@@ -2,6 +2,7 @@ use crate::{router, server::HarnessServer, task_runner};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -46,10 +47,10 @@ async fn create_task(
     State(state): State<Arc<AppState>>,
     Json(req): Json<task_runner::CreateTaskRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if req.prompt.trim().is_empty() {
+    if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "prompt must not be empty"})),
+            Json(json!({"error": "at least one of prompt, issue, or pr must be provided"})),
         );
     }
 
@@ -76,26 +77,21 @@ async fn create_task(
 
 async fn list_tasks(
     State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
-    let tasks: Vec<_> = state.tasks.iter().map(|entry| entry.value().clone()).collect();
-    Json(json!(tasks))
+) -> Json<Vec<task_runner::TaskState>> {
+    let tasks = state.tasks.iter().map(|entry| entry.value().clone()).collect();
+    Json(tasks)
 }
 
 async fn get_task(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response {
     match state.tasks.get(&id) {
-        Some(task) => {
-            let state: &task_runner::TaskState = task.value();
-            match serde_json::to_value(state) {
-                Ok(v) => (StatusCode::OK, Json(v)),
-                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "serialization failed"}))),
-            }
-        }
+        Some(task) => Json(task.value().clone()).into_response(),
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "task not found"})),
-        ),
+        )
+            .into_response(),
     }
 }

@@ -67,7 +67,7 @@ pub fn parse_pr_url(output: &str) -> Option<String> {
 /// Extract PR number from a GitHub PR URL.
 /// Handles URLs with extra path segments or fragments, e.g.:
 ///   https://github.com/owner/repo/pull/42/files
-///   https://github.com/owner/repo/pull/42#discussion
+///   https://github.com/owner/repo/pull/42#discussion_r123
 pub fn extract_pr_number(url: &str) -> Option<u64> {
     url.rsplit_once("/pull/")?
         .1
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn test_extract_pr_number_with_fragment() {
         assert_eq!(
-            extract_pr_number("https://github.com/owner/repo/pull/42#discussion"),
+            extract_pr_number("https://github.com/owner/repo/pull/42#discussion_r123"),
             Some(42)
         );
     }
