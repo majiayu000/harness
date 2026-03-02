@@ -180,7 +180,7 @@ async fn run_task(
             })
             .await?;
 
-        let is_lgtm = resp.output.contains("LGTM");
+        let is_lgtm = resp.output.trim().ends_with("LGTM");
 
         if let Some(mut s) = store.get_mut(&task_id.0) {
             s.rounds.push(RoundResult {
