@@ -206,3 +206,77 @@ fn location_priority(loc: SkillLocation) -> u8 {
         SkillLocation::System => 1,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_skill(name: &str, location: SkillLocation) -> Skill {
+        Skill {
+            id: SkillId::new(),
+            name: name.to_string(),
+            description: "desc".to_string(),
+            content: "content".to_string(),
+            trigger_patterns: Vec::new(),
+            version: "1.0.0".to_string(),
+            author: "test".to_string(),
+            location,
+        }
+    }
+
+    #[test]
+    fn deduplicate_keeps_higher_priority() {
+        let mut store = SkillStore::new();
+        store.skills.push(make_skill("deploy", SkillLocation::System));
+        store.skills.push(make_skill("deploy", SkillLocation::Repo));
+        store.deduplicate();
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.list()[0].location, SkillLocation::Repo);
+    }
+
+    #[test]
+    fn deduplicate_removes_lower_priority_duplicate() {
+        let mut store = SkillStore::new();
+        store.skills.push(make_skill("lint", SkillLocation::User));
+        store.skills.push(make_skill("lint", SkillLocation::Admin));
+        store.deduplicate();
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.list()[0].location, SkillLocation::User);
+    }
+
+    #[test]
+    fn deduplicate_keeps_unique_skills() {
+        let mut store = SkillStore::new();
+        store.skills.push(make_skill("alpha", SkillLocation::Repo));
+        store.skills.push(make_skill("beta", SkillLocation::User));
+        store.deduplicate();
+        assert_eq!(store.list().len(), 2);
+    }
+
+    #[test]
+    fn create_adds_skill_to_store() {
+        let mut store = SkillStore::new();
+        store.create("my-skill".to_string(), "# My Skill\nDoes stuff.".to_string());
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.list()[0].name, "my-skill");
+    }
+
+    #[test]
+    fn delete_removes_skill() {
+        let mut store = SkillStore::new();
+        store.create("removable".to_string(), "content".to_string());
+        let id = store.list()[0].id.clone();
+        assert!(store.delete(&id));
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn search_finds_by_name() {
+        let mut store = SkillStore::new();
+        store.create("rust-lint".to_string(), "# Lint tool".to_string());
+        store.create("python-format".to_string(), "# Format tool".to_string());
+        let results = store.search("rust");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "rust-lint");
+    }
+}

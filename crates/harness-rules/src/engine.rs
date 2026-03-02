@@ -288,7 +288,8 @@ mod tests {
 
     #[test]
     fn parse_rule_file_extracts_security_rule() -> anyhow::Result<()> {
-        let md = "## SEC-01: SQL injection\n\n严重 — use params.\n";
+        // Leading newline required: parser splits on "\n## "
+        let md = "\n## SEC-01: SQL injection\n\n严重 — use params.\n";
         let engine = make_engine_with_content(md)?;
         assert_eq!(engine.rules().len(), 1);
         assert_eq!(engine.rules()[0].id, RuleId::from_str("SEC-01"));
@@ -300,7 +301,7 @@ mod tests {
 
     #[test]
     fn parse_rule_file_extracts_multiple_rules() -> anyhow::Result<()> {
-        let md = "## SEC-01: First rule\n\n严重\n\n## SEC-02: Second rule\n\nhigh severity\n";
+        let md = "\n## SEC-01: First rule\n\n严重\n\n## SEC-02: Second rule\n\nhigh severity\n";
         let engine = make_engine_with_content(md)?;
         assert_eq!(engine.rules().len(), 2);
         Ok(())
@@ -308,7 +309,7 @@ mod tests {
 
     #[test]
     fn parse_rule_file_skips_lowercase_ids() -> anyhow::Result<()> {
-        let md = "## lowercase: should be skipped\n\nsome content\n";
+        let md = "\n## lowercase: should be skipped\n\nsome content\n";
         let engine = make_engine_with_content(md)?;
         assert_eq!(engine.rules().len(), 0);
         Ok(())
@@ -316,7 +317,7 @@ mod tests {
 
     #[test]
     fn parse_rule_file_detects_category_from_prefix() -> anyhow::Result<()> {
-        let md = "## RS-01: Rust stability rule\n\nhigh\n";
+        let md = "\n## RS-01: Rust stability rule\n\nhigh\n";
         let engine = make_engine_with_content(md)?;
         let rules = engine.rules();
         assert_eq!(rules.len(), 1);

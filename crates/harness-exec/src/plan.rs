@@ -155,3 +155,59 @@ impl ExecPlan {
         crate::markdown::from_markdown(content)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn from_spec_extracts_purpose_from_heading() -> anyhow::Result<()> {
+        let spec = "# Implement authentication\n\nDetails here.";
+        let plan = ExecPlan::from_spec(spec, Path::new("/tmp"))?;
+        assert_eq!(plan.purpose, "Implement authentication");
+        assert_eq!(plan.status, ExecPlanStatus::Draft);
+        assert_eq!(plan.project_root, PathBuf::from("/tmp"));
+        Ok(())
+    }
+
+    #[test]
+    fn from_spec_uses_default_purpose_when_no_heading() -> anyhow::Result<()> {
+        let spec = "No heading here, just prose.";
+        let plan = ExecPlan::from_spec(spec, Path::new("/tmp"))?;
+        assert_eq!(plan.purpose, "Untitled Plan");
+        Ok(())
+    }
+
+    #[test]
+    fn markdown_roundtrip_preserves_purpose() -> anyhow::Result<()> {
+        let spec = "# Deploy to production\n\nStep details.";
+        let mut plan = ExecPlan::from_spec(spec, Path::new("/srv/app"))?;
+        plan.add_milestone("Build container".to_string());
+        plan.add_step("Run CI".to_string(), vec![PathBuf::from("Dockerfile")]);
+        let md = plan.to_markdown();
+        let recovered = ExecPlan::from_markdown(&md)?;
+        assert_eq!(recovered.purpose, "Deploy to production");
+        assert_eq!(recovered.progress.len(), 1);
+        assert_eq!(recovered.progress[0].description, "Build container");
+        Ok(())
+    }
+
+    #[test]
+    fn activate_changes_status_to_active() -> anyhow::Result<()> {
+        let mut plan = ExecPlan::from_spec("# Test plan", Path::new("/tmp"))?;
+        assert_eq!(plan.status, ExecPlanStatus::Draft);
+        plan.activate();
+        assert_eq!(plan.status, ExecPlanStatus::Active);
+        Ok(())
+    }
+
+    #[test]
+    fn log_decision_appends_entry() -> anyhow::Result<()> {
+        let mut plan = ExecPlan::from_spec("# Plan", Path::new("/tmp"))?;
+        plan.log_decision("Use axum", "Fits existing pattern");
+        assert_eq!(plan.decision_log.len(), 1);
+        assert_eq!(plan.decision_log[0].decision, "Use axum");
+        Ok(())
+    }
+}

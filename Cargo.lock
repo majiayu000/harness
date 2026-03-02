@@ -770,6 +770,7 @@ dependencies = [
 name = "harness-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "serde",
@@ -820,6 +821,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -830,6 +832,7 @@ dependencies = [
 name = "harness-protocol"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "harness-core",
  "serde",
