@@ -291,9 +291,8 @@ mod tests {
     fn load_builtin_parses_gp_and_sec_ids() -> anyhow::Result<()> {
         let mut engine = RuleEngine::new();
         engine.load_builtin()?;
-        let ids: Vec<&str> = engine.rules().iter().map(|r| r.id.as_str()).collect();
-        assert!(ids.contains(&"GP-01"), "GP-01 rule missing");
-        assert!(ids.contains(&"SEC-01"), "SEC-01 rule missing");
+        assert!(engine.rules().iter().any(|r| r.id.as_str() == "GP-01"), "GP-01 rule missing");
+        assert!(engine.rules().iter().any(|r| r.id.as_str() == "SEC-01"), "SEC-01 rule missing");
         Ok(())
     }
 
