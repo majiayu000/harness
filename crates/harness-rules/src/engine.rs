@@ -87,7 +87,18 @@ impl RuleEngine {
     }
 
     fn load_builtin(&mut self) -> anyhow::Result<()> {
-        // Built-in golden principles are loaded from compiled-in rules
+        let builtin = [
+            ("golden-principles.md", include_str!("../../../rules/golden-principles.md")),
+            ("common/coding-style.md", include_str!("../../../rules/common/coding-style.md")),
+            ("common/security.md", include_str!("../../../rules/common/security.md")),
+            ("go/quality.md", include_str!("../../../rules/go/quality.md")),
+            ("python/quality.md", include_str!("../../../rules/python/quality.md")),
+            ("rust/quality.md", include_str!("../../../rules/rust/quality.md")),
+            ("typescript/quality.md", include_str!("../../../rules/typescript/quality.md")),
+        ];
+        for (name, content) in builtin {
+            self.parse_rule_file(Path::new(name), content)?;
+        }
         Ok(())
     }
 
@@ -116,6 +127,8 @@ impl RuleEngine {
                 body.push('\n');
             }
         }
+
+        let paths = Self::parse_frontmatter_paths(&frontmatter);
 
         // Extract rule blocks from markdown body (## ID: Title pattern)
         for section in body.split("\n## ") {
@@ -148,7 +161,7 @@ impl RuleEngine {
                     title: title.trim().to_string(),
                     severity,
                     category,
-                    paths: Vec::new(),
+                    paths: paths.clone(),
                     description: section.to_string(),
                     fix_pattern: None,
                 });
@@ -156,6 +169,23 @@ impl RuleEngine {
         }
 
         Ok(())
+    }
+
+    /// Parse `paths:` field from YAML frontmatter.
+    /// Supports inline array syntax: `paths: ["*.rs", "src/**"]`
+    fn parse_frontmatter_paths(frontmatter: &str) -> Vec<String> {
+        for line in frontmatter.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("paths:") {
+                let rest = rest.trim().trim_matches(|c| c == '[' || c == ']');
+                return rest
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+        }
+        Vec::new()
     }
 
     pub fn register_guard(&mut self, guard: Guard) {
@@ -238,5 +268,45 @@ impl RuleEngine {
 impl Default for RuleEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_builtin_returns_at_least_40_rules() -> anyhow::Result<()> {
+        let mut engine = RuleEngine::new();
+        engine.load_builtin()?;
+        assert!(
+            engine.rules().len() >= 40,
+            "expected >= 40 builtin rules, got {}",
+            engine.rules().len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_builtin_parses_gp_and_sec_ids() -> anyhow::Result<()> {
+        let mut engine = RuleEngine::new();
+        engine.load_builtin()?;
+        let ids: Vec<&str> = engine.rules().iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"GP-01"), "GP-01 rule missing");
+        assert!(ids.contains(&"SEC-01"), "SEC-01 rule missing");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_frontmatter_paths_inline_array() {
+        let frontmatter = "paths: [\"*.rs\", \"src/**\"]\n";
+        let paths = RuleEngine::parse_frontmatter_paths(frontmatter);
+        assert_eq!(paths, vec!["*.rs", "src/**"]);
+    }
+
+    #[test]
+    fn parse_frontmatter_paths_empty() {
+        let paths = RuleEngine::parse_frontmatter_paths("");
+        assert!(paths.is_empty());
     }
 }
