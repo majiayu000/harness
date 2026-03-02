@@ -315,4 +315,20 @@ mod tests {
         assert!(paths.is_empty());
         Ok(())
     }
+
+    #[test]
+    fn parse_frontmatter_paths_quoted_string() -> anyhow::Result<()> {
+        let frontmatter = "paths: \"**/*.go\"\n";
+        let paths = RuleEngine::parse_frontmatter_paths(frontmatter)?;
+        assert_eq!(paths, vec!["**/*.go"]);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_frontmatter_paths_block_sequence() -> anyhow::Result<()> {
+        let frontmatter = "paths:\n  - \"*.rs\"\n  - \"src/**\"\n";
+        let paths = RuleEngine::parse_frontmatter_paths(frontmatter)?;
+        assert_eq!(paths, vec!["*.rs", "src/**"]);
+        Ok(())
+    }
 }
