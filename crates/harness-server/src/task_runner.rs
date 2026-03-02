@@ -10,7 +10,7 @@ pub struct TaskId(pub String);
 
 impl TaskId {
     pub fn new() -> Self {
-        Self(uuid::Uuid::new_v4().to_string()[..8].to_string())
+        Self(uuid::Uuid::new_v4().to_string())
     }
 }
 
@@ -63,17 +63,17 @@ pub struct CreateTaskRequest {
     pub issue: Option<u64>,
     /// GitHub PR number to review/fix.
     pub pr: Option<u64>,
-    #[serde(default = "default_project")]
-    pub project: PathBuf,
+    /// Project root; defaults to the main git worktree resolved at task spawn time.
+    pub project: Option<PathBuf>,
     #[serde(default = "default_wait")]
     pub wait_secs: u64,
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
 }
 
-fn default_project() -> PathBuf {
-    // Use the main worktree (not a linked worktree) as default project root.
-    // This prevents agent tasks from switching branches in the server's worktree.
+/// Detect the main git worktree root using a blocking subprocess call.
+/// Must be called via `tokio::task::spawn_blocking` in async contexts.
+fn detect_main_worktree() -> PathBuf {
     std::process::Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .output()
@@ -86,10 +86,11 @@ fn default_project() -> PathBuf {
                 .map(|p| PathBuf::from(p.trim()))
         })
         .unwrap_or_else(|| {
-            tracing::warn!("default_project: could not detect git worktree root, falling back to '.'");
+            tracing::warn!("detect_main_worktree: could not detect git worktree root, falling back to '.'");
             PathBuf::from(".")
         })
 }
+
 fn default_wait() -> u64 {
     120
 }
@@ -116,7 +117,14 @@ pub fn spawn_task(
     let store = store.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = run_task(&store, &id, agent.as_ref(), &req).await {
+        // Resolve project root asynchronously to avoid blocking the Tokio thread.
+        let project = match req.project.clone() {
+            Some(p) => p,
+            None => tokio::task::spawn_blocking(detect_main_worktree)
+                .await
+                .unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        if let Err(e) = run_task(&store, &id, agent.as_ref(), &req, project).await {
             if let Some(mut s) = store.get_mut(&id.0) {
                 s.status = TaskStatus::Failed;
                 s.error = Some(e.to_string());
@@ -132,6 +140,7 @@ async fn run_task(
     task_id: &TaskId,
     agent: &dyn CodeAgent,
     req: &CreateTaskRequest,
+    project: PathBuf,
 ) -> anyhow::Result<()> {
     // Turn 1: implement
     update_status(store, task_id, TaskStatus::Implementing, 1);
@@ -147,7 +156,7 @@ async fn run_task(
     let resp = agent
         .execute(AgentRequest {
             prompt: first_prompt,
-            project_root: req.project.clone(),
+            project_root: project.clone(),
             ..Default::default()
         })
         .await?;
@@ -187,7 +196,7 @@ async fn run_task(
         let resp = agent
             .execute(AgentRequest {
                 prompt: prompts::review_prompt(req.issue, pr_num),
-                project_root: req.project.clone(),
+                project_root: project.clone(),
                 ..Default::default()
             })
             .await?;
