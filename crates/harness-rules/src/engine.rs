@@ -134,7 +134,7 @@ impl RuleEngine {
         for section in body.split("\n## ") {
             let first_line = section.lines().next().unwrap_or("");
             if let Some((id_part, title)) = first_line.split_once(':') {
-                let id = id_part.trim().to_string();
+                let id = id_part.trim_start_matches('#').trim().to_string();
                 if id.is_empty() || !id.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
                     continue;
                 }
@@ -330,11 +330,6 @@ mod tests {
         assert!(engine.rules().is_empty());
         assert!(engine.guards().is_empty());
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn load_builtin_returns_at_least_40_rules() -> anyhow::Result<()> {
