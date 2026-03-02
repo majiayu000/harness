@@ -1,6 +1,7 @@
 use clap::Parser;
 
 mod commands;
+mod gc;
 
 fn main() -> anyhow::Result<()> {
     let cli = commands::Cli::parse();

@@ -187,17 +187,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
 
         Command::Gc { cmd } => {
-            match cmd {
-                GcCommand::Run { project } => {
-                    println!("GC run for {:?}", project.unwrap_or_else(|| ".".into()));
-                }
-                GcCommand::Status => println!("GC idle"),
-                GcCommand::Drafts { .. } => println!("No pending drafts"),
-                GcCommand::Adopt { draft_id } => println!("Adopted draft: {draft_id}"),
-                GcCommand::Reject { draft_id, reason } => {
-                    println!("Rejected draft: {draft_id} (reason: {:?})", reason);
-                }
-            }
+            crate::gc::run_gc(cmd, &config).await?;
         }
 
         Command::Rule { cmd } => {
