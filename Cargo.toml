@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/harness-core",
+    "crates/harness-protocol",
+    "crates/harness-server",
+    "crates/harness-agents",
+    "crates/harness-gc",
+    "crates/harness-rules",
+    "crates/harness-skills",
+    "crates/harness-exec",
+    "crates/harness-observe",
+    "crates/harness-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Internal crates
+harness-core = { path = "crates/harness-core" }
+harness-protocol = { path = "crates/harness-protocol" }
+harness-server = { path = "crates/harness-server" }
+harness-agents = { path = "crates/harness-agents" }
+harness-gc = { path = "crates/harness-gc" }
+harness-rules = { path = "crates/harness-rules" }
+harness-skills = { path = "crates/harness-skills" }
+harness-exec = { path = "crates/harness-exec" }
+harness-observe = { path = "crates/harness-observe" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Concurrency
+dashmap = "6"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# File patterns
+glob = "0.3"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Async trait
+async-trait = "0.1"
+
+# Futures
+futures = "0.3"
+tokio-stream = "0.1"
+
+# HTTP client (for Anthropic API)
+reqwest = { version = "0.12", features = ["json", "stream"] }

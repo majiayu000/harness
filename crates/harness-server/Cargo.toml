@@ -1,0 +1,28 @@
+[package]
+name = "harness-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+harness-core = { workspace = true }
+harness-protocol = { workspace = true }
+harness-agents = { workspace = true }
+harness-gc = { workspace = true }
+harness-rules = { workspace = true }
+harness-skills = { workspace = true }
+harness-observe = { workspace = true }
+harness-exec = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }

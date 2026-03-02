@@ -1,0 +1,13 @@
+[package]
+name = "harness-exec"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+harness-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

@@ -1,0 +1,207 @@
+use harness_core::{
+    Decision, Event, ProjectId, RemediationType, Signal, SignalType, Violation,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalThresholds {
+    pub repeated_warn_min: usize,
+    pub chronic_block_min: usize,
+    pub hot_file_edits_min: usize,
+    pub slow_op_threshold_ms: u64,
+    pub slow_op_count_min: usize,
+    pub escalation_ratio: f64,
+    pub violation_min: usize,
+}
+
+impl Default for SignalThresholds {
+    fn default() -> Self {
+        Self {
+            repeated_warn_min: 10,
+            chronic_block_min: 5,
+            hot_file_edits_min: 20,
+            slow_op_threshold_ms: 5000,
+            slow_op_count_min: 10,
+            escalation_ratio: 1.5,
+            violation_min: 5,
+        }
+    }
+}
+
+pub struct SignalDetector {
+    thresholds: SignalThresholds,
+    project_id: ProjectId,
+}
+
+impl SignalDetector {
+    pub fn new(thresholds: SignalThresholds, project_id: ProjectId) -> Self {
+        Self {
+            thresholds,
+            project_id,
+        }
+    }
+
+    pub fn detect(&self, events: &[Event]) -> Vec<Signal> {
+        let mut signals = Vec::new();
+        signals.extend(self.detect_repeated_warns(events));
+        signals.extend(self.detect_chronic_blocks(events));
+        signals.extend(self.detect_hot_files(events));
+        signals.extend(self.detect_slow_sessions(events));
+        signals.extend(self.detect_warn_escalation(events));
+        signals
+    }
+
+    pub fn from_violations(&self, violations: &[Violation]) -> Vec<Signal> {
+        let mut by_rule: HashMap<String, Vec<&Violation>> = HashMap::new();
+        for v in violations {
+            by_rule.entry(v.rule_id.as_str().to_string()).or_default().push(v);
+        }
+
+        by_rule
+            .into_iter()
+            .filter(|(_, vs)| vs.len() >= self.thresholds.violation_min)
+            .map(|(rule_id, vs)| {
+                Signal::new(
+                    SignalType::LinterViolations,
+                    self.project_id.clone(),
+                    serde_json::json!({
+                        "rule_id": rule_id,
+                        "count": vs.len(),
+                        "files": vs.iter().map(|v| v.file.display().to_string()).collect::<Vec<_>>(),
+                    }),
+                    RemediationType::Guard,
+                )
+            })
+            .collect()
+    }
+
+    fn detect_repeated_warns(&self, events: &[Event]) -> Vec<Signal> {
+        let mut by_reason: HashMap<String, usize> = HashMap::new();
+        for e in events {
+            if matches!(e.decision, Decision::Warn) {
+                let reason = e.reason.clone().unwrap_or_else(|| e.hook.clone());
+                *by_reason.entry(reason).or_default() += 1;
+            }
+        }
+
+        by_reason
+            .into_iter()
+            .filter(|(_, count)| *count >= self.thresholds.repeated_warn_min)
+            .map(|(reason, count)| {
+                Signal::new(
+                    SignalType::RepeatedWarn,
+                    self.project_id.clone(),
+                    serde_json::json!({ "reason": reason, "count": count }),
+                    RemediationType::Guard,
+                )
+            })
+            .collect()
+    }
+
+    fn detect_chronic_blocks(&self, events: &[Event]) -> Vec<Signal> {
+        let mut by_hook: HashMap<String, usize> = HashMap::new();
+        for e in events {
+            if matches!(e.decision, Decision::Block) {
+                *by_hook.entry(e.hook.clone()).or_default() += 1;
+            }
+        }
+
+        by_hook
+            .into_iter()
+            .filter(|(_, count)| *count >= self.thresholds.chronic_block_min)
+            .map(|(hook, count)| {
+                Signal::new(
+                    SignalType::ChronicBlock,
+                    self.project_id.clone(),
+                    serde_json::json!({ "hook": hook, "count": count }),
+                    RemediationType::Rule,
+                )
+            })
+            .collect()
+    }
+
+    fn detect_hot_files(&self, events: &[Event]) -> Vec<Signal> {
+        let mut by_file: HashMap<String, usize> = HashMap::new();
+        for e in events {
+            if let Some(ref detail) = e.detail {
+                // Assume detail contains file path for edit events
+                if e.hook.contains("edit") || e.tool.contains("Edit") || e.tool.contains("Write") {
+                    *by_file.entry(detail.clone()).or_default() += 1;
+                }
+            }
+        }
+
+        by_file
+            .into_iter()
+            .filter(|(_, count)| *count >= self.thresholds.hot_file_edits_min)
+            .map(|(file, count)| {
+                Signal::new(
+                    SignalType::HotFiles,
+                    self.project_id.clone(),
+                    serde_json::json!({ "file": file, "count": count }),
+                    RemediationType::Skill,
+                )
+            })
+            .collect()
+    }
+
+    fn detect_slow_sessions(&self, events: &[Event]) -> Vec<Signal> {
+        let slow_count = events
+            .iter()
+            .filter(|e| {
+                e.duration_ms
+                    .map(|d| d > self.thresholds.slow_op_threshold_ms)
+                    .unwrap_or(false)
+            })
+            .count();
+
+        if slow_count >= self.thresholds.slow_op_count_min {
+            vec![Signal::new(
+                SignalType::SlowSessions,
+                self.project_id.clone(),
+                serde_json::json!({
+                    "slow_ops": slow_count,
+                    "threshold_ms": self.thresholds.slow_op_threshold_ms,
+                }),
+                RemediationType::Skill,
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn detect_warn_escalation(&self, events: &[Event]) -> Vec<Signal> {
+        if events.len() < 20 {
+            return Vec::new();
+        }
+
+        let mid = events.len() / 2;
+        let first_half_warns = events[..mid]
+            .iter()
+            .filter(|e| matches!(e.decision, Decision::Warn))
+            .count() as f64;
+        let second_half_warns = events[mid..]
+            .iter()
+            .filter(|e| matches!(e.decision, Decision::Warn))
+            .count() as f64;
+
+        let first_rate = first_half_warns / mid as f64;
+        let second_rate = second_half_warns / (events.len() - mid) as f64;
+
+        if first_rate > 0.0 && second_rate / first_rate >= self.thresholds.escalation_ratio {
+            vec![Signal::new(
+                SignalType::WarnEscalation,
+                self.project_id.clone(),
+                serde_json::json!({
+                    "first_half_rate": first_rate,
+                    "second_half_rate": second_rate,
+                    "ratio": second_rate / first_rate,
+                }),
+                RemediationType::Rule,
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+}
