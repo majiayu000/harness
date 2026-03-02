@@ -14,7 +14,8 @@ pub fn implement_from_issue(issue: u64) -> String {
 pub fn check_existing_pr(pr: u64) -> String {
     format!(
         "检查 PR #{pr} 的 CI 状态和 review comments。\
-         如果有问题就修复代码，commit，push。\
+         如果有问题就修复代码，commit，push，\
+         然后用 `gh pr comment {pr} --body '/gemini review'` 触发 review bot 重新审查。\
          如果没有问题，在最后一行单独输出 LGTM。\
          否则在最后一行单独输出 FIXED。"
     )
@@ -40,7 +41,9 @@ pub fn review_prompt(issue: Option<u64>, pr: u64) -> String {
          现在用 gh pr checks 检查 CI 状态，\
          用 gh pr view 和 gh api 读取 review comments。\
          如果 CI 通过且没有需要处理的 review comments，在最后一行单独输出 LGTM。\
-         否则根据反馈修复代码，commit，push，在最后一行单独输出 FIXED。"
+         否则根据反馈修复代码，commit，push，\
+         然后用 `gh pr comment {pr} --body '/gemini review'` 触发 review bot 重新审查，\
+         在最后一行单独输出 FIXED。"
     )
 }
 
