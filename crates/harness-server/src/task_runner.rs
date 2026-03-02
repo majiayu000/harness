@@ -90,6 +90,9 @@ pub struct CreateTaskRequest {
     pub wait_secs: u64,
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
+    /// Per-turn timeout in seconds; defaults to 600 (10 min).
+    #[serde(default = "default_turn_timeout")]
+    pub turn_timeout_secs: u64,
 }
 
 /// Detect the main git worktree root using a blocking subprocess call.
@@ -117,6 +120,9 @@ fn default_wait() -> u64 {
 }
 fn default_max_rounds() -> u32 {
     5
+}
+fn default_turn_timeout() -> u64 {
+    600
 }
 
 /// In-memory cache + SQLite persistence.
@@ -209,23 +215,31 @@ async fn run_task(
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default())
     };
 
-    let resp = agent
-        .execute(AgentRequest {
+    let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
+    let resp = tokio::time::timeout(
+        turn_timeout,
+        agent.execute(AgentRequest {
             prompt: first_prompt,
             project_root: project.clone(),
             ..Default::default()
-        })
-        .await?;
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Turn 1 timed out after {}s", req.turn_timeout_secs))?
+    ?;
 
     let pr_url = prompts::parse_pr_url(&resp.output);
-    let pr_number = pr_url.as_ref().and_then(|u| prompts::extract_pr_number(u));
+    let pr_number = pr_url
+        .as_ref()
+        .and_then(|u| prompts::extract_pr_number(u))
+        .or(req.pr); // fallback: use req.pr if agent didn't output PR_URL
 
     mutate_and_persist(store, task_id, |s| {
         s.pr_url = pr_url.clone();
         s.rounds.push(RoundResult {
             turn: 1,
             action: "implement".into(),
-            result: if pr_url.is_some() {
+            result: if pr_url.is_some() || req.pr.is_some() {
                 "pr_created".into()
             } else {
                 "implemented".into()
@@ -243,19 +257,25 @@ async fn run_task(
     };
 
     // Review loop: Turn 2..N
-    for round in 2..=(req.max_rounds + 1) {
+    let last_review_round = req.max_rounds + 1;
+    for round in 2..=last_review_round {
         update_status(store, task_id, TaskStatus::Waiting, round).await;
         sleep(Duration::from_secs(req.wait_secs)).await;
 
         update_status(store, task_id, TaskStatus::Reviewing, round).await;
 
-        let resp = agent
-            .execute(AgentRequest {
-                prompt: prompts::review_prompt(req.issue, pr_num),
+        let is_last_round = round == last_review_round;
+        let resp = tokio::time::timeout(
+            turn_timeout,
+            agent.execute(AgentRequest {
+                prompt: prompts::review_prompt(req.issue, pr_num, round, is_last_round),
                 project_root: project.clone(),
                 ..Default::default()
-            })
-            .await?;
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Turn {round} timed out after {}s", req.turn_timeout_secs))?
+        ?;
 
         let lgtm = prompts::is_lgtm(&resp.output);
 

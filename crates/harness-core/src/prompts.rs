@@ -34,10 +34,31 @@ pub fn implement_from_prompt(prompt: &str) -> String {
 }
 
 /// Build review loop prompt for a given round.
-pub fn review_prompt(issue: Option<u64>, pr: u64) -> String {
+///
+/// `round` controls convergence behavior:
+/// - Round 2: fix all critical/high/medium comments
+/// - Round 3+: only fix critical/high; skip medium style/design suggestions
+/// - `is_last_round`: controls whether to trigger `/gemini review`
+pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32, is_last_round: bool) -> String {
     let context = match issue {
         Some(n) => format!("You previously created PR #{pr} for issue #{n}.\n"),
         None => format!("Review PR #{pr}.\n"),
+    };
+
+    let severity_guidance = if round <= 2 {
+        "Fix all review comments marked critical, high, or medium severity."
+    } else {
+        "Fix only critical and high severity issues. \
+         Skip medium severity style/design suggestions — they are acceptable for now."
+    };
+
+    let push_action = if is_last_round {
+        format!(
+            "commit, push, then run `gh pr comment {pr} --body '/gemini review'` \
+             to trigger a final re-review"
+        )
+    } else {
+        "commit and push (do NOT trigger /gemini review this round to avoid feedback inflation)".into()
     };
 
     format!(
@@ -46,11 +67,15 @@ pub fn review_prompt(issue: Option<u64>, pr: u64) -> String {
          1. Run `gh pr checks {pr}` to check CI status\n\
          2. Run `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/reviews` to read review verdicts\n\
          3. Run `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/comments` to read inline review comments\n\
-         4. If all CI checks pass and there are no unresolved review comments \
-         (including bot suggestions marked high/medium), print LGTM on the last line\n\
-         5. Otherwise fix the code based on each review comment, commit, push, \
-         then run `gh pr comment {pr} --body '/gemini review'` to trigger the review bot, \
-         and print FIXED on the last line"
+         4. {severity_guidance}\n\
+         5. If all CI checks pass and there are no unresolved review comments \
+         that match the severity criteria above, print LGTM on the last line\n\
+         6. Otherwise fix the issues, {push_action}, \
+         and print FIXED on the last line\n\n\
+         Constraints:\n\
+         - NEVER downgrade dependency versions\n\
+         - Do NOT refactor working code for style preferences\n\
+         - Focus on correctness and safety, not cosmetic improvements"
     )
 }
 
@@ -118,16 +143,37 @@ mod tests {
 
     #[test]
     fn test_review_prompt_with_issue() {
-        let p = review_prompt(Some(5), 10);
+        let p = review_prompt(Some(5), 10, 2, false);
         assert!(p.contains("issue #5"));
         assert!(p.contains("PR #10"));
+        assert!(p.contains("medium")); // round 2 includes medium
     }
 
     #[test]
     fn test_review_prompt_without_issue() {
-        let p = review_prompt(None, 10);
+        let p = review_prompt(None, 10, 2, false);
         assert!(p.contains("PR #10"));
-        assert!(!p.contains("issue"));
+        assert!(!p.contains("issue #")); // no issue reference when None
+    }
+
+    #[test]
+    fn test_review_prompt_late_round_skips_medium() {
+        let p = review_prompt(None, 10, 3, false);
+        assert!(p.contains("Skip medium"));
+        assert!(p.contains("do NOT trigger /gemini review"));
+    }
+
+    #[test]
+    fn test_review_prompt_last_round_triggers_gemini() {
+        let p = review_prompt(None, 10, 4, true);
+        assert!(p.contains("/gemini review"));
+        assert!(p.contains("final re-review"));
+    }
+
+    #[test]
+    fn test_review_prompt_constraints() {
+        let p = review_prompt(None, 10, 2, false);
+        assert!(p.contains("NEVER downgrade dependency"));
     }
 
     #[test]
