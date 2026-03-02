@@ -46,20 +46,24 @@ async fn create_task(
     State(state): State<Arc<AppState>>,
     Json(req): Json<task_runner::CreateTaskRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if state.server.agent_registry.default_agent().is_none() {
+    if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "no agent registered"})),
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "either prompt, issue, or pr must be specified"})),
         );
     }
 
-    let agent_arc: Arc<dyn harness_core::CodeAgent> =
-        Arc::new(harness_agents::claude::ClaudeCodeAgent::new(
-            state.server.config.agents.claude.cli_path.clone(),
-            state.server.config.agents.claude.default_model.clone(),
-        ));
+    let agent = match state.server.agent_registry.default_agent() {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "no agent registered"})),
+            );
+        }
+    };
 
-    let task_id = task_runner::spawn_task(state.tasks.clone(), agent_arc, req);
+    let task_id = task_runner::spawn_task(state.tasks.clone(), agent, req);
 
     (
         StatusCode::ACCEPTED,
@@ -73,11 +77,7 @@ async fn create_task(
 async fn list_tasks(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    let mut tasks = Vec::new();
-    for entry in state.tasks.iter() {
-        tasks.push(entry.value().clone());
-    }
-
+    let tasks: Vec<_> = state.tasks.iter().map(|entry| entry.value().clone()).collect();
     Json(json!(tasks))
 }
 

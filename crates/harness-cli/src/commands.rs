@@ -185,7 +185,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { transport, port } => {
             let thread_manager = harness_server::thread_manager::ThreadManager::new();
-            let agent_registry = harness_agents::AgentRegistry::new(&config.agents.default_agent);
+            let mut agent_registry = harness_agents::AgentRegistry::new(&config.agents.default_agent);
+            agent_registry.register(
+                "claude",
+                Arc::new(harness_agents::claude::ClaudeCodeAgent::new(
+                    config.agents.claude.cli_path.clone(),
+                    config.agents.claude.default_model.clone(),
+                )),
+            );
             let server = harness_server::server::HarnessServer::new(
                 config.clone(),
                 thread_manager,
