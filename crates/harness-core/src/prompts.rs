@@ -27,7 +27,7 @@ pub fn check_existing_pr(pr: u64) -> String {
 pub fn implement_from_prompt(prompt: &str) -> String {
     format!(
         "{prompt}\n\n\
-         完成后如果创建了 PR，在输出的最后一行单独输出 PR_URL=<完整PR URL>"
+         完成后在输出的最后一行单独输出 PR_URL=<PR URL>（无论是创建了新 PR 还是 push 到了已有 PR）"
     )
 }
 
