@@ -172,18 +172,29 @@ impl RuleEngine {
     }
 
     /// Parse `paths:` field from YAML frontmatter.
-    /// Supports inline array syntax: `paths: ["*.rs", "src/**"]`
+    ///
+    /// Supports two formats used in builtin rule files:
+    /// - Quoted string: `paths: "**/*.go"` or comma-separated `paths: "**/*.ts,**/*.tsx"`
+    /// - Inline array:  `paths: ["*.rs", "src/**"]`
     fn parse_frontmatter_paths(frontmatter: &str) -> Vec<String> {
         for line in frontmatter.lines() {
             let line = line.trim();
-            if let Some(rest) = line.strip_prefix("paths:") {
-                let rest = rest.trim().trim_matches(|c| c == '[' || c == ']');
-                return rest
-                    .split(',')
-                    .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
+            let Some(rest) = line.strip_prefix("paths:") else {
+                continue;
+            };
+            let rest = rest.trim();
+            // Inline array: paths: ["*.rs", "src/**"]
+            let inner = if rest.starts_with('[') && rest.ends_with(']') {
+                &rest[1..rest.len() - 1]
+            } else {
+                // Quoted or bare string: paths: "**/*.go" or paths: **/*.go
+                rest.trim_matches(|c| c == '"' || c == '\'')
+            };
+            return inner
+                .split(',')
+                .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
         Vec::new()
     }
