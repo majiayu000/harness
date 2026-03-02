@@ -49,6 +49,7 @@ impl CodeAgent for CodexAgent {
 
         Ok(AgentResponse {
             output: stdout,
+            stderr,
             items: Vec::new(),
             token_usage: TokenUsage::default(),
             model: "codex".to_string(),

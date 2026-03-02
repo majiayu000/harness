@@ -60,6 +60,12 @@ pub enum Command {
         #[command(subcommand)]
         cmd: PlanCommand,
     },
+
+    /// PR orchestration — implement issue and manage PR review loop
+    Pr {
+        #[command(subcommand)]
+        cmd: PrCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -119,6 +125,38 @@ pub enum SkillCommand {
     /// Delete a skill
     Delete {
         skill_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PrCommand {
+    /// Implement a GitHub issue, create a PR, then run the review loop
+    Fix {
+        /// GitHub issue number
+        issue: u64,
+        /// Seconds to wait between review rounds (for CI and review bots)
+        #[arg(long, default_value = "120")]
+        wait: u64,
+        /// Maximum number of review rounds
+        #[arg(long, default_value = "5")]
+        max_rounds: u32,
+        /// Project directory
+        #[arg(long, default_value = ".")]
+        project: std::path::PathBuf,
+    },
+    /// Run the review loop for an existing PR
+    Loop {
+        /// GitHub PR number
+        pr: u64,
+        /// Seconds to wait between review rounds
+        #[arg(long, default_value = "120")]
+        wait: u64,
+        /// Maximum number of review rounds
+        #[arg(long, default_value = "5")]
+        max_rounds: u32,
+        /// Project directory
+        #[arg(long, default_value = ".")]
+        project: std::path::PathBuf,
     },
 }
 
@@ -184,6 +222,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
             let resp = harness_core::CodeAgent::execute(&agent, req).await?;
             println!("{}", resp.output);
+            if !resp.stderr.is_empty() {
+                eprintln!("[harness] agent stderr:\n{}", resp.stderr);
+            }
         }
 
         Command::Gc { cmd } => {
@@ -243,6 +284,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
                 SkillCommand::Delete { skill_id } => {
                     println!("Delete skill: {skill_id}");
+                }
+            }
+        }
+
+        Command::Pr { cmd } => {
+            match cmd {
+                PrCommand::Fix { issue, wait, max_rounds, project } => {
+                    crate::cmd::pr::fix(&config, issue, wait, max_rounds, project).await?;
+                }
+                PrCommand::Loop { pr, wait, max_rounds, project } => {
+                    crate::cmd::pr::loop_pr(&config, pr, wait, max_rounds, project).await?;
                 }
             }
         }
