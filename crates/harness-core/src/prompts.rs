@@ -19,7 +19,8 @@ pub fn check_existing_pr(pr: u64) -> String {
          3. If CI passes and there are no unresolved review comments, print LGTM on the last line\n\
          4. Otherwise fix each comment, commit, push, \
          then run `gh pr comment {pr} --body '/gemini review'` to trigger re-review, \
-         and print FIXED on the last line"
+         and print FIXED on the last line\n\n\
+         Always print PR_URL=https://github.com/{{owner}}/{{repo}}/pull/{pr} on a separate line of your output."
     )
 }
 
@@ -105,6 +106,7 @@ mod tests {
         let p = check_existing_pr(10);
         assert!(p.contains("PR #10"));
         assert!(p.contains("LGTM"));
+        assert!(p.contains("PR_URL="));
     }
 
     #[test]
