@@ -46,10 +46,10 @@ async fn create_task(
     State(state): State<Arc<AppState>>,
     Json(req): Json<task_runner::CreateTaskRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
+    if req.prompt.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "either prompt, issue, or pr must be specified"})),
+            Json(json!({"error": "prompt must not be empty"})),
         );
     }
 
