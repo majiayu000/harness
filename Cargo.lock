@@ -876,6 +876,7 @@ dependencies = [
  "harness-skills",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
  "tokio-stream",
