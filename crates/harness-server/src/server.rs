@@ -29,7 +29,7 @@ impl HarnessServer {
     }
 
     /// Start in HTTP + WebSocket mode.
-    pub async fn serve_http(&self, addr: SocketAddr) -> anyhow::Result<()> {
+    pub async fn serve_http(self: Arc<Self>, addr: SocketAddr) -> anyhow::Result<()> {
         crate::http::serve(self, addr).await
     }
 }
