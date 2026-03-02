@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "harness", about = "Harness — AI Code Agent Platform")]
@@ -162,7 +163,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     } else {
                         config.server.http_addr
                     };
-                    std::sync::Arc::new(server).serve_http(addr).await?
+                    Arc::new(server).serve_http(addr).await?
                 }
                 other => anyhow::bail!("unknown transport: {other}"),
             }
