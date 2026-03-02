@@ -37,9 +37,11 @@ impl CodeAgent for ClaudeCodeAgent {
         let model = req.model.as_deref().unwrap_or(&self.default_model);
         let mut cmd = Command::new(&self.cli_path);
         cmd.arg("-p")
-            .arg("--output-format").arg("json")
+            .arg("--dangerously-skip-permissions")
+            .arg("--output-format").arg("text")
             .arg("--model").arg(model)
-            .current_dir(&req.project_root);
+            .current_dir(&req.project_root)
+            .env_remove("CLAUDECODE");
 
         if !req.allowed_tools.is_empty() {
             cmd.arg("--allowedTools").arg(req.allowed_tools.join(","));
