@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use harness_core::{AgentRequest, CodeAgent};
+use harness_core::{prompts, AgentRequest, CodeAgent};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -126,8 +126,8 @@ async fn run_task(
         })
         .await?;
 
-    let pr_url = parse_pr_url(&resp.output);
-    let pr_number = pr_url.as_ref().and_then(|u| extract_pr_number(u));
+    let pr_url = prompts::parse_pr_url(&resp.output);
+    let pr_number = pr_url.as_ref().and_then(|u| prompts::extract_pr_number(u));
 
     if let Some(mut s) = store.get_mut(&task_id.0) {
         s.pr_url = pr_url.clone();
@@ -152,10 +152,9 @@ async fn run_task(
     };
 
     // Review loop: Turn 2..N
-    let issue_context = match (req.issue, req.pr) {
-        (Some(n), _) => format!("你之前为 issue #{n} 创建了 PR #{pr_num}。\n"),
-        (_, Some(n)) => format!("检查 PR #{n}。\n"),
-        _ => format!("检查 PR #{pr_num}。\n"),
+    let issue_for_context = match (req.issue, req.pr) {
+        (Some(n), _) => Some(n),
+        _ => None,
     };
 
     for round in 2..=(req.max_rounds + 1) {
@@ -164,37 +163,25 @@ async fn run_task(
 
         update_status(store, task_id, TaskStatus::Reviewing, round);
 
-        let review_prompt = format!(
-            "{issue_context}\
-             现在用 gh pr checks 检查 CI 状态，\
-             用 gh pr view 和 gh api 读取 review comments。\
-             如果 CI 通过且没有需要处理的 review comments，在最后一行单独输出 LGTM。\
-             否则根据反馈修复代码，commit，push，在最后一行单独输出 FIXED。"
-        );
-
         let resp = agent
             .execute(AgentRequest {
-                prompt: review_prompt,
+                prompt: prompts::review_prompt(issue_for_context, pr_num),
                 project_root: req.project.clone(),
                 ..Default::default()
             })
             .await?;
 
-        let is_lgtm = resp.output.trim().ends_with("LGTM");
+        let lgtm = prompts::is_lgtm(&resp.output);
 
         if let Some(mut s) = store.get_mut(&task_id.0) {
             s.rounds.push(RoundResult {
                 turn: round,
                 action: "review".into(),
-                result: if is_lgtm {
-                    "lgtm".into()
-                } else {
-                    "fixed".into()
-                },
+                result: if lgtm { "lgtm".into() } else { "fixed".into() },
             });
         }
 
-        if is_lgtm {
+        if lgtm {
             update_status(store, task_id, TaskStatus::Done, round);
             return Ok(());
         }
@@ -206,24 +193,11 @@ async fn run_task(
 
 fn build_implement_prompt(req: &CreateTaskRequest) -> String {
     if let Some(issue) = req.issue {
-        format!(
-            "读 GitHub issue #{issue}，理解需求，在当前项目中实现代码，\
-             运行 cargo check 和 cargo test，创建功能分支，commit，push，\
-             用 gh pr create 创建 PR。\
-             完成后在输出的最后一行单独输出 PR_URL=<完整PR URL>"
-        )
+        prompts::implement_from_issue(issue)
     } else if let Some(pr) = req.pr {
-        format!(
-            "检查 PR #{pr} 的 CI 状态和 review comments。\
-             如果有问题就修复代码，commit，push。\
-             如果没有问题，在最后一行单独输出 LGTM。\
-             否则在最后一行单独输出 FIXED。"
-        )
+        prompts::check_existing_pr(pr)
     } else if let Some(ref prompt) = req.prompt {
-        format!(
-            "{prompt}\n\n\
-             完成后如果创建了 PR，在输出的最后一行单独输出 PR_URL=<完整PR URL>"
-        )
+        prompts::implement_from_prompt(prompt)
     } else {
         "No task specified.".into()
     }
@@ -236,45 +210,9 @@ fn update_status(store: &TaskStore, task_id: &TaskId, status: TaskStatus, turn: 
     }
 }
 
-fn parse_pr_url(output: &str) -> Option<String> {
-    for line in output.lines().rev() {
-        let line = line.trim();
-        if let Some(url) = line.strip_prefix("PR_URL=") {
-            return Some(url.trim().to_string());
-        }
-    }
-    None
-}
-
-fn extract_pr_number(url: &str) -> Option<u64> {
-    url.split('/').last()?.parse().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_pr_url() {
-        let output = "Some output\nPR_URL=https://github.com/owner/repo/pull/42";
-        assert_eq!(
-            parse_pr_url(output),
-            Some("https://github.com/owner/repo/pull/42".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_pr_url_not_found() {
-        assert_eq!(parse_pr_url("no url here"), None);
-    }
-
-    #[test]
-    fn test_extract_pr_number() {
-        assert_eq!(
-            extract_pr_number("https://github.com/owner/repo/pull/42"),
-            Some(42)
-        );
-    }
 
     #[test]
     fn test_build_prompt_issue() {

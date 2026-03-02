@@ -3,23 +3,20 @@
 /// Build prompt: implement from a GitHub issue, create PR.
 pub fn implement_from_issue(issue: u64) -> String {
     format!(
-        "Read GitHub issue #{issue}, understand the requirements, implement the code in this project, \
-         run cargo check and cargo test, create a feature branch, commit, push, \
-         and create a PR with gh pr create. \
-         On the last line of your output, print PR_URL=<full PR URL>"
+        "读 GitHub issue #{issue}，理解需求，在当前项目中实现代码，\
+         运行 cargo check 和 cargo test，创建功能分支，commit，push，\
+         用 gh pr create 创建 PR。\
+         完成后在输出的最后一行单独输出 PR_URL=<完整PR URL>"
     )
 }
 
 /// Build prompt: check an existing PR's CI and review status.
 pub fn check_existing_pr(pr: u64) -> String {
     format!(
-        "Check PR #{pr}:\n\
-         1. `gh pr checks {pr}` — check CI status\n\
-         2. `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/comments` — read inline review comments\n\
-         3. If CI passes and there are no unresolved review comments, print LGTM on the last line\n\
-         4. Otherwise fix each comment, commit, push, \
-         then run `gh pr comment {pr} --body '/gemini review'` to trigger re-review, \
-         and print FIXED on the last line"
+        "检查 PR #{pr} 的 CI 状态和 review comments。\
+         如果有问题就修复代码，commit，push。\
+         如果没有问题，在最后一行单独输出 LGTM。\
+         否则在最后一行单独输出 FIXED。"
     )
 }
 
@@ -27,29 +24,23 @@ pub fn check_existing_pr(pr: u64) -> String {
 pub fn implement_from_prompt(prompt: &str) -> String {
     format!(
         "{prompt}\n\n\
-         On the last line of your output, print PR_URL=<PR URL> \
-         (whether you created a new PR or pushed to an existing one)"
+         完成后如果创建了 PR，在输出的最后一行单独输出 PR_URL=<完整PR URL>"
     )
 }
 
 /// Build review loop prompt for a given round.
 pub fn review_prompt(issue: Option<u64>, pr: u64) -> String {
     let context = match issue {
-        Some(n) => format!("You previously created PR #{pr} for issue #{n}.\n"),
-        None => format!("Review PR #{pr}.\n"),
+        Some(n) => format!("你之前为 issue #{n} 创建了 PR #{pr}。\n"),
+        None => format!("检查 PR #{pr}。\n"),
     };
 
     format!(
         "{context}\
-         Steps:\n\
-         1. Run `gh pr checks {pr}` to check CI status\n\
-         2. Run `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/reviews` to read review verdicts\n\
-         3. Run `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/comments` to read inline review comments\n\
-         4. If all CI checks pass and there are no unresolved review comments \
-         (including bot suggestions marked high/medium), print LGTM on the last line\n\
-         5. Otherwise fix the code based on each review comment, commit, push, \
-         then run `gh pr comment {pr} --body '/gemini review'` to trigger the review bot, \
-         and print FIXED on the last line"
+         现在用 gh pr checks 检查 CI 状态，\
+         用 gh pr view 和 gh api 读取 review comments。\
+         如果 CI 通过且没有需要处理的 review comments，在最后一行单独输出 LGTM。\
+         否则根据反馈修复代码，commit，push，在最后一行单独输出 FIXED。"
     )
 }
 
