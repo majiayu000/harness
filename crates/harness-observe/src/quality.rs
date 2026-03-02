@@ -68,3 +68,52 @@ impl QualityGrader {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_core::{Decision, Event, Grade, SessionId};
+
+    fn pass_event() -> Event {
+        Event::new(SessionId::new(), "pre_tool_use", "Edit", Decision::Pass)
+    }
+
+    fn block_event(hook: &str) -> Event {
+        Event::new(SessionId::new(), hook, "Edit", Decision::Block)
+    }
+
+    #[test]
+    fn grade_perfect_events_no_violations() {
+        let events: Vec<Event> = (0..10).map(|_| pass_event()).collect();
+        let report = QualityGrader::grade(&events, 0);
+        assert_eq!(report.grade, Grade::A);
+        assert!(report.score >= 90.0);
+    }
+
+    #[test]
+    fn grade_degrades_with_violations() {
+        let events: Vec<Event> = (0..10).map(|_| pass_event()).collect();
+        let report = QualityGrader::grade(&events, 50);
+        assert!(report.score < 100.0);
+        assert!(report.dimensions.coverage < 100.0);
+    }
+
+    #[test]
+    fn grade_degrades_with_many_blocks() {
+        let events: Vec<Event> = (0..10).map(|_| block_event("security_check")).collect();
+        let report = QualityGrader::grade(&events, 0);
+        assert!(report.dimensions.stability < 100.0);
+    }
+
+    #[test]
+    fn grade_empty_events_returns_report() {
+        let report = QualityGrader::grade(&[], 0);
+        assert!(report.score >= 0.0);
+    }
+
+    #[test]
+    fn recommended_gc_interval_matches_grade() {
+        let report = QualityGrader::grade(&[], 0);
+        assert_eq!(report.recommended_gc_interval, report.grade.recommended_gc_interval());
+    }
+}

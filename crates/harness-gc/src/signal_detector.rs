@@ -205,3 +205,115 @@ impl SignalDetector {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_core::{Decision, Event, ProjectId, SessionId, SignalType, Violation, Severity};
+    use std::path::PathBuf;
+
+    fn detector() -> SignalDetector {
+        SignalDetector::new(SignalThresholds::default(), ProjectId::new())
+    }
+
+    fn warn_event(reason: &str) -> Event {
+        let mut e = Event::new(SessionId::new(), "hook", "tool", Decision::Warn);
+        e.reason = Some(reason.to_string());
+        e
+    }
+
+    fn block_event(hook: &str) -> Event {
+        Event::new(SessionId::new(), hook, "tool", Decision::Block)
+    }
+
+    fn edit_event(file: &str) -> Event {
+        let mut e = Event::new(SessionId::new(), "edit_hook", "Edit", Decision::Pass);
+        e.detail = Some(file.to_string());
+        e
+    }
+
+    fn slow_event(ms: u64) -> Event {
+        let mut e = Event::new(SessionId::new(), "hook", "tool", Decision::Pass);
+        e.duration_ms = Some(ms);
+        e
+    }
+
+    #[test]
+    fn detects_repeated_warn() {
+        let det = detector();
+        let events: Vec<Event> = (0..10).map(|_| warn_event("unwrap usage")).collect();
+        let signals = det.detect(&events);
+        assert!(signals.iter().any(|s| s.signal_type == SignalType::RepeatedWarn));
+    }
+
+    #[test]
+    fn no_signal_below_repeated_warn_threshold() {
+        let det = detector();
+        let events: Vec<Event> = (0..9).map(|_| warn_event("test")).collect();
+        let signals = det.detect(&events);
+        assert!(!signals.iter().any(|s| s.signal_type == SignalType::RepeatedWarn));
+    }
+
+    #[test]
+    fn detects_chronic_block() {
+        let det = detector();
+        let events: Vec<Event> = (0..5).map(|_| block_event("security")).collect();
+        let signals = det.detect(&events);
+        assert!(signals.iter().any(|s| s.signal_type == SignalType::ChronicBlock));
+    }
+
+    #[test]
+    fn detects_hot_files() {
+        let det = detector();
+        let events: Vec<Event> = (0..20).map(|_| edit_event("/src/main.rs")).collect();
+        let signals = det.detect(&events);
+        assert!(signals.iter().any(|s| s.signal_type == SignalType::HotFiles));
+    }
+
+    #[test]
+    fn detects_slow_sessions() {
+        let det = detector();
+        let events: Vec<Event> = (0..10).map(|_| slow_event(6000)).collect();
+        let signals = det.detect(&events);
+        assert!(signals.iter().any(|s| s.signal_type == SignalType::SlowSessions));
+    }
+
+    #[test]
+    fn detects_warn_escalation() {
+        let det = SignalDetector::new(
+            SignalThresholds { escalation_ratio: 1.5, ..Default::default() },
+            ProjectId::new(),
+        );
+        // First half: 2 warns out of 10 → rate 0.2
+        // Second half: 8 warns out of 10 → rate 0.8 (ratio 4.0 > 1.5)
+        let mut events: Vec<Event> = Vec::new();
+        for _ in 0..8 {
+            events.push(Event::new(SessionId::new(), "h", "t", Decision::Pass));
+        }
+        for _ in 0..2 {
+            events.push(warn_event("reason"));
+        }
+        for _ in 0..2 {
+            events.push(Event::new(SessionId::new(), "h", "t", Decision::Pass));
+        }
+        for _ in 0..8 {
+            events.push(warn_event("reason"));
+        }
+        let signals = det.detect(&events);
+        assert!(signals.iter().any(|s| s.signal_type == SignalType::WarnEscalation));
+    }
+
+    #[test]
+    fn detects_linter_violations_signal() {
+        let det = detector();
+        let violations: Vec<Violation> = (0..5).map(|_| Violation {
+            rule_id: harness_core::RuleId::from_str("SEC-01"),
+            file: PathBuf::from("/src/lib.rs"),
+            line: Some(1),
+            message: "issue".to_string(),
+            severity: Severity::High,
+        }).collect();
+        let signals = det.from_violations(&violations);
+        assert!(signals.iter().any(|s| s.signal_type == SignalType::LinterViolations));
+    }
+}

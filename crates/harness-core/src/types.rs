@@ -493,3 +493,86 @@ pub struct MetricFilters {
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn grade_from_score_all_boundaries() {
+        assert_eq!(Grade::from_score(100.0), Grade::A);
+        assert_eq!(Grade::from_score(90.0), Grade::A);
+        assert_eq!(Grade::from_score(89.9), Grade::B);
+        assert_eq!(Grade::from_score(70.0), Grade::B);
+        assert_eq!(Grade::from_score(69.9), Grade::C);
+        assert_eq!(Grade::from_score(50.0), Grade::C);
+        assert_eq!(Grade::from_score(49.9), Grade::D);
+        assert_eq!(Grade::from_score(0.0), Grade::D);
+    }
+
+    #[test]
+    fn grade_gc_interval_ordering() {
+        assert!(Grade::A.recommended_gc_interval() > Grade::B.recommended_gc_interval());
+        assert!(Grade::B.recommended_gc_interval() > Grade::C.recommended_gc_interval());
+        assert!(Grade::C.recommended_gc_interval() > Grade::D.recommended_gc_interval());
+    }
+
+    #[test]
+    fn thread_serialization_roundtrip() -> anyhow::Result<()> {
+        let thread = Thread::new(PathBuf::from("/tmp/project"));
+        let json = serde_json::to_string(&thread)?;
+        let back: Thread = serde_json::from_str(&json)?;
+        assert_eq!(thread.id, back.id);
+        assert_eq!(thread.project_root, back.project_root);
+        assert_eq!(thread.status, back.status);
+        Ok(())
+    }
+
+    #[test]
+    fn thread_status_serde_snake_case() -> anyhow::Result<()> {
+        let s = serde_json::to_string(&ThreadStatus::Active)?;
+        assert_eq!(s, "\"active\"");
+        let back: ThreadStatus = serde_json::from_str("\"archived\"")?;
+        assert_eq!(back, ThreadStatus::Archived);
+        Ok(())
+    }
+
+    #[test]
+    fn event_serialization_roundtrip() -> anyhow::Result<()> {
+        let event = Event::new(SessionId::new(), "pre_tool_use", "Edit", Decision::Pass);
+        let json = serde_json::to_string(&event)?;
+        let back: Event = serde_json::from_str(&json)?;
+        assert_eq!(event.id, back.id);
+        assert_eq!(event.hook, back.hook);
+        assert_eq!(event.decision, back.decision);
+        Ok(())
+    }
+
+    #[test]
+    fn signal_serialization_roundtrip() -> anyhow::Result<()> {
+        let signal = Signal::new(
+            SignalType::RepeatedWarn,
+            ProjectId::new(),
+            serde_json::json!({"count": 12}),
+            RemediationType::Guard,
+        );
+        let json = serde_json::to_string(&signal)?;
+        let back: Signal = serde_json::from_str(&json)?;
+        assert_eq!(signal.id, back.id);
+        assert_eq!(signal.signal_type, back.signal_type);
+        Ok(())
+    }
+
+    #[test]
+    fn item_user_message_roundtrip() -> anyhow::Result<()> {
+        let item = Item::UserMessage { content: "hello world".to_string() };
+        let json = serde_json::to_string(&item)?;
+        let back: Item = serde_json::from_str(&json)?;
+        match back {
+            Item::UserMessage { content } => assert_eq!(content, "hello world"),
+            _ => anyhow::bail!("wrong variant"),
+        }
+        Ok(())
+    }
+}

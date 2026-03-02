@@ -93,3 +93,76 @@ impl EventStore {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_core::{Decision, Event, EventFilters, SessionId};
+
+    fn make_event(hook: &str, decision: Decision) -> Event {
+        Event::new(SessionId::new(), hook, "Edit", decision)
+    }
+
+    #[test]
+    fn query_empty_store_returns_empty() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        let results = store.query(&EventFilters::default())?;
+        assert!(results.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn log_and_query_roundtrip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        let event = make_event("pre_tool_use", Decision::Pass);
+        store.log(&event)?;
+        let results = store.query(&EventFilters::default())?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, event.id);
+        Ok(())
+    }
+
+    #[test]
+    fn query_filters_by_hook() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        store.log(&make_event("pre_tool_use", Decision::Pass))?;
+        store.log(&make_event("post_tool_use", Decision::Pass))?;
+        let results = store.query(&EventFilters {
+            hook: Some("pre_tool_use".to_string()),
+            ..Default::default()
+        })?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].hook, "pre_tool_use");
+        Ok(())
+    }
+
+    #[test]
+    fn query_filters_by_decision() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        store.log(&make_event("h1", Decision::Pass))?;
+        store.log(&make_event("h2", Decision::Block))?;
+        let results = store.query(&EventFilters {
+            decision: Some(Decision::Block),
+            ..Default::default()
+        })?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].decision, Decision::Block);
+        Ok(())
+    }
+
+    #[test]
+    fn query_respects_limit() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        for _ in 0..5 {
+            store.log(&make_event("hook", Decision::Pass))?;
+        }
+        let results = store.query(&EventFilters { limit: Some(3), ..Default::default() })?;
+        assert_eq!(results.len(), 3);
+        Ok(())
+    }
+}
