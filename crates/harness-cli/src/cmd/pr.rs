@@ -3,6 +3,13 @@ use harness_core::{AgentRequest, CodeAgent, HarnessConfig};
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
 
+fn create_agent(config: &HarnessConfig) -> ClaudeCodeAgent {
+    ClaudeCodeAgent::new(
+        config.agents.claude.cli_path.clone(),
+        config.agents.claude.default_model.clone(),
+    )
+}
+
 pub async fn fix(
     config: &HarnessConfig,
     issue: u64,
@@ -10,10 +17,7 @@ pub async fn fix(
     max_rounds: u32,
     project: PathBuf,
 ) -> anyhow::Result<()> {
-    let agent = ClaudeCodeAgent::new(
-        config.agents.claude.cli_path.clone(),
-        config.agents.claude.default_model.clone(),
-    );
+    let agent = create_agent(config);
 
     println!("[harness] Round 1 — 实现 issue #{issue} 并创建 PR");
     let prompt = format!(
@@ -59,10 +63,7 @@ pub async fn loop_pr(
     max_rounds: u32,
     project: PathBuf,
 ) -> anyhow::Result<()> {
-    let agent = ClaudeCodeAgent::new(
-        config.agents.claude.cli_path.clone(),
-        config.agents.claude.default_model.clone(),
-    );
+    let agent = create_agent(config);
 
     println!("[harness] 进入 PR #{pr} 的 review loop");
 
@@ -78,6 +79,12 @@ async fn run_review_loop(
     wait: u64,
     max_rounds: u32,
 ) -> anyhow::Result<()> {
+    let url_display = if pr_url.is_empty() {
+        format!("PR #{pr}")
+    } else {
+        pr_url.to_string()
+    };
+
     for round in 1..=max_rounds {
         println!("[harness] 等待 {wait}s，让 CI 和 review bot 运行...");
         sleep(Duration::from_secs(wait)).await;
@@ -107,23 +114,13 @@ async fn run_review_loop(
         let resp = agent.execute(req).await?;
         println!("{}", resp.output);
 
-        if resp.output.contains("LGTM") {
-            let url_display = if pr_url.is_empty() {
-                format!("PR #{pr}")
-            } else {
-                pr_url.to_string()
-            };
+        if resp.output.trim().ends_with("LGTM") {
             println!("[harness] LGTM — {url_display}");
             return Ok(());
         }
         // FIXED or other → continue to next round
     }
 
-    let url_display = if pr_url.is_empty() {
-        format!("PR #{pr}")
-    } else {
-        pr_url.to_string()
-    };
     println!("[harness] 已达最大轮次 ({max_rounds})，PR 状态: {url_display}");
     Ok(())
 }
