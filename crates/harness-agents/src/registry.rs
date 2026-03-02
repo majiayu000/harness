@@ -1,4 +1,4 @@
-use harness_core::{CodeAgent, TaskClassification, TaskComplexity};
+use harness_core::{CodeAgent, HarnessError, TaskClassification, TaskComplexity};
 use std::collections::HashMap;
 
 pub struct AgentRegistry {
@@ -26,7 +26,7 @@ impl AgentRegistry {
         self.get(&self.default_agent)
     }
 
-    pub fn dispatch(&self, task: &TaskClassification) -> &dyn CodeAgent {
+    pub fn dispatch(&self, task: &TaskClassification) -> harness_core::Result<&dyn CodeAgent> {
         // Strategy: complex/critical tasks → prefer strongest agent
         // Simple tasks → default agent is fine
         let preferred = match task.complexity {
@@ -39,7 +39,7 @@ impl AgentRegistry {
 
         preferred
             .or_else(|| self.default_agent())
-            .expect("no agents registered")
+            .ok_or_else(|| HarnessError::AgentNotFound("no agents registered".to_string()))
     }
 
     pub fn list(&self) -> Vec<&str> {

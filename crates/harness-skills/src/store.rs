@@ -160,7 +160,7 @@ impl SkillStore {
             location: SkillLocation::User,
         };
         self.skills.push(skill);
-        self.skills.last().unwrap()
+        &self.skills[self.skills.len() - 1]
     }
 
     pub fn get(&self, id: &SkillId) -> Option<&Skill> {
