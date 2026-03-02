@@ -162,7 +162,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     } else {
                         config.server.http_addr
                     };
-                    server.serve_http(addr).await?
+                    std::sync::Arc::new(server).serve_http(addr).await?
                 }
                 other => anyhow::bail!("unknown transport: {other}"),
             }
