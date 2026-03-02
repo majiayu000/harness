@@ -2,7 +2,6 @@ use crate::types::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::Duration;
 
 /// Core trait for all code agents (Claude Code, Codex, Anthropic API, etc.)
 #[async_trait]
@@ -24,8 +23,6 @@ pub struct AgentRequest {
     pub allowed_tools: Vec<String>,
     pub model: Option<String>,
     pub max_budget_usd: Option<f64>,
-    #[serde(with = "humantime_serde")]
-    pub timeout: Duration,
     pub context: Vec<ContextItem>,
 }
 
@@ -37,7 +34,6 @@ impl Default for AgentRequest {
             allowed_tools: Vec::new(),
             model: None,
             max_budget_usd: None,
-            timeout: Duration::from_secs(300),
             context: Vec::new(),
         }
     }
@@ -46,6 +42,7 @@ impl Default for AgentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentResponse {
     pub output: String,
+    pub stderr: String,
     pub items: Vec<Item>,
     pub token_usage: TokenUsage,
     pub model: String,
@@ -80,22 +77,3 @@ pub enum TaskComplexity {
     Critical,
 }
 
-mod humantime_serde {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use std::time::Duration;
-
-    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_u64(duration.as_secs())
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let secs = u64::deserialize(deserializer)?;
-        Ok(Duration::from_secs(secs))
-    }
-}

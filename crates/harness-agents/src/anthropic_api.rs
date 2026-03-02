@@ -107,6 +107,7 @@ impl CodeAgent for AnthropicApiAgent {
 
         Ok(AgentResponse {
             output,
+            stderr: String::new(),
             items: Vec::new(),
             token_usage: TokenUsage {
                 input_tokens: data.usage.input_tokens,

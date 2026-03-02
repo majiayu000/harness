@@ -40,6 +40,7 @@ impl CodeAgent for ClaudeCodeAgent {
             .arg("--dangerously-skip-permissions")
             .arg("--output-format").arg("text")
             .arg("--model").arg(model)
+            .arg("--verbose")
             .current_dir(&req.project_root)
             .env_remove("CLAUDECODE");
 
@@ -60,6 +61,10 @@ impl CodeAgent for ClaudeCodeAgent {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
+        if !stderr.is_empty() {
+            eprintln!("[agent:claude] stderr:\n{stderr}");
+        }
+
         if !output.status.success() {
             return Err(harness_core::HarnessError::AgentExecution(format!(
                 "claude exited with {}: {stderr}",
@@ -69,6 +74,7 @@ impl CodeAgent for ClaudeCodeAgent {
 
         Ok(AgentResponse {
             output: stdout,
+            stderr,
             items: Vec::new(),
             token_usage: TokenUsage::default(),
             model: model.to_string(),
