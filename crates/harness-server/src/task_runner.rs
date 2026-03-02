@@ -1,3 +1,4 @@
+use crate::task_db::TaskDb;
 use dashmap::DashMap;
 use harness_core::{prompts, AgentRequest, CodeAgent};
 use serde::{Deserialize, Serialize};
@@ -118,26 +119,60 @@ fn default_max_rounds() -> u32 {
     5
 }
 
-pub type TaskStore = Arc<DashMap<TaskId, TaskState>>;
-
-pub fn new_task_store() -> TaskStore {
-    Arc::new(DashMap::new())
+/// In-memory cache + SQLite persistence.
+pub struct TaskStore {
+    cache: DashMap<TaskId, TaskState>,
+    db: TaskDb,
 }
 
-pub fn spawn_task(
-    store: TaskStore,
+impl TaskStore {
+    pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
+        let db = TaskDb::open(db_path).await?;
+        let cache = DashMap::new();
+        // Load existing tasks into cache
+        for task in db.list().await? {
+            cache.insert(task.id.clone(), task);
+        }
+        Ok(Arc::new(Self { cache, db }))
+    }
+
+    pub fn get(&self, id: &TaskId) -> Option<TaskState> {
+        self.cache.get(id).map(|r| r.value().clone())
+    }
+
+    pub fn list_all(&self) -> Vec<TaskState> {
+        self.cache.iter().map(|e| e.value().clone()).collect()
+    }
+
+    async fn insert(&self, state: &TaskState) {
+        self.cache.insert(state.id.clone(), state.clone());
+        if let Err(e) = self.db.insert(state).await {
+            tracing::error!("task_db insert failed: {e}");
+        }
+    }
+
+    async fn persist(&self, id: &TaskId) {
+        if let Some(state) = self.cache.get(id) {
+            if let Err(e) = self.db.update(state.value()).await {
+                tracing::error!("task_db update failed: {e}");
+            }
+        }
+    }
+}
+
+pub async fn spawn_task(
+    store: Arc<TaskStore>,
     agent: Arc<dyn CodeAgent>,
     req: CreateTaskRequest,
 ) -> TaskId {
     let task_id = TaskId::new();
     let state = TaskState::new(task_id.clone());
-    store.insert(task_id.clone(), state);
+    store.insert(&state).await;
 
     let id = task_id.clone();
     let store = store.clone();
 
     tokio::spawn(async move {
-        // Resolve project root asynchronously to avoid blocking the Tokio thread.
         let project = match req.project.clone() {
             Some(p) => p,
             None => tokio::task::spawn_blocking(detect_main_worktree)
@@ -145,10 +180,11 @@ pub fn spawn_task(
                 .unwrap_or_else(|_| PathBuf::from(".")),
         };
         if let Err(e) = run_task(&store, &id, agent.as_ref(), &req, project).await {
-            if let Some(mut s) = store.get_mut(&id) {
+            mutate_and_persist(&store, &id, |s| {
                 s.status = TaskStatus::Failed;
                 s.error = Some(e.to_string());
-            }
+            })
+            .await;
         }
     });
 
@@ -163,7 +199,7 @@ async fn run_task(
     project: PathBuf,
 ) -> anyhow::Result<()> {
     // Turn 1: implement
-    update_status(store, task_id, TaskStatus::Implementing, 1);
+    update_status(store, task_id, TaskStatus::Implementing, 1).await;
 
     let first_prompt = if let Some(issue) = req.issue {
         prompts::implement_from_issue(issue)
@@ -184,7 +220,7 @@ async fn run_task(
     let pr_url = prompts::parse_pr_url(&resp.output);
     let pr_number = pr_url.as_ref().and_then(|u| prompts::extract_pr_number(u));
 
-    if let Some(mut s) = store.get_mut(task_id) {
+    mutate_and_persist(store, task_id, |s| {
         s.pr_url = pr_url.clone();
         s.rounds.push(RoundResult {
             turn: 1,
@@ -195,23 +231,23 @@ async fn run_task(
                 "implemented".into()
             },
         });
-    }
+    })
+    .await;
 
-    // If no PR was created or no review loop needed, we're done
     let pr_num = match pr_number {
         Some(n) => n,
         None => {
-            update_status(store, task_id, TaskStatus::Done, 1);
+            update_status(store, task_id, TaskStatus::Done, 1).await;
             return Ok(());
         }
     };
 
     // Review loop: Turn 2..N
     for round in 2..=(req.max_rounds + 1) {
-        update_status(store, task_id, TaskStatus::Waiting, round);
+        update_status(store, task_id, TaskStatus::Waiting, round).await;
         sleep(Duration::from_secs(req.wait_secs)).await;
 
-        update_status(store, task_id, TaskStatus::Reviewing, round);
+        update_status(store, task_id, TaskStatus::Reviewing, round).await;
 
         let resp = agent
             .execute(AgentRequest {
@@ -223,37 +259,48 @@ async fn run_task(
 
         let lgtm = prompts::is_lgtm(&resp.output);
 
-        if let Some(mut s) = store.get_mut(task_id) {
+        mutate_and_persist(store, task_id, |s| {
             s.rounds.push(RoundResult {
                 turn: round,
                 action: "review".into(),
                 result: if lgtm { "lgtm".into() } else { "fixed".into() },
             });
-        }
+        })
+        .await;
 
         if lgtm {
-            update_status(store, task_id, TaskStatus::Done, round);
+            update_status(store, task_id, TaskStatus::Done, round).await;
             return Ok(());
         }
     }
 
-    // Reached max rounds without LGTM — mark as failed
-    if let Some(mut s) = store.get_mut(task_id) {
+    // Reached max rounds without LGTM
+    mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Failed;
         s.turn = req.max_rounds + 1;
         s.error = Some(format!(
             "Task did not receive LGTM after {} review rounds.",
             req.max_rounds
         ));
-    }
+    })
+    .await;
     Ok(())
 }
 
-fn update_status(store: &TaskStore, task_id: &TaskId, status: TaskStatus, turn: u32) {
-    if let Some(mut s) = store.get_mut(task_id) {
+async fn update_status(store: &TaskStore, task_id: &TaskId, status: TaskStatus, turn: u32) {
+    mutate_and_persist(store, task_id, |s| {
         s.status = status;
         s.turn = turn;
+    })
+    .await;
+}
+
+/// Mutate a task in the cache then persist to SQLite.
+async fn mutate_and_persist(store: &TaskStore, id: &TaskId, f: impl FnOnce(&mut TaskState)) {
+    if let Some(mut entry) = store.cache.get_mut(id) {
+        f(entry.value_mut());
     }
+    store.persist(id).await;
 }
 
 #[cfg(test)]

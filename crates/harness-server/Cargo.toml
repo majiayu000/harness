@@ -23,6 +23,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }
 uuid = { workspace = true }
+sqlx = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true }

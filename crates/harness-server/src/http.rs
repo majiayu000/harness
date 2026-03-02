@@ -13,16 +13,30 @@ use std::sync::Arc;
 
 pub struct AppState {
     pub server: Arc<HarnessServer>,
-    pub tasks: task_runner::TaskStore,
+    pub tasks: Arc<task_runner::TaskStore>,
 }
 
 pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Result<()> {
     tracing::info!("harness: HTTP server listening on {addr}");
 
-    let state = Arc::new(AppState {
-        server,
-        tasks: task_runner::new_task_store(),
-    });
+    let db_path = std::env::var("HARNESS_DB")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            std::path::PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("harness")
+                .join("tasks.db")
+        });
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    tracing::info!("task db: {}", db_path.display());
+
+    let tasks = task_runner::TaskStore::open(&db_path).await?;
+
+    let state = Arc::new(AppState { server, tasks });
 
     let app = Router::new()
         .route("/rpc", post(handle_rpc))
@@ -54,17 +68,7 @@ async fn create_task(
         );
     }
 
-    // For issue/pr tasks (complex) prefer a stronger agent; fall back to default.
-    let preferred = if req.issue.is_some() || req.pr.is_some() {
-        state
-            .server
-            .agent_registry
-            .get("claude")
-            .or_else(|| state.server.agent_registry.get("anthropic-api"))
-    } else {
-        None
-    };
-    let agent = match preferred.or_else(|| state.server.agent_registry.default_agent()) {
+    let agent = match state.server.agent_registry.default_agent() {
         Some(a) => a,
         None => {
             return (
@@ -74,7 +78,7 @@ async fn create_task(
         }
     };
 
-    let task_id = task_runner::spawn_task(state.tasks.clone(), agent, req);
+    let task_id = task_runner::spawn_task(state.tasks.clone(), agent, req).await;
 
     (
         StatusCode::ACCEPTED,
@@ -88,11 +92,7 @@ async fn create_task(
 async fn list_tasks(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<task_runner::TaskSummary>> {
-    let tasks = state
-        .tasks
-        .iter()
-        .map(|entry| entry.value().summary())
-        .collect();
+    let tasks = state.tasks.list_all().into_iter().map(|t| t.summary()).collect();
     Json(tasks)
 }
 
@@ -101,7 +101,7 @@ async fn get_task(
     Path(id): Path<String>,
 ) -> Response {
     match state.tasks.get(&task_runner::TaskId(id)) {
-        Some(task) => Json(task.value().clone()).into_response(),
+        Some(task) => Json(task).into_response(),
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "task not found"})),

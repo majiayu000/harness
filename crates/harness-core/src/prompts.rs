@@ -65,21 +65,28 @@ pub fn parse_pr_url(output: &str) -> Option<String> {
 }
 
 /// Extract PR number from a GitHub PR URL.
-/// Handles URLs with extra path segments or fragments, e.g.:
-///   https://github.com/owner/repo/pull/42/files
-///   https://github.com/owner/repo/pull/42#discussion_r123
+/// Handles URL fragments (`#discussion_r123`) and path suffixes (`/files`, `/commits`).
 pub fn extract_pr_number(url: &str) -> Option<u64> {
-    url.rsplit_once("/pull/")?
-        .1
-        .split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()
+    let without_fragment = url.split('#').next()?;
+    let parts: Vec<&str> = without_fragment.split('/').collect();
+    for (i, &part) in parts.iter().enumerate() {
+        if (part == "pull" || part == "pulls") && i + 1 < parts.len() {
+            if let Ok(n) = parts[i + 1].parse::<u64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
-/// Check if agent output ends with LGTM (strict last-line check).
+/// Check if agent output's last non-empty line is exactly "LGTM".
 pub fn is_lgtm(output: &str) -> bool {
-    output.trim().ends_with("LGTM")
+    output
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim() == "LGTM")
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -154,6 +161,10 @@ mod tests {
             extract_pr_number("https://github.com/owner/repo/pull/42/files"),
             Some(42)
         );
+        assert_eq!(
+            extract_pr_number("https://github.com/owner/repo/pull/42/commits"),
+            Some(42)
+        );
     }
 
     #[test]
@@ -173,8 +184,10 @@ mod tests {
 
     #[test]
     fn test_is_lgtm_false_positive() {
-        // "LGTM" in middle of output should NOT match
+        // "LGTM" embedded in another word or non-final line should NOT match
         assert!(!is_lgtm("LGTM but actually not done"));
         assert!(!is_lgtm("I think it looks LGTM but needs one more fix\nFIXED"));
+        assert!(!is_lgtm("somethingLGTM"));
+        assert!(!is_lgtm("notLGTM\n"));
     }
 }
