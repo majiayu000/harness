@@ -160,7 +160,10 @@ impl SkillStore {
             location: SkillLocation::User,
         };
         self.skills.push(skill);
-        &self.skills[self.skills.len() - 1]
+        match self.skills.last() {
+            Some(skill) => skill,
+            None => unreachable!(),
+        }
     }
 
     pub fn get(&self, id: &SkillId) -> Option<&Skill> {
