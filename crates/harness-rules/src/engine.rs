@@ -171,32 +171,27 @@ impl RuleEngine {
         Ok(())
     }
 
-    /// Parse `paths:` field from YAML frontmatter.
+    /// Parse `paths:` field from YAML frontmatter using `serde_yaml`.
     ///
-    /// Supports two formats used in builtin rule files:
-    /// - Quoted string: `paths: "**/*.go"` or comma-separated `paths: "**/*.ts,**/*.tsx"`
+    /// Supports any valid YAML representation of `paths:`, including:
     /// - Inline array:  `paths: ["*.rs", "src/**"]`
+    /// - Quoted string: `paths: "**/*.go"`
+    /// - Block sequence: multi-line YAML list
     fn parse_frontmatter_paths(frontmatter: &str) -> Vec<String> {
-        for line in frontmatter.lines() {
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("paths:") else {
-                continue;
-            };
-            let rest = rest.trim();
-            // Inline array: paths: ["*.rs", "src/**"]
-            let inner = if rest.starts_with('[') && rest.ends_with(']') {
-                &rest[1..rest.len() - 1]
-            } else {
-                // Quoted or bare string: paths: "**/*.go" or paths: **/*.go
-                rest.trim_matches(|c| c == '"' || c == '\'')
-            };
-            return inner
-                .split(',')
-                .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+        if frontmatter.is_empty() {
+            return Vec::new();
         }
-        Vec::new()
+        let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(frontmatter) else {
+            return Vec::new();
+        };
+        match value.get("paths") {
+            Some(serde_yaml::Value::Sequence(seq)) => seq
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            Some(serde_yaml::Value::String(s)) => vec![s.clone()],
+            _ => Vec::new(),
+        }
     }
 
     pub fn register_guard(&mut self, guard: Guard) {
