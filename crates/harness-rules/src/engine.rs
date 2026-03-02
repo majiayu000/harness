@@ -128,7 +128,7 @@ impl RuleEngine {
             }
         }
 
-        let paths = Self::parse_frontmatter_paths(&frontmatter);
+        let paths = Self::parse_frontmatter_paths(&frontmatter)?;
 
         // Extract rule blocks from markdown body (## ID: Title pattern)
         for section in body.split("\n## ") {
@@ -177,21 +177,20 @@ impl RuleEngine {
     /// - Inline array:  `paths: ["*.rs", "src/**"]`
     /// - Quoted string: `paths: "**/*.go"`
     /// - Block sequence: multi-line YAML list
-    fn parse_frontmatter_paths(frontmatter: &str) -> Vec<String> {
+    fn parse_frontmatter_paths(frontmatter: &str) -> anyhow::Result<Vec<String>> {
         if frontmatter.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(frontmatter) else {
-            return Vec::new();
-        };
-        match value.get("paths") {
+        let value = serde_yaml::from_str::<serde_yaml::Value>(frontmatter)?;
+        let paths = match value.get("paths") {
             Some(serde_yaml::Value::Sequence(seq)) => seq
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect(),
             Some(serde_yaml::Value::String(s)) => vec![s.clone()],
             _ => Vec::new(),
-        }
+        };
+        Ok(paths)
     }
 
     pub fn register_guard(&mut self, guard: Guard) {
@@ -303,15 +302,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_frontmatter_paths_inline_array() {
+    fn parse_frontmatter_paths_inline_array() -> anyhow::Result<()> {
         let frontmatter = "paths: [\"*.rs\", \"src/**\"]\n";
-        let paths = RuleEngine::parse_frontmatter_paths(frontmatter);
+        let paths = RuleEngine::parse_frontmatter_paths(frontmatter)?;
         assert_eq!(paths, vec!["*.rs", "src/**"]);
+        Ok(())
     }
 
     #[test]
-    fn parse_frontmatter_paths_empty() {
-        let paths = RuleEngine::parse_frontmatter_paths("");
+    fn parse_frontmatter_paths_empty() -> anyhow::Result<()> {
+        let paths = RuleEngine::parse_frontmatter_paths("")?;
         assert!(paths.is_empty());
+        Ok(())
     }
 }
