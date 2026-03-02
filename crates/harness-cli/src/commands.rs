@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -128,35 +128,34 @@ pub enum SkillCommand {
     },
 }
 
+#[derive(Args)]
+pub struct LoopArgs {
+    /// Seconds to wait between review rounds (for CI and review bots)
+    #[arg(long, default_value = "120")]
+    pub wait: u64,
+    /// Maximum number of review rounds
+    #[arg(long, default_value = "5")]
+    pub max_rounds: u32,
+    /// Project directory
+    #[arg(long, default_value = ".")]
+    pub project: std::path::PathBuf,
+}
+
 #[derive(Subcommand)]
 pub enum PrCommand {
     /// Implement a GitHub issue, create a PR, then run the review loop
     Fix {
         /// GitHub issue number
         issue: u64,
-        /// Seconds to wait between review rounds (for CI and review bots)
-        #[arg(long, default_value = "120")]
-        wait: u64,
-        /// Maximum number of review rounds
-        #[arg(long, default_value = "5")]
-        max_rounds: u32,
-        /// Project directory
-        #[arg(long, default_value = ".")]
-        project: std::path::PathBuf,
+        #[command(flatten)]
+        args: LoopArgs,
     },
     /// Run the review loop for an existing PR
     Loop {
         /// GitHub PR number
         pr: u64,
-        /// Seconds to wait between review rounds
-        #[arg(long, default_value = "120")]
-        wait: u64,
-        /// Maximum number of review rounds
-        #[arg(long, default_value = "5")]
-        max_rounds: u32,
-        /// Project directory
-        #[arg(long, default_value = ".")]
-        project: std::path::PathBuf,
+        #[command(flatten)]
+        args: LoopArgs,
     },
 }
 
@@ -300,11 +299,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
         Command::Pr { cmd } => {
             match cmd {
-                PrCommand::Fix { issue, wait, max_rounds, project } => {
-                    crate::cmd::pr::fix(&config, issue, wait, max_rounds, project).await?;
+                PrCommand::Fix { issue, args } => {
+                    crate::cmd::pr::fix(&config, issue, args.wait, args.max_rounds, args.project).await?;
                 }
-                PrCommand::Loop { pr, wait, max_rounds, project } => {
-                    crate::cmd::pr::loop_pr(&config, pr, wait, max_rounds, project).await?;
+                PrCommand::Loop { pr, args } => {
+                    crate::cmd::pr::loop_pr(&config, pr, args.wait, args.max_rounds, args.project).await?;
                 }
             }
         }
