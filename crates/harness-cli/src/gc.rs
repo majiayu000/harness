@@ -11,7 +11,10 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
 
     match cmd {
         GcCommand::Run { project } => {
-            let project_root = project.unwrap_or_else(|| std::env::current_dir().unwrap());
+            let project_root = match project {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
             let project = Project::from_path(project_root);
 
             let event_store = EventStore::new(data_dir)?;

@@ -280,6 +280,62 @@ impl Default for RuleEngine {
 mod tests {
     use super::*;
 
+    fn make_engine_with_content(content: &str) -> anyhow::Result<RuleEngine> {
+        let mut engine = RuleEngine::new();
+        engine.parse_rule_file(Path::new("test.md"), content)?;
+        Ok(engine)
+    }
+
+    #[test]
+    fn parse_rule_file_extracts_security_rule() -> anyhow::Result<()> {
+        let md = "## SEC-01: SQL injection\n\n严重 — use params.\n";
+        let engine = make_engine_with_content(md)?;
+        assert_eq!(engine.rules().len(), 1);
+        assert_eq!(engine.rules()[0].id, RuleId::from_str("SEC-01"));
+        assert_eq!(engine.rules()[0].title, "SQL injection");
+        assert_eq!(engine.rules()[0].severity, Severity::Critical);
+        assert_eq!(engine.rules()[0].category, Category::Security);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_rule_file_extracts_multiple_rules() -> anyhow::Result<()> {
+        let md = "## SEC-01: First rule\n\n严重\n\n## SEC-02: Second rule\n\nhigh severity\n";
+        let engine = make_engine_with_content(md)?;
+        assert_eq!(engine.rules().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_rule_file_skips_lowercase_ids() -> anyhow::Result<()> {
+        let md = "## lowercase: should be skipped\n\nsome content\n";
+        let engine = make_engine_with_content(md)?;
+        assert_eq!(engine.rules().len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_rule_file_detects_category_from_prefix() -> anyhow::Result<()> {
+        let md = "## RS-01: Rust stability rule\n\nhigh\n";
+        let engine = make_engine_with_content(md)?;
+        let rules = engine.rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].category, Category::Stability);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_rule_engine_has_no_rules() {
+        let engine = RuleEngine::new();
+        assert!(engine.rules().is_empty());
+        assert!(engine.guards().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
     #[test]
     fn load_builtin_returns_at_least_40_rules() -> anyhow::Result<()> {
         let mut engine = RuleEngine::new();
