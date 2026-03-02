@@ -54,7 +54,17 @@ async fn create_task(
         );
     }
 
-    let agent = match state.server.agent_registry.default_agent() {
+    // For issue/pr tasks (complex) prefer a stronger agent; fall back to default.
+    let preferred = if req.issue.is_some() || req.pr.is_some() {
+        state
+            .server
+            .agent_registry
+            .get("claude")
+            .or_else(|| state.server.agent_registry.get("anthropic-api"))
+    } else {
+        None
+    };
+    let agent = match preferred.or_else(|| state.server.agent_registry.default_agent()) {
         Some(a) => a,
         None => {
             return (
@@ -77,8 +87,12 @@ async fn create_task(
 
 async fn list_tasks(
     State(state): State<Arc<AppState>>,
-) -> Json<Vec<task_runner::TaskState>> {
-    let tasks = state.tasks.iter().map(|entry| entry.value().clone()).collect();
+) -> Json<Vec<task_runner::TaskSummary>> {
+    let tasks = state
+        .tasks
+        .iter()
+        .map(|entry| entry.value().summary())
+        .collect();
     Json(tasks)
 }
 
@@ -86,7 +100,7 @@ async fn get_task(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.tasks.get(&id) {
+    match state.tasks.get(&task_runner::TaskId(id)) {
         Some(task) => Json(task.value().clone()).into_response(),
         None => (
             StatusCode::NOT_FOUND,

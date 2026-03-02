@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TaskId(pub String);
 
 impl TaskId {
@@ -42,6 +42,16 @@ pub struct TaskState {
     pub error: Option<String>,
 }
 
+/// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSummary {
+    pub id: TaskId,
+    pub status: TaskStatus,
+    pub turn: u32,
+    pub pr_url: Option<String>,
+    pub error: Option<String>,
+}
+
 impl TaskState {
     fn new(id: TaskId) -> Self {
         Self {
@@ -51,6 +61,16 @@ impl TaskState {
             pr_url: None,
             rounds: Vec::new(),
             error: None,
+        }
+    }
+
+    pub fn summary(&self) -> TaskSummary {
+        TaskSummary {
+            id: self.id.clone(),
+            status: self.status.clone(),
+            turn: self.turn,
+            pr_url: self.pr_url.clone(),
+            error: self.error.clone(),
         }
     }
 }
@@ -98,7 +118,7 @@ fn default_max_rounds() -> u32 {
     5
 }
 
-pub type TaskStore = Arc<DashMap<String, TaskState>>;
+pub type TaskStore = Arc<DashMap<TaskId, TaskState>>;
 
 pub fn new_task_store() -> TaskStore {
     Arc::new(DashMap::new())
@@ -111,7 +131,7 @@ pub fn spawn_task(
 ) -> TaskId {
     let task_id = TaskId::new();
     let state = TaskState::new(task_id.clone());
-    store.insert(task_id.0.clone(), state);
+    store.insert(task_id.clone(), state);
 
     let id = task_id.clone();
     let store = store.clone();
@@ -125,7 +145,7 @@ pub fn spawn_task(
                 .unwrap_or_else(|_| PathBuf::from(".")),
         };
         if let Err(e) = run_task(&store, &id, agent.as_ref(), &req, project).await {
-            if let Some(mut s) = store.get_mut(&id.0) {
+            if let Some(mut s) = store.get_mut(&id) {
                 s.status = TaskStatus::Failed;
                 s.error = Some(e.to_string());
             }
@@ -164,7 +184,7 @@ async fn run_task(
     let pr_url = prompts::parse_pr_url(&resp.output);
     let pr_number = pr_url.as_ref().and_then(|u| prompts::extract_pr_number(u));
 
-    if let Some(mut s) = store.get_mut(&task_id.0) {
+    if let Some(mut s) = store.get_mut(task_id) {
         s.pr_url = pr_url.clone();
         s.rounds.push(RoundResult {
             turn: 1,
@@ -203,7 +223,7 @@ async fn run_task(
 
         let lgtm = prompts::is_lgtm(&resp.output);
 
-        if let Some(mut s) = store.get_mut(&task_id.0) {
+        if let Some(mut s) = store.get_mut(task_id) {
             s.rounds.push(RoundResult {
                 turn: round,
                 action: "review".into(),
@@ -218,7 +238,7 @@ async fn run_task(
     }
 
     // Reached max rounds without LGTM — mark as failed
-    if let Some(mut s) = store.get_mut(&task_id.0) {
+    if let Some(mut s) = store.get_mut(task_id) {
         s.status = TaskStatus::Failed;
         s.turn = req.max_rounds + 1;
         s.error = Some(format!(
@@ -230,7 +250,7 @@ async fn run_task(
 }
 
 fn update_status(store: &TaskStore, task_id: &TaskId, status: TaskStatus, turn: u32) {
-    if let Some(mut s) = store.get_mut(&task_id.0) {
+    if let Some(mut s) = store.get_mut(task_id) {
         s.status = status;
         s.turn = turn;
     }
