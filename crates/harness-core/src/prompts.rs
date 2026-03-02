@@ -13,11 +13,13 @@ pub fn implement_from_issue(issue: u64) -> String {
 /// Build prompt: check an existing PR's CI and review status.
 pub fn check_existing_pr(pr: u64) -> String {
     format!(
-        "检查 PR #{pr} 的 CI 状态和 review comments。\
-         如果有问题就修复代码，commit，push，\
-         然后用 `gh pr comment {pr} --body '/gemini review'` 触发 review bot 重新审查。\
-         如果没有问题，在最后一行单独输出 LGTM。\
-         否则在最后一行单独输出 FIXED。"
+        "检查 PR #{pr}：\n\
+         1. `gh pr checks {pr}` 检查 CI\n\
+         2. `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/comments` 读取 inline review comments\n\
+         3. 如果 CI 通过且没有未解决的 review comments，在最后一行单独输出 LGTM\n\
+         4. 否则逐条修复，commit，push，\
+         用 `gh pr comment {pr} --body '/gemini review'` 触发重新审查，\
+         在最后一行单独输出 FIXED"
     )
 }
 
@@ -38,12 +40,14 @@ pub fn review_prompt(issue: Option<u64>, pr: u64) -> String {
 
     format!(
         "{context}\
-         现在用 gh pr checks 检查 CI 状态，\
-         用 gh pr view 和 gh api 读取 review comments。\
-         如果 CI 通过且没有需要处理的 review comments，在最后一行单独输出 LGTM。\
-         否则根据反馈修复代码，commit，push，\
+         步骤：\n\
+         1. 用 `gh pr checks {pr}` 检查 CI 状态\n\
+         2. 用 `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/reviews` 读取 review 评价\n\
+         3. 用 `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/comments` 读取 inline review comments\n\
+         4. 如果 CI 全部通过，且没有未解决的 review comments（包括 bot 的 high/medium 级别建议），在最后一行单独输出 LGTM\n\
+         5. 否则根据 review comments 逐条修复代码，commit，push，\
          然后用 `gh pr comment {pr} --body '/gemini review'` 触发 review bot 重新审查，\
-         在最后一行单独输出 FIXED。"
+         在最后一行单独输出 FIXED"
     )
 }
 
