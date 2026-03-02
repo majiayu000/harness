@@ -85,7 +85,10 @@ fn default_project() -> PathBuf {
                 .and_then(|line| line.strip_prefix("worktree "))
                 .map(|p| PathBuf::from(p.trim()))
         })
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(|| {
+            tracing::warn!("default_project: could not detect git worktree root, falling back to '.'");
+            PathBuf::from(".")
+        })
 }
 fn default_wait() -> u64 {
     120
@@ -183,7 +186,7 @@ async fn run_task(
 
         let resp = agent
             .execute(AgentRequest {
-                prompt: prompts::review_prompt(None, pr_num),
+                prompt: prompts::review_prompt(req.issue, pr_num),
                 project_root: req.project.clone(),
                 ..Default::default()
             })
