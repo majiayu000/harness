@@ -70,7 +70,20 @@ pub struct CreateTaskRequest {
 }
 
 fn default_project() -> PathBuf {
-    PathBuf::from(".")
+    // Use the main worktree (not a linked worktree) as default project root.
+    // This prevents agent tasks from switching branches in the server's worktree.
+    std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            s.lines()
+                .next()
+                .and_then(|line| line.strip_prefix("worktree "))
+                .map(|p| PathBuf::from(p.trim()))
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 fn default_wait() -> u64 {
     120
