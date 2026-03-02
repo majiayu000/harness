@@ -57,10 +57,12 @@ impl TaskState {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateTaskRequest {
-    /// The only required field — natural language task description.
-    /// Can be anything: "fix majiayu000/harness#4", an issue URL,
-    /// or a plain sentence like "给 harness 加单元测试".
-    pub prompt: String,
+    /// Free-text task description (prompt, issue URL, etc.).
+    pub prompt: Option<String>,
+    /// GitHub issue number to implement from.
+    pub issue: Option<u64>,
+    /// GitHub PR number to review/fix.
+    pub pr: Option<u64>,
     #[serde(default = "default_project")]
     pub project: PathBuf,
     #[serde(default = "default_wait")]
@@ -131,9 +133,17 @@ async fn run_task(
     // Turn 1: implement
     update_status(store, task_id, TaskStatus::Implementing, 1);
 
+    let first_prompt = if let Some(issue) = req.issue {
+        prompts::implement_from_issue(issue)
+    } else if let Some(pr) = req.pr {
+        prompts::check_existing_pr(pr)
+    } else {
+        prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default())
+    };
+
     let resp = agent
         .execute(AgentRequest {
-            prompt: prompts::implement_from_prompt(&req.prompt),
+            prompt: first_prompt,
             project_root: req.project.clone(),
             ..Default::default()
         })
@@ -195,7 +205,15 @@ async fn run_task(
         }
     }
 
-    update_status(store, task_id, TaskStatus::Done, req.max_rounds + 1);
+    // Reached max rounds without LGTM — mark as failed
+    if let Some(mut s) = store.get_mut(&task_id.0) {
+        s.status = TaskStatus::Failed;
+        s.turn = req.max_rounds + 1;
+        s.error = Some(format!(
+            "Task did not receive LGTM after {} review rounds.",
+            req.max_rounds
+        ));
+    }
     Ok(())
 }
 
