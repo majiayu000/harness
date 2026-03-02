@@ -34,7 +34,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             transport: Transport::Stdio,
-            http_addr: "127.0.0.1:9800".parse().unwrap(),
+            http_addr: SocketAddr::from(([127, 0, 0, 1], 9800)),
             data_dir: dirs_data_dir().join("harness"),
         }
     }
