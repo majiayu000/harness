@@ -57,9 +57,10 @@ impl TaskState {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateTaskRequest {
-    pub prompt: Option<String>,
-    pub issue: Option<u64>,
-    pub pr: Option<u64>,
+    /// The only required field — natural language task description.
+    /// Can be anything: "fix majiayu000/harness#4", an issue URL,
+    /// or a plain sentence like "给 harness 加单元测试".
+    pub prompt: String,
     #[serde(default = "default_project")]
     pub project: PathBuf,
     #[serde(default = "default_wait")]
@@ -117,10 +118,9 @@ async fn run_task(
     // Turn 1: implement
     update_status(store, task_id, TaskStatus::Implementing, 1);
 
-    let implement_prompt = build_implement_prompt(req);
     let resp = agent
         .execute(AgentRequest {
-            prompt: implement_prompt,
+            prompt: prompts::implement_from_prompt(&req.prompt),
             project_root: req.project.clone(),
             ..Default::default()
         })
@@ -152,11 +152,6 @@ async fn run_task(
     };
 
     // Review loop: Turn 2..N
-    let issue_for_context = match (req.issue, req.pr) {
-        (Some(n), _) => Some(n),
-        _ => None,
-    };
-
     for round in 2..=(req.max_rounds + 1) {
         update_status(store, task_id, TaskStatus::Waiting, round);
         sleep(Duration::from_secs(req.wait_secs)).await;
@@ -165,7 +160,7 @@ async fn run_task(
 
         let resp = agent
             .execute(AgentRequest {
-                prompt: prompts::review_prompt(issue_for_context, pr_num),
+                prompt: prompts::review_prompt(None, pr_num),
                 project_root: req.project.clone(),
                 ..Default::default()
             })
@@ -191,18 +186,6 @@ async fn run_task(
     Ok(())
 }
 
-fn build_implement_prompt(req: &CreateTaskRequest) -> String {
-    if let Some(issue) = req.issue {
-        prompts::implement_from_issue(issue)
-    } else if let Some(pr) = req.pr {
-        prompts::check_existing_pr(pr)
-    } else if let Some(ref prompt) = req.prompt {
-        prompts::implement_from_prompt(prompt)
-    } else {
-        "No task specified.".into()
-    }
-}
-
 fn update_status(store: &TaskStore, task_id: &TaskId, status: TaskStatus, turn: u32) {
     if let Some(mut s) = store.get_mut(&task_id.0) {
         s.status = status;
@@ -213,35 +196,6 @@ fn update_status(store: &TaskStore, task_id: &TaskId, status: TaskStatus, turn: 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_build_prompt_issue() {
-        let req = CreateTaskRequest {
-            prompt: None,
-            issue: Some(9),
-            pr: None,
-            project: PathBuf::from("."),
-            wait_secs: 120,
-            max_rounds: 5,
-        };
-        let p = build_implement_prompt(&req);
-        assert!(p.contains("issue #9"));
-        assert!(p.contains("PR_URL="));
-    }
-
-    #[test]
-    fn test_build_prompt_free_text() {
-        let req = CreateTaskRequest {
-            prompt: Some("fix the bug".into()),
-            issue: None,
-            pr: None,
-            project: PathBuf::from("."),
-            wait_secs: 120,
-            max_rounds: 5,
-        };
-        let p = build_implement_prompt(&req);
-        assert!(p.contains("fix the bug"));
-    }
 
     #[test]
     fn test_task_state_new() {
