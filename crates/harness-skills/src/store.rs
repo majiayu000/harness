@@ -17,6 +17,7 @@ pub struct Skill {
 pub struct SkillStore {
     skills: Vec<Skill>,
     discovery_paths: Vec<PathBuf>,
+    persist_dir: Option<PathBuf>,
 }
 
 impl SkillStore {
@@ -24,7 +25,17 @@ impl SkillStore {
         Self {
             skills: Vec::new(),
             discovery_paths: Vec::new(),
+            persist_dir: None,
         }
+    }
+
+    /// Enable disk persistence: created skills are written to `{dir}/{name}.md`,
+    /// deleted skills are removed, and the dir is added to discovery_paths so
+    /// skills survive restarts.
+    pub fn with_persist_dir(mut self, dir: PathBuf) -> Self {
+        self.discovery_paths.push(dir.clone());
+        self.persist_dir = Some(dir);
+        self
     }
 
     /// Set up the 4-layer discovery chain.
@@ -160,10 +171,18 @@ impl SkillStore {
             location: SkillLocation::User,
         };
         self.skills.push(skill);
-        match self.skills.last() {
-            Some(skill) => skill,
-            None => unreachable!(),
+        let idx = self.skills.len() - 1;
+        if let Some(dir) = &self.persist_dir {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!("failed to create skills dir {}: {e}", dir.display());
+            } else {
+                let path = dir.join(format!("{}.md", self.skills[idx].name));
+                if let Err(e) = std::fs::write(&path, &self.skills[idx].content) {
+                    tracing::warn!("failed to persist skill {}: {e}", path.display());
+                }
+            }
         }
+        &self.skills[idx]
     }
 
     pub fn get(&self, id: &SkillId) -> Option<&Skill> {
@@ -171,9 +190,21 @@ impl SkillStore {
     }
 
     pub fn delete(&mut self, id: &SkillId) -> bool {
+        let name = self.skills.iter().find(|s| s.id == *id).map(|s| s.name.clone());
         let len = self.skills.len();
         self.skills.retain(|s| s.id != *id);
-        self.skills.len() < len
+        let deleted = self.skills.len() < len;
+        if deleted {
+            if let (Some(dir), Some(name)) = (&self.persist_dir, name) {
+                let path = dir.join(format!("{}.md", name));
+                if path.exists() {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        tracing::warn!("failed to remove skill file {}: {e}", path.display());
+                    }
+                }
+            }
+        }
+        deleted
     }
 
     pub fn list(&self) -> &[Skill] {
@@ -268,6 +299,31 @@ mod tests {
         let id = store.list()[0].id.clone();
         assert!(store.delete(&id));
         assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn create_persists_file_to_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist_path = dir.path().to_path_buf();
+        let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
+        store.create("my-skill".to_string(), "# My Skill\nDoes stuff.".to_string());
+        let file = persist_path.join("my-skill.md");
+        assert!(file.exists(), "skill file should be written to disk");
+        let contents = std::fs::read_to_string(&file).expect("read file");
+        assert!(contents.contains("Does stuff."));
+    }
+
+    #[test]
+    fn delete_removes_file_from_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist_path = dir.path().to_path_buf();
+        let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
+        store.create("removable".to_string(), "content".to_string());
+        let file = persist_path.join("removable.md");
+        assert!(file.exists(), "file should exist after create");
+        let id = store.list()[0].id.clone();
+        assert!(store.delete(&id));
+        assert!(!file.exists(), "file should be removed after delete");
     }
 
     #[test]
