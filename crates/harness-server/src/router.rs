@@ -322,8 +322,54 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
         }
 
         Method::GcAdopt { draft_id } => {
+            // Fetch artifact paths before adopting so we can build the PR prompt.
+            let artifact_paths: Vec<String> = state
+                .gc_agent
+                .draft_store()
+                .get(&draft_id)
+                .ok()
+                .flatten()
+                .map(|d| {
+                    d.artifacts
+                        .iter()
+                        .map(|a| a.target_path.display().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+
             match state.gc_agent.adopt(&draft_id) {
-                Ok(()) => RpcResponse::success(id, serde_json::json!({ "adopted": true })),
+                Ok(()) => {
+                    // Spawn a task to commit the artifacts and open a PR.
+                    let task_id = if let Some(agent) = server.agent_registry.default_agent() {
+                        let paths_list = artifact_paths.join(", ");
+                        let prompt = format!(
+                            "GC drafted the following files: {paths_list}. \
+                             Review these changes, create a branch named gc/{draft_id}, \
+                             commit, push, and open a PR. \
+                             Print PR_URL=<url> on the last line."
+                        );
+                        let req = crate::task_runner::CreateTaskRequest {
+                            prompt: Some(prompt),
+                            issue: None,
+                            pr: None,
+                            project: None,
+                            wait_secs: 120,
+                            max_rounds: 3,
+                            turn_timeout_secs: 600,
+                        };
+                        let tid = crate::task_runner::spawn_task(
+                            state.tasks.clone(),
+                            agent,
+                            state.skills.clone(),
+                            req,
+                        )
+                        .await;
+                        Some(tid.0)
+                    } else {
+                        None
+                    };
+                    RpcResponse::success(id, serde_json::json!({ "adopted": true, "task_id": task_id }))
+                }
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             }
         }
@@ -431,6 +477,54 @@ mod tests {
             plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
             thread_db: Some(thread_db),
         })
+    }
+
+    #[tokio::test]
+    async fn gc_adopt_response_includes_task_id() -> anyhow::Result<()> {
+        use harness_core::{
+            Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId, RemediationType,
+            Signal, SignalType,
+        };
+
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        // Seed a pending draft in the store.
+        let draft_id = DraftId::new();
+        let signal = Signal::new(
+            SignalType::RepeatedWarn,
+            ProjectId::new(),
+            serde_json::json!("test signal"),
+            RemediationType::Guard,
+        );
+        let draft = Draft {
+            id: draft_id.clone(),
+            status: DraftStatus::Pending,
+            signal,
+            artifacts: vec![Artifact {
+                artifact_type: ArtifactType::Guard,
+                target_path: dir.path().join("test-guard.sh"),
+                content: "#!/bin/bash\necho ok".to_string(),
+            }],
+            rationale: "test".to_string(),
+            validation: "test".to_string(),
+            generated_at: chrono::Utc::now(),
+            agent_model: "test".to_string(),
+        };
+        state.gc_agent.draft_store().save(&draft)?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::GcAdopt { draft_id },
+        };
+        let resp = handle_request(&state, req).await;
+
+        assert!(resp.error.is_none(), "expected success, got error: {:?}", resp.error);
+        let result = resp.result.ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert_eq!(result["adopted"], serde_json::json!(true), "adopted must be true");
+        assert!(result.get("task_id").is_some(), "response must contain task_id field");
+        Ok(())
     }
 
     #[tokio::test]
