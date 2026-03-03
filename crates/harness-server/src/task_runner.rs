@@ -1,6 +1,6 @@
 use crate::task_db::TaskDb;
 use dashmap::DashMap;
-use harness_core::{prompts, AgentRequest, CodeAgent, ContextItem};
+use harness_core::{prompts, AgentRequest, CodeAgent, ContextItem, Decision, Event, SessionId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -175,6 +175,7 @@ pub async fn spawn_task(
     store: Arc<TaskStore>,
     agent: Arc<dyn CodeAgent>,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
+    events: Arc<harness_observe::EventStore>,
     req: CreateTaskRequest,
 ) -> TaskId {
     let task_id = TaskId::new();
@@ -194,7 +195,7 @@ pub async fn spawn_task(
                 .await
                 .unwrap_or_else(|_| PathBuf::from(".")),
         };
-        run_task(&store, &id, agent.as_ref(), skills, &req, project).await
+        run_task(&store, &id, agent.as_ref(), skills, events, &req, project).await
     });
 
     // Watcher: awaits the inner JoinHandle to propagate both errors and panics to the store.
@@ -228,6 +229,7 @@ async fn run_task(
     task_id: &TaskId,
     agent: &dyn CodeAgent,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
+    events: Arc<harness_observe::EventStore>,
     req: &CreateTaskRequest,
     project: PathBuf,
 ) -> anyhow::Result<()> {
@@ -329,6 +331,23 @@ async fn run_task(
         })
         .await;
 
+        // Log pr_review event for observability and GC signal detection.
+        let mut ev = Event::new(
+            SessionId::new(),
+            "pr_review",
+            "task_runner",
+            if lgtm { Decision::Complete } else { Decision::Warn },
+        );
+        ev.detail = Some(format!("pr={pr_num}"));
+        ev.reason = Some(if lgtm {
+            format!("round {round}: lgtm")
+        } else {
+            format!("round {round}: fixed")
+        });
+        if let Err(e) = events.log(&ev) {
+            tracing::warn!("failed to log pr_review event: {e}");
+        }
+
         if lgtm {
             update_status(store, task_id, TaskStatus::Done, round).await;
             return Ok(());
@@ -427,9 +446,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skills_are_injected_into_agent_context() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = TaskStore::open(&dir.path().join("tasks.db")).await.unwrap();
+    async fn skills_are_injected_into_agent_context() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
 
         // Build a SkillStore with one skill
         let mut skill_store = harness_skills::SkillStore::new();
@@ -449,7 +468,8 @@ mod tests {
             turn_timeout_secs: 30,
         };
 
-        spawn_task(store, agent_clone, skills, req).await;
+        let events = Arc::new(harness_observe::EventStore::new(dir.path())?);
+        spawn_task(store, agent_clone, skills, events, req).await;
 
         // Allow the spawned task to run
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -460,5 +480,6 @@ mod tests {
             captured.iter().any(|item| matches!(item, ContextItem::Skill { .. })),
             "expected at least one ContextItem::Skill"
         );
+        Ok(())
     }
 }

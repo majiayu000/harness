@@ -373,6 +373,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
                             state.tasks.clone(),
                             agent,
                             state.skills.clone(),
+                            state.events.clone(),
                             req,
                         )
                         .await;

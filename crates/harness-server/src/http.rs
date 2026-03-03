@@ -140,7 +140,7 @@ async fn create_task(
         }
     };
 
-    let task_id = task_runner::spawn_task(state.tasks.clone(), agent, state.skills.clone(), req).await;
+    let task_id = task_runner::spawn_task(state.tasks.clone(), agent, state.skills.clone(), state.events.clone(), req).await;
 
     (
         StatusCode::ACCEPTED,
