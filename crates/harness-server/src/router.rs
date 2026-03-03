@@ -2,13 +2,23 @@ use crate::http::AppState;
 use harness_core::ThreadId;
 use harness_protocol::{Method, RpcRequest, RpcResponse, INTERNAL_ERROR};
 
-/// Persist a thread to the optional ThreadDb after a mutation.
-#[allow(dead_code)]
+/// Persist an existing thread to the optional ThreadDb after a mutation.
 async fn persist_thread(state: &AppState, thread_id: &ThreadId) {
     if let Some(db) = &state.thread_db {
         if let Some(thread) = state.server.thread_manager.get_thread(thread_id) {
             if let Err(e) = db.update(&thread).await {
                 tracing::warn!("thread_db persist failed: {e}");
+            }
+        }
+    }
+}
+
+/// Insert a newly created thread into the optional ThreadDb.
+async fn persist_thread_insert(state: &AppState, thread_id: &ThreadId) {
+    if let Some(db) = &state.thread_db {
+        if let Some(thread) = state.server.thread_manager.get_thread(thread_id) {
+            if let Err(e) = db.insert(&thread).await {
+                tracing::warn!("thread_db insert failed: {e}");
             }
         }
     }
@@ -37,6 +47,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
 
         Method::ThreadStart { cwd } => {
             let thread_id = server.thread_manager.start_thread(cwd);
+            persist_thread_insert(state, &thread_id).await;
             RpcResponse::success(id, serde_json::json!({ "thread_id": thread_id }))
         }
 
@@ -47,6 +58,13 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
 
         Method::ThreadDelete { thread_id } => {
             let deleted = server.thread_manager.delete_thread(&thread_id);
+            if deleted {
+                if let Some(db) = &state.thread_db {
+                    if let Err(e) = db.delete(thread_id.as_str()).await {
+                        tracing::warn!("thread_db delete failed: {e}");
+                    }
+                }
+            }
             RpcResponse::success(id, serde_json::json!({ "deleted": deleted }))
         }
 
@@ -56,6 +74,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
             );
             match server.thread_manager.start_turn(&thread_id, input, agent_id) {
                 Ok(turn_id) => {
+                    persist_thread(state, &thread_id).await;
                     RpcResponse::success(id, serde_json::json!({ "turn_id": turn_id }))
                 }
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -66,7 +85,10 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
             match server.thread_manager.find_thread_for_turn(&turn_id) {
                 Some(thread_id) => {
                     match server.thread_manager.cancel_turn(&thread_id, &turn_id) {
-                        Ok(()) => RpcResponse::success(id, serde_json::json!({ "cancelled": true })),
+                        Ok(()) => {
+                            persist_thread(state, &thread_id).await;
+                            RpcResponse::success(id, serde_json::json!({ "cancelled": true }))
+                        }
                         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
                     }
                 }
@@ -98,7 +120,10 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
             match server.thread_manager.find_thread_for_turn(&turn_id) {
                 Some(thread_id) => {
                     match server.thread_manager.steer_turn(&thread_id, &turn_id, instruction) {
-                        Ok(()) => RpcResponse::success(id, serde_json::json!({ "steered": true })),
+                        Ok(()) => {
+                            persist_thread(state, &thread_id).await;
+                            RpcResponse::success(id, serde_json::json!({ "steered": true }))
+                        }
                         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
                     }
                 }
@@ -110,21 +135,30 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
 
         Method::ThreadResume { thread_id } => {
             match server.thread_manager.resume_thread(&thread_id) {
-                Ok(()) => RpcResponse::success(id, serde_json::json!({ "resumed": true })),
+                Ok(()) => {
+                    persist_thread(state, &thread_id).await;
+                    RpcResponse::success(id, serde_json::json!({ "resumed": true }))
+                }
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             }
         }
 
         Method::ThreadFork { thread_id, from_turn } => {
             match server.thread_manager.fork_thread(&thread_id, from_turn.as_ref()) {
-                Ok(new_id) => RpcResponse::success(id, serde_json::json!({ "thread_id": new_id })),
+                Ok(new_id) => {
+                    persist_thread_insert(state, &new_id).await;
+                    RpcResponse::success(id, serde_json::json!({ "thread_id": new_id }))
+                }
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             }
         }
 
         Method::ThreadCompact { thread_id } => {
             match server.thread_manager.compact_thread(&thread_id) {
-                Ok(()) => RpcResponse::success(id, serde_json::json!({ "compacted": true })),
+                Ok(()) => {
+                    persist_thread(state, &thread_id).await;
+                    RpcResponse::success(id, serde_json::json!({ "compacted": true }))
+                }
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             }
         }
@@ -355,5 +389,71 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
                 None => RpcResponse::error(id, INTERNAL_ERROR, "plan not found"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
+    use harness_agents::AgentRegistry;
+    use harness_core::HarnessConfig;
+    use harness_protocol::{Method, RpcRequest};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
+        let server = Arc::new(HarnessServer::new(
+            HarnessConfig::default(),
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        ));
+        let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
+        let events = Arc::new(harness_observe::EventStore::new(dir)?);
+        let signal_detector = harness_gc::SignalDetector::new(
+            harness_gc::signal_detector::SignalThresholds::default(),
+            harness_core::ProjectId::new(),
+        );
+        let draft_store = harness_gc::DraftStore::new(dir)?;
+        let gc_agent = Arc::new(harness_gc::GcAgent::new(
+            harness_gc::gc_agent::GcConfig::default(),
+            signal_detector,
+            draft_store,
+        ));
+        let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
+        Ok(AppState {
+            server,
+            tasks,
+            skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
+            rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
+            events,
+            gc_agent,
+            plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            thread_db: Some(thread_db),
+        })
+    }
+
+    #[tokio::test]
+    async fn thread_start_persists_to_db() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::ThreadStart { cwd: std::path::PathBuf::from("/test/project") },
+        };
+        let resp = handle_request(&state, req).await;
+
+        assert!(resp.error.is_none(), "expected success, got error: {:?}", resp.error);
+        let thread_id_str = resp.result.unwrap()["thread_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let db = state.thread_db.as_ref().unwrap();
+        let thread = db.get(&thread_id_str).await?.expect("thread should be in DB");
+        assert_eq!(thread.project_root, std::path::PathBuf::from("/test/project"));
+        Ok(())
     }
 }
