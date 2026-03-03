@@ -38,8 +38,9 @@ pub fn implement_from_prompt(prompt: &str) -> String {
 /// `round` controls convergence behavior:
 /// - Round 2: fix all critical/high/medium comments
 /// - Round 3+: only fix critical/high; skip medium style/design suggestions
-/// - `is_last_round`: controls whether to trigger `/gemini review`
-pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32, is_last_round: bool) -> String {
+///
+/// Every round that pushes fixes triggers `/gemini review` to ensure new code is verified.
+pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32) -> String {
     let context = match issue {
         Some(n) => format!("You previously created PR #{pr} for issue #{n}.\n"),
         None => format!("Review PR #{pr}.\n"),
@@ -52,14 +53,10 @@ pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32, is_last_round: boo
          Skip medium severity style/design suggestions — they are acceptable for now."
     };
 
-    let push_action = if is_last_round {
-        format!(
-            "commit, push, then run `gh pr comment {pr} --body '/gemini review'` \
-             to trigger a final re-review"
-        )
-    } else {
-        "commit and push (do NOT trigger /gemini review this round to avoid feedback inflation)".into()
-    };
+    let push_action = format!(
+        "commit, push, then run `gh pr comment {pr} --body '/gemini review'` \
+         to trigger re-review on the new code"
+    );
 
     format!(
         "{context}\
@@ -143,7 +140,7 @@ mod tests {
 
     #[test]
     fn test_review_prompt_with_issue() {
-        let p = review_prompt(Some(5), 10, 2, false);
+        let p = review_prompt(Some(5), 10, 2);
         assert!(p.contains("issue #5"));
         assert!(p.contains("PR #10"));
         assert!(p.contains("medium")); // round 2 includes medium
@@ -151,28 +148,28 @@ mod tests {
 
     #[test]
     fn test_review_prompt_without_issue() {
-        let p = review_prompt(None, 10, 2, false);
+        let p = review_prompt(None, 10, 2);
         assert!(p.contains("PR #10"));
         assert!(!p.contains("issue #")); // no issue reference when None
     }
 
     #[test]
     fn test_review_prompt_late_round_skips_medium() {
-        let p = review_prompt(None, 10, 3, false);
+        let p = review_prompt(None, 10, 3);
         assert!(p.contains("Skip medium"));
-        assert!(p.contains("do NOT trigger /gemini review"));
     }
 
     #[test]
-    fn test_review_prompt_last_round_triggers_gemini() {
-        let p = review_prompt(None, 10, 4, true);
+    fn test_review_prompt_always_triggers_gemini_review() {
+        let p = review_prompt(None, 10, 2);
         assert!(p.contains("/gemini review"));
-        assert!(p.contains("final re-review"));
+        let p = review_prompt(None, 10, 4);
+        assert!(p.contains("/gemini review"));
     }
 
     #[test]
     fn test_review_prompt_constraints() {
-        let p = review_prompt(None, 10, 2, false);
+        let p = review_prompt(None, 10, 2);
         assert!(p.contains("NEVER downgrade dependency"));
     }
 

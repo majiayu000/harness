@@ -304,11 +304,10 @@ async fn run_task(
 
         update_status(store, task_id, TaskStatus::Reviewing, round).await;
 
-        let is_last_round = round == last_review_round;
         let resp = tokio::time::timeout(
             turn_timeout,
             agent.execute(AgentRequest {
-                prompt: prompts::review_prompt(req.issue, pr_num, round, is_last_round),
+                prompt: prompts::review_prompt(req.issue, pr_num, round),
                 project_root: project.clone(),
                 context: skill_items.clone(),
                 ..Default::default()
