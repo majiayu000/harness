@@ -61,10 +61,6 @@ impl CodeAgent for ClaudeCodeAgent {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-        if !stderr.is_empty() {
-            eprintln!("[agent:claude] stderr:\n{stderr}");
-        }
-
         if !output.status.success() {
             return Err(harness_core::HarnessError::AgentExecution(format!(
                 "claude exited with {}: {stderr}",
