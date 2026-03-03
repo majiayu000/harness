@@ -39,6 +39,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     let state = Arc::new(AppState { server, tasks });
 
     let app = Router::new()
+        .route("/health", get(health_check))
         .route("/rpc", post(handle_rpc))
         .route("/tasks", post(create_task))
         .route("/tasks", get(list_tasks))
@@ -48,6 +49,11 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn health_check(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let count = state.tasks.list_all().len();
+    Json(json!({"status": "ok", "tasks": count}))
 }
 
 async fn handle_rpc(
