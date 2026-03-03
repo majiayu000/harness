@@ -19,7 +19,7 @@ pub async fn fix(
 ) -> anyhow::Result<()> {
     let agent = create_agent(config);
 
-    println!("[harness] Round 1 — 实现 issue #{issue} 并创建 PR");
+    println!("[harness] Round 1 — Implementing issue #{issue} and creating PR");
 
     let req = AgentRequest {
         prompt: prompts::implement_from_issue(issue),
@@ -31,11 +31,11 @@ pub async fn fix(
     println!("{}", resp.output);
 
     let pr_url = prompts::parse_pr_url(&resp.output)
-        .ok_or_else(|| anyhow::anyhow!("agent 输出中未找到 PR_URL=<url>"))?;
+        .ok_or_else(|| anyhow::anyhow!("PR_URL=<url> not found in agent output"))?;
     let pr_number = prompts::extract_pr_number(&pr_url)
-        .ok_or_else(|| anyhow::anyhow!("无法从 URL 解析 PR 编号: {pr_url}"))?;
+        .ok_or_else(|| anyhow::anyhow!("Cannot parse PR number from URL: {pr_url}"))?;
 
-    println!("[harness] PR #{pr_number} 已创建: {pr_url}");
+    println!("[harness] PR #{pr_number} created: {pr_url}");
 
     run_review_loop(
         &agent,
@@ -58,7 +58,7 @@ pub async fn loop_pr(
 ) -> anyhow::Result<()> {
     let agent = create_agent(config);
 
-    println!("[harness] 进入 PR #{pr} 的 review loop");
+    println!("[harness] Starting review loop for PR #{pr}");
 
     run_review_loop(&agent, &project, None, pr, None, wait, max_rounds).await
 }
@@ -78,10 +78,10 @@ async fn run_review_loop(
     };
 
     for round in 1..=max_rounds {
-        println!("[harness] 等待 {wait}s，让 CI 和 review bot 运行...");
+        println!("[harness] Waiting {wait}s for CI and review bot...");
         sleep(Duration::from_secs(wait)).await;
 
-        println!("[harness] Review 轮次 {round}/{max_rounds}，PR #{pr}");
+        println!("[harness] Review round {round}/{max_rounds}, PR #{pr}");
 
         let req = AgentRequest {
             prompt: prompts::review_prompt(issue, pr),
@@ -98,6 +98,6 @@ async fn run_review_loop(
         }
     }
 
-    println!("[harness] 已达最大轮次 ({max_rounds})，PR 状态: {url_display}");
+    println!("[harness] Reached max rounds ({max_rounds}), PR status: {url_display}");
     Ok(())
 }
