@@ -77,14 +77,17 @@ async fn run_review_loop(
         None => std::borrow::Cow::Owned(format!("PR #{pr}")),
     };
 
-    for round in 1..=max_rounds {
+    let mut prev_fixed = false;
+    let mut round = 1u32;
+
+    while round <= max_rounds {
         println!("[harness] Waiting {wait}s for CI and review bot...");
         sleep(Duration::from_secs(wait)).await;
 
         println!("[harness] Review round {round}/{max_rounds}, PR #{pr}");
 
         let req = AgentRequest {
-            prompt: prompts::review_prompt(issue, pr, round),
+            prompt: prompts::review_prompt(issue, pr, round, prev_fixed),
             project_root: project.clone(),
             ..Default::default()
         };
@@ -92,10 +95,18 @@ async fn run_review_loop(
         let resp = agent.execute(req).await?;
         println!("{}", resp.output);
 
+        if prompts::is_waiting(&resp.output) {
+            println!("[harness] Gemini hasn't re-reviewed yet, retrying...");
+            continue;
+        }
+
         if prompts::is_lgtm(&resp.output) {
             println!("[harness] LGTM — {url_display}");
             return Ok(());
         }
+
+        prev_fixed = true;
+        round += 1;
     }
 
     println!("[harness] Reached max rounds ({max_rounds}), PR status: {url_display}");

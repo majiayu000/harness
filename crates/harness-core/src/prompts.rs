@@ -39,8 +39,10 @@ pub fn implement_from_prompt(prompt: &str) -> String {
 /// - Round 2: fix all critical/high/medium comments
 /// - Round 3+: only fix critical/high; skip medium style/design suggestions
 ///
-/// Every round that pushes fixes triggers `/gemini review` to ensure new code is verified.
-pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32) -> String {
+/// When `prev_fixed` is true (previous round pushed code), the agent must first
+/// verify that Gemini has submitted a **new** review covering the latest commit
+/// before declaring LGTM. If no new review exists yet, agent outputs WAITING.
+pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32, prev_fixed: bool) -> String {
     let context = match issue {
         Some(n) => format!("You previously created PR #{pr} for issue #{n}.\n"),
         None => format!("Review PR #{pr}.\n"),
@@ -58,17 +60,37 @@ pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32) -> String {
          to trigger re-review on the new code"
     );
 
+    let freshness_check = if prev_fixed {
+        format!(
+            "\n\nIMPORTANT — New review verification:\n\
+             The previous round pushed a fix commit. Before evaluating review status, \
+             you MUST verify that Gemini has submitted a NEW review covering the latest commit:\n\
+             1. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews --jq '.[-1].submitted_at'` \
+             to get the timestamp of the most recent review\n\
+             2. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/commits --jq '.[-1].commit.committer.date'` \
+             to get the timestamp of the latest commit\n\
+             3. If the latest review was submitted BEFORE the latest commit, \
+             Gemini has not yet re-reviewed the new code. \
+             In this case, print WAITING on the last line and stop.\n\
+             4. Only proceed with the review evaluation below if the latest review \
+             was submitted AFTER the latest commit."
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         "{context}\
          Steps:\n\
          1. Run `gh pr checks {pr}` to check CI status\n\
-         2. Run `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/reviews` to read review verdicts\n\
-         3. Run `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/comments` to read inline review comments\n\
+         2. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews` to read review verdicts\n\
+         3. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/comments` to read inline review comments\n\
          4. {severity_guidance}\n\
          5. If all CI checks pass and there are no unresolved review comments \
          that match the severity criteria above, print LGTM on the last line\n\
          6. Otherwise fix the issues, {push_action}, \
-         and print FIXED on the last line\n\n\
+         and print FIXED on the last line\
+         {freshness_check}\n\n\
          Constraints:\n\
          - NEVER downgrade dependency versions\n\
          - Do NOT refactor working code for style preferences\n\
@@ -104,12 +126,21 @@ pub fn extract_pr_number(url: &str) -> Option<u64> {
 
 /// Check if agent output's last non-empty line is exactly "LGTM".
 pub fn is_lgtm(output: &str) -> bool {
+    last_non_empty_line(output) == Some("LGTM")
+}
+
+/// Check if agent output's last non-empty line is exactly "WAITING".
+/// This means Gemini has not yet re-reviewed after the latest fix commit.
+pub fn is_waiting(output: &str) -> bool {
+    last_non_empty_line(output) == Some("WAITING")
+}
+
+fn last_non_empty_line(output: &str) -> Option<&str> {
     output
         .lines()
         .rev()
         .find(|l| !l.trim().is_empty())
-        .map(|l| l.trim() == "LGTM")
-        .unwrap_or(false)
+        .map(|l| l.trim())
 }
 
 #[cfg(test)]
@@ -140,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_review_prompt_with_issue() {
-        let p = review_prompt(Some(5), 10, 2);
+        let p = review_prompt(Some(5), 10, 2, false);
         assert!(p.contains("issue #5"));
         assert!(p.contains("PR #10"));
         assert!(p.contains("medium")); // round 2 includes medium
@@ -148,29 +179,47 @@ mod tests {
 
     #[test]
     fn test_review_prompt_without_issue() {
-        let p = review_prompt(None, 10, 2);
+        let p = review_prompt(None, 10, 2, false);
         assert!(p.contains("PR #10"));
         assert!(!p.contains("issue #")); // no issue reference when None
     }
 
     #[test]
     fn test_review_prompt_late_round_skips_medium() {
-        let p = review_prompt(None, 10, 3);
+        let p = review_prompt(None, 10, 3, false);
         assert!(p.contains("Skip medium"));
     }
 
     #[test]
     fn test_review_prompt_always_triggers_gemini_review() {
-        let p = review_prompt(None, 10, 2);
+        let p = review_prompt(None, 10, 2, false);
         assert!(p.contains("/gemini review"));
-        let p = review_prompt(None, 10, 4);
+        let p = review_prompt(None, 10, 4, true);
         assert!(p.contains("/gemini review"));
     }
 
     #[test]
+    fn test_review_prompt_prev_fixed_requires_freshness_check() {
+        let p = review_prompt(None, 10, 3, true);
+        assert!(p.contains("WAITING"));
+        assert!(p.contains("latest review was submitted BEFORE the latest commit"));
+        // Without prev_fixed, no freshness check
+        let p = review_prompt(None, 10, 3, false);
+        assert!(!p.contains("WAITING"));
+    }
+
+    #[test]
     fn test_review_prompt_constraints() {
-        let p = review_prompt(None, 10, 2);
+        let p = review_prompt(None, 10, 2, false);
         assert!(p.contains("NEVER downgrade dependency"));
+    }
+
+    #[test]
+    fn test_is_waiting() {
+        assert!(is_waiting("checking reviews...\nWAITING"));
+        assert!(is_waiting("WAITING\n"));
+        assert!(!is_waiting("LGTM"));
+        assert!(!is_waiting("FIXED"));
     }
 
     #[test]
