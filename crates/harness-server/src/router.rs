@@ -322,8 +322,66 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
         }
 
         Method::GcAdopt { draft_id } => {
+            // Fetch draft and artifact paths before adopting.
+            let draft = match state.gc_agent.draft_store().get(&draft_id) {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    return RpcResponse::error(
+                        id,
+                        INTERNAL_ERROR,
+                        format!("draft {} not found", draft_id),
+                    );
+                }
+                Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            };
+            let artifact_paths: Vec<String> = draft
+                .artifacts
+                .iter()
+                .map(|a| a.target_path.display().to_string())
+                .collect();
+
             match state.gc_agent.adopt(&draft_id) {
-                Ok(()) => RpcResponse::success(id, serde_json::json!({ "adopted": true })),
+                Ok(()) => {
+                    if artifact_paths.is_empty() {
+                        return RpcResponse::success(
+                            id,
+                            serde_json::json!({ "adopted": true, "task_id": null }),
+                        );
+                    }
+                    // Spawn a task to commit the artifacts and open a PR.
+                    const GC_ADOPT_WAIT_SECS: u64 = 120;
+                    const GC_ADOPT_MAX_ROUNDS: u32 = 3;
+                    const GC_ADOPT_TURN_TIMEOUT_SECS: u64 = 600;
+                    let task_id = if let Some(agent) = server.agent_registry.default_agent() {
+                        let paths_list = artifact_paths.join(", ");
+                        let prompt = format!(
+                            "GC drafted the following files: {paths_list}. \
+                             Review these changes, create a branch named gc/{draft_id}, \
+                             commit, push, and open a PR. \
+                             Print PR_URL=<url> on the last line."
+                        );
+                        let req = crate::task_runner::CreateTaskRequest {
+                            prompt: Some(prompt),
+                            issue: None,
+                            pr: None,
+                            project: None,
+                            wait_secs: GC_ADOPT_WAIT_SECS,
+                            max_rounds: GC_ADOPT_MAX_ROUNDS,
+                            turn_timeout_secs: GC_ADOPT_TURN_TIMEOUT_SECS,
+                        };
+                        let tid = crate::task_runner::spawn_task(
+                            state.tasks.clone(),
+                            agent,
+                            state.skills.clone(),
+                            req,
+                        )
+                        .await;
+                        Some(tid.0)
+                    } else {
+                        None
+                    };
+                    RpcResponse::success(id, serde_json::json!({ "adopted": true, "task_id": task_id }))
+                }
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             }
         }
@@ -403,10 +461,17 @@ mod tests {
     use tokio::sync::RwLock;
 
     async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
+        make_test_state_with_registry(dir, AgentRegistry::new("test")).await
+    }
+
+    async fn make_test_state_with_registry(
+        dir: &std::path::Path,
+        agent_registry: AgentRegistry,
+    ) -> anyhow::Result<AppState> {
         let server = Arc::new(HarnessServer::new(
             HarnessConfig::default(),
             ThreadManager::new(),
-            AgentRegistry::new("test"),
+            agent_registry,
         ));
         let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
         let events = Arc::new(harness_observe::EventStore::new(dir)?);
@@ -431,6 +496,143 @@ mod tests {
             plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
             thread_db: Some(thread_db),
         })
+    }
+
+    #[tokio::test]
+    async fn gc_adopt_response_includes_task_id() -> anyhow::Result<()> {
+        use harness_core::{
+            Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId, RemediationType,
+            Signal, SignalType,
+        };
+
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        // Seed a pending draft in the store.
+        let draft_id = DraftId::new();
+        let signal = Signal::new(
+            SignalType::RepeatedWarn,
+            ProjectId::new(),
+            serde_json::json!("test signal"),
+            RemediationType::Guard,
+        );
+        let draft = Draft {
+            id: draft_id.clone(),
+            status: DraftStatus::Pending,
+            signal,
+            artifacts: vec![Artifact {
+                artifact_type: ArtifactType::Guard,
+                target_path: dir.path().join("test-guard.sh"),
+                content: "#!/bin/bash\necho ok".to_string(),
+            }],
+            rationale: "test".to_string(),
+            validation: "test".to_string(),
+            generated_at: chrono::Utc::now(),
+            agent_model: "test".to_string(),
+        };
+        state.gc_agent.draft_store().save(&draft)?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::GcAdopt { draft_id },
+        };
+        let resp = handle_request(&state, req).await;
+
+        assert!(resp.error.is_none(), "expected success, got error: {:?}", resp.error);
+        let result = resp.result.ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert_eq!(result["adopted"], serde_json::json!(true), "adopted must be true");
+        assert_eq!(result["task_id"], serde_json::json!(null), "task_id should be null when no agent is registered");
+        Ok(())
+    }
+
+    struct MockAgent;
+
+    #[async_trait::async_trait]
+    impl harness_core::CodeAgent for MockAgent {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn capabilities(&self) -> Vec<harness_core::Capability> {
+            vec![]
+        }
+        async fn execute(
+            &self,
+            _req: harness_core::AgentRequest,
+        ) -> harness_core::Result<harness_core::AgentResponse> {
+            Ok(harness_core::AgentResponse {
+                output: "LGTM".to_string(),
+                stderr: String::new(),
+                items: vec![],
+                token_usage: harness_core::TokenUsage::default(),
+                model: "mock".to_string(),
+                exit_code: Some(0),
+            })
+        }
+        async fn execute_stream(
+            &self,
+            _req: harness_core::AgentRequest,
+            _tx: tokio::sync::mpsc::Sender<harness_core::StreamItem>,
+        ) -> harness_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_adopt_spawns_task_when_agent_registered() -> anyhow::Result<()> {
+        use harness_core::{
+            Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId, RemediationType,
+            Signal, SignalType,
+        };
+
+        let dir = tempfile::tempdir()?;
+        let mut registry = AgentRegistry::new("mock");
+        registry.register("mock", Arc::new(MockAgent));
+        let state = make_test_state_with_registry(dir.path(), registry).await?;
+
+        let draft_id = DraftId::new();
+        let signal = Signal::new(
+            SignalType::RepeatedWarn,
+            ProjectId::new(),
+            serde_json::json!("test signal"),
+            RemediationType::Guard,
+        );
+        let artifact_path = dir.path().join("test-guard.sh");
+        let draft = Draft {
+            id: draft_id.clone(),
+            status: DraftStatus::Pending,
+            signal,
+            artifacts: vec![Artifact {
+                artifact_type: ArtifactType::Guard,
+                target_path: artifact_path,
+                content: "#!/bin/bash\necho ok".to_string(),
+            }],
+            rationale: "test".to_string(),
+            validation: "test".to_string(),
+            generated_at: chrono::Utc::now(),
+            agent_model: "test".to_string(),
+        };
+        state.gc_agent.draft_store().save(&draft)?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::GcAdopt { draft_id },
+        };
+        let resp = handle_request(&state, req).await;
+
+        assert!(resp.error.is_none(), "expected success, got error: {:?}", resp.error);
+        let result = resp.result.ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert_eq!(result["adopted"], serde_json::json!(true), "adopted must be true");
+        let task_id = result["task_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("task_id should be a string"))?;
+        assert!(!task_id.is_empty(), "task_id should be non-empty");
+        // Verify the task was actually created in the task store.
+        let tid = crate::task_runner::TaskId(task_id.to_string());
+        let task = state.tasks.get(&tid);
+        assert!(task.is_some(), "task should exist in the task store");
+        Ok(())
     }
 
     #[tokio::test]
