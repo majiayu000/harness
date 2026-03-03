@@ -257,7 +257,7 @@ async fn run_task(
     };
 
     // Review loop: Turn 2..N
-    let last_review_round = req.max_rounds + 1;
+    let last_review_round = req.max_rounds.saturating_add(1);
     for round in 2..=last_review_round {
         update_status(store, task_id, TaskStatus::Waiting, round).await;
         sleep(Duration::from_secs(req.wait_secs)).await;
@@ -297,7 +297,7 @@ async fn run_task(
     // Reached max rounds without LGTM
     mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Failed;
-        s.turn = req.max_rounds + 1;
+        s.turn = req.max_rounds.saturating_add(1);
         s.error = Some(format!(
             "Task did not receive LGTM after {} review rounds.",
             req.max_rounds
