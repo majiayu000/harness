@@ -1,9 +1,10 @@
 use crate::task_db::TaskDb;
 use dashmap::DashMap;
-use harness_core::{prompts, AgentRequest, CodeAgent};
+use harness_core::{prompts, AgentRequest, CodeAgent, ContextItem};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -173,6 +174,7 @@ impl TaskStore {
 pub async fn spawn_task(
     store: Arc<TaskStore>,
     agent: Arc<dyn CodeAgent>,
+    skills: Arc<RwLock<harness_skills::SkillStore>>,
     req: CreateTaskRequest,
 ) -> TaskId {
     let task_id = TaskId::new();
@@ -192,7 +194,7 @@ pub async fn spawn_task(
                 .await
                 .unwrap_or_else(|_| PathBuf::from(".")),
         };
-        run_task(&store, &id, agent.as_ref(), &req, project).await
+        run_task(&store, &id, agent.as_ref(), skills, &req, project).await
     });
 
     // Watcher: awaits the inner JoinHandle to propagate both errors and panics to the store.
@@ -225,6 +227,7 @@ async fn run_task(
     store: &TaskStore,
     task_id: &TaskId,
     agent: &dyn CodeAgent,
+    skills: Arc<RwLock<harness_skills::SkillStore>>,
     req: &CreateTaskRequest,
     project: PathBuf,
 ) -> anyhow::Result<()> {
@@ -239,12 +242,25 @@ async fn run_task(
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default())
     };
 
+    let skill_items: Vec<ContextItem> = {
+        let guard = skills.read().await;
+        guard
+            .list()
+            .iter()
+            .map(|s| ContextItem::Skill {
+                id: s.id.to_string(),
+                content: s.content.clone(),
+            })
+            .collect()
+    };
+
     let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
     let resp = tokio::time::timeout(
         turn_timeout,
         agent.execute(AgentRequest {
             prompt: first_prompt,
             project_root: project.clone(),
+            context: skill_items.clone(),
             ..Default::default()
         }),
     )
@@ -294,6 +310,7 @@ async fn run_task(
             agent.execute(AgentRequest {
                 prompt: prompts::review_prompt(req.issue, pr_num, round, is_last_round),
                 project_root: project.clone(),
+                context: skill_items.clone(),
                 ..Default::default()
             }),
         )
@@ -350,6 +367,8 @@ async fn mutate_and_persist(store: &TaskStore, id: &TaskId, f: impl FnOnce(&mut 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use harness_core::{AgentResponse, Capability, StreamItem, TokenUsage};
 
     #[test]
     fn test_task_state_new() {
@@ -358,5 +377,88 @@ mod tests {
         assert!(matches!(state.status, TaskStatus::Pending));
         assert_eq!(state.turn, 0);
         assert!(state.pr_url.is_none());
+    }
+
+    /// A mock agent that captures the context from the first AgentRequest it receives.
+    struct CapturingAgent {
+        captured: tokio::sync::Mutex<Vec<ContextItem>>,
+    }
+
+    impl CapturingAgent {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                captured: tokio::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl harness_core::CodeAgent for CapturingAgent {
+        fn name(&self) -> &str {
+            "capturing-mock"
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+
+        async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+            let mut guard = self.captured.lock().await;
+            if guard.is_empty() {
+                *guard = req.context.clone();
+            }
+            Ok(AgentResponse {
+                output: String::new(),
+                stderr: String::new(),
+                items: vec![],
+                token_usage: TokenUsage { input_tokens: 0, output_tokens: 0, total_tokens: 0, cost_usd: 0.0 },
+                model: "mock".into(),
+                exit_code: Some(0),
+            })
+        }
+
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            _tx: tokio::sync::mpsc::Sender<StreamItem>,
+        ) -> harness_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn skills_are_injected_into_agent_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await.unwrap();
+
+        // Build a SkillStore with one skill
+        let mut skill_store = harness_skills::SkillStore::new();
+        skill_store.create("test-skill".to_string(), "do something useful".to_string());
+        let skills = Arc::new(RwLock::new(skill_store));
+
+        let agent = CapturingAgent::new();
+        let agent_clone = agent.clone();
+
+        let req = CreateTaskRequest {
+            prompt: Some("test task".into()),
+            issue: None,
+            pr: None,
+            project: Some(dir.path().to_path_buf()),
+            wait_secs: 0,
+            max_rounds: 0,
+            turn_timeout_secs: 30,
+        };
+
+        spawn_task(store, agent_clone, skills, req).await;
+
+        // Allow the spawned task to run
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let captured = agent.captured.lock().await;
+        assert!(!captured.is_empty(), "expected skills to be injected into AgentRequest.context");
+        assert!(
+            captured.iter().any(|item| matches!(item, ContextItem::Skill { .. })),
+            "expected at least one ContextItem::Skill"
+        );
     }
 }
