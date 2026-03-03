@@ -176,21 +176,41 @@ pub async fn spawn_task(
     store.insert(&state).await;
 
     let id = task_id.clone();
-    let store = store.clone();
+    // Clone handles for the watcher spawn; originals move into the inner spawn.
+    let store_watcher = store.clone();
+    let id_watcher = id.clone();
 
-    tokio::spawn(async move {
+    // Inner task: runs the actual work, returns Result so the watcher can detect errors.
+    let handle = tokio::spawn(async move {
         let project = match req.project.clone() {
             Some(p) => p,
             None => tokio::task::spawn_blocking(detect_main_worktree)
                 .await
                 .unwrap_or_else(|_| PathBuf::from(".")),
         };
-        if let Err(e) = run_task(&store, &id, agent.as_ref(), &req, project).await {
-            mutate_and_persist(&store, &id, |s| {
-                s.status = TaskStatus::Failed;
-                s.error = Some(e.to_string());
-            })
-            .await;
+        run_task(&store, &id, agent.as_ref(), &req, project).await
+    });
+
+    // Watcher: awaits the inner JoinHandle to propagate both errors and panics to the store.
+    // Without this, a panic inside the inner task would leave the task stuck in a non-terminal state.
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                mutate_and_persist(&store_watcher, &id_watcher, |s| {
+                    s.status = TaskStatus::Failed;
+                    s.error = Some(e.to_string());
+                })
+                .await;
+            }
+            Err(join_err) => {
+                tracing::error!("task {id_watcher:?} panicked or was cancelled: {join_err}");
+                mutate_and_persist(&store_watcher, &id_watcher, |s| {
+                    s.status = TaskStatus::Failed;
+                    s.error = Some(format!("task failed unexpectedly: {join_err}"));
+                })
+                .await;
+            }
         }
     });
 
