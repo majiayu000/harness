@@ -30,3 +30,4 @@ tokio-stream = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+async-trait = { workspace = true }
