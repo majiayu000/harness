@@ -65,8 +65,16 @@ pub fn parse_pr_url(output: &str) -> Option<String> {
 }
 
 /// Extract PR number from a GitHub PR URL.
+/// Handles URLs with extra path segments or fragments, e.g.:
+///   https://github.com/owner/repo/pull/42/files
+///   https://github.com/owner/repo/pull/42#discussion
 pub fn extract_pr_number(url: &str) -> Option<u64> {
-    url.split('/').last()?.parse().ok()
+    url.rsplit_once("/pull/")?
+        .1
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Check if agent output ends with LGTM (strict last-line check).
@@ -138,6 +146,22 @@ mod tests {
     #[test]
     fn test_extract_pr_number_invalid() {
         assert_eq!(extract_pr_number("https://github.com/owner/repo/pull/"), None);
+    }
+
+    #[test]
+    fn test_extract_pr_number_with_path_suffix() {
+        assert_eq!(
+            extract_pr_number("https://github.com/owner/repo/pull/42/files"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn test_extract_pr_number_with_fragment() {
+        assert_eq!(
+            extract_pr_number("https://github.com/owner/repo/pull/42#discussion"),
+            Some(42)
+        );
     }
 
     #[test]
