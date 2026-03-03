@@ -52,7 +52,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 }
 
 async fn health_check(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let count = state.tasks.list_all().len();
+    let count = state.tasks.count();
     Json(json!({"status": "ok", "tasks": count}))
 }
 

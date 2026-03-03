@@ -146,6 +146,10 @@ impl TaskStore {
         self.cache.get(id).map(|r| r.value().clone())
     }
 
+    pub fn count(&self) -> usize {
+        self.cache.len()
+    }
+
     pub fn list_all(&self) -> Vec<TaskState> {
         self.cache.iter().map(|e| e.value().clone()).collect()
     }
