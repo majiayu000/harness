@@ -77,7 +77,7 @@ impl ThreadDb {
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|r| r.into_thread()))
+        row.map(|r| r.into_thread()).transpose()
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<Thread>> {
@@ -86,7 +86,7 @@ impl ThreadDb {
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|r| r.into_thread()).collect())
+        rows.into_iter().map(|r| r.into_thread()).collect()
     }
 
     pub async fn delete(&self, id: &str) -> anyhow::Result<bool> {
@@ -110,21 +110,18 @@ struct ThreadRow {
 }
 
 impl ThreadRow {
-    fn into_thread(self) -> Thread {
-        Thread {
+    fn into_thread(self) -> anyhow::Result<Thread> {
+        Ok(Thread {
             id: ThreadId::from_str(&self.id),
             project_root: std::path::PathBuf::from(self.cwd),
             status: str_to_status(&self.status),
-            turns: serde_json::from_str(&self.turns).unwrap_or_default(),
-            metadata: serde_json::from_str(&self.metadata)
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+            turns: serde_json::from_str(&self.turns)?,
+            metadata: serde_json::from_str(&self.metadata)?,
             created_at: chrono::DateTime::parse_from_rfc3339(&self.created_at)
-                .map(|d| d.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now()),
+                .map(|d| d.with_timezone(&chrono::Utc))?,
             updated_at: chrono::DateTime::parse_from_rfc3339(&self.updated_at)
-                .map(|d| d.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now()),
-        }
+                .map(|d| d.with_timezone(&chrono::Utc))?,
+        })
     }
 }
 
