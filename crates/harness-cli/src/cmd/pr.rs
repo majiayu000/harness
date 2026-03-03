@@ -81,10 +81,11 @@ async fn run_review_loop(
         println!("[harness] Waiting {wait}s for CI and review bot...");
         sleep(Duration::from_secs(wait)).await;
 
+        let is_last_round = round == max_rounds;
         println!("[harness] Review round {round}/{max_rounds}, PR #{pr}");
 
         let req = AgentRequest {
-            prompt: prompts::review_prompt(issue, pr),
+            prompt: prompts::review_prompt(issue, pr, round, is_last_round),
             project_root: project.clone(),
             ..Default::default()
         };
