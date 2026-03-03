@@ -171,18 +171,21 @@ impl SkillStore {
             location: SkillLocation::User,
         };
         self.skills.push(skill);
-        let idx = self.skills.len() - 1;
+        let skill_ref = match self.skills.last() {
+            Some(s) => s,
+            None => unreachable!("skill was just pushed, so it must exist"),
+        };
         if let Some(dir) = &self.persist_dir {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 tracing::warn!("failed to create skills dir {}: {e}", dir.display());
             } else {
-                let path = dir.join(format!("{}.md", self.skills[idx].name));
-                if let Err(e) = std::fs::write(&path, &self.skills[idx].content) {
+                let path = dir.join(format!("{}.md", skill_ref.name));
+                if let Err(e) = std::fs::write(&path, &skill_ref.content) {
                     tracing::warn!("failed to persist skill {}: {e}", path.display());
                 }
             }
         }
-        &self.skills[idx]
+        skill_ref
     }
 
     pub fn get(&self, id: &SkillId) -> Option<&Skill> {
