@@ -1,10 +1,10 @@
-use crate::server::HarnessServer;
+use crate::http::AppState;
 use crate::router;
 use harness_protocol::{codec, RpcResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Serve JSON-RPC over stdio (one JSON object per line).
-pub async fn serve(server: &HarnessServer) -> anyhow::Result<()> {
+pub async fn serve(state: &AppState) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let reader = BufReader::new(stdin);
@@ -18,7 +18,7 @@ pub async fn serve(server: &HarnessServer) -> anyhow::Result<()> {
         }
 
         let response = match codec::decode_request(&line) {
-            Ok(req) => router::handle_request(server, req).await,
+            Ok(req) => router::handle_request(state, req).await,
             Err(e) => RpcResponse::error(
                 None,
                 harness_protocol::PARSE_ERROR,

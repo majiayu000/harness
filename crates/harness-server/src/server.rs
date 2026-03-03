@@ -24,8 +24,9 @@ impl HarnessServer {
     }
 
     /// Start in stdio mode (JSON-RPC over stdin/stdout).
-    pub async fn serve_stdio(&self) -> anyhow::Result<()> {
-        crate::stdio::serve(self).await
+    pub async fn serve_stdio(self) -> anyhow::Result<()> {
+        let state = crate::http::build_app_state(Arc::new(self)).await?;
+        crate::stdio::serve(&state).await
     }
 
     /// Start in HTTP + WebSocket mode.

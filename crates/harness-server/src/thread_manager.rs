@@ -1,3 +1,4 @@
+use crate::thread_db::ThreadDb;
 use dashmap::DashMap;
 use harness_core::{
     AgentId, Item, Thread, ThreadId, ThreadStatus, Turn, TurnId,
@@ -5,12 +6,60 @@ use harness_core::{
 
 pub struct ThreadManager {
     threads: DashMap<String, Thread>,
+    db: Option<ThreadDb>,
 }
 
 impl ThreadManager {
     pub fn new() -> Self {
         Self {
             threads: DashMap::new(),
+            db: None,
+        }
+    }
+
+    /// Open with SQLite persistence. Loads existing threads into cache.
+    pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Self> {
+        let db = ThreadDb::open(db_path).await?;
+        let threads = DashMap::new();
+        for thread in db.list().await? {
+            threads.insert(thread.id.as_str().to_string(), thread);
+        }
+        Ok(Self { threads, db: Some(db) })
+    }
+
+    /// Persist a single thread to DB (no-op if no DB configured).
+    pub async fn persist(&self, id: &ThreadId) {
+        if let Some(db) = &self.db {
+            if let Some(thread) = self.threads.get(id.as_str()) {
+                if let Err(e) = db.update(thread.value()).await {
+                    tracing::error!("thread_db update failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Access the underlying threads cache (for loading persisted threads).
+    pub fn threads_cache(&self) -> &DashMap<String, Thread> {
+        &self.threads
+    }
+
+    /// Persist a newly inserted thread to DB.
+    pub async fn persist_insert(&self, id: &ThreadId) {
+        if let Some(db) = &self.db {
+            if let Some(thread) = self.threads.get(id.as_str()) {
+                if let Err(e) = db.insert(thread.value()).await {
+                    tracing::error!("thread_db insert failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Persist a thread deletion to DB.
+    pub async fn persist_delete(&self, id: &str) {
+        if let Some(db) = &self.db {
+            if let Err(e) = db.delete(id).await {
+                tracing::error!("thread_db delete failed: {e}");
+            }
         }
     }
 
@@ -97,6 +146,90 @@ impl ThreadManager {
         if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
             turn.items.push(item);
         }
+        Ok(())
+    }
+
+    /// Find which thread contains a given turn.
+    pub fn find_thread_for_turn(&self, turn_id: &TurnId) -> Option<ThreadId> {
+        for entry in self.threads.iter() {
+            if entry.value().turns.iter().any(|t| t.id == *turn_id) {
+                return Some(entry.value().id.clone());
+            }
+        }
+        None
+    }
+
+    /// Append a steering instruction to a running turn.
+    pub fn steer_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        instruction: String,
+    ) -> harness_core::Result<()> {
+        let mut thread = self
+            .threads
+            .get_mut(thread_id.as_str())
+            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(thread_id.to_string()))?;
+
+        if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
+            turn.items.push(Item::UserMessage { content: instruction });
+        }
+        thread.updated_at = chrono::Utc::now();
+        Ok(())
+    }
+
+    /// Resume an archived thread back to Idle.
+    pub fn resume_thread(&self, id: &ThreadId) -> harness_core::Result<()> {
+        let mut thread = self
+            .threads
+            .get_mut(id.as_str())
+            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(id.to_string()))?;
+
+        thread.status = ThreadStatus::Idle;
+        thread.updated_at = chrono::Utc::now();
+        Ok(())
+    }
+
+    /// Fork a thread, optionally truncating turns at a given position.
+    pub fn fork_thread(
+        &self,
+        id: &ThreadId,
+        from_turn: Option<&TurnId>,
+    ) -> harness_core::Result<ThreadId> {
+        let source = self
+            .threads
+            .get(id.as_str())
+            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(id.to_string()))?;
+
+        let mut new_thread = source.clone();
+        new_thread.id = ThreadId::new();
+        new_thread.status = ThreadStatus::Idle;
+        new_thread.updated_at = chrono::Utc::now();
+
+        if let Some(turn_id) = from_turn {
+            if let Some(pos) = new_thread.turns.iter().position(|t| t.id == *turn_id) {
+                new_thread.turns.truncate(pos + 1);
+            }
+        }
+
+        let new_id = new_thread.id.clone();
+        self.threads.insert(new_id.as_str().to_string(), new_thread);
+        Ok(new_id)
+    }
+
+    /// Compact a thread by clearing items from all completed turns.
+    pub fn compact_thread(&self, id: &ThreadId) -> harness_core::Result<()> {
+        let mut thread = self
+            .threads
+            .get_mut(id.as_str())
+            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(id.to_string()))?;
+
+        for turn in &mut thread.turns {
+            if matches!(turn.status, harness_core::TurnStatus::Completed) {
+                turn.items.clear();
+            }
+        }
+        thread.updated_at = chrono::Utc::now();
         Ok(())
     }
 }

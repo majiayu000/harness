@@ -10,15 +10,20 @@ use harness_protocol::{RpcRequest, RpcResponse};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 pub struct AppState {
     pub server: Arc<HarnessServer>,
     pub tasks: Arc<task_runner::TaskStore>,
+    pub skills: Arc<RwLock<harness_skills::SkillStore>>,
+    pub rules: Arc<RwLock<harness_rules::engine::RuleEngine>>,
+    pub events: Arc<harness_observe::EventStore>,
+    pub gc_agent: Arc<harness_gc::GcAgent>,
+    pub plans: Arc<RwLock<std::collections::HashMap<harness_core::ExecPlanId, harness_exec::ExecPlan>>>,
+    pub thread_db: Option<crate::thread_db::ThreadDb>,
 }
 
-pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Result<()> {
-    tracing::info!("harness: HTTP server listening on {addr}");
-
+fn data_dir() -> std::path::PathBuf {
     let db_path = std::env::var("HARNESS_DB")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
@@ -27,16 +32,67 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                 .join(".local")
                 .join("share")
                 .join("harness")
-                .join("tasks.db")
         });
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if db_path.extension().is_some() {
+        db_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf()
+    } else {
+        db_path
     }
-    tracing::info!("task db: {}", db_path.display());
+}
 
+/// Build an AppState with all stores. Used by both HTTP and stdio transports.
+pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppState> {
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir)?;
+
+    let db_path = dir.join("tasks.db");
+    tracing::info!("task db: {}", db_path.display());
     let tasks = task_runner::TaskStore::open(&db_path).await?;
 
-    let state = Arc::new(AppState { server, tasks });
+    let mut rule_engine = harness_rules::engine::RuleEngine::new();
+    if let Err(e) = rule_engine.load_builtin() {
+        tracing::warn!("failed to load builtin rules: {e}");
+    }
+
+    let events = Arc::new(harness_observe::EventStore::new(&dir)?);
+
+    let signal_detector = harness_gc::SignalDetector::new(
+        harness_gc::signal_detector::SignalThresholds::default(),
+        harness_core::ProjectId::new(),
+    );
+    let draft_store = harness_gc::DraftStore::new(&dir)?;
+    let gc_agent = Arc::new(harness_gc::GcAgent::new(
+        harness_gc::gc_agent::GcConfig::default(),
+        signal_detector,
+        draft_store,
+    ));
+
+    let thread_db_path = dir.join("threads.db");
+    let thread_db = crate::thread_db::ThreadDb::open(&thread_db_path).await?;
+    // Load persisted threads into the in-memory ThreadManager cache
+    for thread in thread_db.list().await? {
+        server.thread_manager.threads_cache().insert(
+            thread.id.as_str().to_string(),
+            thread,
+        );
+    }
+
+    Ok(AppState {
+        server,
+        tasks,
+        skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
+        rules: Arc::new(RwLock::new(rule_engine)),
+        events,
+        gc_agent,
+        plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        thread_db: Some(thread_db),
+    })
+}
+
+pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Result<()> {
+    tracing::info!("harness: HTTP server listening on {addr}");
+
+    let state = Arc::new(build_app_state(server).await?);
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -60,7 +116,7 @@ async fn handle_rpc(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RpcRequest>,
 ) -> Json<RpcResponse> {
-    Json(router::handle_request(&state.server, req).await)
+    Json(router::handle_request(&state, req).await)
 }
 
 async fn create_task(
