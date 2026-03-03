@@ -248,7 +248,7 @@ async fn run_task(
             .list()
             .iter()
             .map(|s| ContextItem::Skill {
-                id: s.id.as_str().to_string(),
+                id: s.id.to_string(),
                 content: s.content.clone(),
             })
             .collect()
