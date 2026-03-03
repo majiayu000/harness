@@ -42,7 +42,7 @@ pub async fn fix(
         &project,
         Some(issue),
         pr_number,
-        &pr_url,
+        Some(&pr_url),
         wait,
         max_rounds,
     )
@@ -60,22 +60,21 @@ pub async fn loop_pr(
 
     println!("[harness] 进入 PR #{pr} 的 review loop");
 
-    run_review_loop(&agent, &project, None, pr, "", wait, max_rounds).await
+    run_review_loop(&agent, &project, None, pr, None, wait, max_rounds).await
 }
 
 async fn run_review_loop(
-    agent: &ClaudeCodeAgent,
+    agent: &impl CodeAgent,
     project: &PathBuf,
     issue: Option<u64>,
     pr: u64,
-    pr_url: &str,
+    pr_url: Option<&str>,
     wait: u64,
     max_rounds: u32,
 ) -> anyhow::Result<()> {
-    let url_display = if pr_url.is_empty() {
-        format!("PR #{pr}")
-    } else {
-        pr_url.to_string()
+    let url_display: std::borrow::Cow<str> = match pr_url {
+        Some(url) => std::borrow::Cow::Borrowed(url),
+        None => std::borrow::Cow::Owned(format!("PR #{pr}")),
     };
 
     for round in 1..=max_rounds {
