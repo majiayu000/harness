@@ -86,7 +86,7 @@ impl RuleEngine {
         Ok(())
     }
 
-    fn load_builtin(&mut self) -> anyhow::Result<()> {
+    pub fn load_builtin(&mut self) -> anyhow::Result<()> {
         let builtin = [
             ("golden-principles.md", include_str!("../../../rules/golden-principles.md")),
             ("common/coding-style.md", include_str!("../../../rules/common/coding-style.md")),

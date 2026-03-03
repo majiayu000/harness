@@ -1,9 +1,33 @@
-use crate::server::HarnessServer;
-use harness_protocol::{Method, RpcRequest, RpcResponse, INTERNAL_ERROR, METHOD_NOT_FOUND};
+use crate::http::AppState;
+use harness_core::ThreadId;
+use harness_protocol::{Method, RpcRequest, RpcResponse, INTERNAL_ERROR};
+
+/// Persist an existing thread to the optional ThreadDb after a mutation.
+async fn persist_thread(state: &AppState, thread_id: &ThreadId) {
+    if let Some(db) = &state.thread_db {
+        if let Some(thread) = state.server.thread_manager.get_thread(thread_id) {
+            if let Err(e) = db.update(&thread).await {
+                tracing::warn!("thread_db persist failed: {e}");
+            }
+        }
+    }
+}
+
+/// Insert a newly created thread into the optional ThreadDb.
+async fn persist_thread_insert(state: &AppState, thread_id: &ThreadId) {
+    if let Some(db) = &state.thread_db {
+        if let Some(thread) = state.server.thread_manager.get_thread(thread_id) {
+            if let Err(e) = db.insert(&thread).await {
+                tracing::warn!("thread_db insert failed: {e}");
+            }
+        }
+    }
+}
 
 /// Route a JSON-RPC request to the appropriate handler.
-pub async fn handle_request(server: &HarnessServer, req: RpcRequest) -> RpcResponse {
+pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
     let id = req.id.clone();
+    let server = &state.server;
 
     match req.method {
         Method::Initialize => {
@@ -23,6 +47,7 @@ pub async fn handle_request(server: &HarnessServer, req: RpcRequest) -> RpcRespo
 
         Method::ThreadStart { cwd } => {
             let thread_id = server.thread_manager.start_thread(cwd);
+            persist_thread_insert(state, &thread_id).await;
             RpcResponse::success(id, serde_json::json!({ "thread_id": thread_id }))
         }
 
@@ -33,6 +58,13 @@ pub async fn handle_request(server: &HarnessServer, req: RpcRequest) -> RpcRespo
 
         Method::ThreadDelete { thread_id } => {
             let deleted = server.thread_manager.delete_thread(&thread_id);
+            if deleted {
+                if let Some(db) = &state.thread_db {
+                    if let Err(e) = db.delete(thread_id.as_str()).await {
+                        tracing::warn!("thread_db delete failed: {e}");
+                    }
+                }
+            }
             RpcResponse::success(id, serde_json::json!({ "deleted": deleted }))
         }
 
@@ -42,22 +74,386 @@ pub async fn handle_request(server: &HarnessServer, req: RpcRequest) -> RpcRespo
             );
             match server.thread_manager.start_turn(&thread_id, input, agent_id) {
                 Ok(turn_id) => {
+                    persist_thread(state, &thread_id).await;
                     RpcResponse::success(id, serde_json::json!({ "turn_id": turn_id }))
                 }
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             }
         }
 
-        Method::TurnCancel { turn_id: _ } => {
-            // Need thread_id to cancel — simplified for now
-            RpcResponse::error(id, INTERNAL_ERROR, "turn cancel requires thread context")
+        Method::TurnCancel { turn_id } => {
+            match server.thread_manager.find_thread_for_turn(&turn_id) {
+                Some(thread_id) => {
+                    match server.thread_manager.cancel_turn(&thread_id, &turn_id) {
+                        Ok(()) => {
+                            persist_thread(state, &thread_id).await;
+                            RpcResponse::success(id, serde_json::json!({ "cancelled": true }))
+                        }
+                        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                    }
+                }
+                None => RpcResponse::error(id, INTERNAL_ERROR, "turn not found in any thread"),
+            }
         }
 
-        Method::TurnStatus { turn_id: _ } => {
-            RpcResponse::error(id, INTERNAL_ERROR, "turn status requires thread context")
+        Method::TurnStatus { turn_id } => {
+            match server.thread_manager.find_thread_for_turn(&turn_id) {
+                Some(thread_id) => {
+                    if let Some(thread) = server.thread_manager.get_thread(&thread_id) {
+                        if let Some(turn) = thread.turns.iter().find(|t| t.id == turn_id) {
+                            match serde_json::to_value(turn) {
+                                Ok(v) => RpcResponse::success(id, v),
+                                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                            }
+                        } else {
+                            RpcResponse::error(id, INTERNAL_ERROR, "turn not found")
+                        }
+                    } else {
+                        RpcResponse::error(id, INTERNAL_ERROR, "thread not found")
+                    }
+                }
+                None => RpcResponse::error(id, INTERNAL_ERROR, "turn not found in any thread"),
+            }
         }
 
-        // Placeholder for unimplemented methods
-        _ => RpcResponse::error(id, METHOD_NOT_FOUND, "method not yet implemented"),
+        Method::TurnSteer { turn_id, instruction } => {
+            match server.thread_manager.find_thread_for_turn(&turn_id) {
+                Some(thread_id) => {
+                    match server.thread_manager.steer_turn(&thread_id, &turn_id, instruction) {
+                        Ok(()) => {
+                            persist_thread(state, &thread_id).await;
+                            RpcResponse::success(id, serde_json::json!({ "steered": true }))
+                        }
+                        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                    }
+                }
+                None => RpcResponse::error(id, INTERNAL_ERROR, "turn not found in any thread"),
+            }
+        }
+
+        // === Thread advanced ===
+
+        Method::ThreadResume { thread_id } => {
+            match server.thread_manager.resume_thread(&thread_id) {
+                Ok(()) => {
+                    persist_thread(state, &thread_id).await;
+                    RpcResponse::success(id, serde_json::json!({ "resumed": true }))
+                }
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        Method::ThreadFork { thread_id, from_turn } => {
+            match server.thread_manager.fork_thread(&thread_id, from_turn.as_ref()) {
+                Ok(new_id) => {
+                    persist_thread_insert(state, &new_id).await;
+                    RpcResponse::success(id, serde_json::json!({ "thread_id": new_id }))
+                }
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        Method::ThreadCompact { thread_id } => {
+            match server.thread_manager.compact_thread(&thread_id) {
+                Ok(()) => {
+                    persist_thread(state, &thread_id).await;
+                    RpcResponse::success(id, serde_json::json!({ "compacted": true }))
+                }
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        // === Skills ===
+
+        Method::SkillCreate { name, content } => {
+            let mut skills = state.skills.write().await;
+            let skill = skills.create(name, content).clone();
+            match serde_json::to_value(&skill) {
+                Ok(v) => RpcResponse::success(id, v),
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        Method::SkillList { query } => {
+            let skills = state.skills.read().await;
+            let result = match query {
+                Some(q) => skills.search(&q).into_iter().cloned().collect::<Vec<_>>(),
+                None => skills.list().to_vec(),
+            };
+            match serde_json::to_value(&result) {
+                Ok(v) => RpcResponse::success(id, v),
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        Method::SkillGet { skill_id } => {
+            let skills = state.skills.read().await;
+            match skills.get(&skill_id) {
+                Some(skill) => match serde_json::to_value(skill) {
+                    Ok(v) => RpcResponse::success(id, v),
+                    Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                },
+                None => RpcResponse::error(id, INTERNAL_ERROR, "skill not found"),
+            }
+        }
+
+        Method::SkillDelete { skill_id } => {
+            let mut skills = state.skills.write().await;
+            let deleted = skills.delete(&skill_id);
+            RpcResponse::success(id, serde_json::json!({ "deleted": deleted }))
+        }
+
+        // === Events / Metrics ===
+
+        Method::EventLog { event } => {
+            match state.events.log(&event) {
+                Ok(event_id) => RpcResponse::success(id, serde_json::json!({ "logged": true, "event_id": event_id })),
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        Method::EventQuery { filters } => {
+            match state.events.query(&filters) {
+                Ok(events) => match serde_json::to_value(&events) {
+                    Ok(v) => RpcResponse::success(id, v),
+                    Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                },
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        Method::MetricsCollect { project_root: _ } => {
+            let events = state.events.query(&harness_core::EventFilters::default());
+            match events {
+                Ok(evts) => {
+                    let report = harness_observe::QualityGrader::grade(&evts, 0);
+                    match serde_json::to_value(&report) {
+                        Ok(v) => RpcResponse::success(id, v),
+                        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        Method::MetricsQuery { filters } => {
+            let event_filters = harness_core::EventFilters {
+                since: filters.since,
+                until: filters.until,
+                ..Default::default()
+            };
+            let events = state.events.query(&event_filters);
+            match events {
+                Ok(evts) => {
+                    let report = harness_observe::QualityGrader::grade(&evts, 0);
+                    match serde_json::to_value(&report) {
+                        Ok(v) => RpcResponse::success(id, v),
+                        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        // === Rules ===
+
+        Method::RuleLoad { project_root } => {
+            let mut rules = state.rules.write().await;
+            match rules.load(&project_root) {
+                Ok(()) => {
+                    let count = rules.rules().len();
+                    RpcResponse::success(id, serde_json::json!({ "rules_count": count }))
+                }
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        Method::RuleCheck { project_root, files } => {
+            let rules = state.rules.read().await;
+            let result = match files {
+                Some(f) => rules.scan_files(&project_root, &f).await,
+                None => rules.scan(&project_root).await,
+            };
+            match result {
+                Ok(violations) => match serde_json::to_value(&violations) {
+                    Ok(v) => RpcResponse::success(id, v),
+                    Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                },
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        // === GC ===
+
+        Method::GcRun { project_id: _ } => {
+            let events = match state.events.query(&harness_core::EventFilters::default()) {
+                Ok(e) => e,
+                Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            };
+            let project = harness_core::Project::from_path(std::path::PathBuf::from("."));
+            let agent = match server.agent_registry.default_agent() {
+                Some(a) => a,
+                None => return RpcResponse::error(id, INTERNAL_ERROR, "no agent registered"),
+            };
+            match state.gc_agent.run(&project, &events, &[], agent.as_ref()).await {
+                Ok(report) => match serde_json::to_value(&report) {
+                    Ok(v) => RpcResponse::success(id, v),
+                    Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                },
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        Method::GcStatus => {
+            match state.gc_agent.drafts() {
+                Ok(drafts) => RpcResponse::success(id, serde_json::json!({ "draft_count": drafts.len() })),
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        Method::GcDrafts { project_id: _ } => {
+            match state.gc_agent.drafts() {
+                Ok(drafts) => match serde_json::to_value(&drafts) {
+                    Ok(v) => RpcResponse::success(id, v),
+                    Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                },
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        Method::GcAdopt { draft_id } => {
+            match state.gc_agent.adopt(&draft_id) {
+                Ok(()) => RpcResponse::success(id, serde_json::json!({ "adopted": true })),
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        Method::GcReject { draft_id, reason } => {
+            match state.gc_agent.reject(&draft_id, reason.as_deref()) {
+                Ok(()) => RpcResponse::success(id, serde_json::json!({ "rejected": true })),
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        // === ExecPlan ===
+
+        Method::ExecPlanInit { spec, project_root } => {
+            match harness_exec::ExecPlan::from_spec(&spec, &project_root) {
+                Ok(plan) => {
+                    let plan_id = plan.id.clone();
+                    let mut plans = state.plans.write().await;
+                    plans.insert(plan_id.clone(), plan);
+                    RpcResponse::success(id, serde_json::json!({ "plan_id": plan_id }))
+                }
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+
+        Method::ExecPlanStatus { plan_id } => {
+            let plans = state.plans.read().await;
+            match plans.get(&plan_id) {
+                Some(plan) => match serde_json::to_value(plan) {
+                    Ok(v) => RpcResponse::success(id, v),
+                    Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                },
+                None => RpcResponse::error(id, INTERNAL_ERROR, "plan not found"),
+            }
+        }
+
+        Method::ExecPlanUpdate { plan_id, updates } => {
+            let mut plans = state.plans.write().await;
+            match plans.get_mut(&plan_id) {
+                Some(plan) => {
+                    let action = updates.get("action").and_then(|a| a.as_str()).unwrap_or("");
+                    match action {
+                        "activate" => plan.activate(),
+                        "complete" => plan.complete(),
+                        "abandon" => plan.abandon(),
+                        "add_milestone" => {
+                            if let Some(desc) = updates.get("description").and_then(|d| d.as_str()) {
+                                plan.add_milestone(desc.to_string());
+                            }
+                        }
+                        "log_decision" => {
+                            let decision = updates.get("decision").and_then(|d| d.as_str()).unwrap_or("");
+                            let rationale = updates.get("rationale").and_then(|r| r.as_str()).unwrap_or("");
+                            plan.log_decision(decision, rationale);
+                        }
+                        _ => return RpcResponse::error(id, INTERNAL_ERROR, format!("unknown action: {action}")),
+                    }
+                    match serde_json::to_value(&*plan) {
+                        Ok(v) => RpcResponse::success(id, v),
+                        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                    }
+                }
+                None => RpcResponse::error(id, INTERNAL_ERROR, "plan not found"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
+    use harness_agents::AgentRegistry;
+    use harness_core::HarnessConfig;
+    use harness_protocol::{Method, RpcRequest};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
+        let server = Arc::new(HarnessServer::new(
+            HarnessConfig::default(),
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        ));
+        let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
+        let events = Arc::new(harness_observe::EventStore::new(dir)?);
+        let signal_detector = harness_gc::SignalDetector::new(
+            harness_gc::signal_detector::SignalThresholds::default(),
+            harness_core::ProjectId::new(),
+        );
+        let draft_store = harness_gc::DraftStore::new(dir)?;
+        let gc_agent = Arc::new(harness_gc::GcAgent::new(
+            harness_gc::gc_agent::GcConfig::default(),
+            signal_detector,
+            draft_store,
+        ));
+        let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
+        Ok(AppState {
+            server,
+            tasks,
+            skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
+            rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
+            events,
+            gc_agent,
+            plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            thread_db: Some(thread_db),
+        })
+    }
+
+    #[tokio::test]
+    async fn thread_start_persists_to_db() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::ThreadStart { cwd: std::path::PathBuf::from("/test/project") },
+        };
+        let resp = handle_request(&state, req).await;
+
+        assert!(resp.error.is_none(), "expected success, got error: {:?}", resp.error);
+        let thread_id_str = resp.result.unwrap()["thread_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let db = state.thread_db.as_ref().unwrap();
+        let thread = db.get(&thread_id_str).await?.expect("thread should be in DB");
+        assert_eq!(thread.project_root, std::path::PathBuf::from("/test/project"));
+        Ok(())
     }
 }
