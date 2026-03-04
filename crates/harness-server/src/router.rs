@@ -156,6 +156,7 @@ mod tests {
             gc_agent,
             plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
             thread_db: Some(thread_db),
+            interceptors: vec![],
         })
     }
 

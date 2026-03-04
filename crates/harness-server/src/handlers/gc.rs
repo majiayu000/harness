@@ -115,6 +115,7 @@ pub async fn gc_adopt(
                         agent,
                         state.skills.clone(),
                         state.events.clone(),
+                        state.interceptors.clone(),
                         req,
                     )
                     .await;

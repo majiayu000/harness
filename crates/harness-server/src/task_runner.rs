@@ -174,6 +174,7 @@ pub async fn spawn_task(
     agent: Arc<dyn CodeAgent>,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
+    interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     req: CreateTaskRequest,
 ) -> TaskId {
     let task_id = TaskId::new();
@@ -183,6 +184,7 @@ pub async fn spawn_task(
     let id = task_id.clone();
     let store_watcher = store.clone();
     let id_watcher = id.clone();
+    let interceptors = Arc::new(interceptors);
 
     let handle = tokio::spawn(async move {
         let project = match req.project.clone() {
@@ -192,7 +194,7 @@ pub async fn spawn_task(
                 .unwrap_or_else(|_| PathBuf::from(".")),
         };
         crate::task_executor::run_task(
-            &store, &id, agent.as_ref(), skills, events, &req, project,
+            &store, &id, agent.as_ref(), skills, events, interceptors, &req, project,
         )
         .await
     });
@@ -344,7 +346,7 @@ mod tests {
         };
 
         let events = Arc::new(harness_observe::EventStore::new(dir.path())?);
-        spawn_task(store, agent_clone, skills, events, req).await;
+        spawn_task(store, agent_clone, skills, events, vec![], req).await;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -358,6 +360,62 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, ContextItem::Skill { .. })),
             "expected at least one ContextItem::Skill"
+        );
+        Ok(())
+    }
+
+    struct BlockingInterceptor;
+
+    #[async_trait]
+    impl harness_core::interceptor::TurnInterceptor for BlockingInterceptor {
+        fn name(&self) -> &str {
+            "blocking-test"
+        }
+
+        async fn pre_execute(
+            &self,
+            _req: &AgentRequest,
+        ) -> harness_core::interceptor::InterceptResult {
+            harness_core::interceptor::InterceptResult::block("test block")
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_interceptor_fails_task() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
+        let agent = CapturingAgent::new();
+        let events = Arc::new(harness_observe::EventStore::new(dir.path())?);
+
+        let interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>> =
+            vec![Arc::new(BlockingInterceptor)];
+
+        let req = CreateTaskRequest {
+            prompt: Some("blocked task".into()),
+            issue: None,
+            pr: None,
+            project: Some(dir.path().to_path_buf()),
+            wait_secs: 0,
+            max_rounds: 0,
+            turn_timeout_secs: 30,
+        };
+
+        let task_id = spawn_task(store.clone(), agent, skills, events, interceptors, req).await;
+
+        // Allow async task to complete.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let state = store.get(&task_id).expect("task must exist");
+        assert!(
+            matches!(state.status, TaskStatus::Failed),
+            "expected Failed, got {:?}",
+            state.status
+        );
+        assert!(
+            state.error.as_deref().unwrap_or("").contains("Blocked by interceptor"),
+            "error message should mention blocked: {:?}",
+            state.error
         );
         Ok(())
     }

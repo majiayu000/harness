@@ -3,12 +3,52 @@ use crate::task_runner::{
     TaskStore,
 };
 use harness_core::{
-    prompts, AgentRequest, CodeAgent, ContextItem, Decision, Event, SessionId,
+    interceptor::TurnInterceptor, prompts, AgentRequest, AgentResponse, CodeAgent, ContextItem,
+    Decision, Event, SessionId,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
+
+/// Run all pre_execute interceptors in order. Returns the (possibly modified) request,
+/// or an error if any interceptor returns Block.
+async fn run_pre_execute(
+    interceptors: &[Arc<dyn TurnInterceptor>],
+    mut req: AgentRequest,
+) -> anyhow::Result<AgentRequest> {
+    for interceptor in interceptors {
+        let result = interceptor.pre_execute(&req).await;
+        if let Decision::Block = result.decision {
+            let reason = result.reason.unwrap_or_else(|| interceptor.name().to_string());
+            return Err(anyhow::anyhow!("Blocked by interceptor '{}': {}", interceptor.name(), reason));
+        }
+        if let Some(modified) = result.request {
+            req = modified;
+        }
+    }
+    Ok(req)
+}
+
+async fn run_post_execute(
+    interceptors: &[Arc<dyn TurnInterceptor>],
+    req: &AgentRequest,
+    resp: &AgentResponse,
+) {
+    for interceptor in interceptors {
+        interceptor.post_execute(req, resp).await;
+    }
+}
+
+async fn run_on_error(
+    interceptors: &[Arc<dyn TurnInterceptor>],
+    req: &AgentRequest,
+    error: &str,
+) {
+    for interceptor in interceptors {
+        interceptor.on_error(req, error).await;
+    }
+}
 
 pub(crate) async fn run_task(
     store: &TaskStore,
@@ -16,6 +56,7 @@ pub(crate) async fn run_task(
     agent: &dyn CodeAgent,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
+    interceptors: Arc<Vec<Arc<dyn TurnInterceptor>>>,
     req: &CreateTaskRequest,
     project: PathBuf,
 ) -> anyhow::Result<()> {
@@ -42,18 +83,33 @@ pub(crate) async fn run_task(
     };
 
     let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
-    let resp = tokio::time::timeout(
-        turn_timeout,
-        agent.execute(AgentRequest {
-            prompt: first_prompt,
-            project_root: project.clone(),
-            context: skill_items.clone(),
-            ..Default::default()
-        }),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Turn 1 timed out after {}s", req.turn_timeout_secs))?
-    ?;
+
+    let initial_req = AgentRequest {
+        prompt: first_prompt,
+        project_root: project.clone(),
+        context: skill_items.clone(),
+        ..Default::default()
+    };
+
+    // Run pre_execute interceptors; Block aborts the task.
+    let first_req = run_pre_execute(&interceptors, initial_req).await?;
+
+    let resp = tokio::time::timeout(turn_timeout, agent.execute(first_req.clone())).await;
+    let resp = match resp {
+        Ok(Ok(r)) => {
+            run_post_execute(&interceptors, &first_req, &r).await;
+            r
+        }
+        Ok(Err(e)) => {
+            run_on_error(&interceptors, &first_req, &e.to_string()).await;
+            return Err(e.into());
+        }
+        Err(_) => {
+            let msg = format!("Turn 1 timed out after {}s", req.turn_timeout_secs);
+            run_on_error(&interceptors, &first_req, &msg).await;
+            return Err(anyhow::anyhow!("{msg}"));
+        }
+    };
 
     let pr_url = prompts::parse_pr_url(&resp.output);
     let pr_number = pr_url
@@ -95,20 +151,31 @@ pub(crate) async fn run_task(
 
         update_status(store, task_id, TaskStatus::Reviewing, round).await;
 
-        let resp = tokio::time::timeout(
-            turn_timeout,
-            agent.execute(AgentRequest {
-                prompt: prompts::review_prompt(req.issue, pr_num, round, prev_fixed),
-                project_root: project.clone(),
-                context: skill_items.clone(),
-                ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!("Turn {round} timed out after {}s", req.turn_timeout_secs)
-        })?
-        ?;
+        let review_req = AgentRequest {
+            prompt: prompts::review_prompt(req.issue, pr_num, round, prev_fixed),
+            project_root: project.clone(),
+            context: skill_items.clone(),
+            ..Default::default()
+        };
+
+        let review_req = run_pre_execute(&interceptors, review_req).await?;
+
+        let resp = tokio::time::timeout(turn_timeout, agent.execute(review_req.clone())).await;
+        let resp = match resp {
+            Ok(Ok(r)) => {
+                run_post_execute(&interceptors, &review_req, &r).await;
+                r
+            }
+            Ok(Err(e)) => {
+                run_on_error(&interceptors, &review_req, &e.to_string()).await;
+                return Err(e.into());
+            }
+            Err(_) => {
+                let msg = format!("Turn {round} timed out after {}s", req.turn_timeout_secs);
+                run_on_error(&interceptors, &review_req, &msg).await;
+                return Err(anyhow::anyhow!("{msg}"));
+            }
+        };
 
         if prompts::is_waiting(&resp.output) {
             mutate_and_persist(store, task_id, |s| {

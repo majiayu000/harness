@@ -21,6 +21,7 @@ pub struct AppState {
     pub gc_agent: Arc<harness_gc::GcAgent>,
     pub plans: Arc<RwLock<std::collections::HashMap<harness_core::ExecPlanId, harness_exec::ExecPlan>>>,
     pub thread_db: Option<crate::thread_db::ThreadDb>,
+    pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
 }
 
 fn data_dir() -> std::path::PathBuf {
@@ -86,6 +87,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         gc_agent,
         plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
         thread_db: Some(thread_db),
+        interceptors: vec![],
     })
 }
 
@@ -140,7 +142,7 @@ async fn create_task(
         }
     };
 
-    let task_id = task_runner::spawn_task(state.tasks.clone(), agent, state.skills.clone(), state.events.clone(), req).await;
+    let task_id = task_runner::spawn_task(state.tasks.clone(), agent, state.skills.clone(), state.events.clone(), state.interceptors.clone(), req).await;
 
     (
         StatusCode::ACCEPTED,
