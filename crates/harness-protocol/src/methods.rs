@@ -52,6 +52,9 @@ pub enum Method {
     EventQuery { filters: EventFilters },
     MetricsCollect { project_root: PathBuf },
     MetricsQuery { filters: MetricFilters },
+
+    // === Task classification ===
+    TaskClassify { prompt: String, issue: Option<u64>, pr: Option<u64> },
 }
 
 /// JSON-RPC 2.0 request envelope.
