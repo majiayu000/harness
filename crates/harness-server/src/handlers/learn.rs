@@ -9,6 +9,11 @@ pub async fn learn_rules(
     id: Option<serde_json::Value>,
     project_root: PathBuf,
 ) -> RpcResponse {
+    let project_root = match crate::handlers::validate_project_root(&project_root) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+    };
+
     let draft_contents = match collect_adopted_draft_contents(state) {
         Ok(d) => d,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
@@ -62,6 +67,11 @@ pub async fn learn_skills(
     id: Option<serde_json::Value>,
     project_root: PathBuf,
 ) -> RpcResponse {
+    let project_root = match crate::handlers::validate_project_root(&project_root) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+    };
+
     let draft_contents = match collect_adopted_draft_contents(state) {
         Ok(d) => d,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
@@ -92,16 +102,21 @@ pub async fn learn_skills(
     };
 
     let skill_items = parse_skills_from_output(&resp.output);
-    let count = skill_items.len();
     let mut created = Vec::new();
 
     {
         let mut skills = state.skills.write().await;
         for (name, content) in skill_items {
+            if let Err(e) = validate_skill_name(&name) {
+                tracing::warn!("skipping skill with invalid name: {e}");
+                continue;
+            }
             let skill = skills.create(name, content).clone();
             created.push(skill);
         }
     }
+
+    let count = created.len();
 
     match serde_json::to_value(&created) {
         Ok(v) => RpcResponse::success(
@@ -110,6 +125,24 @@ pub async fn learn_skills(
         ),
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     }
+}
+
+/// Validate that a skill name is safe to use as a filename component.
+/// Rejects empty names, path separators, and `..` sequences.
+fn validate_skill_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("skill name must not be empty".to_string());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(format!("skill name contains path traversal characters: '{name}'"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(format!("skill name contains invalid characters: '{name}'"));
+    }
+    Ok(())
 }
 
 fn collect_adopted_draft_contents(state: &AppState) -> Result<Vec<String>, String> {
@@ -171,13 +204,21 @@ fn parse_rules_from_output(output: &str) -> Vec<Rule> {
             }
             let severity = detect_severity(section);
             let category = detect_category(&id);
+            let description = section
+                .lines()
+                .skip(1)
+                .filter(|line| !line.trim().to_lowercase().starts_with("severity:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
             rules.push(Rule {
                 id: RuleId::from_str(&id),
                 title: title.trim().to_string(),
                 severity,
                 category,
                 paths: Vec::new(),
-                description: section.to_string(),
+                description,
                 fix_pattern: None,
             });
         }

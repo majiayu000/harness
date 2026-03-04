@@ -2,6 +2,7 @@ use harness_core::{
     Category, GuardId, Language, RuleId, Severity, Violation,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +26,7 @@ pub struct Guard {
 
 pub struct RuleEngine {
     rules: Vec<Rule>,
+    rule_ids: HashSet<RuleId>,
     guards: Vec<Guard>,
 }
 
@@ -32,6 +34,7 @@ impl RuleEngine {
     pub fn new() -> Self {
         Self {
             rules: Vec::new(),
+            rule_ids: HashSet::new(),
             guards: Vec::new(),
         }
     }
@@ -156,8 +159,10 @@ impl RuleEngine {
                     Category::Style
                 };
 
+                let rule_id = RuleId::from_str(&id);
+                self.rule_ids.insert(rule_id.clone());
                 self.rules.push(Rule {
-                    id: RuleId::from_str(&id),
+                    id: rule_id,
                     title: title.trim().to_string(),
                     severity,
                     category,
@@ -263,9 +268,10 @@ impl RuleEngine {
 
     /// Add a rule, deduplicating by rule_id (skip if already present).
     pub fn add_rule(&mut self, rule: Rule) {
-        if self.rules.iter().any(|r| r.id == rule.id) {
+        if self.rule_ids.contains(&rule.id) {
             return;
         }
+        self.rule_ids.insert(rule.id.clone());
         self.rules.push(rule);
     }
 

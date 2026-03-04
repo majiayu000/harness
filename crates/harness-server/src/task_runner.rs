@@ -187,13 +187,14 @@ pub async fn spawn_task(
     let interceptors = Arc::new(interceptors);
 
     let handle = tokio::spawn(async move {
-        let project = match req.project.clone() {
-            Some(p) => crate::handlers::validate_project_root(&p)
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        let raw_project = match req.project.clone() {
+            Some(p) => p,
             None => tokio::task::spawn_blocking(detect_main_worktree)
                 .await
                 .unwrap_or_else(|_| PathBuf::from(".")),
         };
+        let project = crate::handlers::validate_project_root(&raw_project)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         crate::task_executor::run_task(
             &store, &id, agent.as_ref(), skills, events, interceptors, &req, project,
         )
