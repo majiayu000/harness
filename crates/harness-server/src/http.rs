@@ -96,6 +96,12 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
     let state = Arc::new(build_app_state(server).await?);
 
+    let initial_grade = {
+        let events = state.events.query(&harness_core::EventFilters::default()).unwrap_or_default();
+        harness_observe::quality::QualityGrader::grade(&events, 0).grade
+    };
+    crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
+
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/rpc", post(handle_rpc))
