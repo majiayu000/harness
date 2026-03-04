@@ -45,7 +45,9 @@ pub fn implement_from_prompt(prompt: &str) -> String {
 ///
 /// `round` controls convergence behavior:
 /// - Round 2: fix all critical/high/medium comments
-/// - Round 3+: only fix critical/high; skip medium style/design suggestions
+/// - Round 3: only fix critical/high; skip medium style/design suggestions
+/// - Round 4+: convergence mode — only fix actual bugs; skip all design/style/
+///   cross-platform suggestions. If only medium/low remain, declare LGTM.
 ///
 /// When `prev_fixed` is true (previous round pushed code), the agent must first
 /// verify that Gemini has submitted a **new** review covering the latest commit
@@ -58,9 +60,19 @@ pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32, prev_fixed: bool) 
 
     let severity_guidance = if round <= 2 {
         "Fix all review comments marked critical, high, or medium severity."
-    } else {
+    } else if round == 3 {
         "Fix only critical and high severity issues. \
          Skip medium severity style/design suggestions — they are acceptable for now."
+    } else {
+        "CONVERGENCE MODE: This is review round 4+. Only fix comments that describe \
+         actual bugs or security vulnerabilities with concrete exploit scenarios. \
+         Skip ALL of the following:\n\
+         - Cross-platform compatibility suggestions (e.g. Windows support when targeting Linux/macOS)\n\
+         - Style/design preference changes\n\
+         - Hardcoded values that are intentional defaults\n\
+         - \"Could be improved\" suggestions without concrete bug impact\n\
+         If no remaining comments describe actual bugs, print LGTM even if medium-severity \
+         comments exist."
     };
 
     let push_action = format!(
@@ -193,9 +205,17 @@ mod tests {
     }
 
     #[test]
-    fn test_review_prompt_late_round_skips_medium() {
+    fn test_review_prompt_round3_skips_medium() {
         let p = review_prompt(None, 10, 3, false);
         assert!(p.contains("Skip medium"));
+    }
+
+    #[test]
+    fn test_review_prompt_round4_convergence_mode() {
+        let p = review_prompt(None, 10, 4, false);
+        assert!(p.contains("CONVERGENCE MODE"));
+        assert!(p.contains("actual bugs"));
+        assert!(!p.contains("Skip medium")); // different guidance in convergence
     }
 
     #[test]
