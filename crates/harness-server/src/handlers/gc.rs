@@ -10,7 +10,9 @@ pub async fn gc_run(
         Ok(e) => e,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     };
-    let project_root = std::path::PathBuf::from(".");
+    let project_root = tokio::task::spawn_blocking(crate::task_runner::detect_main_worktree)
+        .await
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let violations = {
         let rules = state.rules.read().await;
         rules.scan(&project_root).await.unwrap_or_default()

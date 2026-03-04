@@ -36,8 +36,9 @@ pub(crate) fn validate_file_in_root(
 /// Returns the canonicalized path on success.
 pub(crate) fn validate_project_root(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
     let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
         .map(std::path::PathBuf::from)
-        .map_err(|_| "HOME environment variable not set".to_string())?;
+        .map_err(|_| "could not determine home directory (HOME/USERPROFILE not set)".to_string())?;
     let canonical = path
         .canonicalize()
         .map_err(|e| format!("invalid project root '{}': {e}", path.display()))?;

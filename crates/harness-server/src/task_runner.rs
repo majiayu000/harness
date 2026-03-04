@@ -97,7 +97,7 @@ pub struct CreateTaskRequest {
 
 /// Detect the main git worktree root using a blocking subprocess call.
 /// Must be called via `tokio::task::spawn_blocking` in async contexts.
-fn detect_main_worktree() -> PathBuf {
+pub(crate) fn detect_main_worktree() -> PathBuf {
     std::process::Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .output()
