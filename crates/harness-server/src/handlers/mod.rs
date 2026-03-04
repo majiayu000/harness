@@ -10,6 +10,38 @@ pub mod rules;
 pub mod skills;
 pub mod thread;
 
+/// Persist rule scan violations to the event store using the same format as rule_check.
+pub(crate) fn persist_violations(
+    events: &harness_observe::EventStore,
+    violations: &[harness_core::Violation],
+) {
+    let session_id = harness_core::SessionId::new();
+    for violation in violations {
+        let decision = match violation.severity {
+            harness_core::Severity::Critical | harness_core::Severity::High => {
+                harness_core::Decision::Block
+            }
+            harness_core::Severity::Medium => harness_core::Decision::Warn,
+            harness_core::Severity::Low => harness_core::Decision::Pass,
+        };
+        let mut event = harness_core::Event::new(
+            session_id.clone(),
+            "rule_check",
+            violation.rule_id.as_str(),
+            decision,
+        );
+        event.reason = Some(violation.message.clone());
+        event.detail = Some(format!(
+            "{}:{}",
+            violation.file.display(),
+            violation.line.map(|l| l.to_string()).unwrap_or_default()
+        ));
+        if let Err(e) = events.log(&event) {
+            tracing::warn!("failed to log rule violation event: {e}");
+        }
+    }
+}
+
 /// Validate that `file` is an existing path within `project_root` (already canonicalized).
 /// Returns the canonicalized file path on success.
 pub(crate) fn validate_file_in_root(

@@ -99,6 +99,42 @@ pub fn compute_trends(events: &[Event], period_days: u32) -> Vec<ComplianceTrend
     trends
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleStats {
+    pub rule_id: String,
+    pub total: usize,
+    pub block_count: usize,
+    pub warn_count: usize,
+    pub pass_count: usize,
+}
+
+/// Aggregate per-rule violation counts from historical rule_check events.
+pub fn aggregate_rule_stats(events: &[Event]) -> Vec<RuleStats> {
+    // rule_check events store the rule_id in the `tool` field
+    let mut map: HashMap<String, (usize, usize, usize, usize)> = HashMap::new();
+    for e in events.iter().filter(|e| e.hook == "rule_check") {
+        let entry = map.entry(e.tool.clone()).or_insert((0, 0, 0, 0));
+        entry.0 += 1;
+        match e.decision {
+            Decision::Pass | Decision::Complete => entry.3 += 1,
+            Decision::Warn => entry.2 += 1,
+            Decision::Block | Decision::Gate | Decision::Escalate => entry.1 += 1,
+        }
+    }
+    let mut stats: Vec<RuleStats> = map
+        .into_iter()
+        .map(|(rule_id, (total, block, warn, pass))| RuleStats {
+            rule_id,
+            total,
+            block_count: block,
+            warn_count: warn,
+            pass_count: pass,
+        })
+        .collect();
+    stats.sort_by(|a, b| b.total.cmp(&a.total));
+    stats
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +196,37 @@ mod tests {
         assert!(!trends.is_empty());
         assert!((trends[0].pass_rate - 1.0).abs() < f64::EPSILON);
         assert_eq!(trends[0].grade, Grade::A);
+    }
+
+    #[test]
+    fn aggregate_rule_stats_empty_returns_empty() {
+        let stats = aggregate_rule_stats(&[]);
+        assert!(stats.is_empty());
+    }
+
+    #[test]
+    fn aggregate_rule_stats_groups_by_rule_id() {
+        let events = vec![
+            make_rule_event("SEC-01", Decision::Block),
+            make_rule_event("SEC-01", Decision::Warn),
+            make_rule_event("SEC-02", Decision::Pass),
+            make_event("other_hook", Decision::Block),
+        ];
+        let stats = aggregate_rule_stats(&events);
+        assert_eq!(stats.len(), 2);
+        assert!(
+            stats.iter().any(|s| s.rule_id == "SEC-01" && s.total == 2
+                && s.block_count == 1 && s.warn_count == 1),
+            "expected SEC-01 with 2 total, 1 block, 1 warn"
+        );
+        assert!(
+            stats.iter().any(|s| s.rule_id == "SEC-02" && s.total == 1 && s.pass_count == 1),
+            "expected SEC-02 with 1 total, 1 pass"
+        );
+    }
+
+    fn make_rule_event(rule_id: &str, decision: Decision) -> Event {
+        Event::new(SessionId::new(), "rule_check", rule_id, decision)
     }
 
     #[test]
