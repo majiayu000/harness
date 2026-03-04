@@ -87,7 +87,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         gc_agent,
         plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
         thread_db: Some(thread_db),
-        interceptors: vec![],
+        interceptors: vec![Arc::new(crate::contract_validator::ContractValidator::new())],
     })
 }
 
