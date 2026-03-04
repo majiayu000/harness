@@ -43,11 +43,9 @@ pub fn implement_from_prompt(prompt: &str) -> String {
 
 /// Build review loop prompt for a given round.
 ///
-/// `round` controls convergence behavior:
-/// - Round 2: fix all critical/high/medium comments
-/// - Round 3: only fix critical/high; skip medium style/design suggestions
-/// - Round 4+: convergence mode — only fix actual bugs; skip all design/style/
-///   cross-platform suggestions. If only medium/low remain, declare LGTM.
+/// The agent reads each review comment and decides independently whether to
+/// fix it, based on the project context and actual impact — not blindly by
+/// severity label. Later rounds raise the bar for what counts as worth fixing.
 ///
 /// When `prev_fixed` is true (previous round pushed code), the agent must first
 /// verify that Gemini has submitted a **new** review covering the latest commit
@@ -58,22 +56,24 @@ pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32, prev_fixed: bool) 
         None => format!("Review PR #{pr}.\n"),
     };
 
-    let severity_guidance = if round <= 2 {
-        "Fix all review comments marked critical, high, or medium severity."
-    } else if round == 3 {
-        "Fix only critical and high severity issues. \
-         Skip medium severity style/design suggestions — they are acceptable for now."
-    } else {
-        "CONVERGENCE MODE: This is review round 4+. Only fix comments that describe \
-         actual bugs or security vulnerabilities with concrete exploit scenarios. \
-         Skip ALL of the following:\n\
-         - Cross-platform compatibility suggestions (e.g. Windows support when targeting Linux/macOS)\n\
-         - Style/design preference changes\n\
-         - Hardcoded values that are intentional defaults\n\
-         - \"Could be improved\" suggestions without concrete bug impact\n\
-         If no remaining comments describe actual bugs, print LGTM even if medium-severity \
-         comments exist."
-    };
+    let triage_instruction = format!(
+        "For EACH review comment, analyze it and decide:\n\
+         - FIX: the comment describes a real bug, security flaw, or correctness issue \
+         that could cause failures in production. Fix it.\n\
+         - SKIP: the comment is a style preference, theoretical concern without \
+         concrete impact, or not applicable to this project's context. Skip it.\n\n\
+         Before fixing or skipping, briefly reason about WHY. Do not blindly obey \
+         the reviewer's severity label — a comment labeled \"high\" might be irrelevant \
+         to this project, and a comment labeled \"medium\" might be a real bug.\n\n\
+         Round {round} threshold: {}",
+        if round <= 2 {
+            "Be thorough — fix anything that has a reasonable chance of causing issues."
+        } else {
+            "Be selective — only fix comments where you can articulate a concrete \
+             failure scenario. If a comment is about style, cross-platform compatibility \
+             for platforms we don't target, or hypothetical concerns, skip it."
+        }
+    );
 
     let push_action = format!(
         "commit, push, then run `gh pr comment {pr} --body '/gemini review'` \
@@ -105,16 +105,15 @@ pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32, prev_fixed: bool) 
          1. Run `gh pr checks {pr}` to check CI status\n\
          2. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews` to read review verdicts\n\
          3. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/comments` to read inline review comments\n\
-         4. {severity_guidance}\n\
-         5. If all CI checks pass and there are no unresolved review comments \
-         that match the severity criteria above, print LGTM on the last line\n\
-         6. Otherwise fix the issues, {push_action}, \
+         4. {triage_instruction}\n\
+         5. If CI passes and all remaining comments are SKIP, print LGTM on the last line\n\
+         6. If you fixed anything, {push_action}, \
          and print FIXED on the last line\
          {freshness_check}\n\n\
          Constraints:\n\
          - NEVER downgrade dependency versions\n\
-         - Do NOT refactor working code for style preferences\n\
-         - Focus on correctness and safety, not cosmetic improvements"
+         - Do NOT refactor working code that was not flagged in review\n\
+         - Each FIX/SKIP decision must include a one-line reason"
     )
 }
 
@@ -194,28 +193,34 @@ mod tests {
         let p = review_prompt(Some(5), 10, 2, false);
         assert!(p.contains("issue #5"));
         assert!(p.contains("PR #10"));
-        assert!(p.contains("medium")); // round 2 includes medium
     }
 
     #[test]
     fn test_review_prompt_without_issue() {
         let p = review_prompt(None, 10, 2, false);
         assert!(p.contains("PR #10"));
-        assert!(!p.contains("issue #")); // no issue reference when None
+        assert!(!p.contains("issue #"));
     }
 
     #[test]
-    fn test_review_prompt_round3_skips_medium() {
+    fn test_review_prompt_triage_requires_reasoning() {
+        let p = review_prompt(None, 10, 2, false);
+        assert!(p.contains("FIX"));
+        assert!(p.contains("SKIP"));
+        assert!(p.contains("reason"));
+    }
+
+    #[test]
+    fn test_review_prompt_early_round_thorough() {
+        let p = review_prompt(None, 10, 2, false);
+        assert!(p.contains("Be thorough"));
+    }
+
+    #[test]
+    fn test_review_prompt_late_round_selective() {
         let p = review_prompt(None, 10, 3, false);
-        assert!(p.contains("Skip medium"));
-    }
-
-    #[test]
-    fn test_review_prompt_round4_convergence_mode() {
-        let p = review_prompt(None, 10, 4, false);
-        assert!(p.contains("CONVERGENCE MODE"));
-        assert!(p.contains("actual bugs"));
-        assert!(!p.contains("Skip medium")); // different guidance in convergence
+        assert!(p.contains("Be selective"));
+        assert!(p.contains("concrete"));
     }
 
     #[test]
