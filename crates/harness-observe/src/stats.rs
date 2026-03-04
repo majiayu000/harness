@@ -26,10 +26,7 @@ pub fn rule_violation_stats(events: &[Event]) -> Vec<RuleViolationStat> {
         }
         let entry = map.entry(e.tool.clone()).or_insert((0, None));
         entry.0 += 1;
-        entry.1 = Some(match entry.1 {
-            Some(prev) => prev.max(e.ts),
-            None => e.ts,
-        });
+        entry.1 = Some(entry.1.map_or(e.ts, |prev| prev.max(e.ts)));
     }
     let mut stats: Vec<RuleViolationStat> = map
         .into_iter()
