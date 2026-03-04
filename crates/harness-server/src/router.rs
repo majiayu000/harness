@@ -421,7 +421,14 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
                 Ok(e) => e,
                 Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             };
-            let project_root = std::path::PathBuf::from(".");
+            // Use the server's actual working directory rather than the relative path ".".
+            // Validate it to ensure it is within the user's home directory.
+            let project_root_raw = std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let project_root = match validate_project_root(&project_root_raw) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+            };
             let violations = {
                 let rules = state.rules.read().await;
                 rules.scan(&project_root).await.unwrap_or_default()
