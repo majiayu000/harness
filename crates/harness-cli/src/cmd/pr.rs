@@ -1,13 +1,13 @@
-use harness_agents::claude::ClaudeCodeAgent;
 use harness_core::{prompts, AgentRequest, CodeAgent, HarnessConfig};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
-fn create_agent(config: &HarnessConfig) -> ClaudeCodeAgent {
-    ClaudeCodeAgent::new(
-        config.agents.claude.cli_path.clone(),
-        config.agents.claude.default_model.clone(),
-    )
+fn create_agent(
+    config: &HarnessConfig,
+    agent_name: Option<&str>,
+) -> anyhow::Result<Arc<dyn CodeAgent>> {
+    crate::agent::resolve_agent(config, agent_name)
 }
 
 pub async fn fix(
@@ -16,8 +16,9 @@ pub async fn fix(
     wait: u64,
     max_rounds: u32,
     project: PathBuf,
+    agent_name: Option<&str>,
 ) -> anyhow::Result<()> {
-    let agent = create_agent(config);
+    let agent = create_agent(config, agent_name)?;
 
     println!("[harness] Round 1 — Implementing issue #{issue} and creating PR");
 
@@ -38,7 +39,7 @@ pub async fn fix(
     println!("[harness] PR #{pr_number} created: {pr_url}");
 
     run_review_loop(
-        &agent,
+        agent.as_ref(),
         &project,
         Some(issue),
         pr_number,
@@ -55,16 +56,17 @@ pub async fn loop_pr(
     wait: u64,
     max_rounds: u32,
     project: PathBuf,
+    agent_name: Option<&str>,
 ) -> anyhow::Result<()> {
-    let agent = create_agent(config);
+    let agent = create_agent(config, agent_name)?;
 
     println!("[harness] Starting review loop for PR #{pr}");
 
-    run_review_loop(&agent, &project, None, pr, None, wait, max_rounds).await
+    run_review_loop(agent.as_ref(), &project, None, pr, None, wait, max_rounds).await
 }
 
 async fn run_review_loop(
-    agent: &impl CodeAgent,
+    agent: &dyn CodeAgent,
     project: &PathBuf,
     issue: Option<u64>,
     pr: u64,

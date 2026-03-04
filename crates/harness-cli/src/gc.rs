@@ -26,12 +26,9 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
             let draft_store = DraftStore::new(data_dir)?;
             let gc_agent = GcAgent::new(gc_config, signal_detector, draft_store);
 
-            let claude = harness_agents::claude::ClaudeCodeAgent::new(
-                config.agents.claude.cli_path.clone(),
-                config.agents.claude.default_model.clone(),
-            );
+            let agent = crate::agent::resolve_agent(config, None)?;
 
-            let report = gc_agent.run(&project, &events, &[], &claude).await?;
+            let report = gc_agent.run(&project, &events, &[], agent.as_ref()).await?;
             println!("Signals detected: {}", report.signals.len());
             println!("Drafts generated: {}", report.drafts_generated);
             for e in &report.errors {
@@ -62,7 +59,10 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
                 println!("No pending drafts");
             } else {
                 for draft in &pending {
-                    println!("{} [{:?}] {}", draft.id, draft.signal.signal_type, draft.rationale);
+                    println!(
+                        "{} [{:?}] {}",
+                        draft.id, draft.signal.signal_type, draft.rationale
+                    );
                 }
             }
         }

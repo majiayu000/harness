@@ -33,8 +33,8 @@ pub enum Command {
         #[arg(long)]
         project: Option<PathBuf>,
         /// Agent to use
-        #[arg(long, default_value = "claude")]
-        agent: String,
+        #[arg(long)]
+        agent: Option<String>,
     },
 
     /// GC Agent commands
@@ -78,13 +78,9 @@ pub enum GcCommand {
     /// Show GC status
     Status,
     /// List pending drafts
-    Drafts {
-        project: Option<PathBuf>,
-    },
+    Drafts { project: Option<PathBuf> },
     /// Adopt a draft
-    Adopt {
-        draft_id: String,
-    },
+    Adopt { draft_id: String },
     /// Reject a draft
     Reject {
         draft_id: String,
@@ -123,9 +119,7 @@ pub enum SkillCommand {
         file: PathBuf,
     },
     /// Delete a skill
-    Delete {
-        skill_id: String,
-    },
+    Delete { skill_id: String },
 }
 
 #[derive(Args)]
@@ -139,6 +133,9 @@ pub struct LoopArgs {
     /// Project directory
     #[arg(long, default_value = ".")]
     pub project: std::path::PathBuf,
+    /// Agent to use (defaults to config.agents.default_agent)
+    #[arg(long)]
+    pub agent: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -185,14 +182,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { transport, port } => {
             let thread_manager = harness_server::thread_manager::ThreadManager::new();
-            let mut agent_registry = harness_agents::AgentRegistry::new(&config.agents.default_agent);
-            agent_registry.register(
-                "claude",
-                Arc::new(harness_agents::claude::ClaudeCodeAgent::new(
-                    config.agents.claude.cli_path.clone(),
-                    config.agents.claude.default_model.clone(),
-                )),
-            );
+            let agent_registry = crate::agent::build_agent_registry(&config);
             let server = harness_server::server::HarnessServer::new(
                 config.clone(),
                 thread_manager,
@@ -213,12 +203,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
-        Command::Exec { prompt, project, agent: _agent_name } => {
+        Command::Exec {
+            prompt,
+            project,
+            agent,
+        } => {
             let project_root = project.unwrap_or_else(|| std::env::current_dir().unwrap());
-            let agent = harness_agents::claude::ClaudeCodeAgent::new(
-                config.agents.claude.cli_path.clone(),
-                config.agents.claude.default_model.clone(),
-            );
+            let agent = crate::agent::resolve_agent(&config, agent.as_deref())?;
 
             let req = harness_core::AgentRequest {
                 prompt,
@@ -226,7 +217,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 ..Default::default()
             };
 
-            let resp = harness_core::CodeAgent::execute(&agent, req).await?;
+            let resp = agent.execute(req).await?;
             println!("{}", resp.output);
             if !resp.stderr.is_empty() {
                 eprintln!("[harness] agent stderr:\n{}", resp.stderr);
@@ -237,99 +228,107 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             crate::gc::run_gc(cmd, &config).await?;
         }
 
-        Command::Rule { cmd } => {
-            match cmd {
-                RuleCommand::Load { project } => {
-                    let mut engine = harness_rules::RuleEngine::new();
-                    engine.load(&project)?;
-                    println!("Loaded {} rules", engine.rules().len());
-                }
-                RuleCommand::Check { project } => {
-                    let mut engine = harness_rules::RuleEngine::new();
-                    engine.load(&project)?;
-                    let violations = engine.scan(&project).await?;
-                    if violations.is_empty() {
-                        println!("No violations found");
-                    } else {
-                        for v in &violations {
-                            println!(
-                                "{:?} {}:{} [{}] {}",
-                                v.severity,
-                                v.file.display(),
-                                v.line.unwrap_or(0),
-                                v.rule_id,
-                                v.message
-                            );
-                        }
+        Command::Rule { cmd } => match cmd {
+            RuleCommand::Load { project } => {
+                let mut engine = harness_rules::RuleEngine::new();
+                engine.load(&project)?;
+                println!("Loaded {} rules", engine.rules().len());
+            }
+            RuleCommand::Check { project } => {
+                let mut engine = harness_rules::RuleEngine::new();
+                engine.load(&project)?;
+                let violations = engine.scan(&project).await?;
+                if violations.is_empty() {
+                    println!("No violations found");
+                } else {
+                    for v in &violations {
+                        println!(
+                            "{:?} {}:{} [{}] {}",
+                            v.severity,
+                            v.file.display(),
+                            v.line.unwrap_or(0),
+                            v.rule_id,
+                            v.message
+                        );
                     }
                 }
             }
-        }
+        },
 
-        Command::Skill { cmd } => {
-            match cmd {
-                SkillCommand::List { query } => {
-                    let store = harness_skills::SkillStore::new();
-                    let skills = if let Some(q) = query {
-                        store.search(&q).into_iter().cloned().collect::<Vec<_>>()
-                    } else {
-                        store.list().to_vec()
-                    };
-                    for s in &skills {
-                        println!("{}: {}", s.name, s.description);
-                    }
-                    if skills.is_empty() {
-                        println!("No skills found");
-                    }
+        Command::Skill { cmd } => match cmd {
+            SkillCommand::List { query } => {
+                let store = harness_skills::SkillStore::new();
+                let skills = if let Some(q) = query {
+                    store.search(&q).into_iter().cloned().collect::<Vec<_>>()
+                } else {
+                    store.list().to_vec()
+                };
+                for s in &skills {
+                    println!("{}: {}", s.name, s.description);
                 }
-                SkillCommand::Create { name, file } => {
-                    let content = std::fs::read_to_string(&file)?;
-                    let mut store = harness_skills::SkillStore::new();
-                    store.create(name.clone(), content);
-                    println!("Created skill: {name}");
-                }
-                SkillCommand::Delete { skill_id } => {
-                    println!("Delete skill: {skill_id}");
+                if skills.is_empty() {
+                    println!("No skills found");
                 }
             }
-        }
+            SkillCommand::Create { name, file } => {
+                let content = std::fs::read_to_string(&file)?;
+                let mut store = harness_skills::SkillStore::new();
+                store.create(name.clone(), content);
+                println!("Created skill: {name}");
+            }
+            SkillCommand::Delete { skill_id } => {
+                println!("Delete skill: {skill_id}");
+            }
+        },
 
-        Command::Pr { cmd } => {
-            match cmd {
-                PrCommand::Fix { issue, args } => {
-                    crate::cmd::pr::fix(&config, issue, args.wait, args.max_rounds, args.project).await?;
-                }
-                PrCommand::Loop { pr, args } => {
-                    crate::cmd::pr::loop_pr(&config, pr, args.wait, args.max_rounds, args.project).await?;
-                }
+        Command::Pr { cmd } => match cmd {
+            PrCommand::Fix { issue, args } => {
+                crate::cmd::pr::fix(
+                    &config,
+                    issue,
+                    args.wait,
+                    args.max_rounds,
+                    args.project,
+                    args.agent.as_deref(),
+                )
+                .await?;
             }
-        }
+            PrCommand::Loop { pr, args } => {
+                crate::cmd::pr::loop_pr(
+                    &config,
+                    pr,
+                    args.wait,
+                    args.max_rounds,
+                    args.project,
+                    args.agent.as_deref(),
+                )
+                .await?;
+            }
+        },
 
-        Command::Plan { cmd } => {
-            match cmd {
-                PlanCommand::Init { spec } => {
-                    let content = std::fs::read_to_string(&spec)?;
-                    let project_root = std::env::current_dir()?;
-                    let plan = harness_exec::ExecPlan::from_spec(&content, &project_root)?;
-                    let md = plan.to_markdown();
-                    let out_path = format!("exec-plan-{}.md", plan.id);
-                    std::fs::write(&out_path, &md)?;
-                    println!("Created ExecPlan: {out_path}");
-                }
-                PlanCommand::Status { plan } => {
-                    if std::path::Path::new(&plan).exists() {
-                        let content = std::fs::read_to_string(&plan)?;
-                        let p = harness_exec::ExecPlan::from_markdown(&content)?;
-                        println!("Plan: {}", p.purpose);
-                        println!("Status: {:?}", p.status);
-                        let done = p.progress.iter().filter(|m| m.completed).count();
-                        println!("Progress: {}/{}", done, p.progress.len());
-                    } else {
-                        println!("Plan file not found: {plan}");
-                    }
+        Command::Plan { cmd } => match cmd {
+            PlanCommand::Init { spec } => {
+                let content = std::fs::read_to_string(&spec)?;
+                let project_root = std::env::current_dir()?;
+                let plan = harness_exec::ExecPlan::from_spec(&content, &project_root)?;
+                let md = plan.to_markdown();
+                let out_path = format!("exec-plan-{}.md", plan.id);
+                std::fs::write(&out_path, &md)?;
+                println!("Created ExecPlan: {out_path}");
+            }
+            PlanCommand::Status { plan } => {
+                if std::path::Path::new(&plan).exists() {
+                    let content = std::fs::read_to_string(&plan)?;
+                    let p = harness_exec::ExecPlan::from_markdown(&content)?;
+                    println!("Plan: {}", p.purpose);
+                    println!("Status: {:?}", p.status);
+                    let done = p.progress.iter().filter(|m| m.completed).count();
+                    println!("Progress: {}/{}", done, p.progress.len());
+                } else {
+                    println!("Plan file not found: {plan}");
                 }
             }
-        }
+        },
     }
 
     Ok(())

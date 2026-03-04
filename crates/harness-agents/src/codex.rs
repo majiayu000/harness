@@ -13,6 +13,22 @@ impl CodexAgent {
     pub fn new(cli_path: PathBuf) -> Self {
         Self { cli_path }
     }
+
+    fn build_exec_command(&self, req: &AgentRequest) -> Command {
+        let mut cmd = Command::new(&self.cli_path);
+        cmd.arg("exec")
+            .arg("--skip-git-repo-check")
+            .arg("--full-auto")
+            .arg("-C")
+            .arg(&req.project_root);
+
+        if let Some(model) = req.model.as_deref() {
+            cmd.arg("-m").arg(model);
+        }
+
+        cmd.arg(&req.prompt);
+        cmd
+    }
 }
 
 #[async_trait]
@@ -26,14 +42,7 @@ impl CodeAgent for CodexAgent {
     }
 
     async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
-        let mut cmd = Command::new(&self.cli_path);
-        cmd.arg("exec")
-            .arg("--skip-git-repo-check")
-            .arg("-a").arg("read-only")
-            .arg("-C").arg(&req.project_root)
-            .arg(&req.prompt);
-
-        let output = cmd.output().await.map_err(|e| {
+        let output = self.build_exec_command(&req).output().await.map_err(|e| {
             harness_core::HarnessError::AgentExecution(format!("failed to run codex: {e}"))
         })?;
 
@@ -72,5 +81,57 @@ impl CodeAgent for CodexAgent {
             .await;
         let _ = tx.send(StreamItem::Done).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn codex_exec_uses_full_auto_workspace_write_mode() {
+        let agent = CodexAgent::new(PathBuf::from("codex"));
+        let req = AgentRequest {
+            prompt: "fix tests".to_string(),
+            project_root: PathBuf::from("/tmp/project"),
+            ..Default::default()
+        };
+
+        let cmd = agent.build_exec_command(&req);
+        let args = args_of(&cmd);
+
+        assert!(args.contains(&"exec".to_string()));
+        assert!(args.contains(&"--full-auto".to_string()));
+        assert!(!args.iter().any(|a| a == "-a" || a == "read-only"));
+    }
+
+    #[test]
+    fn codex_exec_adds_model_when_requested() {
+        let agent = CodexAgent::new(PathBuf::from("codex"));
+        let req = AgentRequest {
+            prompt: "analyze".to_string(),
+            project_root: PathBuf::from("."),
+            model: Some("gpt-5.1-codex".to_string()),
+            ..Default::default()
+        };
+
+        let cmd = agent.build_exec_command(&req);
+        let args = args_of(&cmd);
+
+        let model_pos = args
+            .iter()
+            .position(|a| a == "-m")
+            .expect("model flag should be present");
+        assert_eq!(
+            args.get(model_pos + 1).map(String::as_str),
+            Some("gpt-5.1-codex")
+        );
     }
 }
