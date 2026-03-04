@@ -65,9 +65,9 @@ pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32, prev_fixed: bool) 
             "\n\nIMPORTANT — New review verification:\n\
              The previous round pushed a fix commit. Before evaluating review status, \
              you MUST verify that Gemini has submitted a NEW review covering the latest commit:\n\
-             1. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews --jq '.[-1].submitted_at'` \
+             1. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews --jq '(.[-1].submitted_at // null)'` \
              to get the timestamp of the most recent review\n\
-             2. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/commits --jq '.[-1].commit.committer.date'` \
+             2. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/commits --jq '(.[-1].commit.committer.date // null)'` \
              to get the timestamp of the latest commit\n\
              3. If the latest review was submitted BEFORE the latest commit, \
              Gemini has not yet re-reviewed the new code. \

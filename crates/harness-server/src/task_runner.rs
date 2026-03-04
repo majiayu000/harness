@@ -343,7 +343,7 @@ async fn run_task(
                 .map(|s| {
                     s.rounds
                         .iter()
-                        .filter(|r| r.result == "waiting")
+                        .filter(|r| r.turn == round && r.result == "waiting")
                         .count() as u32
                 })
                 .unwrap_or(0);

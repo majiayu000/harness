@@ -79,6 +79,8 @@ async fn run_review_loop(
 
     let mut prev_fixed = false;
     let mut round = 1u32;
+    let mut waiting_retries = 0u32;
+    const MAX_WAITING_RETRIES: u32 = 3;
 
     while round <= max_rounds {
         println!("[harness] Waiting {wait}s for CI and review bot...");
@@ -96,9 +98,18 @@ async fn run_review_loop(
         println!("{}", resp.output);
 
         if prompts::is_waiting(&resp.output) {
-            println!("[harness] Gemini hasn't re-reviewed yet, retrying...");
+            waiting_retries += 1;
+            if waiting_retries >= MAX_WAITING_RETRIES {
+                println!("[harness] Gemini re-review wait limit reached, advancing round.");
+                waiting_retries = 0;
+                prev_fixed = true;
+                round += 1;
+            } else {
+                println!("[harness] Gemini hasn't re-reviewed yet, retrying ({waiting_retries}/{MAX_WAITING_RETRIES})...");
+            }
             continue;
         }
+        waiting_retries = 0;
 
         if prompts::is_lgtm(&resp.output) {
             println!("[harness] LGTM — {url_display}");

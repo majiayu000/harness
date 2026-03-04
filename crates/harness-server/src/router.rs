@@ -36,11 +36,11 @@ fn validate_file_in_root(
 }
 
 /// Sanitize a string from external sources before logging to the event store.
-/// Strips control characters (except newline) to prevent prompt injection attacks.
+/// Strips all control characters (including newlines) to prevent prompt injection attacks.
 /// Truncates to 512 characters.
 fn sanitize_for_log(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control() || *c == '\n')
+        .filter(|c| !c.is_control())
         .take(512)
         .collect()
 }
