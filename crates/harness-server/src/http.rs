@@ -21,6 +21,7 @@ pub struct AppState {
     pub gc_agent: Arc<harness_gc::GcAgent>,
     pub plans: Arc<RwLock<std::collections::HashMap<harness_core::ExecPlanId, harness_exec::ExecPlan>>>,
     pub thread_db: Option<crate::thread_db::ThreadDb>,
+    pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
 }
 
 fn data_dir() -> std::path::PathBuf {
@@ -80,12 +81,17 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     Ok(AppState {
         server,
         tasks,
-        skills: Arc::new(RwLock::new(harness_skills::SkillStore::new().with_persist_dir(dir.join("skills")))),
+        skills: Arc::new(RwLock::new({
+            let mut store = harness_skills::SkillStore::new().with_persist_dir(dir.join("skills"));
+            store.load_builtin();
+            store
+        })),
         rules: Arc::new(RwLock::new(rule_engine)),
         events,
         gc_agent,
         plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
         thread_db: Some(thread_db),
+        interceptors: vec![Arc::new(crate::contract_validator::ContractValidator::new())],
     })
 }
 
@@ -93,6 +99,12 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     tracing::info!("harness: HTTP server listening on {addr}");
 
     let state = Arc::new(build_app_state(server).await?);
+
+    let initial_grade = {
+        let events = state.events.query(&harness_core::EventFilters::default()).unwrap_or_default();
+        harness_observe::quality::QualityGrader::grade(&events, 0).grade
+    };
+    crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -140,7 +152,7 @@ async fn create_task(
         }
     };
 
-    let task_id = task_runner::spawn_task(state.tasks.clone(), agent, state.skills.clone(), state.events.clone(), req).await;
+    let task_id = task_runner::spawn_task(state.tasks.clone(), agent, state.skills.clone(), state.events.clone(), state.interceptors.clone(), req).await;
 
     (
         StatusCode::ACCEPTED,

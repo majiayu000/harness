@@ -224,6 +224,48 @@ impl SkillStore {
             })
             .collect()
     }
+
+    /// Look up a skill by exact name.
+    pub fn get_by_name(&self, name: &str) -> Option<&Skill> {
+        self.skills.iter().find(|s| s.name == name)
+    }
+
+    /// Load built-in system skills embedded at compile time.
+    /// Skips any skill whose name already exists in the store (user/repo skills take priority).
+    pub fn load_builtin(&mut self) {
+        let builtins = [
+            ("interview", include_str!("../../../skills/interview.md")),
+            ("exec-plan", include_str!("../../../skills/exec-plan.md")),
+            ("preflight", include_str!("../../../skills/preflight.md")),
+            ("check", include_str!("../../../skills/check.md")),
+            ("build-fix", include_str!("../../../skills/build-fix.md")),
+            ("review", include_str!("../../../skills/review.md")),
+            ("cross-review", include_str!("../../../skills/cross-review.md")),
+            ("learn", include_str!("../../../skills/learn.md")),
+            ("gc", include_str!("../../../skills/gc.md")),
+            ("stats", include_str!("../../../skills/stats.md")),
+        ];
+        for (name, content) in builtins {
+            if self.get_by_name(name).is_none() {
+                self.skills.push(Skill {
+                    id: SkillId::from_str(name),
+                    name: name.to_string(),
+                    description: content
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim_start_matches('#')
+                        .trim()
+                        .to_string(),
+                    content: content.to_string(),
+                    trigger_patterns: vec![],
+                    version: "1.0".to_string(),
+                    author: "system".to_string(),
+                    location: SkillLocation::System,
+                });
+            }
+        }
+    }
 }
 
 impl Default for SkillStore {
@@ -337,5 +379,66 @@ mod tests {
         let results = store.search("rust");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "rust-lint");
+    }
+
+    #[test]
+    fn load_builtin_adds_10_skills() {
+        let mut store = SkillStore::new();
+        store.load_builtin();
+        assert_eq!(store.list().len(), 10);
+    }
+
+    #[test]
+    fn load_builtin_all_system_location() {
+        let mut store = SkillStore::new();
+        store.load_builtin();
+        for skill in store.list() {
+            assert_eq!(
+                skill.location,
+                SkillLocation::System,
+                "builtin skill '{}' should have System location",
+                skill.name
+            );
+        }
+    }
+
+    #[test]
+    fn load_builtin_user_skill_overrides_builtin() {
+        let mut store = SkillStore::new();
+        // Add a user skill with the same name as a builtin before loading builtins
+        store.skills.push(make_skill("review", SkillLocation::User));
+        store.load_builtin();
+        // Should still have 10 skills total (9 builtins + 1 user, no duplicate)
+        assert_eq!(store.list().len(), 10);
+        // The 'review' skill should retain User location (not overwritten by System)
+        let Some(review) = store.get_by_name("review") else {
+            panic!("review skill must exist");
+        };
+        assert_eq!(review.location, SkillLocation::User);
+    }
+
+    #[test]
+    fn load_builtin_idempotent() {
+        let mut store = SkillStore::new();
+        store.load_builtin();
+        store.load_builtin();
+        assert_eq!(store.list().len(), 10, "calling load_builtin twice must not duplicate skills");
+    }
+
+    #[test]
+    fn get_by_name_returns_correct_skill() {
+        let mut store = SkillStore::new();
+        store.load_builtin();
+        let Some(skill) = store.get_by_name("interview") else {
+            panic!("interview skill must exist");
+        };
+        assert_eq!(skill.name, "interview");
+        assert_eq!(skill.location, SkillLocation::System);
+    }
+
+    #[test]
+    fn get_by_name_returns_none_for_missing() {
+        let store = SkillStore::new();
+        assert!(store.get_by_name("nonexistent").is_none());
     }
 }

@@ -2,6 +2,7 @@ use harness_core::{
     Category, GuardId, Language, RuleId, Severity, Violation,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +26,7 @@ pub struct Guard {
 
 pub struct RuleEngine {
     rules: Vec<Rule>,
+    rule_ids: HashSet<RuleId>,
     guards: Vec<Guard>,
 }
 
@@ -32,6 +34,7 @@ impl RuleEngine {
     pub fn new() -> Self {
         Self {
             rules: Vec::new(),
+            rule_ids: HashSet::new(),
             guards: Vec::new(),
         }
     }
@@ -156,8 +159,10 @@ impl RuleEngine {
                     Category::Style
                 };
 
+                let rule_id = RuleId::from_str(&id);
+                self.rule_ids.insert(rule_id.clone());
                 self.rules.push(Rule {
-                    id: RuleId::from_str(&id),
+                    id: rule_id,
                     title: title.trim().to_string(),
                     severity,
                     category,
@@ -259,6 +264,15 @@ impl RuleEngine {
         }
 
         Ok(violations)
+    }
+
+    /// Add a rule, deduplicating by rule_id (skip if already present).
+    pub fn add_rule(&mut self, rule: Rule) {
+        if self.rule_ids.contains(&rule.id) {
+            return;
+        }
+        self.rule_ids.insert(rule.id.clone());
+        self.rules.push(rule);
     }
 
     pub fn rules(&self) -> &[Rule] {
@@ -382,5 +396,40 @@ mod tests {
         let paths = RuleEngine::parse_frontmatter_paths(frontmatter)?;
         assert_eq!(paths, vec!["*.rs", "src/**"]);
         Ok(())
+    }
+
+    #[test]
+    fn add_rule_inserts_new_rule() {
+        let mut engine = RuleEngine::new();
+        let rule = Rule {
+            id: RuleId::from_str("LEARN-001"),
+            title: "Test rule".to_string(),
+            severity: Severity::High,
+            category: Category::Style,
+            paths: Vec::new(),
+            description: "desc".to_string(),
+            fix_pattern: None,
+        };
+        engine.add_rule(rule);
+        assert_eq!(engine.rules().len(), 1);
+        assert_eq!(engine.rules()[0].id, RuleId::from_str("LEARN-001"));
+    }
+
+    #[test]
+    fn add_rule_deduplicates_by_id() {
+        let mut engine = RuleEngine::new();
+        let make = |title: &str| Rule {
+            id: RuleId::from_str("LEARN-001"),
+            title: title.to_string(),
+            severity: Severity::High,
+            category: Category::Style,
+            paths: Vec::new(),
+            description: "desc".to_string(),
+            fix_pattern: None,
+        };
+        engine.add_rule(make("first"));
+        engine.add_rule(make("duplicate"));
+        assert_eq!(engine.rules().len(), 1, "duplicate rule_id must be skipped");
+        assert_eq!(engine.rules()[0].title, "first");
     }
 }
