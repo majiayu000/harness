@@ -2,6 +2,49 @@ use crate::http::AppState;
 use harness_core::ThreadId;
 use harness_protocol::{Method, RpcRequest, RpcResponse, INTERNAL_ERROR};
 
+/// Validate that `path` is a safe project root: must exist and be a directory.
+/// Canonicalizes the path to prevent path traversal attacks.
+fn validate_project_root(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("invalid project_root '{}': {}", path.display(), e))?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "project_root '{}' is not a directory",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Validate that `file` is within `root` to prevent path traversal.
+fn validate_file_in_root(
+    root: &std::path::Path,
+    file: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let canonical = file
+        .canonicalize()
+        .map_err(|e| format!("invalid file path '{}': {}", file.display(), e))?;
+    if !canonical.starts_with(root) {
+        return Err(format!(
+            "file '{}' is outside project root '{}'",
+            canonical.display(),
+            root.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Sanitize a string from external sources before logging to the event store.
+/// Strips control characters (except newline) to prevent prompt injection attacks.
+/// Truncates to 512 characters.
+fn sanitize_for_log(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .take(512)
+        .collect()
+}
+
 /// Persist an existing thread to the optional ThreadDb after a mutation.
 async fn persist_thread(state: &AppState, thread_id: &ThreadId) {
     if let Some(db) = &state.thread_db {
@@ -223,12 +266,16 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
         }
 
         Method::MetricsCollect { project_root } => {
+            let canonical_root = match validate_project_root(&project_root) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+            };
             let events = state.events.query(&harness_core::EventFilters::default());
             match events {
                 Ok(evts) => {
                     let violation_count = {
                         let rules = state.rules.read().await;
-                        rules.scan(&project_root).await.map(|v| v.len()).unwrap_or(0)
+                        rules.scan(&canonical_root).await.map(|v| v.len()).unwrap_or(0)
                     };
                     let report = harness_observe::QualityGrader::grade(&evts, violation_count);
                     match serde_json::to_value(&report) {
@@ -284,11 +331,30 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
         }
 
         Method::RuleCheck { project_root, files } => {
+            // Validate project_root to prevent path traversal attacks.
+            let canonical_root = match validate_project_root(&project_root) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+            };
+            // Validate each file path is within the project root.
+            let canonical_files: Option<Vec<std::path::PathBuf>> = match files {
+                Some(fs) => {
+                    let mut validated = Vec::with_capacity(fs.len());
+                    for f in &fs {
+                        match validate_file_in_root(&canonical_root, f) {
+                            Ok(p) => validated.push(p),
+                            Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+                        }
+                    }
+                    Some(validated)
+                }
+                None => None,
+            };
             let result = {
                 let rules = state.rules.read().await;
-                match files {
-                    Some(f) => rules.scan_files(&project_root, &f).await,
-                    None => rules.scan(&project_root).await,
+                match canonical_files {
+                    Some(ref f) => rules.scan_files(&canonical_root, f).await,
+                    None => rules.scan(&canonical_root).await,
                 }
             };
             match result {
@@ -304,18 +370,21 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
                             harness_core::Severity::Medium => harness_core::Decision::Warn,
                             harness_core::Severity::Low => harness_core::Decision::Pass,
                         };
+                        // Sanitize data from external guard scripts to prevent
+                        // prompt injection when this data is used in LLM prompts.
+                        let safe_rule_id = sanitize_for_log(violation.rule_id.as_str());
                         let mut event = harness_core::Event::new(
                             session_id.clone(),
                             "rule_check",
-                            violation.rule_id.as_str(),
+                            &safe_rule_id,
                             decision,
                         );
-                        event.reason = Some(violation.message.clone());
-                        event.detail = Some(format!(
-                            "{}:{}",
-                            violation.file.display(),
-                            violation.line.map(|l| l.to_string()).unwrap_or_default()
-                        ));
+                        event.reason = Some(sanitize_for_log(&violation.message));
+                        // Only include line number when present to avoid misleading trailing colon.
+                        event.detail = Some(match violation.line {
+                            Some(l) => format!("{}:{}", violation.file.display(), l),
+                            None => violation.file.display().to_string(),
+                        });
                         if let Err(e) = state.events.log(&event) {
                             tracing::warn!("failed to log rule violation event: {e}");
                         }
