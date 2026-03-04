@@ -52,6 +52,10 @@ pub enum Method {
     EventQuery { filters: EventFilters },
     MetricsCollect { project_root: PathBuf },
     MetricsQuery { filters: MetricFilters },
+
+    // === VibeGuard ===
+    Preflight { project_root: PathBuf, task_description: String },
+    CrossReview { project_root: PathBuf, target: String, max_rounds: Option<u32> },
 }
 
 /// JSON-RPC 2.0 request envelope.

@@ -470,6 +470,12 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
             }
         }
 
+        // === VibeGuard: Cross-Review ===
+
+        Method::CrossReview { project_root, target, max_rounds } => {
+            crate::handlers::cross_review::cross_review(state, id, project_root, target, max_rounds).await
+        }
+
         Method::ExecPlanUpdate { plan_id, updates } => {
             let mut plans = state.plans.write().await;
             match plans.get_mut(&plan_id) {

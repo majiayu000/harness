@@ -1,5 +1,14 @@
 /// Prompt templates and output parsers shared across CLI and HTTP entries.
 
+/// Wrap external (untrusted) data for safe embedding in prompts.
+///
+/// Surrounds the data with XML-like delimiters so that the LLM treats the
+/// content as literal data rather than instructions, reducing prompt-injection
+/// risk when embedding user-supplied strings or tool output into prompts.
+pub fn wrap_external_data(data: &str) -> String {
+    format!("<external_data>\n{data}\n</external_data>")
+}
+
 /// Build prompt: implement from a GitHub issue, create PR.
 pub fn implement_from_issue(issue: u64) -> String {
     format!(

@@ -6,3 +6,4 @@ pub mod http;
 pub mod router;
 pub mod task_runner;
 pub mod task_db;
+pub mod handlers;
