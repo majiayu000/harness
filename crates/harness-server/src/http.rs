@@ -187,3 +187,71 @@ async fn get_task(
             .into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{server::HarnessServer, thread_manager::ThreadManager};
+    use axum::http::Request;
+    use harness_agents::AgentRegistry;
+    use harness_core::HarnessConfig;
+    use tower::ServiceExt;
+
+    async fn make_test_app(dir: &std::path::Path) -> anyhow::Result<Router> {
+        let server = Arc::new(HarnessServer::new(
+            HarnessConfig::default(),
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        ));
+        let tasks = task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
+        let events = Arc::new(harness_observe::EventStore::new(dir)?);
+        let signal_detector = harness_gc::SignalDetector::new(
+            harness_gc::signal_detector::SignalThresholds::default(),
+            harness_core::ProjectId::new(),
+        );
+        let draft_store = harness_gc::DraftStore::new(dir)?;
+        let gc_agent = Arc::new(harness_gc::GcAgent::new(
+            harness_gc::gc_agent::GcConfig::default(),
+            signal_detector,
+            draft_store,
+        ));
+        let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
+        let state = Arc::new(AppState {
+            server,
+            tasks,
+            skills: Arc::new(tokio::sync::RwLock::new(harness_skills::SkillStore::new())),
+            rules: Arc::new(tokio::sync::RwLock::new(
+                harness_rules::engine::RuleEngine::new(),
+            )),
+            events,
+            gc_agent,
+            plans: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            thread_db: Some(thread_db),
+            interceptors: vec![],
+            notify_tx: None,
+        });
+        Ok(Router::new()
+            .route("/health", get(health_check))
+            .with_state(state))
+    }
+
+    #[tokio::test]
+    async fn health_check_returns_ok_and_task_count() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let app = make_test_app(dir.path()).await?;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(axum::body::Body::empty())?;
+        let resp = app.oneshot(req).await?;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+        let val: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(val["status"], serde_json::json!("ok"));
+        assert_eq!(val["tasks"], serde_json::json!(0));
+        Ok(())
+    }
+}
