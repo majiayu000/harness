@@ -81,7 +81,11 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     Ok(AppState {
         server,
         tasks,
-        skills: Arc::new(RwLock::new(harness_skills::SkillStore::new().with_persist_dir(dir.join("skills")))),
+        skills: Arc::new(RwLock::new({
+            let mut store = harness_skills::SkillStore::new().with_persist_dir(dir.join("skills"));
+            store.load_builtin();
+            store
+        })),
         rules: Arc::new(RwLock::new(rule_engine)),
         events,
         gc_agent,
