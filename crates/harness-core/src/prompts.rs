@@ -26,7 +26,7 @@ pub fn check_existing_pr(pr: u64) -> String {
 
 /// Wrap user-supplied content in delimiters to separate it from trusted instructions.
 /// Escapes the closing tag within content to prevent delimiter injection.
-fn wrap_external_data(content: &str) -> String {
+pub fn wrap_external_data(content: &str) -> String {
     let escaped = content.replace("</external_data>", "<\\/external_data>");
     format!("<external_data>\n{}\n</external_data>", escaped)
 }

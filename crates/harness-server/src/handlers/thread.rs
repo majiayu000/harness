@@ -84,6 +84,7 @@ pub async fn turn_start(
     thread_id: ThreadId,
     input: String,
 ) -> RpcResponse {
+    let input = crate::handlers::sanitize_user_input(&input);
     let agent_id =
         harness_core::AgentId::from_str(&state.server.config.agents.default_agent);
     match state
@@ -152,6 +153,7 @@ pub async fn turn_steer(
     turn_id: harness_core::TurnId,
     instruction: String,
 ) -> RpcResponse {
+    let instruction = crate::handlers::sanitize_user_input(&instruction);
     match state.server.thread_manager.find_thread_for_turn(&turn_id) {
         Some(thread_id) => {
             match state

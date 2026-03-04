@@ -95,8 +95,9 @@ pub async fn gc_adopt(
             let task_id =
                 if let Some(agent) = state.server.agent_registry.default_agent() {
                     let paths_list = artifact_paths.join(", ");
+                    let safe_paths = harness_core::prompts::wrap_external_data(&paths_list);
                     let prompt = format!(
-                        "GC drafted the following files: {paths_list}. \
+                        "GC drafted the following files:\n{safe_paths}\n\
                          Review these changes, create a branch named gc/{draft_id}, \
                          commit, push, and open a PR. \
                          Print PR_URL=<url> on the last line."
