@@ -187,6 +187,7 @@ mod tests {
             plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
             thread_db: Some(thread_db),
             interceptors: vec![],
+            notify_tx: None,
         })
     }
 

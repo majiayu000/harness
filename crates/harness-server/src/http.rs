@@ -22,6 +22,9 @@ pub struct AppState {
     pub plans: Arc<RwLock<std::collections::HashMap<harness_core::ExecPlanId, harness_exec::ExecPlan>>>,
     pub thread_db: Option<crate::thread_db::ThreadDb>,
     pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
+    /// Channel for server-push JSON-RPC notifications (stdio transport only).
+    /// `None` in HTTP mode until WebSocket support is added (Step 3).
+    pub notify_tx: Option<crate::notify::NotifySender>,
 }
 
 fn data_dir() -> std::path::PathBuf {
@@ -92,6 +95,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
         thread_db: Some(thread_db),
         interceptors: vec![Arc::new(crate::contract_validator::ContractValidator::new())],
+        notify_tx: None,
     })
 }
 

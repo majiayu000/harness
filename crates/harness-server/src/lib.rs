@@ -11,3 +11,4 @@ pub mod task_db;
 pub mod complexity_router;
 pub mod contract_validator;
 pub mod scheduler;
+pub mod notify;

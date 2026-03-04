@@ -1,6 +1,6 @@
 use crate::http::AppState;
-use harness_core::ThreadId;
-use harness_protocol::{RpcResponse, INTERNAL_ERROR};
+use harness_core::{ThreadId, ThreadStatus, TurnStatus};
+use harness_protocol::{Notification, RpcResponse, INTERNAL_ERROR};
 use std::path::PathBuf;
 
 /// Persist an existing thread to the optional ThreadDb after a mutation.
@@ -44,6 +44,7 @@ pub async fn initialize(id: Option<serde_json::Value>) -> RpcResponse {
                 "rules": true,
                 "exec_plan": true,
                 "observe": true,
+                "notifications": true,
             }
         }),
     )
@@ -60,6 +61,13 @@ pub async fn thread_start(
     };
     let thread_id = state.server.thread_manager.start_thread(cwd);
     persist_thread_insert(state, &thread_id).await;
+    crate::notify::emit(
+        &state.notify_tx,
+        Notification::ThreadStatusChanged {
+            thread_id: thread_id.clone(),
+            status: ThreadStatus::Idle,
+        },
+    );
     RpcResponse::success(id, serde_json::json!({ "thread_id": thread_id }))
 }
 
@@ -100,6 +108,13 @@ pub async fn turn_start(
     {
         Ok(turn_id) => {
             persist_thread(state, &thread_id).await;
+            crate::notify::emit(
+                &state.notify_tx,
+                Notification::TurnStarted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                },
+            );
             RpcResponse::success(id, serde_json::json!({ "turn_id": turn_id }))
         }
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -120,6 +135,14 @@ pub async fn turn_cancel(
             {
                 Ok(()) => {
                     persist_thread(state, &thread_id).await;
+                    crate::notify::emit(
+                        &state.notify_tx,
+                        Notification::TurnCompleted {
+                            turn_id: turn_id.clone(),
+                            status: TurnStatus::Cancelled,
+                            token_usage: harness_core::TokenUsage::default(),
+                        },
+                    );
                     RpcResponse::success(id, serde_json::json!({ "cancelled": true }))
                 }
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
