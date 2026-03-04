@@ -115,6 +115,14 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
         Method::LearnSkills { project_root } => {
             handlers::learn::learn_skills(state, id, project_root).await
         }
+
+        // === Health & Stats ===
+        Method::HealthCheck { project_root } => {
+            handlers::health::health_check(state, id, project_root).await
+        }
+        Method::StatsQuery { since, until } => {
+            handlers::health::stats_query(state, id, since, until).await
+        }
     }
 }
 

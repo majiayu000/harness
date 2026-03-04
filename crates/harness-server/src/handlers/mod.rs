@@ -1,5 +1,6 @@
 pub mod exec;
 pub mod gc;
+pub mod health;
 pub mod learn;
 pub mod observe;
 pub mod rules;

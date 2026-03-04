@@ -56,6 +56,13 @@ pub enum Method {
     // === Learn feedback loop ===
     LearnRules { project_root: PathBuf },
     LearnSkills { project_root: PathBuf },
+
+    // === Health & Stats ===
+    HealthCheck { project_root: PathBuf },
+    StatsQuery {
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+    },
 }
 
 /// JSON-RPC 2.0 request envelope.
