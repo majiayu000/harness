@@ -76,6 +76,21 @@ mod tests {
     }
 
     #[test]
+    fn codec_initialized_roundtrip() -> anyhow::Result<()> {
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Method::Initialized,
+        };
+        let json = serde_json::to_string(&req)?;
+        // method field must be "initialized"
+        assert!(json.contains("\"initialized\""), "serialized: {json}");
+        let back: RpcRequest = decode_request(&json)?;
+        assert!(matches!(back.method, Method::Initialized));
+        Ok(())
+    }
+
+    #[test]
     fn rpc_error_codes_are_negative() {
         assert!(crate::PARSE_ERROR < 0);
         assert!(crate::INVALID_REQUEST < 0);
