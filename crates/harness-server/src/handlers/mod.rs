@@ -5,6 +5,25 @@ pub mod rules;
 pub mod skills;
 pub mod thread;
 
+/// Validate that `file` is an existing path within `project_root` (already canonicalized).
+/// Returns the canonicalized file path on success.
+pub(crate) fn validate_file_in_root(
+    file: &std::path::Path,
+    project_root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let canonical = file
+        .canonicalize()
+        .map_err(|e| format!("invalid file path '{}': {e}", file.display()))?;
+    if !canonical.starts_with(project_root) {
+        return Err(format!(
+            "file path '{}' is outside project root '{}'",
+            canonical.display(),
+            project_root.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 /// Validate that a project root is an existing directory within `$HOME`.
 /// Returns the canonicalized path on success.
 pub(crate) fn validate_project_root(path: &std::path::Path) -> Result<std::path::PathBuf, String> {

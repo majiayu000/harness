@@ -34,7 +34,17 @@ pub async fn rule_check(
     let result = {
         let rules = state.rules.read().await;
         match files {
-            Some(f) => rules.scan_files(&project_root, &f).await,
+            Some(f) => {
+                // Validate each file is within the project root to prevent path traversal.
+                let mut validated = Vec::with_capacity(f.len());
+                for file in &f {
+                    match crate::handlers::validate_file_in_root(file, &project_root) {
+                        Ok(p) => validated.push(p),
+                        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+                    }
+                }
+                rules.scan_files(&project_root, &validated).await
+            }
             None => rules.scan(&project_root).await,
         }
     };

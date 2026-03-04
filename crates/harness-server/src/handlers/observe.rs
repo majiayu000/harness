@@ -35,6 +35,10 @@ pub async fn metrics_collect(
     id: Option<serde_json::Value>,
     project_root: PathBuf,
 ) -> RpcResponse {
+    let project_root = match crate::handlers::validate_project_root(&project_root) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+    };
     let events = state.events.query(&harness_core::EventFilters::default());
     match events {
         Ok(evts) => {

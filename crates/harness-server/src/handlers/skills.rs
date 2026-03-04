@@ -8,6 +8,14 @@ pub async fn skill_create(
     name: String,
     content: String,
 ) -> RpcResponse {
+    // Reject names that could traverse outside the skills directory when used as a filename.
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.is_empty() {
+        return RpcResponse::error(
+            id,
+            INTERNAL_ERROR,
+            "skill name must not contain path separators or '..'",
+        );
+    }
     let mut skills = state.skills.write().await;
     let skill = skills.create(name, content).clone();
     match serde_json::to_value(&skill) {
