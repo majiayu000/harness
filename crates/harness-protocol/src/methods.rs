@@ -66,6 +66,10 @@ pub enum Method {
         since: Option<chrono::DateTime<chrono::Utc>>,
         until: Option<chrono::DateTime<chrono::Utc>>,
     },
+
+    // === VibeGuard ===
+    Preflight { project_root: PathBuf, task_description: String },
+    CrossReview { project_root: PathBuf, target: String, max_rounds: Option<u32> },
 }
 
 /// JSON-RPC 2.0 request envelope.

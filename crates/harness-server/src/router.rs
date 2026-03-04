@@ -128,6 +128,14 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
         Method::StatsQuery { since, until } => {
             handlers::health::stats_query(state, id, since, until).await
         }
+
+        // === VibeGuard ===
+        Method::Preflight { project_root, task_description } => {
+            handlers::preflight::preflight(state, id, project_root, task_description).await
+        }
+        Method::CrossReview { project_root, target, max_rounds } => {
+            handlers::cross_review::cross_review(state, id, project_root, target, max_rounds).await
+        }
     }
 }
 
