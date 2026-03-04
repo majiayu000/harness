@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use harness_core::{
     interceptor::{InterceptResult, TurnInterceptor},
-    AgentRequest, AgentResponse, Decision,
+    AgentRequest, AgentResponse,
 };
 
 /// Minimum prompt length required to allow execution.
@@ -71,24 +71,14 @@ impl TurnInterceptor for ContractValidator {
 
         // Warn when no clear action verb is present.
         if !Self::has_action_verb(prompt) {
-            return InterceptResult {
-                decision: Decision::Warn,
-                reason: Some(
-                    "prompt does not contain a recognizable action verb".to_string(),
-                ),
-                request: None,
-            };
+            return InterceptResult::warn("prompt does not contain a recognizable action verb");
         }
 
         // Warn when no acceptance criteria are specified.
         if !Self::has_acceptance_criteria(prompt) {
-            return InterceptResult {
-                decision: Decision::Warn,
-                reason: Some(
-                    "prompt lacks acceptance criteria (should/must/expect/verify/ensure)".to_string(),
-                ),
-                request: None,
-            };
+            return InterceptResult::warn(
+                "prompt lacks acceptance criteria (should/must/expect/verify/ensure)",
+            );
         }
 
         InterceptResult::pass()

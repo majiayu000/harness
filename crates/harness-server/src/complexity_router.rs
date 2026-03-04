@@ -10,17 +10,18 @@ fn count_file_references(prompt: &str) -> usize {
 
     prompt
         .split_whitespace()
-        .filter(|token| {
+        .filter_map(|token| {
             // Strip surrounding punctuation common in prose (e.g., backticks, parens)
             let token = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '-' && c != '/');
             if let Some(dot_pos) = token.rfind('.') {
                 let ext = &token[dot_pos + 1..];
-                EXTENSIONS.contains(&ext)
+                if EXTENSIONS.contains(&ext) { Some(token) } else { None }
             } else {
-                false
+                None
             }
         })
-        .count()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
 }
 
 /// Classify a task request by complexity.

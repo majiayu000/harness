@@ -8,14 +8,6 @@ pub mod rules;
 pub mod skills;
 pub mod thread;
 
-/// Strip non-whitespace control characters from user-supplied strings to reduce
-/// prompt injection surface. Newlines and tabs are preserved for multiline inputs.
-pub(crate) fn sanitize_user_input(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
-        .collect()
-}
-
 /// Validate that `file` is an existing path within `project_root` (already canonicalized).
 /// Returns the canonicalized file path on success.
 pub(crate) fn validate_file_in_root(

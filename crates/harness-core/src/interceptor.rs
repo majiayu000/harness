@@ -23,6 +23,14 @@ impl InterceptResult {
             request: None,
         }
     }
+
+    pub fn warn(reason: impl Into<String>) -> Self {
+        Self {
+            decision: Decision::Warn,
+            reason: Some(reason.into()),
+            request: None,
+        }
+    }
 }
 
 /// Hook interface for intercepting agent task execution.
