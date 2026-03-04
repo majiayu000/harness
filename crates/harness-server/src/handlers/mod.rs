@@ -8,8 +8,9 @@ pub mod thread;
 /// Validate that a project root is an existing directory within `$HOME`.
 /// Returns the canonicalized path on success.
 pub(crate) fn validate_project_root(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let home = std::path::PathBuf::from(home);
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .map_err(|_| "HOME environment variable not set".to_string())?;
     let canonical = path
         .canonicalize()
         .map_err(|e| format!("invalid project root '{}': {e}", path.display()))?;
