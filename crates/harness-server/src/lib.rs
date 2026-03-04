@@ -3,6 +3,8 @@ pub mod thread_manager;
 pub mod thread_db;
 pub mod stdio;
 pub mod http;
+pub mod handlers;
 pub mod router;
 pub mod task_runner;
+pub mod task_executor;
 pub mod task_db;

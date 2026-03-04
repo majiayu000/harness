@@ -1,11 +1,10 @@
 use crate::task_db::TaskDb;
 use dashmap::DashMap;
-use harness_core::{prompts, AgentRequest, CodeAgent, ContextItem, Decision, Event, SessionId};
+use harness_core::CodeAgent;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TaskId(pub String);
@@ -128,7 +127,7 @@ fn default_turn_timeout() -> u64 {
 
 /// In-memory cache + SQLite persistence.
 pub struct TaskStore {
-    cache: DashMap<TaskId, TaskState>,
+    pub(crate) cache: DashMap<TaskId, TaskState>,
     db: TaskDb,
 }
 
@@ -136,7 +135,6 @@ impl TaskStore {
     pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
         let db = TaskDb::open(db_path).await?;
         let cache = DashMap::new();
-        // Load existing tasks into cache
         for task in db.list().await? {
             cache.insert(task.id.clone(), task);
         }
@@ -155,14 +153,14 @@ impl TaskStore {
         self.cache.iter().map(|e| e.value().clone()).collect()
     }
 
-    async fn insert(&self, state: &TaskState) {
+    pub(crate) async fn insert(&self, state: &TaskState) {
         self.cache.insert(state.id.clone(), state.clone());
         if let Err(e) = self.db.insert(state).await {
             tracing::error!("task_db insert failed: {e}");
         }
     }
 
-    async fn persist(&self, id: &TaskId) {
+    pub(crate) async fn persist(&self, id: &TaskId) {
         if let Some(state) = self.cache.get(id) {
             if let Err(e) = self.db.update(state.value()).await {
                 tracing::error!("task_db update failed: {e}");
@@ -183,11 +181,9 @@ pub async fn spawn_task(
     store.insert(&state).await;
 
     let id = task_id.clone();
-    // Clone handles for the watcher spawn; originals move into the inner spawn.
     let store_watcher = store.clone();
     let id_watcher = id.clone();
 
-    // Inner task: runs the actual work, returns Result so the watcher can detect errors.
     let handle = tokio::spawn(async move {
         let project = match req.project.clone() {
             Some(p) => p,
@@ -195,11 +191,12 @@ pub async fn spawn_task(
                 .await
                 .unwrap_or_else(|_| PathBuf::from(".")),
         };
-        run_task(&store, &id, agent.as_ref(), skills, events, &req, project).await
+        crate::task_executor::run_task(
+            &store, &id, agent.as_ref(), skills, events, &req, project,
+        )
+        .await
     });
 
-    // Watcher: awaits the inner JoinHandle to propagate both errors and panics to the store.
-    // Without this, a panic inside the inner task would leave the task stuck in a non-terminal state.
     tokio::spawn(async move {
         match handle.await {
             Ok(Ok(())) => {}
@@ -211,7 +208,9 @@ pub async fn spawn_task(
                 .await;
             }
             Err(join_err) => {
-                tracing::error!("task {id_watcher:?} panicked or was cancelled: {join_err}");
+                tracing::error!(
+                    "task {id_watcher:?} panicked or was cancelled: {join_err}"
+                );
                 mutate_and_persist(&store_watcher, &id_watcher, |s| {
                     s.status = TaskStatus::Failed;
                     s.error = Some(format!("task failed unexpectedly: {join_err}"));
@@ -224,192 +223,12 @@ pub async fn spawn_task(
     task_id
 }
 
-async fn run_task(
+pub(crate) async fn update_status(
     store: &TaskStore,
     task_id: &TaskId,
-    agent: &dyn CodeAgent,
-    skills: Arc<RwLock<harness_skills::SkillStore>>,
-    events: Arc<harness_observe::EventStore>,
-    req: &CreateTaskRequest,
-    project: PathBuf,
-) -> anyhow::Result<()> {
-    // Turn 1: implement
-    update_status(store, task_id, TaskStatus::Implementing, 1).await;
-
-    let first_prompt = if let Some(issue) = req.issue {
-        prompts::implement_from_issue(issue)
-    } else if let Some(pr) = req.pr {
-        prompts::check_existing_pr(pr)
-    } else {
-        prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default())
-    };
-
-    let skill_items: Vec<ContextItem> = {
-        let guard = skills.read().await;
-        guard
-            .list()
-            .iter()
-            .map(|s| ContextItem::Skill {
-                id: s.id.to_string(),
-                content: s.content.clone(),
-            })
-            .collect()
-    };
-
-    let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
-    let resp = tokio::time::timeout(
-        turn_timeout,
-        agent.execute(AgentRequest {
-            prompt: first_prompt,
-            project_root: project.clone(),
-            context: skill_items.clone(),
-            ..Default::default()
-        }),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Turn 1 timed out after {}s", req.turn_timeout_secs))?
-    ?;
-
-    let pr_url = prompts::parse_pr_url(&resp.output);
-    let pr_number = pr_url
-        .as_ref()
-        .and_then(|u| prompts::extract_pr_number(u))
-        .or(req.pr); // fallback: use req.pr if agent didn't output PR_URL
-
-    mutate_and_persist(store, task_id, |s| {
-        s.pr_url = pr_url.clone();
-        s.rounds.push(RoundResult {
-            turn: 1,
-            action: "implement".into(),
-            result: if pr_url.is_some() || req.pr.is_some() {
-                "pr_created".into()
-            } else {
-                "implemented".into()
-            },
-        });
-    })
-    .await;
-
-    let pr_num = match pr_number {
-        Some(n) => n,
-        None => {
-            update_status(store, task_id, TaskStatus::Done, 1).await;
-            return Ok(());
-        }
-    };
-
-    // Review loop: Turn 2..N
-    // prev_fixed tracks whether the previous round pushed new code.
-    // When true, the next round's prompt requires the agent to verify that
-    // Gemini has submitted a new review covering the latest commit before
-    // declaring LGTM. If Gemini hasn't re-reviewed yet, the agent outputs
-    // WAITING and we retry without consuming a round.
-    let last_review_round = req.max_rounds.saturating_add(1);
-    let mut prev_fixed = false;
-    let mut round = 2u32;
-    let max_waiting_retries = 3u32;
-
-    while round <= last_review_round {
-        update_status(store, task_id, TaskStatus::Waiting, round).await;
-        sleep(Duration::from_secs(req.wait_secs)).await;
-
-        update_status(store, task_id, TaskStatus::Reviewing, round).await;
-
-        let resp = tokio::time::timeout(
-            turn_timeout,
-            agent.execute(AgentRequest {
-                prompt: prompts::review_prompt(req.issue, pr_num, round, prev_fixed),
-                project_root: project.clone(),
-                context: skill_items.clone(),
-                ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Turn {round} timed out after {}s", req.turn_timeout_secs))?
-        ?;
-
-        // WAITING: Gemini hasn't re-reviewed after the fix commit yet.
-        // Retry without consuming a round, up to max_waiting_retries.
-        if prompts::is_waiting(&resp.output) {
-            mutate_and_persist(store, task_id, |s| {
-                s.rounds.push(RoundResult {
-                    turn: round,
-                    action: "review".into(),
-                    result: "waiting".into(),
-                });
-            })
-            .await;
-
-            let waiting_count = store
-                .get(task_id)
-                .map(|s| {
-                    s.rounds
-                        .iter()
-                        .filter(|r| r.result == "waiting")
-                        .count() as u32
-                })
-                .unwrap_or(0);
-
-            if waiting_count >= max_waiting_retries {
-                // Exceeded waiting retries — advance round to avoid infinite loop
-                prev_fixed = true;
-                round += 1;
-            }
-            // Don't advance round; retry with same round number
-            continue;
-        }
-
-        let lgtm = prompts::is_lgtm(&resp.output);
-
-        mutate_and_persist(store, task_id, |s| {
-            s.rounds.push(RoundResult {
-                turn: round,
-                action: "review".into(),
-                result: if lgtm { "lgtm".into() } else { "fixed".into() },
-            });
-        })
-        .await;
-
-        // Log pr_review event for observability and GC signal detection.
-        let mut ev = Event::new(
-            SessionId::new(),
-            "pr_review",
-            "task_runner",
-            if lgtm { Decision::Complete } else { Decision::Warn },
-        );
-        ev.detail = Some(format!("pr={pr_num}"));
-        ev.reason = Some(if lgtm {
-            format!("round {round}: lgtm")
-        } else {
-            format!("round {round}: fixed")
-        });
-        if let Err(e) = events.log(&ev) {
-            tracing::warn!("failed to log pr_review event: {e}");
-        }
-
-        if lgtm {
-            update_status(store, task_id, TaskStatus::Done, round).await;
-            return Ok(());
-        }
-
-        prev_fixed = true;
-        round += 1;
-    }
-
-    // Reached max rounds without LGTM
-    mutate_and_persist(store, task_id, |s| {
-        s.status = TaskStatus::Failed;
-        s.turn = req.max_rounds.saturating_add(1);
-        s.error = Some(format!(
-            "Task did not receive LGTM after {} review rounds.",
-            req.max_rounds
-        ));
-    })
-    .await;
-    Ok(())
-}
-
-async fn update_status(store: &TaskStore, task_id: &TaskId, status: TaskStatus, turn: u32) {
+    status: TaskStatus,
+    turn: u32,
+) {
     mutate_and_persist(store, task_id, |s| {
         s.status = status;
         s.turn = turn;
@@ -418,7 +237,11 @@ async fn update_status(store: &TaskStore, task_id: &TaskId, status: TaskStatus, 
 }
 
 /// Mutate a task in the cache then persist to SQLite.
-async fn mutate_and_persist(store: &TaskStore, id: &TaskId, f: impl FnOnce(&mut TaskState)) {
+pub(crate) async fn mutate_and_persist(
+    store: &TaskStore,
+    id: &TaskId,
+    f: impl FnOnce(&mut TaskState),
+) {
     if let Some(mut entry) = store.cache.get_mut(id) {
         f(entry.value_mut());
     }
@@ -429,7 +252,10 @@ async fn mutate_and_persist(store: &TaskStore, id: &TaskId, f: impl FnOnce(&mut 
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use harness_core::{AgentResponse, Capability, StreamItem, TokenUsage};
+    use harness_core::{
+        AgentRequest, AgentResponse, Capability, ContextItem, StreamItem, TokenUsage,
+    };
+    use tokio::time::Duration;
 
     #[test]
     fn test_task_state_new() {
@@ -440,7 +266,6 @@ mod tests {
         assert!(state.pr_url.is_none());
     }
 
-    /// A mock agent that captures the context from the first AgentRequest it receives.
     struct CapturingAgent {
         captured: tokio::sync::Mutex<Vec<ContextItem>>,
     }
@@ -463,7 +288,10 @@ mod tests {
             vec![]
         }
 
-        async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+        async fn execute(
+            &self,
+            req: AgentRequest,
+        ) -> harness_core::Result<AgentResponse> {
             let mut guard = self.captured.lock().await;
             if guard.is_empty() {
                 *guard = req.context.clone();
@@ -472,7 +300,12 @@ mod tests {
                 output: String::new(),
                 stderr: String::new(),
                 items: vec![],
-                token_usage: TokenUsage { input_tokens: 0, output_tokens: 0, total_tokens: 0, cost_usd: 0.0 },
+                token_usage: TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    cost_usd: 0.0,
+                },
                 model: "mock".into(),
                 exit_code: Some(0),
             })
@@ -490,9 +323,9 @@ mod tests {
     #[tokio::test]
     async fn skills_are_injected_into_agent_context() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let store =
+            TaskStore::open(&dir.path().join("tasks.db")).await?;
 
-        // Build a SkillStore with one skill
         let mut skill_store = harness_skills::SkillStore::new();
         skill_store.create("test-skill".to_string(), "do something useful".to_string());
         let skills = Arc::new(RwLock::new(skill_store));
@@ -513,13 +346,17 @@ mod tests {
         let events = Arc::new(harness_observe::EventStore::new(dir.path())?);
         spawn_task(store, agent_clone, skills, events, req).await;
 
-        // Allow the spawned task to run
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let captured = agent.captured.lock().await;
-        assert!(!captured.is_empty(), "expected skills to be injected into AgentRequest.context");
         assert!(
-            captured.iter().any(|item| matches!(item, ContextItem::Skill { .. })),
+            !captured.is_empty(),
+            "expected skills to be injected into AgentRequest.context"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|item| matches!(item, ContextItem::Skill { .. })),
             "expected at least one ContextItem::Skill"
         );
         Ok(())
