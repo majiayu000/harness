@@ -10,6 +10,9 @@ use std::path::PathBuf;
 pub enum Method {
     // === Initialization ===
     Initialize,
+    /// Sent by the client after receiving an `initialize` response to confirm
+    /// the handshake is complete.  No params required.
+    Initialized,
 
     // === Thread management ===
     ThreadStart { cwd: PathBuf },
