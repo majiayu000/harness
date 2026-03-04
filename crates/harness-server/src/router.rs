@@ -470,7 +470,11 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
             }
         }
 
-        // === VibeGuard: Cross-Review ===
+        // === VibeGuard ===
+
+        Method::Preflight { project_root, task_description } => {
+            crate::handlers::preflight::preflight(state, id, project_root, task_description).await
+        }
 
         Method::CrossReview { project_root, target, max_rounds } => {
             crate::handlers::cross_review::cross_review(state, id, project_root, target, max_rounds).await

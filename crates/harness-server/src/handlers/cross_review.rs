@@ -101,21 +101,36 @@ pub async fn run_cross_review(
 
     let mut challenger_review = String::new();
     let mut rounds_done = 1u32;
+    let mut consensus_issues: Vec<String> = extract_issues(&primary_review);
     let safe_primary = harness_core::prompts::wrap_external_data(&primary_review);
-    let challenge_prompt = format!(
-        "You are a challenger reviewer. Given this primary code review:\n{safe_primary}\n\n\
-         For each ISSUE listed, classify it on its own line:\n\
-         CONFIRMED: <issue>  — the issue is a real problem\n\
-         FALSE-POSITIVE: <issue>  — the issue is wrong or not applicable\n\
-         Also list any issues the primary review missed as:\n\
-         MISSED: <new issue>"
-    );
 
     for _ in 0..max_rounds.saturating_sub(1) {
         rounds_done += 1;
+
+        // Rebuild prompt each round with outstanding issues from previous round
+        let outstanding = if consensus_issues.is_empty() {
+            String::new()
+        } else {
+            let items: String = consensus_issues
+                .iter()
+                .map(|i| format!("- {i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("\n\nOutstanding issues from previous round:\n{items}")
+        };
+
+        let challenge_prompt = format!(
+            "You are a challenger reviewer. Given this primary code review:\n{safe_primary}\n\n\
+             For each ISSUE listed, classify it on its own line:\n\
+             CONFIRMED: <issue>  — the issue is a real problem\n\
+             FALSE-POSITIVE: <issue>  — the issue is wrong or not applicable\n\
+             Also list any issues the primary review missed as:\n\
+             MISSED: <new issue>{outstanding}"
+        );
+
         let resp = challenger
             .execute(AgentRequest {
-                prompt: challenge_prompt.clone(),
+                prompt: challenge_prompt,
                 project_root: project_root.clone(),
                 ..Default::default()
             })
@@ -123,12 +138,12 @@ pub async fn run_cross_review(
             .map_err(|e| e.to_string())?;
         challenger_review = resp.output;
 
-        let consensus: Vec<String> = extract_tagged(&challenger_review, "CONFIRMED")
+        consensus_issues = extract_tagged(&challenger_review, "CONFIRMED")
             .into_iter()
             .chain(extract_tagged(&challenger_review, "MISSED"))
             .collect();
 
-        if consensus.is_empty() {
+        if consensus_issues.is_empty() {
             let contested = extract_tagged(&challenger_review, "FALSE-POSITIVE");
             return Ok(CrossReviewResult {
                 primary_review,
