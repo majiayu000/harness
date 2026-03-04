@@ -1,3 +1,4 @@
+pub mod classify;
 pub mod exec;
 pub mod gc;
 pub mod health;

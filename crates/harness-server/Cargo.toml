@@ -27,7 +27,7 @@ sqlx = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-async-trait = { workspace = true }

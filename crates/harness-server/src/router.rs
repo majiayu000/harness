@@ -108,6 +108,11 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
             handlers::exec::exec_plan_update(state, id, plan_id, updates).await
         }
 
+        // === Task classification ===
+        Method::TaskClassify { prompt, issue, pr } => {
+            handlers::classify::task_classify(id, prompt, issue, pr).await
+        }
+
         // === Learn feedback loop ===
         Method::LearnRules { project_root } => {
             handlers::learn::learn_rules(state, id, project_root).await

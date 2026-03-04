@@ -53,6 +53,9 @@ pub enum Method {
     MetricsCollect { project_root: PathBuf },
     MetricsQuery { filters: MetricFilters },
 
+    // === Task classification ===
+    TaskClassify { prompt: String, issue: Option<u64>, pr: Option<u64> },
+
     // === Learn feedback loop ===
     LearnRules { project_root: PathBuf },
     LearnSkills { project_root: PathBuf },
