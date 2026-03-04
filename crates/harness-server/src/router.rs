@@ -81,6 +81,9 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
             project_root,
             files,
         } => handlers::rules::rule_check(state, id, project_root, files).await,
+        Method::RuleStats { since, until } => {
+            handlers::rules::rule_stats(state, id, since, until).await
+        }
 
         // === GC ===
         Method::GcRun { project_id: _ } => {
@@ -450,6 +453,49 @@ mod tests {
             events.is_empty(),
             "no events should be logged when there are no violations"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rule_stats_returns_aggregated_violation_counts() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let session_id = harness_core::SessionId::new();
+        for _ in 0..3 {
+            let event = harness_core::Event::new(
+                session_id.clone(),
+                "rule_check",
+                "SEC-01",
+                harness_core::Decision::Block,
+            );
+            state.events.log(&event)?;
+        }
+        let event = harness_core::Event::new(
+            session_id.clone(),
+            "rule_check",
+            "RS-05",
+            harness_core::Decision::Warn,
+        );
+        state.events.log(&event)?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::RuleStats { since: None, until: None },
+        };
+        let resp = handle_request(&state, req).await;
+
+        assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
+        let stats: Vec<serde_json::Value> = serde_json::from_value(
+            resp.result.ok_or_else(|| anyhow::anyhow!("missing result"))?,
+        )?;
+        assert_eq!(stats.len(), 2, "should have stats for 2 rules");
+        // SEC-01 should be first (highest count)
+        assert_eq!(stats[0]["rule_id"], "SEC-01");
+        assert_eq!(stats[0]["count"], 3);
+        assert_eq!(stats[1]["rule_id"], "RS-05");
+        assert_eq!(stats[1]["count"], 1);
         Ok(())
     }
 

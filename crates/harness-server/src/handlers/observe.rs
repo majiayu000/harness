@@ -42,14 +42,12 @@ pub async fn metrics_collect(
     let events = state.events.query(&harness_core::EventFilters::default());
     match events {
         Ok(evts) => {
-            let violation_count = {
+            let violations = {
                 let rules = state.rules.read().await;
-                rules
-                    .scan(&project_root)
-                    .await
-                    .map(|v| v.len())
-                    .unwrap_or(0)
+                rules.scan(&project_root).await.unwrap_or_default()
             };
+            crate::handlers::persist_violations(&state.events, &violations);
+            let violation_count = violations.len();
             let report = harness_observe::QualityGrader::grade(&evts, violation_count);
             match serde_json::to_value(&report) {
                 Ok(v) => RpcResponse::success(id, v),

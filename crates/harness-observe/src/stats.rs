@@ -1,6 +1,47 @@
+use chrono::{DateTime, Utc};
 use harness_core::{Decision, Event, Grade};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Per-rule violation summary for historical trend queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleViolationStat {
+    pub rule_id: String,
+    pub count: usize,
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
+/// Aggregate `rule_check` events by rule_id (stored in the `tool` field).
+///
+/// Only Block and Warn decisions are counted as violations.
+pub fn rule_violation_stats(events: &[Event]) -> Vec<RuleViolationStat> {
+    // (count, last_seen)
+    let mut map: HashMap<String, (usize, Option<DateTime<Utc>>)> = HashMap::new();
+    for e in events {
+        if e.hook != "rule_check" {
+            continue;
+        }
+        if !matches!(e.decision, Decision::Block | Decision::Warn) {
+            continue;
+        }
+        let entry = map.entry(e.tool.clone()).or_insert((0, None));
+        entry.0 += 1;
+        entry.1 = Some(match entry.1 {
+            Some(prev) => prev.max(e.ts),
+            None => e.ts,
+        });
+    }
+    let mut stats: Vec<RuleViolationStat> = map
+        .into_iter()
+        .map(|(rule_id, (count, last_seen))| RuleViolationStat {
+            rule_id,
+            count,
+            last_seen,
+        })
+        .collect();
+    stats.sort_by(|a, b| b.count.cmp(&a.count).then(a.rule_id.cmp(&b.rule_id)));
+    stats
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookStats {
@@ -172,5 +213,65 @@ mod tests {
         assert!(!trends.is_empty());
         assert!((trends[0].pass_rate - 0.0).abs() < f64::EPSILON);
         assert_eq!(trends[0].grade, Grade::D);
+    }
+
+    fn rule_event(rule_id: &str, decision: Decision) -> Event {
+        Event::new(SessionId::new(), "rule_check", rule_id, decision)
+    }
+
+    #[test]
+    fn rule_violation_stats_empty_returns_empty() {
+        let stats = rule_violation_stats(&[]);
+        assert!(stats.is_empty());
+    }
+
+    #[test]
+    fn rule_violation_stats_counts_block_and_warn() {
+        let events = vec![
+            rule_event("SEC-01", Decision::Block),
+            rule_event("SEC-01", Decision::Block),
+            rule_event("RS-05", Decision::Warn),
+            rule_event("SEC-01", Decision::Pass), // Pass should not count
+        ];
+        let stats = rule_violation_stats(&events);
+        assert_eq!(stats.len(), 2);
+        assert!(stats.iter().any(|s| s.rule_id == "SEC-01" && s.count == 2), "SEC-01 count should be 2");
+        assert!(stats.iter().any(|s| s.rule_id == "RS-05" && s.count == 1), "RS-05 count should be 1");
+    }
+
+    #[test]
+    fn rule_violation_stats_ignores_non_rule_check_events() {
+        let events = vec![
+            make_event("other_hook", Decision::Block),
+            rule_event("SEC-01", Decision::Block),
+        ];
+        let stats = rule_violation_stats(&events);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].rule_id, "SEC-01");
+    }
+
+    #[test]
+    fn rule_violation_stats_sorted_by_count_desc() {
+        let events = vec![
+            rule_event("A", Decision::Block),
+            rule_event("B", Decision::Block),
+            rule_event("B", Decision::Block),
+        ];
+        let stats = rule_violation_stats(&events);
+        assert_eq!(stats[0].rule_id, "B");
+        assert_eq!(stats[0].count, 2);
+        assert_eq!(stats[1].rule_id, "A");
+        assert_eq!(stats[1].count, 1);
+    }
+
+    #[test]
+    fn rule_violation_stats_last_seen_is_most_recent() {
+        let mut e1 = rule_event("SEC-01", Decision::Block);
+        let mut e2 = rule_event("SEC-01", Decision::Block);
+        e1.ts = chrono::Utc::now() - chrono::Duration::hours(2);
+        e2.ts = chrono::Utc::now();
+        let stats = rule_violation_stats(&[e1, e2]);
+        assert_eq!(stats.len(), 1);
+        assert!(stats[0].last_seen.is_some());
     }
 }

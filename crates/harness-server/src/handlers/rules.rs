@@ -50,35 +50,32 @@ pub async fn rule_check(
     };
     match result {
         Ok(violations) => {
-            let session_id = harness_core::SessionId::new();
-            for violation in &violations {
-                let decision = match violation.severity {
-                    harness_core::Severity::Critical | harness_core::Severity::High => {
-                        harness_core::Decision::Block
-                    }
-                    harness_core::Severity::Medium => harness_core::Decision::Warn,
-                    harness_core::Severity::Low => harness_core::Decision::Pass,
-                };
-                let mut event = harness_core::Event::new(
-                    session_id.clone(),
-                    "rule_check",
-                    violation.rule_id.as_str(),
-                    decision,
-                );
-                event.reason = Some(violation.message.clone());
-                event.detail = Some(format!(
-                    "{}:{}",
-                    violation.file.display(),
-                    violation
-                        .line
-                        .map(|l| l.to_string())
-                        .unwrap_or_default()
-                ));
-                if let Err(e) = state.events.log(&event) {
-                    tracing::warn!("failed to log rule violation event: {e}");
-                }
-            }
+            crate::handlers::persist_violations(&state.events, &violations);
             match serde_json::to_value(&violations) {
+                Ok(v) => RpcResponse::success(id, v),
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+    }
+}
+
+pub async fn rule_stats(
+    state: &AppState,
+    id: Option<serde_json::Value>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+) -> RpcResponse {
+    let filters = harness_core::EventFilters {
+        hook: Some("rule_check".to_string()),
+        since,
+        until,
+        ..Default::default()
+    };
+    match state.events.query(&filters) {
+        Ok(events) => {
+            let stats = harness_observe::rule_violation_stats(&events);
+            match serde_json::to_value(&stats) {
                 Ok(v) => RpcResponse::success(id, v),
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             }

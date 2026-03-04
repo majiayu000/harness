@@ -44,6 +44,10 @@ pub enum Method {
     // === Rule engine ===
     RuleLoad { project_root: PathBuf },
     RuleCheck { project_root: PathBuf, files: Option<Vec<PathBuf>> },
+    RuleStats {
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+    },
 
     // === ExecPlan ===
     ExecPlanInit { spec: String, project_root: PathBuf },
