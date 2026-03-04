@@ -7,6 +7,10 @@ pub async fn rule_load(
     id: Option<serde_json::Value>,
     project_root: PathBuf,
 ) -> RpcResponse {
+    let project_root = match crate::handlers::validate_project_root(&project_root) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+    };
     let mut rules = state.rules.write().await;
     match rules.load(&project_root) {
         Ok(()) => {
@@ -23,6 +27,10 @@ pub async fn rule_check(
     project_root: PathBuf,
     files: Option<Vec<PathBuf>>,
 ) -> RpcResponse {
+    let project_root = match crate::handlers::validate_project_root(&project_root) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+    };
     let result = {
         let rules = state.rules.read().await;
         match files {

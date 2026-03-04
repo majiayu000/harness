@@ -188,7 +188,8 @@ pub async fn spawn_task(
 
     let handle = tokio::spawn(async move {
         let project = match req.project.clone() {
-            Some(p) => p,
+            Some(p) => crate::handlers::validate_project_root(&p)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
             None => tokio::task::spawn_blocking(detect_main_worktree)
                 .await
                 .unwrap_or_else(|_| PathBuf::from(".")),
@@ -324,7 +325,10 @@ mod tests {
 
     #[tokio::test]
     async fn skills_are_injected_into_agent_context() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let dir = tempfile::Builder::new()
+            .prefix("harness-test-")
+            .tempdir_in(&home)?;
         let store =
             TaskStore::open(&dir.path().join("tasks.db")).await?;
 
@@ -382,7 +386,10 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_interceptor_fails_task() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let dir = tempfile::Builder::new()
+            .prefix("harness-test-")
+            .tempdir_in(&home)?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
         let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
         let agent = CapturingAgent::new();

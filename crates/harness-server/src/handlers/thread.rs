@@ -48,6 +48,10 @@ pub async fn thread_start(
     id: Option<serde_json::Value>,
     cwd: PathBuf,
 ) -> RpcResponse {
+    let cwd = match crate::handlers::validate_project_root(&cwd) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+    };
     let thread_id = state.server.thread_manager.start_thread(cwd);
     persist_thread_insert(state, &thread_id).await;
     RpcResponse::success(id, serde_json::json!({ "thread_id": thread_id }))

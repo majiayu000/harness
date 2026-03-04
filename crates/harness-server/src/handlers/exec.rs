@@ -9,6 +9,10 @@ pub async fn exec_plan_init(
     spec: String,
     project_root: PathBuf,
 ) -> RpcResponse {
+    let project_root = match crate::handlers::validate_project_root(&project_root) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+    };
     match harness_exec::ExecPlan::from_spec(&spec, &project_root) {
         Ok(plan) => {
             let plan_id = plan.id.clone();

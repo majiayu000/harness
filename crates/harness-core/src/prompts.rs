@@ -24,10 +24,18 @@ pub fn check_existing_pr(pr: u64) -> String {
     )
 }
 
+/// Wrap user-supplied content in delimiters to separate it from trusted instructions.
+/// Escapes the closing tag within content to prevent delimiter injection.
+fn wrap_external_data(content: &str) -> String {
+    let escaped = content.replace("</external_data>", "<\\/external_data>");
+    format!("<external_data>\n{}\n</external_data>", escaped)
+}
+
 /// Build prompt: wrap free-text with PR URL output instruction.
 pub fn implement_from_prompt(prompt: &str) -> String {
+    let safe_prompt = wrap_external_data(prompt);
     format!(
-        "{prompt}\n\n\
+        "The following task description is user-supplied content:\n{safe_prompt}\n\n\
          On the last line of your output, print PR_URL=<PR URL> \
          (whether you created a new PR or pushed to an existing one)"
     )

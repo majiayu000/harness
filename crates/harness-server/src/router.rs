@@ -324,12 +324,16 @@ mod tests {
     {
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let proj_dir = tempfile::Builder::new()
+            .prefix("harness-test-")
+            .tempdir_in(&home)?;
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(serde_json::json!(1)),
             method: Method::RuleCheck {
-                project_root: dir.path().to_path_buf(),
+                project_root: proj_dir.path().to_path_buf(),
                 files: None,
             },
         };
@@ -407,12 +411,17 @@ mod tests {
     async fn thread_start_persists_to_db() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let proj_dir = tempfile::Builder::new()
+            .prefix("harness-test-")
+            .tempdir_in(&home)?;
+        let canonical_proj = proj_dir.path().canonicalize()?;
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(serde_json::json!(1)),
             method: Method::ThreadStart {
-                cwd: std::path::PathBuf::from("/test/project"),
+                cwd: proj_dir.path().to_path_buf(),
             },
         };
         let resp = handle_request(&state, req).await;
@@ -432,10 +441,7 @@ mod tests {
             .get(&thread_id_str)
             .await?
             .expect("thread should be in DB");
-        assert_eq!(
-            thread.project_root,
-            std::path::PathBuf::from("/test/project")
-        );
+        assert_eq!(thread.project_root, canonical_proj);
         Ok(())
     }
 }
