@@ -2,8 +2,9 @@ use crate::http::AppState;
 use harness_core::ThreadId;
 use harness_protocol::{Method, RpcRequest, RpcResponse, INTERNAL_ERROR};
 
-/// Validate that `path` is a safe project root: must exist and be a directory.
-/// Canonicalizes the path to prevent path traversal attacks.
+/// Validate that `path` is a safe project root: must exist, be a directory,
+/// and reside within the user's home directory to prevent accessing arbitrary
+/// system paths like `/etc` or `/root`.
 fn validate_project_root(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
     let canonical = path
         .canonicalize()
@@ -11,6 +12,19 @@ fn validate_project_root(path: &std::path::Path) -> Result<std::path::PathBuf, S
     if !canonical.is_dir() {
         return Err(format!(
             "project_root '{}' is not a directory",
+            canonical.display()
+        ));
+    }
+    // Restrict to the user's home directory to prevent path traversal into
+    // sensitive system directories. Guard scripts run against this path, so
+    // allowing arbitrary paths could expose /etc, ~/.ssh, etc.
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| std::env::var("USERPROFILE").map(std::path::PathBuf::from))
+        .map_err(|_| "cannot determine home directory for path validation".to_string())?;
+    if !canonical.starts_with(&home) {
+        return Err(format!(
+            "project_root '{}' is outside the allowed workspace (must be within home directory)",
             canonical.display()
         ));
     }
@@ -381,9 +395,11 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
                         );
                         event.reason = Some(sanitize_for_log(&violation.message));
                         // Only include line number when present to avoid misleading trailing colon.
+                        // Sanitize file path from external guard output to prevent prompt injection.
+                        let safe_file = sanitize_for_log(&violation.file.display().to_string());
                         event.detail = Some(match violation.line {
-                            Some(l) => format!("{}:{}", violation.file.display(), l),
-                            None => violation.file.display().to_string(),
+                            Some(l) => format!("{}:{}", safe_file, l),
+                            None => safe_file,
                         });
                         if let Err(e) = state.events.log(&event) {
                             tracing::warn!("failed to log rule violation event: {e}");
@@ -757,7 +773,9 @@ mod tests {
 
     #[tokio::test]
     async fn rule_check_logs_no_violations_when_no_guards_loaded() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+        // Must create temp dir inside HOME so validate_project_root accepts it.
+        let home = std::env::var("HOME").unwrap_or_else(|_| std::env::temp_dir().display().to_string());
+        let dir = tempfile::Builder::new().prefix("harness-test-").tempdir_in(&home)?;
         let state = make_test_state(dir.path()).await?;
 
         let req = RpcRequest {
