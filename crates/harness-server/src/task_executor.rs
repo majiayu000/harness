@@ -192,7 +192,7 @@ pub(crate) async fn run_task(
                 .map(|s| {
                     s.rounds
                         .iter()
-                        .filter(|r| r.result == "waiting")
+                        .filter(|r| r.result == "waiting" && r.turn == round)
                         .count() as u32
                 })
                 .unwrap_or(0);
