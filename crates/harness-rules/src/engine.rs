@@ -261,6 +261,14 @@ impl RuleEngine {
         Ok(violations)
     }
 
+    /// Add a rule, deduplicating by rule_id (skip if already present).
+    pub fn add_rule(&mut self, rule: Rule) {
+        if self.rules.iter().any(|r| r.id == rule.id) {
+            return;
+        }
+        self.rules.push(rule);
+    }
+
     pub fn rules(&self) -> &[Rule] {
         &self.rules
     }
@@ -382,5 +390,40 @@ mod tests {
         let paths = RuleEngine::parse_frontmatter_paths(frontmatter)?;
         assert_eq!(paths, vec!["*.rs", "src/**"]);
         Ok(())
+    }
+
+    #[test]
+    fn add_rule_inserts_new_rule() {
+        let mut engine = RuleEngine::new();
+        let rule = Rule {
+            id: RuleId::from_str("LEARN-001"),
+            title: "Test rule".to_string(),
+            severity: Severity::High,
+            category: Category::Style,
+            paths: Vec::new(),
+            description: "desc".to_string(),
+            fix_pattern: None,
+        };
+        engine.add_rule(rule);
+        assert_eq!(engine.rules().len(), 1);
+        assert_eq!(engine.rules()[0].id, RuleId::from_str("LEARN-001"));
+    }
+
+    #[test]
+    fn add_rule_deduplicates_by_id() {
+        let mut engine = RuleEngine::new();
+        let make = |title: &str| Rule {
+            id: RuleId::from_str("LEARN-001"),
+            title: title.to_string(),
+            severity: Severity::High,
+            category: Category::Style,
+            paths: Vec::new(),
+            description: "desc".to_string(),
+            fix_pattern: None,
+        };
+        engine.add_rule(make("first"));
+        engine.add_rule(make("duplicate"));
+        assert_eq!(engine.rules().len(), 1, "duplicate rule_id must be skipped");
+        assert_eq!(engine.rules()[0].title, "first");
     }
 }

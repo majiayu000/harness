@@ -52,6 +52,10 @@ pub enum Method {
     EventQuery { filters: EventFilters },
     MetricsCollect { project_root: PathBuf },
     MetricsQuery { filters: MetricFilters },
+
+    // === Learn feedback loop ===
+    LearnRules { project_root: PathBuf },
+    LearnSkills { project_root: PathBuf },
 }
 
 /// JSON-RPC 2.0 request envelope.

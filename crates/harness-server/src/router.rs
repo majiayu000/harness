@@ -107,6 +107,14 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
         Method::ExecPlanUpdate { plan_id, updates } => {
             handlers::exec::exec_plan_update(state, id, plan_id, updates).await
         }
+
+        // === Learn feedback loop ===
+        Method::LearnRules { project_root } => {
+            handlers::learn::learn_rules(state, id, project_root).await
+        }
+        Method::LearnSkills { project_root } => {
+            handlers::learn::learn_skills(state, id, project_root).await
+        }
     }
 }
 
