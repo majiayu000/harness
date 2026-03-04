@@ -299,8 +299,17 @@ async fn run_task(
     };
 
     // Review loop: Turn 2..N
+    // prev_fixed tracks whether the previous round pushed new code.
+    // When true, the next round's prompt requires the agent to verify that
+    // Gemini has submitted a new review covering the latest commit before
+    // declaring LGTM. If Gemini hasn't re-reviewed yet, the agent outputs
+    // WAITING and we retry without consuming a round.
     let last_review_round = req.max_rounds.saturating_add(1);
-    for round in 2..=last_review_round {
+    let mut prev_fixed = false;
+    let mut round = 2u32;
+    let max_waiting_retries = 3u32;
+
+    while round <= last_review_round {
         update_status(store, task_id, TaskStatus::Waiting, round).await;
         sleep(Duration::from_secs(req.wait_secs)).await;
 
@@ -309,7 +318,7 @@ async fn run_task(
         let resp = tokio::time::timeout(
             turn_timeout,
             agent.execute(AgentRequest {
-                prompt: prompts::review_prompt(req.issue, pr_num, round),
+                prompt: prompts::review_prompt(req.issue, pr_num, round, prev_fixed),
                 project_root: project.clone(),
                 context: skill_items.clone(),
                 ..Default::default()
@@ -318,6 +327,37 @@ async fn run_task(
         .await
         .map_err(|_| anyhow::anyhow!("Turn {round} timed out after {}s", req.turn_timeout_secs))?
         ?;
+
+        // WAITING: Gemini hasn't re-reviewed after the fix commit yet.
+        // Retry without consuming a round, up to max_waiting_retries.
+        if prompts::is_waiting(&resp.output) {
+            mutate_and_persist(store, task_id, |s| {
+                s.rounds.push(RoundResult {
+                    turn: round,
+                    action: "review".into(),
+                    result: "waiting".into(),
+                });
+            })
+            .await;
+
+            let waiting_count = store
+                .get(task_id)
+                .map(|s| {
+                    s.rounds
+                        .iter()
+                        .filter(|r| r.result == "waiting")
+                        .count() as u32
+                })
+                .unwrap_or(0);
+
+            if waiting_count >= max_waiting_retries {
+                // Exceeded waiting retries — advance round to avoid infinite loop
+                prev_fixed = true;
+                round += 1;
+            }
+            // Don't advance round; retry with same round number
+            continue;
+        }
 
         let lgtm = prompts::is_lgtm(&resp.output);
 
@@ -351,6 +391,9 @@ async fn run_task(
             update_status(store, task_id, TaskStatus::Done, round).await;
             return Ok(());
         }
+
+        prev_fixed = true;
+        round += 1;
     }
 
     // Reached max rounds without LGTM

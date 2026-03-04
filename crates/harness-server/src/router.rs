@@ -222,11 +222,15 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
             }
         }
 
-        Method::MetricsCollect { project_root: _ } => {
+        Method::MetricsCollect { project_root } => {
             let events = state.events.query(&harness_core::EventFilters::default());
             match events {
                 Ok(evts) => {
-                    let report = harness_observe::QualityGrader::grade(&evts, 0);
+                    let violation_count = {
+                        let rules = state.rules.read().await;
+                        rules.scan(&project_root).await.map(|v| v.len()).unwrap_or(0)
+                    };
+                    let report = harness_observe::QualityGrader::grade(&evts, violation_count);
                     match serde_json::to_value(&report) {
                         Ok(v) => RpcResponse::success(id, v),
                         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -245,7 +249,18 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
             let events = state.events.query(&event_filters);
             match events {
                 Ok(evts) => {
-                    let report = harness_observe::QualityGrader::grade(&evts, 0);
+                    // Count rule violations persisted by RuleCheck handler.
+                    let violation_count = evts
+                        .iter()
+                        .filter(|e| {
+                            e.hook == "rule_check"
+                                && matches!(
+                                    e.decision,
+                                    harness_core::Decision::Block | harness_core::Decision::Warn
+                                )
+                        })
+                        .count();
+                    let report = harness_observe::QualityGrader::grade(&evts, violation_count);
                     match serde_json::to_value(&report) {
                         Ok(v) => RpcResponse::success(id, v),
                         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -269,16 +284,47 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
         }
 
         Method::RuleCheck { project_root, files } => {
-            let rules = state.rules.read().await;
-            let result = match files {
-                Some(f) => rules.scan_files(&project_root, &f).await,
-                None => rules.scan(&project_root).await,
+            let result = {
+                let rules = state.rules.read().await;
+                match files {
+                    Some(f) => rules.scan_files(&project_root, &f).await,
+                    None => rules.scan(&project_root).await,
+                }
             };
             match result {
-                Ok(violations) => match serde_json::to_value(&violations) {
-                    Ok(v) => RpcResponse::success(id, v),
-                    Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
-                },
+                Ok(violations) => {
+                    // Persist each violation as an Event so the observability
+                    // pipeline (MetricsQuery, GcRun) can see them.
+                    let session_id = harness_core::SessionId::new();
+                    for violation in &violations {
+                        let decision = match violation.severity {
+                            harness_core::Severity::Critical | harness_core::Severity::High => {
+                                harness_core::Decision::Block
+                            }
+                            harness_core::Severity::Medium => harness_core::Decision::Warn,
+                            harness_core::Severity::Low => harness_core::Decision::Pass,
+                        };
+                        let mut event = harness_core::Event::new(
+                            session_id.clone(),
+                            "rule_check",
+                            violation.rule_id.as_str(),
+                            decision,
+                        );
+                        event.reason = Some(violation.message.clone());
+                        event.detail = Some(format!(
+                            "{}:{}",
+                            violation.file.display(),
+                            violation.line.map(|l| l.to_string()).unwrap_or_default()
+                        ));
+                        if let Err(e) = state.events.log(&event) {
+                            tracing::warn!("failed to log rule violation event: {e}");
+                        }
+                    }
+                    match serde_json::to_value(&violations) {
+                        Ok(v) => RpcResponse::success(id, v),
+                        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                    }
+                }
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             }
         }
@@ -290,12 +336,17 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
                 Ok(e) => e,
                 Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             };
-            let project = harness_core::Project::from_path(std::path::PathBuf::from("."));
+            let project_root = std::path::PathBuf::from(".");
+            let violations = {
+                let rules = state.rules.read().await;
+                rules.scan(&project_root).await.unwrap_or_default()
+            };
+            let project = harness_core::Project::from_path(project_root);
             let agent = match server.agent_registry.default_agent() {
                 Some(a) => a,
                 None => return RpcResponse::error(id, INTERNAL_ERROR, "no agent registered"),
             };
-            match state.gc_agent.run(&project, &events, &[], agent.as_ref()).await {
+            match state.gc_agent.run(&project, &events, &violations, agent.as_ref()).await {
                 Ok(report) => match serde_json::to_value(&report) {
                     Ok(v) => RpcResponse::success(id, v),
                     Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -633,6 +684,75 @@ mod tests {
         let tid = crate::task_runner::TaskId(task_id.to_string());
         let task = state.tasks.get(&tid);
         assert!(task.is_some(), "task should exist in the task store");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rule_check_logs_no_violations_when_no_guards_loaded() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::RuleCheck {
+                project_root: dir.path().to_path_buf(),
+                files: None,
+            },
+        };
+        let resp = handle_request(&state, req).await;
+
+        assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
+        let violations: Vec<serde_json::Value> = serde_json::from_value(
+            resp.result.ok_or_else(|| anyhow::anyhow!("missing result"))?,
+        )?;
+        assert!(violations.is_empty(), "no guards loaded, violations must be empty");
+
+        // No rule_check events should have been logged with no violations.
+        let events = state.events.query(&harness_core::EventFilters {
+            hook: Some("rule_check".to_string()),
+            ..Default::default()
+        })?;
+        assert!(events.is_empty(), "no events should be logged when there are no violations");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_query_counts_rule_violations_from_events() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        // Manually seed rule_check violation events (as RuleCheck handler would).
+        let session_id = harness_core::SessionId::new();
+        for _ in 0..5 {
+            let event = harness_core::Event::new(
+                session_id.clone(),
+                "rule_check",
+                "SEC-01",
+                harness_core::Decision::Block,
+            );
+            state.events.log(&event)?;
+        }
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::MetricsQuery {
+                filters: harness_core::MetricFilters::default(),
+            },
+        };
+        let resp = handle_request(&state, req).await;
+
+        assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
+        let result = resp.result.ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        // Coverage must be below 100% because we have 5 Block violations.
+        let coverage = result["dimensions"]["coverage"]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("missing coverage"))?;
+        assert!(
+            coverage < 100.0,
+            "coverage should degrade with violations, got {coverage}"
+        );
         Ok(())
     }
 
