@@ -164,6 +164,7 @@ mod tests {
             thread_db: Some(thread_db),
             interceptors: vec![],
             notification_tx,
+            notify_tx: None,
         })
     }
 
