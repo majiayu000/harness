@@ -114,14 +114,12 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             .iter()
             .rev()
             .find(|e| e.hook == "rule_scan")
-            .and_then(|scan| {
-                state.events.query(&harness_core::EventFilters {
-                    session_id: Some(scan.session_id.clone()),
-                    hook: Some("rule_check".to_string()),
-                    ..Default::default()
-                }).ok()
+            .map(|scan| {
+                events
+                    .iter()
+                    .filter(|e| e.hook == "rule_check" && e.session_id == scan.session_id)
+                    .count()
             })
-            .map(|v| v.len())
             .unwrap_or(0);
         harness_observe::quality::QualityGrader::grade(&events, violation_count).grade
     };
