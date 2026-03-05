@@ -1,5 +1,7 @@
 use crate::http::AppState;
-use harness_core::{AgentRequest, CodeAgent, TaskComplexity};
+use anyhow::anyhow;
+use chrono::{DateTime, Utc};
+use harness_core::{AgentRequest, CodeAgent, Event, EventFilters, SessionId, TaskComplexity};
 use harness_protocol::{RpcResponse, INTERNAL_ERROR};
 use harness_rules::engine::RuleEngine;
 use harness_skills::SkillStore;
@@ -14,7 +16,25 @@ pub struct PreflightResult {
     pub constraints: Vec<String>,
     pub affected_files: Vec<PathBuf>,
     pub baseline_violations: usize,
+    pub baseline_scan_timestamp: DateTime<Utc>,
+    pub baseline_scan_source: String,
+    pub baseline_scan_session_id: SessionId,
     pub recommended_complexity: TaskComplexity,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedPreflightOutput {
+    constraints: Vec<String>,
+    affected_files: Vec<PathBuf>,
+    recommended_complexity: TaskComplexity,
+}
+
+#[derive(Debug, Clone)]
+struct BaselineScanSnapshot {
+    violation_count: usize,
+    scanned_at: DateTime<Utc>,
+    source: String,
+    session_id: SessionId,
 }
 
 /// Run a preflight analysis for the given task description.
@@ -25,6 +45,7 @@ pub async fn run_preflight(
     agent: Arc<dyn CodeAgent>,
     skills: Arc<RwLock<SkillStore>>,
     rules: Arc<RwLock<RuleEngine>>,
+    events: Arc<harness_observe::EventStore>,
     project_root: PathBuf,
     task_description: String,
 ) -> anyhow::Result<PreflightResult> {
@@ -74,13 +95,23 @@ pub async fn run_preflight(
     };
 
     let resp = agent.execute(req).await?;
-    parse_preflight_output(&resp.output)
+    let parsed = parse_preflight_output(&resp.output)?;
+    let baseline = latest_baseline_scan(events.as_ref())?;
+
+    Ok(PreflightResult {
+        constraints: parsed.constraints,
+        affected_files: parsed.affected_files,
+        baseline_violations: baseline.violation_count,
+        baseline_scan_timestamp: baseline.scanned_at,
+        baseline_scan_source: baseline.source,
+        baseline_scan_session_id: baseline.session_id,
+        recommended_complexity: parsed.recommended_complexity,
+    })
 }
 
-fn parse_preflight_output(output: &str) -> anyhow::Result<PreflightResult> {
+fn parse_preflight_output(output: &str) -> anyhow::Result<ParsedPreflightOutput> {
     let mut constraints: Vec<String> = Vec::new();
     let mut affected_files: Vec<PathBuf> = Vec::new();
-    let mut risk_level = "low";
     let mut complexity_str = "simple";
     let mut current_section = "";
 
@@ -90,8 +121,7 @@ fn parse_preflight_output(output: &str) -> anyhow::Result<PreflightResult> {
             current_section = "constraints";
         } else if trimmed.starts_with("AFFECTED_FILES:") {
             current_section = "affected_files";
-        } else if let Some(rest) = trimmed.strip_prefix("RISK:") {
-            risk_level = rest.trim();
+        } else if trimmed.starts_with("RISK:") {
             current_section = "";
         } else if let Some(rest) = trimmed.strip_prefix("COMPLEXITY:") {
             complexity_str = rest.trim();
@@ -106,12 +136,6 @@ fn parse_preflight_output(output: &str) -> anyhow::Result<PreflightResult> {
         }
     }
 
-    let baseline_violations = match risk_level.to_lowercase().as_str() {
-        "high" => 3,
-        "medium" => 1,
-        _ => 0,
-    };
-
     let recommended_complexity = match complexity_str.to_lowercase().as_str() {
         "complex" => TaskComplexity::Complex,
         "critical" => TaskComplexity::Critical,
@@ -119,11 +143,54 @@ fn parse_preflight_output(output: &str) -> anyhow::Result<PreflightResult> {
         _ => TaskComplexity::Simple,
     };
 
-    Ok(PreflightResult {
+    Ok(ParsedPreflightOutput {
         constraints,
         affected_files,
-        baseline_violations,
         recommended_complexity,
+    })
+}
+
+fn latest_baseline_scan(
+    events: &harness_observe::EventStore,
+) -> anyhow::Result<BaselineScanSnapshot> {
+    let all_events = events
+        .query(&EventFilters::default())
+        .map_err(|e| anyhow!("failed to query event store for baseline scan: {e}"))?;
+
+    select_latest_baseline_scan(&all_events).ok_or_else(|| {
+        anyhow!("no baseline scan results found in event store; run rule_check before preflight")
+    })
+}
+
+fn select_latest_baseline_scan(events: &[Event]) -> Option<BaselineScanSnapshot> {
+    if let Some(scan) = events.iter().rev().find(|e| e.hook == "rule_scan") {
+        let violation_count = events
+            .iter()
+            .filter(|e| e.hook == "rule_check" && e.session_id == scan.session_id)
+            .count();
+
+        return Some(BaselineScanSnapshot {
+            violation_count,
+            scanned_at: scan.ts,
+            source: format!("event_store:{}:{}", scan.hook, scan.tool),
+            session_id: scan.session_id.clone(),
+        });
+    }
+
+    let latest_rule_check = events.iter().rev().find(|e| e.hook == "rule_check")?;
+    let session_id = latest_rule_check.session_id.clone();
+    let (violation_count, scanned_at) = events
+        .iter()
+        .filter(|e| e.hook == "rule_check" && e.session_id == session_id)
+        .fold((0usize, latest_rule_check.ts), |(count, max_ts), event| {
+            (count + 1, max_ts.max(event.ts))
+        });
+
+    Some(BaselineScanSnapshot {
+        violation_count,
+        scanned_at,
+        source: "event_store:rule_check_fallback".to_string(),
+        session_id,
     })
 }
 
@@ -148,6 +215,7 @@ pub async fn preflight(
         agent,
         state.skills.clone(),
         state.rules.clone(),
+        state.events.clone(),
         project_root,
         task_description,
     )
@@ -164,27 +232,74 @@ pub async fn preflight(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::TaskComplexity;
+    use harness_core::{
+        AgentRequest, AgentResponse, Capability, CodeAgent, Decision, Result as HarnessResult,
+        StreamItem, TokenUsage,
+    };
+    use tokio::sync::mpsc::Sender;
 
-    #[test]
-    fn parse_output_with_all_sections() {
-        let output = "\
+    struct StaticAgent {
+        output: String,
+    }
+
+    #[async_trait::async_trait]
+    impl CodeAgent for StaticAgent {
+        fn name(&self) -> &str {
+            "static-agent"
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+
+        async fn execute(&self, _req: AgentRequest) -> HarnessResult<AgentResponse> {
+            Ok(AgentResponse {
+                output: self.output.clone(),
+                stderr: String::new(),
+                items: vec![],
+                token_usage: TokenUsage::default(),
+                model: "mock".to_string(),
+                exit_code: Some(0),
+            })
+        }
+
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            _tx: Sender<StreamItem>,
+        ) -> HarnessResult<()> {
+            Ok(())
+        }
+    }
+
+    fn sample_output() -> String {
+        "\
 CONSTRAINTS:\n- No breaking API changes\n- Must add tests\n\
 AFFECTED_FILES:\n- src/lib.rs\n- src/handler.rs\n\
 RISK: medium\n\
-COMPLEXITY: complex";
-        let result = parse_preflight_output(output).expect("parse");
-        assert_eq!(result.constraints, vec!["No breaking API changes", "Must add tests"]);
-        assert_eq!(result.affected_files, vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/handler.rs")]);
-        assert_eq!(result.baseline_violations, 1);
+COMPLEXITY: complex"
+            .to_string()
+    }
+
+    #[test]
+    fn parse_output_with_all_sections() {
+        let output = sample_output();
+        let result = parse_preflight_output(&output).expect("parse");
+        assert_eq!(
+            result.constraints,
+            vec!["No breaking API changes", "Must add tests"]
+        );
+        assert_eq!(
+            result.affected_files,
+            vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/handler.rs")]
+        );
         assert_eq!(result.recommended_complexity, TaskComplexity::Complex);
     }
 
     #[test]
-    fn parse_output_high_risk() {
+    fn parse_output_critical_complexity() {
         let output = "CONSTRAINTS:\nAFFECTED_FILES:\nRISK: high\nCOMPLEXITY: critical";
         let result = parse_preflight_output(output).expect("parse");
-        assert_eq!(result.baseline_violations, 3);
         assert_eq!(result.recommended_complexity, TaskComplexity::Critical);
     }
 
@@ -192,7 +307,6 @@ COMPLEXITY: complex";
     fn parse_output_low_risk_simple() {
         let output = "CONSTRAINTS:\n- Keep it minimal\nAFFECTED_FILES:\n- README.md\nRISK: low\nCOMPLEXITY: simple";
         let result = parse_preflight_output(output).expect("parse");
-        assert_eq!(result.baseline_violations, 0);
         assert_eq!(result.recommended_complexity, TaskComplexity::Simple);
     }
 
@@ -202,5 +316,173 @@ COMPLEXITY: complex";
         let result = parse_preflight_output(output).expect("parse");
         assert!(result.constraints.is_empty());
         assert!(result.affected_files.is_empty());
+    }
+
+    #[test]
+    fn select_latest_scan_prefers_rule_scan_session() {
+        let first_session = SessionId::new();
+        let latest_session = SessionId::new();
+        let mut events = vec![Event::new(
+            first_session.clone(),
+            "rule_scan",
+            "RuleEngine",
+            Decision::Warn,
+        )];
+        events.push(Event::new(
+            first_session.clone(),
+            "rule_check",
+            "SEC-01",
+            Decision::Block,
+        ));
+        events.push(Event::new(
+            latest_session.clone(),
+            "rule_scan",
+            "RuleEngine",
+            Decision::Warn,
+        ));
+        events.push(Event::new(
+            latest_session.clone(),
+            "rule_check",
+            "PERF-01",
+            Decision::Warn,
+        ));
+        events.push(Event::new(
+            latest_session.clone(),
+            "rule_check",
+            "SEC-02",
+            Decision::Block,
+        ));
+
+        let snapshot = select_latest_baseline_scan(&events).expect("snapshot");
+        assert_eq!(snapshot.violation_count, 2);
+        assert_eq!(snapshot.session_id, latest_session);
+        assert_eq!(snapshot.source, "event_store:rule_scan:RuleEngine");
+    }
+
+    #[test]
+    fn select_latest_scan_falls_back_to_rule_check_session() {
+        let first_session = SessionId::new();
+        let latest_session = SessionId::new();
+        let mut events = vec![Event::new(
+            first_session.clone(),
+            "rule_check",
+            "SEC-01",
+            Decision::Block,
+        )];
+        events.push(Event::new(
+            latest_session.clone(),
+            "rule_check",
+            "SEC-02",
+            Decision::Block,
+        ));
+        events.push(Event::new(
+            latest_session.clone(),
+            "rule_check",
+            "PERF-01",
+            Decision::Warn,
+        ));
+
+        let snapshot = select_latest_baseline_scan(&events).expect("snapshot");
+        assert_eq!(snapshot.violation_count, 2);
+        assert_eq!(snapshot.session_id, latest_session);
+        assert_eq!(snapshot.source, "event_store:rule_check_fallback");
+    }
+
+    #[tokio::test]
+    async fn run_preflight_uses_scan_result_from_event_store() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let events = Arc::new(harness_observe::EventStore::new(temp.path())?);
+        let session_id = SessionId::new();
+
+        let scan_event = Event::new(
+            session_id.clone(),
+            "rule_scan",
+            "RuleEngine",
+            Decision::Warn,
+        );
+        events.log(&scan_event)?;
+        events.log(&Event::new(
+            session_id.clone(),
+            "rule_check",
+            "SEC-01",
+            Decision::Block,
+        ))?;
+        events.log(&Event::new(
+            session_id.clone(),
+            "rule_check",
+            "SEC-02",
+            Decision::Warn,
+        ))?;
+
+        let result = run_preflight(
+            Arc::new(StaticAgent {
+                output: sample_output(),
+            }),
+            Arc::new(RwLock::new(SkillStore::new())),
+            Arc::new(RwLock::new(RuleEngine::new())),
+            events,
+            temp.path().to_path_buf(),
+            "test task".to_string(),
+        )
+        .await?;
+
+        assert_eq!(result.baseline_violations, 2);
+        assert_eq!(
+            result.baseline_scan_source,
+            "event_store:rule_scan:RuleEngine"
+        );
+        assert_eq!(result.baseline_scan_session_id, session_id);
+        assert_eq!(result.recommended_complexity, TaskComplexity::Complex);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_preflight_errors_when_no_scan_result_exists() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let err = run_preflight(
+            Arc::new(StaticAgent {
+                output: sample_output(),
+            }),
+            Arc::new(RwLock::new(SkillStore::new())),
+            Arc::new(RwLock::new(RuleEngine::new())),
+            Arc::new(harness_observe::EventStore::new(temp.path())?),
+            temp.path().to_path_buf(),
+            "test task".to_string(),
+        )
+        .await
+        .expect_err("expected no-scan error");
+
+        assert!(
+            err.to_string()
+                .contains("no baseline scan results found in event store"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_preflight_errors_when_event_store_query_fails() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::create_dir_all(temp.path().join("events.jsonl"))?;
+
+        let err = run_preflight(
+            Arc::new(StaticAgent {
+                output: sample_output(),
+            }),
+            Arc::new(RwLock::new(SkillStore::new())),
+            Arc::new(RwLock::new(RuleEngine::new())),
+            Arc::new(harness_observe::EventStore::new(temp.path())?),
+            temp.path().to_path_buf(),
+            "test task".to_string(),
+        )
+        .await
+        .expect_err("expected event-store failure");
+
+        assert!(
+            err.to_string()
+                .contains("failed to query event store for baseline scan"),
+            "unexpected error: {err}"
+        );
+        Ok(())
     }
 }

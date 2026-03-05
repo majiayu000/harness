@@ -1,10 +1,10 @@
 use crate::{http::AppState, router};
+use axum::extract::ws::{Message, WebSocket};
 use axum::{
     extract::{State, WebSocketUpgrade},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use harness_protocol::{codec, RpcResponse};
 use std::sync::Arc;
@@ -22,7 +22,14 @@ fn is_local_origin(origin: &str) -> bool {
     // Extract the host by stripping scheme and optional port.
     let host = origin
         .split_once("://")
-        .map(|(_, rest)| rest.split(':').next().unwrap_or("").split('/').next().unwrap_or(""))
+        .map(|(_, rest)| {
+            rest.split(':')
+                .next()
+                .unwrap_or("")
+                .split('/')
+                .next()
+                .unwrap_or("")
+        })
         .unwrap_or("");
     host == "localhost" || host == "127.0.0.1"
 }
@@ -39,7 +46,10 @@ pub async fn ws_handler(
     if let Some(origin) = headers.get("Origin") {
         let origin_str = origin.to_str().unwrap_or("");
         if !is_local_origin(origin_str) {
-            tracing::warn!("WebSocket connection rejected: non-local Origin {:?}", origin_str);
+            tracing::warn!(
+                "WebSocket connection rejected: non-local Origin {:?}",
+                origin_str
+            );
             return StatusCode::FORBIDDEN.into_response();
         }
     }
@@ -74,16 +84,14 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
     let notif_task = tokio::spawn(async move {
         loop {
             match notif_rx.recv().await {
-                Ok(notif) => {
-                    match codec::encode_notification(&notif) {
-                        Ok(text) => {
-                            if notif_out_tx.send(text).is_err() {
-                                break;
-                            }
+                Ok(notif) => match codec::encode_notification(&notif) {
+                    Ok(text) => {
+                        if notif_out_tx.send(text).is_err() {
+                            break;
                         }
-                        Err(e) => tracing::warn!("failed to encode notification: {e}"),
                     }
-                }
+                    Err(e) => tracing::warn!("failed to encode notification: {e}"),
+                },
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             }
@@ -134,13 +142,13 @@ mod tests {
     use tokio::sync::broadcast;
     use tokio::sync::RwLock;
 
-    async fn bind_loopback_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
-        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-            Ok(listener) => Ok(Some(listener)),
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("skipping websocket integration test: {err}");
-                Ok(None)
+    fn bind_test_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(std_listener) => {
+                std_listener.set_nonblocking(true)?;
+                Ok(Some(tokio::net::TcpListener::from_std(std_listener)?))
             }
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => Ok(None),
             Err(err) => Err(err.into()),
         }
     }
@@ -168,6 +176,7 @@ mod tests {
 
         Ok(AppState {
             server,
+            project_root: dir.to_path_buf(),
             tasks,
             skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
             rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
@@ -189,7 +198,7 @@ mod tests {
         let state = Arc::new(make_test_state(dir.path()).await?);
 
         // Bind to a random port.
-        let Some(listener) = bind_loopback_listener().await? else {
+        let Some(listener) = bind_test_listener()? else {
             return Ok(());
         };
         let addr = listener.local_addr()?;
@@ -218,7 +227,10 @@ mod tests {
 
         // Receive response.
         use futures::StreamExt;
-        let msg = ws.next().await.ok_or_else(|| anyhow::anyhow!("no message"))??;
+        let msg = ws
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no message"))??;
         let body = match msg {
             tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
             other => anyhow::bail!("unexpected message: {other:?}"),
@@ -239,7 +251,7 @@ mod tests {
         let state = Arc::new(make_test_state(dir.path()).await?);
         let notif_tx = state.notification_tx.clone();
 
-        let Some(listener) = bind_loopback_listener().await? else {
+        let Some(listener) = bind_test_listener()? else {
             return Ok(());
         };
         let addr = listener.local_addr()?;
@@ -270,7 +282,9 @@ mod tests {
         .await?;
         {
             use futures::StreamExt;
-            ws.next().await.ok_or_else(|| anyhow::anyhow!("no init response"))??;
+            ws.next()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("no init response"))??;
         }
 
         // Broadcast a notification.
@@ -285,12 +299,9 @@ mod tests {
 
         // Client should receive it.
         use futures::StreamExt;
-        let msg = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            ws.next(),
-        )
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no message"))??;
+        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws.next())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no message"))??;
 
         let body = match msg {
             tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),

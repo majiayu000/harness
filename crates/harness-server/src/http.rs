@@ -14,6 +14,7 @@ use tokio::sync::{broadcast, RwLock};
 
 pub struct AppState {
     pub server: Arc<HarnessServer>,
+    pub project_root: std::path::PathBuf,
     pub tasks: Arc<task_runner::TaskStore>,
     pub skills: Arc<RwLock<harness_skills::SkillStore>>,
     pub rules: Arc<RwLock<harness_rules::engine::RuleEngine>>,
@@ -45,10 +46,28 @@ fn data_dir() -> std::path::PathBuf {
     }
 }
 
+fn resolve_project_root(configured_root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let project_root = configured_root.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid server.project_root '{}': {e}",
+            configured_root.display()
+        )
+    })?;
+    if !project_root.is_dir() {
+        anyhow::bail!(
+            "server.project_root is not a directory: {}",
+            project_root.display()
+        );
+    }
+    Ok(project_root)
+}
+
 /// Build an AppState with all stores. Used by both HTTP and stdio transports.
 pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppState> {
     let dir = data_dir();
     std::fs::create_dir_all(&dir)?;
+    let project_root = resolve_project_root(&server.config.server.project_root)?;
+    tracing::info!("project root: {}", project_root.display());
 
     let db_path = dir.join("tasks.db");
     tracing::info!("task db: {}", db_path.display());
@@ -84,6 +103,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     Ok(AppState {
         server,
+        project_root,
         tasks,
         skills: Arc::new(RwLock::new({
             let mut store = harness_skills::SkillStore::new().with_persist_dir(dir.join("skills"));
@@ -233,6 +253,7 @@ mod tests {
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
         Ok(Arc::new(AppState {
             server,
+            project_root: dir.to_path_buf(),
             tasks,
             skills: Arc::new(tokio::sync::RwLock::new(harness_skills::SkillStore::new())),
             rules: Arc::new(tokio::sync::RwLock::new(harness_rules::engine::RuleEngine::new())),
