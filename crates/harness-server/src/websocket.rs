@@ -85,7 +85,7 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
     // Main loop: read incoming frames, dispatch as JSON-RPC, reply.
     while let Some(result) = ws_stream.next().await {
         let text = match result {
-            Ok(Message::Text(t)) => t.to_string(),
+            Ok(Message::Text(t)) => t,
             Ok(Message::Close(_)) | Err(_) => break,
             _ => continue,
         };
