@@ -26,10 +26,10 @@ pub(crate) async fn persist_thread_insert(state: &AppState, thread_id: &ThreadId
 }
 
 /// Handle the `initialized` notification sent by the client after `initialize`.
-/// Returns an empty success to confirm the handshake is complete on the server side.
-pub async fn initialized(id: Option<serde_json::Value>) -> RpcResponse {
-    RpcResponse::success(id, serde_json::json!({}))
-}
+///
+/// Per JSON-RPC 2.0, notifications do not get a response. The HTTP layer will
+/// return `204 No Content` when the incoming request has no `id`.
+pub async fn initialized() {}
 
 pub async fn initialize(id: Option<serde_json::Value>) -> RpcResponse {
     RpcResponse::success(

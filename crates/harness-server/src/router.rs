@@ -3,139 +3,147 @@ use crate::http::AppState;
 use harness_protocol::{Method, RpcRequest, RpcResponse};
 
 /// Route a JSON-RPC request to the appropriate handler.
-pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
+pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResponse> {
     let id = req.id.clone();
 
     match req.method {
         // === Initialization ===
-        Method::Initialize => handlers::thread::initialize(id).await,
-        Method::Initialized => handlers::thread::initialized(id).await,
+        Method::Initialize => Some(handlers::thread::initialize(id).await),
+        Method::Initialized => {
+            handlers::thread::initialized().await;
+            // `initialized` is a notification in JSON-RPC (no response when `id` is absent).
+            if id.is_none() {
+                None
+            } else {
+                Some(RpcResponse::success(id, serde_json::json!({})))
+            }
+        }
 
         // === Thread management ===
         Method::ThreadStart { cwd } => {
-            handlers::thread::thread_start(state, id, cwd).await
+            Some(handlers::thread::thread_start(state, id, cwd).await)
         }
-        Method::ThreadList => handlers::thread::thread_list(state, id).await,
+        Method::ThreadList => Some(handlers::thread::thread_list(state, id).await),
         Method::ThreadDelete { thread_id } => {
-            handlers::thread::thread_delete(state, id, thread_id).await
+            Some(handlers::thread::thread_delete(state, id, thread_id).await)
         }
         Method::ThreadResume { thread_id } => {
-            handlers::thread::thread_resume(state, id, thread_id).await
+            Some(handlers::thread::thread_resume(state, id, thread_id).await)
         }
         Method::ThreadFork {
             thread_id,
             from_turn,
-        } => handlers::thread::thread_fork(state, id, thread_id, from_turn).await,
+        } => Some(handlers::thread::thread_fork(state, id, thread_id, from_turn).await),
         Method::ThreadCompact { thread_id } => {
-            handlers::thread::thread_compact(state, id, thread_id).await
+            Some(handlers::thread::thread_compact(state, id, thread_id).await)
         }
 
         // === Turn control ===
         Method::TurnStart { thread_id, input } => {
-            handlers::thread::turn_start(state, id, thread_id, input).await
+            Some(handlers::thread::turn_start(state, id, thread_id, input).await)
         }
         Method::TurnCancel { turn_id } => {
-            handlers::thread::turn_cancel(state, id, turn_id).await
+            Some(handlers::thread::turn_cancel(state, id, turn_id).await)
         }
         Method::TurnStatus { turn_id } => {
-            handlers::thread::turn_status(state, id, turn_id).await
+            Some(handlers::thread::turn_status(state, id, turn_id).await)
         }
         Method::TurnSteer {
             turn_id,
             instruction,
-        } => handlers::thread::turn_steer(state, id, turn_id, instruction).await,
+        } => Some(handlers::thread::turn_steer(state, id, turn_id, instruction).await),
 
         // === Skills ===
         Method::SkillCreate { name, content } => {
-            handlers::skills::skill_create(state, id, name, content).await
+            Some(handlers::skills::skill_create(state, id, name, content).await)
         }
         Method::SkillList { query } => {
-            handlers::skills::skill_list(state, id, query).await
+            Some(handlers::skills::skill_list(state, id, query).await)
         }
         Method::SkillGet { skill_id } => {
-            handlers::skills::skill_get(state, id, skill_id).await
+            Some(handlers::skills::skill_get(state, id, skill_id).await)
         }
         Method::SkillDelete { skill_id } => {
-            handlers::skills::skill_delete(state, id, skill_id).await
+            Some(handlers::skills::skill_delete(state, id, skill_id).await)
         }
 
         // === Events / Metrics ===
         Method::EventLog { event } => {
-            handlers::observe::event_log(state, id, event).await
+            Some(handlers::observe::event_log(state, id, event).await)
         }
         Method::EventQuery { filters } => {
-            handlers::observe::event_query(state, id, filters).await
+            Some(handlers::observe::event_query(state, id, filters).await)
         }
         Method::MetricsCollect { project_root } => {
-            handlers::observe::metrics_collect(state, id, project_root).await
+            Some(handlers::observe::metrics_collect(state, id, project_root).await)
         }
         Method::MetricsQuery { filters } => {
-            handlers::observe::metrics_query(state, id, filters).await
+            Some(handlers::observe::metrics_query(state, id, filters).await)
         }
 
         // === Rules ===
         Method::RuleLoad { project_root } => {
-            handlers::rules::rule_load(state, id, project_root).await
+            Some(handlers::rules::rule_load(state, id, project_root).await)
         }
         Method::RuleCheck {
             project_root,
             files,
-        } => handlers::rules::rule_check(state, id, project_root, files).await,
+        } => Some(handlers::rules::rule_check(state, id, project_root, files).await),
 
         // === GC ===
         Method::GcRun { project_id: _ } => {
-            handlers::gc::gc_run(state, id).await
+            Some(handlers::gc::gc_run(state, id).await)
         }
-        Method::GcStatus => handlers::gc::gc_status(state, id).await,
+        Method::GcStatus => Some(handlers::gc::gc_status(state, id).await),
         Method::GcDrafts { project_id: _ } => {
-            handlers::gc::gc_drafts(state, id).await
+            Some(handlers::gc::gc_drafts(state, id).await)
         }
         Method::GcAdopt { draft_id } => {
-            handlers::gc::gc_adopt(state, id, draft_id).await
+            Some(handlers::gc::gc_adopt(state, id, draft_id).await)
         }
         Method::GcReject { draft_id, reason } => {
-            handlers::gc::gc_reject(state, id, draft_id, reason).await
+            Some(handlers::gc::gc_reject(state, id, draft_id, reason).await)
         }
 
         // === ExecPlan ===
         Method::ExecPlanInit {
             spec,
             project_root,
-        } => handlers::exec::exec_plan_init(state, id, spec, project_root).await,
+        } => Some(handlers::exec::exec_plan_init(state, id, spec, project_root).await),
         Method::ExecPlanStatus { plan_id } => {
-            handlers::exec::exec_plan_status(state, id, plan_id).await
+            Some(handlers::exec::exec_plan_status(state, id, plan_id).await)
         }
         Method::ExecPlanUpdate { plan_id, updates } => {
-            handlers::exec::exec_plan_update(state, id, plan_id, updates).await
+            Some(handlers::exec::exec_plan_update(state, id, plan_id, updates).await)
         }
 
         // === Task classification ===
         Method::TaskClassify { prompt, issue, pr } => {
-            handlers::classify::task_classify(id, prompt, issue, pr).await
+            Some(handlers::classify::task_classify(id, prompt, issue, pr).await)
         }
 
         // === Learn feedback loop ===
         Method::LearnRules { project_root } => {
-            handlers::learn::learn_rules(state, id, project_root).await
+            Some(handlers::learn::learn_rules(state, id, project_root).await)
         }
         Method::LearnSkills { project_root } => {
-            handlers::learn::learn_skills(state, id, project_root).await
+            Some(handlers::learn::learn_skills(state, id, project_root).await)
         }
 
         // === Health & Stats ===
         Method::HealthCheck { project_root } => {
-            handlers::health::health_check(state, id, project_root).await
+            Some(handlers::health::health_check(state, id, project_root).await)
         }
         Method::StatsQuery { since, until } => {
-            handlers::health::stats_query(state, id, since, until).await
+            Some(handlers::health::stats_query(state, id, since, until).await)
         }
 
         // === VibeGuard ===
         Method::Preflight { project_root, task_description } => {
-            handlers::preflight::preflight(state, id, project_root, task_description).await
+            Some(handlers::preflight::preflight(state, id, project_root, task_description).await)
         }
         Method::CrossReview { project_root, target, max_rounds } => {
-            handlers::cross_review::cross_review(state, id, project_root, target, max_rounds).await
+            Some(handlers::cross_review::cross_review(state, id, project_root, target, max_rounds).await)
         }
     }
 }
@@ -200,10 +208,14 @@ mod tests {
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
-            id: None,
+            // `initialized` is typically a notification, but we allow an `id` for
+            // compatibility and return an empty success response in that case.
+            id: Some(serde_json::json!(1)),
             method: Method::Initialized,
         };
-        let resp = handle_request(&state, req).await;
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response for request with id");
 
         assert!(
             resp.error.is_none(),
@@ -225,7 +237,9 @@ mod tests {
             id: Some(serde_json::json!(1)),
             method: Method::Initialize,
         };
-        let init_resp = handle_request(&state, init_req).await;
+        let init_resp = handle_request(&state, init_req)
+            .await
+            .expect("expected response for initialize");
         assert!(
             init_resp.error.is_none(),
             "initialize should succeed: {:?}",
@@ -245,9 +259,8 @@ mod tests {
         };
         let ack_resp = handle_request(&state, ack_req).await;
         assert!(
-            ack_resp.error.is_none(),
-            "initialized handshake should succeed: {:?}",
-            ack_resp.error
+            ack_resp.is_none(),
+            "expected no response for initialized notification, got: {ack_resp:?}"
         );
         Ok(())
     }
@@ -290,7 +303,9 @@ mod tests {
             id: Some(serde_json::json!(1)),
             method: Method::GcAdopt { draft_id },
         };
-        let resp = handle_request(&state, req).await;
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response for request with id");
 
         assert!(
             resp.error.is_none(),
@@ -386,7 +401,9 @@ mod tests {
             id: Some(serde_json::json!(1)),
             method: Method::GcAdopt { draft_id },
         };
-        let resp = handle_request(&state, req).await;
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response for request with id");
 
         assert!(
             resp.error.is_none(),
@@ -429,7 +446,9 @@ mod tests {
                 files: None,
             },
         };
-        let resp = handle_request(&state, req).await;
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response for request with id");
 
         assert!(
             resp.error.is_none(),
@@ -479,7 +498,9 @@ mod tests {
                 filters: harness_core::MetricFilters::default(),
             },
         };
-        let resp = handle_request(&state, req).await;
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response for request with id");
 
         assert!(
             resp.error.is_none(),
@@ -516,7 +537,9 @@ mod tests {
                 cwd: proj_dir.path().to_path_buf(),
             },
         };
-        let resp = handle_request(&state, req).await;
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response for request with id");
 
         assert!(
             resp.error.is_none(),

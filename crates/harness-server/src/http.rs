@@ -6,7 +6,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use harness_protocol::{RpcNotification, RpcRequest, RpcResponse};
+use harness_protocol::{RpcNotification, RpcRequest};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -143,8 +143,11 @@ async fn health_check(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
 async fn handle_rpc(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RpcRequest>,
-) -> Json<RpcResponse> {
-    Json(router::handle_request(&state, req).await)
+) -> Response {
+    match router::handle_request(&state, req).await {
+        Some(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
 }
 
 async fn create_task(

@@ -1,7 +1,7 @@
 use harness_core::{
     DraftId, EventFilters, ExecPlanId, MetricFilters, ProjectId, SkillId, ThreadId, TurnId, Event,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 
 /// All JSON-RPC 2.0 methods supported by the Harness App Server.
@@ -76,12 +76,51 @@ pub enum Method {
 }
 
 /// JSON-RPC 2.0 request envelope.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RpcRequest {
     pub jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<serde_json::Value>,
     #[serde(flatten)]
     pub method: Method,
+}
+
+impl<'de> Deserialize<'de> for RpcRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawRpcRequest {
+            jsonrpc: String,
+            #[serde(default)]
+            id: Option<serde_json::Value>,
+            method: String,
+            #[serde(default)]
+            params: Option<serde_json::Value>,
+        }
+
+        let RawRpcRequest { jsonrpc, id, method, params } = RawRpcRequest::deserialize(deserializer)?;
+
+        let method = if method == "initialized" {
+            if let Some(p) = &params {
+                let is_valid = p.is_null() || p.as_object().is_some_and(|m| m.is_empty());
+                if !is_valid {
+                    return Err(de::Error::custom("`initialized` does not accept params"));
+                }
+            }
+            Method::Initialized
+        } else {
+            let mut raw_method = serde_json::Map::new();
+            raw_method.insert("method".to_string(), serde_json::Value::String(method));
+            if let Some(params) = params {
+                raw_method.insert("params".to_string(), params);
+            }
+            serde_json::from_value::<Method>(serde_json::Value::Object(raw_method)).map_err(de::Error::custom)?
+        };
+
+        Ok(Self { jsonrpc, id, method })
+    }
 }
 
 /// JSON-RPC 2.0 response envelope.
