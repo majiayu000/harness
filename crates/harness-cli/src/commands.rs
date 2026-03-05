@@ -23,6 +23,9 @@ pub enum Command {
         /// HTTP port (only for http/websocket transport)
         #[arg(long)]
         port: Option<u16>,
+        /// Project root used by server-side scans (GC/health)
+        #[arg(long)]
+        project_root: Option<PathBuf>,
     },
 
     /// Execute a prompt non-interactively
@@ -183,18 +186,22 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     };
 
     match cli.command {
-        Command::Serve { transport, port } => {
+        Command::Serve { transport, port, project_root } => {
+            let mut serve_config = config.clone();
+            if let Some(project_root) = project_root {
+                serve_config.server.project_root = project_root;
+            }
             let thread_manager = harness_server::thread_manager::ThreadManager::new();
-            let mut agent_registry = harness_agents::AgentRegistry::new(&config.agents.default_agent);
+            let mut agent_registry = harness_agents::AgentRegistry::new(&serve_config.agents.default_agent);
             agent_registry.register(
                 "claude",
                 Arc::new(harness_agents::claude::ClaudeCodeAgent::new(
-                    config.agents.claude.cli_path.clone(),
-                    config.agents.claude.default_model.clone(),
+                    serve_config.agents.claude.cli_path.clone(),
+                    serve_config.agents.claude.default_model.clone(),
                 )),
             );
             let server = harness_server::server::HarnessServer::new(
-                config.clone(),
+                serve_config.clone(),
                 thread_manager,
                 agent_registry,
             );
@@ -205,7 +212,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     let addr = if let Some(p) = port {
                         format!("127.0.0.1:{p}").parse()?
                     } else {
-                        config.server.http_addr
+                        serve_config.server.http_addr
                     };
                     Arc::new(server).serve_http(addr).await?
                 }

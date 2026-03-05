@@ -28,6 +28,8 @@ pub struct ServerConfig {
     pub transport: Transport,
     pub http_addr: SocketAddr,
     pub data_dir: PathBuf,
+    #[serde(default = "default_project_root")]
+    pub project_root: PathBuf,
 }
 
 impl Default for ServerConfig {
@@ -36,6 +38,7 @@ impl Default for ServerConfig {
             transport: Transport::Stdio,
             http_addr: SocketAddr::from(([127, 0, 0, 1], 9800)),
             data_dir: dirs_data_dir().join("harness"),
+            project_root: default_project_root(),
         }
     }
 }
@@ -188,6 +191,10 @@ impl Default for ObserveConfig {
 
 fn dirs_data_dir() -> PathBuf {
     dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn default_project_root() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 mod dirs {
