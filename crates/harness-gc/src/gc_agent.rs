@@ -54,17 +54,18 @@ impl GcAgent {
         violations: &[harness_core::Violation],
         agent: &dyn CodeAgent,
     ) -> anyhow::Result<GcReport> {
-        // 1. Detect signals from events
+        // 1. Detect signals from events (including persisted `rule_check` violations)
         let mut signals = self.signal_detector.detect(events);
+        // Back-compat: if the caller provided live violations but they haven't been
+        // persisted into `events` yet, fall back to the old detector.
+        if !violations.is_empty() && !events.iter().any(|e| e.hook == "rule_check") {
+            signals.extend(self.signal_detector.from_violations(violations));
+        }
 
-        // 2. Detect signals from code violations
-        let code_signals = self.signal_detector.from_violations(violations);
-        signals.extend(code_signals);
-
-        // 3. Prioritize
+        // 2. Prioritize
         signals.sort_by_key(|s| signal_priority(s.signal_type));
 
-        // 4. Generate fix drafts (up to max_drafts_per_run)
+        // 3. Generate fix drafts (up to max_drafts_per_run)
         let mut drafts_generated = 0;
         let mut errors = Vec::new();
 
