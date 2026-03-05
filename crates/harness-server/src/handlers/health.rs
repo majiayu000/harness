@@ -14,16 +14,16 @@ pub async fn health_check(
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
     };
 
-    let events = match state.events.query(&EventFilters::default()) {
-        Ok(evts) => evts,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
-    };
-
     let violations: Vec<Violation> = {
         let rules = state.rules.read().await;
         rules.scan(&project_root).await.unwrap_or_default()
     };
     crate::handlers::persist_violations(&state.events, &violations);
+
+    let events = match state.events.query(&EventFilters::default()) {
+        Ok(evts) => evts,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+    };
 
     let report = generate_health_report(&events, &violations);
     match serde_json::to_value(&report) {

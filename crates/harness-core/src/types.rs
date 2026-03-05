@@ -481,6 +481,8 @@ pub enum BudgetTier {
 pub struct EventFilters {
     pub session_id: Option<SessionId>,
     pub hook: Option<String>,
+    /// Filter by `Event.tool` (e.g. rule id for `rule_check` events).
+    pub tool: Option<String>,
     pub decision: Option<Decision>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
