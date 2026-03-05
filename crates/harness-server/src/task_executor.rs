@@ -6,10 +6,19 @@ use harness_core::{
     interceptor::TurnInterceptor, prompts, AgentRequest, AgentResponse, CodeAgent, ContextItem,
     Decision, Event, SessionId,
 };
-use std::path::PathBuf;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
+
+#[derive(Debug, Deserialize)]
+struct GhPrListItem {
+    number: u64,
+    #[serde(rename = "headRefName")]
+    head_ref_name: String,
+}
 
 /// Run all pre_execute interceptors in order. Returns the (possibly modified) request,
 /// or an error if any interceptor returns Block.
@@ -50,6 +59,33 @@ async fn run_on_error(
     }
 }
 
+/// Query GitHub for an existing open PR linked to the given issue.
+/// Returns `(pr_number, branch_name)` if found.
+async fn find_existing_pr_for_issue(
+    project: &Path,
+    issue: u64,
+) -> anyhow::Result<Option<(u64, String)>> {
+    let output = Command::new("gh")
+        .current_dir(project)
+        .args(["pr", "list", "--search", &format!("#{issue}"), "--state", "open"])
+        .args(["--json", "number,headRefName", "--limit", "1"])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run `gh pr list` for issue #{issue}: {e}"))?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "`gh pr list` for issue #{issue} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let items: Vec<GhPrListItem> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow::anyhow!("invalid JSON from `gh pr list`: {e}"))?;
+
+    Ok(items.into_iter().next().map(|item| (item.number, item.head_ref_name)))
+}
+
 pub(crate) async fn run_task(
     store: &TaskStore,
     task_id: &TaskId,
@@ -63,7 +99,17 @@ pub(crate) async fn run_task(
     update_status(store, task_id, TaskStatus::Implementing, 1).await;
 
     let first_prompt = if let Some(issue) = req.issue {
-        prompts::implement_from_issue(issue)
+        match find_existing_pr_for_issue(&project, issue).await {
+            Ok(Some((pr_num, branch))) => {
+                tracing::info!("reusing existing PR #{pr_num} on branch `{branch}` for issue #{issue}");
+                prompts::continue_existing_pr(issue, pr_num, &branch)
+            }
+            Ok(None) => prompts::implement_from_issue(issue),
+            Err(e) => {
+                tracing::warn!("failed to check for existing PR for issue #{issue}: {e}");
+                prompts::implement_from_issue(issue)
+            }
+        }
     } else if let Some(pr) = req.pr {
         prompts::check_existing_pr(pr)
     } else {
@@ -251,4 +297,25 @@ pub(crate) async fn run_task(
     })
     .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gh_pr_list_item_parses_from_json() {
+        let json = r#"[{"number":50,"headRefName":"fix/issue-29"}]"#;
+        let items: Vec<GhPrListItem> = serde_json::from_str(json).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].number, 50);
+        assert_eq!(items[0].head_ref_name, "fix/issue-29");
+    }
+
+    #[test]
+    fn gh_pr_list_empty_array_parses() {
+        let json = r#"[]"#;
+        let items: Vec<GhPrListItem> = serde_json::from_str(json).unwrap();
+        assert!(items.is_empty());
+    }
 }
