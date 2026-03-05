@@ -3,6 +3,7 @@ use harness_core::{
     Project, Signal, SignalType, RemediationType,
 };
 use crate::draft_store::DraftStore;
+use crate::remediation::signal_priority;
 use crate::signal_detector::SignalDetector;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -152,17 +153,6 @@ impl GcAgent {
 
     pub fn draft_store(&self) -> &DraftStore {
         &self.draft_store
-    }
-}
-
-fn signal_priority(t: SignalType) -> u8 {
-    match t {
-        SignalType::ChronicBlock => 0,
-        SignalType::WarnEscalation => 1,
-        SignalType::RepeatedWarn => 2,
-        SignalType::LinterViolations => 3,
-        SignalType::HotFiles => 4,
-        SignalType::SlowSessions => 5,
     }
 }
 
