@@ -1,15 +1,24 @@
 use crate::task_runner::{
-    mutate_and_persist, update_status, CreateTaskRequest, RoundResult, TaskId, TaskStatus,
-    TaskStore,
+    mutate_and_persist, mutate_and_persist_with, update_status, CreateTaskRequest, RoundResult,
+    TaskId, TaskStatus, TaskStore,
 };
 use harness_core::{
     interceptor::TurnInterceptor, prompts, AgentRequest, AgentResponse, CodeAgent, ContextItem,
     Decision, Event, SessionId,
 };
-use std::path::PathBuf;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
+
+#[derive(Debug, Deserialize)]
+struct GhPrListItem {
+    number: u64,
+    #[serde(rename = "headRefName")]
+    head_ref_name: String,
+}
 
 /// Run all pre_execute interceptors in order. Returns the (possibly modified) request,
 /// or an error if any interceptor returns Block.
@@ -20,8 +29,14 @@ async fn run_pre_execute(
     for interceptor in interceptors {
         let result = interceptor.pre_execute(&req).await;
         if let Decision::Block = result.decision {
-            let reason = result.reason.unwrap_or_else(|| interceptor.name().to_string());
-            return Err(anyhow::anyhow!("Blocked by interceptor '{}': {}", interceptor.name(), reason));
+            let reason = result
+                .reason
+                .unwrap_or_else(|| interceptor.name().to_string());
+            return Err(anyhow::anyhow!(
+                "Blocked by interceptor '{}': {}",
+                interceptor.name(),
+                reason
+            ));
         }
         if let Some(modified) = result.request {
             req = modified;
@@ -40,14 +55,37 @@ async fn run_post_execute(
     }
 }
 
-async fn run_on_error(
-    interceptors: &[Arc<dyn TurnInterceptor>],
-    req: &AgentRequest,
-    error: &str,
-) {
+async fn run_on_error(interceptors: &[Arc<dyn TurnInterceptor>], req: &AgentRequest, error: &str) {
     for interceptor in interceptors {
         interceptor.on_error(req, error).await;
     }
+}
+
+/// Query GitHub for an existing open PR linked to the given issue.
+/// Returns `(pr_number, branch_name)` if found.
+async fn find_existing_pr_for_issue(
+    project: &Path,
+    issue: u64,
+) -> anyhow::Result<Option<(u64, String)>> {
+    let output = Command::new("gh")
+        .current_dir(project)
+        .args(["pr", "list", "--search", &format!("#{issue}"), "--state", "open"])
+        .args(["--json", "number,headRefName", "--limit", "1"])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run `gh pr list` for issue #{issue}: {e}"))?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "`gh pr list` for issue #{issue} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let items: Vec<GhPrListItem> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow::anyhow!("invalid JSON from `gh pr list`: {e}"))?;
+
+    Ok(items.into_iter().next().map(|item| (item.number, item.head_ref_name)))
 }
 
 pub(crate) async fn run_task(
@@ -63,7 +101,17 @@ pub(crate) async fn run_task(
     update_status(store, task_id, TaskStatus::Implementing, 1).await;
 
     let first_prompt = if let Some(issue) = req.issue {
-        prompts::implement_from_issue(issue)
+        match find_existing_pr_for_issue(&project, issue).await {
+            Ok(Some((pr_num, branch))) => {
+                tracing::info!("reusing existing PR #{pr_num} on branch `{branch}` for issue #{issue}");
+                prompts::continue_existing_pr(issue, pr_num, &branch)
+            }
+            Ok(None) => prompts::implement_from_issue(issue),
+            Err(e) => {
+                tracing::warn!("failed to check for existing PR for issue #{issue}: {e}");
+                prompts::implement_from_issue(issue)
+            }
+        }
     } else if let Some(pr) = req.pr {
         prompts::check_existing_pr(pr)
     } else {
@@ -178,24 +226,19 @@ pub(crate) async fn run_task(
         };
 
         if prompts::is_waiting(&resp.output) {
-            mutate_and_persist(store, task_id, |s| {
+            let waiting_count = mutate_and_persist_with(store, task_id, |s| {
                 s.rounds.push(RoundResult {
                     turn: round,
                     action: "review".into(),
                     result: "waiting".into(),
                 });
+                s.rounds
+                    .iter()
+                    .filter(|r| r.result == "waiting" && r.turn == round)
+                    .count() as u32
             })
-            .await;
-
-            let waiting_count = store
-                .get(task_id)
-                .map(|s| {
-                    s.rounds
-                        .iter()
-                        .filter(|r| r.result == "waiting" && r.turn == round)
-                        .count() as u32
-                })
-                .unwrap_or(0);
+            .await
+            .unwrap_or(0);
 
             if waiting_count >= max_waiting_retries {
                 prev_fixed = true;
@@ -220,7 +263,11 @@ pub(crate) async fn run_task(
             SessionId::new(),
             "pr_review",
             "task_runner",
-            if lgtm { Decision::Complete } else { Decision::Warn },
+            if lgtm {
+                Decision::Complete
+            } else {
+                Decision::Warn
+            },
         );
         ev.detail = Some(format!("pr={pr_num}"));
         ev.reason = Some(if lgtm {
@@ -251,4 +298,25 @@ pub(crate) async fn run_task(
     })
     .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gh_pr_list_item_parses_from_json() {
+        let json = r#"[{"number":50,"headRefName":"fix/issue-29"}]"#;
+        let items: Vec<GhPrListItem> = serde_json::from_str(json).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].number, 50);
+        assert_eq!(items[0].head_ref_name, "fix/issue-29");
+    }
+
+    #[test]
+    fn gh_pr_list_empty_array_parses() {
+        let json = r#"[]"#;
+        let items: Vec<GhPrListItem> = serde_json::from_str(json).unwrap();
+        assert!(items.is_empty());
+    }
 }

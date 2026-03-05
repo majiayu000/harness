@@ -188,6 +188,7 @@ mod tests {
         let (notification_tx, _) = tokio::sync::broadcast::channel(64);
         Ok(AppState {
             server,
+            project_root: dir.to_path_buf(),
             tasks,
             skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
             rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
@@ -199,6 +200,26 @@ mod tests {
             notification_tx,
             notify_tx: None,
         })
+    }
+
+    fn writable_home() -> std::path::PathBuf {
+        let home = std::path::PathBuf::from(
+            std::env::var("HOME").unwrap_or_else(|_| ".".into()),
+        );
+        if tempfile::Builder::new()
+            .prefix("harness-home-probe-")
+            .tempdir_in(&home)
+            .is_ok()
+        {
+            return home;
+        }
+
+        let fallback = std::env::current_dir()
+            .expect("resolve cwd")
+            .join(".harness-test-home");
+        std::fs::create_dir_all(&fallback).expect("create fallback HOME");
+        std::env::set_var("HOME", &fallback);
+        fallback
     }
 
     #[tokio::test]
@@ -433,7 +454,7 @@ mod tests {
     {
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let home = writable_home();
         let proj_dir = tempfile::Builder::new()
             .prefix("harness-test-")
             .tempdir_in(&home)?;
@@ -602,7 +623,7 @@ mod tests {
     async fn thread_start_persists_to_db() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let home = writable_home();
         let proj_dir = tempfile::Builder::new()
             .prefix("harness-test-")
             .tempdir_in(&home)?;

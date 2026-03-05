@@ -1,3 +1,4 @@
+use crate::streaming::send_stream_item;
 use async_trait::async_trait;
 use harness_core::{
     AgentRequest, AgentResponse, Capability, CodeAgent, Item, StreamItem, TokenUsage,
@@ -26,11 +27,7 @@ impl CodeAgent for ClaudeCodeAgent {
     }
 
     fn capabilities(&self) -> Vec<Capability> {
-        vec![
-            Capability::Read,
-            Capability::Write,
-            Capability::Execute,
-        ]
+        vec![Capability::Read, Capability::Write, Capability::Execute]
     }
 
     async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
@@ -38,8 +35,10 @@ impl CodeAgent for ClaudeCodeAgent {
         let mut cmd = Command::new(&self.cli_path);
         cmd.arg("-p")
             .arg("--dangerously-skip-permissions")
-            .arg("--output-format").arg("text")
-            .arg("--model").arg(model)
+            .arg("--output-format")
+            .arg("text")
+            .arg("--model")
+            .arg(model)
             .arg("--verbose")
             .current_dir(&req.project_root)
             .env_remove("CLAUDECODE");
@@ -84,19 +83,51 @@ impl CodeAgent for ClaudeCodeAgent {
         tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::Result<()> {
         let resp = self.execute(req).await?;
-        let _ = tx
-            .send(StreamItem::ItemCompleted {
+        send_stream_item(
+            &tx,
+            StreamItem::ItemCompleted {
                 item: Item::AgentReasoning {
                     content: resp.output.clone(),
                 },
-            })
-            .await;
-        let _ = tx
-            .send(StreamItem::TokenUsage {
+            },
+            self.name(),
+            "item_completed",
+        )
+        .await?;
+        send_stream_item(
+            &tx,
+            StreamItem::TokenUsage {
                 usage: resp.token_usage,
-            })
-            .await;
-        let _ = tx.send(StreamItem::Done).await;
+            },
+            self.name(),
+            "token_usage",
+        )
+        .await?;
+        send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn execute_stream_returns_error_when_channel_closed() {
+        let agent = ClaudeCodeAgent::new(PathBuf::from("/usr/bin/true"), "test-model".to_string());
+        let request = AgentRequest::default();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        let err = agent
+            .execute_stream(request, tx)
+            .await
+            .expect_err("execute_stream should fail when receiver is dropped");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("stream send failed"),
+            "expected send failure in error message, got: {message}"
+        );
     }
 }
