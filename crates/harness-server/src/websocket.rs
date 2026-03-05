@@ -176,6 +176,7 @@ mod tests {
 
         Ok(AppState {
             server,
+            project_root: dir.to_path_buf(),
             tasks,
             skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
             rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
