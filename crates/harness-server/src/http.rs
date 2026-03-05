@@ -24,6 +24,8 @@ pub struct AppState {
     pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     /// Broadcast channel for server-push notifications (WebSocket and stdio transports).
     pub notification_tx: broadcast::Sender<RpcNotification>,
+    /// Channel for server-push JSON-RPC notifications (stdio transport only).
+    pub notify_tx: Option<crate::notify::NotifySender>,
 }
 
 fn data_dir() -> std::path::PathBuf {
@@ -95,6 +97,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         thread_db: Some(thread_db),
         interceptors: vec![Arc::new(crate::contract_validator::ContractValidator::new())],
         notification_tx: broadcast::channel(256).0,
+        notify_tx: None,
     })
 }
 
@@ -233,6 +236,7 @@ mod tests {
             thread_db: Some(thread_db),
             interceptors: vec![],
             notification_tx: tokio::sync::broadcast::channel(32).0,
+            notify_tx: None,
         }))
     }
 

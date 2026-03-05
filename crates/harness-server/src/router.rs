@@ -9,6 +9,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> RpcResponse {
     match req.method {
         // === Initialization ===
         Method::Initialize => handlers::thread::initialize(id).await,
+        Method::Initialized => handlers::thread::initialized(id).await,
 
         // === Thread management ===
         Method::ThreadStart { cwd } => {
@@ -188,7 +189,67 @@ mod tests {
             thread_db: Some(thread_db),
             interceptors: vec![],
             notification_tx,
+            notify_tx: None,
         })
+    }
+
+    #[tokio::test]
+    async fn initialized_returns_success() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Method::Initialized,
+        };
+        let resp = handle_request(&state, req).await;
+
+        assert!(
+            resp.error.is_none(),
+            "initialized should succeed, got error: {:?}",
+            resp.error
+        );
+        assert!(resp.result.is_some(), "initialized must return a result");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initialize_then_initialized_succeeds() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        // Step 1: initialize
+        let init_req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::Initialize,
+        };
+        let init_resp = handle_request(&state, init_req).await;
+        assert!(
+            init_resp.error.is_none(),
+            "initialize should succeed: {:?}",
+            init_resp.error
+        );
+        let result = init_resp
+            .result
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("initialize must return result"))?;
+        assert!(result["capabilities"].is_object(), "capabilities should be present");
+
+        // Step 2: initialized (notification — id is None)
+        let ack_req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Method::Initialized,
+        };
+        let ack_resp = handle_request(&state, ack_req).await;
+        assert!(
+            ack_resp.error.is_none(),
+            "initialized handshake should succeed: {:?}",
+            ack_resp.error
+        );
+        Ok(())
     }
 
     #[tokio::test]
