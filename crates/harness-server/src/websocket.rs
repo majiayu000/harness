@@ -141,6 +141,9 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::broadcast;
     use tokio::sync::RwLock;
+    type TestWebSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
 
     async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
         let server = Arc::new(HarnessServer::new(
@@ -178,6 +181,30 @@ mod tests {
         })
     }
 
+    async fn bind_ws_test_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
+        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => Ok(Some(listener)),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::warn!("skipping websocket test due to sandbox network restriction: {err}");
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn connect_ws_test_client(url: &str) -> anyhow::Result<Option<TestWebSocket>> {
+        match tokio_tungstenite::connect_async(url).await {
+            Ok((ws, _)) => Ok(Some(ws)),
+            Err(tokio_tungstenite::tungstenite::Error::Io(err))
+                if err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                tracing::warn!("skipping websocket test due to sandbox network restriction: {err}");
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
     /// Integration test: spin up the HTTP server on a random port and connect
     /// via WebSocket.  Sends an `initialize` request and checks the response.
     #[tokio::test]
@@ -185,14 +212,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let state = Arc::new(make_test_state(dir.path()).await?);
 
-        // Bind to a random port.
-        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-            Ok(listener) => listener,
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                tracing::warn!("skipping websocket test due to sandbox network restriction: {err}");
-                return Ok(());
-            }
-            Err(err) => return Err(err.into()),
+        let listener = match bind_ws_test_listener().await? {
+            Some(listener) => listener,
+            None => return Ok(()),
         };
         let addr = listener.local_addr()?;
 
@@ -206,15 +228,9 @@ mod tests {
 
         // Connect with tokio-tungstenite.
         let url = format!("ws://127.0.0.1:{}/ws", addr.port());
-        let (mut ws, _) = match tokio_tungstenite::connect_async(&url).await {
-            Ok(connection) => connection,
-            Err(tokio_tungstenite::tungstenite::Error::Io(err))
-                if err.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
-                tracing::warn!("skipping websocket test due to sandbox network restriction: {err}");
-                return Ok(());
-            }
-            Err(err) => return Err(err.into()),
+        let mut ws = match connect_ws_test_client(&url).await? {
+            Some(ws) => ws,
+            None => return Ok(()),
         };
 
         // Send `initialize`.
@@ -253,13 +269,9 @@ mod tests {
         let state = Arc::new(make_test_state(dir.path()).await?);
         let notif_tx = state.notification_tx.clone();
 
-        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-            Ok(listener) => listener,
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                tracing::warn!("skipping websocket test due to sandbox network restriction: {err}");
-                return Ok(());
-            }
-            Err(err) => return Err(err.into()),
+        let listener = match bind_ws_test_listener().await? {
+            Some(listener) => listener,
+            None => return Ok(()),
         };
         let addr = listener.local_addr()?;
 
@@ -272,15 +284,9 @@ mod tests {
         });
 
         let url = format!("ws://127.0.0.1:{}/ws", addr.port());
-        let (mut ws, _) = match tokio_tungstenite::connect_async(&url).await {
-            Ok(connection) => connection,
-            Err(tokio_tungstenite::tungstenite::Error::Io(err))
-                if err.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
-                tracing::warn!("skipping websocket test due to sandbox network restriction: {err}");
-                return Ok(());
-            }
-            Err(err) => return Err(err.into()),
+        let mut ws = match connect_ws_test_client(&url).await? {
+            Some(ws) => ws,
+            None => return Ok(()),
         };
 
         // Ensure the server-side handler is fully running (broadcast subscriber
