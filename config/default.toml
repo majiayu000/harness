@@ -4,6 +4,7 @@
 transport = "stdio"
 http_addr = "127.0.0.1:9800"
 data_dir = "~/.local/share/harness"
+project_root = "."
 
 [agents]
 default_agent = "claude"

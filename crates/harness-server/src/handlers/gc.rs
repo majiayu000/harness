@@ -6,7 +6,8 @@ pub async fn gc_run(
     state: &AppState,
     id: Option<serde_json::Value>,
 ) -> RpcResponse {
-    let project_root = std::path::PathBuf::from(".");
+    let project_root = state.project_root.clone();
+    tracing::info!("gc: scanning project root {}", project_root.display());
     let violations = {
         let rules = state.rules.read().await;
         rules.scan(&project_root).await.unwrap_or_default()
