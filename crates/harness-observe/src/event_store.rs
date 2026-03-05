@@ -1,4 +1,4 @@
-use harness_core::{Event, EventFilters, EventId};
+use harness_core::{Decision, Event, EventFilters, EventId, SessionId, Severity, Violation};
 use std::path::{Path, PathBuf};
 
 /// Event store backed by JSONL files (SQLite upgrade path available).
@@ -56,6 +56,37 @@ impl EventStore {
         Ok(events)
     }
 
+    /// Persist each violation as a `rule_check` event so they flow into the
+    /// observability pipeline (quality grading, GC signal detection, stats).
+    pub fn log_violations(&self, violations: &[Violation]) {
+        if violations.is_empty() {
+            return;
+        }
+        let session_id = SessionId::new();
+        for violation in violations {
+            let decision = match violation.severity {
+                Severity::Critical | Severity::High => Decision::Block,
+                Severity::Medium => Decision::Warn,
+                Severity::Low => Decision::Pass,
+            };
+            let mut event = Event::new(
+                session_id.clone(),
+                "rule_check",
+                violation.rule_id.as_str(),
+                decision,
+            );
+            event.reason = Some(violation.message.clone());
+            event.detail = Some(format!(
+                "{}:{}",
+                violation.file.display(),
+                violation.line.map(|l| l.to_string()).unwrap_or_default()
+            ));
+            if let Err(e) = self.log(&event) {
+                tracing::warn!("failed to log rule violation event: {e}");
+            }
+        }
+    }
+
     pub fn query_recent(&self, duration: std::time::Duration) -> anyhow::Result<Vec<Event>> {
         let since = chrono::Utc::now() - chrono::Duration::from_std(duration)?;
         self.query(&EventFilters {
@@ -97,7 +128,7 @@ impl EventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Decision, Event, EventFilters, SessionId};
+    use harness_core::{Decision, Event, EventFilters, RuleId, SessionId};
 
     fn make_event(hook: &str, decision: Decision) -> Event {
         Event::new(SessionId::new(), hook, "Edit", decision)
@@ -163,6 +194,89 @@ mod tests {
         }
         let results = store.query(&EventFilters { limit: Some(3), ..Default::default() })?;
         assert_eq!(results.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn log_violations_creates_one_event_per_violation() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        let violations = vec![
+            Violation {
+                rule_id: RuleId::from_str("SEC-01"),
+                file: std::path::PathBuf::from("src/main.rs"),
+                line: Some(42),
+                message: "security issue".to_string(),
+                severity: Severity::Critical,
+            },
+            Violation {
+                rule_id: RuleId::from_str("U-05"),
+                file: std::path::PathBuf::from("src/lib.rs"),
+                line: None,
+                message: "style issue".to_string(),
+                severity: Severity::Low,
+            },
+        ];
+        store.log_violations(&violations);
+        let events = store.query(&EventFilters::default())?;
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.hook == "rule_check"));
+        Ok(())
+    }
+
+    #[test]
+    fn log_violations_maps_severity_to_decision() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        let violations = vec![
+            Violation {
+                rule_id: RuleId::from_str("R-CRIT"),
+                file: std::path::PathBuf::from("a.rs"),
+                line: None,
+                message: "critical".to_string(),
+                severity: Severity::Critical,
+            },
+            Violation {
+                rule_id: RuleId::from_str("R-HIGH"),
+                file: std::path::PathBuf::from("b.rs"),
+                line: None,
+                message: "high".to_string(),
+                severity: Severity::High,
+            },
+            Violation {
+                rule_id: RuleId::from_str("R-MED"),
+                file: std::path::PathBuf::from("c.rs"),
+                line: None,
+                message: "medium".to_string(),
+                severity: Severity::Medium,
+            },
+            Violation {
+                rule_id: RuleId::from_str("R-LOW"),
+                file: std::path::PathBuf::from("d.rs"),
+                line: None,
+                message: "low".to_string(),
+                severity: Severity::Low,
+            },
+        ];
+        store.log_violations(&violations);
+        let events = store.query(&EventFilters::default())?;
+        assert_eq!(events.len(), 4);
+        let by_tool: std::collections::HashMap<_, _> =
+            events.iter().map(|e| (e.tool.as_str(), e.decision.clone())).collect();
+        assert_eq!(by_tool["R-CRIT"], Decision::Block);
+        assert_eq!(by_tool["R-HIGH"], Decision::Block);
+        assert_eq!(by_tool["R-MED"], Decision::Warn);
+        assert_eq!(by_tool["R-LOW"], Decision::Pass);
+        Ok(())
+    }
+
+    #[test]
+    fn log_violations_empty_slice_logs_nothing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        store.log_violations(&[]);
+        let events = store.query(&EventFilters::default())?;
+        assert!(events.is_empty());
         Ok(())
     }
 }
