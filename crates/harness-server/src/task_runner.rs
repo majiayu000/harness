@@ -4,7 +4,7 @@ use harness_core::{CodeAgent, Decision, Event, SessionId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TaskId(pub String);
@@ -185,16 +185,23 @@ async fn record_task_failure(
 pub struct TaskStore {
     pub(crate) cache: DashMap<TaskId, TaskState>,
     db: TaskDb,
+    persist_locks: DashMap<TaskId, Arc<Mutex<()>>>,
 }
 
 impl TaskStore {
     pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
         let db = TaskDb::open(db_path).await?;
         let cache = DashMap::new();
+        let persist_locks = DashMap::new();
         for task in db.list().await? {
+            persist_locks.insert(task.id.clone(), Arc::new(Mutex::new(())));
             cache.insert(task.id.clone(), task);
         }
-        Ok(Arc::new(Self { cache, db }))
+        Ok(Arc::new(Self {
+            cache,
+            db,
+            persist_locks,
+        }))
     }
 
     pub fn get(&self, id: &TaskId) -> Option<TaskState> {
@@ -210,6 +217,9 @@ impl TaskStore {
     }
 
     pub(crate) async fn insert(&self, state: &TaskState) {
+        self.persist_locks
+            .entry(state.id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())));
         self.cache.insert(state.id.clone(), state.clone());
         if let Err(e) = self.db.insert(state).await {
             tracing::error!("task_db insert failed: {e}");
@@ -217,8 +227,16 @@ impl TaskStore {
     }
 
     pub(crate) async fn persist(&self, id: &TaskId) {
-        if let Some(state) = self.cache.get(id) {
-            if let Err(e) = self.db.update(state.value()).await {
+        let lock = self
+            .persist_locks
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        let snapshot = self.cache.get(id).map(|state| state.value().clone());
+        if let Some(state) = snapshot {
+            if let Err(e) = self.db.update(&state).await {
                 tracing::error!("task_db update failed: {e}");
             }
         }
@@ -324,10 +342,27 @@ pub(crate) async fn mutate_and_persist(
     id: &TaskId,
     f: impl FnOnce(&mut TaskState),
 ) {
-    if let Some(mut entry) = store.cache.get_mut(id) {
-        f(entry.value_mut());
-    }
+    let _ = mutate_and_persist_with(store, id, |state| {
+        f(state);
+    })
+    .await;
+}
+
+/// Mutate a task, compute a return value from the same in-lock snapshot, then persist.
+pub(crate) async fn mutate_and_persist_with<R>(
+    store: &TaskStore,
+    id: &TaskId,
+    f: impl FnOnce(&mut TaskState) -> R,
+) -> Option<R> {
+    let result = if let Some(mut entry) = store.cache.get_mut(id) {
+        let result = f(entry.value_mut());
+        Some(result)
+    } else {
+        None
+    };
+
     store.persist(id).await;
+    result
 }
 
 #[cfg(test)]
@@ -361,9 +396,7 @@ mod tests {
     }
 
     fn writable_home() -> std::path::PathBuf {
-        let home = std::path::PathBuf::from(
-            std::env::var("HOME").unwrap_or_else(|_| ".".into()),
-        );
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
         if tempfile::Builder::new()
             .prefix("harness-home-probe-")
             .tempdir_in(&home)
@@ -523,6 +556,69 @@ mod tests {
             "error message should mention blocked: {:?}",
             state.error
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutate_and_persist_with_counts_waiting_entries_in_single_snapshot(
+    ) -> anyhow::Result<()> {
+        let home = writable_home();
+        let dir = tempfile::Builder::new()
+            .prefix("harness-test-")
+            .tempdir_in(&home)?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let task_id = TaskId::new();
+        let task_state = TaskState::new(task_id.clone());
+        store.insert(&task_state).await;
+
+        let mut handles = Vec::new();
+        let round = 2u32;
+        let workers = 8u32;
+
+        for _ in 0..workers {
+            let store = store.clone();
+            let task_id = task_id.clone();
+            handles.push(tokio::spawn(async move {
+                mutate_and_persist_with(store.as_ref(), &task_id, |state| {
+                    state.rounds.push(RoundResult {
+                        turn: round,
+                        action: "review".into(),
+                        result: "waiting".into(),
+                    });
+                    state
+                        .rounds
+                        .iter()
+                        .filter(|result| result.turn == round && result.result == "waiting")
+                        .count() as u32
+                })
+                .await
+                .expect("task state should exist")
+            }));
+        }
+
+        let mut observed_counts = Vec::new();
+        for handle in handles {
+            observed_counts.push(handle.await?);
+        }
+        observed_counts.sort_unstable();
+
+        assert_eq!(observed_counts, (1..=workers).collect::<Vec<u32>>());
+
+        let state = store.get(&task_id).expect("task state should exist");
+        let waiting_entries = state
+            .rounds
+            .iter()
+            .filter(|result| result.turn == round && result.result == "waiting")
+            .count() as u32;
+        assert_eq!(waiting_entries, workers);
+
+        let persisted = store
+            .db
+            .get(&task_id.0)
+            .await?
+            .expect("persisted task state should exist");
+        assert_eq!(persisted.rounds.len(), state.rounds.len());
         Ok(())
     }
 

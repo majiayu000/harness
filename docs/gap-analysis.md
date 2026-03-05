@@ -113,7 +113,7 @@
 ### 6. Feedback Loops — Production Signal Collection (40%)
 
 **What we have:**
-- `harness-observe` crate: EventStore (JSONL), SessionManager, QualityGrader, SessionMetrics
+- `harness-observe` crate: EventStore (JSONL), QualityGrader, statistics aggregators
 - Event structure: ts/session_id/hook/tool/decision/reason/detail/duration_ms
 - EventFilters: filter by session/hook/decision/time range
 - `EventLog` and `EventQuery` methods declared in protocol
@@ -123,7 +123,7 @@
 1. **EventLog/EventQuery not routed**: Protocol methods exist but router returns METHOD_NOT_FOUND
 2. **No production signal ingestion**: Only internal hook events; no GitHub CI failure, external review score, or user complaint signals
 3. **PR review feedback not structured**: PR review loop's LGTM/FIXED results stored only in task rounds JSON, not flowing back to EventStore as aggregatable feedback signals
-4. **No telemetry export**: SessionMetrics fields defined but no Prometheus/OpenTelemetry/external export path
+4. **No telemetry export**: Observability statistics are not exported to Prometheus/OpenTelemetry/external sinks
 5. **EventStore uses JSONL files**: Comment says "SQLite upgrade path available" but not implemented; full-file reads on large event volumes
 
 **Effort to close**: ~1 week — router wiring + PR feedback structuring + SQLite migration

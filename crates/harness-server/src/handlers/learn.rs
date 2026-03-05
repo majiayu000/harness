@@ -246,15 +246,29 @@ fn parse_skills_from_output(output: &str) -> Vec<(String, String)> {
 }
 
 fn detect_severity(section: &str) -> Severity {
-    let lower = section.to_lowercase();
-    if lower.contains("severity: critical") || lower.contains("critical") {
-        Severity::Critical
-    } else if lower.contains("severity: high") || lower.contains("high") {
-        Severity::High
-    } else if lower.contains("severity: medium") || lower.contains("medium") {
-        Severity::Medium
-    } else {
-        Severity::Low
+    section
+        .lines()
+        .find_map(parse_severity_from_line)
+        .unwrap_or(Severity::Low)
+}
+
+fn parse_severity_from_line(line: &str) -> Option<Severity> {
+    let normalized = line
+        .trim_start()
+        .trim_start_matches(|c| matches!(c, '-' | '*' | '>'))
+        .trim_start()
+        .to_ascii_lowercase();
+    let value = normalized.strip_prefix("severity:")?.trim();
+    let token = value
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .find(|token| !token.is_empty())?;
+
+    match token {
+        "critical" => Some(Severity::Critical),
+        "high" => Some(Severity::High),
+        "medium" => Some(Severity::Medium),
+        "low" => Some(Severity::Low),
+        _ => None,
     }
 }
 
@@ -311,6 +325,34 @@ mod tests {
         let rules = parse_rules_from_output(output);
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].category, Category::Security);
+    }
+
+    #[test]
+    fn detect_severity_prefers_explicit_field_over_title_keywords() {
+        let section =
+            "LEARN-101: Avoid high memory usage\nseverity: low\nUse streaming to stay stable.";
+        assert_eq!(detect_severity(section), Severity::Low);
+    }
+
+    #[test]
+    fn detect_severity_without_explicit_field_defaults_to_low() {
+        let section = "LEARN-102: Critical path notes\nThis description mentions high and medium.";
+        assert_eq!(detect_severity(section), Severity::Low);
+    }
+
+    #[test]
+    fn detect_severity_accepts_marker_and_suffix() {
+        let section = "- severity: CRITICAL (blocker)";
+        assert_eq!(detect_severity(section), Severity::Critical);
+    }
+
+    #[test]
+    fn parse_rules_avoids_false_positive_from_title_keyword() {
+        let output =
+            "## LEARN-103: Avoid high memory usage\nseverity: low\nUse bounded queues for safety.";
+        let rules = parse_rules_from_output(output);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].severity, Severity::Low);
     }
 
     #[test]

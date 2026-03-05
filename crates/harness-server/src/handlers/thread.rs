@@ -73,7 +73,21 @@ pub async fn thread_start(
 
 pub async fn thread_list(state: &AppState, id: Option<serde_json::Value>) -> RpcResponse {
     let threads = state.server.thread_manager.list_threads();
-    RpcResponse::success(id, serde_json::to_value(threads).unwrap_or_default())
+    thread_list_response(id, threads)
+}
+
+fn thread_list_response<T: serde::Serialize>(
+    id: Option<serde_json::Value>,
+    threads: T,
+) -> RpcResponse {
+    match serde_json::to_value(threads) {
+        Ok(value) => RpcResponse::success(id, value),
+        Err(e) => RpcResponse::error(
+            id,
+            INTERNAL_ERROR,
+            format!("failed to serialize thread list: {e}"),
+        ),
+    }
 }
 
 pub async fn thread_delete(
@@ -245,5 +259,43 @@ pub async fn thread_compact(
             RpcResponse::success(id, serde_json::json!({ "compacted": true }))
         }
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Serializer;
+    use serde_json::json;
+
+    struct AlwaysFailSerialize;
+
+    impl serde::Serialize for AlwaysFailSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            Err(serde::ser::Error::custom("forced serialization failure"))
+        }
+    }
+
+    #[test]
+    fn thread_list_response_returns_success_when_serialization_succeeds() {
+        let response = thread_list_response(Some(json!(1)), vec![json!({ "thread_id": "t-1" })]);
+
+        assert_eq!(response.result, Some(json!([{ "thread_id": "t-1" }])));
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn thread_list_response_returns_error_when_serialization_fails() {
+        let response = thread_list_response(Some(json!(1)), AlwaysFailSerialize);
+
+        assert!(response.result.is_none());
+        let error = response.error.expect("expected serialization error response");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(error
+            .message
+            .contains("failed to serialize thread list: forced serialization failure"));
     }
 }

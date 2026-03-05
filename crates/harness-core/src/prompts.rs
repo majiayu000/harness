@@ -1,5 +1,27 @@
 /// Prompt templates and output parsers shared across CLI and HTTP entries.
 
+/// Build prompt: continue work on an existing PR for a GitHub issue.
+///
+/// Used when a prior task already created a PR for this issue. Instead of
+/// creating a duplicate PR, the agent checks out the existing branch, reads
+/// review feedback, continues the implementation, and pushes to the same branch.
+pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str) -> String {
+    format!(
+        "GitHub issue #{issue} already has an open PR #{pr_number} on branch `{branch}`.\n\n\
+         Steps:\n\
+         1. `git fetch origin {branch} && git checkout {branch}`\n\
+         2. Read the PR diff and any review comments:\n\
+            - `gh pr diff {pr_number}`\n\
+            - `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr_number}/comments`\n\
+            - `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr_number}/reviews`\n\
+         3. Read the original issue requirements: `gh issue view {issue}`\n\
+         4. Fix any unresolved review comments and continue the implementation if incomplete\n\
+         5. Run `cargo check` and `cargo test`\n\
+         6. Commit and push to the SAME branch `{branch}` — do NOT create a new PR\n\n\
+         On the last line of your output, print PR_URL=https://github.com/{{{{owner}}}}/{{{{repo}}}}/pull/{pr_number}"
+    )
+}
+
 /// Build prompt: implement from a GitHub issue, create PR.
 pub fn implement_from_issue(issue: u64) -> String {
     format!(
@@ -154,6 +176,16 @@ fn last_non_empty_line(output: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_continue_existing_pr() {
+        let p = continue_existing_pr(29, 50, "fix/issue-29");
+        assert!(p.contains("issue #29"));
+        assert!(p.contains("PR #50"));
+        assert!(p.contains("fix/issue-29"));
+        assert!(p.contains("do NOT create a new PR"));
+        assert!(p.contains("PR_URL="));
+    }
 
     #[test]
     fn test_implement_from_issue() {

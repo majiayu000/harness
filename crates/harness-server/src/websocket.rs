@@ -34,6 +34,28 @@ fn is_local_origin(origin: &str) -> bool {
     host == "localhost" || host == "127.0.0.1"
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum OriginValidationError {
+    InvalidUtf8,
+    NonLocal(String),
+}
+
+fn validate_origin_header(headers: &HeaderMap) -> Result<(), OriginValidationError> {
+    let Some(origin) = headers.get("Origin") else {
+        return Ok(());
+    };
+
+    let origin_str = origin
+        .to_str()
+        .map_err(|_| OriginValidationError::InvalidUtf8)?;
+
+    if is_local_origin(origin_str) {
+        Ok(())
+    } else {
+        Err(OriginValidationError::NonLocal(origin_str.to_owned()))
+    }
+}
+
 /// Axum handler that upgrades the HTTP connection to WebSocket.
 ///
 /// Validates the Origin header to prevent Cross-Site WebSocket Hijacking (CSWH).
@@ -43,15 +65,18 @@ pub async fn ws_handler(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    if let Some(origin) = headers.get("Origin") {
-        let origin_str = origin.to_str().unwrap_or("");
-        if !is_local_origin(origin_str) {
-            tracing::warn!(
-                "WebSocket connection rejected: non-local Origin {:?}",
-                origin_str
-            );
-            return StatusCode::FORBIDDEN.into_response();
+    if let Err(err) = validate_origin_header(&headers) {
+        match err {
+            OriginValidationError::InvalidUtf8 => {
+                tracing::warn!(
+                    "WebSocket connection rejected: Origin header is not valid UTF-8"
+                );
+            }
+            OriginValidationError::NonLocal(origin) => {
+                tracing::warn!("WebSocket connection rejected: non-local Origin {:?}", origin);
+            }
         }
+        return StatusCode::FORBIDDEN.into_response();
     }
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
@@ -135,6 +160,7 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
 mod tests {
     use super::*;
     use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
+    use axum::http::HeaderValue;
     use harness_agents::AgentRegistry;
     use harness_core::HarnessConfig;
     use harness_protocol::{codec, Method, Notification, RpcNotification, RpcRequest};
@@ -188,6 +214,20 @@ mod tests {
             notification_tx,
             notify_tx: None,
         })
+    }
+
+    #[test]
+    fn validate_origin_header_rejects_non_utf8_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Origin",
+            HeaderValue::from_bytes(b"http://localhost\xff").expect("valid raw header value"),
+        );
+
+        assert!(matches!(
+            validate_origin_header(&headers),
+            Err(OriginValidationError::InvalidUtf8)
+        ));
     }
 
     /// Integration test: spin up the HTTP server on a random port and connect
