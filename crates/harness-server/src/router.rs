@@ -188,7 +188,6 @@ mod tests {
         let (notification_tx, _) = tokio::sync::broadcast::channel(64);
         Ok(AppState {
             server,
-            project_root: dir.to_path_buf(),
             tasks,
             skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
             rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
@@ -527,6 +526,75 @@ mod tests {
             coverage < 100.0,
             "coverage should degrade with violations, got {coverage}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_query_sees_violations_written_via_handler_entry() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+        let violations = vec![
+            harness_core::Violation {
+                rule_id: harness_core::RuleId::from_str("SEC-01"),
+                file: std::path::PathBuf::from("src/lib.rs"),
+                line: Some(7),
+                message: "critical issue".to_string(),
+                severity: harness_core::Severity::Critical,
+            },
+            harness_core::Violation {
+                rule_id: harness_core::RuleId::from_str("U-01"),
+                file: std::path::PathBuf::from("src/main.rs"),
+                line: None,
+                message: "style issue".to_string(),
+                severity: harness_core::Severity::Low,
+            },
+        ];
+        crate::handlers::persist_violations(&state.events, &project_root, &violations);
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::MetricsQuery {
+                filters: harness_core::MetricFilters::default(),
+            },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response for request with id");
+
+        assert!(
+            resp.error.is_none(),
+            "expected success: {:?}",
+            resp.error
+        );
+        let result =
+            resp.result
+                .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        let coverage = result["dimensions"]["coverage"]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("missing coverage"))?;
+        assert!(
+            coverage < 100.0,
+            "coverage should degrade with persisted violations, got {coverage}"
+        );
+
+        let events = state.events.query(&harness_core::EventFilters::default())?;
+        let latest_scan = events
+            .iter()
+            .rev()
+            .find(|event| event.hook == "rule_scan")
+            .ok_or_else(|| anyhow::anyhow!("missing rule_scan anchor event"))?;
+        let linked_checks = events
+            .iter()
+            .filter(|event| {
+                event.hook == "rule_check"
+                    && event.session_id == latest_scan.session_id
+            })
+            .count();
+        assert_eq!(linked_checks, violations.len());
+
         Ok(())
     }
 
