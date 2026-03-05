@@ -299,10 +299,9 @@ mod tests {
     }
 
     fn proj_dir() -> tempfile::TempDir {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         tempfile::Builder::new()
             .prefix("cr-test-")
-            .tempdir_in(&home)
+            .tempdir()
             .expect("create temp dir")
     }
 

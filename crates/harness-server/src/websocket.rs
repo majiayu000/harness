@@ -134,6 +134,17 @@ mod tests {
     use tokio::sync::broadcast;
     use tokio::sync::RwLock;
 
+    async fn bind_loopback_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
+        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => Ok(Some(listener)),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping websocket integration test: {err}");
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
     async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
         let server = Arc::new(HarnessServer::new(
             HarnessConfig::default(),
@@ -178,7 +189,9 @@ mod tests {
         let state = Arc::new(make_test_state(dir.path()).await?);
 
         // Bind to a random port.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let Some(listener) = bind_loopback_listener().await? else {
+            return Ok(());
+        };
         let addr = listener.local_addr()?;
 
         let app = axum::Router::new()
@@ -226,7 +239,9 @@ mod tests {
         let state = Arc::new(make_test_state(dir.path()).await?);
         let notif_tx = state.notification_tx.clone();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let Some(listener) = bind_loopback_listener().await? else {
+            return Ok(());
+        };
         let addr = listener.local_addr()?;
 
         let app = axum::Router::new()
