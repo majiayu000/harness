@@ -282,6 +282,26 @@ mod tests {
         }
     }
 
+    fn writable_home() -> std::path::PathBuf {
+        let home = std::path::PathBuf::from(
+            std::env::var("HOME").unwrap_or_else(|_| ".".into()),
+        );
+        if tempfile::Builder::new()
+            .prefix("harness-home-probe-")
+            .tempdir_in(&home)
+            .is_ok()
+        {
+            return home;
+        }
+
+        let fallback = std::env::current_dir()
+            .expect("resolve cwd")
+            .join(".harness-test-home");
+        std::fs::create_dir_all(&fallback).expect("create fallback HOME");
+        std::env::set_var("HOME", &fallback);
+        fallback
+    }
+
     #[async_trait]
     impl harness_core::CodeAgent for CapturingAgent {
         fn name(&self) -> &str {
@@ -326,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn skills_are_injected_into_agent_context() -> anyhow::Result<()> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let home = writable_home();
         let dir = tempfile::Builder::new()
             .prefix("harness-test-")
             .tempdir_in(&home)?;
@@ -387,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_interceptor_fails_task() -> anyhow::Result<()> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let home = writable_home();
         let dir = tempfile::Builder::new()
             .prefix("harness-test-")
             .tempdir_in(&home)?;
