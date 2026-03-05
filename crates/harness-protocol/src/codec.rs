@@ -97,6 +97,12 @@ mod tests {
         let json_with_params = r#"{"jsonrpc":"2.0","id":null,"method":"initialized","params":{}}"#;
         let back_with_params: RpcRequest = decode_request(json_with_params)?;
         assert!(matches!(back_with_params.method, Method::Initialized));
+
+        // Also accept explicit `null` params, which is handled by `RpcRequest` deserialization.
+        let json_with_null_params =
+            r#"{"jsonrpc":"2.0","id":null,"method":"initialized","params":null}"#;
+        let back_with_null_params: RpcRequest = decode_request(json_with_null_params)?;
+        assert!(matches!(back_with_null_params.method, Method::Initialized));
         Ok(())
     }
 

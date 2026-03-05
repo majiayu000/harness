@@ -103,12 +103,13 @@ impl<'de> Deserialize<'de> for RpcRequest {
         let RawRpcRequest { jsonrpc, id, method, params } = RawRpcRequest::deserialize(deserializer)?;
 
         let method = if method == "initialized" {
-            match params {
-                None => Method::Initialized,
-                Some(serde_json::Value::Null) => Method::Initialized,
-                Some(serde_json::Value::Object(map)) if map.is_empty() => Method::Initialized,
-                Some(_) => return Err(de::Error::custom("`initialized` does not accept params")),
+            if let Some(p) = &params {
+                let is_valid = p.is_null() || p.as_object().is_some_and(|m| m.is_empty());
+                if !is_valid {
+                    return Err(de::Error::custom("`initialized` does not accept params"));
+                }
             }
+            Method::Initialized
         } else {
             let mut raw_method = serde_json::Map::new();
             raw_method.insert("method".to_string(), serde_json::Value::String(method));
