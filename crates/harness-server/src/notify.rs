@@ -1,8 +1,12 @@
 use harness_protocol::{Notification, RpcNotification};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 pub type NotifySender = mpsc::Sender<RpcNotification>;
 pub type NotifyReceiver = mpsc::Receiver<RpcNotification>;
+
+const DROP_LOG_EVERY: u64 = 100;
+static DROPPED_NOTIFICATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Create a bounded channel for server-push notifications.
 pub fn channel(capacity: usize) -> (NotifySender, NotifyReceiver) {
@@ -10,11 +14,33 @@ pub fn channel(capacity: usize) -> (NotifySender, NotifyReceiver) {
 }
 
 /// Emit a notification fire-and-forget style.
-/// Silently drops the notification if the channel is full or closed.
+/// Drops and records the notification if the channel is full or closed.
 pub fn emit(tx: &Option<NotifySender>, notification: Notification) {
     if let Some(tx) = tx {
-        let _ = tx.try_send(RpcNotification::new(notification));
+        if let Err(err) = tx.try_send(RpcNotification::new(notification)) {
+            match err {
+                mpsc::error::TrySendError::Full(_) => record_drop("full"),
+                mpsc::error::TrySendError::Closed(_) => record_drop("closed"),
+            }
+        }
     }
+}
+
+fn record_drop(reason: &'static str) {
+    let dropped_count = DROPPED_NOTIFICATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped_count == 1 || dropped_count % DROP_LOG_EVERY == 0 {
+        tracing::warn!(
+            event = "notify_channel_drop",
+            reason,
+            dropped_count,
+            "dropping outbound notification"
+        );
+    }
+}
+
+#[cfg(test)]
+fn dropped_notification_count() -> u64 {
+    DROPPED_NOTIFICATIONS.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -61,6 +87,7 @@ mod tests {
     async fn emit_drops_when_channel_full() {
         let (tx, _rx) = channel(1);
         let opt = Some(tx);
+        let dropped_before = dropped_notification_count();
         // Fill channel.
         emit(
             &opt,
@@ -76,6 +103,33 @@ mod tests {
                 thread_id: ThreadId::new(),
                 status: ThreadStatus::Active,
             },
+        );
+        let dropped_after = dropped_notification_count();
+        assert!(
+            dropped_after > dropped_before,
+            "expected drop count to increase when channel is full"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_tracks_drops_in_pressure_burst() {
+        let (tx, _rx) = channel(1);
+        let opt = Some(tx);
+        let dropped_before = dropped_notification_count();
+        for _ in 0..256 {
+            emit(
+                &opt,
+                Notification::ThreadStatusChanged {
+                    thread_id: ThreadId::new(),
+                    status: ThreadStatus::Active,
+                },
+            );
+        }
+        let dropped_after = dropped_notification_count();
+        assert!(
+            dropped_after.saturating_sub(dropped_before) >= 255,
+            "expected at least 255 dropped notifications, got {}",
+            dropped_after.saturating_sub(dropped_before)
         );
     }
 }
