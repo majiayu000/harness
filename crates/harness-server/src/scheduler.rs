@@ -105,6 +105,8 @@ mod tests {
             thread_db: Some(thread_db),
             interceptors: vec![],
             notification_tx: tokio::sync::broadcast::channel(32).0,
+            notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            notification_lag_log_every: 1,
             notify_tx: None,
         }))
     }
