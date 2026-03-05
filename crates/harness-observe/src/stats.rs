@@ -118,10 +118,7 @@ pub fn aggregate_rule_stats(events: &[Event]) -> Vec<RuleStats> {
     for e in events.iter().filter(|e| e.hook == "rule_check") {
         let entry = map.entry(e.tool.clone()).or_insert((0, None));
         entry.0 += 1;
-        entry.1 = Some(match entry.1 {
-            Some(prev) if prev > e.ts => prev,
-            _ => e.ts,
-        });
+        entry.1 = Some(entry.1.map_or(e.ts, |prev| prev.max(e.ts)));
     }
 
     let mut stats: Vec<RuleStats> = map

@@ -178,8 +178,13 @@ impl SignalDetector {
             let entry = by_rule.entry(e.tool.clone()).or_insert((0, HashSet::new()));
             entry.0 += 1;
             if let Some(detail) = &e.detail {
-                // `EventStore::log_violations` stores detail as "file:line"
-                let file = detail.split(':').next().unwrap_or(detail).to_string();
+                // `EventStore::log_violations` stores detail as "file:line";
+                // use rsplit_once so paths containing colons (e.g. Windows) are handled correctly.
+                let file = match detail.rsplit_once(':') {
+                    Some((path, line)) if !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()) => path,
+                    _ => detail.as_str(),
+                }
+                .to_string();
                 if !file.is_empty() {
                     entry.1.insert(file);
                 }
