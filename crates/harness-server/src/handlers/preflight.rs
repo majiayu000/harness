@@ -179,16 +179,12 @@ fn select_latest_baseline_scan(events: &[Event]) -> Option<BaselineScanSnapshot>
 
     let latest_rule_check = events.iter().rev().find(|e| e.hook == "rule_check")?;
     let session_id = latest_rule_check.session_id.clone();
-    let violation_count = events
+    let (violation_count, scanned_at) = events
         .iter()
         .filter(|e| e.hook == "rule_check" && e.session_id == session_id)
-        .count();
-    let scanned_at = events
-        .iter()
-        .filter(|e| e.hook == "rule_check" && e.session_id == session_id)
-        .map(|e| e.ts)
-        .max()
-        .unwrap_or(latest_rule_check.ts);
+        .fold((0usize, latest_rule_check.ts), |(count, max_ts), event| {
+            (count + 1, max_ts.max(event.ts))
+        });
 
     Some(BaselineScanSnapshot {
         violation_count,
