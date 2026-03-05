@@ -1,4 +1,4 @@
-use crate::{RpcRequest, RpcResponse, RpcNotification};
+use crate::{RpcNotification, RpcRequest, RpcResponse};
 use serde_json;
 
 /// Encode a response to a JSON line (for stdio transport).
@@ -29,7 +29,8 @@ mod tests {
 
     #[test]
     fn rpc_response_success_omits_error_field() -> anyhow::Result<()> {
-        let resp = RpcResponse::success(Some(serde_json::json!(1)), serde_json::json!({"ok": true}));
+        let resp =
+            RpcResponse::success(Some(serde_json::json!(1)), serde_json::json!({"ok": true}));
         let json = serde_json::to_string(&resp)?;
         assert!(json.contains("\"result\""));
         assert!(!json.contains("\"error\""));
@@ -47,7 +48,9 @@ mod tests {
         assert!(json.contains("\"error\""));
         assert!(!json.contains("\"result\""));
         let back: RpcResponse = serde_json::from_str(&json)?;
-        let err = back.error.ok_or_else(|| anyhow::anyhow!("error field missing"))?;
+        let err = back
+            .error
+            .ok_or_else(|| anyhow::anyhow!("error field missing"))?;
         assert_eq!(err.code, -32600);
         Ok(())
     }
@@ -67,7 +70,9 @@ mod tests {
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(serde_json::json!(1)),
-            method: Method::ThreadStart { cwd: PathBuf::from("/tmp") },
+            method: Method::ThreadStart {
+                cwd: PathBuf::from("/tmp"),
+            },
         };
         let json = serde_json::to_string(&req)?;
         let back: RpcRequest = decode_request(&json)?;
@@ -87,6 +92,11 @@ mod tests {
         assert!(json.contains("\"initialized\""), "serialized: {json}");
         let back: RpcRequest = decode_request(&json)?;
         assert!(matches!(back.method, Method::Initialized));
+
+        // Also accept an explicit empty params object for compatibility.
+        let json_with_params = r#"{"jsonrpc":"2.0","id":null,"method":"initialized","params":{}}"#;
+        let back_with_params: RpcRequest = decode_request(json_with_params)?;
+        assert!(matches!(back_with_params.method, Method::Initialized));
         Ok(())
     }
 
