@@ -43,10 +43,8 @@ impl Scheduler {
                         continue;
                     }
                 };
-                let violations = {
-                    let rules = health_state.rules.read().await;
-                    rules.scan(&std::path::PathBuf::from(".")).await.unwrap_or_default()
-                };
+                let rules = crate::handlers::snapshot_rule_engine(health_state.rules.as_ref()).await;
+                let violations = rules.scan(&std::path::PathBuf::from(".")).await.unwrap_or_default();
                 let project_root = std::path::PathBuf::from(".");
                 health_state.events.persist_rule_scan(&project_root, &violations);
                 let report = generate_health_report(&events, &violations);

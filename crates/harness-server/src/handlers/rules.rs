@@ -31,22 +31,20 @@ pub async fn rule_check(
         Ok(p) => p,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
     };
-    let result = {
-        let rules = state.rules.read().await;
-        match files {
-            Some(f) => {
-                // Validate each file is within the project root to prevent path traversal.
-                let mut validated = Vec::with_capacity(f.len());
-                for file in &f {
-                    match crate::handlers::validate_file_in_root(file, &project_root) {
-                        Ok(p) => validated.push(p),
-                        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-                    }
+    let rules = crate::handlers::snapshot_rule_engine(state.rules.as_ref()).await;
+    let result = match files {
+        Some(f) => {
+            // Validate each file is within the project root to prevent path traversal.
+            let mut validated = Vec::with_capacity(f.len());
+            for file in &f {
+                match crate::handlers::validate_file_in_root(file, &project_root) {
+                    Ok(p) => validated.push(p),
+                    Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
                 }
-                rules.scan_files(&project_root, &validated).await
             }
-            None => rules.scan(&project_root).await,
+            rules.scan_files(&project_root, &validated).await
         }
+        None => rules.scan(&project_root).await,
     };
     match result {
         Ok(violations) => {

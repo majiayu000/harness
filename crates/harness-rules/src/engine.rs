@@ -24,6 +24,7 @@ pub struct Guard {
     pub rules: Vec<RuleId>,
 }
 
+#[derive(Clone)]
 pub struct RuleEngine {
     rules: Vec<Rule>,
     rule_ids: HashSet<RuleId>,

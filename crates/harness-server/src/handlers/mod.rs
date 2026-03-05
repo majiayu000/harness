@@ -10,6 +10,12 @@ pub mod rules;
 pub mod skills;
 pub mod thread;
 
+pub(crate) async fn snapshot_rule_engine(
+    rules: &tokio::sync::RwLock<harness_rules::engine::RuleEngine>,
+) -> harness_rules::engine::RuleEngine {
+    rules.read().await.clone()
+}
+
 /// Persist rule scan violations to the event store using the same format as rule_check.
 pub(crate) fn persist_violations(
     events: &harness_observe::EventStore,
@@ -83,4 +89,34 @@ pub(crate) fn validate_project_root(path: &std::path::Path) -> Result<std::path:
         ));
     }
     Ok(canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snapshot_rule_engine;
+    use harness_rules::engine::RuleEngine;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tokio::time::{sleep, timeout, Duration};
+
+    #[tokio::test]
+    async fn rule_scan_snapshot_allows_write_lock_while_async_work_runs() {
+        let rules = Arc::new(RwLock::new(RuleEngine::new()));
+        let snapshot = snapshot_rule_engine(rules.as_ref()).await;
+        assert!(snapshot.rules().is_empty());
+
+        let writer_rules = Arc::clone(&rules);
+        let writer = tokio::spawn(async move {
+            let mut guard = writer_rules.write().await;
+            guard.load_builtin().expect("builtin rules should load");
+            guard.rules().len()
+        });
+
+        sleep(Duration::from_millis(100)).await;
+        let writer_rule_count = timeout(Duration::from_secs(1), writer)
+            .await
+            .expect("write lock should not be blocked by snapshot await")
+            .expect("writer task should complete");
+        assert!(writer_rule_count > 0);
+    }
 }

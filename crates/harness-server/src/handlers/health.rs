@@ -21,10 +21,8 @@ pub async fn health_check(
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     };
 
-    let violations: Vec<Violation> = {
-        let rules = state.rules.read().await;
-        rules.scan(&project_root).await.unwrap_or_default()
-    };
+    let rules = crate::handlers::snapshot_rule_engine(state.rules.as_ref()).await;
+    let violations: Vec<Violation> = rules.scan(&project_root).await.unwrap_or_default();
     crate::handlers::persist_violations(&state.events, &violations);
 
     let report = generate_health_report(&events, &violations);

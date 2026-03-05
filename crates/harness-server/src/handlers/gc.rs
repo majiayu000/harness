@@ -8,10 +8,8 @@ pub async fn gc_run(
 ) -> RpcResponse {
     let project_root = state.project_root.clone();
     tracing::info!("gc: scanning project root {}", project_root.display());
-    let violations = {
-        let rules = state.rules.read().await;
-        rules.scan(&project_root).await.unwrap_or_default()
-    };
+    let rules = crate::handlers::snapshot_rule_engine(state.rules.as_ref()).await;
+    let violations = rules.scan(&project_root).await.unwrap_or_default();
     crate::handlers::persist_violations(&state.events, &violations);
 
     let events = match state.events.query(&harness_core::EventFilters::default()) {

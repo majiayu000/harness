@@ -41,10 +41,8 @@ pub async fn metrics_collect(
     };
 
     // scan -> persist -> query -> grade
-    let violations = {
-        let rules = state.rules.read().await;
-        rules.scan(&project_root).await.unwrap_or_default()
-    };
+    let rules = crate::handlers::snapshot_rule_engine(state.rules.as_ref()).await;
+    let violations = rules.scan(&project_root).await.unwrap_or_default();
     crate::handlers::persist_violations(&state.events, &violations);
 
     let evts = match state.events.query(&harness_core::EventFilters::default()) {
