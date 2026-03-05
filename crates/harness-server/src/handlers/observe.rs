@@ -52,7 +52,7 @@ pub async fn metrics_collect(
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     };
 
-    let violation_count = evts.iter().filter(|e| e.hook == "rule_check").count();
+    let violation_count = violations.len();
     let report = harness_observe::QualityGrader::grade(&evts, violation_count);
     match serde_json::to_value(&report) {
         Ok(v) => RpcResponse::success(id, v),
