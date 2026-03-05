@@ -115,6 +115,12 @@ pub struct GcConfig {
     pub max_drafts_per_run: usize,
     pub budget_per_signal_usd: f64,
     pub total_budget_usd: f64,
+    #[serde(default = "default_gc_adopt_wait_secs")]
+    pub adopt_wait_secs: u64,
+    #[serde(default = "default_gc_adopt_max_rounds")]
+    pub adopt_max_rounds: u32,
+    #[serde(default = "default_gc_adopt_turn_timeout_secs")]
+    pub adopt_turn_timeout_secs: u64,
     pub signal_thresholds: SignalThresholds,
 }
 
@@ -124,9 +130,24 @@ impl Default for GcConfig {
             max_drafts_per_run: 5,
             budget_per_signal_usd: 0.50,
             total_budget_usd: 5.0,
+            adopt_wait_secs: default_gc_adopt_wait_secs(),
+            adopt_max_rounds: default_gc_adopt_max_rounds(),
+            adopt_turn_timeout_secs: default_gc_adopt_turn_timeout_secs(),
             signal_thresholds: SignalThresholds::default(),
         }
     }
+}
+
+fn default_gc_adopt_wait_secs() -> u64 {
+    120
+}
+
+fn default_gc_adopt_max_rounds() -> u32 {
+    3
+}
+
+fn default_gc_adopt_turn_timeout_secs() -> u64 {
+    600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

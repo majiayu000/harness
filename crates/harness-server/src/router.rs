@@ -20,9 +20,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         }
 
         // === Thread management ===
-        Method::ThreadStart { cwd } => {
-            Some(handlers::thread::thread_start(state, id, cwd).await)
-        }
+        Method::ThreadStart { cwd } => Some(handlers::thread::thread_start(state, id, cwd).await),
         Method::ThreadList => Some(handlers::thread::thread_list(state, id).await),
         Method::ThreadDelete { thread_id } => {
             Some(handlers::thread::thread_delete(state, id, thread_id).await)
@@ -57,9 +55,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         Method::SkillCreate { name, content } => {
             Some(handlers::skills::skill_create(state, id, name, content).await)
         }
-        Method::SkillList { query } => {
-            Some(handlers::skills::skill_list(state, id, query).await)
-        }
+        Method::SkillList { query } => Some(handlers::skills::skill_list(state, id, query).await),
         Method::SkillGet { skill_id } => {
             Some(handlers::skills::skill_get(state, id, skill_id).await)
         }
@@ -68,9 +64,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         }
 
         // === Events / Metrics ===
-        Method::EventLog { event } => {
-            Some(handlers::observe::event_log(state, id, event).await)
-        }
+        Method::EventLog { event } => Some(handlers::observe::event_log(state, id, event).await),
         Method::EventQuery { filters } => {
             Some(handlers::observe::event_query(state, id, filters).await)
         }
@@ -91,25 +85,18 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         } => Some(handlers::rules::rule_check(state, id, project_root, files).await),
 
         // === GC ===
-        Method::GcRun { project_id: _ } => {
-            Some(handlers::gc::gc_run(state, id).await)
-        }
+        Method::GcRun { project_id: _ } => Some(handlers::gc::gc_run(state, id).await),
         Method::GcStatus => Some(handlers::gc::gc_status(state, id).await),
-        Method::GcDrafts { project_id: _ } => {
-            Some(handlers::gc::gc_drafts(state, id).await)
-        }
-        Method::GcAdopt { draft_id } => {
-            Some(handlers::gc::gc_adopt(state, id, draft_id).await)
-        }
+        Method::GcDrafts { project_id: _ } => Some(handlers::gc::gc_drafts(state, id).await),
+        Method::GcAdopt { draft_id } => Some(handlers::gc::gc_adopt(state, id, draft_id).await),
         Method::GcReject { draft_id, reason } => {
             Some(handlers::gc::gc_reject(state, id, draft_id, reason).await)
         }
 
         // === ExecPlan ===
-        Method::ExecPlanInit {
-            spec,
-            project_root,
-        } => Some(handlers::exec::exec_plan_init(state, id, spec, project_root).await),
+        Method::ExecPlanInit { spec, project_root } => {
+            Some(handlers::exec::exec_plan_init(state, id, spec, project_root).await)
+        }
         Method::ExecPlanStatus { plan_id } => {
             Some(handlers::exec::exec_plan_status(state, id, plan_id).await)
         }
@@ -139,12 +126,17 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         }
 
         // === VibeGuard ===
-        Method::Preflight { project_root, task_description } => {
-            Some(handlers::preflight::preflight(state, id, project_root, task_description).await)
-        }
-        Method::CrossReview { project_root, target, max_rounds } => {
-            Some(handlers::cross_review::cross_review(state, id, project_root, target, max_rounds).await)
-        }
+        Method::Preflight {
+            project_root,
+            task_description,
+        } => Some(handlers::preflight::preflight(state, id, project_root, task_description).await),
+        Method::CrossReview {
+            project_root,
+            target,
+            max_rounds,
+        } => Some(
+            handlers::cross_review::cross_review(state, id, project_root, target, max_rounds).await,
+        ),
     }
 }
 
@@ -159,15 +151,29 @@ mod tests {
     use tokio::sync::RwLock;
 
     async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
-        make_test_state_with_registry(dir, AgentRegistry::new("test")).await
+        make_test_state_with_config_and_registry(
+            dir,
+            HarnessConfig::default(),
+            AgentRegistry::new("test"),
+        )
+        .await
     }
 
     async fn make_test_state_with_registry(
         dir: &std::path::Path,
         agent_registry: AgentRegistry,
     ) -> anyhow::Result<AppState> {
+        make_test_state_with_config_and_registry(dir, HarnessConfig::default(), agent_registry)
+            .await
+    }
+
+    async fn make_test_state_with_config_and_registry(
+        dir: &std::path::Path,
+        config: HarnessConfig,
+        agent_registry: AgentRegistry,
+    ) -> anyhow::Result<AppState> {
         let server = Arc::new(HarnessServer::new(
-            HarnessConfig::default(),
+            config,
             ThreadManager::new(),
             agent_registry,
         ));
@@ -183,8 +189,7 @@ mod tests {
             signal_detector,
             draft_store,
         ));
-        let thread_db =
-            crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
+        let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
         let (notification_tx, _) = tokio::sync::broadcast::channel(64);
         Ok(AppState {
             server,
@@ -249,7 +254,10 @@ mod tests {
             .result
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("initialize must return result"))?;
-        assert!(result["capabilities"].is_object(), "capabilities should be present");
+        assert!(
+            result["capabilities"].is_object(),
+            "capabilities should be present"
+        );
 
         // Step 2: initialized (notification — id is None)
         let ack_req = RpcRequest {
@@ -268,8 +276,8 @@ mod tests {
     #[tokio::test]
     async fn gc_adopt_response_includes_task_id() -> anyhow::Result<()> {
         use harness_core::{
-            Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId,
-            RemediationType, Signal, SignalType,
+            Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId, RemediationType,
+            Signal, SignalType,
         };
 
         let dir = tempfile::tempdir()?;
@@ -312,9 +320,9 @@ mod tests {
             "expected success, got error: {:?}",
             resp.error
         );
-        let result =
-            resp.result
-                .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
         assert_eq!(
             result["adopted"],
             serde_json::json!(true),
@@ -360,11 +368,147 @@ mod tests {
         }
     }
 
+    struct NonLgtmAgent {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NonLgtmAgent {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl harness_core::CodeAgent for NonLgtmAgent {
+        fn name(&self) -> &str {
+            "non-lgtm"
+        }
+
+        fn capabilities(&self) -> Vec<harness_core::Capability> {
+            vec![]
+        }
+
+        async fn execute(
+            &self,
+            _req: harness_core::AgentRequest,
+        ) -> harness_core::Result<harness_core::AgentResponse> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let output = if call == 0 {
+                "Implemented\nPR_URL=https://github.com/example/repo/pull/123".to_string()
+            } else {
+                "Needs follow-up\nFIXED".to_string()
+            };
+            Ok(harness_core::AgentResponse {
+                output,
+                stderr: String::new(),
+                items: vec![],
+                token_usage: harness_core::TokenUsage::default(),
+                model: "mock".to_string(),
+                exit_code: Some(0),
+            })
+        }
+
+        async fn execute_stream(
+            &self,
+            _req: harness_core::AgentRequest,
+            _tx: tokio::sync::mpsc::Sender<harness_core::StreamItem>,
+        ) -> harness_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn wait_for_terminal_task(
+        state: &AppState,
+        task_id: &str,
+    ) -> anyhow::Result<crate::task_runner::TaskState> {
+        use tokio::time::{sleep, Duration};
+
+        let tid = crate::task_runner::TaskId(task_id.to_string());
+        for _ in 0..120 {
+            if let Some(task) = state.tasks.get(&tid) {
+                if matches!(
+                    task.status,
+                    crate::task_runner::TaskStatus::Done | crate::task_runner::TaskStatus::Failed
+                ) {
+                    return Ok(task);
+                }
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        anyhow::bail!("task did not reach terminal state in time");
+    }
+
+    async fn run_gc_adopt_and_wait_for_failure_turn(max_rounds: u32) -> anyhow::Result<u32> {
+        let dir = tempfile::tempdir()?;
+        let mut config = HarnessConfig::default();
+        config.gc.adopt_wait_secs = 0;
+        config.gc.adopt_max_rounds = max_rounds;
+        config.gc.adopt_turn_timeout_secs = 30;
+
+        let mut registry = AgentRegistry::new("mock");
+        registry.register("mock", Arc::new(NonLgtmAgent::new()));
+        let state = make_test_state_with_config_and_registry(dir.path(), config, registry).await?;
+
+        let draft_id = harness_core::DraftId::new();
+        let signal = harness_core::Signal::new(
+            harness_core::SignalType::RepeatedWarn,
+            harness_core::ProjectId::new(),
+            serde_json::json!("test signal"),
+            harness_core::RemediationType::Guard,
+        );
+        let draft = harness_core::Draft {
+            id: draft_id.clone(),
+            status: harness_core::DraftStatus::Pending,
+            signal,
+            artifacts: vec![harness_core::Artifact {
+                artifact_type: harness_core::ArtifactType::Guard,
+                target_path: dir.path().join("test-guard.sh"),
+                content: "#!/bin/bash\necho ok".to_string(),
+            }],
+            rationale: "test".to_string(),
+            validation: "test".to_string(),
+            generated_at: chrono::Utc::now(),
+            agent_model: "test".to_string(),
+        };
+        state.gc_agent.draft_store().save(&draft)?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::GcAdopt { draft_id },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response for request with id");
+        assert!(
+            resp.error.is_none(),
+            "expected success, got error: {:?}",
+            resp.error
+        );
+
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        let task_id = result["task_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("task_id should be a string"))?;
+
+        let task = wait_for_terminal_task(&state, task_id).await?;
+        assert!(
+            matches!(task.status, crate::task_runner::TaskStatus::Failed),
+            "expected task to fail after exhausting rounds, got {:?}",
+            task.status
+        );
+        Ok(task.turn)
+    }
+
     #[tokio::test]
     async fn gc_adopt_spawns_task_when_agent_registered() -> anyhow::Result<()> {
         use harness_core::{
-            Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId,
-            RemediationType, Signal, SignalType,
+            Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId, RemediationType,
+            Signal, SignalType,
         };
 
         let dir = tempfile::tempdir()?;
@@ -410,9 +554,9 @@ mod tests {
             "expected success, got error: {:?}",
             resp.error
         );
-        let result =
-            resp.result
-                .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
         assert_eq!(
             result["adopted"],
             serde_json::json!(true),
@@ -429,8 +573,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_check_logs_no_violations_when_no_guards_loaded() -> anyhow::Result<()>
-    {
+    async fn gc_adopt_schedule_changes_with_gc_config() -> anyhow::Result<()> {
+        let short_schedule_turn = run_gc_adopt_and_wait_for_failure_turn(1).await?;
+        let long_schedule_turn = run_gc_adopt_and_wait_for_failure_turn(3).await?;
+
+        assert_eq!(short_schedule_turn, 2, "max_rounds=1 should end at turn 2");
+        assert_eq!(long_schedule_turn, 4, "max_rounds=3 should end at turn 4");
+        assert!(
+            long_schedule_turn > short_schedule_turn,
+            "larger max_rounds should produce a longer schedule"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rule_check_logs_no_violations_when_no_guards_loaded() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -450,11 +607,7 @@ mod tests {
             .await
             .expect("expected response for request with id");
 
-        assert!(
-            resp.error.is_none(),
-            "expected success: {:?}",
-            resp.error
-        );
+        assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
         let violations: Vec<serde_json::Value> = serde_json::from_value(
             resp.result
                 .ok_or_else(|| anyhow::anyhow!("missing result"))?,
@@ -511,14 +664,10 @@ mod tests {
             .await
             .expect("expected response for request with id");
 
-        assert!(
-            resp.error.is_none(),
-            "expected success: {:?}",
-            resp.error
-        );
-        let result =
-            resp.result
-                .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
         let coverage = result["dimensions"]["coverage"]
             .as_f64()
             .ok_or_else(|| anyhow::anyhow!("missing coverage"))?;
