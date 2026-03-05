@@ -106,6 +106,7 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
     // Task 2: subscribe to the notification broadcast and forward to client.
     let notif_out_tx = out_tx.clone();
     let mut notif_rx = state.notification_tx.subscribe();
+    let notif_state = state.clone();
     let notif_task = tokio::spawn(async move {
         loop {
             match notif_rx.recv().await {
@@ -117,7 +118,10 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
                     }
                     Err(e) => tracing::warn!("failed to encode notification: {e}"),
                 },
-                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Lagged(skipped)) => {
+                    notif_state.observe_notification_lag(skipped as u64);
+                    continue;
+                }
                 Err(RecvError::Closed) => break,
             }
         }
@@ -172,8 +176,17 @@ mod tests {
     >;
 
     async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
+        make_test_state_with_config(dir, HarnessConfig::default()).await
+    }
+
+    async fn make_test_state_with_config(
+        dir: &std::path::Path,
+        config: HarnessConfig,
+    ) -> anyhow::Result<AppState> {
+        let notification_broadcast_capacity = config.server.notification_broadcast_capacity.max(1);
+        let notification_lag_log_every = config.server.notification_lag_log_every;
         let server = Arc::new(HarnessServer::new(
-            HarnessConfig::default(),
+            config,
             ThreadManager::new(),
             AgentRegistry::new("test"),
         ));
@@ -190,7 +203,7 @@ mod tests {
             draft_store,
         ));
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
-        let (notification_tx, _) = broadcast::channel(16);
+        let (notification_tx, _) = broadcast::channel(notification_broadcast_capacity);
 
         Ok(AppState {
             server,
@@ -204,6 +217,8 @@ mod tests {
             thread_db: Some(thread_db),
             interceptors: vec![],
             notification_tx,
+            notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            notification_lag_log_every,
             notify_tx: None,
         })
     }
@@ -384,6 +399,45 @@ mod tests {
             other => anyhow::bail!("unexpected notification variant: {other:?}"),
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn websocket_tracks_lagged_notifications_under_load() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = HarnessConfig::default();
+        config.server.notification_broadcast_capacity = 4;
+        config.server.notification_lag_log_every = 1;
+        let state = make_test_state_with_config(dir.path(), config).await?;
+        let mut rx = state.notification_tx.subscribe();
+
+        for _ in 0..512 {
+            state
+                .notification_tx
+                .send(RpcNotification::new(Notification::TurnStarted {
+                    thread_id: harness_core::ThreadId::new(),
+                    turn_id: harness_core::TurnId::new(),
+                }))
+                .ok();
+        }
+
+        let skipped = loop {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(_)) => continue,
+                Ok(Err(RecvError::Lagged(skipped))) => break skipped,
+                Ok(Err(other)) => anyhow::bail!("unexpected recv error: {other:?}"),
+                Err(_) => anyhow::bail!("timed out waiting for lagged receiver signal"),
+            }
+        };
+
+        let dropped_total = state.observe_notification_lag(skipped as u64);
+        assert!(dropped_total >= skipped as u64);
+        assert_eq!(
+            state
+                .notification_lagged_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            dropped_total
+        );
         Ok(())
     }
 }

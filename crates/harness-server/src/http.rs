@@ -9,6 +9,7 @@ use axum::{
 use harness_protocol::{RpcNotification, RpcRequest};
 use serde_json::json;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
@@ -26,10 +27,33 @@ pub struct AppState {
     pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     /// Broadcast channel for server-push notifications (WebSocket and stdio transports).
     pub notification_tx: broadcast::Sender<RpcNotification>,
+    /// Total number of dropped broadcast notifications due to lagged receivers.
+    pub notification_lagged_total: Arc<AtomicU64>,
+    /// Log lagged drops when the total crosses a multiple of this value.
+    /// Set to 0 to disable lag logs while still counting drops.
+    pub notification_lag_log_every: u64,
     /// Channel for server-push JSON-RPC notifications (stdio transport only).
     pub notify_tx: Option<crate::notify::NotifySender>,
 }
 
+impl AppState {
+    pub fn observe_notification_lag(&self, dropped: u64) -> u64 {
+        let previous_total = self
+            .notification_lagged_total
+            .fetch_add(dropped, Ordering::Relaxed);
+        let dropped_total = previous_total.saturating_add(dropped);
+        let log_every = self.notification_lag_log_every;
+        if log_every > 0 && previous_total / log_every < dropped_total / log_every {
+            tracing::warn!(
+                dropped_since_last_recv = dropped,
+                dropped_total,
+                log_every,
+                "notification receiver lagged; dropped broadcast notifications"
+            );
+        }
+        dropped_total
+    }
+}
 fn resolve_project_root(configured_root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     let project_root = configured_root.canonicalize().map_err(|e| {
         anyhow::anyhow!(
@@ -93,6 +117,14 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     let thread_db_path = dir.join("threads.db");
     let thread_db = crate::thread_db::ThreadDb::open(&thread_db_path).await?;
+    let configured_capacity = server.config.server.notification_broadcast_capacity;
+    let notification_broadcast_capacity = configured_capacity.max(1);
+    let notification_lag_log_every = server.config.server.notification_lag_log_every;
+    if configured_capacity == 0 {
+        tracing::warn!(
+            "server.notification_broadcast_capacity=0 is invalid; falling back to capacity=1"
+        );
+    }
     // Load persisted threads into the in-memory ThreadManager cache
     for thread in thread_db.list().await? {
         server
@@ -116,7 +148,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
         thread_db: Some(thread_db),
         interceptors: vec![Arc::new(crate::contract_validator::ContractValidator::new())],
-        notification_tx: broadcast::channel(256).0,
+        notification_tx: broadcast::channel(notification_broadcast_capacity).0,
+        notification_lagged_total: Arc::new(AtomicU64::new(0)),
+        notification_lag_log_every,
         notify_tx: None,
     })
 }
@@ -277,6 +311,8 @@ mod tests {
             thread_db: Some(thread_db),
             interceptors: vec![],
             notification_tx: tokio::sync::broadcast::channel(32).0,
+            notification_lagged_total: Arc::new(AtomicU64::new(0)),
+            notification_lag_log_every: 1,
             notify_tx: None,
         }))
     }
