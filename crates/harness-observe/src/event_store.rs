@@ -14,6 +14,14 @@ impl EventStore {
         })
     }
 
+    pub fn with_policies(
+        data_dir: &Path,
+        _session_renewal_secs: u64,
+        _log_retention_days: u32,
+    ) -> anyhow::Result<Self> {
+        Self::new(data_dir)
+    }
+
     fn events_file(&self) -> PathBuf {
         self.data_dir.join("events.jsonl")
     }
