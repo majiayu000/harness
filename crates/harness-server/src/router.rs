@@ -20,9 +20,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         }
 
         // === Thread management ===
-        Method::ThreadStart { cwd } => {
-            Some(handlers::thread::thread_start(state, id, cwd).await)
-        }
+        Method::ThreadStart { cwd } => Some(handlers::thread::thread_start(state, id, cwd).await),
         Method::ThreadList => Some(handlers::thread::thread_list(state, id).await),
         Method::ThreadDelete { thread_id } => {
             Some(handlers::thread::thread_delete(state, id, thread_id).await)
@@ -57,9 +55,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         Method::SkillCreate { name, content } => {
             Some(handlers::skills::skill_create(state, id, name, content).await)
         }
-        Method::SkillList { query } => {
-            Some(handlers::skills::skill_list(state, id, query).await)
-        }
+        Method::SkillList { query } => Some(handlers::skills::skill_list(state, id, query).await),
         Method::SkillGet { skill_id } => {
             Some(handlers::skills::skill_get(state, id, skill_id).await)
         }
@@ -68,9 +64,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         }
 
         // === Events / Metrics ===
-        Method::EventLog { event } => {
-            Some(handlers::observe::event_log(state, id, event).await)
-        }
+        Method::EventLog { event } => Some(handlers::observe::event_log(state, id, event).await),
         Method::EventQuery { filters } => {
             Some(handlers::observe::event_query(state, id, filters).await)
         }
@@ -91,25 +85,18 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         } => Some(handlers::rules::rule_check(state, id, project_root, files).await),
 
         // === GC ===
-        Method::GcRun { project_id: _ } => {
-            Some(handlers::gc::gc_run(state, id).await)
-        }
+        Method::GcRun { project_id: _ } => Some(handlers::gc::gc_run(state, id).await),
         Method::GcStatus => Some(handlers::gc::gc_status(state, id).await),
-        Method::GcDrafts { project_id: _ } => {
-            Some(handlers::gc::gc_drafts(state, id).await)
-        }
-        Method::GcAdopt { draft_id } => {
-            Some(handlers::gc::gc_adopt(state, id, draft_id).await)
-        }
+        Method::GcDrafts { project_id: _ } => Some(handlers::gc::gc_drafts(state, id).await),
+        Method::GcAdopt { draft_id } => Some(handlers::gc::gc_adopt(state, id, draft_id).await),
         Method::GcReject { draft_id, reason } => {
             Some(handlers::gc::gc_reject(state, id, draft_id, reason).await)
         }
 
         // === ExecPlan ===
-        Method::ExecPlanInit {
-            spec,
-            project_root,
-        } => Some(handlers::exec::exec_plan_init(state, id, spec, project_root).await),
+        Method::ExecPlanInit { spec, project_root } => {
+            Some(handlers::exec::exec_plan_init(state, id, spec, project_root).await)
+        }
         Method::ExecPlanStatus { plan_id } => {
             Some(handlers::exec::exec_plan_status(state, id, plan_id).await)
         }
@@ -139,12 +126,17 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         }
 
         // === VibeGuard ===
-        Method::Preflight { project_root, task_description } => {
-            Some(handlers::preflight::preflight(state, id, project_root, task_description).await)
-        }
-        Method::CrossReview { project_root, target, max_rounds } => {
-            Some(handlers::cross_review::cross_review(state, id, project_root, target, max_rounds).await)
-        }
+        Method::Preflight {
+            project_root,
+            task_description,
+        } => Some(handlers::preflight::preflight(state, id, project_root, task_description).await),
+        Method::CrossReview {
+            project_root,
+            target,
+            max_rounds,
+        } => Some(
+            handlers::cross_review::cross_review(state, id, project_root, target, max_rounds).await,
+        ),
     }
 }
 
@@ -183,8 +175,7 @@ mod tests {
             signal_detector,
             draft_store,
         ));
-        let thread_db =
-            crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
+        let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
         let (notification_tx, _) = tokio::sync::broadcast::channel(64);
         Ok(AppState {
             server,
@@ -198,14 +189,14 @@ mod tests {
             thread_db: Some(thread_db),
             interceptors: vec![],
             notification_tx,
+            notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            notification_lag_log_every: 1,
             notify_tx: None,
         })
     }
 
     fn writable_home() -> std::path::PathBuf {
-        let home = std::path::PathBuf::from(
-            std::env::var("HOME").unwrap_or_else(|_| ".".into()),
-        );
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
         if tempfile::Builder::new()
             .prefix("harness-home-probe-")
             .tempdir_in(&home)
@@ -270,7 +261,10 @@ mod tests {
             .result
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("initialize must return result"))?;
-        assert!(result["capabilities"].is_object(), "capabilities should be present");
+        assert!(
+            result["capabilities"].is_object(),
+            "capabilities should be present"
+        );
 
         // Step 2: initialized (notification — id is None)
         let ack_req = RpcRequest {
@@ -289,8 +283,8 @@ mod tests {
     #[tokio::test]
     async fn gc_adopt_response_includes_task_id() -> anyhow::Result<()> {
         use harness_core::{
-            Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId,
-            RemediationType, Signal, SignalType,
+            Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId, RemediationType,
+            Signal, SignalType,
         };
 
         let dir = tempfile::tempdir()?;
@@ -333,9 +327,9 @@ mod tests {
             "expected success, got error: {:?}",
             resp.error
         );
-        let result =
-            resp.result
-                .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
         assert_eq!(
             result["adopted"],
             serde_json::json!(true),
@@ -384,8 +378,8 @@ mod tests {
     #[tokio::test]
     async fn gc_adopt_spawns_task_when_agent_registered() -> anyhow::Result<()> {
         use harness_core::{
-            Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId,
-            RemediationType, Signal, SignalType,
+            Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId, RemediationType,
+            Signal, SignalType,
         };
 
         let dir = tempfile::tempdir()?;
@@ -431,9 +425,9 @@ mod tests {
             "expected success, got error: {:?}",
             resp.error
         );
-        let result =
-            resp.result
-                .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
         assert_eq!(
             result["adopted"],
             serde_json::json!(true),
@@ -450,8 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_check_logs_no_violations_when_no_guards_loaded() -> anyhow::Result<()>
-    {
+    async fn rule_check_logs_no_violations_when_no_guards_loaded() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
         let home = writable_home();
@@ -471,11 +464,7 @@ mod tests {
             .await
             .expect("expected response for request with id");
 
-        assert!(
-            resp.error.is_none(),
-            "expected success: {:?}",
-            resp.error
-        );
+        assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
         let violations: Vec<serde_json::Value> = serde_json::from_value(
             resp.result
                 .ok_or_else(|| anyhow::anyhow!("missing result"))?,
@@ -532,14 +521,10 @@ mod tests {
             .await
             .expect("expected response for request with id");
 
-        assert!(
-            resp.error.is_none(),
-            "expected success: {:?}",
-            resp.error
-        );
-        let result =
-            resp.result
-                .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
         let coverage = result["dimensions"]["coverage"]
             .as_f64()
             .ok_or_else(|| anyhow::anyhow!("missing coverage"))?;
