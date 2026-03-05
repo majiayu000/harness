@@ -151,15 +151,29 @@ mod tests {
     use tokio::sync::RwLock;
 
     async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
-        make_test_state_with_registry(dir, AgentRegistry::new("test")).await
+        make_test_state_with_config_and_registry(
+            dir,
+            HarnessConfig::default(),
+            AgentRegistry::new("test"),
+        )
+        .await
     }
 
     async fn make_test_state_with_registry(
         dir: &std::path::Path,
         agent_registry: AgentRegistry,
     ) -> anyhow::Result<AppState> {
+        make_test_state_with_config_and_registry(dir, HarnessConfig::default(), agent_registry)
+            .await
+    }
+
+    async fn make_test_state_with_config_and_registry(
+        dir: &std::path::Path,
+        config: HarnessConfig,
+        agent_registry: AgentRegistry,
+    ) -> anyhow::Result<AppState> {
         let server = Arc::new(HarnessServer::new(
-            HarnessConfig::default(),
+            config,
             ThreadManager::new(),
             agent_registry,
         ));
@@ -375,6 +389,142 @@ mod tests {
         }
     }
 
+    struct NonLgtmAgent {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NonLgtmAgent {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl harness_core::CodeAgent for NonLgtmAgent {
+        fn name(&self) -> &str {
+            "non-lgtm"
+        }
+
+        fn capabilities(&self) -> Vec<harness_core::Capability> {
+            vec![]
+        }
+
+        async fn execute(
+            &self,
+            _req: harness_core::AgentRequest,
+        ) -> harness_core::Result<harness_core::AgentResponse> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let output = if call == 0 {
+                "Implemented\nPR_URL=https://github.com/example/repo/pull/123".to_string()
+            } else {
+                "Needs follow-up\nFIXED".to_string()
+            };
+            Ok(harness_core::AgentResponse {
+                output,
+                stderr: String::new(),
+                items: vec![],
+                token_usage: harness_core::TokenUsage::default(),
+                model: "mock".to_string(),
+                exit_code: Some(0),
+            })
+        }
+
+        async fn execute_stream(
+            &self,
+            _req: harness_core::AgentRequest,
+            _tx: tokio::sync::mpsc::Sender<harness_core::StreamItem>,
+        ) -> harness_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn wait_for_terminal_task(
+        state: &AppState,
+        task_id: &str,
+    ) -> anyhow::Result<crate::task_runner::TaskState> {
+        use tokio::time::{sleep, Duration};
+
+        let tid = crate::task_runner::TaskId(task_id.to_string());
+        for _ in 0..120 {
+            if let Some(task) = state.tasks.get(&tid) {
+                if matches!(
+                    task.status,
+                    crate::task_runner::TaskStatus::Done | crate::task_runner::TaskStatus::Failed
+                ) {
+                    return Ok(task);
+                }
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        anyhow::bail!("task did not reach terminal state in time");
+    }
+
+    async fn run_gc_adopt_and_wait_for_failure_turn(max_rounds: u32) -> anyhow::Result<u32> {
+        let dir = tempfile::tempdir()?;
+        let mut config = HarnessConfig::default();
+        config.gc.adopt_wait_secs = 0;
+        config.gc.adopt_max_rounds = max_rounds;
+        config.gc.adopt_turn_timeout_secs = 30;
+
+        let mut registry = AgentRegistry::new("mock");
+        registry.register("mock", Arc::new(NonLgtmAgent::new()));
+        let state = make_test_state_with_config_and_registry(dir.path(), config, registry).await?;
+
+        let draft_id = harness_core::DraftId::new();
+        let signal = harness_core::Signal::new(
+            harness_core::SignalType::RepeatedWarn,
+            harness_core::ProjectId::new(),
+            serde_json::json!("test signal"),
+            harness_core::RemediationType::Guard,
+        );
+        let draft = harness_core::Draft {
+            id: draft_id.clone(),
+            status: harness_core::DraftStatus::Pending,
+            signal,
+            artifacts: vec![harness_core::Artifact {
+                artifact_type: harness_core::ArtifactType::Guard,
+                target_path: dir.path().join("test-guard.sh"),
+                content: "#!/bin/bash\necho ok".to_string(),
+            }],
+            rationale: "test".to_string(),
+            validation: "test".to_string(),
+            generated_at: chrono::Utc::now(),
+            agent_model: "test".to_string(),
+        };
+        state.gc_agent.draft_store().save(&draft)?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::GcAdopt { draft_id },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response for request with id");
+        assert!(
+            resp.error.is_none(),
+            "expected success, got error: {:?}",
+            resp.error
+        );
+
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        let task_id = result["task_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("task_id should be a string"))?;
+
+        let task = wait_for_terminal_task(&state, task_id).await?;
+        assert!(
+            matches!(task.status, crate::task_runner::TaskStatus::Failed),
+            "expected task to fail after exhausting rounds, got {:?}",
+            task.status
+        );
+        Ok(task.turn)
+    }
+
     #[tokio::test]
     async fn gc_adopt_spawns_task_when_agent_registered() -> anyhow::Result<()> {
         use harness_core::{
@@ -440,6 +590,30 @@ mod tests {
         let tid = crate::task_runner::TaskId(task_id.to_string());
         let task = state.tasks.get(&tid);
         assert!(task.is_some(), "task should exist in the task store");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gc_adopt_schedule_changes_with_gc_config() -> anyhow::Result<()> {
+        let short_max_rounds = 1;
+        let long_max_rounds = 3;
+        let short_schedule_turn = run_gc_adopt_and_wait_for_failure_turn(short_max_rounds).await?;
+        let long_schedule_turn = run_gc_adopt_and_wait_for_failure_turn(long_max_rounds).await?;
+
+        assert_eq!(
+            short_schedule_turn,
+            short_max_rounds + 1,
+            "max_rounds=1 should end at turn 2"
+        );
+        assert_eq!(
+            long_schedule_turn,
+            long_max_rounds + 1,
+            "max_rounds=3 should end at turn 4"
+        );
+        assert!(
+            long_schedule_turn > short_schedule_turn,
+            "larger max_rounds should produce a longer schedule"
+        );
         Ok(())
     }
 

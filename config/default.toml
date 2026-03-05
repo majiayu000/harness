@@ -26,6 +26,9 @@ default_model = "claude-sonnet-4-20250514"
 max_drafts_per_run = 5
 budget_per_signal_usd = 0.50
 total_budget_usd = 5.0
+adopt_wait_secs = 120
+adopt_max_rounds = 3
+adopt_turn_timeout_secs = 600
 
 [gc.signal_thresholds]
 repeated_warn_min = 10
