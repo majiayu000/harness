@@ -137,10 +137,7 @@ pub fn aggregate_rule_stats(events: &[Event]) -> Vec<RuleStats> {
             Decision::Warn => counts.warn += 1,
             Decision::Block | Decision::Gate | Decision::Escalate => counts.block += 1,
         }
-        counts.last_seen = Some(match counts.last_seen {
-            Some(prev) if prev > e.ts => prev,
-            _ => e.ts,
-        });
+        counts.last_seen = Some(counts.last_seen.map_or(e.ts, |prev| prev.max(e.ts)));
     }
     let mut stats: Vec<RuleStats> = map
         .into_iter()
