@@ -100,20 +100,22 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
 
         let response = match codec::decode_request(&text) {
             Ok(req) => router::handle_request(&state, req).await,
-            Err(e) => RpcResponse::error(
+            Err(e) => Some(RpcResponse::error(
                 None,
                 harness_protocol::PARSE_ERROR,
                 format!("parse error: {e}"),
-            ),
+            )),
         };
 
-        match codec::encode_response(&response) {
-            Ok(out) => {
-                if out_tx.send(out).is_err() {
-                    break;
+        if let Some(resp) = response {
+            match codec::encode_response(&resp) {
+                Ok(out) => {
+                    if out_tx.send(out).is_err() {
+                        break;
+                    }
                 }
+                Err(e) => tracing::warn!("failed to encode response: {e}"),
             }
-            Err(e) => tracing::warn!("failed to encode response: {e}"),
         }
     }
 

@@ -4,17 +4,20 @@ use harness_protocol::{codec, RpcResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-async fn process_line(state: &AppState, line: &str) -> anyhow::Result<String> {
+async fn process_line(state: &AppState, line: &str) -> anyhow::Result<Option<String>> {
     let response = match codec::decode_request(line) {
         Ok(req) => router::handle_request(state, req).await,
-        Err(e) => RpcResponse::error(
+        Err(e) => Some(RpcResponse::error(
             None,
             harness_protocol::PARSE_ERROR,
             format!("parse error: {e}"),
-        ),
+        )),
     };
 
-    Ok(codec::encode_response(&response)?)
+    match response {
+        Some(r) => Ok(Some(codec::encode_response(&r)?)),
+        None => Ok(None),
+    }
 }
 
 /// Serve JSON-RPC over stdio (one JSON object per line).
@@ -69,9 +72,10 @@ pub async fn serve(mut state: AppState) -> anyhow::Result<()> {
             continue;
         }
 
-        let out = process_line(&state, &line).await?;
-        if out_tx.send(out).await.is_err() {
-            break;
+        if let Some(out) = process_line(&state, &line).await? {
+            if out_tx.send(out).await.is_err() {
+                break;
+            }
         }
     }
 
@@ -133,7 +137,7 @@ mod tests {
             id: Some(serde_json::json!(1)),
             method: Method::Initialize,
         })?;
-        let init_out = process_line(&state, &init_line).await?;
+        let init_out = process_line(&state, &init_line).await?.expect("initialize should return a response");
         let init_resp: harness_protocol::RpcResponse = codec::decode_response(&init_out)?;
         assert!(
             init_resp.error.is_none(),
@@ -154,22 +158,16 @@ mod tests {
             "capabilities should advertise notifications support"
         );
 
+        // Initialized with id=None is a JSON-RPC notification — no response expected.
         let initialized_line = serde_json::to_string(&RpcRequest {
             jsonrpc: "2.0".to_string(),
             id: None,
             method: Method::Initialized,
         })?;
         let initialized_out = process_line(&state, &initialized_line).await?;
-        let initialized_resp: harness_protocol::RpcResponse =
-            codec::decode_response(&initialized_out)?;
         assert!(
-            initialized_resp.error.is_none(),
-            "initialized failed: {:?}",
-            initialized_resp.error
-        );
-        assert!(
-            initialized_resp.result.is_some(),
-            "initialized should return success payload"
+            initialized_out.is_none(),
+            "initialized notification (id=None) should produce no response"
         );
         Ok(())
     }
@@ -195,7 +193,7 @@ mod tests {
             },
         })?;
 
-        let out = process_line(&state, &line).await?;
+        let out = process_line(&state, &line).await?.expect("should return a response");
         let resp: harness_protocol::RpcResponse = codec::decode_response(&out)?;
         assert!(resp.error.is_none(), "thread_start failed: {:?}", resp.error);
 
@@ -231,7 +229,7 @@ mod tests {
                 cwd: proj_dir.path().to_path_buf(),
             },
         })?;
-        let thread_out = process_line(&state, &thread_line).await?;
+        let thread_out = process_line(&state, &thread_line).await?.expect("thread_start should return a response");
         let thread_resp: harness_protocol::RpcResponse = codec::decode_response(&thread_out)?;
         let thread_id_str = thread_resp.result.unwrap()["thread_id"]
             .as_str()
@@ -251,7 +249,7 @@ mod tests {
                 input: "hello".to_string(),
             },
         })?;
-        let turn_out = process_line(&state, &turn_line).await?;
+        let turn_out = process_line(&state, &turn_line).await?.expect("turn_start should return a response");
         let turn_resp: harness_protocol::RpcResponse = codec::decode_response(&turn_out)?;
         assert!(
             turn_resp.error.is_none(),
