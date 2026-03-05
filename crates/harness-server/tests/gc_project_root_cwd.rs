@@ -6,6 +6,7 @@ use harness_server::{
     server::HarnessServer,
     thread_manager::ThreadManager,
 };
+use std::ffi::OsString;
 use std::sync::Arc;
 
 struct CwdGuard(std::path::PathBuf);
@@ -21,6 +22,28 @@ impl CwdGuard {
 impl Drop for CwdGuard {
     fn drop(&mut self) {
         let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &std::path::Path) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
     }
 }
 
@@ -42,8 +65,7 @@ async fn gc_run_uses_configured_project_root_across_cwd() -> anyhow::Result<()> 
     )?;
 
     let harness_db = sandbox.path().join("harness.db");
-    let previous_harness_db = std::env::var_os("HARNESS_DB");
-    std::env::set_var("HARNESS_DB", &harness_db);
+    let _harness_db_guard = EnvVarGuard::set("HARNESS_DB", &harness_db);
 
     let mut config = HarnessConfig::default();
     config.server.project_root = project_root.clone();
@@ -65,11 +87,6 @@ async fn gc_run_uses_configured_project_root_across_cwd() -> anyhow::Result<()> 
 
     let _cwd_guard = CwdGuard::switch_to(&other_cwd)?;
     let _response = gc_run(&state, Some(serde_json::json!(1))).await;
-
-    match previous_harness_db {
-        Some(v) => std::env::set_var("HARNESS_DB", v),
-        None => std::env::remove_var("HARNESS_DB"),
-    }
 
     let scanned_root = std::fs::read_to_string(&capture_file)?;
     assert_eq!(scanned_root, project_root.canonicalize()?.display().to_string());
