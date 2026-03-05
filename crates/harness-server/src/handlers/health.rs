@@ -23,6 +23,7 @@ pub async fn health_check(
         let rules = state.rules.read().await;
         rules.scan(&project_root).await.unwrap_or_default()
     };
+    crate::handlers::persist_violations(&state.events, &violations);
 
     let report = generate_health_report(&events, &violations);
     match serde_json::to_value(&report) {
@@ -45,10 +46,12 @@ pub async fn stats_query(
 
     let hook_stats = stats::aggregate_hook_stats(&events);
     let trends = stats::compute_trends(&events, 7);
+    let rule_stats = stats::aggregate_rule_stats(&events);
 
     match serde_json::to_value(serde_json::json!({
         "hook_stats": hook_stats,
         "trends": trends,
+        "rule_stats": rule_stats,
     })) {
         Ok(v) => RpcResponse::success(id, v),
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),

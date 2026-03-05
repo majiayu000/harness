@@ -176,6 +176,7 @@ mod tests {
         ));
         let thread_db =
             crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
+        let (notification_tx, _) = tokio::sync::broadcast::channel(64);
         Ok(AppState {
             server,
             tasks,
@@ -186,6 +187,7 @@ mod tests {
             plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
             thread_db: Some(thread_db),
             interceptors: vec![],
+            notification_tx,
         })
     }
 
