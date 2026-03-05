@@ -11,12 +11,20 @@ use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
 
 /// Returns true if the origin is a localhost origin (safe for local dev tools).
+///
+/// Parses the host from the origin to prevent bypass via domains like
+/// `http://localhost.evil.com`.
 fn is_local_origin(origin: &str) -> bool {
-    origin == "null"
-        || origin.starts_with("http://localhost")
-        || origin.starts_with("https://localhost")
-        || origin.starts_with("http://127.0.0.1")
-        || origin.starts_with("https://127.0.0.1")
+    if origin == "null" {
+        return true;
+    }
+    // Origin format: scheme://host or scheme://host:port
+    // Extract the host by stripping scheme and optional port.
+    let host = origin
+        .split_once("://")
+        .map(|(_, rest)| rest.split(':').next().unwrap_or("").split('/').next().unwrap_or(""))
+        .unwrap_or("");
+    host == "localhost" || host == "127.0.0.1"
 }
 
 /// Axum handler that upgrades the HTTP connection to WebSocket.
