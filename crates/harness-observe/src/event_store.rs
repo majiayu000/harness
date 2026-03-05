@@ -63,6 +63,36 @@ impl EventStore {
             return;
         }
         let session_id = SessionId::new();
+        self.log_violations_with_session(&session_id, violations);
+    }
+
+    /// Persist a full rule scan into the event store.
+    ///
+    /// - Always logs a single `rule_scan` event (even when `violations` is empty)
+    /// - Logs one `rule_check` event per violation under the same `session_id`
+    pub fn persist_rule_scan(&self, project_root: &Path, violations: &[Violation]) -> SessionId {
+        let session_id = SessionId::new();
+        let decision = if violations.is_empty() {
+            Decision::Pass
+        } else {
+            Decision::Warn
+        };
+        let mut scan_event = Event::new(session_id.clone(), "rule_scan", "RuleEngine", decision);
+        scan_event.reason = Some(format!("violations={}", violations.len()));
+        scan_event.detail = Some(project_root.display().to_string());
+        if let Err(e) = self.log(&scan_event) {
+            tracing::warn!("failed to log rule_scan event: {e}");
+        }
+
+        self.log_violations_with_session(&session_id, violations);
+        session_id
+    }
+
+    fn log_violations_with_session(&self, session_id: &SessionId, violations: &[Violation]) {
+        if violations.is_empty() {
+            return;
+        }
+
         for violation in violations {
             let decision = match violation.severity {
                 Severity::Critical | Severity::High => Decision::Block,
@@ -106,6 +136,11 @@ impl EventStore {
                 return false;
             }
         }
+        if let Some(ref tool) = filters.tool {
+            if event.tool != *tool {
+                return false;
+            }
+        }
         if let Some(ref decision) = filters.decision {
             if event.decision != *decision {
                 return false;
@@ -129,6 +164,7 @@ impl EventStore {
 mod tests {
     use super::*;
     use harness_core::{Decision, Event, EventFilters, RuleId, SessionId};
+    use std::path::Path;
 
     fn make_event(hook: &str, decision: Decision) -> Event {
         Event::new(SessionId::new(), hook, "Edit", decision)
@@ -186,6 +222,22 @@ mod tests {
     }
 
     #[test]
+    fn query_filters_by_tool() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        let sid = SessionId::new();
+        store.log(&Event::new(sid.clone(), "hook", "tool_a", Decision::Pass))?;
+        store.log(&Event::new(sid, "hook", "tool_b", Decision::Pass))?;
+        let results = store.query(&EventFilters {
+            tool: Some("tool_a".to_string()),
+            ..Default::default()
+        })?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool, "tool_a");
+        Ok(())
+    }
+
+    #[test]
     fn query_respects_limit() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = EventStore::new(dir.path())?;
@@ -221,6 +273,26 @@ mod tests {
         let events = store.query(&EventFilters::default())?;
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|e| e.hook == "rule_check"));
+        Ok(())
+    }
+
+    #[test]
+    fn persist_rule_scan_logs_summary_even_when_empty() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        store.persist_rule_scan(Path::new("/tmp/project"), &[]);
+        let scan_events = store.query(&EventFilters {
+            hook: Some("rule_scan".to_string()),
+            ..Default::default()
+        })?;
+        assert_eq!(scan_events.len(), 1);
+        assert_eq!(scan_events[0].decision, Decision::Pass);
+
+        let violation_events = store.query(&EventFilters {
+            hook: Some("rule_check".to_string()),
+            ..Default::default()
+        })?;
+        assert!(violation_events.is_empty());
         Ok(())
     }
 

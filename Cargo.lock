@@ -875,6 +875,7 @@ dependencies = [
  "harness-protocol",
  "harness-rules",
  "harness-skills",
+ "http-body-util",
  "serde",
  "serde_json",
  "sqlx",

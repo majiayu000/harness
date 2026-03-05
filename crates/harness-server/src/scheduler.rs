@@ -34,6 +34,13 @@ impl Scheduler {
         tokio::spawn(async move {
             loop {
                 sleep(health_interval).await;
+                let violations = {
+                    let rules = health_state.rules.read().await;
+                    rules.scan(&std::path::PathBuf::from(".")).await.unwrap_or_default()
+                };
+                let project_root = std::path::PathBuf::from(".");
+                health_state.events.persist_rule_scan(&project_root, &violations);
+
                 let events = match health_state.events.query(&EventFilters::default()) {
                     Ok(e) => e,
                     Err(err) => {
@@ -41,11 +48,6 @@ impl Scheduler {
                         continue;
                     }
                 };
-                let violations = {
-                    let rules = health_state.rules.read().await;
-                    rules.scan(&std::path::PathBuf::from(".")).await.unwrap_or_default()
-                };
-                health_state.events.log_violations(&violations);
                 let report = generate_health_report(&events, &violations);
                 tracing::info!(
                     grade = ?report.quality.grade,

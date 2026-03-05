@@ -107,13 +107,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         let events = state.events.query(&harness_core::EventFilters::default()).unwrap_or_default();
         let violation_count = events
             .iter()
-            .filter(|e| {
-                e.hook == "rule_check"
-                    && matches!(
-                        e.decision,
-                        harness_core::Decision::Block | harness_core::Decision::Warn
-                    )
-            })
+            .filter(|e| e.hook == "rule_check")
             .count();
         harness_observe::quality::QualityGrader::grade(&events, violation_count).grade
     };
