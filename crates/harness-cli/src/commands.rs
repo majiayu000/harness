@@ -248,6 +248,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     let mut engine = harness_rules::RuleEngine::new();
                     engine.load(&project)?;
                     let violations = engine.scan(&project).await?;
+                    // Persist rule scan results for observability/GC even when running via CLI.
+                    match harness_observe::EventStore::new(&config.server.data_dir) {
+                        Ok(store) => {
+                            store.persist_rule_scan(&project, &violations);
+                        }
+                        Err(e) => tracing::warn!("Failed to initialize event store, rule scan not persisted: {e}"),
+                    }
                     if violations.is_empty() {
                         println!("No violations found");
                     } else {

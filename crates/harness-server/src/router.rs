@@ -481,6 +481,15 @@ mod tests {
         let state = make_test_state(dir.path()).await?;
 
         let session_id = harness_core::SessionId::new();
+        // The metrics_query handler scopes violation counts by the latest
+        // rule_scan session, so we must log a rule_scan summary event first.
+        let scan_event = harness_core::Event::new(
+            session_id.clone(),
+            "rule_scan",
+            "RuleEngine",
+            harness_core::Decision::Block,
+        );
+        state.events.log(&scan_event)?;
         for _ in 0..5 {
             let event = harness_core::Event::new(
                 session_id.clone(),

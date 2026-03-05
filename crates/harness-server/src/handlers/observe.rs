@@ -39,20 +39,23 @@ pub async fn metrics_collect(
         Ok(p) => p,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
     };
-    let events = state.events.query(&harness_core::EventFilters::default());
-    match events {
-        Ok(evts) => {
-            let violations = {
-                let rules = state.rules.read().await;
-                rules.scan(&project_root).await.unwrap_or_default()
-            };
-            crate::handlers::persist_violations(&state.events, &violations);
-            let report = harness_observe::QualityGrader::grade(&evts, violations.len());
-            match serde_json::to_value(&report) {
-                Ok(v) => RpcResponse::success(id, v),
-                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
-            }
-        }
+
+    // scan -> persist -> query -> grade
+    let violations = {
+        let rules = state.rules.read().await;
+        rules.scan(&project_root).await.unwrap_or_default()
+    };
+    crate::handlers::persist_violations(&state.events, &violations);
+
+    let evts = match state.events.query(&harness_core::EventFilters::default()) {
+        Ok(e) => e,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+    };
+
+    let violation_count = violations.len();
+    let report = harness_observe::QualityGrader::grade(&evts, violation_count);
+    match serde_json::to_value(&report) {
+        Ok(v) => RpcResponse::success(id, v),
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     }
 }
@@ -72,14 +75,14 @@ pub async fn metrics_query(
         Ok(evts) => {
             let violation_count = evts
                 .iter()
-                .filter(|e| {
-                    e.hook == "rule_check"
-                        && matches!(
-                            e.decision,
-                            harness_core::Decision::Block | harness_core::Decision::Warn
-                        )
+                .rev()
+                .find(|e| e.hook == "rule_scan")
+                .map(|scan| {
+                    evts.iter()
+                        .filter(|e| e.hook == "rule_check" && e.session_id == scan.session_id)
+                        .count()
                 })
-                .count();
+                .unwrap_or(0);
             let report = harness_observe::QualityGrader::grade(&evts, violation_count);
             match serde_json::to_value(&report) {
                 Ok(v) => RpcResponse::success(id, v),

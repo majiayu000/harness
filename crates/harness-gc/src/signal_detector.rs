@@ -2,7 +2,7 @@ use harness_core::{
     Decision, Event, ProjectId, RemediationType, Signal, SignalType, Violation,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalThresholds {
@@ -49,6 +49,7 @@ impl SignalDetector {
         signals.extend(self.detect_hot_files(events));
         signals.extend(self.detect_slow_sessions(events));
         signals.extend(self.detect_warn_escalation(events));
+        signals.extend(self.detect_linter_violations(events));
         signals
     }
 
@@ -169,6 +170,45 @@ impl SignalDetector {
         } else {
             Vec::new()
         }
+    }
+
+    fn detect_linter_violations(&self, events: &[Event]) -> Vec<Signal> {
+        let mut by_rule: HashMap<String, (usize, HashSet<String>)> = HashMap::new();
+        for e in events.iter().filter(|e| e.hook == "rule_check") {
+            let entry = by_rule.entry(e.tool.clone()).or_default();
+            entry.0 += 1;
+            if let Some(detail) = &e.detail {
+                // `EventStore::log_violations` stores detail as "file:line";
+                // use rsplit_once so paths containing colons (e.g. Windows) are handled correctly.
+                let file = match detail.rsplit_once(':') {
+                    Some((path, line)) if line.chars().all(|c| c.is_ascii_digit()) => path,
+                    _ => detail.as_str(),
+                }
+                .to_string();
+                if !file.is_empty() {
+                    entry.1.insert(file);
+                }
+            }
+        }
+
+        by_rule
+            .into_iter()
+            .filter(|(_, (count, _))| *count >= self.thresholds.violation_min)
+            .map(|(rule_id, (count, files))| {
+                let mut files: Vec<String> = files.into_iter().collect();
+                files.sort();
+                Signal::new(
+                    SignalType::LinterViolations,
+                    self.project_id.clone(),
+                    serde_json::json!({
+                        "rule_id": rule_id,
+                        "count": count,
+                        "files": files,
+                    }),
+                    RemediationType::Guard,
+                )
+            })
+            .collect()
     }
 
     fn detect_warn_escalation(&self, events: &[Event]) -> Vec<Signal> {
@@ -314,6 +354,20 @@ mod tests {
             severity: Severity::High,
         }).collect();
         let signals = det.from_violations(&violations);
+        assert!(signals.iter().any(|s| s.signal_type == SignalType::LinterViolations));
+    }
+
+    #[test]
+    fn detects_linter_violations_from_events() {
+        let det = detector();
+        let sid = SessionId::new();
+        let mut events: Vec<Event> = Vec::new();
+        for i in 0..5 {
+            let mut e = Event::new(sid.clone(), "rule_check", "SEC-01", Decision::Block);
+            e.detail = Some(format!("/src/lib.rs:{i}"));
+            events.push(e);
+        }
+        let signals = det.detect(&events);
         assert!(signals.iter().any(|s| s.signal_type == SignalType::LinterViolations));
     }
 }

@@ -108,16 +108,19 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
     let initial_grade = {
         let events = state.events.query(&harness_core::EventFilters::default()).unwrap_or_default();
+        // Use violations from the most recent scan (identified by the latest rule_scan session_id)
+        // rather than all historical rule_check events, to avoid permanently depressing the grade.
         let violation_count = events
             .iter()
-            .filter(|e| {
-                e.hook == "rule_check"
-                    && matches!(
-                        e.decision,
-                        harness_core::Decision::Block | harness_core::Decision::Warn
-                    )
+            .rev()
+            .find(|e| e.hook == "rule_scan")
+            .map(|scan| {
+                events
+                    .iter()
+                    .filter(|e| e.hook == "rule_check" && e.session_id == scan.session_id)
+                    .count()
             })
-            .count();
+            .unwrap_or(0);
         harness_observe::quality::QualityGrader::grade(&events, violation_count).grade
     };
     crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());

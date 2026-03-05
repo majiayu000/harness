@@ -6,16 +6,17 @@ pub async fn gc_run(
     state: &AppState,
     id: Option<serde_json::Value>,
 ) -> RpcResponse {
-    let events = match state.events.query(&harness_core::EventFilters::default()) {
-        Ok(e) => e,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
-    };
     let project_root = std::path::PathBuf::from(".");
     let violations = {
         let rules = state.rules.read().await;
         rules.scan(&project_root).await.unwrap_or_default()
     };
     crate::handlers::persist_violations(&state.events, &violations);
+
+    let events = match state.events.query(&harness_core::EventFilters::default()) {
+        Ok(e) => e,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+    };
     let project = harness_core::Project::from_path(project_root);
     let agent = match state.server.agent_registry.default_agent() {
         Some(a) => a,
