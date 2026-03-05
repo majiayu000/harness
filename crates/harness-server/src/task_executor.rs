@@ -1,6 +1,6 @@
 use crate::task_runner::{
-    mutate_and_persist, update_status, CreateTaskRequest, RoundResult, TaskId, TaskStatus,
-    TaskStore,
+    mutate_and_persist, mutate_and_persist_with, update_status, CreateTaskRequest, RoundResult,
+    TaskId, TaskStatus, TaskStore,
 };
 use harness_core::{
     interceptor::TurnInterceptor, prompts, AgentRequest, AgentResponse, CodeAgent, ContextItem,
@@ -29,8 +29,14 @@ async fn run_pre_execute(
     for interceptor in interceptors {
         let result = interceptor.pre_execute(&req).await;
         if let Decision::Block = result.decision {
-            let reason = result.reason.unwrap_or_else(|| interceptor.name().to_string());
-            return Err(anyhow::anyhow!("Blocked by interceptor '{}': {}", interceptor.name(), reason));
+            let reason = result
+                .reason
+                .unwrap_or_else(|| interceptor.name().to_string());
+            return Err(anyhow::anyhow!(
+                "Blocked by interceptor '{}': {}",
+                interceptor.name(),
+                reason
+            ));
         }
         if let Some(modified) = result.request {
             req = modified;
@@ -49,11 +55,7 @@ async fn run_post_execute(
     }
 }
 
-async fn run_on_error(
-    interceptors: &[Arc<dyn TurnInterceptor>],
-    req: &AgentRequest,
-    error: &str,
-) {
+async fn run_on_error(interceptors: &[Arc<dyn TurnInterceptor>], req: &AgentRequest, error: &str) {
     for interceptor in interceptors {
         interceptor.on_error(req, error).await;
     }
@@ -224,24 +226,19 @@ pub(crate) async fn run_task(
         };
 
         if prompts::is_waiting(&resp.output) {
-            mutate_and_persist(store, task_id, |s| {
+            let waiting_count = mutate_and_persist_with(store, task_id, |s| {
                 s.rounds.push(RoundResult {
                     turn: round,
                     action: "review".into(),
                     result: "waiting".into(),
                 });
+                s.rounds
+                    .iter()
+                    .filter(|r| r.result == "waiting" && r.turn == round)
+                    .count() as u32
             })
-            .await;
-
-            let waiting_count = store
-                .get(task_id)
-                .map(|s| {
-                    s.rounds
-                        .iter()
-                        .filter(|r| r.result == "waiting" && r.turn == round)
-                        .count() as u32
-                })
-                .unwrap_or(0);
+            .await
+            .unwrap_or(0);
 
             if waiting_count >= max_waiting_retries {
                 prev_fixed = true;
@@ -266,7 +263,11 @@ pub(crate) async fn run_task(
             SessionId::new(),
             "pr_review",
             "task_runner",
-            if lgtm { Decision::Complete } else { Decision::Warn },
+            if lgtm {
+                Decision::Complete
+            } else {
+                Decision::Warn
+            },
         );
         ev.detail = Some(format!("pr={pr_num}"));
         ev.reason = Some(if lgtm {
