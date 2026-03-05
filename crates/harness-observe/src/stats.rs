@@ -19,6 +19,20 @@ pub struct ComplianceTrend {
     pub grade: Grade,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleStats {
+    pub rule_id: String,
+    pub total: usize,
+    pub last_seen: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleTrend {
+    pub period: String,
+    pub rule_id: String,
+    pub count: usize,
+}
+
 pub fn aggregate_hook_stats(events: &[Event]) -> Vec<HookStats> {
     // (total, pass, warn, block)
     let mut map: HashMap<String, (usize, usize, usize, usize)> = HashMap::new();
@@ -99,6 +113,70 @@ pub fn compute_trends(events: &[Event], period_days: u32) -> Vec<ComplianceTrend
     trends
 }
 
+pub fn aggregate_rule_stats(events: &[Event]) -> Vec<RuleStats> {
+    let mut map: HashMap<String, (usize, Option<chrono::DateTime<chrono::Utc>>)> = HashMap::new();
+    for e in events.iter().filter(|e| e.hook == "rule_check") {
+        let entry = map.entry(e.tool.clone()).or_insert((0, None));
+        entry.0 += 1;
+        entry.1 = Some(match entry.1 {
+            Some(prev) if prev > e.ts => prev,
+            _ => e.ts,
+        });
+    }
+
+    let mut stats: Vec<RuleStats> = map
+        .into_iter()
+        .map(|(rule_id, (total, last_seen))| RuleStats {
+            rule_id,
+            total,
+            last_seen,
+        })
+        .collect();
+    stats.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.rule_id.cmp(&b.rule_id)));
+    stats
+}
+
+pub fn compute_rule_trends(events: &[Event], period_days: u32) -> Vec<RuleTrend> {
+    let rule_events: Vec<&Event> = events.iter().filter(|e| e.hook == "rule_check").collect();
+    if rule_events.is_empty() {
+        return Vec::new();
+    }
+
+    let period = chrono::Duration::days(period_days as i64);
+    // Add 1ms to ensure the period containing the latest event is always included.
+    let now = chrono::Utc::now() + chrono::Duration::milliseconds(1);
+    let earliest = rule_events.iter().map(|e| e.ts).min().unwrap_or(now);
+
+    let mut trends = Vec::new();
+    let mut period_start = earliest;
+
+    while period_start < now {
+        let period_end = period_start + period;
+        let mut by_rule: HashMap<String, usize> = HashMap::new();
+        for e in rule_events
+            .iter()
+            .copied()
+            .filter(|e| e.ts >= period_start && e.ts < period_end)
+        {
+            *by_rule.entry(e.tool.clone()).or_default() += 1;
+        }
+
+        let mut rules: Vec<(String, usize)> = by_rule.into_iter().collect();
+        rules.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (rule_id, count) in rules {
+            trends.push(RuleTrend {
+                period: period_start.format("%Y-%m-%d").to_string(),
+                rule_id,
+                count,
+            });
+        }
+
+        period_start = period_end;
+    }
+
+    trends
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +250,26 @@ mod tests {
         assert!(!trends.is_empty());
         assert!((trends[0].pass_rate - 0.0).abs() < f64::EPSILON);
         assert_eq!(trends[0].grade, Grade::D);
+    }
+
+    #[test]
+    fn aggregate_rule_stats_groups_by_rule_id() {
+        let sid = SessionId::new();
+        let mut e1 = Event::new(sid.clone(), "rule_check", "SEC-01", Decision::Block);
+        e1.detail = Some("src/a.rs:1".to_string());
+        let mut e2 = Event::new(sid.clone(), "rule_check", "SEC-01", Decision::Warn);
+        e2.detail = Some("src/b.rs:2".to_string());
+        let e3 = Event::new(sid, "rule_check", "U-05", Decision::Pass);
+
+        let stats = aggregate_rule_stats(&[e1, e2, e3]);
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].rule_id, "SEC-01");
+        assert_eq!(stats[0].total, 2);
+    }
+
+    #[test]
+    fn compute_rule_trends_empty_when_no_rule_events() {
+        let trends = compute_rule_trends(&[make_event("h", Decision::Pass)], 7);
+        assert!(trends.is_empty());
     }
 }
