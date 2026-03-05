@@ -574,11 +574,21 @@ mod tests {
 
     #[tokio::test]
     async fn gc_adopt_schedule_changes_with_gc_config() -> anyhow::Result<()> {
-        let short_schedule_turn = run_gc_adopt_and_wait_for_failure_turn(1).await?;
-        let long_schedule_turn = run_gc_adopt_and_wait_for_failure_turn(3).await?;
+        let short_max_rounds = 1;
+        let long_max_rounds = 3;
+        let short_schedule_turn = run_gc_adopt_and_wait_for_failure_turn(short_max_rounds).await?;
+        let long_schedule_turn = run_gc_adopt_and_wait_for_failure_turn(long_max_rounds).await?;
 
-        assert_eq!(short_schedule_turn, 2, "max_rounds=1 should end at turn 2");
-        assert_eq!(long_schedule_turn, 4, "max_rounds=3 should end at turn 4");
+        assert_eq!(
+            short_schedule_turn,
+            short_max_rounds + 1,
+            "max_rounds=1 should end at turn 2"
+        );
+        assert_eq!(
+            long_schedule_turn,
+            long_max_rounds + 1,
+            "max_rounds=3 should end at turn 4"
+        );
         assert!(
             long_schedule_turn > short_schedule_turn,
             "larger max_rounds should produce a longer schedule"
