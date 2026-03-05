@@ -89,7 +89,7 @@ mod tests {
         };
         let json = serde_json::to_string(&req)?;
         // method field must be "initialized"
-        assert!(json.contains("\"initialized\""), "serialized: {json}");
+        assert!(json.contains("\"method\":\"initialized\""), "serialized: {json}");
         let back: RpcRequest = decode_request(&json)?;
         assert!(matches!(back.method, Method::Initialized));
 

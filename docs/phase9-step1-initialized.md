@@ -6,7 +6,8 @@ Step: 1 of 3 protocol parity items
 ## What changed
 
 - Added `Initialized` to `harness_protocol::Method` so clients can send:
-  - `{"jsonrpc":"2.0","method":"initialized","params":{}}`
+  - `{"jsonrpc":"2.0","method":"initialized"}`
+  - `{"jsonrpc":"2.0","method":"initialized","params":{}}` (accepted for compatibility)
 - Added server handler `handlers::thread::initialized(...)` that returns a success result.
 - Routed `Method::Initialized` in `router::handle_request`.
 

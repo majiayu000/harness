@@ -27,6 +27,8 @@ pub(crate) async fn persist_thread_insert(state: &AppState, thread_id: &ThreadId
 
 /// Handle the `initialized` notification sent by the client after `initialize`.
 /// Returns an empty success to confirm the handshake is complete on the server side.
+/// This intentionally responds even when `id` is absent to mirror Codex App
+/// Server behavior during handshake.
 pub async fn initialized(id: Option<serde_json::Value>) -> RpcResponse {
     RpcResponse::success(id, serde_json::json!({}))
 }
