@@ -175,13 +175,13 @@ impl SignalDetector {
     fn detect_linter_violations(&self, events: &[Event]) -> Vec<Signal> {
         let mut by_rule: HashMap<String, (usize, HashSet<String>)> = HashMap::new();
         for e in events.iter().filter(|e| e.hook == "rule_check") {
-            let entry = by_rule.entry(e.tool.clone()).or_insert((0, HashSet::new()));
+            let entry = by_rule.entry(e.tool.clone()).or_default();
             entry.0 += 1;
             if let Some(detail) = &e.detail {
                 // `EventStore::log_violations` stores detail as "file:line";
                 // use rsplit_once so paths containing colons (e.g. Windows) are handled correctly.
                 let file = match detail.rsplit_once(':') {
-                    Some((path, line)) if !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()) => path,
+                    Some((path, line)) if line.chars().all(|c| c.is_ascii_digit()) => path,
                     _ => detail.as_str(),
                 }
                 .to_string();
