@@ -25,7 +25,7 @@ pub async fn health_check(
         let rules = state.rules.read().await;
         rules.scan(&project_root).await.unwrap_or_default()
     };
-    crate::handlers::persist_violations(&state.events, &violations);
+    crate::handlers::persist_violations(&state.events, &project_root, &violations);
 
     let report = generate_health_report(&events, &violations);
     match serde_json::to_value(&report) {

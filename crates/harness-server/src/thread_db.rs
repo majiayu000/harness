@@ -1,3 +1,4 @@
+use anyhow::Context;
 use harness_core::{Thread, ThreadId, ThreadStatus};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
@@ -111,10 +112,13 @@ struct ThreadRow {
 
 impl ThreadRow {
     fn into_thread(self) -> anyhow::Result<Thread> {
+        let id = ThreadId::from_str(&self.id);
+        let status = str_to_status(&self.status)
+            .with_context(|| format!("invalid status for thread `{}`", id.as_str()))?;
         Ok(Thread {
-            id: ThreadId::from_str(&self.id),
+            id,
             project_root: std::path::PathBuf::from(self.cwd),
-            status: str_to_status(&self.status),
+            status,
             turns: serde_json::from_str(&self.turns)?,
             metadata: serde_json::from_str(&self.metadata)?,
             created_at: chrono::DateTime::parse_from_rfc3339(&self.created_at)
@@ -133,12 +137,14 @@ fn status_to_str(s: ThreadStatus) -> &'static str {
     }
 }
 
-fn str_to_status(s: &str) -> ThreadStatus {
+/// Persisted thread statuses are strict. Unknown values are surfaced as errors
+/// so state-machine drift is visible during load instead of silently downgraded.
+fn str_to_status(s: &str) -> anyhow::Result<ThreadStatus> {
     match s {
-        "idle" => ThreadStatus::Idle,
-        "active" => ThreadStatus::Active,
-        "archived" => ThreadStatus::Archived,
-        _ => ThreadStatus::Idle,
+        "idle" => Ok(ThreadStatus::Idle),
+        "active" => Ok(ThreadStatus::Active),
+        "archived" => Ok(ThreadStatus::Archived),
+        _ => anyhow::bail!("unknown thread status `{s}`"),
     }
 }
 
@@ -203,6 +209,31 @@ mod tests {
         let loaded = db.get(thread_id.as_str()).await?;
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().project_root, PathBuf::from("/srv/app"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_db_rejects_unknown_status() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("threads.db");
+        let db = ThreadDb::open(&db_path).await?;
+
+        let thread = Thread::new(PathBuf::from("/srv/app"));
+        db.insert(&thread).await?;
+
+        sqlx::query("UPDATE threads SET status = ? WHERE id = ?")
+            .bind("paused")
+            .bind(thread.id.as_str())
+            .execute(&db.pool)
+            .await?;
+
+        let err = db
+            .get(thread.id.as_str())
+            .await
+            .expect_err("unknown status must return an explicit error");
+        let message = format!("{err:#}");
+        assert!(message.contains("invalid status for thread"));
+        assert!(message.contains("unknown thread status `paused`"));
         Ok(())
     }
 }

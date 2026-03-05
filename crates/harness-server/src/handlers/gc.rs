@@ -7,12 +7,11 @@ pub async fn gc_run(
     id: Option<serde_json::Value>,
 ) -> RpcResponse {
     let project_root = state.project_root.clone();
-    tracing::info!("gc: scanning project root {}", project_root.display());
     let violations = {
         let rules = state.rules.read().await;
         rules.scan(&project_root).await.unwrap_or_default()
     };
-    crate::handlers::persist_violations(&state.events, &violations);
+    crate::handlers::persist_violations(&state.events, &project_root, &violations);
 
     let events = match state.events.query(&harness_core::EventFilters::default()) {
         Ok(e) => e,

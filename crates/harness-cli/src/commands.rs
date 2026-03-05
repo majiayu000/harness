@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -179,6 +180,35 @@ fn configured_rule_engine(config: &harness_core::HarnessConfig) -> harness_rules
     engine
 }
 
+fn resolve_exec_project_root(project: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    resolve_exec_project_root_with(project, std::env::current_dir)
+}
+
+fn resolve_exec_project_root_with<F>(
+    project: Option<PathBuf>,
+    current_dir: F,
+) -> anyhow::Result<PathBuf>
+where
+    F: FnOnce() -> std::io::Result<PathBuf>,
+{
+    if let Some(project_root) = project {
+        return Ok(project_root);
+    }
+
+    let project_root = current_dir().with_context(|| {
+        "failed to resolve `harness exec` project root from current working directory"
+    });
+
+    if let Err(error) = &project_root {
+        tracing::error!(
+            error = %error,
+            "unable to determine project root for `harness exec`; pass --project to override"
+        );
+    }
+
+    project_root
+}
+
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Load config
     let config = if let Some(config_path) = &cli.config {
@@ -233,7 +263,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             project,
             agent: _agent_name,
         } => {
-            let project_root = project.unwrap_or_else(|| std::env::current_dir().unwrap());
+            let project_root = resolve_exec_project_root(project)?;
             let agent = harness_agents::claude::ClaudeCodeAgent::new(
                 config.agents.claude.cli_path.clone(),
                 config.agents.claude.default_model.clone(),
@@ -361,4 +391,52 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn resolve_exec_project_root_prefers_explicit_project() {
+        let explicit = PathBuf::from("/tmp/project");
+        let resolved = resolve_exec_project_root_with(Some(explicit.clone()), || {
+            panic!("current_dir fallback must not be used when --project is provided")
+        })
+        .expect("explicit project should resolve");
+
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn resolve_exec_project_root_uses_current_dir_fallback() {
+        let fallback = PathBuf::from("/tmp/fallback");
+        let resolved = resolve_exec_project_root_with(None, || Ok(fallback.clone()))
+            .expect("cwd fallback should resolve when current_dir succeeds");
+
+        assert_eq!(resolved, fallback);
+    }
+
+    #[test]
+    fn resolve_exec_project_root_returns_contextual_error_on_failure() {
+        let error = resolve_exec_project_root_with(None, || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cwd lookup blocked",
+            ))
+        })
+        .expect_err("cwd failure should be returned as recoverable error");
+
+        let message = error.to_string();
+        assert!(message.contains(
+            "failed to resolve `harness exec` project root from current working directory"
+        ));
+        let chain = error
+            .chain()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(chain.contains("cwd lookup blocked"));
+    }
 }
