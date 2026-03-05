@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +24,9 @@ pub enum Command {
         /// HTTP port (only for http/websocket transport)
         #[arg(long)]
         port: Option<u16>,
+        /// Project root used by server-side scans (GC/health)
+        #[arg(long)]
+        project_root: Option<PathBuf>,
     },
 
     /// Execute a prompt non-interactively
@@ -78,13 +82,9 @@ pub enum GcCommand {
     /// Show GC status
     Status,
     /// List pending drafts
-    Drafts {
-        project: Option<PathBuf>,
-    },
+    Drafts { project: Option<PathBuf> },
     /// Adopt a draft
-    Adopt {
-        draft_id: String,
-    },
+    Adopt { draft_id: String },
     /// Reject a draft
     Reject {
         draft_id: String,
@@ -123,9 +123,7 @@ pub enum SkillCommand {
         file: PathBuf,
     },
     /// Delete a skill
-    Delete {
-        skill_id: String,
-    },
+    Delete { skill_id: String },
 }
 
 #[derive(Args)]
@@ -173,6 +171,44 @@ pub enum PlanCommand {
     },
 }
 
+fn configured_rule_engine(config: &harness_core::HarnessConfig) -> harness_rules::RuleEngine {
+    let mut engine = harness_rules::RuleEngine::new();
+    engine.configure_sources(
+        config.rules.discovery_paths.clone(),
+        config.rules.builtin_path.clone(),
+    );
+    engine
+}
+
+fn resolve_exec_project_root(project: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    resolve_exec_project_root_with(project, std::env::current_dir)
+}
+
+fn resolve_exec_project_root_with<F>(
+    project: Option<PathBuf>,
+    current_dir: F,
+) -> anyhow::Result<PathBuf>
+where
+    F: FnOnce() -> std::io::Result<PathBuf>,
+{
+    if let Some(project_root) = project {
+        return Ok(project_root);
+    }
+
+    let project_root = current_dir().with_context(|| {
+        "failed to resolve `harness exec` project root from current working directory"
+    });
+
+    if let Err(error) = &project_root {
+        tracing::error!(
+            error = %error,
+            "unable to determine project root for `harness exec`; pass --project to override"
+        );
+    }
+
+    project_root
+}
+
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Load config
     let config = if let Some(config_path) = &cli.config {
@@ -183,18 +219,27 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     };
 
     match cli.command {
-        Command::Serve { transport, port } => {
+        Command::Serve {
+            transport,
+            port,
+            project_root,
+        } => {
+            let mut serve_config = config.clone();
+            if let Some(project_root) = project_root {
+                serve_config.server.project_root = project_root;
+            }
             let thread_manager = harness_server::thread_manager::ThreadManager::new();
-            let mut agent_registry = harness_agents::AgentRegistry::new(&config.agents.default_agent);
+            let mut agent_registry =
+                harness_agents::AgentRegistry::new(&serve_config.agents.default_agent);
             agent_registry.register(
                 "claude",
                 Arc::new(harness_agents::claude::ClaudeCodeAgent::new(
-                    config.agents.claude.cli_path.clone(),
-                    config.agents.claude.default_model.clone(),
+                    serve_config.agents.claude.cli_path.clone(),
+                    serve_config.agents.claude.default_model.clone(),
                 )),
             );
             let server = harness_server::server::HarnessServer::new(
-                config.clone(),
+                serve_config.clone(),
                 thread_manager,
                 agent_registry,
             );
@@ -205,7 +250,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     let addr = if let Some(p) = port {
                         format!("127.0.0.1:{p}").parse()?
                     } else {
-                        config.server.http_addr
+                        serve_config.server.http_addr
                     };
                     Arc::new(server).serve_http(addr).await?
                 }
@@ -213,8 +258,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
-        Command::Exec { prompt, project, agent: _agent_name } => {
-            let project_root = project.unwrap_or_else(|| std::env::current_dir().unwrap());
+        Command::Exec {
+            prompt,
+            project,
+            agent: _agent_name,
+        } => {
+            let project_root = resolve_exec_project_root(project)?;
             let agent = harness_agents::claude::ClaudeCodeAgent::new(
                 config.agents.claude.cli_path.clone(),
                 config.agents.claude.default_model.clone(),
@@ -240,20 +289,26 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Rule { cmd } => {
             match cmd {
                 RuleCommand::Load { project } => {
-                    let mut engine = harness_rules::RuleEngine::new();
+                    let mut engine = configured_rule_engine(&config);
                     engine.load(&project)?;
                     println!("Loaded {} rules", engine.rules().len());
                 }
                 RuleCommand::Check { project } => {
-                    let mut engine = harness_rules::RuleEngine::new();
+                    let mut engine = configured_rule_engine(&config);
                     engine.load(&project)?;
                     let violations = engine.scan(&project).await?;
                     // Persist rule scan results for observability/GC even when running via CLI.
-                    match harness_observe::EventStore::new(&config.server.data_dir) {
+                    match harness_observe::EventStore::with_policies(
+                        &config.server.data_dir,
+                        config.observe.session_renewal_secs,
+                        config.observe.log_retention_days,
+                    ) {
                         Ok(store) => {
                             store.persist_rule_scan(&project, &violations);
                         }
-                        Err(e) => tracing::warn!("Failed to initialize event store, rule scan not persisted: {e}"),
+                        Err(e) => tracing::warn!(
+                            "Failed to initialize event store, rule scan not persisted: {e}"
+                        ),
                     }
                     if violations.is_empty() {
                         println!("No violations found");
@@ -273,71 +328,115 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
-        Command::Skill { cmd } => {
-            match cmd {
-                SkillCommand::List { query } => {
-                    let store = harness_skills::SkillStore::new();
-                    let skills = if let Some(q) = query {
-                        store.search(&q).into_iter().cloned().collect::<Vec<_>>()
-                    } else {
-                        store.list().to_vec()
-                    };
-                    for s in &skills {
-                        println!("{}: {}", s.name, s.description);
-                    }
-                    if skills.is_empty() {
-                        println!("No skills found");
-                    }
+        Command::Skill { cmd } => match cmd {
+            SkillCommand::List { query } => {
+                let store = harness_skills::SkillStore::new();
+                let skills = if let Some(q) = query {
+                    store.search(&q).into_iter().cloned().collect::<Vec<_>>()
+                } else {
+                    store.list().to_vec()
+                };
+                for s in &skills {
+                    println!("{}: {}", s.name, s.description);
                 }
-                SkillCommand::Create { name, file } => {
-                    let content = std::fs::read_to_string(&file)?;
-                    let mut store = harness_skills::SkillStore::new();
-                    store.create(name.clone(), content);
-                    println!("Created skill: {name}");
-                }
-                SkillCommand::Delete { skill_id } => {
-                    println!("Delete skill: {skill_id}");
+                if skills.is_empty() {
+                    println!("No skills found");
                 }
             }
-        }
+            SkillCommand::Create { name, file } => {
+                let content = std::fs::read_to_string(&file)?;
+                let mut store = harness_skills::SkillStore::new();
+                store.create(name.clone(), content);
+                println!("Created skill: {name}");
+            }
+            SkillCommand::Delete { skill_id } => {
+                println!("Delete skill: {skill_id}");
+            }
+        },
 
-        Command::Pr { cmd } => {
-            match cmd {
-                PrCommand::Fix { issue, args } => {
-                    crate::cmd::pr::fix(&config, issue, args.wait, args.max_rounds, args.project).await?;
-                }
-                PrCommand::Loop { pr, args } => {
-                    crate::cmd::pr::loop_pr(&config, pr, args.wait, args.max_rounds, args.project).await?;
-                }
+        Command::Pr { cmd } => match cmd {
+            PrCommand::Fix { issue, args } => {
+                crate::cmd::pr::fix(&config, issue, args.wait, args.max_rounds, args.project)
+                    .await?;
             }
-        }
+            PrCommand::Loop { pr, args } => {
+                crate::cmd::pr::loop_pr(&config, pr, args.wait, args.max_rounds, args.project)
+                    .await?;
+            }
+        },
 
-        Command::Plan { cmd } => {
-            match cmd {
-                PlanCommand::Init { spec } => {
-                    let content = std::fs::read_to_string(&spec)?;
-                    let project_root = std::env::current_dir()?;
-                    let plan = harness_exec::ExecPlan::from_spec(&content, &project_root)?;
-                    let md = plan.to_markdown();
-                    let out_path = format!("exec-plan-{}.md", plan.id);
-                    std::fs::write(&out_path, &md)?;
-                    println!("Created ExecPlan: {out_path}");
-                }
-                PlanCommand::Status { plan } => {
-                    if std::path::Path::new(&plan).exists() {
-                        let content = std::fs::read_to_string(&plan)?;
-                        let p = harness_exec::ExecPlan::from_markdown(&content)?;
-                        println!("Plan: {}", p.purpose);
-                        println!("Status: {:?}", p.status);
-                        let done = p.progress.iter().filter(|m| m.completed).count();
-                        println!("Progress: {}/{}", done, p.progress.len());
-                    } else {
-                        println!("Plan file not found: {plan}");
-                    }
+        Command::Plan { cmd } => match cmd {
+            PlanCommand::Init { spec } => {
+                let content = std::fs::read_to_string(&spec)?;
+                let project_root = std::env::current_dir()?;
+                let plan = harness_exec::ExecPlan::from_spec(&content, &project_root)?;
+                let md = plan.to_markdown();
+                let out_path = format!("exec-plan-{}.md", plan.id);
+                std::fs::write(&out_path, &md)?;
+                println!("Created ExecPlan: {out_path}");
+            }
+            PlanCommand::Status { plan } => {
+                if std::path::Path::new(&plan).exists() {
+                    let content = std::fs::read_to_string(&plan)?;
+                    let p = harness_exec::ExecPlan::from_markdown(&content)?;
+                    println!("Plan: {}", p.purpose);
+                    println!("Status: {:?}", p.status);
+                    let done = p.progress.iter().filter(|m| m.completed).count();
+                    println!("Progress: {}/{}", done, p.progress.len());
+                } else {
+                    println!("Plan file not found: {plan}");
                 }
             }
-        }
+        },
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn resolve_exec_project_root_prefers_explicit_project() {
+        let explicit = PathBuf::from("/tmp/project");
+        let resolved = resolve_exec_project_root_with(Some(explicit.clone()), || {
+            panic!("current_dir fallback must not be used when --project is provided")
+        })
+        .expect("explicit project should resolve");
+
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn resolve_exec_project_root_uses_current_dir_fallback() {
+        let fallback = PathBuf::from("/tmp/fallback");
+        let resolved = resolve_exec_project_root_with(None, || Ok(fallback.clone()))
+            .expect("cwd fallback should resolve when current_dir succeeds");
+
+        assert_eq!(resolved, fallback);
+    }
+
+    #[test]
+    fn resolve_exec_project_root_returns_contextual_error_on_failure() {
+        let error = resolve_exec_project_root_with(None, || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cwd lookup blocked",
+            ))
+        })
+        .expect_err("cwd failure should be returned as recoverable error");
+
+        let message = error.to_string();
+        assert!(message.contains(
+            "failed to resolve `harness exec` project root from current working directory"
+        ));
+        let chain = error
+            .chain()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(chain.contains("cwd lookup blocked"));
+    }
 }

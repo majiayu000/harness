@@ -34,6 +34,28 @@ fn is_local_origin(origin: &str) -> bool {
     host == "localhost" || host == "127.0.0.1"
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum OriginValidationError {
+    InvalidUtf8,
+    NonLocal(String),
+}
+
+fn validate_origin_header(headers: &HeaderMap) -> Result<(), OriginValidationError> {
+    let Some(origin) = headers.get("Origin") else {
+        return Ok(());
+    };
+
+    let origin_str = origin
+        .to_str()
+        .map_err(|_| OriginValidationError::InvalidUtf8)?;
+
+    if is_local_origin(origin_str) {
+        Ok(())
+    } else {
+        Err(OriginValidationError::NonLocal(origin_str.to_owned()))
+    }
+}
+
 /// Axum handler that upgrades the HTTP connection to WebSocket.
 ///
 /// Validates the Origin header to prevent Cross-Site WebSocket Hijacking (CSWH).
@@ -43,15 +65,18 @@ pub async fn ws_handler(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    if let Some(origin) = headers.get("Origin") {
-        let origin_str = origin.to_str().unwrap_or("");
-        if !is_local_origin(origin_str) {
-            tracing::warn!(
-                "WebSocket connection rejected: non-local Origin {:?}",
-                origin_str
-            );
-            return StatusCode::FORBIDDEN.into_response();
+    if let Err(err) = validate_origin_header(&headers) {
+        match err {
+            OriginValidationError::InvalidUtf8 => {
+                tracing::warn!(
+                    "WebSocket connection rejected: Origin header is not valid UTF-8"
+                );
+            }
+            OriginValidationError::NonLocal(origin) => {
+                tracing::warn!("WebSocket connection rejected: non-local Origin {:?}", origin);
+            }
         }
+        return StatusCode::FORBIDDEN.into_response();
     }
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
@@ -81,6 +106,7 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
     // Task 2: subscribe to the notification broadcast and forward to client.
     let notif_out_tx = out_tx.clone();
     let mut notif_rx = state.notification_tx.subscribe();
+    let notif_state = state.clone();
     let notif_task = tokio::spawn(async move {
         loop {
             match notif_rx.recv().await {
@@ -92,7 +118,10 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
                     }
                     Err(e) => tracing::warn!("failed to encode notification: {e}"),
                 },
-                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Lagged(skipped)) => {
+                    notif_state.observe_notification_lag(skipped as u64);
+                    continue;
+                }
                 Err(RecvError::Closed) => break,
             }
         }
@@ -135,27 +164,29 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
 mod tests {
     use super::*;
     use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
+    use axum::http::HeaderValue;
     use harness_agents::AgentRegistry;
     use harness_core::HarnessConfig;
     use harness_protocol::{codec, Method, Notification, RpcNotification, RpcRequest};
     use std::sync::Arc;
     use tokio::sync::broadcast;
     use tokio::sync::RwLock;
-
-    fn bind_test_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
-        match std::net::TcpListener::bind("127.0.0.1:0") {
-            Ok(std_listener) => {
-                std_listener.set_nonblocking(true)?;
-                Ok(Some(tokio::net::TcpListener::from_std(std_listener)?))
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => Ok(None),
-            Err(err) => Err(err.into()),
-        }
-    }
+    type TestWebSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
 
     async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
+        make_test_state_with_config(dir, HarnessConfig::default()).await
+    }
+
+    async fn make_test_state_with_config(
+        dir: &std::path::Path,
+        config: HarnessConfig,
+    ) -> anyhow::Result<AppState> {
+        let notification_broadcast_capacity = config.server.notification_broadcast_capacity.max(1);
+        let notification_lag_log_every = config.server.notification_lag_log_every;
         let server = Arc::new(HarnessServer::new(
-            HarnessConfig::default(),
+            config,
             ThreadManager::new(),
             AgentRegistry::new("test"),
         ));
@@ -172,10 +203,11 @@ mod tests {
             draft_store,
         ));
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
-        let (notification_tx, _) = broadcast::channel(16);
+        let (notification_tx, _) = broadcast::channel(notification_broadcast_capacity);
 
         Ok(AppState {
             server,
+            project_root: dir.to_path_buf(),
             tasks,
             skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
             rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
@@ -185,8 +217,48 @@ mod tests {
             thread_db: Some(thread_db),
             interceptors: vec![],
             notification_tx,
+            notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            notification_lag_log_every,
             notify_tx: None,
         })
+    }
+
+    async fn bind_ws_test_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
+        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => Ok(Some(listener)),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::warn!("skipping websocket test due to sandbox network restriction: {err}");
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn connect_ws_test_client(url: &str) -> anyhow::Result<Option<TestWebSocket>> {
+        match tokio_tungstenite::connect_async(url).await {
+            Ok((ws, _)) => Ok(Some(ws)),
+            Err(tokio_tungstenite::tungstenite::Error::Io(err))
+                if err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                tracing::warn!("skipping websocket test due to sandbox network restriction: {err}");
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    #[test]
+    fn validate_origin_header_rejects_non_utf8_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Origin",
+            HeaderValue::from_bytes(b"http://localhost\xff").expect("valid raw header value"),
+        );
+
+        assert!(matches!(
+            validate_origin_header(&headers),
+            Err(OriginValidationError::InvalidUtf8)
+        ));
     }
 
     /// Integration test: spin up the HTTP server on a random port and connect
@@ -196,9 +268,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let state = Arc::new(make_test_state(dir.path()).await?);
 
-        // Bind to a random port.
-        let Some(listener) = bind_test_listener()? else {
-            return Ok(());
+        let listener = match bind_ws_test_listener().await? {
+            Some(listener) => listener,
+            None => return Ok(()),
         };
         let addr = listener.local_addr()?;
 
@@ -212,7 +284,10 @@ mod tests {
 
         // Connect with tokio-tungstenite.
         let url = format!("ws://127.0.0.1:{}/ws", addr.port());
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
+        let mut ws = match connect_ws_test_client(&url).await? {
+            Some(ws) => ws,
+            None => return Ok(()),
+        };
 
         // Send `initialize`.
         let req = RpcRequest {
@@ -250,8 +325,9 @@ mod tests {
         let state = Arc::new(make_test_state(dir.path()).await?);
         let notif_tx = state.notification_tx.clone();
 
-        let Some(listener) = bind_test_listener()? else {
-            return Ok(());
+        let listener = match bind_ws_test_listener().await? {
+            Some(listener) => listener,
+            None => return Ok(()),
         };
         let addr = listener.local_addr()?;
 
@@ -264,7 +340,10 @@ mod tests {
         });
 
         let url = format!("ws://127.0.0.1:{}/ws", addr.port());
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
+        let mut ws = match connect_ws_test_client(&url).await? {
+            Some(ws) => ws,
+            None => return Ok(()),
+        };
 
         // Ensure the server-side handler is fully running (broadcast subscriber
         // registered) before sending the notification. We do this by completing
@@ -320,6 +399,45 @@ mod tests {
             other => anyhow::bail!("unexpected notification variant: {other:?}"),
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn websocket_tracks_lagged_notifications_under_load() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = HarnessConfig::default();
+        config.server.notification_broadcast_capacity = 4;
+        config.server.notification_lag_log_every = 1;
+        let state = make_test_state_with_config(dir.path(), config).await?;
+        let mut rx = state.notification_tx.subscribe();
+
+        for _ in 0..512 {
+            state
+                .notification_tx
+                .send(RpcNotification::new(Notification::TurnStarted {
+                    thread_id: harness_core::ThreadId::new(),
+                    turn_id: harness_core::TurnId::new(),
+                }))
+                .ok();
+        }
+
+        let skipped = loop {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(_)) => continue,
+                Ok(Err(RecvError::Lagged(skipped))) => break skipped,
+                Ok(Err(other)) => anyhow::bail!("unexpected recv error: {other:?}"),
+                Err(_) => anyhow::bail!("timed out waiting for lagged receiver signal"),
+            }
+        };
+
+        let dropped_total = state.observe_notification_lag(skipped as u64);
+        assert!(dropped_total >= skipped as u64);
+        assert_eq!(
+            state
+                .notification_lagged_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            dropped_total
+        );
         Ok(())
     }
 }

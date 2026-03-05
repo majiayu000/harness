@@ -114,6 +114,7 @@ mod tests {
 
         Ok(AppState {
             server,
+            project_root: dir.to_path_buf(),
             tasks,
             skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
             rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
@@ -123,8 +124,28 @@ mod tests {
             thread_db: Some(thread_db),
             interceptors: vec![],
             notification_tx: tokio::sync::broadcast::channel(32).0,
+            notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            notification_lag_log_every: 1,
             notify_tx: None,
         })
+    }
+
+    fn writable_home() -> std::path::PathBuf {
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+        if tempfile::Builder::new()
+            .prefix("harness-home-probe-")
+            .tempdir_in(&home)
+            .is_ok()
+        {
+            return home;
+        }
+
+        let fallback = std::env::current_dir()
+            .expect("resolve cwd")
+            .join(".harness-test-home");
+        std::fs::create_dir_all(&fallback).expect("create fallback HOME");
+        std::env::set_var("HOME", &fallback);
+        fallback
     }
 
     #[tokio::test]
@@ -137,7 +158,9 @@ mod tests {
             id: Some(serde_json::json!(1)),
             method: Method::Initialize,
         })?;
-        let init_out = process_line(&state, &init_line).await?.expect("initialize should return a response");
+        let init_out = process_line(&state, &init_line)
+            .await?
+            .expect("initialize should return a response");
         let init_resp: harness_protocol::RpcResponse = codec::decode_response(&init_out)?;
         assert!(
             init_resp.error.is_none(),
@@ -180,7 +203,7 @@ mod tests {
         let (notify_tx, mut notify_rx) = crate::notify::channel(8);
         state.notify_tx = Some(notify_tx);
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let home = writable_home();
         let proj_dir = tempfile::Builder::new()
             .prefix("harness-test-")
             .tempdir_in(&home)?;
@@ -193,9 +216,15 @@ mod tests {
             },
         })?;
 
-        let out = process_line(&state, &line).await?.expect("should return a response");
+        let out = process_line(&state, &line)
+            .await?
+            .expect("should return a response");
         let resp: harness_protocol::RpcResponse = codec::decode_response(&out)?;
-        assert!(resp.error.is_none(), "thread_start failed: {:?}", resp.error);
+        assert!(
+            resp.error.is_none(),
+            "thread_start failed: {:?}",
+            resp.error
+        );
 
         let notif = notify_rx
             .try_recv()
@@ -216,7 +245,7 @@ mod tests {
         let (notify_tx, mut notify_rx) = crate::notify::channel(8);
         state.notify_tx = Some(notify_tx);
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let home = writable_home();
         let proj_dir = tempfile::Builder::new()
             .prefix("harness-test-")
             .tempdir_in(&home)?;
@@ -229,7 +258,9 @@ mod tests {
                 cwd: proj_dir.path().to_path_buf(),
             },
         })?;
-        let thread_out = process_line(&state, &thread_line).await?.expect("thread_start should return a response");
+        let thread_out = process_line(&state, &thread_line)
+            .await?
+            .expect("thread_start should return a response");
         let thread_resp: harness_protocol::RpcResponse = codec::decode_response(&thread_out)?;
         let thread_id_str = thread_resp.result.unwrap()["thread_id"]
             .as_str()
@@ -249,7 +280,9 @@ mod tests {
                 input: "hello".to_string(),
             },
         })?;
-        let turn_out = process_line(&state, &turn_line).await?.expect("turn_start should return a response");
+        let turn_out = process_line(&state, &turn_line)
+            .await?
+            .expect("turn_start should return a response");
         let turn_resp: harness_protocol::RpcResponse = codec::decode_response(&turn_out)?;
         assert!(
             turn_resp.error.is_none(),
