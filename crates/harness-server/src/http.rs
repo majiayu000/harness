@@ -255,11 +255,18 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-        let json: serde_json::Value = serde_json::from_slice(&body)?;
+        #[derive(serde::Deserialize, Debug)]
+        struct HealthResponse {
+            status: String,
+            tasks: u64,
+        }
 
-        assert_eq!(json["status"], "ok");
-        assert_eq!(json["tasks"], 0);
+        use http_body_util::BodyExt;
+        let body = response.into_body().collect().await?.to_bytes();
+        let health: HealthResponse = serde_json::from_slice(&body)?;
+
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.tasks, 0);
         Ok(())
     }
 }
