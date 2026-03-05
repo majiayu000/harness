@@ -75,8 +75,14 @@ pub async fn metrics_query(
         Ok(evts) => {
             let violation_count = evts
                 .iter()
-                .filter(|e| e.hook == "rule_check")
-                .count();
+                .rev()
+                .find(|e| e.hook == "rule_scan")
+                .map(|scan| {
+                    evts.iter()
+                        .filter(|e| e.hook == "rule_check" && e.session_id == scan.session_id)
+                        .count()
+                })
+                .unwrap_or(0);
             let report = harness_observe::QualityGrader::grade(&evts, violation_count);
             match serde_json::to_value(&report) {
                 Ok(v) => RpcResponse::success(id, v),
