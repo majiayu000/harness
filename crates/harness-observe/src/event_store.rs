@@ -106,11 +106,11 @@ impl EventStore {
                 decision,
             );
             event.reason = Some(violation.message.clone());
-            event.detail = Some(format!(
-                "{}:{}",
-                violation.file.display(),
-                violation.line.map(|l| l.to_string()).unwrap_or_default()
-            ));
+            event.detail = Some(if let Some(line) = violation.line {
+                format!("{}:{}", violation.file.display(), line)
+            } else {
+                violation.file.display().to_string()
+            });
             if let Err(e) = self.log(&event) {
                 tracing::warn!("failed to log rule violation event: {e}");
             }
