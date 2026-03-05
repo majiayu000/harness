@@ -23,3 +23,49 @@ pub fn signal_priority(signal_type: SignalType) -> u8 {
         SignalType::SlowSessions => 5,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_priority_mapping_is_stable() {
+        let ordered = [
+            SignalType::ChronicBlock,
+            SignalType::WarnEscalation,
+            SignalType::RepeatedWarn,
+            SignalType::LinterViolations,
+            SignalType::HotFiles,
+            SignalType::SlowSessions,
+        ];
+        let priorities: Vec<u8> = ordered.into_iter().map(signal_priority).collect();
+
+        assert_eq!(priorities, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn sorting_uses_priority_boundaries() {
+        let mut signals = vec![
+            SignalType::SlowSessions,
+            SignalType::HotFiles,
+            SignalType::LinterViolations,
+            SignalType::RepeatedWarn,
+            SignalType::WarnEscalation,
+            SignalType::ChronicBlock,
+        ];
+
+        signals.sort_by_key(|signal| signal_priority(*signal));
+
+        assert_eq!(
+            signals,
+            vec![
+                SignalType::ChronicBlock,
+                SignalType::WarnEscalation,
+                SignalType::RepeatedWarn,
+                SignalType::LinterViolations,
+                SignalType::HotFiles,
+                SignalType::SlowSessions,
+            ]
+        );
+    }
+}
