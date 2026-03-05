@@ -110,25 +110,33 @@ pub struct RuleStats {
 
 /// Aggregate per-rule violation counts from historical rule_check events.
 pub fn aggregate_rule_stats(events: &[Event]) -> Vec<RuleStats> {
+    #[derive(Default)]
+    struct RuleCounts {
+        total: usize,
+        block: usize,
+        warn: usize,
+        pass: usize,
+    }
+
     // rule_check events store the rule_id in the `tool` field
-    let mut map: HashMap<String, (usize, usize, usize, usize)> = HashMap::new();
+    let mut map: HashMap<String, RuleCounts> = HashMap::new();
     for e in events.iter().filter(|e| e.hook == "rule_check") {
-        let entry = map.entry(e.tool.clone()).or_insert((0, 0, 0, 0));
-        entry.0 += 1;
+        let counts = map.entry(e.tool.clone()).or_default();
+        counts.total += 1;
         match e.decision {
-            Decision::Pass | Decision::Complete => entry.3 += 1,
-            Decision::Warn => entry.2 += 1,
-            Decision::Block | Decision::Gate | Decision::Escalate => entry.1 += 1,
+            Decision::Pass | Decision::Complete => counts.pass += 1,
+            Decision::Warn => counts.warn += 1,
+            Decision::Block | Decision::Gate | Decision::Escalate => counts.block += 1,
         }
     }
     let mut stats: Vec<RuleStats> = map
         .into_iter()
-        .map(|(rule_id, (total, block, warn, pass))| RuleStats {
+        .map(|(rule_id, counts)| RuleStats {
             rule_id,
-            total,
-            block_count: block,
-            warn_count: warn,
-            pass_count: pass,
+            total: counts.total,
+            block_count: counts.block,
+            warn_count: counts.warn,
+            pass_count: counts.pass,
         })
         .collect();
     stats.sort_by(|a, b| b.total.cmp(&a.total));

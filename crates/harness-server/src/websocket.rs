@@ -1,7 +1,8 @@
 use crate::{http::AppState, router};
 use axum::{
     extract::{State, WebSocketUpgrade},
-    response::Response,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
 };
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
@@ -9,11 +10,31 @@ use harness_protocol::{codec, RpcResponse};
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
 
+/// Returns true if the origin is a localhost origin (safe for local dev tools).
+fn is_local_origin(origin: &str) -> bool {
+    origin == "null"
+        || origin.starts_with("http://localhost")
+        || origin.starts_with("https://localhost")
+        || origin.starts_with("http://127.0.0.1")
+        || origin.starts_with("https://127.0.0.1")
+}
+
 /// Axum handler that upgrades the HTTP connection to WebSocket.
+///
+/// Validates the Origin header to prevent Cross-Site WebSocket Hijacking (CSWH).
+/// CLI clients that omit the Origin header are always allowed.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Response {
+    if let Some(origin) = headers.get("Origin") {
+        let origin_str = origin.to_str().unwrap_or("");
+        if !is_local_origin(origin_str) {
+            tracing::warn!("WebSocket connection rejected: non-local Origin {:?}", origin_str);
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -46,10 +67,13 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
         loop {
             match notif_rx.recv().await {
                 Ok(notif) => {
-                    if let Ok(text) = codec::encode_notification(&notif) {
-                        if notif_out_tx.send(text).is_err() {
-                            break;
+                    match codec::encode_notification(&notif) {
+                        Ok(text) => {
+                            if notif_out_tx.send(text).is_err() {
+                                break;
+                            }
                         }
+                        Err(e) => tracing::warn!("failed to encode notification: {e}"),
                     }
                 }
                 Err(RecvError::Lagged(_)) => continue,
@@ -75,10 +99,13 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
             ),
         };
 
-        if let Ok(out) = codec::encode_response(&response) {
-            if out_tx.send(out).is_err() {
-                break;
+        match codec::encode_response(&response) {
+            Ok(out) => {
+                if out_tx.send(out).is_err() {
+                    break;
+                }
             }
+            Err(e) => tracing::warn!("failed to encode response: {e}"),
         }
     }
 
@@ -202,8 +229,23 @@ mod tests {
         let url = format!("ws://127.0.0.1:{}/ws", addr.port());
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
 
-        // Give the connection a moment to register the broadcast subscriber.
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // Ensure the server-side handler is fully running (broadcast subscriber
+        // registered) before sending the notification. We do this by completing
+        // an initialize round-trip: once we receive the response, the handler
+        // loop is live and ready to forward notifications.
+        let init_req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(0)),
+            method: Method::Initialize,
+        };
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&init_req)?.into(),
+        ))
+        .await?;
+        {
+            use futures::StreamExt;
+            ws.next().await.ok_or_else(|| anyhow::anyhow!("no init response"))??;
+        }
 
         // Broadcast a notification.
         let thread_id = harness_core::ThreadId::new();
