@@ -79,6 +79,7 @@ pub enum Method {
 #[derive(Debug, Clone, Serialize)]
 pub struct RpcRequest {
     pub jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<serde_json::Value>,
     #[serde(flatten)]
     pub method: Method,
