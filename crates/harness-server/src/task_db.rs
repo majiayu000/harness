@@ -78,16 +78,14 @@ impl TaskDb {
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|r| r.into_task_state()))
+        row.map(TaskRow::try_into_task_state).transpose()
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
-        let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT * FROM tasks ORDER BY created_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|r| r.into_task_state()).collect())
+        let rows = sqlx::query_as::<_, TaskRow>("SELECT * FROM tasks ORDER BY created_at DESC")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 }
 
@@ -105,16 +103,44 @@ struct TaskRow {
     updated_at: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum TaskDbDecodeError {
+    #[error("failed to deserialize rounds for task `{task_id}`")]
+    RoundsDeserialize {
+        task_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
 impl TaskRow {
-    fn into_task_state(self) -> TaskState {
-        TaskState {
-            id: TaskId(self.id),
-            status: str_to_status(&self.status),
-            turn: self.turn as u32,
-            pr_url: self.pr_url,
-            rounds: serde_json::from_str(&self.rounds).unwrap_or_default(),
-            error: self.error,
-        }
+    fn try_into_task_state(self) -> anyhow::Result<TaskState> {
+        let Self {
+            id,
+            status,
+            turn,
+            pr_url,
+            rounds,
+            error,
+            created_at: _,
+            updated_at: _,
+        } = self;
+
+        let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
+            TaskDbDecodeError::RoundsDeserialize {
+                task_id: id.clone(),
+                source,
+            }
+        })?;
+
+        Ok(TaskState {
+            id: TaskId(id),
+            status: str_to_status(&status),
+            turn: turn as u32,
+            pr_url,
+            rounds: decoded_rounds,
+            error,
+        })
     }
 }
 
@@ -138,5 +164,61 @@ fn str_to_status(s: &str) -> TaskStatus {
         "done" => TaskStatus::Done,
         "failed" => TaskStatus::Failed,
         _ => TaskStatus::Failed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TaskDb, TaskDbDecodeError, TaskRow};
+
+    fn build_task_row(rounds: &str) -> TaskRow {
+        TaskRow {
+            id: "task-1".to_string(),
+            status: "pending".to_string(),
+            turn: 1,
+            pr_url: None,
+            rounds: rounds.to_string(),
+            error: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn invalid_rounds_json_returns_distinguishable_error() {
+        let err = build_task_row("{not-json")
+            .try_into_task_state()
+            .expect_err("invalid rounds JSON should return error");
+        let decode_error = err
+            .downcast_ref::<TaskDbDecodeError>()
+            .expect("error should expose task-db decode type");
+
+        assert!(matches!(
+            decode_error,
+            TaskDbDecodeError::RoundsDeserialize { task_id, .. } if task_id == "task-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_distinguishes_missing_task_from_corrupted_rounds() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        assert!(db.get("missing-task").await?.is_none());
+
+        sqlx::query("INSERT INTO tasks (id, status, turn, rounds) VALUES (?, ?, ?, ?)")
+            .bind("task-corrupted")
+            .bind("pending")
+            .bind(1_i64)
+            .bind("{not-json")
+            .execute(&db.pool)
+            .await?;
+
+        let err = db
+            .get("task-corrupted")
+            .await
+            .expect_err("corrupted rounds should return an error");
+        assert!(err.downcast_ref::<TaskDbDecodeError>().is_some());
+        Ok(())
     }
 }

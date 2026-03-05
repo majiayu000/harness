@@ -28,6 +28,8 @@ pub struct RuleEngine {
     rules: Vec<Rule>,
     rule_ids: HashSet<RuleId>,
     guards: Vec<Guard>,
+    discovery_paths: Vec<PathBuf>,
+    builtin_path: Option<PathBuf>,
 }
 
 impl RuleEngine {
@@ -36,29 +38,52 @@ impl RuleEngine {
             rules: Vec::new(),
             rule_ids: HashSet::new(),
             guards: Vec::new(),
+            discovery_paths: Vec::new(),
+            builtin_path: None,
         }
+    }
+
+    pub fn configure_sources(
+        &mut self,
+        discovery_paths: Vec<PathBuf>,
+        builtin_path: Option<PathBuf>,
+    ) {
+        self.discovery_paths = discovery_paths;
+        self.builtin_path = builtin_path;
     }
 
     /// Load rules using the 4-layer discovery chain: repo → user → admin → system.
     pub fn load(&mut self, project_root: &Path) -> anyhow::Result<()> {
-        // Repo level
-        let repo_rules = project_root.join(".harness/rules/");
-        if repo_rules.is_dir() {
-            self.load_from(&repo_rules)?;
-        }
-
-        // User level
-        if let Some(home) = std::env::var("HOME").ok() {
-            let user_rules = PathBuf::from(home).join(".harness/rules/");
-            if user_rules.is_dir() {
-                self.load_from(&user_rules)?;
+        if self.discovery_paths.is_empty() {
+            // Repo level
+            let repo_rules = project_root.join(".harness/rules/");
+            if repo_rules.is_dir() {
+                self.load_from(&repo_rules)?;
             }
-        }
 
-        // Admin level
-        let admin_rules = Path::new("/etc/harness/rules/");
-        if admin_rules.is_dir() {
-            self.load_from(admin_rules)?;
+            // User level
+            if let Some(home) = std::env::var("HOME").ok() {
+                let user_rules = PathBuf::from(home).join(".harness/rules/");
+                if user_rules.is_dir() {
+                    self.load_from(&user_rules)?;
+                }
+            }
+
+            // Admin level
+            let admin_rules = Path::new("/etc/harness/rules/");
+            if admin_rules.is_dir() {
+                self.load_from(admin_rules)?;
+            }
+        } else {
+            let discovery_paths = self.discovery_paths.clone();
+            for source in discovery_paths {
+                if source.is_dir() {
+                    self.load_from(&source)?;
+                } else if source.is_file() {
+                    let content = std::fs::read_to_string(&source)?;
+                    self.parse_rule_file(&source, &content)?;
+                }
+            }
         }
 
         // System (builtin) level
@@ -90,6 +115,19 @@ impl RuleEngine {
     }
 
     pub fn load_builtin(&mut self) -> anyhow::Result<()> {
+        if let Some(path) = self.builtin_path.clone() {
+            if path.is_dir() {
+                self.load_from(&path)?;
+                return Ok(());
+            }
+            if path.is_file() {
+                let content = std::fs::read_to_string(&path)?;
+                self.parse_rule_file(&path, &content)?;
+                return Ok(());
+            }
+            anyhow::bail!("configured rules.builtin_path does not exist: {}", path.display());
+        }
+
         let builtin = [
             ("golden-principles.md", include_str!("../../../rules/golden-principles.md")),
             ("common/coding-style.md", include_str!("../../../rules/common/coding-style.md")),

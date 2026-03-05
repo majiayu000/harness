@@ -34,6 +34,28 @@ fn is_local_origin(origin: &str) -> bool {
     host == "localhost" || host == "127.0.0.1"
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum OriginValidationError {
+    InvalidUtf8,
+    NonLocal(String),
+}
+
+fn validate_origin_header(headers: &HeaderMap) -> Result<(), OriginValidationError> {
+    let Some(origin) = headers.get("Origin") else {
+        return Ok(());
+    };
+
+    let origin_str = origin
+        .to_str()
+        .map_err(|_| OriginValidationError::InvalidUtf8)?;
+
+    if is_local_origin(origin_str) {
+        Ok(())
+    } else {
+        Err(OriginValidationError::NonLocal(origin_str.to_owned()))
+    }
+}
+
 /// Axum handler that upgrades the HTTP connection to WebSocket.
 ///
 /// Validates the Origin header to prevent Cross-Site WebSocket Hijacking (CSWH).
@@ -43,15 +65,18 @@ pub async fn ws_handler(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    if let Some(origin) = headers.get("Origin") {
-        let origin_str = origin.to_str().unwrap_or("");
-        if !is_local_origin(origin_str) {
-            tracing::warn!(
-                "WebSocket connection rejected: non-local Origin {:?}",
-                origin_str
-            );
-            return StatusCode::FORBIDDEN.into_response();
+    if let Err(err) = validate_origin_header(&headers) {
+        match err {
+            OriginValidationError::InvalidUtf8 => {
+                tracing::warn!(
+                    "WebSocket connection rejected: Origin header is not valid UTF-8"
+                );
+            }
+            OriginValidationError::NonLocal(origin) => {
+                tracing::warn!("WebSocket connection rejected: non-local Origin {:?}", origin);
+            }
         }
+        return StatusCode::FORBIDDEN.into_response();
     }
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
@@ -139,23 +164,16 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
 mod tests {
     use super::*;
     use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
+    use axum::http::HeaderValue;
     use harness_agents::AgentRegistry;
     use harness_core::HarnessConfig;
     use harness_protocol::{codec, Method, Notification, RpcNotification, RpcRequest};
     use std::sync::Arc;
     use tokio::sync::broadcast;
     use tokio::sync::RwLock;
-
-    fn bind_test_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
-        match std::net::TcpListener::bind("127.0.0.1:0") {
-            Ok(std_listener) => {
-                std_listener.set_nonblocking(true)?;
-                Ok(Some(tokio::net::TcpListener::from_std(std_listener)?))
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => Ok(None),
-            Err(err) => Err(err.into()),
-        }
-    }
+    type TestWebSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
 
     async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
         make_test_state_with_config(dir, HarnessConfig::default()).await
@@ -205,6 +223,44 @@ mod tests {
         })
     }
 
+    async fn bind_ws_test_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
+        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => Ok(Some(listener)),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::warn!("skipping websocket test due to sandbox network restriction: {err}");
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn connect_ws_test_client(url: &str) -> anyhow::Result<Option<TestWebSocket>> {
+        match tokio_tungstenite::connect_async(url).await {
+            Ok((ws, _)) => Ok(Some(ws)),
+            Err(tokio_tungstenite::tungstenite::Error::Io(err))
+                if err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                tracing::warn!("skipping websocket test due to sandbox network restriction: {err}");
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    #[test]
+    fn validate_origin_header_rejects_non_utf8_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Origin",
+            HeaderValue::from_bytes(b"http://localhost\xff").expect("valid raw header value"),
+        );
+
+        assert!(matches!(
+            validate_origin_header(&headers),
+            Err(OriginValidationError::InvalidUtf8)
+        ));
+    }
+
     /// Integration test: spin up the HTTP server on a random port and connect
     /// via WebSocket.  Sends an `initialize` request and checks the response.
     #[tokio::test]
@@ -212,9 +268,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let state = Arc::new(make_test_state(dir.path()).await?);
 
-        // Bind to a random port.
-        let Some(listener) = bind_test_listener()? else {
-            return Ok(());
+        let listener = match bind_ws_test_listener().await? {
+            Some(listener) => listener,
+            None => return Ok(()),
         };
         let addr = listener.local_addr()?;
 
@@ -228,7 +284,10 @@ mod tests {
 
         // Connect with tokio-tungstenite.
         let url = format!("ws://127.0.0.1:{}/ws", addr.port());
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
+        let mut ws = match connect_ws_test_client(&url).await? {
+            Some(ws) => ws,
+            None => return Ok(()),
+        };
 
         // Send `initialize`.
         let req = RpcRequest {
@@ -266,8 +325,9 @@ mod tests {
         let state = Arc::new(make_test_state(dir.path()).await?);
         let notif_tx = state.notification_tx.clone();
 
-        let Some(listener) = bind_test_listener()? else {
-            return Ok(());
+        let listener = match bind_ws_test_listener().await? {
+            Some(listener) => listener,
+            None => return Ok(()),
         };
         let addr = listener.local_addr()?;
 
@@ -280,7 +340,10 @@ mod tests {
         });
 
         let url = format!("ws://127.0.0.1:{}/ws", addr.port());
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
+        let mut ws = match connect_ws_test_client(&url).await? {
+            Some(ws) => ws,
+            None => return Ok(()),
+        };
 
         // Ensure the server-side handler is fully running (broadcast subscriber
         // registered) before sending the notification. We do this by completing

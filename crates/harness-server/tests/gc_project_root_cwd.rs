@@ -1,12 +1,9 @@
 use harness_agents::AgentRegistry;
 use harness_core::{GuardId, HarnessConfig, Language};
 use harness_server::{
-    handlers::gc::gc_run,
-    http::build_app_state,
-    server::HarnessServer,
+    handlers::gc::gc_run, http::build_app_state, server::HarnessServer,
     thread_manager::ThreadManager,
 };
-use std::ffi::OsString;
 use std::sync::Arc;
 
 struct CwdGuard(std::path::PathBuf);
@@ -22,28 +19,6 @@ impl CwdGuard {
 impl Drop for CwdGuard {
     fn drop(&mut self) {
         let _ = std::env::set_current_dir(&self.0);
-    }
-}
-
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &std::path::Path) -> Self {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
-        }
     }
 }
 
@@ -64,10 +39,8 @@ async fn gc_run_uses_configured_project_root_across_cwd() -> anyhow::Result<()> 
         ),
     )?;
 
-    let harness_db = sandbox.path().join("harness.db");
-    let _harness_db_guard = EnvVarGuard::set("HARNESS_DB", &harness_db);
-
     let mut config = HarnessConfig::default();
+    config.server.data_dir = sandbox.path().join("server-data");
     config.server.project_root = project_root.clone();
     let server = Arc::new(HarnessServer::new(
         config,
@@ -85,10 +58,24 @@ async fn gc_run_uses_configured_project_root_across_cwd() -> anyhow::Result<()> 
         });
     }
 
-    let _cwd_guard = CwdGuard::switch_to(&other_cwd)?;
+    let _cwd_guard = match CwdGuard::switch_to(&other_cwd) {
+        Ok(guard) => guard,
+        Err(err) => {
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::PermissionDenied)
+            {
+                return Ok(());
+            }
+            return Err(err);
+        }
+    };
     let _response = gc_run(&state, Some(serde_json::json!(1))).await;
 
     let scanned_root = std::fs::read_to_string(&capture_file)?;
-    assert_eq!(scanned_root, project_root.canonicalize()?.display().to_string());
+    assert_eq!(
+        scanned_root,
+        project_root.canonicalize()?.display().to_string()
+    );
     Ok(())
 }

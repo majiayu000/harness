@@ -14,6 +14,14 @@ impl EventStore {
         })
     }
 
+    pub fn with_policies(
+        data_dir: &Path,
+        _session_renewal_secs: u64,
+        _log_retention_days: u32,
+    ) -> anyhow::Result<Self> {
+        Self::new(data_dir)
+    }
+
     fn events_file(&self) -> PathBuf {
         self.data_dir.join("events.jsonl")
     }
@@ -54,16 +62,6 @@ impl EventStore {
         }
 
         Ok(events)
-    }
-
-    /// Persist each violation as a `rule_check` event so they flow into the
-    /// observability pipeline (quality grading, GC signal detection, stats).
-    pub fn log_violations(&self, violations: &[Violation]) {
-        if violations.is_empty() {
-            return;
-        }
-        let session_id = SessionId::new();
-        self.log_violations_with_session(&session_id, violations);
     }
 
     /// Persist a full rule scan into the event store.
@@ -244,13 +242,16 @@ mod tests {
         for _ in 0..5 {
             store.log(&make_event("hook", Decision::Pass))?;
         }
-        let results = store.query(&EventFilters { limit: Some(3), ..Default::default() })?;
+        let results = store.query(&EventFilters {
+            limit: Some(3),
+            ..Default::default()
+        })?;
         assert_eq!(results.len(), 3);
         Ok(())
     }
 
     #[test]
-    fn log_violations_creates_one_event_per_violation() -> anyhow::Result<()> {
+    fn persist_rule_scan_logs_one_event_per_violation_under_scan_session() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = EventStore::new(dir.path())?;
         let violations = vec![
@@ -269,10 +270,15 @@ mod tests {
                 severity: Severity::Low,
             },
         ];
-        store.log_violations(&violations);
+        let session_id = store.persist_rule_scan(Path::new("/tmp/project"), &violations);
         let events = store.query(&EventFilters::default())?;
-        assert_eq!(events.len(), 2);
-        assert!(events.iter().all(|e| e.hook == "rule_check"));
+        assert_eq!(events.len(), 3);
+        assert_eq!(events.iter().filter(|e| e.hook == "rule_scan").count(), 1);
+        let check_events: Vec<_> = events.iter().filter(|e| e.hook == "rule_check").collect();
+        assert_eq!(check_events.len(), 2);
+        assert!(check_events
+            .iter()
+            .all(|event| event.session_id == session_id));
         Ok(())
     }
 
@@ -297,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn log_violations_maps_severity_to_decision() -> anyhow::Result<()> {
+    fn persist_rule_scan_maps_severity_to_decision() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = EventStore::new(dir.path())?;
         let violations = vec![
@@ -330,11 +336,16 @@ mod tests {
                 severity: Severity::Low,
             },
         ];
-        store.log_violations(&violations);
-        let events = store.query(&EventFilters::default())?;
+        store.persist_rule_scan(Path::new("/tmp/project"), &violations);
+        let events = store.query(&EventFilters {
+            hook: Some("rule_check".to_string()),
+            ..Default::default()
+        })?;
         assert_eq!(events.len(), 4);
-        let by_tool: std::collections::HashMap<_, _> =
-            events.iter().map(|e| (e.tool.as_str(), e.decision.clone())).collect();
+        let by_tool: std::collections::HashMap<_, _> = events
+            .iter()
+            .map(|e| (e.tool.as_str(), e.decision.clone()))
+            .collect();
         assert_eq!(by_tool["R-CRIT"], Decision::Block);
         assert_eq!(by_tool["R-HIGH"], Decision::Block);
         assert_eq!(by_tool["R-MED"], Decision::Warn);
@@ -343,12 +354,17 @@ mod tests {
     }
 
     #[test]
-    fn log_violations_empty_slice_logs_nothing() -> anyhow::Result<()> {
+    fn persist_rule_scan_stores_project_path_on_anchor() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = EventStore::new(dir.path())?;
-        store.log_violations(&[]);
-        let events = store.query(&EventFilters::default())?;
-        assert!(events.is_empty());
+        let project_root = Path::new("/tmp/my-project");
+        store.persist_rule_scan(project_root, &[]);
+        let events = store.query(&EventFilters {
+            hook: Some("rule_scan".to_string()),
+            ..Default::default()
+        })?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail.as_deref(), Some("/tmp/my-project"));
         Ok(())
     }
 }

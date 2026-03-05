@@ -54,27 +54,6 @@ impl AppState {
         dropped_total
     }
 }
-
-fn data_dir() -> std::path::PathBuf {
-    let db_path = std::env::var("HARNESS_DB")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            std::path::PathBuf::from(home)
-                .join(".local")
-                .join("share")
-                .join("harness")
-        });
-    if db_path.extension().is_some() {
-        db_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf()
-    } else {
-        db_path
-    }
-}
-
 fn resolve_project_root(configured_root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     let project_root = configured_root.canonicalize().map_err(|e| {
         anyhow::anyhow!(
@@ -93,21 +72,37 @@ fn resolve_project_root(configured_root: &std::path::Path) -> anyhow::Result<std
 
 /// Build an AppState with all stores. Used by both HTTP and stdio transports.
 pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppState> {
-    let dir = data_dir();
-    std::fs::create_dir_all(&dir)?;
+    let dir = server.config.server.data_dir.clone();
     let project_root = resolve_project_root(&server.config.server.project_root)?;
-    tracing::info!("project root: {}", project_root.display());
+    std::fs::create_dir_all(&dir)?;
+    tracing::info!(
+        data_dir = %dir.display(),
+        project_root = %project_root.display(),
+        discovery_paths = ?server.config.rules.discovery_paths,
+        builtin_path = ?server.config.rules.builtin_path,
+        session_renewal_secs = server.config.observe.session_renewal_secs,
+        log_retention_days = server.config.observe.log_retention_days,
+        "harness: effective config"
+    );
 
     let db_path = dir.join("tasks.db");
     tracing::info!("task db: {}", db_path.display());
     let tasks = task_runner::TaskStore::open(&db_path).await?;
 
     let mut rule_engine = harness_rules::engine::RuleEngine::new();
+    rule_engine.configure_sources(
+        server.config.rules.discovery_paths.clone(),
+        server.config.rules.builtin_path.clone(),
+    );
     if let Err(e) = rule_engine.load_builtin() {
         tracing::warn!("failed to load builtin rules: {e}");
     }
 
-    let events = Arc::new(harness_observe::EventStore::new(&dir)?);
+    let events = Arc::new(harness_observe::EventStore::with_policies(
+        &dir,
+        server.config.observe.session_renewal_secs,
+        server.config.observe.log_retention_days,
+    )?);
 
     let signal_detector = harness_gc::SignalDetector::new(
         harness_gc::signal_detector::SignalThresholds::default(),
