@@ -15,6 +15,7 @@ pub async fn gc_run(
         let rules = state.rules.read().await;
         rules.scan(&project_root).await.unwrap_or_default()
     };
+    state.events.log_violations(&violations);
     let project = harness_core::Project::from_path(project_root);
     let agent = match state.server.agent_registry.default_agent() {
         Some(a) => a,

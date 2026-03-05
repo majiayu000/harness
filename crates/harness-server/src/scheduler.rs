@@ -45,6 +45,7 @@ impl Scheduler {
                     let rules = health_state.rules.read().await;
                     rules.scan(&std::path::PathBuf::from(".")).await.unwrap_or_default()
                 };
+                health_state.events.log_violations(&violations);
                 let report = generate_health_report(&events, &violations);
                 tracing::info!(
                     grade = ?report.quality.grade,

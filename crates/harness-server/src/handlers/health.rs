@@ -23,6 +23,7 @@ pub async fn health_check(
         let rules = state.rules.read().await;
         rules.scan(&project_root).await.unwrap_or_default()
     };
+    state.events.log_violations(&violations);
 
     let report = generate_health_report(&events, &violations);
     match serde_json::to_value(&report) {

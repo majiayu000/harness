@@ -44,11 +44,9 @@ pub async fn metrics_collect(
         Ok(evts) => {
             let violation_count = {
                 let rules = state.rules.read().await;
-                rules
-                    .scan(&project_root)
-                    .await
-                    .map(|v| v.len())
-                    .unwrap_or(0)
+                let violations = rules.scan(&project_root).await.unwrap_or_default();
+                state.events.log_violations(&violations);
+                violations.len()
             };
             let report = harness_observe::QualityGrader::grade(&evts, violation_count);
             match serde_json::to_value(&report) {
