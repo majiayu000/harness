@@ -171,6 +171,15 @@ pub enum PlanCommand {
     },
 }
 
+fn configured_rule_engine(config: &harness_core::HarnessConfig) -> harness_rules::RuleEngine {
+    let mut engine = harness_rules::RuleEngine::new();
+    engine.configure_sources(
+        config.rules.discovery_paths.clone(),
+        config.rules.builtin_path.clone(),
+    );
+    engine
+}
+
 fn resolve_exec_project_root(project: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     resolve_exec_project_root_with(project, std::env::current_dir)
 }
@@ -280,16 +289,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Rule { cmd } => {
             match cmd {
                 RuleCommand::Load { project } => {
-                    let mut engine = harness_rules::RuleEngine::new();
+                    let mut engine = configured_rule_engine(&config);
                     engine.load(&project)?;
                     println!("Loaded {} rules", engine.rules().len());
                 }
                 RuleCommand::Check { project } => {
-                    let mut engine = harness_rules::RuleEngine::new();
+                    let mut engine = configured_rule_engine(&config);
                     engine.load(&project)?;
                     let violations = engine.scan(&project).await?;
                     // Persist rule scan results for observability/GC even when running via CLI.
-                    match harness_observe::EventStore::new(&config.server.data_dir) {
+                    match harness_observe::EventStore::with_policies(
+                        &config.server.data_dir,
+                        config.observe.session_renewal_secs,
+                        config.observe.log_retention_days,
+                    ) {
                         Ok(store) => {
                             store.persist_rule_scan(&project, &violations);
                         }
