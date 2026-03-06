@@ -133,15 +133,17 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             .insert(thread.id.as_str().to_string(), thread);
     }
 
+    let mut skill_store = harness_skills::SkillStore::new().with_persist_dir(dir.join("skills"));
+    skill_store.load_builtin();
+    if let Err(e) = skill_store.discover() {
+        tracing::warn!("Failed to reload persisted skills on startup: {}", e);
+    }
+
     Ok(AppState {
         server,
         project_root,
         tasks,
-        skills: Arc::new(RwLock::new({
-            let mut store = harness_skills::SkillStore::new().with_persist_dir(dir.join("skills"));
-            store.load_builtin();
-            store
-        })),
+        skills: Arc::new(RwLock::new(skill_store)),
         rules: Arc::new(RwLock::new(rule_engine)),
         events,
         gc_agent,
