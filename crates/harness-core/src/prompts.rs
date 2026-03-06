@@ -33,14 +33,14 @@ pub fn implement_from_issue(issue: u64) -> String {
 }
 
 /// Build prompt: check an existing PR's CI and review status.
-pub fn check_existing_pr(pr: u64) -> String {
+pub fn check_existing_pr(pr: u64, reviewer_name: &str, recheck_command: &str) -> String {
     format!(
         "Check PR #{pr}:\n\
          1. `gh pr checks {pr}` — check CI status\n\
          2. `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/comments` — read inline review comments\n\
          3. If CI passes and there are no unresolved review comments, print LGTM on the last line\n\
          4. Otherwise fix each comment, commit, push, \
-         then run `gh pr comment {pr} --body '/gemini review'` to trigger re-review, \
+         then run `gh pr comment {pr} --body '{recheck_command}'` to trigger {reviewer_name} re-review, \
          and print FIXED on the last line\n\n\
          Always print PR_URL=https://github.com/{{owner}}/{{repo}}/pull/{pr} on a separate line of your output."
     )
@@ -70,9 +70,16 @@ pub fn implement_from_prompt(prompt: &str) -> String {
 /// - Round 3+: only fix critical/high; skip medium style/design suggestions
 ///
 /// When `prev_fixed` is true (previous round pushed code), the agent must first
-/// verify that Gemini has submitted a **new** review covering the latest commit
+/// verify that the configured reviewer has submitted a **new** review covering the latest commit
 /// before declaring LGTM. If no new review exists yet, agent outputs WAITING.
-pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32, prev_fixed: bool) -> String {
+pub fn review_prompt(
+    issue: Option<u64>,
+    pr: u64,
+    round: u32,
+    prev_fixed: bool,
+    reviewer_name: &str,
+    recheck_command: &str,
+) -> String {
     let context = match issue {
         Some(n) => format!("You previously created PR #{pr} for issue #{n}.\n"),
         None => format!("Review PR #{pr}.\n"),
@@ -86,21 +93,21 @@ pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32, prev_fixed: bool) 
     };
 
     let push_action = format!(
-        "commit, push, then run `gh pr comment {pr} --body '/gemini review'` \
-         to trigger re-review on the new code"
+        "commit, push, then run `gh pr comment {pr} --body '{recheck_command}'` \
+         to trigger {reviewer_name} re-review on the new code"
     );
 
     let freshness_check = if prev_fixed {
         format!(
             "\n\nIMPORTANT — New review verification:\n\
              The previous round pushed a fix commit. Before evaluating review status, \
-             you MUST verify that Gemini has submitted a NEW review covering the latest commit:\n\
+             you MUST verify that {reviewer_name} has submitted a NEW review covering the latest commit:\n\
              1. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews --jq '.[-1].submitted_at'` \
              to get the timestamp of the most recent review\n\
              2. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/commits --jq '.[-1].commit.committer.date'` \
              to get the timestamp of the latest commit\n\
              3. If the latest review was submitted BEFORE the latest commit, \
-             Gemini has not yet re-reviewed the new code. \
+             {reviewer_name} has not yet re-reviewed the new code. \
              In this case, print WAITING on the last line and stop.\n\
              4. Only proceed with the review evaluation below if the latest review \
              was submitted AFTER the latest commit."
@@ -172,7 +179,11 @@ pub fn is_approved(output: &str) -> bool {
 pub fn extract_review_issues(output: &str) -> Vec<String> {
     output
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("ISSUE:").map(|s| s.trim().to_string()))
+        .filter_map(|l| {
+            l.trim()
+                .strip_prefix("ISSUE:")
+                .map(|s| s.trim().to_string())
+        })
         .filter(|s| !s.is_empty())
         .collect()
 }
@@ -209,7 +220,7 @@ pub fn is_lgtm(output: &str) -> bool {
 }
 
 /// Check if agent output's last non-empty line is exactly "WAITING".
-/// This means Gemini has not yet re-reviewed after the latest fix commit.
+/// This means the reviewer has not yet re-reviewed after the latest fix commit.
 pub fn is_waiting(output: &str) -> bool {
     last_non_empty_line(output) == Some("WAITING")
 }
@@ -245,9 +256,10 @@ mod tests {
 
     #[test]
     fn test_check_existing_pr() {
-        let p = check_existing_pr(10);
+        let p = check_existing_pr(10, "Gemini", "/gemini review");
         assert!(p.contains("PR #10"));
         assert!(p.contains("LGTM"));
+        assert!(p.contains("/gemini review"));
         assert!(p.contains("PR_URL="));
     }
 
@@ -260,7 +272,7 @@ mod tests {
 
     #[test]
     fn test_review_prompt_with_issue() {
-        let p = review_prompt(Some(5), 10, 2, false);
+        let p = review_prompt(Some(5), 10, 2, false, "Gemini", "/gemini review");
         assert!(p.contains("issue #5"));
         assert!(p.contains("PR #10"));
         assert!(p.contains("medium")); // round 2 includes medium
@@ -268,38 +280,38 @@ mod tests {
 
     #[test]
     fn test_review_prompt_without_issue() {
-        let p = review_prompt(None, 10, 2, false);
+        let p = review_prompt(None, 10, 2, false, "Gemini", "/gemini review");
         assert!(p.contains("PR #10"));
         assert!(!p.contains("issue #")); // no issue reference when None
     }
 
     #[test]
     fn test_review_prompt_late_round_skips_medium() {
-        let p = review_prompt(None, 10, 3, false);
+        let p = review_prompt(None, 10, 3, false, "Gemini", "/gemini review");
         assert!(p.contains("Skip medium"));
     }
 
     #[test]
-    fn test_review_prompt_always_triggers_gemini_review() {
-        let p = review_prompt(None, 10, 2, false);
+    fn test_review_prompt_uses_recheck_command() {
+        let p = review_prompt(None, 10, 2, false, "Gemini", "/gemini review");
         assert!(p.contains("/gemini review"));
-        let p = review_prompt(None, 10, 4, true);
-        assert!(p.contains("/gemini review"));
+        let p = review_prompt(None, 10, 4, true, "ReviewFox", "/reviewfox run");
+        assert!(p.contains("/reviewfox run"));
     }
 
     #[test]
     fn test_review_prompt_prev_fixed_requires_freshness_check() {
-        let p = review_prompt(None, 10, 3, true);
+        let p = review_prompt(None, 10, 3, true, "Gemini", "/gemini review");
         assert!(p.contains("WAITING"));
         assert!(p.contains("latest review was submitted BEFORE the latest commit"));
         // Without prev_fixed, no freshness check
-        let p = review_prompt(None, 10, 3, false);
+        let p = review_prompt(None, 10, 3, false, "Gemini", "/gemini review");
         assert!(!p.contains("WAITING"));
     }
 
     #[test]
     fn test_review_prompt_constraints() {
-        let p = review_prompt(None, 10, 2, false);
+        let p = review_prompt(None, 10, 2, false, "Gemini", "/gemini review");
         assert!(p.contains("NEVER downgrade dependency"));
     }
 
@@ -335,7 +347,10 @@ mod tests {
 
     #[test]
     fn test_extract_pr_number_invalid() {
-        assert_eq!(extract_pr_number("https://github.com/owner/repo/pull/"), None);
+        assert_eq!(
+            extract_pr_number("https://github.com/owner/repo/pull/"),
+            None
+        );
     }
 
     #[test]
@@ -369,7 +384,9 @@ mod tests {
     fn test_is_lgtm_false_positive() {
         // "LGTM" embedded in another word or non-final line should NOT match
         assert!(!is_lgtm("LGTM but actually not done"));
-        assert!(!is_lgtm("I think it looks LGTM but needs one more fix\nFIXED"));
+        assert!(!is_lgtm(
+            "I think it looks LGTM but needs one more fix\nFIXED"
+        ));
         assert!(!is_lgtm("somethingLGTM"));
         assert!(!is_lgtm("notLGTM\n"));
     }
@@ -385,7 +402,10 @@ mod tests {
 
     #[test]
     fn test_agent_review_fix_prompt() {
-        let issues = vec!["Missing error handling".to_string(), "Unbounded loop".to_string()];
+        let issues = vec![
+            "Missing error handling".to_string(),
+            "Unbounded loop".to_string(),
+        ];
         let p = agent_review_fix_prompt(42, &issues, 2);
         assert!(p.contains("PR #42"));
         assert!(p.contains("round 2"));

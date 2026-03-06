@@ -69,7 +69,14 @@ async fn find_existing_pr_for_issue(
 ) -> anyhow::Result<Option<(u64, String)>> {
     let output = Command::new("gh")
         .current_dir(project)
-        .args(["pr", "list", "--search", &format!("#{issue}"), "--state", "open"])
+        .args([
+            "pr",
+            "list",
+            "--search",
+            &format!("#{issue}"),
+            "--state",
+            "open",
+        ])
         .args(["--json", "number,headRefName", "--limit", "1"])
         .output()
         .await
@@ -85,7 +92,10 @@ async fn find_existing_pr_for_issue(
     let items: Vec<GhPrListItem> = serde_json::from_slice(&output.stdout)
         .map_err(|e| anyhow::anyhow!("invalid JSON from `gh pr list`: {e}"))?;
 
-    Ok(items.into_iter().next().map(|item| (item.number, item.head_ref_name)))
+    Ok(items
+        .into_iter()
+        .next()
+        .map(|item| (item.number, item.head_ref_name)))
 }
 
 pub(crate) async fn run_task(
@@ -105,7 +115,9 @@ pub(crate) async fn run_task(
     let first_prompt = if let Some(issue) = req.issue {
         match find_existing_pr_for_issue(&project, issue).await {
             Ok(Some((pr_num, branch))) => {
-                tracing::info!("reusing existing PR #{pr_num} on branch `{branch}` for issue #{issue}");
+                tracing::info!(
+                    "reusing existing PR #{pr_num} on branch `{branch}` for issue #{issue}"
+                );
                 prompts::continue_existing_pr(issue, pr_num, &branch)
             }
             Ok(None) => prompts::implement_from_issue(issue),
@@ -115,7 +127,11 @@ pub(crate) async fn run_task(
             }
         }
     } else if let Some(pr) = req.pr {
-        prompts::check_existing_pr(pr)
+        prompts::check_existing_pr(
+            pr,
+            &review_config.reviewer_name,
+            &review_config.recheck_command,
+        )
     } else {
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default())
     };
@@ -224,7 +240,14 @@ pub(crate) async fn run_task(
         update_status(store, task_id, TaskStatus::Reviewing, round).await;
 
         let review_req = AgentRequest {
-            prompt: prompts::review_prompt(req.issue, pr_num, round, prev_fixed),
+            prompt: prompts::review_prompt(
+                req.issue,
+                pr_num,
+                round,
+                prev_fixed,
+                &review_config.reviewer_name,
+                &review_config.recheck_command,
+            ),
             project_root: project.clone(),
             context: skill_items.clone(),
             ..Default::default()

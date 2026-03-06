@@ -43,6 +43,7 @@ pub async fn fix(
         Some(issue),
         pr_number,
         Some(&pr_url),
+        &config.agents.review,
         wait,
         max_rounds,
     )
@@ -60,7 +61,17 @@ pub async fn loop_pr(
 
     println!("[harness] Starting review loop for PR #{pr}");
 
-    run_review_loop(&agent, &project, None, pr, None, wait, max_rounds).await
+    run_review_loop(
+        &agent,
+        &project,
+        None,
+        pr,
+        None,
+        &config.agents.review,
+        wait,
+        max_rounds,
+    )
+    .await
 }
 
 async fn run_review_loop(
@@ -69,6 +80,7 @@ async fn run_review_loop(
     issue: Option<u64>,
     pr: u64,
     pr_url: Option<&str>,
+    review_config: &harness_core::AgentReviewConfig,
     wait: u64,
     max_rounds: u32,
 ) -> anyhow::Result<()> {
@@ -87,7 +99,14 @@ async fn run_review_loop(
         println!("[harness] Review round {round}/{max_rounds}, PR #{pr}");
 
         let req = AgentRequest {
-            prompt: prompts::review_prompt(issue, pr, round, prev_fixed),
+            prompt: prompts::review_prompt(
+                issue,
+                pr,
+                round,
+                prev_fixed,
+                &review_config.reviewer_name,
+                &review_config.recheck_command,
+            ),
             project_root: project.clone(),
             ..Default::default()
         };
@@ -96,7 +115,10 @@ async fn run_review_loop(
         println!("{}", resp.output);
 
         if prompts::is_waiting(&resp.output) {
-            println!("[harness] Gemini hasn't re-reviewed yet, retrying...");
+            println!(
+                "[harness] {} hasn't re-reviewed yet, retrying...",
+                review_config.reviewer_name
+            );
             continue;
         }
 

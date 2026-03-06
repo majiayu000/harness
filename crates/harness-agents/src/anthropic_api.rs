@@ -8,15 +8,17 @@ pub struct AnthropicApiAgent {
     pub api_key: String,
     pub base_url: String,
     pub default_model: String,
+    pub max_tokens: u32,
     client: reqwest::Client,
 }
 
 impl AnthropicApiAgent {
-    pub fn new(api_key: String, base_url: String, default_model: String) -> Self {
+    pub fn new(api_key: String, base_url: String, default_model: String, max_tokens: u32) -> Self {
         Self {
             api_key,
             base_url,
             default_model,
+            max_tokens,
             client: reqwest::Client::new(),
         }
     }
@@ -68,7 +70,7 @@ impl CodeAgent for AnthropicApiAgent {
 
         let body = MessagesRequest {
             model: model.to_string(),
-            max_tokens: 4096,
+            max_tokens: self.max_tokens,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: req.prompt.clone(),
@@ -84,7 +86,9 @@ impl CodeAgent for AnthropicApiAgent {
             .json(&body)
             .send()
             .await
-            .map_err(|e| harness_core::HarnessError::AgentExecution(format!("API request failed: {e}")))?;
+            .map_err(|e| {
+                harness_core::HarnessError::AgentExecution(format!("API request failed: {e}"))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();

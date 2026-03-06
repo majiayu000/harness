@@ -86,6 +86,10 @@ pub struct AgentReviewConfig {
     /// Agent name to use as reviewer. Empty string = auto-select.
     #[serde(default)]
     pub reviewer_agent: String,
+    #[serde(default = "default_review_reviewer_name")]
+    pub reviewer_name: String,
+    #[serde(default = "default_review_recheck_command")]
+    pub recheck_command: String,
     #[serde(default = "default_max_agent_review_rounds")]
     pub max_rounds: u32,
 }
@@ -95,9 +99,19 @@ impl Default for AgentReviewConfig {
         Self {
             enabled: false,
             reviewer_agent: String::new(),
+            reviewer_name: default_review_reviewer_name(),
+            recheck_command: default_review_recheck_command(),
             max_rounds: default_max_agent_review_rounds(),
         }
     }
+}
+
+fn default_review_reviewer_name() -> String {
+    "Gemini".to_string()
+}
+
+fn default_review_recheck_command() -> String {
+    "/gemini review".to_string()
 }
 
 fn default_max_agent_review_rounds() -> u32 {
@@ -136,6 +150,8 @@ impl Default for CodexAgentConfig {
 pub struct AnthropicApiConfig {
     pub base_url: String,
     pub default_model: String,
+    #[serde(default = "default_anthropic_api_max_tokens")]
+    pub max_tokens: u32,
 }
 
 impl Default for AnthropicApiConfig {
@@ -143,8 +159,13 @@ impl Default for AnthropicApiConfig {
         Self {
             base_url: "https://api.anthropic.com".to_string(),
             default_model: "claude-sonnet-4-20250514".to_string(),
+            max_tokens: default_anthropic_api_max_tokens(),
         }
     }
+}
+
+fn default_anthropic_api_max_tokens() -> u32 {
+    4096
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,6 +322,8 @@ mod tests {
         let config = AgentReviewConfig::default();
         assert!(!config.enabled);
         assert!(config.reviewer_agent.is_empty());
+        assert_eq!(config.reviewer_name, "Gemini");
+        assert_eq!(config.recheck_command, "/gemini review");
         assert_eq!(config.max_rounds, 3);
     }
 
@@ -309,11 +332,15 @@ mod tests {
         let toml_str = r#"
             enabled = true
             reviewer_agent = "codex"
+            reviewer_name = "ReviewerBot"
+            recheck_command = "/review-bot check"
             max_rounds = 5
         "#;
         let config: AgentReviewConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
         assert_eq!(config.reviewer_agent, "codex");
+        assert_eq!(config.reviewer_name, "ReviewerBot");
+        assert_eq!(config.recheck_command, "/review-bot check");
         assert_eq!(config.max_rounds, 5);
     }
 
@@ -325,6 +352,8 @@ mod tests {
         let config: AgentReviewConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
         assert!(config.reviewer_agent.is_empty());
+        assert_eq!(config.reviewer_name, "Gemini");
+        assert_eq!(config.recheck_command, "/gemini review");
         assert_eq!(config.max_rounds, 3);
     }
 
@@ -340,14 +369,30 @@ mod tests {
             [anthropic_api]
             base_url = "https://api.anthropic.com"
             default_model = "claude-sonnet-4-20250514"
+            max_tokens = 8192
             [review]
             enabled = true
             reviewer_agent = "codex"
+            reviewer_name = "ReviewFox"
+            recheck_command = "/reviewfox run"
             max_rounds = 2
         "#;
         let config: AgentsConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.anthropic_api.max_tokens, 8192);
         assert!(config.review.enabled);
         assert_eq!(config.review.reviewer_agent, "codex");
+        assert_eq!(config.review.reviewer_name, "ReviewFox");
+        assert_eq!(config.review.recheck_command, "/reviewfox run");
         assert_eq!(config.review.max_rounds, 2);
+    }
+
+    #[test]
+    fn anthropic_api_config_defaults_max_tokens_when_missing() {
+        let toml_str = r#"
+            base_url = "https://api.anthropic.com"
+            default_model = "claude-sonnet-4-20250514"
+        "#;
+        let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.max_tokens, 4096);
     }
 }
