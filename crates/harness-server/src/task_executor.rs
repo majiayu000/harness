@@ -115,7 +115,7 @@ pub(crate) async fn run_task(
             }
         }
     } else if let Some(pr) = req.pr {
-        prompts::check_existing_pr(pr)
+        prompts::check_existing_pr(pr, &review_config.review_bot_command)
     } else {
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default())
     };
@@ -224,7 +224,7 @@ pub(crate) async fn run_task(
         update_status(store, task_id, TaskStatus::Reviewing, round).await;
 
         let review_req = AgentRequest {
-            prompt: prompts::review_prompt(req.issue, pr_num, round, prev_fixed),
+            prompt: prompts::review_prompt(req.issue, pr_num, round, prev_fixed, &review_config.review_bot_command),
             project_root: project.clone(),
             context: skill_items.clone(),
             ..Default::default()

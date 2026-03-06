@@ -33,14 +33,14 @@ pub fn implement_from_issue(issue: u64) -> String {
 }
 
 /// Build prompt: check an existing PR's CI and review status.
-pub fn check_existing_pr(pr: u64) -> String {
+pub fn check_existing_pr(pr: u64, review_bot_command: &str) -> String {
     format!(
         "Check PR #{pr}:\n\
          1. `gh pr checks {pr}` — check CI status\n\
          2. `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/comments` — read inline review comments\n\
          3. If CI passes and there are no unresolved review comments, print LGTM on the last line\n\
          4. Otherwise fix each comment, commit, push, \
-         then run `gh pr comment {pr} --body '/gemini review'` to trigger re-review, \
+         then run `gh pr comment {pr} --body '{review_bot_command}'` to trigger re-review, \
          and print FIXED on the last line\n\n\
          Always print PR_URL=https://github.com/{{owner}}/{{repo}}/pull/{pr} on a separate line of your output."
     )
@@ -72,7 +72,13 @@ pub fn implement_from_prompt(prompt: &str) -> String {
 /// When `prev_fixed` is true (previous round pushed code), the agent must first
 /// verify that Gemini has submitted a **new** review covering the latest commit
 /// before declaring LGTM. If no new review exists yet, agent outputs WAITING.
-pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32, prev_fixed: bool) -> String {
+pub fn review_prompt(
+    issue: Option<u64>,
+    pr: u64,
+    round: u32,
+    prev_fixed: bool,
+    review_bot_command: &str,
+) -> String {
     let context = match issue {
         Some(n) => format!("You previously created PR #{pr} for issue #{n}.\n"),
         None => format!("Review PR #{pr}.\n"),
@@ -86,7 +92,7 @@ pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32, prev_fixed: bool) 
     };
 
     let push_action = format!(
-        "commit, push, then run `gh pr comment {pr} --body '/gemini review'` \
+        "commit, push, then run `gh pr comment {pr} --body '{review_bot_command}'` \
          to trigger re-review on the new code"
     );
 
@@ -245,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_check_existing_pr() {
-        let p = check_existing_pr(10);
+        let p = check_existing_pr(10, "/gemini review");
         assert!(p.contains("PR #10"));
         assert!(p.contains("LGTM"));
         assert!(p.contains("PR_URL="));
@@ -260,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_review_prompt_with_issue() {
-        let p = review_prompt(Some(5), 10, 2, false);
+        let p = review_prompt(Some(5), 10, 2, false, "/gemini review");
         assert!(p.contains("issue #5"));
         assert!(p.contains("PR #10"));
         assert!(p.contains("medium")); // round 2 includes medium
@@ -268,38 +274,47 @@ mod tests {
 
     #[test]
     fn test_review_prompt_without_issue() {
-        let p = review_prompt(None, 10, 2, false);
+        let p = review_prompt(None, 10, 2, false, "/gemini review");
         assert!(p.contains("PR #10"));
         assert!(!p.contains("issue #")); // no issue reference when None
     }
 
     #[test]
     fn test_review_prompt_late_round_skips_medium() {
-        let p = review_prompt(None, 10, 3, false);
+        let p = review_prompt(None, 10, 3, false, "/gemini review");
         assert!(p.contains("Skip medium"));
     }
 
     #[test]
-    fn test_review_prompt_always_triggers_gemini_review() {
-        let p = review_prompt(None, 10, 2, false);
+    #[test]
+    fn test_review_prompt_uses_configured_review_bot_command() {
+        let p = review_prompt(None, 10, 2, false, "/gemini review");
         assert!(p.contains("/gemini review"));
-        let p = review_prompt(None, 10, 4, true);
+        let p = review_prompt(None, 10, 2, false, "/reviewbot run");
+        assert!(p.contains("/reviewbot run"));
+        assert!(!p.contains("/gemini"));
+    }
+
+    fn test_review_prompt_always_triggers_gemini_review() {
+        let p = review_prompt(None, 10, 2, false, "/gemini review");
+        assert!(p.contains("/gemini review"));
+        let p = review_prompt(None, 10, 4, true, "/gemini review");
         assert!(p.contains("/gemini review"));
     }
 
     #[test]
     fn test_review_prompt_prev_fixed_requires_freshness_check() {
-        let p = review_prompt(None, 10, 3, true);
+        let p = review_prompt(None, 10, 3, true, "/gemini review");
         assert!(p.contains("WAITING"));
         assert!(p.contains("latest review was submitted BEFORE the latest commit"));
         // Without prev_fixed, no freshness check
-        let p = review_prompt(None, 10, 3, false);
+        let p = review_prompt(None, 10, 3, false, "/gemini review");
         assert!(!p.contains("WAITING"));
     }
 
     #[test]
     fn test_review_prompt_constraints() {
-        let p = review_prompt(None, 10, 2, false);
+        let p = review_prompt(None, 10, 2, false, "/gemini review");
         assert!(p.contains("NEVER downgrade dependency"));
     }
 

@@ -143,19 +143,27 @@ impl CodeAgent for AnthropicApiAgent {
         tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::Result<()> {
         let resp = self.execute(req).await?;
-        let _ = tx
-            .send(StreamItem::ItemCompleted {
+        crate::streaming::send_stream_item(
+            &tx,
+            StreamItem::ItemCompleted {
                 item: Item::AgentReasoning {
                     content: resp.output.clone(),
                 },
-            })
-            .await;
-        let _ = tx
-            .send(StreamItem::TokenUsage {
+            },
+            self.name(),
+            "item_completed",
+        )
+        .await?;
+        crate::streaming::send_stream_item(
+            &tx,
+            StreamItem::TokenUsage {
                 usage: resp.token_usage,
-            })
-            .await;
-        let _ = tx.send(StreamItem::Done).await;
+            },
+            self.name(),
+            "token_usage",
+        )
+        .await?;
+        crate::streaming::send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
     }
 }
