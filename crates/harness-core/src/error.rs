@@ -50,8 +50,12 @@ pub enum HarnessError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+
     #[error("{0}")]
     Other(String),
 }
 
+pub type Error = HarnessError;
 pub type Result<T> = std::result::Result<T, HarnessError>;
