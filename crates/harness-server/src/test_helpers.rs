@@ -1,7 +1,7 @@
 use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
 use harness_agents::AgentRegistry;
 use harness_core::HarnessConfig;
-use std::sync::{atomic::AtomicU64, Arc};
+use std::sync::{atomic::{AtomicBool, AtomicU64}, Arc};
 use tokio::sync::{broadcast, RwLock};
 
 pub async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
@@ -46,5 +46,6 @@ pub async fn make_test_state_with_registry(
         notification_lagged_total: Arc::new(AtomicU64::new(0)),
         notification_lag_log_every: 1,
         notify_tx: None,
+        initialized: Arc::new(AtomicBool::new(true)),
     })
 }

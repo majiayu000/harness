@@ -102,6 +102,10 @@ impl<'de> Deserialize<'de> for RpcRequest {
 
         let RawRpcRequest { jsonrpc, id, method, params } = RawRpcRequest::deserialize(deserializer)?;
 
+        // Normalize slash-style method names to snake_case for serde:
+        // "thread/start" -> "thread_start", "exec_plan/init" -> "exec_plan_init"
+        let method = method.replace('/', "_");
+
         let method = if method == "initialized" {
             if let Some(p) = &params {
                 let is_valid = p.is_null() || p.as_object().is_some_and(|m| m.is_empty());
@@ -162,6 +166,51 @@ impl RpcResponse {
                 message: message.into(),
                 data: None,
             }),
+        }
+    }
+}
+
+impl Method {
+    /// Returns the canonical slash-style method name (e.g. `"thread/start"`).
+    pub fn method_name(&self) -> &'static str {
+        match self {
+            Self::Initialize => "initialize",
+            Self::Initialized => "initialized",
+            Self::ThreadStart { .. } => "thread/start",
+            Self::ThreadResume { .. } => "thread/resume",
+            Self::ThreadFork { .. } => "thread/fork",
+            Self::ThreadList => "thread/list",
+            Self::ThreadDelete { .. } => "thread/delete",
+            Self::ThreadCompact { .. } => "thread/compact",
+            Self::TurnStart { .. } => "turn/start",
+            Self::TurnSteer { .. } => "turn/steer",
+            Self::TurnCancel { .. } => "turn/cancel",
+            Self::TurnStatus { .. } => "turn/status",
+            Self::GcRun { .. } => "gc/run",
+            Self::GcStatus => "gc/status",
+            Self::GcDrafts { .. } => "gc/drafts",
+            Self::GcAdopt { .. } => "gc/adopt",
+            Self::GcReject { .. } => "gc/reject",
+            Self::SkillCreate { .. } => "skill/create",
+            Self::SkillList { .. } => "skill/list",
+            Self::SkillGet { .. } => "skill/get",
+            Self::SkillDelete { .. } => "skill/delete",
+            Self::RuleLoad { .. } => "rule/load",
+            Self::RuleCheck { .. } => "rule/check",
+            Self::ExecPlanInit { .. } => "exec_plan/init",
+            Self::ExecPlanUpdate { .. } => "exec_plan/update",
+            Self::ExecPlanStatus { .. } => "exec_plan/status",
+            Self::EventLog { .. } => "event/log",
+            Self::EventQuery { .. } => "event/query",
+            Self::MetricsCollect { .. } => "metrics/collect",
+            Self::MetricsQuery { .. } => "metrics/query",
+            Self::TaskClassify { .. } => "task/classify",
+            Self::LearnRules { .. } => "learn/rules",
+            Self::LearnSkills { .. } => "learn/skills",
+            Self::HealthCheck { .. } => "health/check",
+            Self::StatsQuery { .. } => "stats/query",
+            Self::Preflight { .. } => "preflight",
+            Self::CrossReview { .. } => "cross_review",
         }
     }
 }
