@@ -45,7 +45,7 @@ pub async fn metrics_collect(
         let rules = state.rules.read().await;
         rules.scan(&project_root).await.unwrap_or_default()
     };
-    crate::handlers::persist_violations(&state.events, &project_root, &violations);
+    state.events.persist_rule_scan(&project_root, &violations);
 
     let evts = match state.events.query(&harness_core::EventFilters::default()) {
         Ok(e) => e,

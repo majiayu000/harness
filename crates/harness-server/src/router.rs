@@ -734,7 +734,7 @@ mod tests {
                 severity: harness_core::Severity::Low,
             },
         ];
-        crate::handlers::persist_violations(&state.events, &project_root, &violations);
+        state.events.persist_rule_scan(&project_root, &violations);
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
