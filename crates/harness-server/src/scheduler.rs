@@ -34,25 +34,29 @@ impl Scheduler {
         tokio::spawn(async move {
             loop {
                 sleep(health_interval).await;
-                Self::run_health_tick(&health_state).await;
+                if let Err(err) = Self::run_health_tick(&health_state).await {
+                    tracing::error!("scheduler: periodic health tick failed: {err}");
+                }
             }
         });
     }
 
-    async fn run_health_tick(state: &AppState) {
+    async fn run_health_tick(state: &AppState) -> anyhow::Result<()> {
         // Query historical events before persisting the current scan to avoid the
         // just-persisted rule_check events inflating the quality stability score.
-        let events = match state.events.query(&EventFilters::default()) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!("scheduler: failed to query events: {err}");
-                return;
-            }
-        };
+        let events = state
+            .events
+            .query(&EventFilters::default())
+            .map_err(|err| anyhow::anyhow!("failed to query events: {err}"))?;
         let project_root = state.project_root.clone();
         let violations = {
             let rules = state.rules.read().await;
-            rules.scan(&project_root).await.unwrap_or_default()
+            rules.scan(&project_root).await.map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to scan rules for '{}': {err}",
+                    project_root.display()
+                )
+            })?
         };
         state.events.persist_rule_scan(&project_root, &violations);
         let report = generate_health_report(&events, &violations);
@@ -62,6 +66,7 @@ impl Scheduler {
             violations = report.violation_summary.len(),
             "scheduler: periodic health report"
         );
+        Ok(())
     }
 }
 
@@ -70,7 +75,8 @@ mod tests {
     use super::*;
     use crate::{server::HarnessServer, thread_manager::ThreadManager};
     use harness_agents::AgentRegistry;
-    use harness_core::{EventFilters, Grade, HarnessConfig};
+    use harness_core::{EventFilters, Grade, GuardId, HarnessConfig, Language};
+    use harness_rules::engine::Guard;
     use std::{path::Path, sync::Arc};
     use tokio::sync::RwLock;
 
@@ -112,6 +118,16 @@ mod tests {
         }))
     }
 
+    async fn register_failing_guard(state: &AppState) {
+        let mut rules = state.rules.write().await;
+        rules.register_guard(Guard {
+            id: GuardId::from_str("FAIL-SCAN-GUARD"),
+            script_path: std::path::PathBuf::from("fail\0scan.sh"),
+            language: Language::Common,
+            rules: vec![],
+        });
+    }
+
     #[test]
     fn from_grade_d_returns_1h_gc_interval() {
         let s = Scheduler::from_grade(Grade::D);
@@ -147,7 +163,7 @@ mod tests {
         let cwd = std::env::current_dir()?;
         assert_ne!(cwd, project_root.path());
 
-        Scheduler::run_health_tick(&state).await;
+        Scheduler::run_health_tick(&state).await?;
 
         let events = state.events.query(&EventFilters::default())?;
         let scan = events
@@ -158,6 +174,30 @@ mod tests {
         let expected_root = project_root.path().display().to_string();
         assert_eq!(scan.detail.as_deref(), Some(expected_root.as_str()));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_tick_returns_error_when_scan_fails() -> anyhow::Result<()> {
+        let data_dir = tempfile::tempdir()?;
+        let project_root = tempfile::tempdir()?;
+        let state = make_test_state(data_dir.path(), project_root.path()).await?;
+        register_failing_guard(&state).await;
+
+        let error = Scheduler::run_health_tick(&state)
+            .await
+            .expect_err("expected scan failure to be surfaced");
+        let message = error.to_string();
+        assert!(
+            message.contains("failed to scan rules"),
+            "unexpected scheduler scan failure message: {message}"
+        );
+
+        let events = state.events.query(&EventFilters::default())?;
+        assert!(
+            events.iter().all(|event| event.hook != "rule_scan"),
+            "scan failure should not persist a rule_scan event"
+        );
         Ok(())
     }
 }

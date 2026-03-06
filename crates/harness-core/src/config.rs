@@ -154,6 +154,10 @@ pub struct AnthropicApiConfig {
     pub max_tokens: u32,
 }
 
+fn default_anthropic_api_max_tokens() -> u32 {
+    4096
+}
+
 impl Default for AnthropicApiConfig {
     fn default() -> Self {
         Self {
@@ -162,10 +166,6 @@ impl Default for AnthropicApiConfig {
             max_tokens: default_anthropic_api_max_tokens(),
         }
     }
-}
-
-fn default_anthropic_api_max_tokens() -> u32 {
-    4096
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,7 +369,6 @@ mod tests {
             [anthropic_api]
             base_url = "https://api.anthropic.com"
             default_model = "claude-sonnet-4-20250514"
-            max_tokens = 8192
             [review]
             enabled = true
             reviewer_agent = "codex"
@@ -378,12 +377,26 @@ mod tests {
             max_rounds = 2
         "#;
         let config: AgentsConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.anthropic_api.max_tokens, 8192);
         assert!(config.review.enabled);
         assert_eq!(config.review.reviewer_agent, "codex");
         assert_eq!(config.review.reviewer_name, "ReviewFox");
         assert_eq!(config.review.recheck_command, "/reviewfox run");
         assert_eq!(config.review.max_rounds, 2);
+        assert_eq!(
+            config.anthropic_api.max_tokens,
+            default_anthropic_api_max_tokens()
+        );
+    }
+
+    #[test]
+    fn anthropic_api_config_deserializes_configured_max_tokens() {
+        let toml_str = r#"
+            base_url = "https://api.anthropic.com"
+            default_model = "claude-sonnet-4-20250514"
+            max_tokens = 8192
+        "#;
+        let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.max_tokens, 8192);
     }
 
     #[test]
@@ -393,6 +406,6 @@ mod tests {
             default_model = "claude-sonnet-4-20250514"
         "#;
         let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.max_tokens, 4096);
+        assert_eq!(config.max_tokens, default_anthropic_api_max_tokens());
     }
 }
