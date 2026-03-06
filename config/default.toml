@@ -17,6 +17,7 @@ default_model = "sonnet"
 
 [agents.codex]
 cli_path = "codex"
+approval_policy = "suggest" # suggest | auto-edit | full-auto
 
 [agents.anthropic_api]
 base_url = "https://api.anthropic.com"

@@ -130,12 +130,29 @@ impl Default for ClaudeAgentConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexAgentConfig {
     pub cli_path: PathBuf,
+    #[serde(default)]
+    pub approval_policy: CodexApprovalPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexApprovalPolicy {
+    Suggest,
+    AutoEdit,
+    FullAuto,
+}
+
+impl Default for CodexApprovalPolicy {
+    fn default() -> Self {
+        Self::Suggest
+    }
 }
 
 impl Default for CodexAgentConfig {
     fn default() -> Self {
         Self {
             cli_path: PathBuf::from("codex"),
+            approval_policy: CodexApprovalPolicy::default(),
         }
     }
 }
@@ -389,5 +406,21 @@ mod tests {
         "#;
         let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.max_tokens, default_anthropic_api_max_tokens());
+    }
+
+    #[test]
+    fn codex_agent_config_defaults_to_suggest_policy() {
+        let config = CodexAgentConfig::default();
+        assert_eq!(config.approval_policy, CodexApprovalPolicy::Suggest);
+    }
+
+    #[test]
+    fn codex_agent_config_deserializes_approval_policy() {
+        let toml_str = r#"
+            cli_path = "codex"
+            approval_policy = "full-auto"
+        "#;
+        let config: CodexAgentConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.approval_policy, CodexApprovalPolicy::FullAuto);
     }
 }
