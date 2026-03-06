@@ -4,14 +4,38 @@ use harness_protocol::{Method, RpcRequest, RpcResponse};
 
 /// Route a JSON-RPC request to the appropriate handler.
 pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResponse> {
+    use std::sync::atomic::Ordering;
+
     let id = req.id.clone();
+
+    // Handshake gate: only Initialize and Initialized are allowed before handshake.
+    match &req.method {
+        Method::Initialize | Method::Initialized => {}
+        _ if !state.initialized.load(Ordering::Relaxed) => {
+            return Some(RpcResponse::error(
+                id,
+                harness_protocol::INVALID_REQUEST,
+                "Server not initialized. Send 'initialize' first.",
+            ));
+        }
+        _ => {}
+    }
 
     match req.method {
         // === Initialization ===
-        Method::Initialize => Some(handlers::thread::initialize(id).await),
+        Method::Initialize => {
+            if state.initialized.load(Ordering::Relaxed) {
+                return Some(RpcResponse::error(
+                    id,
+                    harness_protocol::INVALID_REQUEST,
+                    "Server already initialized.",
+                ));
+            }
+            Some(handlers::thread::initialize(id).await)
+        }
         Method::Initialized => {
+            state.initialized.store(true, Ordering::Relaxed);
             handlers::thread::initialized().await;
-            // `initialized` is a notification in JSON-RPC (no response when `id` is absent).
             if id.is_none() {
                 None
             } else {
@@ -206,6 +230,7 @@ mod tests {
             notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             notification_lag_log_every: 1,
             notify_tx: None,
+            initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
@@ -255,7 +280,9 @@ mod tests {
     #[tokio::test]
     async fn initialize_then_initialized_succeeds() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let state = make_test_state(dir.path()).await?;
+        let mut state = make_test_state(dir.path()).await?;
+        // Start uninitialised to test the full handshake.
+        state.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Step 1: initialize
         let init_req = RpcRequest {
@@ -818,6 +845,86 @@ mod tests {
             .await?
             .expect("thread should be in DB");
         assert_eq!(thread.project_root, canonical_proj);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pre_init_request_rejected() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut state = make_test_state(dir.path()).await?;
+        state.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::ThreadList,
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("should return error response");
+        assert!(resp.error.is_some(), "pre-init request should be rejected");
+        assert_eq!(resp.error.unwrap().code, harness_protocol::INVALID_REQUEST);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn double_initialize_rejected() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+        // state.initialized is already true from make_test_state
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::Initialize,
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("should return error response");
+        assert!(resp.error.is_some(), "double init should be rejected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handshake_unlocks_methods() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut state = make_test_state(dir.path()).await?;
+        state.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Before handshake: ThreadList rejected
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::ThreadList,
+        };
+        let resp = handle_request(&state, req).await.unwrap();
+        assert!(resp.error.is_some());
+
+        // Initialize
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(2)),
+            method: Method::Initialize,
+        };
+        let resp = handle_request(&state, req).await.unwrap();
+        assert!(resp.error.is_none(), "initialize should succeed");
+
+        // Initialized (complete handshake)
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Method::Initialized,
+        };
+        handle_request(&state, req).await;
+
+        // After handshake: ThreadList works
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(3)),
+            method: Method::ThreadList,
+        };
+        let resp = handle_request(&state, req).await.unwrap();
+        assert!(resp.error.is_none(), "post-init request should work");
         Ok(())
     }
 }

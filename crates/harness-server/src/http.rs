@@ -9,7 +9,7 @@ use axum::{
 use harness_protocol::{RpcNotification, RpcRequest};
 use serde_json::json;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
@@ -34,6 +34,8 @@ pub struct AppState {
     pub notification_lag_log_every: u64,
     /// Channel for server-push JSON-RPC notifications (stdio transport only).
     pub notify_tx: Option<crate::notify::NotifySender>,
+    /// Whether the client has completed the initialize/initialized handshake.
+    pub initialized: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -154,6 +156,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         notification_lagged_total: Arc::new(AtomicU64::new(0)),
         notification_lag_log_every,
         notify_tx: None,
+        initialized: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -366,6 +369,7 @@ mod tests {
             notification_lagged_total: Arc::new(AtomicU64::new(0)),
             notification_lag_log_every: 1,
             notify_tx: None,
+            initialized: Arc::new(AtomicBool::new(true)),
         }))
     }
 

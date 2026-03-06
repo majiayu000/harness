@@ -220,6 +220,7 @@ mod tests {
             notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             notification_lag_log_every,
             notify_tx: None,
+            initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
@@ -266,7 +267,9 @@ mod tests {
     #[tokio::test]
     async fn websocket_initialize_roundtrip() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let state = Arc::new(make_test_state(dir.path()).await?);
+        let mut state = make_test_state(dir.path()).await?;
+        state.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state = Arc::new(state);
 
         let listener = match bind_ws_test_listener().await? {
             Some(listener) => listener,

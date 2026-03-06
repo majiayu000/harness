@@ -127,6 +127,7 @@ mod tests {
             notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             notification_lag_log_every: 1,
             notify_tx: None,
+            initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
@@ -151,7 +152,8 @@ mod tests {
     #[tokio::test]
     async fn stdio_processes_initialize_then_initialized() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let state = make_test_state(dir.path()).await?;
+        let mut state = make_test_state(dir.path()).await?;
+        state.initialized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let init_line = serde_json::to_string(&RpcRequest {
             jsonrpc: "2.0".to_string(),
