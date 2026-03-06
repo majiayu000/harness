@@ -1,6 +1,6 @@
 use crate::task_db::TaskDb;
 use dashmap::DashMap;
-use harness_core::{CodeAgent, Decision, Event, SessionId};
+use harness_core::{CodeAgent, Decision, Event, ReviewConfig, SessionId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -249,6 +249,7 @@ pub async fn spawn_task(
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
     interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
+    review: ReviewConfig,
     req: CreateTaskRequest,
 ) -> TaskId {
     spawn_task_with_worktree_detector(
@@ -257,6 +258,7 @@ pub async fn spawn_task(
         skills,
         events,
         interceptors,
+        review,
         req,
         detect_main_worktree,
     )
@@ -269,6 +271,7 @@ async fn spawn_task_with_worktree_detector<F>(
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
     interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
+    review: ReviewConfig,
     req: CreateTaskRequest,
     detect_worktree: F,
 ) -> TaskId
@@ -285,9 +288,11 @@ where
     let id_watcher = id.clone();
     let interceptors = Arc::new(interceptors);
     let detect_worktree = Arc::new(detect_worktree);
+    let review = Arc::new(review);
 
     let handle = tokio::spawn(async move {
         let detect_worktree = detect_worktree.clone();
+        let review = review.clone();
         let raw_project =
             resolve_project_root_with(req.project.clone(), move || detect_worktree()).await?;
         let project = crate::handlers::validate_project_root(&raw_project)
@@ -300,6 +305,7 @@ where
             events,
             interceptors,
             &req,
+            review.as_ref(),
             project,
         )
         .await
@@ -478,7 +484,16 @@ mod tests {
         };
 
         let events = Arc::new(harness_observe::EventStore::new(dir.path())?);
-        spawn_task(store, agent_clone, skills, events, vec![], req).await;
+        spawn_task(
+            store,
+            agent_clone,
+            skills,
+            events,
+            vec![],
+            ReviewConfig::default(),
+            req,
+        )
+        .await;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -536,7 +551,16 @@ mod tests {
             turn_timeout_secs: 30,
         };
 
-        let task_id = spawn_task(store.clone(), agent, skills, events, interceptors, req).await;
+        let task_id = spawn_task(
+            store.clone(),
+            agent,
+            skills,
+            events,
+            interceptors,
+            ReviewConfig::default(),
+            req,
+        )
+        .await;
 
         // Allow async task to complete.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -649,6 +673,7 @@ mod tests {
             skills,
             events.clone(),
             vec![],
+            ReviewConfig::default(),
             req,
             || -> PathBuf {
                 panic!("forced detect_main_worktree panic");

@@ -106,6 +106,7 @@ pub async fn gc_adopt(
                     state.skills.clone(),
                     state.events.clone(),
                     state.interceptors.clone(),
+                    state.server.config.review.clone(),
                     req,
                 )
                 .await;

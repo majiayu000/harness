@@ -1,5 +1,5 @@
 use harness_agents::claude::ClaudeCodeAgent;
-use harness_core::{prompts, AgentRequest, CodeAgent, HarnessConfig};
+use harness_core::{prompts, AgentRequest, CodeAgent, HarnessConfig, ReviewConfig};
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
 
@@ -40,6 +40,7 @@ pub async fn fix(
     run_review_loop(
         &agent,
         &project,
+        &config.review,
         Some(issue),
         pr_number,
         Some(&pr_url),
@@ -60,12 +61,23 @@ pub async fn loop_pr(
 
     println!("[harness] Starting review loop for PR #{pr}");
 
-    run_review_loop(&agent, &project, None, pr, None, wait, max_rounds).await
+    run_review_loop(
+        &agent,
+        &project,
+        &config.review,
+        None,
+        pr,
+        None,
+        wait,
+        max_rounds,
+    )
+    .await
 }
 
 async fn run_review_loop(
     agent: &impl CodeAgent,
     project: &PathBuf,
+    review: &ReviewConfig,
     issue: Option<u64>,
     pr: u64,
     pr_url: Option<&str>,
@@ -87,7 +99,7 @@ async fn run_review_loop(
         println!("[harness] Review round {round}/{max_rounds}, PR #{pr}");
 
         let req = AgentRequest {
-            prompt: prompts::review_prompt(issue, pr, round, prev_fixed),
+            prompt: prompts::review_prompt(issue, pr, round, prev_fixed, review),
             project_root: project.clone(),
             ..Default::default()
         };
@@ -96,7 +108,10 @@ async fn run_review_loop(
         println!("{}", resp.output);
 
         if prompts::is_waiting(&resp.output) {
-            println!("[harness] Gemini hasn't re-reviewed yet, retrying...");
+            println!(
+                "[harness] {} hasn't re-reviewed yet, retrying...",
+                review.reviewer_name
+            );
             continue;
         }
 

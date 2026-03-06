@@ -234,6 +234,7 @@ async fn create_task(
         state.skills.clone(),
         state.events.clone(),
         state.interceptors.clone(),
+        state.server.config.review.clone(),
         req,
     )
     .await;

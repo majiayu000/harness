@@ -238,6 +238,23 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     serve_config.agents.claude.default_model.clone(),
                 )),
             );
+            if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+                agent_registry.register(
+                    "anthropic-api",
+                    Arc::new(
+                        harness_agents::anthropic_api::AnthropicApiAgent::new_with_max_tokens(
+                            api_key,
+                            serve_config.agents.anthropic_api.base_url.clone(),
+                            serve_config.agents.anthropic_api.default_model.clone(),
+                            serve_config.agents.anthropic_api.max_tokens,
+                        ),
+                    ),
+                );
+            } else {
+                tracing::info!(
+                    "ANTHROPIC_API_KEY is not set; skipping anthropic-api agent registration"
+                );
+            }
             let server = harness_server::server::HarnessServer::new(
                 serve_config.clone(),
                 thread_manager,

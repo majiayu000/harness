@@ -6,6 +6,8 @@ use std::path::PathBuf;
 pub struct HarnessConfig {
     pub server: ServerConfig,
     pub agents: AgentsConfig,
+    #[serde(default)]
+    pub review: ReviewConfig,
     pub gc: GcConfig,
     pub rules: RulesConfig,
     pub observe: ObserveConfig,
@@ -16,6 +18,7 @@ impl Default for HarnessConfig {
         Self {
             server: ServerConfig::default(),
             agents: AgentsConfig::default(),
+            review: ReviewConfig::default(),
             gc: GcConfig::default(),
             rules: RulesConfig::default(),
             observe: ObserveConfig::default(),
@@ -108,6 +111,8 @@ impl Default for CodexAgentConfig {
 pub struct AnthropicApiConfig {
     pub base_url: String,
     pub default_model: String,
+    #[serde(default = "default_anthropic_api_max_tokens")]
+    pub max_tokens: u32,
 }
 
 impl Default for AnthropicApiConfig {
@@ -115,8 +120,38 @@ impl Default for AnthropicApiConfig {
         Self {
             base_url: "https://api.anthropic.com".to_string(),
             default_model: "claude-sonnet-4-20250514".to_string(),
+            max_tokens: default_anthropic_api_max_tokens(),
         }
     }
+}
+
+fn default_anthropic_api_max_tokens() -> u32 {
+    4096
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    #[serde(default = "default_reviewer_name")]
+    pub reviewer_name: String,
+    #[serde(default = "default_recheck_command")]
+    pub recheck_command: String,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            reviewer_name: default_reviewer_name(),
+            recheck_command: default_recheck_command(),
+        }
+    }
+}
+
+fn default_reviewer_name() -> String {
+    "Gemini".to_string()
+}
+
+fn default_recheck_command() -> String {
+    "/gemini review".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,5 +296,77 @@ mod dirs {
         {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn review_config_defaults_match_gemini_compatibility() {
+        let review = ReviewConfig::default();
+        assert_eq!(review.reviewer_name, "Gemini");
+        assert_eq!(review.recheck_command, "/gemini review");
+    }
+
+    #[test]
+    fn deserialize_without_new_review_fields_keeps_defaults() {
+        let raw = json!({
+            "server": {
+                "transport": "stdio",
+                "http_addr": "127.0.0.1:9800",
+                "data_dir": ".",
+                "project_root": ".",
+                "notification_broadcast_capacity": 256,
+                "notification_lag_log_every": 1
+            },
+            "agents": {
+                "default_agent": "claude",
+                "claude": {
+                    "cli_path": "claude",
+                    "default_model": "sonnet"
+                },
+                "codex": {
+                    "cli_path": "codex"
+                },
+                "anthropic_api": {
+                    "base_url": "https://api.anthropic.com",
+                    "default_model": "claude-sonnet-4-20250514"
+                }
+            },
+            "gc": {
+                "max_drafts_per_run": 5,
+                "budget_per_signal_usd": 0.5,
+                "total_budget_usd": 5.0,
+                "adopt_wait_secs": 120,
+                "adopt_max_rounds": 3,
+                "adopt_turn_timeout_secs": 600,
+                "signal_thresholds": {
+                    "repeated_warn_min": 10,
+                    "chronic_block_min": 5,
+                    "hot_file_edits_min": 20,
+                    "slow_op_threshold_ms": 5000,
+                    "slow_op_count_min": 10,
+                    "escalation_ratio": 1.5,
+                    "violation_min": 5
+                }
+            },
+            "rules": {
+                "discovery_paths": [],
+                "builtin_path": null
+            },
+            "observe": {
+                "db_path": "./harness.db",
+                "session_renewal_secs": 1800,
+                "log_retention_days": 90
+            }
+        });
+
+        let parsed: HarnessConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.review.reviewer_name, "Gemini");
+        assert_eq!(parsed.review.recheck_command, "/gemini review");
+        assert_eq!(parsed.agents.anthropic_api.max_tokens, 4096);
     }
 }
