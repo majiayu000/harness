@@ -88,6 +88,9 @@ pub struct AgentReviewConfig {
     pub reviewer_agent: String,
     #[serde(default = "default_max_agent_review_rounds")]
     pub max_rounds: u32,
+    /// Command to trigger review bot re-review (e.g. "/gemini review", "/reviewbot run").
+    #[serde(default = "default_review_bot_command")]
+    pub review_bot_command: String,
 }
 
 impl Default for AgentReviewConfig {
@@ -96,8 +99,13 @@ impl Default for AgentReviewConfig {
             enabled: false,
             reviewer_agent: String::new(),
             max_rounds: default_max_agent_review_rounds(),
+            review_bot_command: default_review_bot_command(),
         }
     }
+}
+
+fn default_review_bot_command() -> String {
+    "/gemini review".to_string()
 }
 
 fn default_max_agent_review_rounds() -> u32 {
