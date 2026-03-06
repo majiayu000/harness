@@ -30,7 +30,7 @@ impl CodeAgent for CodexAgent {
         let mut cmd = Command::new(&self.cli_path);
         cmd.arg("exec")
             .arg("--skip-git-repo-check")
-            .arg("-a")
+            .arg("-s")
             .arg("read-only")
             .arg("-C")
             .arg(&req.project_root)
