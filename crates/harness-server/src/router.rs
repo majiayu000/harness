@@ -462,7 +462,10 @@ mod tests {
     }
 
     async fn run_gc_adopt_and_wait_for_failure_turn(max_rounds: u32) -> anyhow::Result<u32> {
-        let dir = tempfile::tempdir()?;
+        let home = writable_home();
+        let dir = tempfile::Builder::new()
+            .prefix("harness-gc-test-")
+            .tempdir_in(&home)?;
         let mut config = HarnessConfig::default();
         config.gc.adopt_wait_secs = 0;
         config.gc.adopt_max_rounds = max_rounds;

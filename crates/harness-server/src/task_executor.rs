@@ -92,6 +92,8 @@ pub(crate) async fn run_task(
     store: &TaskStore,
     task_id: &TaskId,
     agent: &dyn CodeAgent,
+    reviewer: Option<&dyn CodeAgent>,
+    review_config: &harness_core::AgentReviewConfig,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
     interceptors: Arc<Vec<Arc<dyn TurnInterceptor>>>,
@@ -186,6 +188,28 @@ pub(crate) async fn run_task(
             return Ok(());
         }
     };
+
+    // Agent review phase: independent reviewer evaluates PR diff before GitHub review
+    if review_config.enabled {
+        if let Some(reviewer) = reviewer {
+            run_agent_review(
+                store,
+                task_id,
+                agent,
+                reviewer,
+                review_config,
+                &skill_items,
+                &project,
+                &interceptors,
+                turn_timeout,
+                pr_num,
+                &events,
+            )
+            .await?;
+        } else {
+            tracing::info!("agent review enabled but no reviewer available, skipping");
+        }
+    }
 
     // Review loop: Turn 2..N
     let last_review_round = req.max_rounds.saturating_add(1);
@@ -297,6 +321,143 @@ pub(crate) async fn run_task(
         ));
     })
     .await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_review(
+    store: &TaskStore,
+    task_id: &TaskId,
+    agent: &dyn CodeAgent,
+    reviewer: &dyn CodeAgent,
+    review_config: &harness_core::AgentReviewConfig,
+    skill_items: &[ContextItem],
+    project: &Path,
+    interceptors: &[Arc<dyn TurnInterceptor>],
+    turn_timeout: Duration,
+    pr_num: u64,
+    events: &harness_observe::EventStore,
+) -> anyhow::Result<()> {
+    let max_rounds = review_config.max_rounds;
+    for agent_round in 1..=max_rounds {
+        update_status(store, task_id, TaskStatus::AgentReview, agent_round).await;
+
+        // Reviewer evaluates the PR diff
+        let review_req = AgentRequest {
+            prompt: prompts::agent_review_prompt(pr_num, agent_round),
+            project_root: project.to_path_buf(),
+            context: skill_items.to_vec(),
+            ..Default::default()
+        };
+        let review_req = run_pre_execute(interceptors, review_req).await?;
+
+        let resp = tokio::time::timeout(turn_timeout, reviewer.execute(review_req.clone())).await;
+        let resp = match resp {
+            Ok(Ok(r)) => {
+                run_post_execute(interceptors, &review_req, &r).await;
+                r
+            }
+            Ok(Err(e)) => {
+                run_on_error(interceptors, &review_req, &e.to_string()).await;
+                return Err(e.into());
+            }
+            Err(_) => {
+                let msg = format!(
+                    "Agent review round {agent_round} timed out after {}s",
+                    turn_timeout.as_secs()
+                );
+                run_on_error(interceptors, &review_req, &msg).await;
+                return Err(anyhow::anyhow!("{msg}"));
+            }
+        };
+
+        let approved = prompts::is_approved(&resp.output);
+        let issues = prompts::extract_review_issues(&resp.output);
+
+        mutate_and_persist(store, task_id, |s| {
+            s.rounds.push(RoundResult {
+                turn: 0, // agent review rounds use turn 0
+                action: "agent_review".into(),
+                result: if approved {
+                    "approved".into()
+                } else {
+                    format!("{} issues", issues.len())
+                },
+            });
+        })
+        .await;
+
+        // Log agent_review event
+        let mut ev = harness_core::Event::new(
+            harness_core::SessionId::new(),
+            "agent_review",
+            "task_runner",
+            if approved {
+                harness_core::Decision::Complete
+            } else {
+                harness_core::Decision::Warn
+            },
+        );
+        ev.detail = Some(format!("pr={pr_num}"));
+        ev.reason = Some(if approved {
+            format!("round {agent_round}: approved")
+        } else {
+            format!("round {agent_round}: {} issues", issues.len())
+        });
+        if let Err(e) = events.log(&ev) {
+            tracing::warn!("failed to log agent_review event: {e}");
+        }
+
+        if approved || issues.is_empty() {
+            tracing::info!("agent review approved at round {agent_round}");
+            break;
+        }
+
+        if agent_round == max_rounds {
+            tracing::info!(
+                "agent review exhausted {max_rounds} rounds, proceeding to GitHub review"
+            );
+            break;
+        }
+
+        // Implementor fixes the issues
+        let fix_req = AgentRequest {
+            prompt: prompts::agent_review_fix_prompt(pr_num, &issues, agent_round),
+            project_root: project.to_path_buf(),
+            context: skill_items.to_vec(),
+            ..Default::default()
+        };
+        let fix_req = run_pre_execute(interceptors, fix_req).await?;
+
+        let fix_resp = tokio::time::timeout(turn_timeout, agent.execute(fix_req.clone())).await;
+        match fix_resp {
+            Ok(Ok(r)) => {
+                run_post_execute(interceptors, &fix_req, &r).await;
+            }
+            Ok(Err(e)) => {
+                run_on_error(interceptors, &fix_req, &e.to_string()).await;
+                return Err(e.into());
+            }
+            Err(_) => {
+                let msg = format!(
+                    "Agent review fix round {agent_round} timed out after {}s",
+                    turn_timeout.as_secs()
+                );
+                run_on_error(interceptors, &fix_req, &msg).await;
+                return Err(anyhow::anyhow!("{msg}"));
+            }
+        }
+
+        mutate_and_persist(store, task_id, |s| {
+            s.rounds.push(RoundResult {
+                turn: 0,
+                action: "agent_review_fix".into(),
+                result: "fixed".into(),
+            });
+        })
+        .await;
+    }
+
     Ok(())
 }
 

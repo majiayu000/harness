@@ -148,6 +148,7 @@ fn status_to_str(s: &TaskStatus) -> &'static str {
     match s {
         TaskStatus::Pending => "pending",
         TaskStatus::Implementing => "implementing",
+        TaskStatus::AgentReview => "agent_review",
         TaskStatus::Waiting => "waiting",
         TaskStatus::Reviewing => "reviewing",
         TaskStatus::Done => "done",
@@ -159,6 +160,7 @@ fn str_to_status(s: &str) -> TaskStatus {
     match s {
         "pending" => TaskStatus::Pending,
         "implementing" => TaskStatus::Implementing,
+        "agent_review" => TaskStatus::AgentReview,
         "waiting" => TaskStatus::Waiting,
         "reviewing" => TaskStatus::Reviewing,
         "done" => TaskStatus::Done,

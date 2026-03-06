@@ -85,7 +85,7 @@ pub async fn run_cross_review(
     let challenger = match challenger {
         None => {
             // Graceful degradation: treat all ISSUE lines as consensus.
-            let consensus_issues = extract_issues(&primary_review);
+            let consensus_issues = harness_core::prompts::extract_review_issues(&primary_review);
             let verdict = verdict_for(&consensus_issues);
             return Ok(CrossReviewResult {
                 primary_review,
@@ -101,7 +101,8 @@ pub async fn run_cross_review(
 
     let mut challenger_review = String::new();
     let mut rounds_done = 1u32;
-    let mut consensus_issues: Vec<String> = extract_issues(&primary_review);
+    let mut consensus_issues: Vec<String> =
+        harness_core::prompts::extract_review_issues(&primary_review);
     let safe_primary = harness_core::prompts::wrap_external_data(&primary_review);
 
     for _ in 0..max_rounds.saturating_sub(1) {
@@ -178,14 +179,6 @@ fn verdict_for(issues: &[String]) -> String {
     } else {
         "NOT_CONVERGED".to_string()
     }
-}
-
-fn extract_issues(output: &str) -> Vec<String> {
-    output
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("ISSUE:").map(|s| s.trim().to_string()))
-        .filter(|s| !s.is_empty())
-        .collect()
 }
 
 fn extract_tagged(output: &str, tag: &str) -> Vec<String> {

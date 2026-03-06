@@ -128,6 +128,55 @@ pub fn review_prompt(issue: Option<u64>, pr: u64, round: u32, prev_fixed: bool) 
     )
 }
 
+/// Build prompt: reviewer agent evaluates a PR diff.
+///
+/// The reviewer reads the diff and outputs either `APPROVED` on the last line
+/// or lists issues prefixed with `ISSUE:`.
+pub fn agent_review_prompt(pr: u64, round: u32) -> String {
+    format!(
+        "You are an independent code reviewer. Review PR #{pr} (agent review round {round}).\n\n\
+         Steps:\n\
+         1. Run `gh pr diff {pr}` to read the full diff\n\
+         2. Check for correctness, safety, and style issues\n\
+         3. If everything looks good, print APPROVED on the last line\n\
+         4. Otherwise, list each issue on its own line prefixed with \"ISSUE: \"\n\n\
+         Constraints:\n\
+         - Focus on correctness and safety, not cosmetic preferences\n\
+         - NEVER downgrade dependency versions\n\
+         - Be specific: reference file names and line numbers"
+    )
+}
+
+/// Build prompt: implementor fixes issues found by the reviewer agent.
+pub fn agent_review_fix_prompt(pr: u64, issues: &[String], round: u32) -> String {
+    let issue_list: String = issues
+        .iter()
+        .enumerate()
+        .map(|(i, issue)| format!("{}. {issue}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "The independent reviewer found the following issues in PR #{pr} \
+         (agent review round {round}):\n\n{issue_list}\n\n\
+         Fix each issue, run cargo check and cargo test, then commit and push.\n\
+         On the last line of your output, print PR_URL=<PR URL>"
+    )
+}
+
+/// Check if agent output indicates approval (last non-empty line is "APPROVED").
+pub fn is_approved(output: &str) -> bool {
+    last_non_empty_line(output) == Some("APPROVED")
+}
+
+/// Extract `ISSUE:` prefixed lines from agent review output.
+pub fn extract_review_issues(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("ISSUE:").map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Parse `PR_URL=<url>` from agent output (searches from last line).
 pub fn parse_pr_url(output: &str) -> Option<String> {
     for line in output.lines().rev() {
@@ -323,5 +372,48 @@ mod tests {
         assert!(!is_lgtm("I think it looks LGTM but needs one more fix\nFIXED"));
         assert!(!is_lgtm("somethingLGTM"));
         assert!(!is_lgtm("notLGTM\n"));
+    }
+
+    #[test]
+    fn test_agent_review_prompt() {
+        let p = agent_review_prompt(42, 1);
+        assert!(p.contains("PR #42"));
+        assert!(p.contains("round 1"));
+        assert!(p.contains("APPROVED"));
+        assert!(p.contains("ISSUE:"));
+    }
+
+    #[test]
+    fn test_agent_review_fix_prompt() {
+        let issues = vec!["Missing error handling".to_string(), "Unbounded loop".to_string()];
+        let p = agent_review_fix_prompt(42, &issues, 2);
+        assert!(p.contains("PR #42"));
+        assert!(p.contains("round 2"));
+        assert!(p.contains("Missing error handling"));
+        assert!(p.contains("Unbounded loop"));
+        assert!(p.contains("PR_URL="));
+    }
+
+    #[test]
+    fn test_is_approved() {
+        assert!(is_approved("looks good\nAPPROVED"));
+        assert!(is_approved("APPROVED\n"));
+        assert!(is_approved("APPROVED"));
+        assert!(!is_approved("APPROVED but with caveats"));
+        assert!(!is_approved("ISSUE: something\nAPPROVED not really"));
+        assert!(!is_approved("LGTM"));
+    }
+
+    #[test]
+    fn test_extract_review_issues() {
+        let output = "Looking at the diff...\nISSUE: Missing error handling\nThis is fine\nISSUE: Unbounded loop\nAPPROVED";
+        let issues = extract_review_issues(output);
+        assert_eq!(issues, vec!["Missing error handling", "Unbounded loop"]);
+    }
+
+    #[test]
+    fn test_extract_review_issues_empty() {
+        assert!(extract_review_issues("APPROVED").is_empty());
+        assert!(extract_review_issues("ISSUE: ").is_empty());
     }
 }

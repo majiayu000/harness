@@ -22,6 +22,11 @@ cli_path = "codex"
 base_url = "https://api.anthropic.com"
 default_model = "claude-sonnet-4-20250514"
 
+[agents.review]
+enabled = false
+reviewer_agent = ""
+max_rounds = 3
+
 [gc]
 max_drafts_per_run = 5
 budget_per_signal_usd = 0.50
