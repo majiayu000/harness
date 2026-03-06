@@ -29,6 +29,20 @@ impl Default for SignalThresholds {
     }
 }
 
+impl From<harness_core::config::SignalThresholds> for SignalThresholds {
+    fn from(t: harness_core::config::SignalThresholds) -> Self {
+        Self {
+            repeated_warn_min: t.repeated_warn_min,
+            chronic_block_min: t.chronic_block_min,
+            hot_file_edits_min: t.hot_file_edits_min,
+            slow_op_threshold_ms: t.slow_op_threshold_ms,
+            slow_op_count_min: t.slow_op_count_min,
+            escalation_ratio: t.escalation_ratio,
+            violation_min: t.violation_min,
+        }
+    }
+}
+
 pub struct SignalDetector {
     thresholds: SignalThresholds,
     project_id: ProjectId,
