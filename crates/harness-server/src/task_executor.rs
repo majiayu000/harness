@@ -120,7 +120,7 @@ pub(crate) async fn run_task(
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default())
     };
 
-    let skill_items: Vec<ContextItem> = {
+    let mut context_items: Vec<ContextItem> = {
         let guard = skills.read().await;
         guard
             .list()
@@ -132,12 +132,20 @@ pub(crate) async fn run_task(
             .collect()
     };
 
+    // Load cascading AGENTS.md files and inject as context
+    let agents_md = harness_core::agents_md::load_agents_md(&project);
+    if !agents_md.is_empty() {
+        context_items.push(ContextItem::AgentsMd {
+            content: agents_md,
+        });
+    }
+
     let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
 
     let initial_req = AgentRequest {
         prompt: first_prompt,
         project_root: project.clone(),
-        context: skill_items.clone(),
+        context: context_items.clone(),
         ..Default::default()
     };
 
@@ -198,7 +206,7 @@ pub(crate) async fn run_task(
                 agent,
                 reviewer,
                 review_config,
-                &skill_items,
+                &context_items,
                 &project,
                 &interceptors,
                 turn_timeout,
@@ -226,7 +234,7 @@ pub(crate) async fn run_task(
         let review_req = AgentRequest {
             prompt: prompts::review_prompt(req.issue, pr_num, round, prev_fixed, &review_config.review_bot_command),
             project_root: project.clone(),
-            context: skill_items.clone(),
+            context: context_items.clone(),
             ..Default::default()
         };
 
@@ -331,7 +339,7 @@ async fn run_agent_review(
     agent: &dyn CodeAgent,
     reviewer: &dyn CodeAgent,
     review_config: &harness_core::AgentReviewConfig,
-    skill_items: &[ContextItem],
+    context_items: &[ContextItem],
     project: &Path,
     interceptors: &[Arc<dyn TurnInterceptor>],
     turn_timeout: Duration,
@@ -346,7 +354,7 @@ async fn run_agent_review(
         let review_req = AgentRequest {
             prompt: prompts::agent_review_prompt(pr_num, agent_round),
             project_root: project.to_path_buf(),
-            context: skill_items.to_vec(),
+            context: context_items.to_vec(),
             ..Default::default()
         };
         let review_req = run_pre_execute(interceptors, review_req).await?;
@@ -424,7 +432,7 @@ async fn run_agent_review(
         let fix_req = AgentRequest {
             prompt: prompts::agent_review_fix_prompt(pr_num, &issues, agent_round),
             project_root: project.to_path_buf(),
-            context: skill_items.to_vec(),
+            context: context_items.to_vec(),
             ..Default::default()
         };
         let fix_req = run_pre_execute(interceptors, fix_req).await?;
