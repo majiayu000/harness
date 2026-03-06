@@ -101,11 +101,16 @@ pub async fn gc_adopt(
                          Print PR_URL=<url> on the last line."
                 );
                 let req = gc_adopt_task_request(prompt, &state.server.config.gc, state.project_root.clone());
+                let (reviewer, review_config) = crate::http::resolve_reviewer(
+                    &state.server.agent_registry,
+                    &state.server.config.agents.review,
+                    agent.name(),
+                );
                 let tid = crate::task_runner::spawn_task(
                     state.tasks.clone(),
                     agent,
-                    None,
-                    harness_core::AgentReviewConfig::default(),
+                    reviewer,
+                    review_config,
                     state.skills.clone(),
                     state.events.clone(),
                     state.interceptors.clone(),

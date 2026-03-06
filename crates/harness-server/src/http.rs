@@ -162,7 +162,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 /// 1. If `config.reviewer_agent` is set and differs from implementor, use it.
 /// 2. Otherwise, auto-select the first registered agent that isn't the implementor.
 /// 3. If none found, return None (agent review will be skipped).
-fn resolve_reviewer(
+pub(crate) fn resolve_reviewer(
     registry: &harness_agents::AgentRegistry,
     config: &harness_core::AgentReviewConfig,
     implementor_name: &str,

@@ -408,7 +408,7 @@ async fn run_agent_review(
             tracing::warn!("failed to log agent_review event: {e}");
         }
 
-        if approved || issues.is_empty() {
+        if approved {
             tracing::info!("agent review approved at round {agent_round}");
             break;
         }
