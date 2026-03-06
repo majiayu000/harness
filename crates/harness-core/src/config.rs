@@ -63,6 +63,8 @@ pub struct AgentsConfig {
     pub claude: ClaudeAgentConfig,
     pub codex: CodexAgentConfig,
     pub anthropic_api: AnthropicApiConfig,
+    #[serde(default)]
+    pub review: AgentReviewConfig,
 }
 
 impl Default for AgentsConfig {
@@ -72,8 +74,34 @@ impl Default for AgentsConfig {
             claude: ClaudeAgentConfig::default(),
             codex: CodexAgentConfig::default(),
             anthropic_api: AnthropicApiConfig::default(),
+            review: AgentReviewConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentReviewConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Agent name to use as reviewer. Empty string = auto-select.
+    #[serde(default)]
+    pub reviewer_agent: String,
+    #[serde(default = "default_max_agent_review_rounds")]
+    pub max_rounds: u32,
+}
+
+impl Default for AgentReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reviewer_agent: String::new(),
+            max_rounds: default_max_agent_review_rounds(),
+        }
+    }
+}
+
+fn default_max_agent_review_rounds() -> u32 {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,5 +289,65 @@ mod dirs {
         {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_review_config_defaults() {
+        let config = AgentReviewConfig::default();
+        assert!(!config.enabled);
+        assert!(config.reviewer_agent.is_empty());
+        assert_eq!(config.max_rounds, 3);
+    }
+
+    #[test]
+    fn agent_review_config_deserializes_from_toml() {
+        let toml_str = r#"
+            enabled = true
+            reviewer_agent = "codex"
+            max_rounds = 5
+        "#;
+        let config: AgentReviewConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.reviewer_agent, "codex");
+        assert_eq!(config.max_rounds, 5);
+    }
+
+    #[test]
+    fn agent_review_config_deserializes_with_defaults() {
+        let toml_str = r#"
+            enabled = true
+        "#;
+        let config: AgentReviewConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert!(config.reviewer_agent.is_empty());
+        assert_eq!(config.max_rounds, 3);
+    }
+
+    #[test]
+    fn agents_config_includes_review() {
+        let toml_str = r#"
+            default_agent = "claude"
+            [claude]
+            cli_path = "claude"
+            default_model = "sonnet"
+            [codex]
+            cli_path = "codex"
+            [anthropic_api]
+            base_url = "https://api.anthropic.com"
+            default_model = "claude-sonnet-4-20250514"
+            [review]
+            enabled = true
+            reviewer_agent = "codex"
+            max_rounds = 2
+        "#;
+        let config: AgentsConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.review.enabled);
+        assert_eq!(config.review.reviewer_agent, "codex");
+        assert_eq!(config.review.max_rounds, 2);
     }
 }

@@ -103,6 +103,8 @@ pub async fn gc_adopt(
                 let tid = crate::task_runner::spawn_task(
                     state.tasks.clone(),
                     agent,
+                    None,
+                    harness_core::AgentReviewConfig::default(),
                     state.skills.clone(),
                     state.events.clone(),
                     state.interceptors.clone(),

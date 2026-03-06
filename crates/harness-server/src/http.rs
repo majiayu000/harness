@@ -155,6 +155,51 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     })
 }
 
+/// Resolve the reviewer agent for independent agent review.
+///
+/// 1. If `config.reviewer_agent` is set and differs from implementor, use it.
+/// 2. Otherwise, auto-select the first registered agent that isn't the implementor.
+/// 3. If none found, return None (agent review will be skipped).
+fn resolve_reviewer(
+    registry: &harness_agents::AgentRegistry,
+    config: &harness_core::AgentReviewConfig,
+    implementor_name: &str,
+) -> (Option<Arc<dyn harness_core::CodeAgent>>, harness_core::AgentReviewConfig) {
+    if !config.enabled {
+        return (None, config.clone());
+    }
+
+    // Explicit reviewer
+    if !config.reviewer_agent.is_empty() {
+        if config.reviewer_agent == implementor_name {
+            tracing::warn!(
+                "agents.review.reviewer_agent == implementor '{}', skipping agent review",
+                implementor_name
+            );
+            return (None, config.clone());
+        }
+        if let Some(agent) = registry.get(&config.reviewer_agent) {
+            return (Some(agent), config.clone());
+        }
+        tracing::warn!(
+            "agents.review.reviewer_agent '{}' not registered, skipping agent review",
+            config.reviewer_agent
+        );
+        return (None, config.clone());
+    }
+
+    // Auto-select: first agent != implementor
+    for name in registry.list() {
+        if name != implementor_name {
+            if let Some(agent) = registry.get(name) {
+                return (Some(agent), config.clone());
+            }
+        }
+    }
+
+    (None, config.clone())
+}
+
 pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Result<()> {
     tracing::info!("harness: HTTP server listening on {addr}");
 
@@ -228,9 +273,14 @@ async fn create_task(
         }
     };
 
+    let (reviewer, review_config) =
+        resolve_reviewer(&state.server.agent_registry, &state.server.config.agents.review, agent.name());
+
     let task_id = task_runner::spawn_task(
         state.tasks.clone(),
         agent,
+        reviewer,
+        review_config,
         state.skills.clone(),
         state.events.clone(),
         state.interceptors.clone(),

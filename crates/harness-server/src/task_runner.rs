@@ -20,6 +20,7 @@ impl TaskId {
 pub enum TaskStatus {
     Pending,
     Implementing,
+    AgentReview,
     Waiting,
     Reviewing,
     Done,
@@ -246,6 +247,8 @@ impl TaskStore {
 pub async fn spawn_task(
     store: Arc<TaskStore>,
     agent: Arc<dyn CodeAgent>,
+    reviewer: Option<Arc<dyn CodeAgent>>,
+    review_config: harness_core::AgentReviewConfig,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
     interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
@@ -254,6 +257,8 @@ pub async fn spawn_task(
     spawn_task_with_worktree_detector(
         store,
         agent,
+        reviewer,
+        review_config,
         skills,
         events,
         interceptors,
@@ -266,6 +271,8 @@ pub async fn spawn_task(
 async fn spawn_task_with_worktree_detector<F>(
     store: Arc<TaskStore>,
     agent: Arc<dyn CodeAgent>,
+    reviewer: Option<Arc<dyn CodeAgent>>,
+    review_config: harness_core::AgentReviewConfig,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
     interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
@@ -296,6 +303,8 @@ where
             &store,
             &id,
             agent.as_ref(),
+            reviewer.as_deref(),
+            &review_config,
             skills,
             events,
             interceptors,
@@ -478,7 +487,7 @@ mod tests {
         };
 
         let events = Arc::new(harness_observe::EventStore::new(dir.path())?);
-        spawn_task(store, agent_clone, skills, events, vec![], req).await;
+        spawn_task(store, agent_clone, None, Default::default(), skills, events, vec![], req).await;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -536,7 +545,7 @@ mod tests {
             turn_timeout_secs: 30,
         };
 
-        let task_id = spawn_task(store.clone(), agent, skills, events, interceptors, req).await;
+        let task_id = spawn_task(store.clone(), agent, None, Default::default(), skills, events, interceptors, req).await;
 
         // Allow async task to complete.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -646,6 +655,8 @@ mod tests {
         let task_id = spawn_task_with_worktree_detector(
             store.clone(),
             agent,
+            None,
+            Default::default(),
             skills,
             events.clone(),
             vec![],
