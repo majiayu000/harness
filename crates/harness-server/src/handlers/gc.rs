@@ -5,12 +5,13 @@ use harness_protocol::{RpcResponse, INTERNAL_ERROR};
 fn gc_adopt_task_request(
     prompt: String,
     gc_config: &harness_core::GcConfig,
+    project_root: std::path::PathBuf,
 ) -> crate::task_runner::CreateTaskRequest {
     crate::task_runner::CreateTaskRequest {
         prompt: Some(prompt),
         issue: None,
         pr: None,
-        project: None,
+        project: Some(project_root),
         wait_secs: gc_config.adopt_wait_secs,
         max_rounds: gc_config.adopt_max_rounds,
         turn_timeout_secs: gc_config.adopt_turn_timeout_secs,
@@ -99,7 +100,7 @@ pub async fn gc_adopt(
                          commit, push, and open a PR. \
                          Print PR_URL=<url> on the last line."
                 );
-                let req = gc_adopt_task_request(prompt, &state.server.config.gc);
+                let req = gc_adopt_task_request(prompt, &state.server.config.gc, state.project_root.clone());
                 let tid = crate::task_runner::spawn_task(
                     state.tasks.clone(),
                     agent,
@@ -135,7 +136,7 @@ mod tests {
         gc_config.adopt_max_rounds = 9;
         gc_config.adopt_turn_timeout_secs = 11;
 
-        let req = gc_adopt_task_request("prompt".to_string(), &gc_config);
+        let req = gc_adopt_task_request("prompt".to_string(), &gc_config, std::path::PathBuf::from("/tmp/project"));
 
         assert_eq!(req.wait_secs, 7);
         assert_eq!(req.max_rounds, 9);
@@ -146,11 +147,21 @@ mod tests {
     fn gc_adopt_task_request_uses_gc_config_defaults() {
         let gc_config = harness_core::GcConfig::default();
 
-        let req = gc_adopt_task_request("prompt".to_string(), &gc_config);
+        let req = gc_adopt_task_request("prompt".to_string(), &gc_config, std::path::PathBuf::from("/tmp/project"));
 
         assert_eq!(req.wait_secs, 120);
         assert_eq!(req.max_rounds, 3);
         assert_eq!(req.turn_timeout_secs, 600);
+    }
+
+    #[test]
+    fn gc_adopt_task_request_sets_project_root() {
+        let gc_config = harness_core::GcConfig::default();
+        let project_root = std::path::PathBuf::from("/tmp/my-project");
+
+        let req = gc_adopt_task_request("prompt".to_string(), &gc_config, project_root.clone());
+
+        assert_eq!(req.project, Some(project_root));
     }
 }
 
