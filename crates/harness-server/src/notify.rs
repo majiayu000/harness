@@ -66,7 +66,7 @@ mod tests {
         assert_eq!(received.jsonrpc, "2.0");
         let json = serde_json::to_string(&received).unwrap();
         assert!(
-            json.contains("thread_status_changed"),
+            json.contains("thread/status_changed"),
             "unexpected method: {json}"
         );
     }

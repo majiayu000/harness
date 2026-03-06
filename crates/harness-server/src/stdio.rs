@@ -231,8 +231,8 @@ mod tests {
             .expect("thread_start should emit a notification");
         let json = serde_json::to_string(&notif)?;
         assert!(
-            json.contains("thread_status_changed"),
-            "expected thread_status_changed notification, got: {json}"
+            json.contains("thread/status_changed"),
+            "expected thread/status_changed notification, got: {json}"
         );
         Ok(())
     }
@@ -295,8 +295,8 @@ mod tests {
             .expect("turn_start should emit a notification");
         let json = serde_json::to_string(&notif)?;
         assert!(
-            json.contains("turn_started"),
-            "expected turn_started notification, got: {json}"
+            json.contains("turn/started"),
+            "expected turn/started notification, got: {json}"
         );
         Ok(())
     }

@@ -114,4 +114,86 @@ mod tests {
         assert!(crate::INVALID_PARAMS < 0);
         assert!(crate::INTERNAL_ERROR < 0);
     }
+
+    #[test]
+    fn slash_style_thread_start() -> anyhow::Result<()> {
+        let json = r#"{"jsonrpc":"2.0","id":1,"method":"thread/start","params":{"cwd":"/tmp"}}"#;
+        let req: RpcRequest = decode_request(json)?;
+        assert!(matches!(req.method, Method::ThreadStart { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_style_turn_start() -> anyhow::Result<()> {
+        let json = r#"{"jsonrpc":"2.0","id":2,"method":"turn/start","params":{"thread_id":"t1","input":"hello"}}"#;
+        let req: RpcRequest = decode_request(json)?;
+        assert!(matches!(req.method, Method::TurnStart { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_style_gc_run() -> anyhow::Result<()> {
+        let json = r#"{"jsonrpc":"2.0","id":3,"method":"gc/run","params":{}}"#;
+        let req: RpcRequest = decode_request(json)?;
+        assert!(matches!(req.method, Method::GcRun { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_style_exec_plan_init() -> anyhow::Result<()> {
+        let json = r#"{"jsonrpc":"2.0","id":4,"method":"exec_plan/init","params":{"spec":"do stuff","project_root":"/tmp"}}"#;
+        let req: RpcRequest = decode_request(json)?;
+        assert!(matches!(req.method, Method::ExecPlanInit { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn snake_case_still_works() -> anyhow::Result<()> {
+        let json = r#"{"jsonrpc":"2.0","id":5,"method":"thread_start","params":{"cwd":"/tmp"}}"#;
+        let req: RpcRequest = decode_request(json)?;
+        assert!(matches!(req.method, Method::ThreadStart { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn method_name_returns_slash_style() {
+        let m = Method::ThreadStart { cwd: PathBuf::from("/tmp") };
+        assert_eq!(m.method_name(), "thread/start");
+
+        let m = Method::Initialize;
+        assert_eq!(m.method_name(), "initialize");
+
+        let m = Method::GcRun { project_id: None };
+        assert_eq!(m.method_name(), "gc/run");
+
+        let m = Method::ExecPlanInit {
+            spec: String::new(),
+            project_root: PathBuf::from("/tmp"),
+        };
+        assert_eq!(m.method_name(), "exec_plan/init");
+    }
+
+    #[test]
+    fn notification_serializes_slash_style() -> anyhow::Result<()> {
+        use crate::{Notification, RpcNotification};
+        use harness_core::{ThreadId, TurnId};
+
+        let notif = RpcNotification::new(Notification::TurnStarted {
+            thread_id: ThreadId::new(),
+            turn_id: TurnId::new(),
+        });
+        let json = serde_json::to_string(&notif)?;
+        assert!(json.contains("\"method\":\"turn/started\""), "got: {json}");
+
+        let notif = RpcNotification::new(Notification::ThreadStatusChanged {
+            thread_id: ThreadId::new(),
+            status: harness_core::ThreadStatus::Active,
+        });
+        let json = serde_json::to_string(&notif)?;
+        assert!(
+            json.contains("\"method\":\"thread/status_changed\""),
+            "got: {json}"
+        );
+        Ok(())
+    }
 }
