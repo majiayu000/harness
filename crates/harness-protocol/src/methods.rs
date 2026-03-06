@@ -70,6 +70,9 @@ pub enum Method {
         until: Option<chrono::DateTime<chrono::Utc>>,
     },
 
+    // === Agent management ===
+    AgentList,
+
     // === VibeGuard ===
     Preflight { project_root: PathBuf, task_description: String },
     CrossReview { project_root: PathBuf, target: String, max_rounds: Option<u32> },
@@ -209,6 +212,7 @@ impl Method {
             Self::LearnSkills { .. } => "learn/skills",
             Self::HealthCheck { .. } => "health/check",
             Self::StatsQuery { .. } => "stats/query",
+            Self::AgentList => "agent/list",
             Self::Preflight { .. } => "preflight",
             Self::CrossReview { .. } => "cross_review",
         }
@@ -221,3 +225,11 @@ pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
 pub const INTERNAL_ERROR: i32 = -32603;
+
+// Application-specific semantic error codes (server error range: -32000 to -32099)
+pub const NOT_FOUND: i32 = -32001;
+pub const CONFLICT: i32 = -32002;
+pub const NOT_INITIALIZED: i32 = -32003;
+pub const STORAGE_ERROR: i32 = -32004;
+pub const AGENT_ERROR: i32 = -32005;
+pub const VALIDATION_ERROR: i32 = -32006;
