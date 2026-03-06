@@ -190,9 +190,10 @@ pub(crate) async fn run_task(
     };
 
     // Agent review phase: independent reviewer evaluates PR diff before GitHub review
+    let mut prev_fixed = false;
     if review_config.enabled {
         if let Some(reviewer) = reviewer {
-            run_agent_review(
+            let fixes_applied = run_agent_review(
                 store,
                 task_id,
                 agent,
@@ -206,6 +207,7 @@ pub(crate) async fn run_task(
                 &events,
             )
             .await?;
+            prev_fixed = fixes_applied;
         } else {
             tracing::info!("agent review enabled but no reviewer available, skipping");
         }
@@ -213,7 +215,6 @@ pub(crate) async fn run_task(
 
     // Review loop: Turn 2..N
     let last_review_round = req.max_rounds.saturating_add(1);
-    let mut prev_fixed = false;
     let mut round = 2u32;
     let max_waiting_retries = 3u32;
 
@@ -337,7 +338,8 @@ async fn run_agent_review(
     turn_timeout: Duration,
     pr_num: u64,
     events: &harness_observe::EventStore,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
+    let mut fixes_applied = false;
     let max_rounds = review_config.max_rounds;
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await;
@@ -456,9 +458,10 @@ async fn run_agent_review(
             });
         })
         .await;
+        fixes_applied = true;
     }
 
-    Ok(())
+    Ok(fixes_applied)
 }
 
 #[cfg(test)]
