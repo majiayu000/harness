@@ -113,6 +113,10 @@ mod tests {
         assert!(crate::METHOD_NOT_FOUND < 0);
         assert!(crate::INVALID_PARAMS < 0);
         assert!(crate::INTERNAL_ERROR < 0);
+        assert!(crate::NOT_FOUND < 0);
+        assert!(crate::VALIDATION < 0);
+        assert!(crate::AGENT_UNAVAILABLE < 0);
+        assert!(crate::SERIALIZATION < 0);
     }
 
     #[test]

@@ -1,7 +1,21 @@
 use crate::http::AppState;
 use harness_core::{ThreadId, ThreadStatus, TurnStatus};
-use harness_protocol::{Notification, RpcResponse, INTERNAL_ERROR};
+use harness_protocol::{
+    Notification, RpcResponse, INTERNAL_ERROR, NOT_FOUND, SERIALIZATION, VALIDATION,
+};
 use std::path::PathBuf;
+
+fn thread_error_response(
+    id: Option<serde_json::Value>,
+    error: harness_core::HarnessError,
+) -> RpcResponse {
+    let code = match &error {
+        harness_core::HarnessError::ThreadNotFound(_)
+        | harness_core::HarnessError::TurnNotFound(_) => NOT_FOUND,
+        _ => INTERNAL_ERROR,
+    };
+    RpcResponse::error(id, code, error.to_string())
+}
 
 /// Persist an existing thread to the optional ThreadDb after a mutation.
 pub(crate) async fn persist_thread(state: &AppState, thread_id: &ThreadId) {
@@ -57,7 +71,7 @@ pub async fn thread_start(
 ) -> RpcResponse {
     let cwd = match crate::handlers::validate_project_root(&cwd) {
         Ok(p) => p,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+        Err(e) => return RpcResponse::error(id, VALIDATION, e),
     };
     let thread_id = state.server.thread_manager.start_thread(cwd);
     persist_thread_insert(state, &thread_id).await;
@@ -84,7 +98,7 @@ fn thread_list_response<T: serde::Serialize>(
         Ok(value) => RpcResponse::success(id, value),
         Err(e) => RpcResponse::error(
             id,
-            INTERNAL_ERROR,
+            SERIALIZATION,
             format!("failed to serialize thread list: {e}"),
         ),
     }
@@ -113,8 +127,7 @@ pub async fn turn_start(
     input: String,
 ) -> RpcResponse {
     let input = harness_core::prompts::wrap_external_data(&input);
-    let agent_id =
-        harness_core::AgentId::from_str(&state.server.config.agents.default_agent);
+    let agent_id = harness_core::AgentId::from_str(&state.server.config.agents.default_agent);
     match state
         .server
         .thread_manager
@@ -131,7 +144,7 @@ pub async fn turn_start(
             );
             RpcResponse::success(id, serde_json::json!({ "turn_id": turn_id }))
         }
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => thread_error_response(id, e),
     }
 }
 
@@ -159,10 +172,10 @@ pub async fn turn_cancel(
                     );
                     RpcResponse::success(id, serde_json::json!({ "cancelled": true }))
                 }
-                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                Err(e) => thread_error_response(id, e),
             }
         }
-        None => RpcResponse::error(id, INTERNAL_ERROR, "turn not found in any thread"),
+        None => RpcResponse::error(id, NOT_FOUND, "turn not found in any thread"),
     }
 }
 
@@ -177,16 +190,16 @@ pub async fn turn_status(
                 if let Some(turn) = thread.turns.iter().find(|t| t.id == turn_id) {
                     match serde_json::to_value(turn) {
                         Ok(v) => RpcResponse::success(id, v),
-                        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                        Err(e) => RpcResponse::error(id, SERIALIZATION, e.to_string()),
                     }
                 } else {
-                    RpcResponse::error(id, INTERNAL_ERROR, "turn not found")
+                    RpcResponse::error(id, NOT_FOUND, "turn not found")
                 }
             } else {
-                RpcResponse::error(id, INTERNAL_ERROR, "thread not found")
+                RpcResponse::error(id, NOT_FOUND, "thread not found")
             }
         }
-        None => RpcResponse::error(id, INTERNAL_ERROR, "turn not found in any thread"),
+        None => RpcResponse::error(id, NOT_FOUND, "turn not found in any thread"),
     }
 }
 
@@ -208,10 +221,10 @@ pub async fn turn_steer(
                     persist_thread(state, &thread_id).await;
                     RpcResponse::success(id, serde_json::json!({ "steered": true }))
                 }
-                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                Err(e) => thread_error_response(id, e),
             }
         }
-        None => RpcResponse::error(id, INTERNAL_ERROR, "turn not found in any thread"),
+        None => RpcResponse::error(id, NOT_FOUND, "turn not found in any thread"),
     }
 }
 
@@ -225,7 +238,7 @@ pub async fn thread_resume(
             persist_thread(state, &thread_id).await;
             RpcResponse::success(id, serde_json::json!({ "resumed": true }))
         }
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => thread_error_response(id, e),
     }
 }
 
@@ -244,7 +257,7 @@ pub async fn thread_fork(
             persist_thread_insert(state, &new_id).await;
             RpcResponse::success(id, serde_json::json!({ "thread_id": new_id }))
         }
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => thread_error_response(id, e),
     }
 }
 
@@ -258,7 +271,7 @@ pub async fn thread_compact(
             persist_thread(state, &thread_id).await;
             RpcResponse::success(id, serde_json::json!({ "compacted": true }))
         }
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => thread_error_response(id, e),
     }
 }
 
@@ -292,8 +305,10 @@ mod tests {
         let response = thread_list_response(Some(json!(1)), AlwaysFailSerialize);
 
         assert!(response.result.is_none());
-        let error = response.error.expect("expected serialization error response");
-        assert_eq!(error.code, INTERNAL_ERROR);
+        let error = response
+            .error
+            .expect("expected serialization error response");
+        assert_eq!(error.code, SERIALIZATION);
         assert!(error
             .message
             .contains("failed to serialize thread list: forced serialization failure"));

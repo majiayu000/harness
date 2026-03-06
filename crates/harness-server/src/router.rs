@@ -774,14 +774,10 @@ mod tests {
             .await
             .expect("expected response for request with id");
 
-        assert!(
-            resp.error.is_none(),
-            "expected success: {:?}",
-            resp.error
-        );
-        let result =
-            resp.result
-                .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
         let coverage = result["dimensions"]["coverage"]
             .as_f64()
             .ok_or_else(|| anyhow::anyhow!("missing coverage"))?;
@@ -799,8 +795,7 @@ mod tests {
         let linked_checks = events
             .iter()
             .filter(|event| {
-                event.hook == "rule_check"
-                    && event.session_id == latest_scan.session_id
+                event.hook == "rule_check" && event.session_id == latest_scan.session_id
             })
             .count();
         assert_eq!(linked_checks, violations.len());
@@ -845,6 +840,67 @@ mod tests {
             .await?
             .expect("thread should be in DB");
         assert_eq!(thread.project_root, canonical_proj);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_start_invalid_root_returns_validation_error() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::ThreadStart {
+                cwd: dir.path().join("missing-project-root"),
+            },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response for request with id");
+
+        let error = resp.error.ok_or_else(|| anyhow::anyhow!("missing error"))?;
+        assert_eq!(error.code, harness_protocol::VALIDATION);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gc_run_without_default_agent_returns_agent_unavailable() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::GcRun { project_id: None },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response for request with id");
+
+        let error = resp.error.ok_or_else(|| anyhow::anyhow!("missing error"))?;
+        assert_eq!(error.code, harness_protocol::AGENT_UNAVAILABLE);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gc_adopt_missing_draft_returns_not_found() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::GcAdopt {
+                draft_id: harness_core::DraftId::new(),
+            },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response for request with id");
+
+        let error = resp.error.ok_or_else(|| anyhow::anyhow!("missing error"))?;
+        assert_eq!(error.code, harness_protocol::NOT_FOUND);
         Ok(())
     }
 

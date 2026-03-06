@@ -1,6 +1,16 @@
 use crate::http::AppState;
 use harness_core::DraftId;
-use harness_protocol::{RpcResponse, INTERNAL_ERROR};
+use harness_protocol::{RpcResponse, AGENT_UNAVAILABLE, INTERNAL_ERROR, NOT_FOUND, SERIALIZATION};
+
+fn gc_harness_error_response(id: Option<serde_json::Value>, error: anyhow::Error) -> RpcResponse {
+    let code = match error.downcast_ref::<harness_core::HarnessError>() {
+        Some(harness_core::HarnessError::DraftNotFound(_)) => NOT_FOUND,
+        Some(harness_core::HarnessError::AgentNotFound(_)) => AGENT_UNAVAILABLE,
+        Some(harness_core::HarnessError::Json(_)) => SERIALIZATION,
+        _ => INTERNAL_ERROR,
+    };
+    RpcResponse::error(id, code, error.to_string())
+}
 
 fn gc_adopt_task_request(
     prompt: String,
@@ -33,7 +43,7 @@ pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcRespo
     let project = harness_core::Project::from_path(project_root);
     let agent = match state.server.agent_registry.default_agent() {
         Some(a) => a,
-        None => return RpcResponse::error(id, INTERNAL_ERROR, "no agent registered"),
+        None => return RpcResponse::error(id, AGENT_UNAVAILABLE, "no agent registered"),
     };
     match state
         .gc_agent
@@ -42,7 +52,7 @@ pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcRespo
     {
         Ok(report) => match serde_json::to_value(&report) {
             Ok(v) => RpcResponse::success(id, v),
-            Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            Err(e) => RpcResponse::error(id, SERIALIZATION, e.to_string()),
         },
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     }
@@ -59,7 +69,7 @@ pub async fn gc_drafts(state: &AppState, id: Option<serde_json::Value>) -> RpcRe
     match state.gc_agent.drafts() {
         Ok(drafts) => match serde_json::to_value(&drafts) {
             Ok(v) => RpcResponse::success(id, v),
-            Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            Err(e) => RpcResponse::error(id, SERIALIZATION, e.to_string()),
         },
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     }
@@ -73,7 +83,7 @@ pub async fn gc_adopt(
     let draft = match state.gc_agent.draft_store().get(&draft_id) {
         Ok(Some(d)) => d,
         Ok(None) => {
-            return RpcResponse::error(id, INTERNAL_ERROR, format!("draft {} not found", draft_id));
+            return RpcResponse::error(id, NOT_FOUND, format!("draft {} not found", draft_id));
         }
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     };
@@ -100,7 +110,11 @@ pub async fn gc_adopt(
                          commit, push, and open a PR. \
                          Print PR_URL=<url> on the last line."
                 );
-                let req = gc_adopt_task_request(prompt, &state.server.config.gc, state.project_root.clone());
+                let req = gc_adopt_task_request(
+                    prompt,
+                    &state.server.config.gc,
+                    state.project_root.clone(),
+                );
                 let tid = crate::task_runner::spawn_task(
                     state.tasks.clone(),
                     agent,
@@ -121,7 +135,7 @@ pub async fn gc_adopt(
                 serde_json::json!({ "adopted": true, "task_id": task_id }),
             )
         }
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => gc_harness_error_response(id, e),
     }
 }
 
@@ -136,7 +150,11 @@ mod tests {
         gc_config.adopt_max_rounds = 9;
         gc_config.adopt_turn_timeout_secs = 11;
 
-        let req = gc_adopt_task_request("prompt".to_string(), &gc_config, std::path::PathBuf::from("/tmp/project"));
+        let req = gc_adopt_task_request(
+            "prompt".to_string(),
+            &gc_config,
+            std::path::PathBuf::from("/tmp/project"),
+        );
 
         assert_eq!(req.wait_secs, 7);
         assert_eq!(req.max_rounds, 9);
@@ -147,7 +165,11 @@ mod tests {
     fn gc_adopt_task_request_uses_gc_config_defaults() {
         let gc_config = harness_core::GcConfig::default();
 
-        let req = gc_adopt_task_request("prompt".to_string(), &gc_config, std::path::PathBuf::from("/tmp/project"));
+        let req = gc_adopt_task_request(
+            "prompt".to_string(),
+            &gc_config,
+            std::path::PathBuf::from("/tmp/project"),
+        );
 
         assert_eq!(req.wait_secs, 120);
         assert_eq!(req.max_rounds, 3);
@@ -173,6 +195,6 @@ pub async fn gc_reject(
 ) -> RpcResponse {
     match state.gc_agent.reject(&draft_id, reason.as_deref()) {
         Ok(()) => RpcResponse::success(id, serde_json::json!({ "rejected": true })),
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => gc_harness_error_response(id, e),
     }
 }
