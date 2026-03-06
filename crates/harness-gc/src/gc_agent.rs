@@ -118,11 +118,33 @@ impl GcAgent {
     }
 
     /// Adopt a draft: write artifacts to disk.
+    ///
+    /// All artifact target_paths are validated to be relative (no absolute
+    /// paths or `..` traversal) before any writes occur.
     pub fn adopt(&self, draft_id: &DraftId) -> anyhow::Result<()> {
         let mut draft = self
             .draft_store
             .get(draft_id)?
             .ok_or_else(|| anyhow::anyhow!("draft not found"))?;
+
+        // Validate all paths before writing any files
+        for artifact in &draft.artifacts {
+            let path = &artifact.target_path;
+            if path.is_absolute() {
+                anyhow::bail!(
+                    "artifact target_path must be relative, got: {}",
+                    path.display()
+                );
+            }
+            for component in path.components() {
+                if matches!(component, std::path::Component::ParentDir) {
+                    anyhow::bail!(
+                        "artifact target_path must not contain '..': {}",
+                        path.display()
+                    );
+                }
+            }
+        }
 
         for artifact in &draft.artifacts {
             if let Some(parent) = artifact.target_path.parent() {
@@ -188,6 +210,99 @@ fn build_prompt(signal: &Signal, project: &Project) -> String {
             project.name,
             signal.details
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_core::{
+        Artifact, ArtifactType, Draft, DraftStatus, ProjectId, RemediationType, Signal,
+        SignalType,
+    };
+
+    fn make_test_gc_agent(dir: &std::path::Path) -> GcAgent {
+        let signal_detector = SignalDetector::new(
+            crate::signal_detector::SignalThresholds::default(),
+            ProjectId::new(),
+        );
+        let draft_store = DraftStore::new(dir).unwrap();
+        GcAgent::new(GcConfig::default(), signal_detector, draft_store)
+    }
+
+    fn test_signal() -> Signal {
+        Signal::new(
+            SignalType::RepeatedWarn,
+            ProjectId::new(),
+            serde_json::json!({"test": true}),
+            RemediationType::Guard,
+        )
+    }
+
+    fn test_draft(artifacts: Vec<Artifact>) -> Draft {
+        Draft {
+            id: DraftId::new(),
+            status: DraftStatus::Pending,
+            signal: test_signal(),
+            artifacts,
+            rationale: "test".into(),
+            validation: "test".into(),
+            generated_at: Utc::now(),
+            agent_model: "test".into(),
+        }
+    }
+
+    #[test]
+    fn adopt_rejects_absolute_target_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let gc = make_test_gc_agent(dir.path());
+
+        let draft = test_draft(vec![Artifact {
+            artifact_type: ArtifactType::Guard,
+            target_path: std::path::PathBuf::from("/etc/passwd"),
+            content: "malicious".into(),
+        }]);
+        gc.draft_store.save(&draft).unwrap();
+
+        let err = gc.adopt(&draft.id).unwrap_err();
+        assert!(
+            err.to_string().contains("must be relative"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn adopt_rejects_parent_dir_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let gc = make_test_gc_agent(dir.path());
+
+        let draft = test_draft(vec![Artifact {
+            artifact_type: ArtifactType::Skill,
+            target_path: std::path::PathBuf::from("../../etc/shadow"),
+            content: "traversal".into(),
+        }]);
+        gc.draft_store.save(&draft).unwrap();
+
+        let err = gc.adopt(&draft.id).unwrap_err();
+        assert!(
+            err.to_string().contains("must not contain '..'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn adopt_accepts_valid_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let gc = make_test_gc_agent(dir.path());
+
+        let draft = test_draft(vec![Artifact {
+            artifact_type: ArtifactType::Guard,
+            target_path: std::path::PathBuf::from(".harness/drafts/test.md"),
+            content: "valid content".into(),
+        }]);
+        gc.draft_store.save(&draft).unwrap();
+
+        gc.adopt(&draft.id).unwrap();
     }
 }
 

@@ -14,7 +14,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         _ if !state.initialized.load(Ordering::Relaxed) => {
             return Some(RpcResponse::error(
                 id,
-                harness_protocol::INVALID_REQUEST,
+                harness_protocol::NOT_INITIALIZED,
                 "Server not initialized. Send 'initialize' first.",
             ));
         }
@@ -149,6 +149,12 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
             Some(handlers::health::stats_query(state, id, since, until).await)
         }
 
+        // === Agent management ===
+        Method::AgentList => {
+            let agents = state.server.agent_registry.list();
+            Some(RpcResponse::success(id, serde_json::json!({ "agents": agents })))
+        }
+
         // === VibeGuard ===
         Method::Preflight {
             project_root,
@@ -225,6 +231,7 @@ mod tests {
             gc_agent,
             plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
             thread_db: Some(thread_db),
+            plan_db: None,
             interceptors: vec![],
             notification_tx,
             notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -344,7 +351,7 @@ mod tests {
             signal,
             artifacts: vec![Artifact {
                 artifact_type: ArtifactType::Guard,
-                target_path: dir.path().join("test-guard.sh"),
+                target_path: std::path::PathBuf::from("test-guard.sh"),
                 content: "#!/bin/bash\necho ok".to_string(),
             }],
             rationale: "test".to_string(),
@@ -515,7 +522,7 @@ mod tests {
             signal,
             artifacts: vec![harness_core::Artifact {
                 artifact_type: harness_core::ArtifactType::Guard,
-                target_path: dir.path().join("test-guard.sh"),
+                target_path: std::path::PathBuf::from("test-guard.sh"),
                 content: "#!/bin/bash\necho ok".to_string(),
             }],
             rationale: "test".to_string(),
@@ -574,14 +581,13 @@ mod tests {
             serde_json::json!("test signal"),
             RemediationType::Guard,
         );
-        let artifact_path = dir.path().join("test-guard.sh");
         let draft = Draft {
             id: draft_id.clone(),
             status: DraftStatus::Pending,
             signal,
             artifacts: vec![Artifact {
                 artifact_type: ArtifactType::Guard,
-                target_path: artifact_path,
+                target_path: std::path::PathBuf::from("test-guard.sh"),
                 content: "#!/bin/bash\necho ok".to_string(),
             }],
             rationale: "test".to_string(),
@@ -863,7 +869,7 @@ mod tests {
             .await
             .expect("should return error response");
         assert!(resp.error.is_some(), "pre-init request should be rejected");
-        assert_eq!(resp.error.unwrap().code, harness_protocol::INVALID_REQUEST);
+        assert_eq!(resp.error.unwrap().code, harness_protocol::NOT_INITIALIZED);
         Ok(())
     }
 
