@@ -136,6 +136,12 @@ impl Default for CodexAgentConfig {
 pub struct AnthropicApiConfig {
     pub base_url: String,
     pub default_model: String,
+    #[serde(default = "default_anthropic_api_max_tokens")]
+    pub max_tokens: u32,
+}
+
+fn default_anthropic_api_max_tokens() -> u32 {
+    4096
 }
 
 impl Default for AnthropicApiConfig {
@@ -143,6 +149,7 @@ impl Default for AnthropicApiConfig {
         Self {
             base_url: "https://api.anthropic.com".to_string(),
             default_model: "claude-sonnet-4-20250514".to_string(),
+            max_tokens: default_anthropic_api_max_tokens(),
         }
     }
 }
@@ -349,5 +356,30 @@ mod tests {
         assert!(config.review.enabled);
         assert_eq!(config.review.reviewer_agent, "codex");
         assert_eq!(config.review.max_rounds, 2);
+        assert_eq!(
+            config.anthropic_api.max_tokens,
+            default_anthropic_api_max_tokens()
+        );
+    }
+
+    #[test]
+    fn anthropic_api_config_deserializes_configured_max_tokens() {
+        let toml_str = r#"
+            base_url = "https://api.anthropic.com"
+            default_model = "claude-sonnet-4-20250514"
+            max_tokens = 8192
+        "#;
+        let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.max_tokens, 8192);
+    }
+
+    #[test]
+    fn anthropic_api_config_defaults_max_tokens_when_missing() {
+        let toml_str = r#"
+            base_url = "https://api.anthropic.com"
+            default_model = "claude-sonnet-4-20250514"
+        "#;
+        let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.max_tokens, default_anthropic_api_max_tokens());
     }
 }
