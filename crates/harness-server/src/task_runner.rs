@@ -85,6 +85,8 @@ pub struct CreateTaskRequest {
     pub issue: Option<u64>,
     /// GitHub PR number to review/fix.
     pub pr: Option<u64>,
+    /// Explicit agent name; if omitted, uses the default agent.
+    pub agent: Option<String>,
     /// Project root; defaults to the main git worktree resolved at task spawn time.
     pub project: Option<PathBuf>,
     #[serde(default = "default_wait")]
@@ -480,6 +482,7 @@ mod tests {
             prompt: Some("test task".into()),
             issue: None,
             pr: None,
+            agent: None,
             project: Some(dir.path().to_path_buf()),
             wait_secs: 0,
             max_rounds: 0,
@@ -539,6 +542,7 @@ mod tests {
             prompt: Some("blocked task".into()),
             issue: None,
             pr: None,
+            agent: None,
             project: Some(dir.path().to_path_buf()),
             wait_secs: 0,
             max_rounds: 0,
@@ -646,6 +650,7 @@ mod tests {
             prompt: Some("panic path".into()),
             issue: None,
             pr: None,
+            agent: None,
             project: None,
             wait_secs: 0,
             max_rounds: 0,
