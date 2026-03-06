@@ -1,4 +1,3 @@
-use crate::thread_db::ThreadDb;
 use dashmap::DashMap;
 use harness_core::{
     AgentId, Item, Thread, ThreadId, ThreadStatus, Turn, TurnId,
@@ -6,61 +5,18 @@ use harness_core::{
 
 pub struct ThreadManager {
     threads: DashMap<String, Thread>,
-    db: Option<ThreadDb>,
 }
 
 impl ThreadManager {
     pub fn new() -> Self {
         Self {
             threads: DashMap::new(),
-            db: None,
-        }
-    }
-
-    /// Open with SQLite persistence. Loads existing threads into cache.
-    pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Self> {
-        let db = ThreadDb::open(db_path).await?;
-        let threads = DashMap::new();
-        for thread in db.list().await? {
-            threads.insert(thread.id.as_str().to_string(), thread);
-        }
-        Ok(Self { threads, db: Some(db) })
-    }
-
-    /// Persist a single thread to DB (no-op if no DB configured).
-    pub async fn persist(&self, id: &ThreadId) {
-        if let Some(db) = &self.db {
-            if let Some(thread) = self.threads.get(id.as_str()) {
-                if let Err(e) = db.update(thread.value()).await {
-                    tracing::error!("thread_db update failed: {e}");
-                }
-            }
         }
     }
 
     /// Access the underlying threads cache (for loading persisted threads).
     pub fn threads_cache(&self) -> &DashMap<String, Thread> {
         &self.threads
-    }
-
-    /// Persist a newly inserted thread to DB.
-    pub async fn persist_insert(&self, id: &ThreadId) {
-        if let Some(db) = &self.db {
-            if let Some(thread) = self.threads.get(id.as_str()) {
-                if let Err(e) = db.insert(thread.value()).await {
-                    tracing::error!("thread_db insert failed: {e}");
-                }
-            }
-        }
-    }
-
-    /// Persist a thread deletion to DB.
-    pub async fn persist_delete(&self, id: &str) {
-        if let Some(db) = &self.db {
-            if let Err(e) = db.delete(id).await {
-                tracing::error!("thread_db delete failed: {e}");
-            }
-        }
     }
 
     pub fn start_thread(&self, cwd: std::path::PathBuf) -> ThreadId {
