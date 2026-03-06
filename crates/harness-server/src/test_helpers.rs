@@ -30,6 +30,8 @@ pub async fn make_test_state_with_registry(
         draft_store,
     ));
     let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
+    let exec_plan_db =
+        Arc::new(crate::exec_plan_db::ExecPlanDb::open(&dir.join("exec_plans.db")).await?);
     let (notification_tx, _) = broadcast::channel(64);
     Ok(AppState {
         server,
@@ -39,7 +41,7 @@ pub async fn make_test_state_with_registry(
         rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
         events,
         gc_agent,
-        plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        exec_plan_db,
         thread_db: Some(thread_db),
         interceptors: vec![],
         notification_tx,

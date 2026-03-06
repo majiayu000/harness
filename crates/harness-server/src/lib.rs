@@ -1,6 +1,7 @@
 pub mod server;
 pub mod thread_manager;
 pub mod thread_db;
+pub mod exec_plan_db;
 pub mod stdio;
 pub mod http;
 pub mod handlers;

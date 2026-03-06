@@ -21,8 +21,7 @@ pub struct AppState {
     pub rules: Arc<RwLock<harness_rules::engine::RuleEngine>>,
     pub events: Arc<harness_observe::EventStore>,
     pub gc_agent: Arc<harness_gc::GcAgent>,
-    pub plans:
-        Arc<RwLock<std::collections::HashMap<harness_core::ExecPlanId, harness_exec::ExecPlan>>>,
+    pub exec_plan_db: Arc<crate::exec_plan_db::ExecPlanDb>,
     pub thread_db: Option<crate::thread_db::ThreadDb>,
     pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     /// Broadcast channel for server-push notifications (WebSocket and stdio transports).
@@ -119,6 +118,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     let thread_db_path = dir.join("threads.db");
     let thread_db = crate::thread_db::ThreadDb::open(&thread_db_path).await?;
+    let exec_plan_db =
+        Arc::new(crate::exec_plan_db::ExecPlanDb::open(&dir.join("exec_plans.db")).await?);
     let configured_capacity = server.config.server.notification_broadcast_capacity;
     let notification_broadcast_capacity = configured_capacity.max(1);
     let notification_lag_log_every = server.config.server.notification_lag_log_every;
@@ -149,7 +150,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         rules: Arc::new(RwLock::new(rule_engine)),
         events,
         gc_agent,
-        plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        exec_plan_db,
         thread_db: Some(thread_db),
         interceptors: vec![Arc::new(crate::contract_validator::ContractValidator::new())],
         notification_tx: broadcast::channel(notification_broadcast_capacity).0,
@@ -352,6 +353,8 @@ mod tests {
             draft_store,
         ));
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
+        let exec_plan_db =
+            Arc::new(crate::exec_plan_db::ExecPlanDb::open(&dir.join("exec_plans.db")).await?);
         Ok(Arc::new(AppState {
             server,
             project_root: dir.to_path_buf(),
@@ -362,7 +365,7 @@ mod tests {
             )),
             events,
             gc_agent,
-            plans: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            exec_plan_db,
             thread_db: Some(thread_db),
             interceptors: vec![],
             notification_tx: tokio::sync::broadcast::channel(32).0,
