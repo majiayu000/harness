@@ -20,6 +20,11 @@ pub enum Notification {
         turn_id: TurnId,
         item: Item,
     },
+    #[serde(rename = "message/delta")]
+    MessageDelta {
+        turn_id: TurnId,
+        text: String,
+    },
     #[serde(rename = "turn/completed")]
     TurnCompleted {
         turn_id: TurnId,
