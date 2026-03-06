@@ -80,7 +80,7 @@ pub enum TaskComplexity {
 // === Streaming Agent Adapter (new, coexists with CodeAgent) ===
 
 /// Events emitted by an agent adapter during a turn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     TurnStarted,
@@ -94,7 +94,7 @@ pub enum AgentEvent {
 }
 
 /// Decision for an approval request from the agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum ApprovalDecision {
     Accept,
@@ -179,10 +179,10 @@ mod tests {
             },
         ];
 
-        for event in &events {
-            let json = serde_json::to_string(event).unwrap();
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
             let parsed: AgentEvent = serde_json::from_str(&json).unwrap();
-            assert_eq!(json, serde_json::to_string(&parsed).unwrap());
+            assert_eq!(event, parsed);
         }
     }
 
@@ -199,16 +199,18 @@ mod tests {
 
     #[test]
     fn approval_decision_serde_round_trip() {
-        let accept = ApprovalDecision::Accept;
-        let json = serde_json::to_string(&accept).unwrap();
-        assert!(json.contains("\"decision\":\"accept\""));
+        let decisions = vec![
+            ApprovalDecision::Accept,
+            ApprovalDecision::Reject {
+                reason: "dangerous".into(),
+            },
+        ];
 
-        let reject = ApprovalDecision::Reject {
-            reason: "dangerous".into(),
-        };
-        let json = serde_json::to_string(&reject).unwrap();
-        let parsed: ApprovalDecision = serde_json::from_str(&json).unwrap();
-        assert_eq!(json, serde_json::to_string(&parsed).unwrap());
+        for decision in decisions {
+            let json = serde_json::to_string(&decision).unwrap();
+            let parsed: ApprovalDecision = serde_json::from_str(&json).unwrap();
+            assert_eq!(decision, parsed);
+        }
     }
 }
 
