@@ -105,7 +105,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     )?);
 
     let signal_detector = harness_gc::SignalDetector::new(
-        harness_gc::signal_detector::SignalThresholds::default(),
+        server.config.gc.signal_thresholds.clone().into(),
         harness_core::ProjectId::new(),
     );
     let draft_store = harness_gc::DraftStore::new(&dir)?;
@@ -339,7 +339,7 @@ mod tests {
         let tasks = task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
         let events = Arc::new(harness_observe::EventStore::new(dir)?);
         let signal_detector = harness_gc::SignalDetector::new(
-            harness_gc::signal_detector::SignalThresholds::default(),
+            server.config.gc.signal_thresholds.clone().into(),
             harness_core::ProjectId::new(),
         );
         let draft_store = harness_gc::DraftStore::new(dir)?;
