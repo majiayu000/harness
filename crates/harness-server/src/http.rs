@@ -115,6 +115,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         harness_gc::gc_agent::GcConfig::default(),
         signal_detector,
         draft_store,
+        project_root.clone(),
     ));
 
     let thread_db_path = dir.join("threads.db");
@@ -350,6 +351,7 @@ mod tests {
             harness_gc::gc_agent::GcConfig::default(),
             signal_detector,
             draft_store,
+            dir.to_path_buf(),
         ));
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
         Ok(Arc::new(AppState {

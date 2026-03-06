@@ -97,6 +97,7 @@ mod tests {
             harness_gc::gc_agent::GcConfig::default(),
             signal_detector,
             draft_store,
+            project_root.to_path_buf(),
         ));
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
         Ok(Arc::new(AppState {

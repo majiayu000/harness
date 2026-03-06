@@ -109,6 +109,7 @@ mod tests {
             harness_gc::gc_agent::GcConfig::default(),
             signal_detector,
             draft_store,
+            dir.to_path_buf(),
         ));
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
 

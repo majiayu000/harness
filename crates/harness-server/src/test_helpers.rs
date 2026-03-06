@@ -28,6 +28,7 @@ pub async fn make_test_state_with_registry(
         harness_gc::gc_agent::GcConfig::default(),
         signal_detector,
         draft_store,
+        dir.to_path_buf(),
     ));
     let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
     let (notification_tx, _) = broadcast::channel(64);

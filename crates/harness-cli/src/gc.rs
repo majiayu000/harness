@@ -24,7 +24,12 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
             let signal_detector = SignalDetector::new(thresholds, project.id.clone());
             let gc_config = map_gc_config(&config.gc);
             let draft_store = DraftStore::new(data_dir)?;
-            let gc_agent = GcAgent::new(gc_config, signal_detector, draft_store);
+            let gc_agent = GcAgent::new(
+                gc_config,
+                signal_detector,
+                draft_store,
+                project.root.clone(),
+            );
 
             let claude = harness_agents::claude::ClaudeCodeAgent::new(
                 config.agents.claude.cli_path.clone(),
@@ -87,10 +92,12 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
 
 fn make_agent_for_draft_ops(data_dir: &std::path::Path) -> anyhow::Result<GcAgent> {
     let draft_store = DraftStore::new(data_dir)?;
+    let project_root = std::env::current_dir()?;
     Ok(GcAgent::new(
         GcAgentConfig::default(),
         SignalDetector::new(GcThresholds::default(), ProjectId::new()),
         draft_store,
+        project_root,
     ))
 }
 
