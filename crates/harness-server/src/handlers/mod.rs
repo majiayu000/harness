@@ -10,15 +10,6 @@ pub mod rules;
 pub mod skills;
 pub mod thread;
 
-/// Persist rule scan results to the event store with a `rule_scan` anchor.
-pub(crate) fn persist_violations(
-    events: &harness_observe::EventStore,
-    project_root: &std::path::Path,
-    violations: &[harness_core::Violation],
-) {
-    events.persist_rule_scan(project_root, violations);
-}
-
 /// Validate that `file` is an existing path within `project_root` (already canonicalized).
 /// Returns the canonicalized file path on success.
 pub(crate) fn validate_file_in_root(

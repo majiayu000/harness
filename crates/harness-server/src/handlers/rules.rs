@@ -50,7 +50,7 @@ pub async fn rule_check(
     };
     match result {
         Ok(violations) => {
-            crate::handlers::persist_violations(&state.events, &project_root, &violations);
+            state.events.persist_rule_scan(&project_root, &violations);
             match serde_json::to_value(&violations) {
                 Ok(v) => RpcResponse::success(id, v),
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
