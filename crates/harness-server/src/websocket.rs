@@ -215,6 +215,7 @@ mod tests {
             gc_agent,
             plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
             thread_db: Some(thread_db),
+            plan_db: None,
             interceptors: vec![],
             notification_tx,
             notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
