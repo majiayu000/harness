@@ -1,0 +1,186 @@
+name: Harness Action
+description: Install Harness CLI, run `harness exec`, and expose final message output.
+
+inputs:
+  prompt:
+    description: Prompt passed to `harness exec`
+    required: true
+  sandbox-mode:
+    description: Sandbox mode hint (read-only, workspace-write, danger-full-access)
+    required: false
+    default: workspace-write
+  model:
+    description: Optional model override
+    required: false
+    default: ""
+  output-file:
+    description: File path for final harness output
+    required: false
+    default: .harness/final-message.txt
+  drop-sudo:
+    description: Reject sudo/root execution by default
+    required: false
+    default: "true"
+  unprivileged-user:
+    description: Required local user when privilege checks are enabled
+    required: false
+    default: runner
+  allow-users:
+    description: Comma-separated allow list for human GitHub actors
+    required: false
+    default: ""
+  allow-bots:
+    description: Comma-separated allow list for bot GitHub actors
+    required: false
+    default: ""
+
+outputs:
+  final-message:
+    description: Final message emitted by `harness exec`
+    value: ${{ steps.export.outputs.final-message }}
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install Harness CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        workspace_root="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
+        cargo install --locked --path "${workspace_root}/crates/harness-cli" --force
+
+    - name: Resolve output file path
+      id: resolve-output
+      shell: bash
+      env:
+        INPUT_OUTPUT_FILE: ${{ inputs.output-file }}
+      run: |
+        set -euo pipefail
+        workspace_root="$(realpath -m "${GITHUB_WORKSPACE}")"
+
+        if [[ -z "${INPUT_OUTPUT_FILE}" ]]; then
+          echo "::error::output-file input must not be empty."
+          exit 1
+        fi
+
+        if [[ "${INPUT_OUTPUT_FILE}" == *$'\n'* || "${INPUT_OUTPUT_FILE}" == *$'\r'* ]]; then
+          echo "::error::output-file input must not contain newline characters."
+          exit 1
+        fi
+
+        if [[ "${INPUT_OUTPUT_FILE}" = /* ]]; then
+          resolved_output="$(realpath -m "${INPUT_OUTPUT_FILE}")"
+        else
+          resolved_output="$(realpath -m "${workspace_root}/${INPUT_OUTPUT_FILE}")"
+        fi
+
+        case "${resolved_output}" in
+          "${workspace_root}"/*) ;;
+          *)
+            echo "::error::output-file must stay within GITHUB_WORKSPACE (${workspace_root})."
+            exit 1
+            ;;
+        esac
+
+        relative_output="${resolved_output#${workspace_root}/}"
+        if [[ -z "${relative_output}" || "${relative_output}" == "${resolved_output}" ]]; then
+          echo "::error::output-file must resolve to a file path under GITHUB_WORKSPACE."
+          exit 1
+        fi
+
+        delimiter="HARNESS_OUTPUT_$(openssl rand -hex 8)"
+        {
+          echo "resolved-output=${resolved_output}"
+          echo "relative-output=${relative_output}"
+          echo "final-message-delimiter=${delimiter}"
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Run harness exec
+      shell: bash
+      env:
+        INPUT_PROMPT: ${{ inputs.prompt }}
+        INPUT_SANDBOX_MODE: ${{ inputs.sandbox-mode }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_DROP_SUDO: ${{ inputs.drop-sudo }}
+        INPUT_UNPRIVILEGED_USER: ${{ inputs.unprivileged-user }}
+        INPUT_ALLOW_USERS: ${{ inputs.allow-users }}
+        INPUT_ALLOW_BOTS: ${{ inputs.allow-bots }}
+        RESOLVED_OUTPUT_FILE: ${{ steps.resolve-output.outputs.resolved-output }}
+        RELATIVE_OUTPUT_FILE: ${{ steps.resolve-output.outputs.relative-output }}
+      run: |
+        set -euo pipefail
+        if [[ -z "${RESOLVED_OUTPUT_FILE}" || -z "${RELATIVE_OUTPUT_FILE}" ]]; then
+          echo "::error::Resolved output-file path metadata is missing."
+          exit 1
+        fi
+
+        exec_args=(
+          exec
+          "${INPUT_PROMPT}"
+          --project "${GITHUB_WORKSPACE}"
+          --sandbox-mode "${INPUT_SANDBOX_MODE}"
+          --output-file "${RELATIVE_OUTPUT_FILE}"
+          --actor "${GITHUB_ACTOR}"
+          --unprivileged-user "${INPUT_UNPRIVILEGED_USER}"
+        )
+
+        if [[ -n "${INPUT_MODEL}" ]]; then
+          exec_args+=(--model "${INPUT_MODEL}")
+        fi
+
+        if [[ -n "${INPUT_ALLOW_USERS}" ]]; then
+          exec_args+=(--allow-users "${INPUT_ALLOW_USERS}")
+        fi
+
+        if [[ -n "${INPUT_ALLOW_BOTS}" ]]; then
+          exec_args+=(--allow-bots "${INPUT_ALLOW_BOTS}")
+        fi
+
+        if [[ "${INPUT_DROP_SUDO}" == "false" ]]; then
+          exec_args+=(--drop-sudo=false)
+        fi
+
+        if [[ "${INPUT_DROP_SUDO}" == "true" && "${EUID}" -eq 0 ]]; then
+          if [[ -z "${INPUT_UNPRIVILEGED_USER}" ]]; then
+            echo "::error::drop-sudo is enabled, but no unprivileged-user was provided."
+            exit 1
+          fi
+          if ! command -v sudo >/dev/null 2>&1; then
+            echo "::error::drop-sudo is enabled but sudo is unavailable on this runner."
+            exit 1
+          fi
+          if ! id "${INPUT_UNPRIVILEGED_USER}" >/dev/null 2>&1; then
+            echo "::error::unprivileged-user '${INPUT_UNPRIVILEGED_USER}' does not exist."
+            exit 1
+          fi
+          sudo -u "${INPUT_UNPRIVILEGED_USER}" --preserve-env=GITHUB_ACTOR,HOME,PATH harness "${exec_args[@]}"
+        else
+          harness "${exec_args[@]}"
+        fi
+
+    - name: Export final message
+      id: export
+      shell: bash
+      env:
+        RESOLVED_OUTPUT_FILE: ${{ steps.resolve-output.outputs.resolved-output }}
+        FINAL_MESSAGE_DELIMITER: ${{ steps.resolve-output.outputs.final-message-delimiter }}
+      run: |
+        set -euo pipefail
+        if [[ -z "${RESOLVED_OUTPUT_FILE}" || -z "${FINAL_MESSAGE_DELIMITER}" ]]; then
+          echo "::error::Resolved output-file metadata is missing."
+          exit 1
+        fi
+
+        if [[ ! -f "${RESOLVED_OUTPUT_FILE}" ]]; then
+          echo "::error::Expected harness output file '${RESOLVED_OUTPUT_FILE}' was not generated."
+          exit 1
+        fi
+
+        {
+          echo "final-message<<${FINAL_MESSAGE_DELIMITER}"
+          cat "${RESOLVED_OUTPUT_FILE}"
+          echo "${FINAL_MESSAGE_DELIMITER}"
+        } >> "${GITHUB_OUTPUT}"
