@@ -301,18 +301,10 @@ def _extract_output(turn: dict[str, Any] | None) -> str:
         if item.get("type") == "user_message":
             continue
 
-        content = item.get("content")
-        if isinstance(content, str) and content.strip():
-            messages.append(content.strip())
-            continue
-
-        stdout = item.get("stdout")
-        if isinstance(stdout, str) and stdout.strip():
-            messages.append(stdout.strip())
-            continue
-
-        message = item.get("message")
-        if isinstance(message, str) and message.strip():
-            messages.append(message.strip())
+        for key in ("content", "stdout", "message"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                messages.append(value.strip())
+                break
 
     return "\n\n".join(messages)

@@ -1,8 +1,12 @@
 import unittest
 from typing import Any
 
-from sdk.python.src.harness_sdk import Harness, HarnessRpcError
-from sdk.python.src.harness_sdk.client import _extract_output
+try:
+    from harness_sdk import Harness, HarnessRpcError
+    from harness_sdk.client import _extract_output
+except ModuleNotFoundError:
+    from sdk.python.src.harness_sdk import Harness, HarnessRpcError
+    from sdk.python.src.harness_sdk.client import _extract_output
 
 
 class MockRpc:
