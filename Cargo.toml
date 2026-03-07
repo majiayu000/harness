@@ -57,6 +57,9 @@ dashmap = "6"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = { version = "0.22", features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.22", features = ["trace", "metrics", "logs", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.15", features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-client"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

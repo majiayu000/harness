@@ -17,7 +17,12 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
             };
             let project = Project::from_path(project_root);
 
-            let event_store = EventStore::new(data_dir)?;
+            let event_store = EventStore::with_policies_and_otel(
+                data_dir,
+                config.observe.session_renewal_secs,
+                config.observe.log_retention_days,
+                &config.otel,
+            )?;
             let events = event_store.query(&EventFilters::default())?;
 
             let thresholds = map_thresholds(&config.gc.signal_thresholds);
