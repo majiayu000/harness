@@ -759,6 +759,7 @@ dependencies = [
  "harness-rules",
  "harness-server",
  "harness-skills",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
