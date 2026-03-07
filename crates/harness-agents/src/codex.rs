@@ -146,9 +146,7 @@ mod tests {
 
     impl ScopedEnvVar {
         fn set(key: &str, value: &str) -> Self {
-            let guard = env_lock()
-                .lock()
-                .expect("env lock should not be poisoned");
+            let guard = env_lock().lock().expect("env lock should not be poisoned");
             let original = std::env::var(key).ok();
             unsafe { std::env::set_var(key, value) };
             Self {

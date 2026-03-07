@@ -9,10 +9,31 @@ const MIN_PROMPT_LEN: usize = 10;
 
 /// Common action verbs that indicate a well-formed task prompt.
 const ACTION_VERBS: &[&str] = &[
-    "add", "create", "update", "fix", "remove", "delete", "refactor",
-    "implement", "write", "build", "change", "move", "rename", "migrate",
-    "review", "check", "test", "run", "deploy", "configure", "enable",
-    "disable", "improve", "optimize", "extract",
+    "add",
+    "create",
+    "update",
+    "fix",
+    "remove",
+    "delete",
+    "refactor",
+    "implement",
+    "write",
+    "build",
+    "change",
+    "move",
+    "rename",
+    "migrate",
+    "review",
+    "check",
+    "test",
+    "run",
+    "deploy",
+    "configure",
+    "enable",
+    "disable",
+    "improve",
+    "optimize",
+    "extract",
 ];
 
 /// Validates task contracts before agent execution.
@@ -40,9 +61,13 @@ impl ContractValidator {
     fn has_acceptance_criteria(prompt: &str) -> bool {
         let lower = prompt.to_lowercase();
         // Look for common acceptance-criteria signals
-        lower.contains("should") || lower.contains("must") || lower.contains("expect")
-            || lower.contains("verify") || lower.contains("ensure")
-            || lower.contains("assert") || lower.contains("confirm")
+        lower.contains("should")
+            || lower.contains("must")
+            || lower.contains("expect")
+            || lower.contains("verify")
+            || lower.contains("ensure")
+            || lower.contains("assert")
+            || lower.contains("confirm")
     }
 }
 
@@ -124,14 +149,18 @@ mod tests {
     async fn warns_without_action_verb() {
         let v = ContractValidator::new();
         // Long enough but no action verb
-        let result = v.pre_execute(&make_req("the authentication module needs attention")).await;
+        let result = v
+            .pre_execute(&make_req("the authentication module needs attention"))
+            .await;
         assert_eq!(result.decision, Decision::Warn);
     }
 
     #[tokio::test]
     async fn warns_without_acceptance_criteria() {
         let v = ContractValidator::new();
-        let result = v.pre_execute(&make_req("Fix the login redirect bug in auth.rs")).await;
+        let result = v
+            .pre_execute(&make_req("Fix the login redirect bug in auth.rs"))
+            .await;
         assert_eq!(result.decision, Decision::Warn);
     }
 
@@ -166,7 +195,9 @@ mod tests {
     #[tokio::test]
     async fn all_acceptance_criteria_keywords_accepted() {
         let v = ContractValidator::new();
-        for keyword in &["should", "must", "expect", "verify", "ensure", "assert", "confirm"] {
+        for keyword in &[
+            "should", "must", "expect", "verify", "ensure", "assert", "confirm",
+        ] {
             let prompt = format!("Add input validation. Users {keyword} see error messages.");
             let result = v.pre_execute(&make_req(&prompt)).await;
             assert_eq!(

@@ -41,15 +41,18 @@ impl SkillStore {
     /// Set up the 4-layer discovery chain.
     pub fn with_discovery(mut self, project_root: &Path) -> Self {
         // Repo level
-        self.discovery_paths.push(project_root.join(".harness/skills/"));
+        self.discovery_paths
+            .push(project_root.join(".harness/skills/"));
 
         // User level
         if let Ok(home) = std::env::var("HOME") {
-            self.discovery_paths.push(PathBuf::from(home).join(".harness/skills/"));
+            self.discovery_paths
+                .push(PathBuf::from(home).join(".harness/skills/"));
         }
 
         // Admin level
-        self.discovery_paths.push(PathBuf::from("/etc/harness/skills/"));
+        self.discovery_paths
+            .push(PathBuf::from("/etc/harness/skills/"));
 
         self
     }
@@ -71,7 +74,8 @@ impl SkillStore {
         } else if dir.to_string_lossy().contains("/.harness/skills") {
             // Check if it's a project-level path (not under home)
             if let Ok(home) = std::env::var("HOME") {
-                if dir.starts_with(&home) && !dir.starts_with(PathBuf::from(&home).join(".harness")) {
+                if dir.starts_with(&home) && !dir.starts_with(PathBuf::from(&home).join(".harness"))
+                {
                     SkillLocation::Repo
                 } else {
                     SkillLocation::User
@@ -96,7 +100,13 @@ impl SkillStore {
                     self.skills.push(Skill {
                         id: SkillId::new(),
                         name: name.clone(),
-                        description: content.lines().next().unwrap_or("").trim_start_matches('#').trim().to_string(),
+                        description: content
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim_start_matches('#')
+                            .trim()
+                            .to_string(),
                         content,
                         trigger_patterns: Vec::new(),
                         version: "1.0.0".to_string(),
@@ -193,7 +203,11 @@ impl SkillStore {
     }
 
     pub fn delete(&mut self, id: &SkillId) -> bool {
-        let name = self.skills.iter().find(|s| s.id == *id).map(|s| s.name.clone());
+        let name = self
+            .skills
+            .iter()
+            .find(|s| s.id == *id)
+            .map(|s| s.name.clone());
         let len = self.skills.len();
         self.skills.retain(|s| s.id != *id);
         let deleted = self.skills.len() < len;
@@ -219,8 +233,7 @@ impl SkillStore {
         self.skills
             .iter()
             .filter(|s| {
-                s.name.to_lowercase().contains(&q)
-                    || s.description.to_lowercase().contains(&q)
+                s.name.to_lowercase().contains(&q) || s.description.to_lowercase().contains(&q)
             })
             .collect()
     }
@@ -240,7 +253,10 @@ impl SkillStore {
             ("check", include_str!("../../../skills/check.md")),
             ("build-fix", include_str!("../../../skills/build-fix.md")),
             ("review", include_str!("../../../skills/review.md")),
-            ("cross-review", include_str!("../../../skills/cross-review.md")),
+            (
+                "cross-review",
+                include_str!("../../../skills/cross-review.md"),
+            ),
             ("learn", include_str!("../../../skills/learn.md")),
             ("gc", include_str!("../../../skills/gc.md")),
             ("stats", include_str!("../../../skills/stats.md")),
@@ -303,7 +319,9 @@ mod tests {
     #[test]
     fn deduplicate_keeps_higher_priority() {
         let mut store = SkillStore::new();
-        store.skills.push(make_skill("deploy", SkillLocation::System));
+        store
+            .skills
+            .push(make_skill("deploy", SkillLocation::System));
         store.skills.push(make_skill("deploy", SkillLocation::Repo));
         store.deduplicate();
         assert_eq!(store.list().len(), 1);
@@ -332,7 +350,10 @@ mod tests {
     #[test]
     fn create_adds_skill_to_store() {
         let mut store = SkillStore::new();
-        store.create("my-skill".to_string(), "# My Skill\nDoes stuff.".to_string());
+        store.create(
+            "my-skill".to_string(),
+            "# My Skill\nDoes stuff.".to_string(),
+        );
         assert_eq!(store.list().len(), 1);
         assert_eq!(store.list()[0].name, "my-skill");
     }
@@ -351,7 +372,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let persist_path = dir.path().to_path_buf();
         let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
-        store.create("my-skill".to_string(), "# My Skill\nDoes stuff.".to_string());
+        store.create(
+            "my-skill".to_string(),
+            "# My Skill\nDoes stuff.".to_string(),
+        );
         let file = persist_path.join("my-skill.md");
         assert!(file.exists(), "skill file should be written to disk");
         let contents = std::fs::read_to_string(&file).expect("read file");
@@ -422,7 +446,11 @@ mod tests {
         let mut store = SkillStore::new();
         store.load_builtin();
         store.load_builtin();
-        assert_eq!(store.list().len(), 10, "calling load_builtin twice must not duplicate skills");
+        assert_eq!(
+            store.list().len(),
+            10,
+            "calling load_builtin twice must not duplicate skills"
+        );
     }
 
     #[test]

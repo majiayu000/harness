@@ -113,8 +113,7 @@ pub async fn turn_start(
     input: String,
 ) -> RpcResponse {
     let input = harness_core::prompts::wrap_external_data(&input);
-    let agent_id =
-        harness_core::AgentId::from_str(&state.server.config.agents.default_agent);
+    let agent_id = harness_core::AgentId::from_str(&state.server.config.agents.default_agent);
     match state
         .server
         .thread_manager
@@ -292,7 +291,9 @@ mod tests {
         let response = thread_list_response(Some(json!(1)), AlwaysFailSerialize);
 
         assert!(response.result.is_none());
-        let error = response.error.expect("expected serialization error response");
+        let error = response
+            .error
+            .expect("expected serialization error response");
         assert_eq!(error.code, INTERNAL_ERROR);
         assert!(error
             .message

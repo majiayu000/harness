@@ -351,11 +351,8 @@ async fn ensure_endpoint_reachable(exporter: OtelExporter, endpoint: &str) -> an
         .map_err(|err| anyhow::anyhow!("failed to resolve OTLP endpoint `{endpoint}`: {err}"))?;
     for addr in addrs {
         attempted = true;
-        match tokio::time::timeout(
-            Duration::from_secs(1),
-            tokio::net::TcpStream::connect(addr),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_secs(1), tokio::net::TcpStream::connect(addr))
+            .await
         {
             Ok(Ok(stream)) => {
                 drop(stream);

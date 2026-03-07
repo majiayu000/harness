@@ -178,7 +178,11 @@ pub fn is_approved(output: &str) -> bool {
 pub fn extract_review_issues(output: &str) -> Vec<String> {
     output
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("ISSUE:").map(|s| s.trim().to_string()))
+        .filter_map(|l| {
+            l.trim()
+                .strip_prefix("ISSUE:")
+                .map(|s| s.trim().to_string())
+        })
         .filter(|s| !s.is_empty())
         .collect()
 }
@@ -286,7 +290,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_review_prompt_uses_configured_review_bot_command() {
         let p = review_prompt(None, 10, 2, false, "/gemini review");
         assert!(p.contains("/gemini review"));
@@ -295,6 +298,7 @@ mod tests {
         assert!(!p.contains("/gemini"));
     }
 
+    #[test]
     fn test_review_prompt_always_triggers_gemini_review() {
         let p = review_prompt(None, 10, 2, false, "/gemini review");
         assert!(p.contains("/gemini review"));
@@ -350,7 +354,10 @@ mod tests {
 
     #[test]
     fn test_extract_pr_number_invalid() {
-        assert_eq!(extract_pr_number("https://github.com/owner/repo/pull/"), None);
+        assert_eq!(
+            extract_pr_number("https://github.com/owner/repo/pull/"),
+            None
+        );
     }
 
     #[test]
@@ -384,7 +391,9 @@ mod tests {
     fn test_is_lgtm_false_positive() {
         // "LGTM" embedded in another word or non-final line should NOT match
         assert!(!is_lgtm("LGTM but actually not done"));
-        assert!(!is_lgtm("I think it looks LGTM but needs one more fix\nFIXED"));
+        assert!(!is_lgtm(
+            "I think it looks LGTM but needs one more fix\nFIXED"
+        ));
         assert!(!is_lgtm("somethingLGTM"));
         assert!(!is_lgtm("notLGTM\n"));
     }
@@ -400,7 +409,10 @@ mod tests {
 
     #[test]
     fn test_agent_review_fix_prompt() {
-        let issues = vec!["Missing error handling".to_string(), "Unbounded loop".to_string()];
+        let issues = vec![
+            "Missing error handling".to_string(),
+            "Unbounded loop".to_string(),
+        ];
         let p = agent_review_fix_prompt(42, &issues, 2);
         assert!(p.contains("PR #42"));
         assert!(p.contains("round 2"));

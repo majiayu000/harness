@@ -373,9 +373,9 @@ fn current_username() -> Option<String> {
                 .and_then(|passwd| passwd.pw_name.as_ref())
                 .and_then(|name| CStr::from_ptr(name).to_str().ok())
         }
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
     }
 
     #[cfg(not(unix))]
@@ -977,7 +977,8 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let suffix = std::process::id();
-        let root = std::env::temp_dir().join(format!("harness-cli-output-path-symlink-root-{suffix}"));
+        let root =
+            std::env::temp_dir().join(format!("harness-cli-output-path-symlink-root-{suffix}"));
         let outside =
             std::env::temp_dir().join(format!("harness-cli-output-path-symlink-outside-{suffix}"));
         let link = root.join("escape-link");
@@ -1064,10 +1065,16 @@ mod tests {
 
         let uid = unsafe { libc::getuid() };
         let passwd = unsafe { libc::getpwuid(uid) };
-        assert!(!passwd.is_null(), "getpwuid(getuid()) should resolve current user");
+        assert!(
+            !passwd.is_null(),
+            "getpwuid(getuid()) should resolve current user"
+        );
 
         let username_ptr = unsafe { (*passwd).pw_name };
-        assert!(!username_ptr.is_null(), "passwd record should contain pw_name");
+        assert!(
+            !username_ptr.is_null(),
+            "passwd record should contain pw_name"
+        );
 
         let expected = unsafe { CStr::from_ptr(username_ptr) }
             .to_str()
@@ -1081,10 +1088,14 @@ mod tests {
 
     #[test]
     fn cli_parses_serve_with_defaults() {
-        let cli = Cli::try_parse_from(["harness", "serve"])
-            .expect("serve with defaults should parse");
+        let cli =
+            Cli::try_parse_from(["harness", "serve"]).expect("serve with defaults should parse");
         match cli.command {
-            Command::Serve { transport, port, project_root } => {
+            Command::Serve {
+                transport,
+                port,
+                project_root,
+            } => {
                 assert_eq!(transport, "stdio");
                 assert!(port.is_none());
                 assert!(project_root.is_none());
@@ -1095,12 +1106,13 @@ mod tests {
 
     #[test]
     fn cli_parses_serve_with_http_and_port() {
-        let cli = Cli::try_parse_from([
-            "harness", "serve", "--transport", "http", "--port", "8080",
-        ])
-        .expect("serve with http+port should parse");
+        let cli =
+            Cli::try_parse_from(["harness", "serve", "--transport", "http", "--port", "8080"])
+                .expect("serve with http+port should parse");
         match cli.command {
-            Command::Serve { transport, port, .. } => {
+            Command::Serve {
+                transport, port, ..
+            } => {
                 assert_eq!(transport, "http");
                 assert_eq!(port, Some(8080));
             }
@@ -1113,7 +1125,13 @@ mod tests {
         let cli = Cli::try_parse_from(["harness", "exec", "fix the bug"])
             .expect("exec with defaults should parse");
         match cli.command {
-            Command::Exec { prompt, agent, sandbox_mode, drop_sudo, .. } => {
+            Command::Exec {
+                prompt,
+                agent,
+                sandbox_mode,
+                drop_sudo,
+                ..
+            } => {
                 assert_eq!(prompt, "fix the bug");
                 assert_eq!(agent, "claude");
                 assert_eq!(sandbox_mode, "workspace-write");
@@ -1126,23 +1144,43 @@ mod tests {
     #[test]
     fn cli_parses_exec_with_all_options() {
         let cli = Cli::try_parse_from([
-            "harness", "exec", "review PR",
-            "--project", "/tmp/repo",
-            "--agent", "codex",
-            "--model", "gpt-4",
-            "--sandbox-mode", "read-only",
-            "--output-file", "out.txt",
-            "--drop-sudo", "false",
-            "--unprivileged-user", "runner",
-            "--allow-users", "alice,bob",
-            "--allow-bots", "dependabot[bot]",
-            "--actor", "alice",
+            "harness",
+            "exec",
+            "review PR",
+            "--project",
+            "/tmp/repo",
+            "--agent",
+            "codex",
+            "--model",
+            "gpt-4",
+            "--sandbox-mode",
+            "read-only",
+            "--output-file",
+            "out.txt",
+            "--drop-sudo",
+            "false",
+            "--unprivileged-user",
+            "runner",
+            "--allow-users",
+            "alice,bob",
+            "--allow-bots",
+            "dependabot[bot]",
+            "--actor",
+            "alice",
         ])
         .expect("exec with all options should parse");
         match cli.command {
             Command::Exec {
-                prompt, agent, model, sandbox_mode,
-                drop_sudo, unprivileged_user, allow_users, allow_bots, actor, ..
+                prompt,
+                agent,
+                model,
+                sandbox_mode,
+                drop_sudo,
+                unprivileged_user,
+                allow_users,
+                allow_bots,
+                actor,
+                ..
             } => {
                 assert_eq!(prompt, "review PR");
                 assert_eq!(agent, "codex");
@@ -1163,20 +1201,28 @@ mod tests {
         let cli = Cli::try_parse_from(["harness", "gc", "run", "/tmp/proj"])
             .expect("gc run should parse");
         match cli.command {
-            Command::Gc { cmd: GcCommand::Run { project } } => {
+            Command::Gc {
+                cmd: GcCommand::Run { project },
+            } => {
                 assert_eq!(project, Some(PathBuf::from("/tmp/proj")));
             }
             _ => panic!("expected Gc Run command"),
         }
 
-        let cli = Cli::try_parse_from(["harness", "gc", "status"])
-            .expect("gc status should parse");
-        assert!(matches!(cli.command, Command::Gc { cmd: GcCommand::Status }));
+        let cli = Cli::try_parse_from(["harness", "gc", "status"]).expect("gc status should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Gc {
+                cmd: GcCommand::Status
+            }
+        ));
 
         let cli = Cli::try_parse_from(["harness", "gc", "adopt", "draft-123"])
             .expect("gc adopt should parse");
         match cli.command {
-            Command::Gc { cmd: GcCommand::Adopt { draft_id } } => {
+            Command::Gc {
+                cmd: GcCommand::Adopt { draft_id },
+            } => {
                 assert_eq!(draft_id, "draft-123");
             }
             _ => panic!("expected Gc Adopt command"),
@@ -1185,10 +1231,11 @@ mod tests {
 
     #[test]
     fn cli_parses_pr_fix_subcommand() {
-        let cli = Cli::try_parse_from(["harness", "pr", "fix", "42"])
-            .expect("pr fix should parse");
+        let cli = Cli::try_parse_from(["harness", "pr", "fix", "42"]).expect("pr fix should parse");
         match cli.command {
-            Command::Pr { cmd: PrCommand::Fix { issue, args } } => {
+            Command::Pr {
+                cmd: PrCommand::Fix { issue, args },
+            } => {
                 assert_eq!(issue, 42);
                 assert_eq!(args.wait, 120);
                 assert_eq!(args.max_rounds, 5);
@@ -1200,12 +1247,20 @@ mod tests {
     #[test]
     fn cli_parses_pr_loop_with_custom_args() {
         let cli = Cli::try_parse_from([
-            "harness", "pr", "loop", "99",
-            "--wait", "30", "--max-rounds", "3",
+            "harness",
+            "pr",
+            "loop",
+            "99",
+            "--wait",
+            "30",
+            "--max-rounds",
+            "3",
         ])
         .expect("pr loop with custom args should parse");
         match cli.command {
-            Command::Pr { cmd: PrCommand::Loop { pr, args } } => {
+            Command::Pr {
+                cmd: PrCommand::Loop { pr, args },
+            } => {
                 assert_eq!(pr, 99);
                 assert_eq!(args.wait, 30);
                 assert_eq!(args.max_rounds, 3);
@@ -1222,10 +1277,8 @@ mod tests {
 
     #[test]
     fn cli_global_config_flag() {
-        let cli = Cli::try_parse_from([
-            "harness", "--config", "/etc/harness.toml", "serve",
-        ])
-        .expect("global config flag should parse");
+        let cli = Cli::try_parse_from(["harness", "--config", "/etc/harness.toml", "serve"])
+            .expect("global config flag should parse");
         assert_eq!(cli.config, Some(PathBuf::from("/etc/harness.toml")));
     }
 

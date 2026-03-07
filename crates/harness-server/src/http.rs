@@ -130,13 +130,15 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         .load_configured_requirements()
         .context("failed to load configured rules.requirements_path")?;
 
-    let events = Arc::new(harness_observe::EventStore::with_policies_and_otel(
-        &dir,
-        server.config.observe.session_renewal_secs,
-        server.config.observe.log_retention_days,
-        &server.config.otel,
-    )
-    .await?);
+    let events = Arc::new(
+        harness_observe::EventStore::with_policies_and_otel(
+            &dir,
+            server.config.observe.session_renewal_secs,
+            server.config.observe.log_retention_days,
+            &server.config.otel,
+        )
+        .await?,
+    );
 
     let signal_detector = harness_gc::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),

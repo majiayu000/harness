@@ -110,7 +110,9 @@ impl EventStore {
         let pipeline = match self.otel_pipeline.lock() {
             Ok(mut slot) => slot.take(),
             Err(poisoned) => {
-                tracing::error!("OpenTelemetry pipeline mutex poisoned during shutdown; recovering");
+                tracing::error!(
+                    "OpenTelemetry pipeline mutex poisoned during shutdown; recovering"
+                );
                 poisoned.into_inner().take()
             }
         };

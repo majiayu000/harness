@@ -101,7 +101,11 @@ pub async fn gc_adopt(
                          commit, push, and open a PR. \
                          Print PR_URL=<url> on the last line."
                 );
-                let req = gc_adopt_task_request(prompt, &state.server.config.gc, state.project_root.clone());
+                let req = gc_adopt_task_request(
+                    prompt,
+                    &state.server.config.gc,
+                    state.project_root.clone(),
+                );
                 let tid = crate::task_runner::spawn_task(
                     state.tasks.clone(),
                     agent,
@@ -137,7 +141,11 @@ mod tests {
         gc_config.adopt_max_rounds = 9;
         gc_config.adopt_turn_timeout_secs = 11;
 
-        let req = gc_adopt_task_request("prompt".to_string(), &gc_config, std::path::PathBuf::from("/tmp/project"));
+        let req = gc_adopt_task_request(
+            "prompt".to_string(),
+            &gc_config,
+            std::path::PathBuf::from("/tmp/project"),
+        );
 
         assert_eq!(req.wait_secs, 7);
         assert_eq!(req.max_rounds, 9);
@@ -148,7 +156,11 @@ mod tests {
     fn gc_adopt_task_request_uses_gc_config_defaults() {
         let gc_config = harness_core::GcConfig::default();
 
-        let req = gc_adopt_task_request("prompt".to_string(), &gc_config, std::path::PathBuf::from("/tmp/project"));
+        let req = gc_adopt_task_request(
+            "prompt".to_string(),
+            &gc_config,
+            std::path::PathBuf::from("/tmp/project"),
+        );
 
         assert_eq!(req.wait_secs, 120);
         assert_eq!(req.max_rounds, 3);

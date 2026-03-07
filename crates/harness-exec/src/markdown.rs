@@ -40,7 +40,11 @@ pub fn to_markdown(plan: &ExecPlan) -> String {
     if !plan.decision_log.is_empty() {
         out.push_str("## Decision Log\n\n");
         for d in &plan.decision_log {
-            out.push_str(&format!("### {} ({})\n\n", d.decision, d.timestamp.format("%Y-%m-%d %H:%M")));
+            out.push_str(&format!(
+                "### {} ({})\n\n",
+                d.decision,
+                d.timestamp.format("%Y-%m-%d %H:%M")
+            ));
             out.push_str(&format!("{}\n\n", d.rationale));
         }
     }
@@ -131,7 +135,9 @@ pub fn from_markdown(content: &str) -> anyhow::Result<ExecPlan> {
                     if line.contains("[x]") || line.contains("[ ]") {
                         let completed = line.contains("[x]");
                         let desc = line
-                            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ' ')
+                            .trim_start_matches(|c: char| {
+                                c.is_ascii_digit() || c == '.' || c == ' '
+                            })
                             .trim_start_matches("[x] ")
                             .trim_start_matches("[ ] ")
                             .to_string();

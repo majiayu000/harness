@@ -69,7 +69,10 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
                 println!("No pending drafts");
             } else {
                 for draft in &pending {
-                    println!("{} [{:?}] {}", draft.id, draft.signal.signal_type, draft.rationale);
+                    println!(
+                        "{} [{:?}] {}",
+                        draft.id, draft.signal.signal_type, draft.rationale
+                    );
                 }
             }
         }

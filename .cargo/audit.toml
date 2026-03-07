@@ -1,0 +1,5 @@
+[advisories]
+ignore = [
+  # No patched rsa release is available yet; tracked upstream in advisory.
+  "RUSTSEC-2023-0071",
+]
