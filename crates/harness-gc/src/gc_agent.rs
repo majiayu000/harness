@@ -217,6 +217,7 @@ fn build_prompt(signal: &Signal, project: &Project) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use harness_core::{

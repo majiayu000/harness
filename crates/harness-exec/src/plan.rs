@@ -46,19 +46,10 @@ pub struct Surprise {
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ValidationCriteria {
     pub tests: Vec<String>,
     pub checks: Vec<String>,
-}
-
-impl Default for ValidationCriteria {
-    fn default() -> Self {
-        Self {
-            tests: Vec::new(),
-            checks: Vec::new(),
-        }
-    }
 }
 
 impl ExecPlan {

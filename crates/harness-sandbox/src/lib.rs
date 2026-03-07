@@ -71,12 +71,12 @@ pub fn wrap_command(
 
     #[cfg(target_os = "macos")]
     {
-        return wrap_macos_command(program, args, spec);
+        wrap_macos_command(program, args, spec)
     }
 
     #[cfg(target_os = "linux")]
     {
-        return wrap_linux_command(program, args, spec);
+        wrap_linux_command(program, args, spec)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

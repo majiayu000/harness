@@ -1,3 +1,5 @@
+#![allow(clippy::manual_map, clippy::needless_return, clippy::ptr_arg)]
+
 use clap::Parser;
 
 mod cmd;

@@ -401,7 +401,7 @@ mod tests {
         assert_eq!(events.len(), 4);
         let by_tool: std::collections::HashMap<_, _> = events
             .iter()
-            .map(|e| (e.tool.as_str(), e.decision.clone()))
+            .map(|e| (e.tool.as_str(), e.decision))
             .collect();
         assert_eq!(by_tool["R-CRIT"], Decision::Block);
         assert_eq!(by_tool["R-HIGH"], Decision::Block);

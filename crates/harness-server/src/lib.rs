@@ -1,3 +1,14 @@
+#![allow(
+    clippy::field_reassign_with_default,
+    clippy::items_after_test_module,
+    clippy::manual_is_multiple_of,
+    clippy::manual_pattern_char_comparison,
+    clippy::new_without_default,
+    clippy::too_many_arguments,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_to_owned
+)]
+
 pub mod complexity_router;
 pub mod contract_validator;
 pub mod handlers;
