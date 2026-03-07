@@ -1,21 +1,26 @@
 use crate::streaming::send_stream_item;
 use async_trait::async_trait;
+use harness_core::SandboxMode;
 use harness_core::{
     AgentRequest, AgentResponse, Capability, CodeAgent, Item, StreamItem, TokenUsage,
 };
+use harness_sandbox::{wrap_command, SandboxSpec};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use tokio::process::Command;
 
 pub struct ClaudeCodeAgent {
     pub cli_path: PathBuf,
     pub default_model: String,
+    pub sandbox_mode: SandboxMode,
 }
 
 impl ClaudeCodeAgent {
-    pub fn new(cli_path: PathBuf, default_model: String) -> Self {
+    pub fn new(cli_path: PathBuf, default_model: String, sandbox_mode: SandboxMode) -> Self {
         Self {
             cli_path,
             default_model,
+            sandbox_mode,
         }
     }
 }
@@ -32,26 +37,40 @@ impl CodeAgent for ClaudeCodeAgent {
 
     async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
         let model = req.model.as_deref().unwrap_or(&self.default_model);
-        let mut cmd = Command::new(&self.cli_path);
-        cmd.arg("-p")
-            .arg("--dangerously-skip-permissions")
-            .arg("--output-format")
-            .arg("text")
-            .arg("--model")
-            .arg(model)
-            .arg("--verbose")
-            .current_dir(&req.project_root)
-            .env_remove("CLAUDECODE");
+        let mut base_args = vec![
+            OsString::from("-p"),
+            OsString::from("--dangerously-skip-permissions"),
+            OsString::from("--output-format"),
+            OsString::from("text"),
+            OsString::from("--model"),
+            OsString::from(model),
+            OsString::from("--verbose"),
+        ];
 
         if !req.allowed_tools.is_empty() {
-            cmd.arg("--allowedTools").arg(req.allowed_tools.join(","));
+            base_args.push(OsString::from("--allowedTools"));
+            base_args.push(OsString::from(req.allowed_tools.join(",")));
         }
 
         if let Some(budget) = req.max_budget_usd {
-            cmd.arg("--max-budget-usd").arg(budget.to_string());
+            base_args.push(OsString::from("--max-budget-usd"));
+            base_args.push(OsString::from(budget.to_string()));
         }
 
-        cmd.arg(&req.prompt);
+        base_args.push(OsString::from(req.prompt.clone()));
+
+        let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
+        let wrapped_command =
+            wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
+                harness_core::HarnessError::AgentExecution(format!(
+                    "sandbox setup failed for claude: {error}"
+                ))
+            })?;
+
+        let mut cmd = Command::new(&wrapped_command.program);
+        cmd.args(&wrapped_command.args)
+            .current_dir(&req.project_root)
+            .env_remove("CLAUDECODE");
 
         let output = cmd.output().await.map_err(|e| {
             harness_core::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
@@ -114,7 +133,11 @@ mod tests {
 
     #[tokio::test]
     async fn execute_stream_returns_error_when_channel_closed() {
-        let agent = ClaudeCodeAgent::new(PathBuf::from("/usr/bin/true"), "test-model".to_string());
+        let agent = ClaudeCodeAgent::new(
+            PathBuf::from("/usr/bin/true"),
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
         let request = AgentRequest::default();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
