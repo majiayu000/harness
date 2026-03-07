@@ -330,19 +330,14 @@ fn current_username() -> Option<String> {
         use std::ffi::CStr;
 
         let uid = unsafe { libc::getuid() };
-        let passwd = unsafe { libc::getpwuid(uid) };
-        if passwd.is_null() {
-            return None;
-        }
+        let passwd_ptr = unsafe { libc::getpwuid(uid) };
 
-        let username_ptr = unsafe { (*passwd).pw_name };
-        if username_ptr.is_null() {
-            return None;
+        return unsafe {
+            passwd_ptr
+                .as_ref()
+                .and_then(|passwd| passwd.pw_name.as_ref())
+                .and_then(|name| CStr::from_ptr(name).to_str().ok())
         }
-
-        return unsafe { CStr::from_ptr(username_ptr) }
-            .to_str()
-            .ok()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
@@ -453,6 +448,16 @@ fn normalize_absolute_output_path(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(normalized)
 }
 
+fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
+    let mut candidate = path;
+    loop {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        candidate = candidate.parent()?;
+    }
+}
+
 fn resolve_exec_output_path(project_root: &Path, output_file: &Path) -> anyhow::Result<PathBuf> {
     let canonical_project_root = project_root.canonicalize().with_context(|| {
         format!(
@@ -470,6 +475,25 @@ fn resolve_exec_output_path(project_root: &Path, output_file: &Path) -> anyhow::
     let candidate = normalize_absolute_output_path(&candidate_input)?;
 
     if !candidate.starts_with(&canonical_project_root) {
+        anyhow::bail!(
+            "`--output-file` must stay within project root `{}`",
+            canonical_project_root.display()
+        );
+    }
+
+    let parent = candidate.parent().ok_or_else(|| {
+        anyhow::anyhow!("`--output-file` must include a valid parent path within project root")
+    })?;
+    let existing_ancestor = nearest_existing_ancestor(parent).ok_or_else(|| {
+        anyhow::anyhow!("unable to resolve existing ancestor for `--output-file` validation")
+    })?;
+    let canonical_ancestor = existing_ancestor.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize output ancestor {} for --output-file validation",
+            existing_ancestor.display()
+        )
+    })?;
+    if !canonical_ancestor.starts_with(&canonical_project_root) {
         anyhow::bail!(
             "`--output-file` must stay within project root `{}`",
             canonical_project_root.display()
@@ -864,6 +888,36 @@ mod tests {
         assert!(error
             .to_string()
             .contains("`--output-file` must stay within project root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_exec_output_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let suffix = std::process::id();
+        let root = std::env::temp_dir().join(format!("harness-cli-output-path-symlink-root-{suffix}"));
+        let outside =
+            std::env::temp_dir().join(format!("harness-cli-output-path-symlink-outside-{suffix}"));
+        let link = root.join("escape-link");
+
+        std::fs::create_dir_all(&root).expect("temp root should be creatable");
+        std::fs::create_dir_all(&outside).expect("outside dir should be creatable");
+        if link.exists() {
+            std::fs::remove_file(&link).expect("pre-existing symlink should be removable");
+        }
+        symlink(&outside, &link).expect("symlink should be creatable");
+
+        let error = resolve_exec_output_path(&root, Path::new("escape-link/evil.txt"))
+            .expect_err("symlink-based escape should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("`--output-file` must stay within project root"));
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
