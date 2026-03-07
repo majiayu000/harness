@@ -17,6 +17,10 @@ classifiers = [
   "Topic :: Software Development :: Libraries",
 ]
 
+[project.optional-dependencies]
+dev = ["build>=1.2.2", "twine>=6.0.0", "pytest>=8.0.0"]
+test = ["pytest>=8.0.0"]
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 

@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Generator, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Callable, Generator
 
-Event = Dict[str, Any]
-RpcHandler = Callable[[str, Dict[str, Any]], Any]
+Event = dict[str, Any]
+RpcHandler = Callable[[str, dict[str, Any]], Any]
 EventHandler = Callable[[Event], None]
 
 
@@ -26,27 +26,32 @@ class RunResult:
     turn_id: str
     status: str
     output: str
-    turn: Optional[Dict[str, Any]]
-    events: List[Event]
+    turn: dict[str, Any] | None
+    events: list[Event]
     timed_out: bool
 
 
 class Harness:
     def __init__(
         self,
-        base_url: str = "http://127.0.0.1:8080",
-        cwd: Optional[str] = None,
+        base_url: str = "http://127.0.0.1:9800",
+        cwd: str | None = None,
         request_timeout_seconds: float = 15.0,
-        rpc_handler: Optional[RpcHandler] = None,
+        rpc_handler: RpcHandler | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        self.cwd = cwd or os.getcwd()
+        self.cwd = cwd
         self.request_timeout_seconds = request_timeout_seconds
         self._rpc_handler = rpc_handler
         self._next_id = 1
 
-    def start_thread(self, cwd: Optional[str] = None) -> "HarnessThread":
-        result = self._rpc("thread/start", {"cwd": cwd or self.cwd})
+    def start_thread(self, cwd: str | None = None) -> "HarnessThread":
+        resolved_cwd = cwd if cwd is not None else self.cwd
+        params: dict[str, Any] = {}
+        if resolved_cwd is not None:
+            params["cwd"] = resolved_cwd
+
+        result = self._rpc("thread/start", params)
         return HarnessThread(self, str(result["thread_id"]))
 
     def resume_thread(self, thread_id: str) -> "HarnessThread":
@@ -56,13 +61,13 @@ class Harness:
     def thread(self, thread_id: str) -> "HarnessThread":
         return HarnessThread(self, thread_id)
 
-    def start_turn(self, thread_id: str, prompt: str) -> Dict[str, Any]:
+    def start_turn(self, thread_id: str, prompt: str) -> dict[str, Any]:
         return self._rpc("turn/start", {"thread_id": thread_id, "input": prompt})
 
-    def turn_status(self, turn_id: str) -> Dict[str, Any]:
+    def turn_status(self, turn_id: str) -> dict[str, Any]:
         return self._rpc("turn/status", {"turn_id": turn_id})
 
-    def _rpc(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    def _rpc(self, method: str, params: dict[str, Any] | None = None) -> Any:
         if self._rpc_handler:
             return self._rpc_handler(method, params or {})
 
@@ -124,11 +129,11 @@ class HarnessThread:
         prompt: str,
         timeout_seconds: float = 30.0,
         poll_interval_seconds: float = 0.5,
-        on_event: Optional[EventHandler] = None,
+        on_event: EventHandler | None = None,
     ) -> RunResult:
-        events: List[Event] = []
+        events: list[Event] = []
         turn_id = ""
-        latest_turn: Optional[Dict[str, Any]] = None
+        latest_turn: dict[str, Any] | None = None
 
         for event in self.run_stream(
             prompt,
@@ -137,9 +142,9 @@ class HarnessThread:
             on_event=on_event,
         ):
             events.append(event)
-            if event["method"] == "turn/started":
+            if event["method"] == "sdk:turn/started":
                 turn_id = str(event["params"]["turn_id"])
-            if event["method"] == "turn/status":
+            if event["method"] == "sdk:turn/status":
                 latest_turn = event["params"]["turn"]
 
         if not latest_turn and turn_id:
@@ -152,7 +157,7 @@ class HarnessThread:
             output=_extract_output(latest_turn),
             turn=latest_turn,
             events=events,
-            timed_out=any(event["method"] == "turn/timeout" for event in events),
+            timed_out=any(event["method"] == "sdk:turn/timeout" for event in events),
         )
 
     def run_stream(
@@ -160,7 +165,7 @@ class HarnessThread:
         prompt: str,
         timeout_seconds: float = 30.0,
         poll_interval_seconds: float = 0.5,
-        on_event: Optional[EventHandler] = None,
+        on_event: EventHandler | None = None,
     ) -> Generator[Event, None, None]:
         poll_interval = max(0.01, float(poll_interval_seconds))
         timeout = max(0.01, float(timeout_seconds))
@@ -171,8 +176,13 @@ class HarnessThread:
         previous_signature = ""
 
         start_event = _new_event(
-            "turn/started",
-            {"thread_id": self.id, "turn_id": turn_id, "source": "rpc"},
+            "sdk:turn/started",
+            {
+                "thread_id": self.id,
+                "turn_id": turn_id,
+                "source": "sdk-poll",
+                "server_method": "turn/start",
+            },
         )
         _notify(on_event, start_event)
         yield start_event
@@ -184,8 +194,14 @@ class HarnessThread:
             if signature != previous_signature:
                 previous_signature = signature
                 status_event = _new_event(
-                    "turn/status",
-                    {"thread_id": self.id, "turn_id": turn_id, "turn": turn},
+                    "sdk:turn/status",
+                    {
+                        "thread_id": self.id,
+                        "turn_id": turn_id,
+                        "turn": turn,
+                        "source": "sdk-poll",
+                        "server_method": "turn/status",
+                    },
                 )
                 _notify(on_event, status_event)
                 yield status_event
@@ -193,12 +209,14 @@ class HarnessThread:
             status = str(turn.get("status", "running"))
             if _is_terminal_status(status):
                 completed_event = _new_event(
-                    "turn/completed",
+                    "sdk:turn/completed",
                     {
                         "thread_id": self.id,
                         "turn_id": turn_id,
                         "status": status,
                         "token_usage": turn.get("token_usage"),
+                        "source": "sdk-poll",
+                        "server_method": "turn/status",
                     },
                 )
                 _notify(on_event, completed_event)
@@ -207,11 +225,13 @@ class HarnessThread:
 
             if time.monotonic() - started_at >= timeout:
                 timeout_event = _new_event(
-                    "turn/timeout",
+                    "sdk:turn/timeout",
                     {
                         "thread_id": self.id,
                         "turn_id": turn_id,
                         "timeout_seconds": timeout,
+                        "source": "sdk-poll",
+                        "server_method": "turn/status",
                     },
                 )
                 _notify(on_event, timeout_event)
@@ -221,20 +241,25 @@ class HarnessThread:
             time.sleep(poll_interval)
 
 
-def _notify(on_event: Optional[EventHandler], event: Event) -> None:
+def _notify(on_event: EventHandler | None, event: Event) -> None:
     if on_event:
         on_event(event)
 
 
-def _new_event(method: str, params: Dict[str, Any]) -> Event:
+def _new_event(method: str, params: dict[str, Any]) -> Event:
+    timestamp = (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
     return {
         "method": method,
         "params": params,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "timestamp": timestamp,
     }
 
 
-def _turn_signature(turn: Dict[str, Any]) -> str:
+def _turn_signature(turn: dict[str, Any]) -> str:
     status = str(turn.get("status", "running"))
     items = turn.get("items")
     item_count = len(items) if isinstance(items, list) else 0
@@ -246,7 +271,7 @@ def _is_terminal_status(status: str) -> bool:
     return status in {"completed", "cancelled", "failed"}
 
 
-def _extract_output(turn: Optional[Dict[str, Any]]) -> str:
+def _extract_output(turn: dict[str, Any] | None) -> str:
     if not turn:
         return ""
 
@@ -254,7 +279,7 @@ def _extract_output(turn: Optional[Dict[str, Any]]) -> str:
     if not isinstance(items, list):
         return ""
 
-    messages: List[str] = []
+    messages: list[str] = []
     for item in items:
         if not isinstance(item, dict):
             continue
