@@ -165,12 +165,10 @@ pub(crate) async fn run_setup_phase(
     Ok(())
 }
 
-fn redact_secret_values(mut text: String, secret_env: &[String]) -> String {
-    for key in secret_env {
-        if let Ok(secret_value) = std::env::var(key) {
-            if !secret_value.is_empty() {
-                text = text.replace(&secret_value, "***");
-            }
+fn redact_secret_values(mut text: String, secret_values: &[String]) -> String {
+    for secret_value in secret_values {
+        if !secret_value.is_empty() {
+            text = text.replace(secret_value, "***");
         }
     }
     text
