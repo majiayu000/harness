@@ -15,6 +15,7 @@ macro_rules! define_id {
                 Self(uuid::Uuid::new_v4().to_string())
             }
 
+            #[allow(clippy::should_implement_trait)]
             pub fn from_str(s: &str) -> Self {
                 Self(s.to_string())
             }

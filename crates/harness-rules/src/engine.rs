@@ -70,7 +70,7 @@ impl RuleEngine {
             }
 
             // User level
-            if let Some(home) = std::env::var("HOME").ok() {
+            if let Ok(home) = std::env::var("HOME") {
                 let user_rules = PathBuf::from(home).join(".harness/rules/");
                 if user_rules.is_dir() {
                     self.load_from(&user_rules)?;

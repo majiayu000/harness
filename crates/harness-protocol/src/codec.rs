@@ -110,6 +110,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn rpc_error_codes_are_negative() {
         assert!(crate::PARSE_ERROR < 0);
         assert!(crate::INVALID_REQUEST < 0);
