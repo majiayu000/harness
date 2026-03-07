@@ -1,6 +1,6 @@
 use crate::http::AppState;
 use harness_core::DraftId;
-use harness_protocol::{RpcResponse, INTERNAL_ERROR};
+use harness_protocol::{RpcResponse, INTERNAL_ERROR, NOT_FOUND};
 
 fn gc_adopt_task_request(
     prompt: String,
@@ -11,6 +11,7 @@ fn gc_adopt_task_request(
         prompt: Some(prompt),
         issue: None,
         pr: None,
+        agent: None,
         project: Some(project_root),
         wait_secs: gc_config.adopt_wait_secs,
         max_rounds: gc_config.adopt_max_rounds,
@@ -73,7 +74,7 @@ pub async fn gc_adopt(
     let draft = match state.gc_agent.draft_store().get(&draft_id) {
         Ok(Some(d)) => d,
         Ok(None) => {
-            return RpcResponse::error(id, INTERNAL_ERROR, format!("draft {} not found", draft_id));
+            return RpcResponse::error(id, NOT_FOUND, format!("draft {} not found", draft_id));
         }
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     };

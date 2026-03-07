@@ -57,6 +57,24 @@ pub enum Transport {
     WebSocket,
 }
 
+/// Controls how much autonomy the agent has when executing tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    /// Agent suggests changes but does not apply them.
+    Suggest,
+    /// Agent can edit files but requires human approval for shell commands.
+    AutoEdit,
+    /// Agent has full autonomy — no approval gates.
+    FullAuto,
+}
+
+impl Default for ApprovalPolicy {
+    fn default() -> Self {
+        Self::AutoEdit
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentsConfig {
     pub default_agent: String,
@@ -65,6 +83,8 @@ pub struct AgentsConfig {
     pub anthropic_api: AnthropicApiConfig,
     #[serde(default)]
     pub review: AgentReviewConfig,
+    #[serde(default)]
+    pub approval_policy: ApprovalPolicy,
 }
 
 impl Default for AgentsConfig {
@@ -75,6 +95,7 @@ impl Default for AgentsConfig {
             codex: CodexAgentConfig::default(),
             anthropic_api: AnthropicApiConfig::default(),
             review: AgentReviewConfig::default(),
+            approval_policy: ApprovalPolicy::default(),
         }
     }
 }
@@ -379,6 +400,30 @@ mod tests {
         "#;
         let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.max_tokens, 8192);
+    }
+
+    #[test]
+    fn approval_policy_defaults_to_auto_edit() {
+        let config = AgentsConfig::default();
+        assert_eq!(config.approval_policy, ApprovalPolicy::AutoEdit);
+    }
+
+    #[test]
+    fn approval_policy_deserializes_from_toml() {
+        let toml_str = r#"
+            default_agent = "claude"
+            approval_policy = "full_auto"
+            [claude]
+            cli_path = "claude"
+            default_model = "sonnet"
+            [codex]
+            cli_path = "codex"
+            [anthropic_api]
+            base_url = "https://api.anthropic.com"
+            default_model = "claude-sonnet-4-20250514"
+        "#;
+        let config: AgentsConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.approval_policy, ApprovalPolicy::FullAuto);
     }
 
     #[test]

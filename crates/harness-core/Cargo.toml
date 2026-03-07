@@ -16,3 +16,4 @@ tokio = { workspace = true, features = ["sync"] }
 [dev-dependencies]
 anyhow = { workspace = true }
 toml = { workspace = true }
+tempfile = { workspace = true }

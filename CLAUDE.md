@@ -21,6 +21,12 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 - ZERO `Command::new("gh")` or `Command::new("git")` calls inside harness crates — all GitHub/git interaction must be in agent prompts only
 - When user says "fix issue X" or "handle PR Y", ALWAYS delegate to harness server (`POST /tasks`) instead of implementing directly
 
+## PR Workflow
+
+- After creating a PR, wait for Gemini code review bot before merging
+- If Gemini leaves review comments, address valid feedback before merge
+- If no comments or only false positives, proceed with merge
+
 ## Dependencies
 
 - NEVER downgrade dependency versions unless explicitly requested

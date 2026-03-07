@@ -1,6 +1,6 @@
 use crate::http::AppState;
 use harness_core::{ThreadId, ThreadStatus, TurnStatus};
-use harness_protocol::{Notification, RpcResponse, INTERNAL_ERROR};
+use harness_protocol::{Notification, RpcResponse, INTERNAL_ERROR, NOT_FOUND};
 use std::path::PathBuf;
 
 /// Persist an existing thread to the optional ThreadDb after a mutation.
@@ -162,7 +162,7 @@ pub async fn turn_cancel(
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             }
         }
-        None => RpcResponse::error(id, INTERNAL_ERROR, "turn not found in any thread"),
+        None => RpcResponse::error(id, NOT_FOUND, "turn not found in any thread"),
     }
 }
 
@@ -180,13 +180,13 @@ pub async fn turn_status(
                         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
                     }
                 } else {
-                    RpcResponse::error(id, INTERNAL_ERROR, "turn not found")
+                    RpcResponse::error(id, NOT_FOUND, "turn not found")
                 }
             } else {
-                RpcResponse::error(id, INTERNAL_ERROR, "thread not found")
+                RpcResponse::error(id, NOT_FOUND, "thread not found")
             }
         }
-        None => RpcResponse::error(id, INTERNAL_ERROR, "turn not found in any thread"),
+        None => RpcResponse::error(id, NOT_FOUND, "turn not found in any thread"),
     }
 }
 
@@ -211,7 +211,7 @@ pub async fn turn_steer(
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             }
         }
-        None => RpcResponse::error(id, INTERNAL_ERROR, "turn not found in any thread"),
+        None => RpcResponse::error(id, NOT_FOUND, "turn not found in any thread"),
     }
 }
 

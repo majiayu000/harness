@@ -422,6 +422,7 @@ pub enum ContextItem {
     Skill { id: String, content: String },
     History { turn_id: TurnId, summary: String },
     File { path: PathBuf, content: String },
+    AgentsMd { content: String },
 }
 
 // === Quality ===

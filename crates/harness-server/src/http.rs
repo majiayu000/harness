@@ -23,6 +23,7 @@ pub struct AppState {
     pub gc_agent: Arc<harness_gc::GcAgent>,
     pub plans:
         Arc<RwLock<std::collections::HashMap<harness_core::ExecPlanId, harness_exec::ExecPlan>>>,
+    pub plan_db: Option<crate::plan_db::PlanDb>,
     pub thread_db: Option<crate::thread_db::ThreadDb>,
     pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     /// Broadcast channel for server-push notifications (WebSocket and stdio transports).
@@ -119,6 +120,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     let thread_db_path = dir.join("threads.db");
     let thread_db = crate::thread_db::ThreadDb::open(&thread_db_path).await?;
+    let plan_db = crate::plan_db::PlanDb::open(&dir.join("plans.db")).await?;
     let configured_capacity = server.config.server.notification_broadcast_capacity;
     let notification_broadcast_capacity = configured_capacity.max(1);
     let notification_lag_log_every = server.config.server.notification_lag_log_every;
@@ -151,6 +153,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         gc_agent,
         plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
         thread_db: Some(thread_db),
+        plan_db: Some(plan_db),
         interceptors: vec![Arc::new(crate::contract_validator::ContractValidator::new())],
         notification_tx: broadcast::channel(notification_broadcast_capacity).0,
         notification_lagged_total: Arc::new(AtomicU64::new(0)),
@@ -235,6 +238,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/rpc", post(handle_rpc))
+        .route("/ws", get(crate::websocket::ws_handler))
         .route("/tasks", post(create_task))
         .route("/tasks", get(list_tasks))
         .route("/tasks/{id}", get(get_task))
@@ -268,13 +272,25 @@ async fn create_task(
         );
     }
 
-    let agent = match state.server.agent_registry.default_agent() {
-        Some(a) => a,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "no agent registered"})),
-            );
+    let agent = if let Some(name) = &req.agent {
+        match state.server.agent_registry.get(name) {
+            Some(a) => a,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("agent '{}' not registered", name)})),
+                );
+            }
+        }
+    } else {
+        match state.server.agent_registry.default_agent() {
+            Some(a) => a,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "no agent registered"})),
+                );
+            }
         }
     };
 
@@ -364,6 +380,7 @@ mod tests {
             gc_agent,
             plans: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             thread_db: Some(thread_db),
+            plan_db: None,
             interceptors: vec![],
             notification_tx: tokio::sync::broadcast::channel(32).0,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),

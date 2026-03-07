@@ -8,6 +8,7 @@ pub mod router;
 pub mod task_runner;
 pub mod task_executor;
 pub mod task_db;
+pub mod plan_db;
 pub mod complexity_router;
 pub mod contract_validator;
 pub mod scheduler;

@@ -1,5 +1,6 @@
 pub mod types;
 pub mod agent;
+pub mod agents_md;
 pub mod error;
 pub mod config;
 pub mod prompts;
