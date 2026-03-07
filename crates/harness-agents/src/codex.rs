@@ -1,10 +1,12 @@
 use crate::cloud_setup;
 use crate::streaming::send_stream_item;
 use async_trait::async_trait;
+use harness_core::SandboxMode;
 use harness_core::{
     AgentRequest, AgentResponse, Capability, CodeAgent, CodexAgentConfig, CodexCloudConfig, Item,
     StreamItem, TokenUsage,
 };
+use harness_sandbox::{wrap_command, SandboxSpec};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -12,39 +14,36 @@ use tokio::process::Command;
 pub struct CodexAgent {
     pub cli_path: PathBuf,
     pub cloud: CodexCloudConfig,
+    pub sandbox_mode: SandboxMode,
 }
 
 impl CodexAgent {
-    pub fn new(cli_path: PathBuf) -> Self {
-        Self::with_cloud(cli_path, CodexCloudConfig::default())
+    pub fn new(cli_path: PathBuf, sandbox_mode: SandboxMode) -> Self {
+        Self::with_cloud(cli_path, CodexCloudConfig::default(), sandbox_mode)
     }
 
-    pub fn with_cloud(cli_path: PathBuf, cloud: CodexCloudConfig) -> Self {
-        Self { cli_path, cloud }
-    }
-
-    pub fn from_config(config: CodexAgentConfig) -> Self {
-        Self::with_cloud(config.cli_path, config.cloud)
-    }
-
-    fn sandbox_mode(&self) -> &'static str {
-        if self.cloud.enabled {
-            "workspace-write"
-        } else {
-            "read-only"
+    pub fn with_cloud(cli_path: PathBuf, cloud: CodexCloudConfig, sandbox_mode: SandboxMode) -> Self {
+        Self {
+            cli_path,
+            cloud,
+            sandbox_mode,
         }
+    }
+
+    pub fn from_config(config: CodexAgentConfig, sandbox_mode: SandboxMode) -> Self {
+        Self::with_cloud(config.cli_path, config.cloud, sandbox_mode)
     }
 
     async fn run_setup_phase(&self, project_root: &Path) -> harness_core::Result<()> {
         cloud_setup::run_setup_phase(&self.cloud, project_root).await
     }
 
-    fn agent_phase_args(&self, req: &AgentRequest) -> Vec<OsString> {
+    fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
         let mut args = vec![
             OsString::from("exec"),
             OsString::from("--skip-git-repo-check"),
-            OsString::from("-s"),
-            OsString::from(self.sandbox_mode()),
+            OsString::from("-a"),
+            OsString::from(codex_approval_mode(self.sandbox_mode)),
         ];
 
         if self.cloud.enabled {
@@ -71,8 +70,18 @@ impl CodeAgent for CodexAgent {
     async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
         self.run_setup_phase(&req.project_root).await?;
 
-        let mut cmd = Command::new(&self.cli_path);
-        cmd.args(self.agent_phase_args(&req));
+        let base_args = self.base_args(&req);
+        let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
+        let wrapped_command =
+            wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
+                harness_core::HarnessError::AgentExecution(format!(
+                    "sandbox setup failed for codex: {error}"
+                ))
+            })?;
+
+        let mut cmd = Command::new(&wrapped_command.program);
+        cmd.args(&wrapped_command.args)
+            .current_dir(&req.project_root);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {
@@ -126,6 +135,14 @@ impl CodeAgent for CodexAgent {
     }
 }
 
+fn codex_approval_mode(mode: SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::ReadOnly => "read-only",
+        SandboxMode::WorkspaceWrite => "read-write",
+        SandboxMode::DangerFullAccess => "full-access",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,7 +188,10 @@ mod tests {
 
     #[tokio::test]
     async fn execute_stream_returns_error_when_channel_closed() {
-        let agent = CodexAgent::new(PathBuf::from("/usr/bin/true"));
+        let agent = CodexAgent::new(
+            PathBuf::from("/usr/bin/true"),
+            SandboxMode::DangerFullAccess,
+        );
         let request = AgentRequest::default();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
@@ -189,8 +209,8 @@ mod tests {
     }
 
     #[test]
-    fn local_mode_uses_read_only_sandbox_without_ephemeral() {
-        let agent = CodexAgent::new(PathBuf::from("codex"));
+    fn local_mode_uses_read_only_approval_without_ephemeral() {
+        let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::ReadOnly);
         let request = AgentRequest {
             prompt: "ping".to_string(),
             project_root: PathBuf::from("/tmp/project"),
@@ -198,24 +218,28 @@ mod tests {
         };
 
         let args: Vec<String> = agent
-            .agent_phase_args(&request)
+            .base_args(&request)
             .iter()
             .map(|value| value.to_string_lossy().to_string())
             .collect();
 
-        assert!(args.windows(2).any(|window| window == ["-s", "read-only"]));
+        assert!(args.windows(2).any(|window| window == ["-a", "read-only"]));
         assert!(!args.iter().any(|arg| arg == "--ephemeral"));
     }
 
     #[test]
-    fn cloud_mode_uses_workspace_write_and_ephemeral() {
+    fn cloud_mode_uses_workspace_write_approval_and_ephemeral() {
         let cloud = CodexCloudConfig {
             enabled: true,
             cache_ttl_hours: 12,
             setup_commands: Vec::new(),
             setup_secret_env: Vec::new(),
         };
-        let agent = CodexAgent::with_cloud(PathBuf::from("codex"), cloud);
+        let agent = CodexAgent::with_cloud(
+            PathBuf::from("codex"),
+            cloud,
+            SandboxMode::WorkspaceWrite,
+        );
         let request = AgentRequest {
             prompt: "ping".to_string(),
             project_root: PathBuf::from("/tmp/project"),
@@ -223,14 +247,14 @@ mod tests {
         };
 
         let args: Vec<String> = agent
-            .agent_phase_args(&request)
+            .base_args(&request)
             .iter()
             .map(|value| value.to_string_lossy().to_string())
             .collect();
 
         assert!(args
             .windows(2)
-            .any(|window| window == ["-s", "workspace-write"]));
+            .any(|window| window == ["-a", "read-write"]));
         assert!(args.iter().any(|arg| arg == "--ephemeral"));
     }
 
@@ -246,7 +270,11 @@ mod tests {
             setup_secret_env: Vec::new(),
         };
 
-        let agent = CodexAgent::with_cloud(PathBuf::from("/usr/bin/true"), cloud);
+        let agent = CodexAgent::with_cloud(
+            PathBuf::from("/usr/bin/true"),
+            cloud,
+            SandboxMode::DangerFullAccess,
+        );
         let request = AgentRequest {
             prompt: "ping".to_string(),
             project_root: dir.path().to_path_buf(),
@@ -295,7 +323,7 @@ mod tests {
             setup_secret_env: vec![secret_name.to_string()],
         };
 
-        let agent = CodexAgent::with_cloud(cli_script, cloud);
+        let agent = CodexAgent::with_cloud(cli_script, cloud, SandboxMode::DangerFullAccess);
         let request = AgentRequest {
             prompt: "ping".to_string(),
             project_root: dir.path().to_path_buf(),
@@ -315,5 +343,12 @@ mod tests {
             "setup secret leaked into agent phase environment"
         );
         Ok(())
+    }
+
+    #[test]
+    fn codex_approval_mode_maps_to_codex_cli_values() {
+        assert_eq!(codex_approval_mode(SandboxMode::ReadOnly), "read-only");
+        assert_eq!(codex_approval_mode(SandboxMode::WorkspaceWrite), "read-write");
+        assert_eq!(codex_approval_mode(SandboxMode::DangerFullAccess), "full-access");
     }
 }

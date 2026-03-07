@@ -297,6 +297,14 @@ impl ExecSandboxMode {
             Self::DangerFullAccess => "danger-full-access",
         }
     }
+
+    fn to_sandbox_mode(self) -> harness_core::SandboxMode {
+        match self {
+            Self::ReadOnly => harness_core::SandboxMode::ReadOnly,
+            Self::WorkspaceWrite => harness_core::SandboxMode::WorkspaceWrite,
+            Self::DangerFullAccess => harness_core::SandboxMode::DangerFullAccess,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -573,12 +581,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 Arc::new(harness_agents::claude::ClaudeCodeAgent::new(
                     serve_config.agents.claude.cli_path.clone(),
                     serve_config.agents.claude.default_model.clone(),
+                    serve_config.agents.sandbox_mode,
                 )),
             );
             agent_registry.register(
                 "codex",
                 Arc::new(harness_agents::codex::CodexAgent::from_config(
                     serve_config.agents.codex.clone(),
+                    serve_config.agents.sandbox_mode,
                 )),
             );
             let server = harness_server::server::HarnessServer::new(
@@ -629,6 +639,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
             enforce_exec_actor_filters(actor, &allow_users, &allow_bots)?;
             enforce_exec_privilege_policy(drop_sudo, unprivileged_user.as_deref())?;
+            let runtime_sandbox_mode = sandbox_mode.to_sandbox_mode();
 
             let req = harness_core::AgentRequest {
                 prompt: apply_sandbox_hint(prompt, sandbox_mode),
@@ -641,9 +652,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 "claude" => Arc::new(harness_agents::claude::ClaudeCodeAgent::new(
                     config.agents.claude.cli_path.clone(),
                     config.agents.claude.default_model.clone(),
+                    runtime_sandbox_mode,
                 )),
-                "codex" => Arc::new(harness_agents::codex::CodexAgent::new(
-                    config.agents.codex.cli_path.clone(),
+                "codex" => Arc::new(harness_agents::codex::CodexAgent::from_config(
+                    config.agents.codex.clone(),
+                    runtime_sandbox_mode,
                 )),
                 other => anyhow::bail!(
                     "unknown exec agent `{other}`; supported values are: claude, codex"
