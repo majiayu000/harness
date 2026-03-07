@@ -193,6 +193,18 @@ pub(crate) fn command_output_summary(
     output: &std::process::Output,
     secret_env: &[String],
 ) -> String {
+    let secret_values: Vec<String> = secret_env
+        .iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .filter(|value| !value.is_empty())
+        .collect();
+    command_output_summary_with_secret_values(output, &secret_values)
+}
+
+fn command_output_summary_with_secret_values(
+    output: &std::process::Output,
+    secret_values: &[String],
+) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let summary = if !stderr.is_empty() {
@@ -203,7 +215,7 @@ pub(crate) fn command_output_summary(
         "no output".to_string()
     };
 
-    let redacted = redact_secret_values(summary, secret_env);
+    let redacted = redact_secret_values(summary, secret_values);
     truncate_to_max_bytes(redacted, SETUP_OUTPUT_MAX_BYTES)
 }
 
@@ -283,19 +295,17 @@ mod tests {
 
     #[test]
     fn command_output_summary_redacts_configured_secrets() {
-        let Some(path_value) = std::env::var("PATH").ok().filter(|value| !value.is_empty()) else {
-            return;
-        };
-
+        let secret_value = "secret-token-value";
         let output = Output {
             status: successful_status(),
             stdout: Vec::new(),
-            stderr: format!("failed with token={path_value}").into_bytes(),
+            stderr: format!("failed with token={secret_value}").into_bytes(),
         };
 
-        let summary = command_output_summary(&output, &[String::from("PATH")]);
+        let summary =
+            command_output_summary_with_secret_values(&output, &[secret_value.to_string()]);
 
-        assert!(!summary.contains(&path_value));
+        assert!(!summary.contains(secret_value));
         assert!(summary.contains("***"));
     }
 

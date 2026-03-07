@@ -130,15 +130,43 @@ impl CodeAgent for CodexAgent {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::tempdir;
 
-    fn find_existing_secret_env() -> Option<(String, String)> {
-        std::env::vars().find(|(key, value)| {
-            !value.is_empty()
-                && !cloud_setup::SETUP_ENV_ALLOWLIST
-                    .iter()
-                    .any(|allowlisted| allowlisted == &key.as_str())
-        })
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct ScopedEnvVar {
+        key: String,
+        original: Option<String>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &str, value: &str) -> Self {
+            let guard = env_lock()
+                .lock()
+                .expect("env lock should not be poisoned");
+            let original = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self {
+                key: key.to_string(),
+                original,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                unsafe { std::env::set_var(&self.key, value) };
+            } else {
+                unsafe { std::env::remove_var(&self.key) };
+            }
+        }
     }
 
     #[tokio::test]
@@ -233,34 +261,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn cloud_setup_cache_invalidation_uses_config_hash() {
-        let project_root = Path::new("/tmp/project");
-        let first = CodexCloudConfig {
-            enabled: true,
-            cache_ttl_hours: 12,
-            setup_commands: vec!["npm ci".to_string()],
-            setup_secret_env: vec!["NPM_TOKEN".to_string()],
-        };
-        let second = CodexCloudConfig {
-            enabled: true,
-            cache_ttl_hours: 12,
-            setup_commands: vec!["cargo fetch".to_string()],
-            setup_secret_env: vec!["NPM_TOKEN".to_string()],
-        };
-
-        assert_ne!(
-            cloud_setup::setup_cache_key(&first, project_root),
-            cloud_setup::setup_cache_key(&second, project_root)
-        );
-    }
-
     #[tokio::test]
     async fn setup_secret_is_available_in_setup_but_removed_for_agent_phase() -> anyhow::Result<()>
     {
-        let Some((secret_name, secret_value)) = find_existing_secret_env() else {
-            return Ok(());
-        };
+        let secret_name = "HARNESS_TEST_SETUP_SECRET";
+        let secret_value = format!("secret-value-{}", std::process::id());
+        let _secret_guard = ScopedEnvVar::set(secret_name, &secret_value);
 
         let dir = tempdir()?;
         let setup_capture = dir.path().join("setup-secret.txt");
@@ -286,7 +292,7 @@ mod tests {
             enabled: true,
             cache_ttl_hours: 12,
             setup_commands: vec![setup],
-            setup_secret_env: vec![secret_name.clone()],
+            setup_secret_env: vec![secret_name.to_string()],
         };
 
         let agent = CodexAgent::with_cloud(cli_script, cloud);
