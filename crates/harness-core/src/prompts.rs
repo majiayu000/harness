@@ -290,7 +290,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_review_prompt_uses_configured_review_bot_command() {
         let p = review_prompt(None, 10, 2, false, "/gemini review");
         assert!(p.contains("/gemini review"));
@@ -299,6 +298,7 @@ mod tests {
         assert!(!p.contains("/gemini"));
     }
 
+    #[test]
     fn test_review_prompt_always_triggers_gemini_review() {
         let p = review_prompt(None, 10, 2, false, "/gemini review");
         assert!(p.contains("/gemini review"));
