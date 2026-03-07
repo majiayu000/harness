@@ -29,6 +29,9 @@ pub enum Command {
         project_root: Option<PathBuf>,
     },
 
+    /// Start MCP Server mode (JSON-RPC over stdio)
+    McpServer,
+
     /// Execute a prompt non-interactively
     Exec {
         /// The prompt to execute
@@ -262,6 +265,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
                 other => anyhow::bail!("unknown transport: {other}"),
             }
+        }
+
+        Command::McpServer => {
+            crate::cmd::mcp_server::run(config.clone()).await?;
         }
 
         Command::Exec {
