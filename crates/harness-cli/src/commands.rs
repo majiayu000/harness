@@ -243,8 +243,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             );
             agent_registry.register(
                 "codex",
-                Arc::new(harness_agents::codex::CodexAgent::new(
-                    serve_config.agents.codex.cli_path.clone(),
+                Arc::new(harness_agents::codex::CodexAgent::from_config(
+                    serve_config.agents.codex.clone(),
                 )),
             );
             let server = harness_server::server::HarnessServer::new(
