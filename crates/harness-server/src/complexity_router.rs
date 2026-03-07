@@ -4,18 +4,24 @@ use harness_core::{TaskClassification, TaskComplexity};
 /// a dot followed by a known source-file extension.
 fn count_file_references(prompt: &str) -> usize {
     const EXTENSIONS: &[&str] = &[
-        "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "swift",
-        "cpp", "c", "h", "toml", "yaml", "yml", "json", "sh", "md",
+        "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "swift", "cpp", "c", "h", "toml",
+        "yaml", "yml", "json", "sh", "md",
     ];
 
     prompt
         .split_whitespace()
         .filter_map(|token| {
             // Strip surrounding punctuation common in prose (e.g., backticks, parens)
-            let token = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '-' && c != '/');
+            let token = token.trim_matches(|c: char| {
+                !c.is_alphanumeric() && c != '.' && c != '_' && c != '-' && c != '/'
+            });
             if let Some(dot_pos) = token.rfind('.') {
                 let ext = &token[dot_pos + 1..];
-                if EXTENSIONS.contains(&ext) { Some(token) } else { None }
+                if EXTENSIONS.contains(&ext) {
+                    Some(token)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -32,11 +38,7 @@ fn count_file_references(prompt: &str) -> usize {
 /// - 3–5 files → Medium
 /// - 6+  files → Complex
 /// - If `issue` or `pr` is present, bump to at least Medium.
-pub fn classify(
-    prompt: &str,
-    issue: Option<u64>,
-    pr: Option<u64>,
-) -> TaskClassification {
+pub fn classify(prompt: &str, issue: Option<u64>, pr: Option<u64>) -> TaskClassification {
     let file_count = count_file_references(prompt);
 
     let complexity = match file_count {
@@ -111,11 +113,7 @@ mod tests {
 
     #[test]
     fn complex_stays_complex_with_pr() {
-        let c = classify(
-            "Rewrite a.rs b.rs c.rs d.rs e.rs f.rs g.rs",
-            None,
-            Some(1),
-        );
+        let c = classify("Rewrite a.rs b.rs c.rs d.rs e.rs f.rs g.rs", None, Some(1));
         assert_eq!(c.complexity, TaskComplexity::Complex);
     }
 }

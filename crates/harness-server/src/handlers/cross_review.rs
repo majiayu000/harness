@@ -38,11 +38,10 @@ pub async fn cross_review(
     let challenger = state.server.agent_registry.get("codex");
     let rounds = max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS);
 
-    let result =
-        match run_cross_review(primary, challenger, project_root, target, rounds).await {
-            Ok(r) => r,
-            Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-        };
+    let result = match run_cross_review(primary, challenger, project_root, target, rounds).await {
+        Ok(r) => r,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+    };
 
     match serde_json::to_value(&result) {
         Ok(v) => RpcResponse::success(id, v),
@@ -198,8 +197,8 @@ fn extract_tagged(output: &str, tag: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use harness_core::{
-        AgentRequest, AgentResponse, Capability, CodeAgent, Result as HarnessResult,
-        StreamItem, TokenUsage,
+        AgentRequest, AgentResponse, Capability, CodeAgent, Result as HarnessResult, StreamItem,
+        TokenUsage,
     };
     use tokio::sync::mpsc::Sender;
 

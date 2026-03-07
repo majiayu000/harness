@@ -1,11 +1,11 @@
-use harness_core::{
-    AgentRequest, Artifact, ArtifactType, CodeAgent, Draft, DraftId, DraftStatus,
-    Project, Signal, SignalType, RemediationType,
-};
 use crate::draft_store::DraftStore;
 use crate::remediation::signal_priority;
 use crate::signal_detector::SignalDetector;
 use chrono::Utc;
+use harness_core::{
+    AgentRequest, Artifact, ArtifactType, CodeAgent, Draft, DraftId, DraftStatus, Project,
+    RemediationType, Signal, SignalType,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +105,10 @@ impl GcAgent {
                     }
                 }
                 Err(e) => {
-                    errors.push(format!("agent failed for signal {:?}: {e}", signal.signal_type));
+                    errors.push(format!(
+                        "agent failed for signal {:?}: {e}",
+                        signal.signal_type
+                    ));
                 }
             }
         }
@@ -214,11 +217,11 @@ fn build_prompt(signal: &Signal, project: &Project) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use harness_core::{
-        Artifact, ArtifactType, Draft, DraftStatus, ProjectId, RemediationType, Signal,
-        SignalType,
+        Artifact, ArtifactType, Draft, DraftStatus, ProjectId, RemediationType, Signal, SignalType,
     };
 
     fn make_test_gc_agent(dir: &std::path::Path) -> GcAgent {
@@ -317,10 +320,7 @@ fn parse_artifacts(output: &str, signal: &Signal) -> Vec<Artifact> {
     // For now, treat the entire output as a single artifact
     vec![Artifact {
         artifact_type,
-        target_path: std::path::PathBuf::from(format!(
-            ".harness/drafts/{}.md",
-            signal.id
-        )),
+        target_path: std::path::PathBuf::from(format!(".harness/drafts/{}.md", signal.id)),
         content: output.to_string(),
     }]
 }

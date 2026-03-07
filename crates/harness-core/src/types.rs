@@ -15,6 +15,7 @@ macro_rules! define_id {
                 Self(uuid::Uuid::new_v4().to_string())
             }
 
+            #[allow(clippy::should_implement_trait)]
             pub fn from_str(s: &str) -> Self {
                 Self(s.to_string())
             }
@@ -266,12 +267,7 @@ pub struct Event {
 }
 
 impl Event {
-    pub fn new(
-        session_id: SessionId,
-        hook: &str,
-        tool: &str,
-        decision: Decision,
-    ) -> Self {
+    pub fn new(session_id: SessionId, hook: &str, tool: &str, decision: Decision) -> Self {
         Self {
             id: EventId::new(),
             ts: Utc::now(),
@@ -569,7 +565,9 @@ mod tests {
 
     #[test]
     fn item_user_message_roundtrip() -> anyhow::Result<()> {
-        let item = Item::UserMessage { content: "hello world".to_string() };
+        let item = Item::UserMessage {
+            content: "hello world".to_string(),
+        };
         let json = serde_json::to_string(&item)?;
         let back: Item = serde_json::from_str(&json)?;
         match back {

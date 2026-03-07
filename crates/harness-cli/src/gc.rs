@@ -36,6 +36,7 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
             let claude = harness_agents::claude::ClaudeCodeAgent::new(
                 config.agents.claude.cli_path.clone(),
                 config.agents.claude.default_model.clone(),
+                config.agents.sandbox_mode,
             );
 
             let report = gc_agent.run(&project, &events, &[], &claude).await?;
@@ -69,7 +70,10 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
                 println!("No pending drafts");
             } else {
                 for draft in &pending {
-                    println!("{} [{:?}] {}", draft.id, draft.signal.signal_type, draft.rationale);
+                    println!(
+                        "{} [{:?}] {}",
+                        draft.id, draft.signal.signal_type, draft.rationale
+                    );
                 }
             }
         }

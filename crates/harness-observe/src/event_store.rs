@@ -110,7 +110,9 @@ impl EventStore {
         let pipeline = match self.otel_pipeline.lock() {
             Ok(mut slot) => slot.take(),
             Err(poisoned) => {
-                tracing::error!("OpenTelemetry pipeline mutex poisoned during shutdown; recovering");
+                tracing::error!(
+                    "OpenTelemetry pipeline mutex poisoned during shutdown; recovering"
+                );
                 poisoned.into_inner().take()
             }
         };
@@ -399,7 +401,7 @@ mod tests {
         assert_eq!(events.len(), 4);
         let by_tool: std::collections::HashMap<_, _> = events
             .iter()
-            .map(|e| (e.tool.as_str(), e.decision.clone()))
+            .map(|e| (e.tool.as_str(), e.decision))
             .collect();
         assert_eq!(by_tool["R-CRIT"], Decision::Block);
         assert_eq!(by_tool["R-HIGH"], Decision::Block);

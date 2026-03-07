@@ -1,0 +1,4 @@
+[advisories]
+# `rsa` is pulled transitively by `sqlx-mysql`; no fixed release is available yet.
+# Track upstream: https://github.com/RustCrypto/RSA/issues/19#issuecomment-1822995643
+ignore = ["RUSTSEC-2023-0071"]

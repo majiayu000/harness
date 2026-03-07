@@ -80,10 +80,7 @@ impl CodexAdapter {
     }
 
     /// Send a JSON-RPC notification (no id, no response expected).
-    async fn send_notification(
-        state: &mut AdapterState,
-        method: &str,
-    ) -> harness_core::Result<()> {
+    async fn send_notification(state: &mut AdapterState, method: &str) -> harness_core::Result<()> {
         let notification = json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -128,9 +125,7 @@ impl AgentAdapter for CodexAdapter {
                 .current_dir(&req.project_root);
 
             let mut child = cmd.spawn().map_err(|e| {
-                harness_core::HarnessError::AgentExecution(format!(
-                    "failed to spawn codex: {e}"
-                ))
+                harness_core::HarnessError::AgentExecution(format!("failed to spawn codex: {e}"))
             })?;
 
             state.stdin = child.stdin.take();
@@ -155,12 +150,7 @@ impl AgentAdapter for CodexAdapter {
             Self::send_notification(&mut state, "initialized").await?;
 
             // Send turn/start
-            Self::send_request(
-                &mut state,
-                "turn/start",
-                json!({ "text": req.prompt }),
-            )
-            .await?;
+            Self::send_request(&mut state, "turn/start", json!({ "text": req.prompt })).await?;
 
             // Release lock before reading event stream
             drop(state);
@@ -181,8 +171,7 @@ impl AgentAdapter for CodexAdapter {
                         output_buf.push_str(text);
                     }
 
-                    let is_turn_completed =
-                        matches!(event, AgentEvent::TurnCompleted { .. });
+                    let is_turn_completed = matches!(event, AgentEvent::TurnCompleted { .. });
                     let is_error = matches!(event, AgentEvent::Error { .. });
 
                     if tx.send(event).await.is_err() {
@@ -196,12 +185,7 @@ impl AgentAdapter for CodexAdapter {
             }
         } else {
             // Already running — just send a new turn
-            Self::send_request(
-                &mut state,
-                "turn/start",
-                json!({ "text": req.prompt }),
-            )
-            .await?;
+            Self::send_request(&mut state, "turn/start", json!({ "text": req.prompt })).await?;
             drop(state);
 
             let _ = tx.send(AgentEvent::TurnStarted).await;
@@ -354,8 +338,7 @@ mod tests {
 
     #[test]
     fn parse_item_started_notification() {
-        let line =
-            r#"{"jsonrpc":"2.0","method":"item/started","params":{"type":"tool_call"}}"#;
+        let line = r#"{"jsonrpc":"2.0","method":"item/started","params":{"type":"tool_call"}}"#;
         let event = parse_codex_message(line).unwrap();
         match event {
             AgentEvent::ItemStarted { item_type } => assert_eq!(item_type, "tool_call"),

@@ -244,7 +244,10 @@ mod tests {
         let task = make_task("task-rt", TaskStatus::Pending);
         db.insert(&task).await?;
 
-        let loaded = db.get("task-rt").await?.expect("inserted task should exist");
+        let loaded = db
+            .get("task-rt")
+            .await?
+            .expect("inserted task should exist");
         assert_eq!(loaded.id.0, "task-rt");
         assert!(matches!(loaded.status, TaskStatus::Pending));
         assert_eq!(loaded.turn, 0);
@@ -271,10 +274,16 @@ mod tests {
         });
         db.update(&task).await?;
 
-        let loaded = db.get("task-upd").await?.expect("updated task should exist");
+        let loaded = db
+            .get("task-upd")
+            .await?
+            .expect("updated task should exist");
         assert!(matches!(loaded.status, TaskStatus::Implementing));
         assert_eq!(loaded.turn, 1);
-        assert_eq!(loaded.pr_url.as_deref(), Some("https://github.com/org/repo/pull/42"));
+        assert_eq!(
+            loaded.pr_url.as_deref(),
+            Some("https://github.com/org/repo/pull/42")
+        );
         assert_eq!(loaded.rounds.len(), 1);
         assert_eq!(loaded.rounds[0].action, "implement");
         Ok(())
@@ -341,7 +350,10 @@ mod tests {
         task.error = Some("agent panicked".to_string());
         db.insert(&task).await?;
 
-        let loaded = db.get("task-err").await?.expect("task with error should exist");
+        let loaded = db
+            .get("task-err")
+            .await?
+            .expect("task with error should exist");
         assert_eq!(loaded.error.as_deref(), Some("agent panicked"));
         Ok(())
     }
@@ -353,11 +365,15 @@ mod tests {
 
         {
             let db = TaskDb::open(&db_path).await?;
-            db.insert(&make_task("task-persist", TaskStatus::Done)).await?;
+            db.insert(&make_task("task-persist", TaskStatus::Done))
+                .await?;
         }
 
         let db = TaskDb::open(&db_path).await?;
-        let loaded = db.get("task-persist").await?.expect("task should survive reopen");
+        let loaded = db
+            .get("task-persist")
+            .await?
+            .expect("task should survive reopen");
         assert!(matches!(loaded.status, TaskStatus::Done));
         Ok(())
     }

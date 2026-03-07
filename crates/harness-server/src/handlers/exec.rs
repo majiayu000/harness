@@ -53,18 +53,13 @@ pub async fn exec_plan_update(
     let mut plans = state.plans.write().await;
     match plans.get_mut(&plan_id) {
         Some(plan) => {
-            let action = updates
-                .get("action")
-                .and_then(|a| a.as_str())
-                .unwrap_or("");
+            let action = updates.get("action").and_then(|a| a.as_str()).unwrap_or("");
             match action {
                 "activate" => plan.activate(),
                 "complete" => plan.complete(),
                 "abandon" => plan.abandon(),
                 "add_milestone" => {
-                    if let Some(desc) =
-                        updates.get("description").and_then(|d| d.as_str())
-                    {
+                    if let Some(desc) = updates.get("description").and_then(|d| d.as_str()) {
                         plan.add_milestone(desc.to_string());
                     }
                 }

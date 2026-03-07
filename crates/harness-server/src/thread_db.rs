@@ -82,11 +82,9 @@ impl ThreadDb {
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<Thread>> {
-        let rows = sqlx::query_as::<_, ThreadRow>(
-            "SELECT * FROM threads ORDER BY created_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query_as::<_, ThreadRow>("SELECT * FROM threads ORDER BY created_at DESC")
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter().map(|r| r.into_thread()).collect()
     }
 
@@ -250,7 +248,10 @@ mod tests {
         thread.updated_at = chrono::Utc::now();
         db.update(&thread).await?;
 
-        let loaded = db.get(thread.id.as_str()).await?.expect("updated thread should exist");
+        let loaded = db
+            .get(thread.id.as_str())
+            .await?
+            .expect("updated thread should exist");
         assert_eq!(loaded.status, ThreadStatus::Active);
         assert_eq!(loaded.project_root, PathBuf::from("/updated"));
         Ok(())
@@ -265,7 +266,10 @@ mod tests {
         thread.metadata = serde_json::json!({"key": "value", "count": 42});
         db.insert(&thread).await?;
 
-        let loaded = db.get(thread.id.as_str()).await?.expect("thread with metadata should exist");
+        let loaded = db
+            .get(thread.id.as_str())
+            .await?
+            .expect("thread with metadata should exist");
         assert_eq!(loaded.metadata["key"], "value");
         assert_eq!(loaded.metadata["count"], 42);
         Ok(())

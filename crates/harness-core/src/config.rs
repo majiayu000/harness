@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HarnessConfig {
     pub server: ServerConfig,
     pub agents: AgentsConfig,
@@ -10,19 +10,6 @@ pub struct HarnessConfig {
     pub rules: RulesConfig,
     pub observe: ObserveConfig,
     pub otel: OtelConfig,
-}
-
-impl Default for HarnessConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            agents: AgentsConfig::default(),
-            gc: GcConfig::default(),
-            rules: RulesConfig::default(),
-            observe: ObserveConfig::default(),
-            otel: OtelConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,20 +50,36 @@ pub enum Transport {
 }
 
 /// Controls how much autonomy the agent has when executing tasks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalPolicy {
     /// Agent suggests changes but does not apply them.
     Suggest,
     /// Agent can edit files but requires human approval for shell commands.
+    #[default]
     AutoEdit,
     /// Agent has full autonomy — no approval gates.
     FullAuto,
 }
 
-impl Default for ApprovalPolicy {
-    fn default() -> Self {
-        Self::AutoEdit
+/// OS-level sandbox mode for agent subprocess execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxMode {
+    ReadOnly,
+    #[default]
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl std::fmt::Display for SandboxMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            SandboxMode::ReadOnly => "read-only",
+            SandboxMode::WorkspaceWrite => "workspace-write",
+            SandboxMode::DangerFullAccess => "danger-full-access",
+        };
+        write!(f, "{value}")
     }
 }
 
@@ -90,6 +93,8 @@ pub struct AgentsConfig {
     pub review: AgentReviewConfig,
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
+    #[serde(default)]
+    pub sandbox_mode: SandboxMode,
 }
 
 impl Default for AgentsConfig {
@@ -101,6 +106,7 @@ impl Default for AgentsConfig {
             anthropic_api: AnthropicApiConfig::default(),
             review: AgentReviewConfig::default(),
             approval_policy: ApprovalPolicy::default(),
+            sandbox_mode: SandboxMode::default(),
         }
     }
 }
@@ -283,7 +289,7 @@ impl Default for SignalThresholds {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RulesConfig {
     #[serde(default)]
     pub discovery_paths: Vec<PathBuf>,
@@ -293,17 +299,6 @@ pub struct RulesConfig {
     pub exec_policy_paths: Vec<PathBuf>,
     #[serde(default)]
     pub requirements_path: Option<PathBuf>,
-}
-
-impl Default for RulesConfig {
-    fn default() -> Self {
-        Self {
-            discovery_paths: vec![],
-            builtin_path: None,
-            exec_policy_paths: vec![],
-            requirements_path: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,18 +341,13 @@ impl Default for OtelConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OtelExporter {
+    #[default]
     Disabled,
     OtlpHttp,
     OtlpGrpc,
-}
-
-impl Default for OtelExporter {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 fn default_otel_environment() -> String {
@@ -473,6 +463,7 @@ mod tests {
             config.anthropic_api.max_tokens,
             default_anthropic_api_max_tokens()
         );
+        assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
     }
 
     #[test]
@@ -493,6 +484,12 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_mode_defaults_to_workspace_write() {
+        let config = AgentsConfig::default();
+        assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
+    }
+
+    #[test]
     fn approval_policy_deserializes_from_toml() {
         let toml_str = r#"
             default_agent = "claude"
@@ -508,6 +505,24 @@ mod tests {
         "#;
         let config: AgentsConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.approval_policy, ApprovalPolicy::FullAuto);
+    }
+
+    #[test]
+    fn sandbox_mode_deserializes_from_toml() {
+        let toml_str = r#"
+            default_agent = "claude"
+            sandbox_mode = "danger-full-access"
+            [claude]
+            cli_path = "claude"
+            default_model = "sonnet"
+            [codex]
+            cli_path = "codex"
+            [anthropic_api]
+            base_url = "https://api.anthropic.com"
+            default_model = "claude-sonnet-4-20250514"
+        "#;
+        let config: AgentsConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.sandbox_mode, SandboxMode::DangerFullAccess);
     }
 
     #[test]

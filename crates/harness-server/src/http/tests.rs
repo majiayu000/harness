@@ -130,14 +130,8 @@ async fn make_test_state_with_agent(
 fn task_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_check))
-        .route(
-            "/tasks",
-            post(task_routes::create_task),
-        )
-        .route(
-            "/tasks/{id}",
-            get(get_task),
-        )
+        .route("/tasks", post(task_routes::create_task))
+        .route("/tasks/{id}", get(get_task))
         .with_state(state)
 }
 
@@ -557,7 +551,9 @@ async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
     use http_body_util::BodyExt;
     let create_body = create_resp.into_body().collect().await?.to_bytes();
     let create_json: serde_json::Value = serde_json::from_slice(&create_body)?;
-    let task_id = create_json["task_id"].as_str().expect("task_id should be string");
+    let task_id = create_json["task_id"]
+        .as_str()
+        .expect("task_id should be string");
 
     // GET the task — agent executes instantly (mock), so status should be observable
     let get_resp = task_app(state)

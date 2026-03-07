@@ -1,7 +1,5 @@
 use dashmap::DashMap;
-use harness_core::{
-    AgentId, Item, Thread, ThreadId, ThreadStatus, Turn, TurnId,
-};
+use harness_core::{AgentId, Item, Thread, ThreadId, ThreadStatus, Turn, TurnId};
 
 pub struct ThreadManager {
     threads: DashMap<String, Thread>,
@@ -60,7 +58,11 @@ impl ThreadManager {
         Ok(turn_id)
     }
 
-    pub fn complete_turn(&self, thread_id: &ThreadId, turn_id: &TurnId) -> harness_core::Result<()> {
+    pub fn complete_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+    ) -> harness_core::Result<()> {
         let mut thread = self
             .threads
             .get_mut(thread_id.as_str())
@@ -128,7 +130,9 @@ impl ThreadManager {
             .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(thread_id.to_string()))?;
 
         if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
-            turn.items.push(Item::UserMessage { content: instruction });
+            turn.items.push(Item::UserMessage {
+                content: instruction,
+            });
         }
         thread.updated_at = chrono::Utc::now();
         Ok(())
@@ -236,7 +240,8 @@ mod tests {
         let tm = ThreadManager::new();
         let thread_id = tm.start_thread(PathBuf::from("/tmp"));
         tm.start_turn(&thread_id, "do something".to_string(), AgentId::new())?;
-        let thread = tm.get_thread(&thread_id)
+        let thread = tm
+            .get_thread(&thread_id)
             .ok_or_else(|| anyhow::anyhow!("thread missing"))?;
         assert_eq!(thread.turns.len(), 1);
         Ok(())
@@ -248,9 +253,13 @@ mod tests {
         let thread_id = tm.start_thread(PathBuf::from("/tmp"));
         let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
         tm.complete_turn(&thread_id, &turn_id)?;
-        let thread = tm.get_thread(&thread_id)
+        let thread = tm
+            .get_thread(&thread_id)
             .ok_or_else(|| anyhow::anyhow!("thread missing"))?;
-        let turn = thread.turns.iter().find(|t| t.id == turn_id)
+        let turn = thread
+            .turns
+            .iter()
+            .find(|t| t.id == turn_id)
             .ok_or_else(|| anyhow::anyhow!("turn missing"))?;
         assert_eq!(turn.status, TurnStatus::Completed);
         Ok(())
@@ -261,11 +270,17 @@ mod tests {
         let tm = ThreadManager::new();
         let thread_id = tm.start_thread(PathBuf::from("/tmp"));
         let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
-        let item = Item::AgentReasoning { content: "thinking...".to_string() };
+        let item = Item::AgentReasoning {
+            content: "thinking...".to_string(),
+        };
         tm.add_item(&thread_id, &turn_id, item)?;
-        let thread = tm.get_thread(&thread_id)
+        let thread = tm
+            .get_thread(&thread_id)
             .ok_or_else(|| anyhow::anyhow!("thread missing"))?;
-        let turn = thread.turns.iter().find(|t| t.id == turn_id)
+        let turn = thread
+            .turns
+            .iter()
+            .find(|t| t.id == turn_id)
             .ok_or_else(|| anyhow::anyhow!("turn missing"))?;
         assert_eq!(turn.items.len(), 2); // UserMessage + AgentReasoning
         Ok(())
@@ -275,6 +290,8 @@ mod tests {
     fn start_turn_on_missing_thread_returns_error() {
         let tm = ThreadManager::new();
         let bad_id = ThreadId::from_str("nonexistent");
-        assert!(tm.start_turn(&bad_id, "x".to_string(), AgentId::new()).is_err());
+        assert!(tm
+            .start_turn(&bad_id, "x".to_string(), AgentId::new())
+            .is_err());
     }
 }

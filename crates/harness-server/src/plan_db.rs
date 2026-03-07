@@ -48,11 +48,10 @@ impl PlanDb {
     }
 
     pub async fn get(&self, id: &ExecPlanId) -> anyhow::Result<Option<ExecPlan>> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT data FROM plans WHERE id = ?")
-                .bind(id.as_str())
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT data FROM plans WHERE id = ?")
+            .bind(id.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
         match row {
             Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
             None => Ok(None),
@@ -79,8 +78,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db = PlanDb::open(&dir.path().join("plans.db")).await?;
 
-        let plan =
-            ExecPlan::from_spec("Test plan purpose", &dir.path().to_path_buf())?;
+        let plan = ExecPlan::from_spec("Test plan purpose", &dir.path().to_path_buf())?;
         db.upsert(&plan).await?;
 
         let loaded = db.get(&plan.id).await?.expect("plan should exist");

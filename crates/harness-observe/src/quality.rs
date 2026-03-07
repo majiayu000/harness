@@ -1,4 +1,4 @@
-use harness_core::{Event, Decision, Grade};
+use harness_core::{Decision, Event, Grade};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +114,9 @@ mod tests {
     #[test]
     fn recommended_gc_interval_matches_grade() {
         let report = QualityGrader::grade(&[], 0);
-        assert_eq!(report.recommended_gc_interval, report.grade.recommended_gc_interval());
+        assert_eq!(
+            report.recommended_gc_interval,
+            report.grade.recommended_gc_interval()
+        );
     }
 }
