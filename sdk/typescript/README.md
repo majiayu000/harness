@@ -13,7 +13,7 @@ npm install harness-sdk
 ```ts
 import { Harness } from "harness-sdk";
 
-const harness = new Harness({ baseUrl: "http://127.0.0.1:9800" });
+const harness = new Harness({ baseUrl: "http://127.0.0.1:9800", cwd: "/repo" });
 const thread = await harness.startThread();
 
 const result = await thread.run("Summarize the repository", {

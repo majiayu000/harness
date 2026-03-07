@@ -287,7 +287,7 @@ function parseTurnItem(value: unknown): TurnItem | undefined {
       }
       return { type: "error", code: value.code, message: value.message };
     default:
-      return undefined;
+      return { ...value, type: value.type };
   }
 }
 

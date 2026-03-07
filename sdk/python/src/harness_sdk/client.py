@@ -61,9 +61,12 @@ class Harness:
 
     def start_thread(self, cwd: str | None = None) -> "HarnessThread":
         resolved_cwd = cwd if cwd is not None else self.cwd
-        params: dict[str, Any] = {}
-        if resolved_cwd is not None:
-            params["cwd"] = resolved_cwd
+        if not isinstance(resolved_cwd, str) or not resolved_cwd:
+            raise ValueError(
+                "`cwd` is required for thread/start; pass Harness(cwd=...) "
+                "or start_thread(cwd=...)."
+            )
+        params: dict[str, Any] = {"cwd": resolved_cwd}
 
         result = self._rpc("thread/start", params)
         return HarnessThread(self, str(result["thread_id"]))
@@ -78,10 +81,21 @@ class Harness:
     def start_turn(self, thread_id: str, prompt: str) -> dict[str, Any]:
         return self._rpc("turn/start", {"thread_id": thread_id, "input": prompt})
 
-    def turn_status(self, turn_id: str) -> dict[str, Any]:
-        return self._rpc("turn/status", {"turn_id": turn_id})
+    def turn_status(
+        self, turn_id: str, timeout_seconds: float | None = None
+    ) -> dict[str, Any]:
+        return self._rpc(
+            "turn/status",
+            {"turn_id": turn_id},
+            timeout_seconds=timeout_seconds,
+        )
 
-    def _rpc(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    def _rpc(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> Any:
         if self._rpc_handler:
             return self._rpc_handler(method, params or {})
 
@@ -103,9 +117,12 @@ class Harness:
         )
 
         try:
-            with urllib.request.urlopen(
-                request, timeout=self.request_timeout_seconds
-            ) as response:
+            timeout = (
+                self.request_timeout_seconds
+                if timeout_seconds is None
+                else max(0.01, float(timeout_seconds))
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 response_body = response.read().decode("utf-8")
         except urllib.error.HTTPError as error:
             response_body = error.read().decode("utf-8", errors="replace")
@@ -183,10 +200,10 @@ class HarnessThread:
     ) -> Generator[Event, None, None]:
         poll_interval = max(0.01, float(poll_interval_seconds))
         timeout = max(0.01, float(timeout_seconds))
+        deadline = time.monotonic() + timeout
 
         started = self._client.start_turn(self.id, prompt)
         turn_id = str(started["turn_id"])
-        started_at = time.monotonic()
         previous_signature = ""
 
         start_event = _new_event(
@@ -202,7 +219,28 @@ class HarnessThread:
         yield start_event
 
         while True:
-            turn = self._client.turn_status(turn_id)
+            remaining_before_poll = deadline - time.monotonic()
+            if remaining_before_poll <= 0:
+                timeout_event = _new_event(
+                    "sdk:turn/timeout",
+                    {
+                        "thread_id": self.id,
+                        "turn_id": turn_id,
+                        "timeout_seconds": timeout,
+                        "source": "sdk-poll",
+                        "server_method": "turn/status",
+                    },
+                )
+                _notify(on_event, timeout_event)
+                yield timeout_event
+                return
+
+            turn = self._client.turn_status(
+                turn_id,
+                timeout_seconds=min(
+                    self._client.request_timeout_seconds, remaining_before_poll
+                ),
+            )
             signature = _turn_signature(turn)
 
             if signature != previous_signature:
@@ -237,7 +275,7 @@ class HarnessThread:
                 yield completed_event
                 return
 
-            if time.monotonic() - started_at >= timeout:
+            if time.monotonic() >= deadline:
                 timeout_event = _new_event(
                     "sdk:turn/timeout",
                     {
@@ -252,7 +290,9 @@ class HarnessThread:
                 yield timeout_event
                 return
 
-            time.sleep(poll_interval)
+            sleep_for = min(poll_interval, max(0.0, deadline - time.monotonic()))
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
 
 def _notify(on_event: EventHandler | None, event: Event) -> None:

@@ -73,15 +73,16 @@ class HarnessSdkTests(unittest.TestCase):
         self.assertEqual(mock.calls[0][0], "thread/start")
         self.assertEqual(mock.calls[0][1]["cwd"], "/repo")
 
-    def test_start_thread_omits_cwd_when_not_configured(self) -> None:
+    def test_start_thread_requires_cwd_when_not_configured(self) -> None:
         mock = MockRpc()
         harness = Harness(rpc_handler=mock.start_thread_and_run_complete)
 
-        thread = harness.start_thread()
-
-        self.assertEqual(thread.id, "thread-1")
-        self.assertEqual(mock.calls[0][0], "thread/start")
-        self.assertNotIn("cwd", mock.calls[0][1])
+        with self.assertRaisesRegex(
+            ValueError,
+            r"`cwd` is required for thread/start; pass Harness\(cwd=\.\.\.\) or start_thread\(cwd=\.\.\.\)\.",
+        ):
+            harness.start_thread()
+        self.assertEqual(mock.calls, [])
 
     def test_run_collects_events_and_output(self) -> None:
         mock = MockRpc()
@@ -108,7 +109,7 @@ class HarnessSdkTests(unittest.TestCase):
 
     def test_run_returns_timeout_when_turn_never_completes(self) -> None:
         mock = MockRpc()
-        harness = Harness(rpc_handler=mock.run_timeout)
+        harness = Harness(rpc_handler=mock.run_timeout, cwd="/repo")
         thread = harness.start_thread()
 
         result = thread.run(

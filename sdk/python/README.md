@@ -13,7 +13,7 @@ pip install harness-sdk
 ```python
 from harness_sdk import Harness
 
-harness = Harness(base_url="http://127.0.0.1:9800")
+harness = Harness(base_url="http://127.0.0.1:9800", cwd="/repo")
 thread = harness.start_thread()
 
 result = thread.run(
@@ -33,6 +33,8 @@ for event in thread.run_stream("Diagnose failing tests"):
 
 Events are SDK-synthesized polling lifecycle events:
 `sdk:turn/started`, `sdk:turn/status`, `sdk:turn/completed`, `sdk:turn/timeout`.
+
+This SDK uses synchronous polling; calls block the current thread.
 
 ## Publish to PyPI
 

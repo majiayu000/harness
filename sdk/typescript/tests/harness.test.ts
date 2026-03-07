@@ -74,7 +74,7 @@ test("startThread sends configured cwd", async () => {
   assert.equal(mock.calls[0]?.params.cwd, "/repo");
 });
 
-test("startThread omits cwd when not configured and defaults to port 9800", async () => {
+test("startThread requires cwd when not configured", async () => {
   const mock = createMockFetch((method) => {
     if (method === "thread/start") {
       return { result: { thread_id: "thread-2" } };
@@ -83,10 +83,11 @@ test("startThread omits cwd when not configured and defaults to port 9800", asyn
   });
 
   const harness = new Harness({ fetch: mock.fetch });
-  await harness.startThread();
-
-  assert.equal(mock.calls[0]?.url, "http://127.0.0.1:9800/rpc");
-  assert.equal(Object.prototype.hasOwnProperty.call(mock.calls[0]?.params ?? {}, "cwd"), false);
+  await assert.rejects(
+    () => harness.startThread(),
+    /`cwd` is required for thread\/start; pass Harness\(\{ cwd \}\) or startThread\(\{ cwd \}\)\./,
+  );
+  assert.equal(mock.calls.length, 0);
 });
 
 test("run returns completed status and extracted output", async () => {
@@ -192,6 +193,7 @@ test("run validates status-event turn payload before storing snapshot", async ()
 
   const harness = new Harness({
     fetch: mock.fetch,
+    cwd: "/repo",
     defaultPollIntervalMs: 1,
     defaultRunTimeoutMs: 500,
   });
@@ -203,6 +205,43 @@ test("run validates status-event turn payload before storing snapshot", async ()
   assert.equal(result.status, "completed");
   assert.equal(result.output, "final answer");
   assert.equal(statusPollCount, 2);
+});
+
+test("run preserves unknown turn item types in final snapshot", async () => {
+  const mock = createMockFetch((method) => {
+    if (method === "thread/start") {
+      return { result: { thread_id: "thread-6" } };
+    }
+    if (method === "turn/start") {
+      return { result: { turn_id: "turn-6" } };
+    }
+    if (method === "turn/status") {
+      return {
+        result: {
+          id: "turn-6",
+          thread_id: "thread-6",
+          status: "completed",
+          items: [
+            { type: "user_message", content: "hello" },
+            { type: "future_item", payload: { a: 1 } },
+          ],
+        },
+      };
+    }
+    return { result: {} };
+  });
+
+  const harness = new Harness({
+    fetch: mock.fetch,
+    defaultPollIntervalMs: 1,
+    defaultRunTimeoutMs: 500,
+  });
+  const thread = await harness.startThread({ cwd: "/repo" });
+  const result = await thread.run("Summarize");
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.turn?.items.length, 2);
+  assert.equal(result.turn?.items[1]?.type, "future_item");
 });
 
 test("run handles timeout when turn never reaches terminal status", async () => {
