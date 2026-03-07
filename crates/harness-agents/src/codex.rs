@@ -142,7 +142,6 @@ fn codex_approval_mode(mode: SandboxMode) -> &'static str {
         SandboxMode::DangerFullAccess => "full-access",
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
