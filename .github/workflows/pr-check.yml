@@ -1,0 +1,20 @@
+name: PR Check
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+jobs:
+  pr-body:
+    name: PR Description
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR body is not empty
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [ -z "$PR_BODY" ] || [ ${#PR_BODY} -lt 20 ]; then
+            echo "::error::PR description is too short. Please describe what this PR does (minimum 20 characters)."
+            exit 1
+          fi
+          echo "PR description looks good (${#PR_BODY} chars)."
