@@ -13,7 +13,7 @@ npm install harness-sdk
 ```ts
 import { Harness } from "harness-sdk";
 
-const harness = new Harness({ baseUrl: "http://127.0.0.1:8080" });
+const harness = new Harness({ baseUrl: "http://127.0.0.1:9800" });
 const thread = await harness.startThread();
 
 const result = await thread.run("Summarize the repository", {
@@ -32,6 +32,9 @@ for await (const event of thread.runStream("Diagnose failing tests")) {
   console.log(event.method, event.params);
 }
 ```
+
+Events are SDK-synthesized polling lifecycle events:
+`sdk:turn/started`, `sdk:turn/status`, `sdk:turn/completed`, `sdk:turn/timeout`.
 
 ## Publish to npm
 
