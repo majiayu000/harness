@@ -20,6 +20,72 @@ struct GhPrListItem {
     head_ref_name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HarnessMentionCommand {
+    Mention,
+    Review,
+    FixCi,
+}
+
+/// Parse the first `@harness` mention found while scanning line-by-line.
+/// For each line, only the first `@harness` occurrence is considered.
+pub(crate) fn parse_harness_mention_command(body: &str) -> Option<HarnessMentionCommand> {
+    for line in body.lines() {
+        let lowercase = line.trim().to_ascii_lowercase();
+        if let Some(idx) = lowercase.find("@harness") {
+            let mut command = lowercase[idx + "@harness".len()..].trim_start();
+            command = command.trim_start_matches(|ch: char| {
+                ch.is_whitespace() || ch == ':' || ch == ',' || ch == '-' || ch == '.'
+            });
+
+            if command.starts_with("fix ci")
+                || command.starts_with("fix-ci")
+                || command.starts_with("fix_ci")
+            {
+                return Some(HarnessMentionCommand::FixCi);
+            }
+            if command.starts_with("review") {
+                return Some(HarnessMentionCommand::Review);
+            }
+            return Some(HarnessMentionCommand::Mention);
+        }
+    }
+
+    None
+}
+
+pub(crate) fn build_fix_ci_prompt(
+    repository: &str,
+    pr_number: u64,
+    comment_body: &str,
+    comment_url: Option<&str>,
+    pr_url: Option<&str>,
+) -> String {
+    let wrapped_comment = prompts::wrap_external_data(comment_body);
+    let comment_url_line = comment_url
+        .map(|url| format!("- Trigger comment: {url}\n"))
+        .unwrap_or_default();
+    let pr_url_line = pr_url
+        .map(|url| format!("- PR URL: {url}\n"))
+        .unwrap_or_default();
+    let canonical_pr_url = format!("https://github.com/{repository}/pull/{pr_number}");
+
+    format!(
+        "CI failure repair requested for PR #{pr_number} in `{repository}`.\n\
+         {comment_url_line}\
+         {pr_url_line}\
+         Command payload:\n\
+         {wrapped_comment}\n\n\
+         Required workflow:\n\
+         1. Inspect failing checks for PR #{pr_number} (`gh pr checks {pr_number}`)\n\
+         2. Investigate CI failure details from logs and failing tests\n\
+         3. Implement a minimal fix that makes CI green\n\
+         4. Run `cargo check` and `cargo test`\n\
+         5. Commit and push to the existing PR branch\n\n\
+         On the last line, print PR_URL={canonical_pr_url}"
+    )
+}
+
 /// Run all pre_execute interceptors in order. Returns the (possibly modified) request,
 /// or an error if any interceptor returns Block.
 async fn run_pre_execute(
@@ -69,7 +135,14 @@ async fn find_existing_pr_for_issue(
 ) -> anyhow::Result<Option<(u64, String)>> {
     let output = Command::new("gh")
         .current_dir(project)
-        .args(["pr", "list", "--search", &format!("#{issue}"), "--state", "open"])
+        .args([
+            "pr",
+            "list",
+            "--search",
+            &format!("#{issue}"),
+            "--state",
+            "open",
+        ])
         .args(["--json", "number,headRefName", "--limit", "1"])
         .output()
         .await
@@ -85,7 +158,10 @@ async fn find_existing_pr_for_issue(
     let items: Vec<GhPrListItem> = serde_json::from_slice(&output.stdout)
         .map_err(|e| anyhow::anyhow!("invalid JSON from `gh pr list`: {e}"))?;
 
-    Ok(items.into_iter().next().map(|item| (item.number, item.head_ref_name)))
+    Ok(items
+        .into_iter()
+        .next()
+        .map(|item| (item.number, item.head_ref_name)))
 }
 
 pub(crate) async fn run_task(
@@ -105,7 +181,9 @@ pub(crate) async fn run_task(
     let first_prompt = if let Some(issue) = req.issue {
         match find_existing_pr_for_issue(&project, issue).await {
             Ok(Some((pr_num, branch))) => {
-                tracing::info!("reusing existing PR #{pr_num} on branch `{branch}` for issue #{issue}");
+                tracing::info!(
+                    "reusing existing PR #{pr_num} on branch `{branch}` for issue #{issue}"
+                );
                 prompts::continue_existing_pr(issue, pr_num, &branch)
             }
             Ok(None) => prompts::implement_from_issue(issue),
@@ -135,9 +213,7 @@ pub(crate) async fn run_task(
     // Load cascading AGENTS.md files and inject as context
     let agents_md = harness_core::agents_md::load_agents_md(&project);
     if !agents_md.is_empty() {
-        context_items.push(ContextItem::AgentsMd {
-            content: agents_md,
-        });
+        context_items.push(ContextItem::AgentsMd { content: agents_md });
     }
 
     let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
@@ -232,7 +308,13 @@ pub(crate) async fn run_task(
         update_status(store, task_id, TaskStatus::Reviewing, round).await;
 
         let review_req = AgentRequest {
-            prompt: prompts::review_prompt(req.issue, pr_num, round, prev_fixed, &review_config.review_bot_command),
+            prompt: prompts::review_prompt(
+                req.issue,
+                pr_num,
+                round,
+                prev_fixed,
+                &review_config.review_bot_command,
+            ),
             project_root: project.clone(),
             context: context_items.clone(),
             ..Default::default()
@@ -487,5 +569,51 @@ mod tests {
         let json = r#"[]"#;
         let items: Vec<GhPrListItem> = serde_json::from_str(json).unwrap();
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn parse_harness_review_command() {
+        let cmd = parse_harness_mention_command("@harness review");
+        assert_eq!(cmd, Some(HarnessMentionCommand::Review));
+    }
+
+    #[test]
+    fn parse_harness_fix_ci_command_case_insensitive() {
+        let cmd = parse_harness_mention_command("please @Harness FIX CI");
+        assert_eq!(cmd, Some(HarnessMentionCommand::FixCi));
+    }
+
+    #[test]
+    fn parse_harness_plain_mention_command() {
+        let cmd = parse_harness_mention_command("hello @harness can you help?");
+        assert_eq!(cmd, Some(HarnessMentionCommand::Mention));
+    }
+
+    #[test]
+    fn parse_harness_command_returns_none_without_mention() {
+        let cmd = parse_harness_mention_command("no command here");
+        assert_eq!(cmd, None);
+    }
+
+    #[test]
+    fn parse_harness_first_mention_per_line_is_used() {
+        let cmd = parse_harness_mention_command("@harness review then @harness fix ci");
+        assert_eq!(cmd, Some(HarnessMentionCommand::Review));
+    }
+
+    #[test]
+    fn build_fix_ci_prompt_contains_context() {
+        let prompt = build_fix_ci_prompt(
+            "majiayu000/harness",
+            42,
+            "@harness fix CI",
+            Some("https://github.com/majiayu000/harness/issues/42#issuecomment-1"),
+            Some("https://github.com/majiayu000/harness/pull/42"),
+        );
+
+        assert!(prompt.contains("CI failure repair requested for PR #42"));
+        assert!(prompt.contains("majiayu000/harness"));
+        assert!(prompt.contains("<external_data>"));
+        assert!(prompt.contains("PR_URL=https://github.com/majiayu000/harness/pull/42"));
     }
 }

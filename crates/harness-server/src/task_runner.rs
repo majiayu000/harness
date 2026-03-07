@@ -98,6 +98,21 @@ pub struct CreateTaskRequest {
     pub turn_timeout_secs: u64,
 }
 
+impl Default for CreateTaskRequest {
+    fn default() -> Self {
+        Self {
+            prompt: None,
+            issue: None,
+            pr: None,
+            agent: None,
+            project: None,
+            wait_secs: default_wait(),
+            max_rounds: default_max_rounds(),
+            turn_timeout_secs: default_turn_timeout(),
+        }
+    }
+}
+
 /// Detect the main git worktree root using a blocking subprocess call.
 /// Must be called via `tokio::task::spawn_blocking` in async contexts.
 fn detect_main_worktree() -> PathBuf {

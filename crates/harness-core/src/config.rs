@@ -30,6 +30,8 @@ pub struct ServerConfig {
     pub data_dir: PathBuf,
     #[serde(default = "default_project_root")]
     pub project_root: PathBuf,
+    #[serde(default)]
+    pub github_webhook_secret: Option<String>,
     #[serde(default = "default_notification_broadcast_capacity")]
     pub notification_broadcast_capacity: usize,
     #[serde(default = "default_notification_lag_log_every")]
@@ -43,6 +45,7 @@ impl Default for ServerConfig {
             http_addr: SocketAddr::from(([127, 0, 0, 1], 9800)),
             data_dir: dirs_data_dir().join("harness"),
             project_root: default_project_root(),
+            github_webhook_secret: None,
             notification_broadcast_capacity: default_notification_broadcast_capacity(),
             notification_lag_log_every: default_notification_lag_log_every(),
         }
@@ -434,5 +437,27 @@ mod tests {
         "#;
         let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.max_tokens, default_anthropic_api_max_tokens());
+    }
+
+    #[test]
+    fn server_config_webhook_secret_defaults_to_none() {
+        let config = ServerConfig::default();
+        assert!(config.github_webhook_secret.is_none());
+    }
+
+    #[test]
+    fn server_config_deserializes_webhook_secret() {
+        let toml_str = r#"
+            transport = "http"
+            http_addr = "127.0.0.1:9800"
+            data_dir = "/tmp/harness"
+            project_root = "."
+            github_webhook_secret = "super-secret"
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.github_webhook_secret.as_deref(),
+            Some("super-secret")
+        );
     }
 }
