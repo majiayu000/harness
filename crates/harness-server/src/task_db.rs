@@ -172,6 +172,7 @@ fn str_to_status(s: &str) -> TaskStatus {
 #[cfg(test)]
 mod tests {
     use super::{TaskDb, TaskDbDecodeError, TaskRow};
+    use crate::task_runner::{RoundResult, TaskId, TaskState, TaskStatus};
 
     fn build_task_row(rounds: &str) -> TaskRow {
         TaskRow {
@@ -221,6 +222,143 @@ mod tests {
             .await
             .expect_err("corrupted rounds should return an error");
         assert!(err.downcast_ref::<TaskDbDecodeError>().is_some());
+        Ok(())
+    }
+
+    fn make_task(id: &str, status: TaskStatus) -> TaskState {
+        TaskState {
+            id: TaskId(id.to_string()),
+            status,
+            turn: 0,
+            pr_url: None,
+            rounds: vec![],
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_and_get_roundtrip() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let task = make_task("task-rt", TaskStatus::Pending);
+        db.insert(&task).await?;
+
+        let loaded = db.get("task-rt").await?.expect("inserted task should exist");
+        assert_eq!(loaded.id.0, "task-rt");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.turn, 0);
+        assert!(loaded.pr_url.is_none());
+        assert!(loaded.rounds.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_persists_status_and_pr_url() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-upd", TaskStatus::Pending);
+        db.insert(&task).await?;
+
+        task.status = TaskStatus::Implementing;
+        task.turn = 1;
+        task.pr_url = Some("https://github.com/org/repo/pull/42".to_string());
+        task.rounds.push(RoundResult {
+            turn: 1,
+            action: "implement".to_string(),
+            result: "created PR".to_string(),
+        });
+        db.update(&task).await?;
+
+        let loaded = db.get("task-upd").await?.expect("updated task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Implementing));
+        assert_eq!(loaded.turn, 1);
+        assert_eq!(loaded.pr_url.as_deref(), Some("https://github.com/org/repo/pull/42"));
+        assert_eq!(loaded.rounds.len(), 1);
+        assert_eq!(loaded.rounds[0].action, "implement");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_returns_all_tasks_in_order() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("task-a", TaskStatus::Pending)).await?;
+        db.insert(&make_task("task-b", TaskStatus::Done)).await?;
+        db.insert(&make_task("task-c", TaskStatus::Failed)).await?;
+
+        let all = db.list().await?;
+        assert_eq!(all.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_missing_task() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+        assert!(db.get("nonexistent").await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_roundtrip_all_variants() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let variants = [
+            ("s-pending", TaskStatus::Pending),
+            ("s-impl", TaskStatus::Implementing),
+            ("s-review", TaskStatus::AgentReview),
+            ("s-waiting", TaskStatus::Waiting),
+            ("s-reviewing", TaskStatus::Reviewing),
+            ("s-done", TaskStatus::Done),
+            ("s-failed", TaskStatus::Failed),
+        ];
+
+        for (id, status) in &variants {
+            db.insert(&make_task(id, status.clone())).await?;
+        }
+
+        for (id, expected) in &variants {
+            let loaded = db.get(id).await?.expect("task should exist");
+            assert_eq!(
+                std::mem::discriminant(&loaded.status),
+                std::mem::discriminant(expected),
+                "status mismatch for task {id}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_with_error_persists() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-err", TaskStatus::Failed);
+        task.error = Some("agent panicked".to_string());
+        db.insert(&task).await?;
+
+        let loaded = db.get("task-err").await?.expect("task with error should exist");
+        assert_eq!(loaded.error.as_deref(), Some("agent panicked"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn survives_reopen() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("tasks.db");
+
+        {
+            let db = TaskDb::open(&db_path).await?;
+            db.insert(&make_task("task-persist", TaskStatus::Done)).await?;
+        }
+
+        let db = TaskDb::open(&db_path).await?;
+        let loaded = db.get("task-persist").await?.expect("task should survive reopen");
+        assert!(matches!(loaded.status, TaskStatus::Done));
         Ok(())
     }
 }
