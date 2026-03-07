@@ -250,6 +250,47 @@ mod tests {
     }
 
     #[test]
+    fn is_local_origin_accepts_localhost_variants() {
+        assert!(is_local_origin("http://localhost"));
+        assert!(is_local_origin("http://localhost:3000"));
+        assert!(is_local_origin("https://localhost:9800"));
+        assert!(is_local_origin("http://127.0.0.1"));
+        assert!(is_local_origin("http://127.0.0.1:8080"));
+        assert!(is_local_origin("null"));
+    }
+
+    #[test]
+    fn is_local_origin_rejects_non_local() {
+        assert!(!is_local_origin("http://example.com"));
+        assert!(!is_local_origin("http://localhost.evil.com"));
+        assert!(!is_local_origin("http://192.168.1.1"));
+        assert!(!is_local_origin("http://0.0.0.0"));
+    }
+
+    #[test]
+    fn validate_origin_header_allows_missing_origin() {
+        let headers = HeaderMap::new();
+        assert!(validate_origin_header(&headers).is_ok());
+    }
+
+    #[test]
+    fn validate_origin_header_allows_local_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Origin", HeaderValue::from_static("http://localhost:9800"));
+        assert!(validate_origin_header(&headers).is_ok());
+    }
+
+    #[test]
+    fn validate_origin_header_rejects_remote_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Origin", HeaderValue::from_static("http://evil.com"));
+        assert!(matches!(
+            validate_origin_header(&headers),
+            Err(OriginValidationError::NonLocal(_))
+        ));
+    }
+
+    #[test]
     fn validate_origin_header_rejects_non_utf8_origin() {
         let mut headers = HeaderMap::new();
         headers.insert(
