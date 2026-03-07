@@ -654,4 +654,120 @@ mod tests {
             Some("super-secret")
         );
     }
+
+    #[derive(Deserialize)]
+    struct TransportWrapper {
+        t: Transport,
+    }
+
+    #[test]
+    fn transport_deserializes_all_variants() {
+        let parse = |s: &str| -> Transport {
+            toml::from_str::<TransportWrapper>(&format!("t = \"{s}\""))
+                .unwrap_or_else(|e| panic!("failed to parse transport `{s}`: {e}"))
+                .t
+        };
+        assert_eq!(parse("stdio"), Transport::Stdio);
+        assert_eq!(parse("http"), Transport::Http);
+        assert_eq!(parse("web_socket"), Transport::WebSocket);
+    }
+
+    #[test]
+    fn transport_rejects_unknown_variant() {
+        let result = toml::from_str::<TransportWrapper>(r#"t = "grpc""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gc_config_defaults_are_consistent() {
+        let config = GcConfig::default();
+        assert_eq!(config.max_drafts_per_run, 5);
+        assert_eq!(config.adopt_wait_secs, 120);
+        assert_eq!(config.adopt_max_rounds, 3);
+        assert_eq!(config.adopt_turn_timeout_secs, 600);
+        assert!(config.budget_per_signal_usd > 0.0);
+        assert!(config.total_budget_usd >= config.budget_per_signal_usd);
+    }
+
+    #[test]
+    fn gc_config_deserializes_from_toml() {
+        let toml_str = r#"
+            max_drafts_per_run = 10
+            budget_per_signal_usd = 1.0
+            total_budget_usd = 20.0
+            adopt_wait_secs = 60
+            adopt_max_rounds = 5
+            adopt_turn_timeout_secs = 300
+
+            [signal_thresholds]
+            repeated_warn_min = 20
+            chronic_block_min = 10
+            hot_file_edits_min = 30
+            slow_op_threshold_ms = 3000
+            slow_op_count_min = 5
+            escalation_ratio = 2.0
+            violation_min = 3
+        "#;
+        let config: GcConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.max_drafts_per_run, 10);
+        assert_eq!(config.adopt_wait_secs, 60);
+        assert_eq!(config.signal_thresholds.repeated_warn_min, 20);
+        assert_eq!(config.signal_thresholds.escalation_ratio, 2.0);
+    }
+
+    #[test]
+    fn signal_thresholds_defaults_are_consistent() {
+        let thresholds = SignalThresholds::default();
+        assert_eq!(thresholds.repeated_warn_min, 10);
+        assert_eq!(thresholds.chronic_block_min, 5);
+        assert_eq!(thresholds.hot_file_edits_min, 20);
+        assert_eq!(thresholds.slow_op_threshold_ms, 5000);
+        assert_eq!(thresholds.slow_op_count_min, 10);
+        assert_eq!(thresholds.violation_min, 5);
+        assert!(thresholds.escalation_ratio > 1.0);
+    }
+
+    #[test]
+    fn harness_config_default_roundtrip() {
+        let config = HarnessConfig::default();
+        assert_eq!(config.agents.default_agent, "claude");
+        assert_eq!(config.server.transport, Transport::Stdio);
+        assert!(!config.agents.review.enabled);
+        assert_eq!(config.otel.exporter, OtelExporter::Disabled);
+        assert_eq!(config.gc.max_drafts_per_run, 5);
+    }
+
+    #[test]
+    fn invalid_toml_returns_parse_error() {
+        let result = toml::from_str::<HarnessConfig>("not valid toml {{{}}}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn otel_exporter_grpc_variant_deserializes() {
+        let toml_str = r#"
+            environment = "production"
+            exporter = "otlp-grpc"
+            endpoint = "http://otel-collector:4317"
+        "#;
+        let config: OtelConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.exporter, OtelExporter::OtlpGrpc);
+        assert_eq!(
+            config.endpoint.as_deref(),
+            Some("http://otel-collector:4317")
+        );
+    }
+
+    #[test]
+    fn agent_review_config_review_bot_command_default() {
+        let config = AgentReviewConfig::default();
+        assert_eq!(config.review_bot_command, "/gemini review");
+    }
+
+    #[test]
+    fn server_config_notification_defaults() {
+        let config = ServerConfig::default();
+        assert_eq!(config.notification_broadcast_capacity, 256);
+        assert_eq!(config.notification_lag_log_every, 1);
+    }
 }
