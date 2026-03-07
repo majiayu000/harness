@@ -9,6 +9,7 @@ pub struct HarnessConfig {
     pub gc: GcConfig,
     pub rules: RulesConfig,
     pub observe: ObserveConfig,
+    pub otel: OtelConfig,
 }
 
 impl Default for HarnessConfig {
@@ -19,6 +20,7 @@ impl Default for HarnessConfig {
             gc: GcConfig::default(),
             rules: RulesConfig::default(),
             observe: ObserveConfig::default(),
+            otel: OtelConfig::default(),
         }
     }
 }
@@ -280,6 +282,47 @@ impl Default for ObserveConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtelConfig {
+    #[serde(default = "default_otel_environment")]
+    pub environment: String,
+    #[serde(default)]
+    pub exporter: OtelExporter,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub log_user_prompt: bool,
+}
+
+impl Default for OtelConfig {
+    fn default() -> Self {
+        Self {
+            environment: default_otel_environment(),
+            exporter: OtelExporter::default(),
+            endpoint: None,
+            log_user_prompt: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OtelExporter {
+    Disabled,
+    OtlpHttp,
+    OtlpGrpc,
+}
+
+impl Default for OtelExporter {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+fn default_otel_environment() -> String {
+    "development".to_string()
+}
+
 fn dirs_data_dir() -> PathBuf {
     dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."))
 }
@@ -434,5 +477,72 @@ mod tests {
         "#;
         let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.max_tokens, default_anthropic_api_max_tokens());
+    }
+
+    #[test]
+    fn otel_config_defaults_to_disabled_exporter() {
+        let config = OtelConfig::default();
+        assert_eq!(config.exporter, OtelExporter::Disabled);
+        assert!(config.endpoint.is_none());
+        assert!(!config.log_user_prompt);
+        assert_eq!(config.environment, "development");
+    }
+
+    #[test]
+    fn harness_config_deserializes_otel_section() {
+        let toml_str = r#"
+            [server]
+            transport = "stdio"
+            http_addr = "127.0.0.1:9800"
+            data_dir = "."
+            project_root = "."
+
+            [agents]
+            default_agent = "claude"
+            [agents.claude]
+            cli_path = "claude"
+            default_model = "sonnet"
+            [agents.codex]
+            cli_path = "codex"
+            [agents.anthropic_api]
+            base_url = "https://api.anthropic.com"
+            default_model = "claude-sonnet-4-20250514"
+
+            [gc]
+            max_drafts_per_run = 5
+            budget_per_signal_usd = 0.5
+            total_budget_usd = 5.0
+            [gc.signal_thresholds]
+            repeated_warn_min = 10
+            chronic_block_min = 5
+            hot_file_edits_min = 20
+            slow_op_threshold_ms = 5000
+            slow_op_count_min = 10
+            escalation_ratio = 1.5
+            violation_min = 5
+
+            [rules]
+            discovery_paths = []
+
+            [observe]
+            db_path = "."
+            session_renewal_secs = 1800
+            log_retention_days = 90
+
+            [otel]
+            environment = "staging"
+            exporter = "otlp-http"
+            endpoint = "http://collector:4318"
+            log_user_prompt = true
+        "#;
+
+        let config: HarnessConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.otel.environment, "staging");
+        assert_eq!(config.otel.exporter, OtelExporter::OtlpHttp);
+        assert_eq!(
+            config.otel.endpoint.as_deref(),
+            Some("http://collector:4318")
+        );
+        assert!(config.otel.log_user_prompt);
     }
 }

@@ -101,10 +101,11 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         tracing::warn!("failed to load builtin rules: {e}");
     }
 
-    let events = Arc::new(harness_observe::EventStore::with_policies(
+    let events = Arc::new(harness_observe::EventStore::with_policies_and_otel(
         &dir,
         server.config.observe.session_renewal_secs,
         server.config.observe.log_retention_days,
+        &server.config.otel,
     )?);
 
     let signal_detector = harness_gc::SignalDetector::new(
