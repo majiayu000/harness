@@ -350,11 +350,7 @@ fn current_username() -> Option<String> {
 
     #[cfg(not(unix))]
     {
-        std::env::var("USER")
-            .ok()
-            .or_else(|| std::env::var("LOGNAME").ok())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+        None
     }
 }
 
@@ -425,7 +421,11 @@ fn enforce_exec_privilege_policy(
     )
 }
 
-fn normalize_exec_output_path(path: &Path) -> anyhow::Result<PathBuf> {
+fn normalize_absolute_output_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!("expected absolute path when normalizing `--output-file`");
+    }
+
     let mut normalized = PathBuf::new();
     let mut saw_normal_component = false;
 
@@ -461,11 +461,13 @@ fn resolve_exec_output_path(project_root: &Path, output_file: &Path) -> anyhow::
         )
     })?;
 
-    let candidate = if output_file.is_absolute() {
-        normalize_exec_output_path(output_file)?
+    let candidate_input = if output_file.is_absolute() {
+        output_file.to_path_buf()
     } else {
-        normalize_exec_output_path(&canonical_project_root.join(output_file))?
+        canonical_project_root.join(output_file)
     };
+
+    let candidate = normalize_absolute_output_path(&candidate_input)?;
 
     if !candidate.starts_with(&canonical_project_root) {
         anyhow::bail!(

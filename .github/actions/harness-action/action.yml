@@ -52,17 +52,11 @@ runs:
         workspace_root="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
         cargo install --locked --path "${workspace_root}/crates/harness-cli" --force
 
-    - name: Run harness exec
+    - name: Resolve output file path
+      id: resolve-output
       shell: bash
       env:
-        INPUT_PROMPT: ${{ inputs.prompt }}
-        INPUT_SANDBOX_MODE: ${{ inputs.sandbox-mode }}
-        INPUT_MODEL: ${{ inputs.model }}
         INPUT_OUTPUT_FILE: ${{ inputs.output-file }}
-        INPUT_DROP_SUDO: ${{ inputs.drop-sudo }}
-        INPUT_UNPRIVILEGED_USER: ${{ inputs.unprivileged-user }}
-        INPUT_ALLOW_USERS: ${{ inputs.allow-users }}
-        INPUT_ALLOW_BOTS: ${{ inputs.allow-bots }}
       run: |
         set -euo pipefail
         workspace_root="$(realpath -m "${GITHUB_WORKSPACE}")"
@@ -97,12 +91,38 @@ runs:
           exit 1
         fi
 
+        delimiter="HARNESS_OUTPUT_$(openssl rand -hex 8)"
+        {
+          echo "resolved-output=${resolved_output}"
+          echo "relative-output=${relative_output}"
+          echo "final-message-delimiter=${delimiter}"
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Run harness exec
+      shell: bash
+      env:
+        INPUT_PROMPT: ${{ inputs.prompt }}
+        INPUT_SANDBOX_MODE: ${{ inputs.sandbox-mode }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_DROP_SUDO: ${{ inputs.drop-sudo }}
+        INPUT_UNPRIVILEGED_USER: ${{ inputs.unprivileged-user }}
+        INPUT_ALLOW_USERS: ${{ inputs.allow-users }}
+        INPUT_ALLOW_BOTS: ${{ inputs.allow-bots }}
+        RESOLVED_OUTPUT_FILE: ${{ steps.resolve-output.outputs.resolved-output }}
+        RELATIVE_OUTPUT_FILE: ${{ steps.resolve-output.outputs.relative-output }}
+      run: |
+        set -euo pipefail
+        if [[ -z "${RESOLVED_OUTPUT_FILE}" || -z "${RELATIVE_OUTPUT_FILE}" ]]; then
+          echo "::error::Resolved output-file path metadata is missing."
+          exit 1
+        fi
+
         exec_args=(
           exec
           "${INPUT_PROMPT}"
           --project "${GITHUB_WORKSPACE}"
           --sandbox-mode "${INPUT_SANDBOX_MODE}"
-          --output-file "${relative_output}"
+          --output-file "${RELATIVE_OUTPUT_FILE}"
           --actor "${GITHUB_ACTOR}"
           --unprivileged-user "${INPUT_UNPRIVILEGED_USER}"
         )
@@ -145,38 +165,22 @@ runs:
       id: export
       shell: bash
       env:
-        INPUT_OUTPUT_FILE: ${{ inputs.output-file }}
+        RESOLVED_OUTPUT_FILE: ${{ steps.resolve-output.outputs.resolved-output }}
+        FINAL_MESSAGE_DELIMITER: ${{ steps.resolve-output.outputs.final-message-delimiter }}
       run: |
         set -euo pipefail
-        workspace_root="$(realpath -m "${GITHUB_WORKSPACE}")"
-
-        if [[ "${INPUT_OUTPUT_FILE}" == *$'\n'* || "${INPUT_OUTPUT_FILE}" == *$'\r'* ]]; then
-          echo "::error::output-file input must not contain newline characters."
+        if [[ -z "${RESOLVED_OUTPUT_FILE}" || -z "${FINAL_MESSAGE_DELIMITER}" ]]; then
+          echo "::error::Resolved output-file metadata is missing."
           exit 1
         fi
 
-        if [[ "${INPUT_OUTPUT_FILE}" = /* ]]; then
-          resolved_output="$(realpath -m "${INPUT_OUTPUT_FILE}")"
-        else
-          resolved_output="$(realpath -m "${workspace_root}/${INPUT_OUTPUT_FILE}")"
-        fi
-
-        case "${resolved_output}" in
-          "${workspace_root}"/*) ;;
-          *)
-            echo "::error::output-file must stay within GITHUB_WORKSPACE (${workspace_root})."
-            exit 1
-            ;;
-        esac
-
-        if [[ ! -f "${resolved_output}" ]]; then
-          echo "::error::Expected harness output file '${resolved_output}' was not generated."
+        if [[ ! -f "${RESOLVED_OUTPUT_FILE}" ]]; then
+          echo "::error::Expected harness output file '${RESOLVED_OUTPUT_FILE}' was not generated."
           exit 1
         fi
 
-        delimiter="HARNESS_OUTPUT_$(openssl rand -hex 8)"
         {
-          echo "final-message<<${delimiter}"
-          cat "${resolved_output}"
-          echo "${delimiter}"
+          echo "final-message<<${FINAL_MESSAGE_DELIMITER}"
+          cat "${RESOLVED_OUTPUT_FILE}"
+          echo "${FINAL_MESSAGE_DELIMITER}"
         } >> "${GITHUB_OUTPUT}"
