@@ -1,0 +1,292 @@
+use harness_core::{CodexCloudConfig, HarnessError};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+use tokio::process::Command;
+
+const SETUP_OUTPUT_MAX_BYTES: usize = 512;
+const SETUP_ENV_ALLOWLIST: [&str; 10] = [
+    "PATH", "HOME", "USER", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE",
+];
+
+fn setup_cache_ttl(cloud: &CodexCloudConfig) -> Duration {
+    Duration::from_secs(cloud.cache_ttl_hours.saturating_mul(3600))
+}
+
+pub(crate) fn setup_cache_key(cloud: &CodexCloudConfig, project_root: &Path) -> String {
+    let fingerprint = serde_json::json!({
+        "project_root": project_root.to_string_lossy(),
+        "setup_commands": cloud.setup_commands,
+        "setup_secret_env": cloud.setup_secret_env,
+        "cache_ttl_hours": cloud.cache_ttl_hours,
+    })
+    .to_string();
+
+    let mut hasher = Sha256::new();
+    hasher.update(fingerprint.as_bytes());
+    let digest = hasher.finalize();
+
+    let mut key = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut key, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    key
+}
+
+fn setup_cache_stamp_path(cloud: &CodexCloudConfig, project_root: &Path) -> PathBuf {
+    let key = setup_cache_key(cloud, project_root);
+    project_root
+        .join(".harness")
+        .join("cloud-setup-cache")
+        .join(format!("{key}.stamp"))
+}
+
+fn setup_cache_is_fresh(
+    cloud: &CodexCloudConfig,
+    project_root: &Path,
+) -> harness_core::Result<bool> {
+    if cloud.cache_ttl_hours == 0 {
+        return Ok(false);
+    }
+
+    let stamp = setup_cache_stamp_path(cloud, project_root);
+    let metadata = match fs::metadata(&stamp) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(HarnessError::AgentExecution(format!(
+                "failed to read cloud setup cache metadata `{}`: {err}",
+                stamp.display()
+            )));
+        }
+    };
+
+    let modified = metadata.modified().map_err(|err| {
+        HarnessError::AgentExecution(format!(
+            "failed to read cloud setup cache mtime `{}`: {err}",
+            stamp.display()
+        ))
+    })?;
+
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::ZERO);
+
+    Ok(age <= setup_cache_ttl(cloud))
+}
+
+fn write_setup_cache_stamp(
+    cloud: &CodexCloudConfig,
+    project_root: &Path,
+) -> harness_core::Result<()> {
+    if cloud.cache_ttl_hours == 0 {
+        return Ok(());
+    }
+
+    let stamp = setup_cache_stamp_path(cloud, project_root);
+    let Some(parent) = stamp.parent() else {
+        return Err(HarnessError::AgentExecution(format!(
+            "invalid cloud setup cache path `{}`",
+            stamp.display()
+        )));
+    };
+
+    fs::create_dir_all(parent).map_err(|err| {
+        HarnessError::AgentExecution(format!(
+            "failed to create cloud setup cache dir `{}`: {err}",
+            parent.display()
+        ))
+    })?;
+
+    fs::write(&stamp, b"ok\n").map_err(|err| {
+        HarnessError::AgentExecution(format!(
+            "failed to write cloud setup cache stamp `{}`: {err}",
+            stamp.display()
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn apply_setup_environment(cmd: &mut Command, cloud: &CodexCloudConfig) {
+    cmd.env_clear();
+
+    for key in SETUP_ENV_ALLOWLIST {
+        if let Ok(value) = std::env::var(key) {
+            cmd.env(key, value);
+        }
+    }
+
+    for key in &cloud.setup_secret_env {
+        if let Ok(value) = std::env::var(key) {
+            cmd.env(key, value);
+        }
+    }
+}
+
+pub(crate) async fn run_setup_phase(
+    cloud: &CodexCloudConfig,
+    project_root: &Path,
+) -> harness_core::Result<()> {
+    if !cloud.enabled || cloud.setup_commands.is_empty() {
+        return Ok(());
+    }
+
+    if setup_cache_is_fresh(cloud, project_root)? {
+        return Ok(());
+    }
+
+    for setup_command in &cloud.setup_commands {
+        if setup_command.trim().is_empty() {
+            continue;
+        }
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-lc").arg(setup_command).current_dir(project_root);
+        apply_setup_environment(&mut cmd, cloud);
+
+        let output = cmd.output().await.map_err(|err| {
+            HarnessError::AgentExecution(format!(
+                "failed to run cloud setup command `{setup_command}`: {err}"
+            ))
+        })?;
+
+        if !output.status.success() {
+            let detail = command_output_summary(&output, &cloud.setup_secret_env);
+            return Err(HarnessError::AgentExecution(format!(
+                "cloud setup command `{setup_command}` failed with {}: {detail}",
+                output.status
+            )));
+        }
+    }
+
+    write_setup_cache_stamp(cloud, project_root)?;
+    Ok(())
+}
+
+fn redact_secret_values(mut text: String, secret_env: &[String]) -> String {
+    for key in secret_env {
+        if let Ok(secret_value) = std::env::var(key) {
+            if !secret_value.is_empty() {
+                text = text.replace(&secret_value, "***");
+            }
+        }
+    }
+    text
+}
+
+fn truncate_to_max_bytes(mut text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
+
+pub(crate) fn command_output_summary(
+    output: &std::process::Output,
+    secret_env: &[String],
+) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let summary = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "no output".to_string()
+    };
+
+    let redacted = redact_secret_values(summary, secret_env);
+    truncate_to_max_bytes(redacted, SETUP_OUTPUT_MAX_BYTES)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Command as StdCommand, Output};
+
+    fn successful_status() -> std::process::ExitStatus {
+        StdCommand::new("sh")
+            .arg("-lc")
+            .arg("exit 0")
+            .output()
+            .expect("status command should run")
+            .status
+    }
+
+    #[test]
+    fn setup_cache_key_is_deterministic() {
+        let cloud = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: vec!["npm ci".to_string()],
+            setup_secret_env: vec!["NPM_TOKEN".to_string()],
+        };
+        let project_root = Path::new("/tmp/project");
+
+        let first = setup_cache_key(&cloud, project_root);
+        let second = setup_cache_key(&cloud, project_root);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn setup_cache_key_changes_when_setup_changes() {
+        let project_root = Path::new("/tmp/project");
+        let first = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: vec!["npm ci".to_string()],
+            setup_secret_env: vec!["NPM_TOKEN".to_string()],
+        };
+        let second = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: vec!["cargo fetch".to_string()],
+            setup_secret_env: vec!["NPM_TOKEN".to_string()],
+        };
+
+        assert_ne!(
+            setup_cache_key(&first, project_root),
+            setup_cache_key(&second, project_root)
+        );
+    }
+
+    #[test]
+    fn command_output_summary_redacts_configured_secrets() {
+        let Some(path_value) = std::env::var("PATH").ok().filter(|value| !value.is_empty()) else {
+            return;
+        };
+
+        let output = Output {
+            status: successful_status(),
+            stdout: Vec::new(),
+            stderr: format!("failed with token={path_value}").into_bytes(),
+        };
+
+        let summary = command_output_summary(&output, &[String::from("PATH")]);
+
+        assert!(!summary.contains(&path_value));
+        assert!(summary.contains("***"));
+    }
+
+    #[test]
+    fn command_output_summary_truncates_to_512_bytes() {
+        let output = Output {
+            status: successful_status(),
+            stdout: Vec::new(),
+            stderr: "x".repeat(2048).into_bytes(),
+        };
+
+        let summary = command_output_summary(&output, &[]);
+        assert_eq!(summary.len(), 512);
+    }
+}
