@@ -216,6 +216,22 @@ fn build_prompt(signal: &Signal, project: &Project) -> String {
     }
 }
 
+fn parse_artifacts(output: &str, signal: &Signal) -> Vec<Artifact> {
+    let artifact_type = match signal.remediation {
+        RemediationType::Guard => ArtifactType::Guard,
+        RemediationType::Rule => ArtifactType::Rule,
+        RemediationType::Hook => ArtifactType::Hook,
+        RemediationType::Skill => ArtifactType::Skill,
+    };
+
+    // For now, treat the entire output as a single artifact
+    vec![Artifact {
+        artifact_type,
+        target_path: std::path::PathBuf::from(format!(".harness/drafts/{}.md", signal.id)),
+        content: output.to_string(),
+    }]
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -307,20 +323,4 @@ mod tests {
 
         gc.adopt(&draft.id).unwrap();
     }
-}
-
-fn parse_artifacts(output: &str, signal: &Signal) -> Vec<Artifact> {
-    let artifact_type = match signal.remediation {
-        RemediationType::Guard => ArtifactType::Guard,
-        RemediationType::Rule => ArtifactType::Rule,
-        RemediationType::Hook => ArtifactType::Hook,
-        RemediationType::Skill => ArtifactType::Skill,
-    };
-
-    // For now, treat the entire output as a single artifact
-    vec![Artifact {
-        artifact_type,
-        target_path: std::path::PathBuf::from(format!(".harness/drafts/{}.md", signal.id)),
-        content: output.to_string(),
-    }]
 }

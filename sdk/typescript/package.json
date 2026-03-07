@@ -1,0 +1,31 @@
+{
+  "name": "harness-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for Harness JSON-RPC app server",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "test": "tsx --test tests/harness.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.57",
+    "tsup": "^8.5.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
+  }
+}
