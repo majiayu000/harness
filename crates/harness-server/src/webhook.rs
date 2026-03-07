@@ -319,4 +319,81 @@ mod tests {
         assert!(!is_valid_github_event_name("IssueComment"));
         assert!(!is_valid_github_event_name("issue comment"));
     }
+
+    #[test]
+    fn github_event_name_rejects_empty() {
+        assert!(!is_valid_github_event_name(""));
+    }
+
+    #[test]
+    fn ping_event_returns_none_request() {
+        let (request, reason) =
+            parse_github_webhook_task_request("ping", br#"{"zen":"anything"}"#).unwrap();
+        assert!(request.is_none());
+        assert_eq!(reason, "ping");
+    }
+
+    #[test]
+    fn issue_comment_non_created_action_is_ignored() {
+        let payload = serde_json::json!({
+            "action": "deleted",
+            "issue": { "number": 1 },
+            "comment": { "body": "@harness review" },
+            "repository": { "full_name": "org/repo" }
+        });
+        let (request, reason) =
+            parse_github_webhook_task_request("issue_comment", payload.to_string().as_bytes())
+                .unwrap();
+        assert!(request.is_none());
+        assert_eq!(reason, "ignored issue_comment action");
+    }
+
+    #[test]
+    fn issue_comment_without_mention_is_ignored() {
+        let payload = serde_json::json!({
+            "action": "created",
+            "issue": { "number": 1 },
+            "comment": { "body": "just a regular comment" },
+            "repository": { "full_name": "org/repo" }
+        });
+        let (request, reason) =
+            parse_github_webhook_task_request("issue_comment", payload.to_string().as_bytes())
+                .unwrap();
+        assert!(request.is_none());
+        assert_eq!(reason, "no @harness command in comment");
+    }
+
+    #[test]
+    fn issues_event_with_pull_request_ref_is_ignored() {
+        let payload = serde_json::json!({
+            "action": "opened",
+            "issue": {
+                "number": 5,
+                "body": "@harness handle",
+                "pull_request": { "url": "https://api.github.com/repos/org/repo/pulls/5" }
+            }
+        });
+        let (request, reason) =
+            parse_github_webhook_task_request("issues", payload.to_string().as_bytes()).unwrap();
+        assert!(request.is_none());
+        assert_eq!(reason, "issues event references pull request");
+    }
+
+    #[test]
+    fn invalid_payload_json_returns_error() {
+        let result =
+            parse_github_webhook_task_request("issues", b"not valid json");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid issues payload"));
+    }
+
+    #[test]
+    fn verify_github_signature_rejects_missing_prefix() {
+        assert!(!verify_github_signature("secret", "deadbeef", b"payload"));
+    }
+
+    #[test]
+    fn verify_github_signature_rejects_invalid_hex() {
+        assert!(!verify_github_signature("secret", "sha256=zzzz", b"payload"));
+    }
 }
