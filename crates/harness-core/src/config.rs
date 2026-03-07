@@ -250,8 +250,14 @@ impl Default for SignalThresholds {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RulesConfig {
+    #[serde(default)]
     pub discovery_paths: Vec<PathBuf>,
+    #[serde(default)]
     pub builtin_path: Option<PathBuf>,
+    #[serde(default)]
+    pub exec_policy_paths: Vec<PathBuf>,
+    #[serde(default = "default_rules_requirements_path")]
+    pub requirements_path: Option<PathBuf>,
 }
 
 impl Default for RulesConfig {
@@ -259,8 +265,14 @@ impl Default for RulesConfig {
         Self {
             discovery_paths: vec![],
             builtin_path: None,
+            exec_policy_paths: vec![],
+            requirements_path: default_rules_requirements_path(),
         }
     }
+}
+
+fn default_rules_requirements_path() -> Option<PathBuf> {
+    Some(PathBuf::from("/etc/harness/requirements.toml"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

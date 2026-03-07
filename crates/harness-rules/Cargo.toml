@@ -14,3 +14,6 @@ tracing = { workspace = true }
 glob = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
 chrono = { workspace = true }
+shlex = { workspace = true }
+starlark = { workspace = true }
+toml = { workspace = true }

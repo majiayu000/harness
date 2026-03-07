@@ -1,6 +1,7 @@
-use harness_core::{
-    Category, GuardId, Language, RuleId, Severity, Violation,
+use crate::exec_policy::{
+    ExecPolicy, ExecPolicyCheckOutput, ExecPolicyParser, MatchOptions, RequirementsToml,
 };
+use harness_core::{Category, GuardId, Language, RuleId, Severity, Violation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -28,8 +29,10 @@ pub struct RuleEngine {
     rules: Vec<Rule>,
     rule_ids: HashSet<RuleId>,
     guards: Vec<Guard>,
+    exec_policy: ExecPolicy,
     discovery_paths: Vec<PathBuf>,
     builtin_path: Option<PathBuf>,
+    requirements_path: Option<PathBuf>,
 }
 
 impl RuleEngine {
@@ -38,8 +41,10 @@ impl RuleEngine {
             rules: Vec::new(),
             rule_ids: HashSet::new(),
             guards: Vec::new(),
+            exec_policy: ExecPolicy::empty(),
             discovery_paths: Vec::new(),
             builtin_path: None,
+            requirements_path: None,
         }
     }
 
@@ -47,9 +52,11 @@ impl RuleEngine {
         &mut self,
         discovery_paths: Vec<PathBuf>,
         builtin_path: Option<PathBuf>,
+        requirements_path: Option<PathBuf>,
     ) {
         self.discovery_paths = discovery_paths;
         self.builtin_path = builtin_path;
+        self.requirements_path = requirements_path;
     }
 
     /// Load rules using the 4-layer discovery chain: repo → user → admin → system.
@@ -100,7 +107,11 @@ impl RuleEngine {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map(|e| e == "md" || e == "toml").unwrap_or(false) {
+            if path
+                .extension()
+                .map(|e| e == "md" || e == "toml")
+                .unwrap_or(false)
+            {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     self.parse_rule_file(&path, &content)?;
                 }
@@ -125,17 +136,41 @@ impl RuleEngine {
                 self.parse_rule_file(&path, &content)?;
                 return Ok(());
             }
-            anyhow::bail!("configured rules.builtin_path does not exist: {}", path.display());
+            anyhow::bail!(
+                "configured rules.builtin_path does not exist: {}",
+                path.display()
+            );
         }
 
         let builtin = [
-            ("golden-principles.md", include_str!("../../../rules/golden-principles.md")),
-            ("common/coding-style.md", include_str!("../../../rules/common/coding-style.md")),
-            ("common/security.md", include_str!("../../../rules/common/security.md")),
-            ("go/quality.md", include_str!("../../../rules/go/quality.md")),
-            ("python/quality.md", include_str!("../../../rules/python/quality.md")),
-            ("rust/quality.md", include_str!("../../../rules/rust/quality.md")),
-            ("typescript/quality.md", include_str!("../../../rules/typescript/quality.md")),
+            (
+                "golden-principles.md",
+                include_str!("../../../rules/golden-principles.md"),
+            ),
+            (
+                "common/coding-style.md",
+                include_str!("../../../rules/common/coding-style.md"),
+            ),
+            (
+                "common/security.md",
+                include_str!("../../../rules/common/security.md"),
+            ),
+            (
+                "go/quality.md",
+                include_str!("../../../rules/go/quality.md"),
+            ),
+            (
+                "python/quality.md",
+                include_str!("../../../rules/python/quality.md"),
+            ),
+            (
+                "rust/quality.md",
+                include_str!("../../../rules/rust/quality.md"),
+            ),
+            (
+                "typescript/quality.md",
+                include_str!("../../../rules/typescript/quality.md"),
+            ),
         ];
         for (name, content) in builtin {
             self.parse_rule_file(Path::new(name), content)?;
@@ -176,7 +211,13 @@ impl RuleEngine {
             let first_line = section.lines().next().unwrap_or("");
             if let Some((id_part, title)) = first_line.split_once(':') {
                 let id = id_part.trim_start_matches('#').trim().to_string();
-                if id.is_empty() || !id.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+                if id.is_empty()
+                    || !id
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_uppercase())
+                        .unwrap_or(false)
+                {
                     continue;
                 }
                 let severity = if section.contains("严重") || section.contains("critical") {
@@ -191,7 +232,11 @@ impl RuleEngine {
 
                 let category = if id.starts_with("SEC") {
                     Category::Security
-                } else if id.starts_with("RS") || id.starts_with("GO") || id.starts_with("TS") || id.starts_with("PY") {
+                } else if id.starts_with("RS")
+                    || id.starts_with("GO")
+                    || id.starts_with("TS")
+                    || id.starts_with("PY")
+                {
                     Category::Stability
                 } else {
                     Category::Style
@@ -255,7 +300,11 @@ impl RuleEngine {
     }
 
     /// Scan specific files.
-    pub async fn scan_files(&self, project_root: &Path, files: &[PathBuf]) -> anyhow::Result<Vec<Violation>> {
+    pub async fn scan_files(
+        &self,
+        project_root: &Path,
+        files: &[PathBuf],
+    ) -> anyhow::Result<Vec<Violation>> {
         let mut violations = Vec::new();
         for guard in &self.guards {
             for file in files {
@@ -319,6 +368,56 @@ impl RuleEngine {
 
     pub fn guards(&self) -> &[Guard] {
         &self.guards
+    }
+
+    pub fn exec_policy(&self) -> &ExecPolicy {
+        &self.exec_policy
+    }
+
+    pub fn load_exec_policy_files(&mut self, policy_paths: &[PathBuf]) -> anyhow::Result<()> {
+        if policy_paths.is_empty() {
+            return Ok(());
+        }
+        let mut parser = ExecPolicyParser::new();
+        for path in policy_paths {
+            let content = std::fs::read_to_string(path).map_err(|error| {
+                anyhow::anyhow!("failed to read execpolicy file {}: {error}", path.display())
+            })?;
+            let identifier = path.to_string_lossy().to_string();
+            parser.parse(&identifier, &content).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to parse execpolicy file {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+        self.exec_policy = self.exec_policy.merge_overlay(&parser.build());
+        Ok(())
+    }
+
+    pub fn load_requirements_toml(&mut self, path: &Path) -> anyhow::Result<()> {
+        let requirements = RequirementsToml::from_path(path)?;
+        let requirements_policy = requirements.to_policy()?;
+        self.exec_policy = self.exec_policy.merge_overlay(&requirements_policy);
+        Ok(())
+    }
+
+    pub fn load_configured_requirements(&mut self) -> anyhow::Result<()> {
+        let Some(path) = self.requirements_path.clone() else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+        self.load_requirements_toml(&path)
+    }
+
+    pub fn check_command_policy(
+        &self,
+        command: &[String],
+        options: &MatchOptions,
+    ) -> ExecPolicyCheckOutput {
+        self.exec_policy.check_command(command, options)
     }
 }
 
@@ -400,8 +499,14 @@ mod tests {
     fn load_builtin_parses_gp_and_sec_ids() -> anyhow::Result<()> {
         let mut engine = RuleEngine::new();
         engine.load_builtin()?;
-        assert!(engine.rules().iter().any(|r| r.id.as_str() == "GP-01"), "GP-01 rule missing");
-        assert!(engine.rules().iter().any(|r| r.id.as_str() == "SEC-01"), "SEC-01 rule missing");
+        assert!(
+            engine.rules().iter().any(|r| r.id.as_str() == "GP-01"),
+            "GP-01 rule missing"
+        );
+        assert!(
+            engine.rules().iter().any(|r| r.id.as_str() == "SEC-01"),
+            "SEC-01 rule missing"
+        );
         Ok(())
     }
 

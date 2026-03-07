@@ -96,6 +96,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     rule_engine.configure_sources(
         server.config.rules.discovery_paths.clone(),
         server.config.rules.builtin_path.clone(),
+        server.config.rules.requirements_path.clone(),
     );
     if let Err(e) = rule_engine.load_builtin() {
         tracing::warn!("failed to load builtin rules: {e}");
@@ -172,7 +173,10 @@ fn resolve_reviewer(
     registry: &harness_agents::AgentRegistry,
     config: &harness_core::AgentReviewConfig,
     implementor_name: &str,
-) -> (Option<Arc<dyn harness_core::CodeAgent>>, harness_core::AgentReviewConfig) {
+) -> (
+    Option<Arc<dyn harness_core::CodeAgent>>,
+    harness_core::AgentReviewConfig,
+) {
     if !config.enabled {
         return (None, config.clone());
     }
@@ -294,8 +298,11 @@ async fn create_task(
         }
     };
 
-    let (reviewer, review_config) =
-        resolve_reviewer(&state.server.agent_registry, &state.server.config.agents.review, agent.name());
+    let (reviewer, review_config) = resolve_reviewer(
+        &state.server.agent_registry,
+        &state.server.config.agents.review,
+        agent.name(),
+    );
 
     let task_id = task_runner::spawn_task(
         state.tasks.clone(),
