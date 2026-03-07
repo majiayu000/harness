@@ -236,4 +236,57 @@ mod tests {
         assert!(message.contains("unknown thread status `paused`"));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn thread_db_update_roundtrip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = ThreadDb::open(&dir.path().join("threads.db")).await?;
+
+        let mut thread = Thread::new(PathBuf::from("/original"));
+        db.insert(&thread).await?;
+
+        thread.status = ThreadStatus::Active;
+        thread.project_root = PathBuf::from("/updated");
+        thread.updated_at = chrono::Utc::now();
+        db.update(&thread).await?;
+
+        let loaded = db.get(thread.id.as_str()).await?.expect("updated thread should exist");
+        assert_eq!(loaded.status, ThreadStatus::Active);
+        assert_eq!(loaded.project_root, PathBuf::from("/updated"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_db_metadata_persists() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = ThreadDb::open(&dir.path().join("threads.db")).await?;
+
+        let mut thread = Thread::new(PathBuf::from("/meta"));
+        thread.metadata = serde_json::json!({"key": "value", "count": 42});
+        db.insert(&thread).await?;
+
+        let loaded = db.get(thread.id.as_str()).await?.expect("thread with metadata should exist");
+        assert_eq!(loaded.metadata["key"], "value");
+        assert_eq!(loaded.metadata["count"], 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_db_delete_nonexistent_returns_false() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = ThreadDb::open(&dir.path().join("threads.db")).await?;
+
+        let deleted = db.delete("does-not-exist").await?;
+        assert!(!deleted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_db_get_returns_none_for_missing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = ThreadDb::open(&dir.path().join("threads.db")).await?;
+
+        assert!(db.get("missing-id").await?.is_none());
+        Ok(())
+    }
 }
