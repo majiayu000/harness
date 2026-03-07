@@ -1,4 +1,4 @@
-import type { TurnSnapshot } from "./types";
+import type { TurnSnapshot, TurnStatus } from "./types";
 
 export function normalizeBaseUrl(value: string | undefined): string {
   return (value ?? "http://127.0.0.1:9800").replace(/\/+$/, "");
@@ -8,7 +8,7 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export function isTerminalStatus(status: string): boolean {
+export function isTerminalStatus(status: TurnStatus): boolean {
   return status === "completed" || status === "cancelled" || status === "failed";
 }
 

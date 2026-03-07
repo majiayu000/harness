@@ -55,21 +55,17 @@ export interface TokenUsage {
   cost_usd: number;
 }
 
-interface TurnItemBase {
-  [key: string]: unknown;
-}
-
-export interface UserMessageItem extends TurnItemBase {
+export interface UserMessageItem {
   type: "user_message";
   content: string;
 }
 
-export interface AgentReasoningItem extends TurnItemBase {
+export interface AgentReasoningItem {
   type: "agent_reasoning";
   content: string;
 }
 
-export interface ShellCommandItem extends TurnItemBase {
+export interface ShellCommandItem {
   type: "shell_command";
   command: string;
   exit_code?: number | null;
@@ -77,33 +73,33 @@ export interface ShellCommandItem extends TurnItemBase {
   stderr: string;
 }
 
-export interface FileEditItem extends TurnItemBase {
+export interface FileEditItem {
   type: "file_edit";
   path: string;
   before: string;
   after: string;
 }
 
-export interface FileReadItem extends TurnItemBase {
+export interface FileReadItem {
   type: "file_read";
   path: string;
   content: string;
 }
 
-export interface ToolCallItem extends TurnItemBase {
+export interface ToolCallItem {
   type: "tool_call";
   name: string;
   input: unknown;
   output?: unknown;
 }
 
-export interface ApprovalRequestItem extends TurnItemBase {
+export interface ApprovalRequestItem {
   type: "approval_request";
   action: string;
   approved?: boolean | null;
 }
 
-export interface ErrorItem extends TurnItemBase {
+export interface ErrorItem {
   type: "error";
   code: number;
   message: string;
@@ -119,11 +115,15 @@ export type TurnItem =
   | ApprovalRequestItem
   | ErrorItem;
 
+export type TurnStatus = "running" | "completed" | "cancelled" | "failed";
+
 export interface TurnSnapshot {
   id: string;
   thread_id: string;
-  status: string;
+  agent_id?: string | null;
+  status: TurnStatus;
   items: TurnItem[];
+  started_at?: string | null;
   token_usage?: TokenUsage;
   completed_at?: string | null;
   [key: string]: unknown;
@@ -135,11 +135,54 @@ export type SdkThreadEventMethod =
   | "sdk:turn/completed"
   | "sdk:turn/timeout";
 
-export interface ThreadEvent {
-  method: SdkThreadEventMethod;
-  params: Record<string, unknown>;
+interface ThreadEventBase<Method extends SdkThreadEventMethod, Params> {
+  method: Method;
+  params: Params;
   timestamp: string;
 }
+
+interface ThreadStartedEventParams {
+  thread_id: string;
+  turn_id: string;
+  source: "sdk-poll";
+  server_method: "turn/start";
+}
+
+interface ThreadStatusEventParams {
+  thread_id: string;
+  turn_id: string;
+  turn: TurnSnapshot;
+  source: "sdk-poll";
+  server_method: "turn/status";
+}
+
+interface ThreadCompletedEventParams {
+  thread_id: string;
+  turn_id: string;
+  status: TurnStatus;
+  token_usage: TokenUsage | null;
+  source: "sdk-poll";
+  server_method: "turn/status";
+}
+
+interface ThreadTimeoutEventParams {
+  thread_id: string;
+  turn_id: string;
+  timeout_ms: number;
+  source: "sdk-poll";
+  server_method: "turn/status";
+}
+
+export type ThreadStartedEvent = ThreadEventBase<"sdk:turn/started", ThreadStartedEventParams>;
+export type ThreadStatusEvent = ThreadEventBase<"sdk:turn/status", ThreadStatusEventParams>;
+export type ThreadCompletedEvent = ThreadEventBase<"sdk:turn/completed", ThreadCompletedEventParams>;
+export type ThreadTimeoutEvent = ThreadEventBase<"sdk:turn/timeout", ThreadTimeoutEventParams>;
+
+export type ThreadEvent =
+  | ThreadStartedEvent
+  | ThreadStatusEvent
+  | ThreadCompletedEvent
+  | ThreadTimeoutEvent;
 
 export interface RunOptions {
   pollIntervalMs?: number;
@@ -150,7 +193,7 @@ export interface RunOptions {
 export interface RunResult {
   threadId: string;
   turnId: string;
-  status: string;
+  status: TurnStatus;
   output: string;
   turn?: TurnSnapshot;
   events: ThreadEvent[];
