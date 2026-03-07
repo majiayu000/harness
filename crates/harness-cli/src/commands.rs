@@ -1,5 +1,5 @@
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -42,6 +42,30 @@ pub enum Command {
         /// Agent to use
         #[arg(long, default_value = "claude")]
         agent: String,
+        /// Optional model override
+        #[arg(long)]
+        model: Option<String>,
+        /// Sandbox mode hint injected into the exec prompt
+        #[arg(long, default_value = "workspace-write")]
+        sandbox_mode: String,
+        /// Optional output file for final response
+        #[arg(long)]
+        output_file: Option<PathBuf>,
+        /// Refuse execution from sudo/root context by default
+        #[arg(long, default_value_t = true, action = ArgAction::Set)]
+        drop_sudo: bool,
+        /// Require this local OS user for execution
+        #[arg(long)]
+        unprivileged_user: Option<String>,
+        /// Allowed human GitHub actors (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        allow_users: Vec<String>,
+        /// Allowed bot GitHub actors (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        allow_bots: Vec<String>,
+        /// GitHub actor identity used with allow lists
+        #[arg(long)]
+        actor: Option<String>,
     },
 
     /// GC Agent commands
@@ -212,6 +236,141 @@ where
     project_root
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecSandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl ExecSandboxMode {
+    fn parse(input: &str) -> anyhow::Result<Self> {
+        match input {
+            "read-only" => Ok(Self::ReadOnly),
+            "workspace-write" => Ok(Self::WorkspaceWrite),
+            "danger-full-access" => Ok(Self::DangerFullAccess),
+            other => anyhow::bail!(
+                "unsupported sandbox mode `{other}`; expected one of: read-only, workspace-write, danger-full-access"
+            ),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitHubActorKind {
+    User,
+    Bot,
+}
+
+fn classify_github_actor(actor: &str) -> GitHubActorKind {
+    if actor.ends_with("[bot]") {
+        GitHubActorKind::Bot
+    } else {
+        GitHubActorKind::User
+    }
+}
+
+fn normalize_allow_list(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn allow_list_matches(list: &[String], actor: &str) -> bool {
+    list.iter().any(|entry| entry == "*" || entry == actor)
+}
+
+fn resolve_exec_actor(actor: Option<String>) -> Option<String> {
+    actor
+        .or_else(|| std::env::var("GITHUB_ACTOR").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn enforce_exec_actor_filters(
+    actor: Option<String>,
+    allow_users: &[String],
+    allow_bots: &[String],
+) -> anyhow::Result<()> {
+    if allow_users.is_empty() && allow_bots.is_empty() {
+        return Ok(());
+    }
+
+    let actor = resolve_exec_actor(actor).ok_or_else(|| {
+        anyhow::anyhow!(
+            "allow lists are configured but no actor identity was provided; pass --actor or set GITHUB_ACTOR"
+        )
+    })?;
+
+    let allowed = match classify_github_actor(&actor) {
+        GitHubActorKind::User => allow_list_matches(allow_users, &actor),
+        GitHubActorKind::Bot => allow_list_matches(allow_bots, &actor),
+    };
+
+    if !allowed {
+        anyhow::bail!("actor `{actor}` is not allowed to run `harness exec`");
+    }
+
+    Ok(())
+}
+
+fn current_username() -> Option<String> {
+    std::env::var("USER")
+        .ok()
+        .or_else(|| std::env::var("LOGNAME").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn enforce_exec_privilege_policy(
+    drop_sudo: bool,
+    unprivileged_user: Option<&str>,
+) -> anyhow::Result<()> {
+    let is_root_user = current_username().as_deref() == Some("root");
+    let has_sudo_env =
+        std::env::var_os("SUDO_UID").is_some() || std::env::var_os("SUDO_USER").is_some();
+
+    if drop_sudo && (is_root_user || has_sudo_env) {
+        anyhow::bail!(
+            "refusing to run `harness exec` with elevated privileges; rerun without sudo or pass --drop-sudo=false"
+        );
+    }
+
+    if let Some(expected_user) = unprivileged_user {
+        let expected_user = expected_user.trim();
+        if !expected_user.is_empty() {
+            let current_user = current_username().ok_or_else(|| {
+                anyhow::anyhow!("unable to determine current OS user for --unprivileged-user check")
+            })?;
+            if current_user != expected_user {
+                anyhow::bail!(
+                    "`harness exec` must run as `{expected_user}`, current user is `{current_user}`"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_sandbox_hint(prompt: String, sandbox_mode: ExecSandboxMode) -> String {
+    format!(
+        "Sandbox mode requirement for this run: `{}`.\n\n{}",
+        sandbox_mode.as_str(),
+        prompt
+    )
+}
+
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Load config
     let config = if let Some(config_path) = &cli.config {
@@ -274,21 +433,64 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Exec {
             prompt,
             project,
-            agent: _agent_name,
+            agent,
+            model,
+            sandbox_mode,
+            output_file,
+            drop_sudo,
+            unprivileged_user,
+            allow_users,
+            allow_bots,
+            actor,
         } => {
             let project_root = resolve_exec_project_root(project)?;
-            let agent = harness_agents::claude::ClaudeCodeAgent::new(
-                config.agents.claude.cli_path.clone(),
-                config.agents.claude.default_model.clone(),
-            );
+            let sandbox_mode = ExecSandboxMode::parse(&sandbox_mode)?;
+            let allow_users = normalize_allow_list(allow_users);
+            let allow_bots = normalize_allow_list(allow_bots);
+
+            enforce_exec_actor_filters(actor, &allow_users, &allow_bots)?;
+            enforce_exec_privilege_policy(drop_sudo, unprivileged_user.as_deref())?;
 
             let req = harness_core::AgentRequest {
-                prompt,
+                prompt: apply_sandbox_hint(prompt, sandbox_mode),
                 project_root,
+                model,
                 ..Default::default()
             };
 
-            let resp = harness_core::CodeAgent::execute(&agent, req).await?;
+            let selected_agent: Arc<dyn harness_core::CodeAgent> = match agent.as_str() {
+                "claude" => Arc::new(harness_agents::claude::ClaudeCodeAgent::new(
+                    config.agents.claude.cli_path.clone(),
+                    config.agents.claude.default_model.clone(),
+                )),
+                "codex" => Arc::new(harness_agents::codex::CodexAgent::new(
+                    config.agents.codex.cli_path.clone(),
+                )),
+                other => anyhow::bail!(
+                    "unknown exec agent `{other}`; supported values are: claude, codex"
+                ),
+            };
+
+            let resp = selected_agent.execute(req).await?;
+            if let Some(output_path) = output_file {
+                if let Some(parent) = output_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent).with_context(|| {
+                            format!(
+                                "failed to create parent directory for output file {}",
+                                output_path.display()
+                            )
+                        })?;
+                    }
+                }
+                std::fs::write(&output_path, &resp.output).with_context(|| {
+                    format!(
+                        "failed to write `harness exec` output to {}",
+                        output_path.display()
+                    )
+                })?;
+            }
+
             println!("{}", resp.output);
             if !resp.stderr.is_empty() {
                 eprintln!("[harness] agent stderr:\n{}", resp.stderr);
@@ -451,5 +653,71 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" | ");
         assert!(chain.contains("cwd lookup blocked"));
+    }
+
+    #[test]
+    fn sandbox_mode_parse_accepts_supported_values() {
+        assert_eq!(
+            ExecSandboxMode::parse("read-only").expect("read-only should parse"),
+            ExecSandboxMode::ReadOnly
+        );
+        assert_eq!(
+            ExecSandboxMode::parse("workspace-write").expect("workspace-write should parse"),
+            ExecSandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            ExecSandboxMode::parse("danger-full-access").expect("danger-full-access should parse"),
+            ExecSandboxMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn sandbox_mode_parse_rejects_unknown_value() {
+        let error = ExecSandboxMode::parse("unsafe").expect_err("unsupported mode should fail");
+        assert!(error
+            .to_string()
+            .contains("unsupported sandbox mode `unsafe`"));
+    }
+
+    #[test]
+    fn normalize_allow_list_trims_and_drops_empty_entries() {
+        let values = vec![
+            "alice".to_string(),
+            "  bob  ".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+        ];
+        assert_eq!(normalize_allow_list(values), vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn exec_actor_filters_allow_matching_user_or_bot() {
+        let users = vec!["alice".to_string()];
+        let bots = vec!["dependabot[bot]".to_string()];
+
+        enforce_exec_actor_filters(Some("alice".to_string()), &users, &bots)
+            .expect("listed human user should pass");
+        enforce_exec_actor_filters(Some("dependabot[bot]".to_string()), &users, &bots)
+            .expect("listed bot should pass");
+    }
+
+    #[test]
+    fn exec_actor_filters_block_unlisted_actor() {
+        let users = vec!["alice".to_string()];
+        let bots = vec!["dependabot[bot]".to_string()];
+        let error = enforce_exec_actor_filters(Some("mallory".to_string()), &users, &bots)
+            .expect_err("unlisted actor should be rejected when allow lists are configured");
+
+        assert!(error
+            .to_string()
+            .contains("actor `mallory` is not allowed to run `harness exec`"));
+    }
+
+    #[test]
+    fn apply_sandbox_hint_prefixes_prompt() {
+        let prompt = "review this PR".to_string();
+        let hinted = apply_sandbox_hint(prompt.clone(), ExecSandboxMode::WorkspaceWrite);
+        assert!(hinted.contains("Sandbox mode requirement for this run: `workspace-write`."));
+        assert!(hinted.ends_with(&prompt));
     }
 }

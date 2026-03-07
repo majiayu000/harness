@@ -1,0 +1,128 @@
+name: Harness Action
+description: Install Harness CLI, run `harness exec`, and expose final message output.
+
+inputs:
+  prompt:
+    description: Prompt passed to `harness exec`
+    required: true
+  sandbox-mode:
+    description: Sandbox mode hint (read-only, workspace-write, danger-full-access)
+    required: false
+    default: workspace-write
+  model:
+    description: Optional model override
+    required: false
+    default: ""
+  output-file:
+    description: File path for final harness output
+    required: false
+    default: .harness/final-message.txt
+  drop-sudo:
+    description: Reject sudo/root execution by default
+    required: false
+    default: "true"
+  unprivileged-user:
+    description: Required local user when privilege checks are enabled
+    required: false
+    default: runner
+  allow-users:
+    description: Comma-separated allow list for human GitHub actors
+    required: false
+    default: ""
+  allow-bots:
+    description: Comma-separated allow list for bot GitHub actors
+    required: false
+    default: ""
+
+outputs:
+  final-message:
+    description: Final message emitted by `harness exec`
+    value: ${{ steps.export.outputs.final-message }}
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install Harness CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        action_root="$(cd "${GITHUB_ACTION_PATH}/../../.." && pwd)"
+        cargo install --locked --path "${action_root}/crates/harness-cli" --force
+
+    - name: Run harness exec
+      shell: bash
+      env:
+        INPUT_PROMPT: ${{ inputs.prompt }}
+        INPUT_SANDBOX_MODE: ${{ inputs.sandbox-mode }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_OUTPUT_FILE: ${{ inputs.output-file }}
+        INPUT_DROP_SUDO: ${{ inputs.drop-sudo }}
+        INPUT_UNPRIVILEGED_USER: ${{ inputs.unprivileged-user }}
+        INPUT_ALLOW_USERS: ${{ inputs.allow-users }}
+        INPUT_ALLOW_BOTS: ${{ inputs.allow-bots }}
+      run: |
+        set -euo pipefail
+
+        exec_args=(
+          exec
+          "${INPUT_PROMPT}"
+          --project "${GITHUB_WORKSPACE}"
+          --sandbox-mode "${INPUT_SANDBOX_MODE}"
+          --output-file "${INPUT_OUTPUT_FILE}"
+          --actor "${GITHUB_ACTOR}"
+          --unprivileged-user "${INPUT_UNPRIVILEGED_USER}"
+        )
+
+        if [[ -n "${INPUT_MODEL}" ]]; then
+          exec_args+=(--model "${INPUT_MODEL}")
+        fi
+
+        if [[ -n "${INPUT_ALLOW_USERS}" ]]; then
+          exec_args+=(--allow-users "${INPUT_ALLOW_USERS}")
+        fi
+
+        if [[ -n "${INPUT_ALLOW_BOTS}" ]]; then
+          exec_args+=(--allow-bots "${INPUT_ALLOW_BOTS}")
+        fi
+
+        if [[ "${INPUT_DROP_SUDO}" == "false" ]]; then
+          exec_args+=(--drop-sudo false)
+        fi
+
+        if [[ "${INPUT_DROP_SUDO}" == "true" && "${EUID}" -eq 0 ]]; then
+          if [[ -z "${INPUT_UNPRIVILEGED_USER}" ]]; then
+            echo "::error::drop-sudo is enabled, but no unprivileged-user was provided."
+            exit 1
+          fi
+          if ! command -v sudo >/dev/null 2>&1; then
+            echo "::error::drop-sudo is enabled but sudo is unavailable on this runner."
+            exit 1
+          fi
+          if ! id "${INPUT_UNPRIVILEGED_USER}" >/dev/null 2>&1; then
+            echo "::error::unprivileged-user '${INPUT_UNPRIVILEGED_USER}' does not exist."
+            exit 1
+          fi
+          sudo -u "${INPUT_UNPRIVILEGED_USER}" --preserve-env=GITHUB_ACTOR,HOME,PATH harness "${exec_args[@]}"
+        else
+          harness "${exec_args[@]}"
+        fi
+
+    - name: Export final message
+      id: export
+      shell: bash
+      env:
+        INPUT_OUTPUT_FILE: ${{ inputs.output-file }}
+      run: |
+        set -euo pipefail
+        if [[ ! -f "${INPUT_OUTPUT_FILE}" ]]; then
+          echo "::error::Expected harness output file '${INPUT_OUTPUT_FILE}' was not generated."
+          exit 1
+        fi
+        {
+          echo "final-message<<__HARNESS_OUTPUT__"
+          cat "${INPUT_OUTPUT_FILE}"
+          echo "__HARNESS_OUTPUT__"
+        } >> "${GITHUB_OUTPUT}"

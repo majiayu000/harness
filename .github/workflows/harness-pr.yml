@@ -1,0 +1,50 @@
+name: Harness PR Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  harness-pr:
+    if: ${{ vars.HARNESS_ACTION_ENABLED == 'true' && github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run harness action
+        id: harness
+        uses: ./.github/actions/harness-action
+        with:
+          prompt: >-
+            Review this pull request and return a concise summary of key changes,
+            risks, and any required follow-up checks.
+          sandbox-mode: workspace-write
+          output-file: .harness/pr-final-message.txt
+          allow-users: "*"
+          allow-bots: "dependabot[bot],renovate[bot]"
+
+      - name: Comment harness result on PR
+        uses: actions/github-script@v7
+        env:
+          FINAL_MESSAGE: ${{ steps.harness.outputs.final-message }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const body = (process.env.FINAL_MESSAGE || "").trim();
+            if (!body) {
+              core.setFailed("harness-action output `final-message` is empty.");
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## Harness CI/CD Result\n\n${body}`,
+            });
