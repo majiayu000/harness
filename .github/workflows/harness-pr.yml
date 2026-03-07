@@ -10,15 +10,19 @@ permissions:
 
 jobs:
   harness-pr:
-    if: ${{ vars.HARNESS_ACTION_ENABLED == 'true' && github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Skip when disabled or draft
+        if: ${{ !(vars.HARNESS_ACTION_ENABLED == 'true' && github.event.pull_request.draft == false) }}
+        run: echo "Harness action is disabled (set HARNESS_ACTION_ENABLED=true) or PR is draft; skipping run."
+
       - name: Run harness action
         id: harness
+        if: ${{ vars.HARNESS_ACTION_ENABLED == 'true' && github.event.pull_request.draft == false }}
         uses: ./.github/actions/harness-action
         with:
           prompt: >-
@@ -30,6 +34,7 @@ jobs:
           allow-bots: "dependabot[bot],renovate[bot]"
 
       - name: Comment harness result on PR
+        if: ${{ vars.HARNESS_ACTION_ENABLED == 'true' && github.event.pull_request.draft == false }}
         uses: actions/github-script@v7
         env:
           FINAL_MESSAGE: ${{ steps.harness.outputs.final-message }}
