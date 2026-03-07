@@ -475,7 +475,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn codex_cloud_config_defaults() {
         let config = CodexCloudConfig::default();
         assert!(!config.enabled);
@@ -502,7 +501,9 @@ mod tests {
             vec!["npm ci".to_string(), "cargo fetch".to_string()]
         );
         assert_eq!(config.cloud.setup_secret_env, vec!["NPM_TOKEN".to_string()]);
-=======
+    }
+
+    #[test]
     fn rules_config_defaults_do_not_autoload_requirements() {
         let rules = RulesConfig::default();
         assert!(rules.exec_policy_paths.is_empty());
@@ -517,6 +518,5 @@ mod tests {
         let rules: RulesConfig = toml::from_str(toml_str).unwrap();
         assert!(rules.exec_policy_paths.is_empty());
         assert_eq!(rules.requirements_path, None);
->>>>>>> origin/main
     }
 }
