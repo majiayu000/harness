@@ -56,6 +56,13 @@ pub enum Command {
         cmd: RuleCommand,
     },
 
+    /// Starlark execpolicy commands
+    #[command(name = "execpolicy")]
+    ExecPolicy {
+        #[command(subcommand)]
+        cmd: ExecPolicyCommand,
+    },
+
     /// Skill system commands
     Skill {
         #[command(subcommand)]
@@ -109,6 +116,33 @@ pub enum RuleCommand {
         /// Project directory
         #[arg(default_value = ".")]
         project: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ExecPolicyCommand {
+    /// Check a command against Starlark policy rules
+    Check {
+        /// Paths to policy files (repeatable). Falls back to `rules.exec_policy_paths`.
+        #[arg(short = 'r', long = "rules", value_name = "PATH")]
+        rules: Vec<PathBuf>,
+        /// Optional requirements.toml path. Falls back to `rules.requirements_path` when omitted.
+        #[arg(long, value_name = "PATH")]
+        requirements: Option<PathBuf>,
+        /// Resolve absolute executables against basename rules.
+        #[arg(long)]
+        resolve_host_executables: bool,
+        /// Pretty-print JSON output.
+        #[arg(long)]
+        pretty: bool,
+        /// Command tokens to evaluate.
+        #[arg(
+            value_name = "COMMAND",
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        command: Vec<String>,
     },
 }
 
@@ -179,6 +213,7 @@ fn configured_rule_engine(config: &harness_core::HarnessConfig) -> harness_rules
     engine.configure_sources(
         config.rules.discovery_paths.clone(),
         config.rules.builtin_path.clone(),
+        config.rules.requirements_path.clone(),
     );
     engine
 }
@@ -341,6 +376,48 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
+        Command::ExecPolicy { cmd } => match cmd {
+            ExecPolicyCommand::Check {
+                rules,
+                requirements,
+                resolve_host_executables,
+                pretty,
+                command,
+            } => {
+                let mut engine = configured_rule_engine(&config);
+                let policy_paths = if rules.is_empty() {
+                    config.rules.exec_policy_paths.clone()
+                } else {
+                    rules
+                };
+                if policy_paths.is_empty() {
+                    anyhow::bail!(
+                        "no execpolicy rules supplied; pass --rules or set rules.exec_policy_paths"
+                    );
+                }
+
+                engine.load_exec_policy_files(&policy_paths)?;
+                if let Some(path) = requirements {
+                    engine.load_requirements_toml(&path)?;
+                } else {
+                    engine.load_configured_requirements()?;
+                }
+
+                let result = engine.check_command_policy(
+                    &command,
+                    &harness_rules::exec_policy::MatchOptions {
+                        resolve_host_executables,
+                    },
+                );
+                let rendered = if pretty {
+                    serde_json::to_string_pretty(&result)?
+                } else {
+                    serde_json::to_string(&result)?
+                };
+                println!("{rendered}");
+            }
+        },
+
         Command::Skill { cmd } => match cmd {
             SkillCommand::List { query } => {
                 let store = harness_skills::SkillStore::new();
@@ -451,5 +528,39 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" | ");
         assert!(chain.contains("cwd lookup blocked"));
+    }
+
+    #[test]
+    fn cli_parses_execpolicy_check_subcommand() {
+        let cli = Cli::try_parse_from([
+            "harness",
+            "execpolicy",
+            "check",
+            "--rules",
+            "policy.star",
+            "--pretty",
+            "git",
+            "status",
+        ])
+        .expect("execpolicy command should parse");
+
+        match cli.command {
+            Command::ExecPolicy { cmd } => match cmd {
+                ExecPolicyCommand::Check {
+                    rules,
+                    requirements,
+                    resolve_host_executables,
+                    pretty,
+                    command,
+                } => {
+                    assert_eq!(rules, vec![PathBuf::from("policy.star")]);
+                    assert_eq!(requirements, None);
+                    assert!(!resolve_host_executables);
+                    assert!(pretty);
+                    assert_eq!(command, vec!["git".to_string(), "status".to_string()]);
+                }
+            },
+            _ => panic!("unexpected command variant parsed"),
+        }
     }
 }

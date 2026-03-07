@@ -280,8 +280,14 @@ impl Default for SignalThresholds {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RulesConfig {
+    #[serde(default)]
     pub discovery_paths: Vec<PathBuf>,
+    #[serde(default)]
     pub builtin_path: Option<PathBuf>,
+    #[serde(default)]
+    pub exec_policy_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub requirements_path: Option<PathBuf>,
 }
 
 impl Default for RulesConfig {
@@ -289,6 +295,8 @@ impl Default for RulesConfig {
         Self {
             discovery_paths: vec![],
             builtin_path: None,
+            exec_policy_paths: vec![],
+            requirements_path: None,
         }
     }
 }
@@ -467,6 +475,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn codex_cloud_config_defaults() {
         let config = CodexCloudConfig::default();
         assert!(!config.enabled);
@@ -493,5 +502,21 @@ mod tests {
             vec!["npm ci".to_string(), "cargo fetch".to_string()]
         );
         assert_eq!(config.cloud.setup_secret_env, vec!["NPM_TOKEN".to_string()]);
+=======
+    fn rules_config_defaults_do_not_autoload_requirements() {
+        let rules = RulesConfig::default();
+        assert!(rules.exec_policy_paths.is_empty());
+        assert_eq!(rules.requirements_path, None);
+    }
+
+    #[test]
+    fn rules_config_deserializes_when_new_fields_are_missing() {
+        let toml_str = r#"
+            discovery_paths = []
+        "#;
+        let rules: RulesConfig = toml::from_str(toml_str).unwrap();
+        assert!(rules.exec_policy_paths.is_empty());
+        assert_eq!(rules.requirements_path, None);
+>>>>>>> origin/main
     }
 }
