@@ -127,6 +127,20 @@ async fn make_test_state_with_agent(
     Ok((state, capturing))
 }
 
+fn task_app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health", get(health_check))
+        .route(
+            "/tasks",
+            post(task_routes::create_task),
+        )
+        .route(
+            "/tasks/{id}",
+            get(get_task),
+        )
+        .with_state(state)
+}
+
 fn webhook_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route(
@@ -453,5 +467,110 @@ async fn webhook_body_limit_rejects_large_payload() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_task_with_prompt_returns_accepted() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+    let before_count = state.tasks.count();
+    let app = task_app(state.clone());
+
+    let body = serde_json::json!({ "prompt": "fix the bug" });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    use http_body_util::BodyExt;
+    let resp_body = response.into_body().collect().await?.to_bytes();
+    let resp: serde_json::Value = serde_json::from_slice(&resp_body)?;
+    assert!(resp["task_id"].is_string());
+    assert_eq!(state.tasks.count(), before_count + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_task_empty_request_returns_bad_request() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+    let app = task_app(state);
+
+    let body = serde_json::json!({});
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_task_returns_not_found_for_missing_id() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = task_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tasks/nonexistent-id")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+
+    let create_body = serde_json::json!({ "prompt": "add tests" });
+    let create_resp = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(create_resp.status(), StatusCode::ACCEPTED);
+
+    use http_body_util::BodyExt;
+    let create_body = create_resp.into_body().collect().await?.to_bytes();
+    let create_json: serde_json::Value = serde_json::from_slice(&create_body)?;
+    let task_id = create_json["task_id"].as_str().expect("task_id should be string");
+
+    // GET the task — agent executes instantly (mock), so status should be observable
+    let get_resp = task_app(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/tasks/{task_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get_resp.status(), StatusCode::OK);
+
+    let get_body = get_resp.into_body().collect().await?.to_bytes();
+    let task_json: serde_json::Value = serde_json::from_slice(&get_body)?;
+    assert_eq!(task_json["id"], task_id);
     Ok(())
 }
