@@ -18,26 +18,18 @@ impl EventStore {
         })
     }
 
-    pub fn with_policies(
+    pub fn with_policies_and_otel(
         data_dir: &Path,
         session_renewal_secs: u64,
         log_retention_days: u32,
-    ) -> anyhow::Result<Self> {
-        Self::with_policies_and_otel(
-            data_dir,
-            session_renewal_secs,
-            log_retention_days,
-            &OtelConfig::default(),
-        )
-    }
-
-    pub fn with_policies_and_otel(
-        data_dir: &Path,
-        _session_renewal_secs: u64,
-        _log_retention_days: u32,
         otel_config: &OtelConfig,
     ) -> anyhow::Result<Self> {
         let mut store = Self::new(data_dir)?;
+        tracing::debug!(
+            session_renewal_secs,
+            log_retention_days,
+            "event store policy values accepted"
+        );
         store.otel_pipeline = match crate::otel_export::OtelPipeline::from_config(otel_config) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -192,7 +184,7 @@ impl EventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Decision, Event, EventFilters, RuleId, SessionId};
+    use harness_core::{Decision, Event, EventFilters, OtelExporter, RuleId, SessionId};
     use std::path::Path;
 
     fn make_event(hook: &str, decision: Decision) -> Event {
@@ -396,6 +388,32 @@ mod tests {
         })?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].detail.as_deref(), Some("/tmp/my-project"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn log_with_active_otel_pipeline_still_persists_event() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = OtelConfig {
+            exporter: OtelExporter::OtlpHttp,
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            ..OtelConfig::default()
+        };
+        let store = EventStore::with_policies_and_otel(dir.path(), 1800, 90, &config)?;
+        let event = Event::new(
+            SessionId::new(),
+            "api_request",
+            "http_client",
+            Decision::Pass,
+        );
+        store.log(&event)?;
+        let events = store.query(&EventFilters {
+            session_id: Some(event.session_id.clone()),
+            ..Default::default()
+        })?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, event.id);
+        std::mem::forget(store);
         Ok(())
     }
 }

@@ -56,4 +56,5 @@ log_retention_days = 90
 [otel]
 environment = "development"
 exporter = "disabled"
+# endpoint = "http://127.0.0.1:4318"
 log_user_prompt = false

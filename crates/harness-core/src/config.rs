@@ -289,6 +289,8 @@ pub struct OtelConfig {
     #[serde(default)]
     pub exporter: OtelExporter,
     #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
     pub log_user_prompt: bool,
 }
 
@@ -297,6 +299,7 @@ impl Default for OtelConfig {
         Self {
             environment: default_otel_environment(),
             exporter: OtelExporter::default(),
+            endpoint: None,
             log_user_prompt: false,
         }
     }
@@ -480,6 +483,7 @@ mod tests {
     fn otel_config_defaults_to_disabled_exporter() {
         let config = OtelConfig::default();
         assert_eq!(config.exporter, OtelExporter::Disabled);
+        assert!(config.endpoint.is_none());
         assert!(!config.log_user_prompt);
         assert_eq!(config.environment, "development");
     }
@@ -528,12 +532,17 @@ mod tests {
             [otel]
             environment = "staging"
             exporter = "otlp-http"
+            endpoint = "http://collector:4318"
             log_user_prompt = true
         "#;
 
         let config: HarnessConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.otel.environment, "staging");
         assert_eq!(config.otel.exporter, OtelExporter::OtlpHttp);
+        assert_eq!(
+            config.otel.endpoint.as_deref(),
+            Some("http://collector:4318")
+        );
         assert!(config.otel.log_user_prompt);
     }
 }

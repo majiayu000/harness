@@ -1,22 +1,57 @@
 use harness_core::{Decision, Event, OtelConfig, OtelExporter};
-use opentelemetry::logs::{AnyValue, LogRecord, Logger, LoggerProvider as _, Severity};
+use opentelemetry::logs::{AnyValue, LogRecord as _, Logger, LoggerProvider as _, Severity};
 use opentelemetry::metrics::{Counter, Histogram, MeterProvider as _};
 use opentelemetry::trace::{Span, Tracer, TracerProvider as _};
 use opentelemetry::KeyValue;
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::logs::LoggerProvider;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::Resource;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 
 const SERVICE_NAME: &str = "harness-observe";
 const DEFAULT_HTTP_ENDPOINT: &str = "http://127.0.0.1:4318";
 const DEFAULT_GRPC_ENDPOINT: &str = "http://127.0.0.1:4317";
+const MAX_TRACKED_CONVERSATION_SESSIONS: usize = 10_000;
+
+struct SessionStartDeduper {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl SessionStartDeduper {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn insert(&mut self, session_id: &str) -> bool {
+        if self.seen.contains(session_id) {
+            return false;
+        }
+
+        let session_id = session_id.to_string();
+        self.seen.insert(session_id.clone());
+        self.order.push_back(session_id);
+
+        while self.order.len() > self.capacity {
+            if let Some(expired) = self.order.pop_front() {
+                self.seen.remove(expired.as_str());
+            }
+        }
+
+        true
+    }
+}
 
 pub struct OtelPipeline {
     log_user_prompt: bool,
-    seen_sessions: Mutex<HashSet<String>>,
+    seen_sessions: Mutex<SessionStartDeduper>,
     tracer_provider: opentelemetry_sdk::trace::TracerProvider,
     tracer: opentelemetry_sdk::trace::Tracer,
     logger_provider: LoggerProvider,
@@ -39,32 +74,41 @@ impl OtelPipeline {
             KeyValue::new("deployment.environment", config.environment.clone()),
         ]);
 
-        let tracer_provider = build_tracer_provider(config.exporter, resource.clone())?;
+        let tracer_provider = build_tracer_provider(
+            config.exporter,
+            config.endpoint.as_deref(),
+            resource.clone(),
+        )?;
         let tracer = tracer_provider.tracer(SERVICE_NAME);
-        let logger_provider = build_logger_provider(config.exporter, resource.clone())?;
+        let logger_provider = build_logger_provider(
+            config.exporter,
+            config.endpoint.as_deref(),
+            resource.clone(),
+        )?;
         let logger = logger_provider.logger(SERVICE_NAME);
-        let meter_provider = build_meter_provider(config.exporter, resource)?;
+        let meter_provider =
+            build_meter_provider(config.exporter, config.endpoint.as_deref(), resource)?;
         let meter = meter_provider.meter(SERVICE_NAME);
         let conversation_starts_total = meter
             .u64_counter("harness.conversation_starts.total")
             .with_description("Number of distinct conversation starts by session.")
-            .init();
+            .build();
         let api_request_total = meter
             .u64_counter("harness.api_request.total")
             .with_description("Number of API request-like events.")
-            .init();
+            .build();
         let tool_decision_total = meter
             .u64_counter("harness.tool_decision.total")
             .with_description("Number of tool decision events.")
-            .init();
+            .build();
         let tool_execution_duration_ms = meter
             .u64_histogram("harness.tool_execution.duration_ms")
             .with_description("Tool execution duration in milliseconds.")
-            .init();
+            .build();
 
         Ok(Some(Self {
             log_user_prompt: config.log_user_prompt,
-            seen_sessions: Mutex::new(HashSet::new()),
+            seen_sessions: Mutex::new(SessionStartDeduper::new(MAX_TRACKED_CONVERSATION_SESSIONS)),
             tracer_provider,
             tracer,
             logger_provider,
@@ -106,7 +150,7 @@ impl OtelPipeline {
 
     fn mark_conversation_started(&self, event: &Event) -> bool {
         match self.seen_sessions.lock() {
-            Ok(mut sessions) => sessions.insert(event.session_id.as_str().to_string()),
+            Ok(mut sessions) => sessions.insert(event.session_id.as_str()),
             Err(_) => false,
         }
     }
@@ -141,19 +185,20 @@ impl OtelPipeline {
         span.end();
     }
 
-    fn emit_log(&self, name: &str, event: &Event, attrs: &[KeyValue]) {
+    fn emit_log(&self, name: &'static str, event: &Event, attrs: &[KeyValue]) {
         let timestamp = std::time::SystemTime::from(event.ts);
         let severity = severity_for_decision(event.decision);
-        let mut builder = LogRecord::builder()
-            .with_name(name.to_string().into())
-            .with_body(AnyValue::from(name.to_string()))
-            .with_timestamp(timestamp)
-            .with_severity_text(severity.name())
-            .with_severity_number(severity);
+        let mut record = self.logger.create_log_record();
+        record.set_event_name(name);
+        record.set_body(AnyValue::from(name.to_string()));
+        record.set_timestamp(timestamp);
+        record.set_observed_timestamp(timestamp);
+        record.set_severity_text(severity.name());
+        record.set_severity_number(severity);
         for attr in attrs {
-            builder = builder.with_attribute(attr.key.clone(), attr.value.clone());
+            record.add_attribute(attr.key.clone(), attr.value.to_string());
         }
-        self.logger.emit(builder.build());
+        self.logger.emit(record);
     }
 }
 
@@ -161,113 +206,117 @@ impl Drop for OtelPipeline {
     fn drop(&mut self) {
         for result in self.tracer_provider.force_flush() {
             if let Err(err) = result {
-                tracing::warn!("failed to force flush tracer provider: {err}");
+                report_pipeline_error("failed to force flush tracer provider", err);
             }
         }
+        if let Err(err) = self.tracer_provider.shutdown() {
+            report_pipeline_error("failed to shut down tracer provider", err);
+        }
         if let Err(err) = self.meter_provider.force_flush() {
-            tracing::warn!("failed to force flush meter provider: {err}");
+            report_pipeline_error("failed to force flush meter provider", err);
         }
         if let Err(err) = self.meter_provider.shutdown() {
-            tracing::warn!("failed to shut down meter provider: {err}");
+            report_pipeline_error("failed to shut down meter provider", err);
         }
         for result in self.logger_provider.force_flush() {
             if let Err(err) = result {
-                tracing::warn!("failed to force flush logger provider: {err}");
+                report_pipeline_error("failed to force flush logger provider", err);
             }
         }
-        for result in self.logger_provider.shutdown() {
-            if let Err(err) = result {
-                tracing::warn!("failed to shut down logger provider: {err}");
-            }
+        if let Err(err) = self.logger_provider.shutdown() {
+            report_pipeline_error("failed to shut down logger provider", err);
         }
     }
 }
 
 fn build_tracer_provider(
     exporter: OtelExporter,
+    endpoint: Option<&str>,
     resource: Resource,
 ) -> anyhow::Result<opentelemetry_sdk::trace::TracerProvider> {
     let span_exporter = match exporter {
-        OtelExporter::OtlpHttp => opentelemetry_otlp::new_exporter()
-            .http()
-            .with_endpoint(resolve_endpoint(exporter))
-            .build_span_exporter()?,
-        OtelExporter::OtlpGrpc => opentelemetry_otlp::new_exporter()
-            .tonic()
-            .with_endpoint(resolve_endpoint(exporter))
-            .build_span_exporter()?,
+        OtelExporter::OtlpHttp => opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpBinary)
+            .with_endpoint(resolve_endpoint(exporter, endpoint))
+            .build()?,
+        OtelExporter::OtlpGrpc => opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(resolve_endpoint(exporter, endpoint))
+            .build()?,
         OtelExporter::Disabled => {
-            unreachable!("disabled exporter should not initialize tracer provider")
+            anyhow::bail!("disabled exporter cannot initialize tracer provider")
         }
     };
 
     Ok(opentelemetry_sdk::trace::TracerProvider::builder()
-        .with_config(opentelemetry_sdk::trace::config().with_resource(resource))
+        .with_resource(resource)
         .with_batch_exporter(span_exporter, opentelemetry_sdk::runtime::Tokio)
         .build())
 }
 
 fn build_logger_provider(
     exporter: OtelExporter,
+    endpoint: Option<&str>,
     resource: Resource,
 ) -> anyhow::Result<LoggerProvider> {
     let log_exporter = match exporter {
-        OtelExporter::OtlpHttp => opentelemetry_otlp::new_exporter()
-            .http()
-            .with_endpoint(resolve_endpoint(exporter))
-            .build_log_exporter()?,
-        OtelExporter::OtlpGrpc => opentelemetry_otlp::new_exporter()
-            .tonic()
-            .with_endpoint(resolve_endpoint(exporter))
-            .build_log_exporter()?,
+        OtelExporter::OtlpHttp => opentelemetry_otlp::LogExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpBinary)
+            .with_endpoint(resolve_endpoint(exporter, endpoint))
+            .build()?,
+        OtelExporter::OtlpGrpc => opentelemetry_otlp::LogExporter::builder()
+            .with_tonic()
+            .with_endpoint(resolve_endpoint(exporter, endpoint))
+            .build()?,
         OtelExporter::Disabled => {
-            unreachable!("disabled exporter should not initialize logger provider")
+            anyhow::bail!("disabled exporter cannot initialize logger provider")
         }
     };
 
-    let batch_processor = opentelemetry_sdk::logs::BatchLogProcessor::builder(
-        log_exporter,
-        opentelemetry_sdk::runtime::Tokio,
-    )
-    .build();
     Ok(opentelemetry_sdk::logs::LoggerProvider::builder()
-        .with_config(opentelemetry_sdk::logs::Config::default().with_resource(resource))
-        .with_log_processor(batch_processor)
+        .with_resource(resource)
+        .with_batch_exporter(log_exporter, opentelemetry_sdk::runtime::Tokio)
         .build())
 }
 
 fn build_meter_provider(
     exporter: OtelExporter,
+    endpoint: Option<&str>,
     resource: Resource,
 ) -> anyhow::Result<SdkMeterProvider> {
-    let metrics_pipeline = opentelemetry_otlp::new_pipeline()
-        .metrics(opentelemetry_sdk::runtime::Tokio)
-        .with_resource(resource);
-
-    let meter_provider = match exporter {
-        OtelExporter::OtlpHttp => metrics_pipeline
-            .with_exporter(
-                opentelemetry_otlp::new_exporter()
-                    .http()
-                    .with_endpoint(resolve_endpoint(exporter)),
-            )
+    let metric_exporter = match exporter {
+        OtelExporter::OtlpHttp => opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpBinary)
+            .with_endpoint(resolve_endpoint(exporter, endpoint))
             .build()?,
-        OtelExporter::OtlpGrpc => metrics_pipeline
-            .with_exporter(
-                opentelemetry_otlp::new_exporter()
-                    .tonic()
-                    .with_endpoint(resolve_endpoint(exporter)),
-            )
+        OtelExporter::OtlpGrpc => opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(resolve_endpoint(exporter, endpoint))
             .build()?,
         OtelExporter::Disabled => {
-            unreachable!("disabled exporter should not initialize meter provider")
+            anyhow::bail!("disabled exporter cannot initialize meter provider")
         }
     };
 
-    Ok(meter_provider)
+    let reader =
+        PeriodicReader::builder(metric_exporter, opentelemetry_sdk::runtime::Tokio).build();
+    Ok(SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(reader)
+        .build())
 }
 
-fn resolve_endpoint(exporter: OtelExporter) -> String {
+fn resolve_endpoint(exporter: OtelExporter, config_endpoint: Option<&str>) -> String {
+    if let Some(endpoint) = config_endpoint
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+    {
+        return endpoint.to_string();
+    }
+
     if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
         if !endpoint.trim().is_empty() {
             return endpoint;
@@ -282,14 +331,17 @@ fn resolve_endpoint(exporter: OtelExporter) -> String {
 }
 
 fn is_api_request_event(event: &Event) -> bool {
-    let hook = event.hook.to_ascii_lowercase();
-    let tool = event.tool.to_ascii_lowercase();
-    hook.contains("api")
-        || hook.contains("http")
-        || hook.contains("request")
-        || tool.contains("api")
-        || tool.contains("http")
-        || tool.contains("request")
+    [event.hook.as_str(), event.tool.as_str()]
+        .iter()
+        .any(|value| {
+            has_token(value, "api") || has_token(value, "http") || has_token(value, "request")
+        })
+}
+
+fn has_token(value: &str, needle: &str) -> bool {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case(needle))
 }
 
 fn looks_like_user_prompt_payload(event: &Event) -> bool {
@@ -320,6 +372,11 @@ fn severity_for_decision(decision: Decision) -> Severity {
     }
 }
 
+fn report_pipeline_error(message: &str, err: impl std::fmt::Display) {
+    tracing::warn!("{message}: {err}");
+    eprintln!("harness-observe: {message}: {err}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,10 +390,12 @@ mod tests {
     fn api_request_classifier_matches_common_markers() {
         assert!(is_api_request_event(&event_with("api_call", "tool")));
         assert!(is_api_request_event(&event_with("hook", "http_client")));
+        assert!(is_api_request_event(&event_with("request_started", "tool")));
         assert!(!is_api_request_event(&event_with(
             "rule_scan",
             "RuleEngine"
         )));
+        assert!(!is_api_request_event(&event_with("therapist", "editor")));
     }
 
     #[test]
@@ -362,6 +421,26 @@ mod tests {
             ..OtelConfig::default()
         };
         assert!(OtelPipeline::from_config(&config)?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn record_event_with_active_pipeline_does_not_panic() -> anyhow::Result<()> {
+        let config = OtelConfig {
+            exporter: OtelExporter::OtlpHttp,
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            ..OtelConfig::default()
+        };
+        let pipeline = OtelPipeline::from_config(&config)?
+            .expect("otlp-http exporter should initialize active pipeline");
+        let event = Event::new(
+            SessionId::new(),
+            "api_request",
+            "http_client",
+            Decision::Pass,
+        );
+        pipeline.record_event(&event);
+        std::mem::forget(pipeline);
         Ok(())
     }
 }
