@@ -1,8 +1,10 @@
 use crate::{router, server::HarnessServer, task_runner};
 use anyhow::Context;
 use axum::{
+    body::Bytes,
+    extract::DefaultBodyLimit,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -13,6 +15,10 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
+
+const MAX_WEBHOOK_BODY_BYTES: usize = 512 * 1024;
+
+mod task_routes;
 
 pub struct AppState {
     pub server: Arc<HarnessServer>,
@@ -90,6 +96,19 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         log_retention_days = server.config.observe.log_retention_days,
         "harness: effective config"
     );
+    match server.config.server.github_webhook_secret.as_deref() {
+        Some("") => {
+            tracing::warn!(
+                "server.github_webhook_secret is configured as empty string; refusing webhook requests until this is set to a non-empty value"
+            );
+        }
+        None => {
+            tracing::warn!(
+                "server.github_webhook_secret is not configured; refusing webhook requests until this is set to a non-empty value"
+            );
+        }
+        Some(_) => {}
+    }
 
     let db_path = dir.join("tasks.db");
     tracing::info!("task db: {}", db_path.display());
@@ -254,9 +273,13 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .route("/health", get(health_check))
         .route("/rpc", post(handle_rpc))
         .route("/ws", get(crate::websocket::ws_handler))
-        .route("/tasks", post(create_task))
+        .route("/tasks", post(task_routes::create_task))
         .route("/tasks", get(list_tasks))
         .route("/tasks/{id}", get(get_task))
+        .route(
+            "/webhook",
+            post(github_webhook).layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES)),
+        )
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -278,64 +301,101 @@ async fn handle_rpc(State(state): State<Arc<AppState>>, Json(req): Json<RpcReque
     }
 }
 
-async fn create_task(
+async fn github_webhook(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<task_runner::CreateTaskRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
+    let secret = match state.server.config.server.github_webhook_secret.as_deref() {
+        Some("") => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "invalid server.github_webhook_secret configuration"})),
+            )
+        }
+        Some(secret) => secret,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "missing server.github_webhook_secret configuration"})),
+            )
+        }
+    };
+    let signature = match headers
+        .get("x-hub-signature-256")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(signature) => signature,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "missing header x-hub-signature-256"})),
+            )
+        }
+    };
+    if !crate::webhook::verify_github_signature(secret, signature, body.as_ref()) {
         return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "at least one of prompt, issue, or pr must be provided"})),
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid webhook signature"})),
         );
     }
 
-    let agent = if let Some(name) = &req.agent {
-        match state.server.agent_registry.get(name) {
-            Some(a) => a,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!("agent '{}' not registered", name)})),
-                );
-            }
-        }
-    } else {
-        match state.server.agent_registry.default_agent() {
-            Some(a) => a,
-            None => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "no agent registered"})),
-                );
-            }
+    let event = match headers
+        .get("x-github-event")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(event) => event,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing header x-github-event"})),
+            )
         }
     };
+    if !crate::webhook::is_valid_github_event_name(event) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid header x-github-event"})),
+        );
+    }
 
-    let (reviewer, review_config) = resolve_reviewer(
-        &state.server.agent_registry,
-        &state.server.config.agents.review,
-        agent.name(),
-    );
+    let (request, reason) =
+        match crate::webhook::parse_github_webhook_task_request(event, body.as_ref()) {
+            Ok(parsed) => parsed,
+            Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+        };
 
-    let task_id = task_runner::spawn_task(
-        state.tasks.clone(),
-        agent,
-        reviewer,
-        review_config,
-        state.skills.clone(),
-        state.events.clone(),
-        state.interceptors.clone(),
-        req,
-    )
-    .await;
+    let Some(mut req) = request else {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ignored",
+                "reason": reason,
+            })),
+        );
+    };
 
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "task_id": task_id.0,
-            "status": "running"
-        })),
-    )
+    if req.project.is_none() {
+        req.project = Some(state.project_root.clone());
+    }
+
+    match task_routes::enqueue_task(&state, req).await {
+        Ok(task_id) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "accepted",
+                "reason": reason,
+                "task_id": task_id.0,
+            })),
+        ),
+        Err(task_routes::EnqueueTaskError::BadRequest(error)) => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
+        }
+        Err(task_routes::EnqueueTaskError::Internal(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        ),
+    }
 }
 
 async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<task_runner::TaskSummary>> {
@@ -360,83 +420,4 @@ async fn get_task(State(state): State<Arc<AppState>>, Path(id): Path<String>) ->
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
-
-    async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>> {
-        let config = harness_core::HarnessConfig::default();
-        let thread_manager = crate::thread_manager::ThreadManager::new();
-        let agent_registry = harness_agents::AgentRegistry::new("test");
-        let server = Arc::new(crate::server::HarnessServer::new(
-            config,
-            thread_manager,
-            agent_registry,
-        ));
-        let tasks = task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
-        let events = Arc::new(harness_observe::EventStore::new(dir)?);
-        let signal_detector = harness_gc::SignalDetector::new(
-            server.config.gc.signal_thresholds.clone().into(),
-            harness_core::ProjectId::new(),
-        );
-        let draft_store = harness_gc::DraftStore::new(dir)?;
-        let gc_agent = Arc::new(harness_gc::GcAgent::new(
-            harness_gc::gc_agent::GcConfig::default(),
-            signal_detector,
-            draft_store,
-        ));
-        let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
-        Ok(Arc::new(AppState {
-            server,
-            project_root: dir.to_path_buf(),
-            tasks,
-            skills: Arc::new(tokio::sync::RwLock::new(harness_skills::SkillStore::new())),
-            rules: Arc::new(tokio::sync::RwLock::new(
-                harness_rules::engine::RuleEngine::new(),
-            )),
-            events,
-            gc_agent,
-            plans: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            thread_db: Some(thread_db),
-            plan_db: None,
-            interceptors: vec![],
-            notification_tx: tokio::sync::broadcast::channel(32).0,
-            notification_lagged_total: Arc::new(AtomicU64::new(0)),
-            notification_lag_log_every: 1,
-            notify_tx: None,
-            initialized: Arc::new(AtomicBool::new(true)),
-        }))
-    }
-
-    #[tokio::test]
-    async fn health_endpoint_returns_ok_and_task_count() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let state = make_test_state(dir.path()).await?;
-
-        let app = Router::new()
-            .route("/health", get(health_check))
-            .with_state(state);
-
-        let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty())?)
-            .await?;
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        #[derive(serde::Deserialize, Debug)]
-        struct HealthResponse {
-            status: String,
-            tasks: u64,
-        }
-
-        use http_body_util::BodyExt;
-        let body = response.into_body().collect().await?.to_bytes();
-        let health: HealthResponse = serde_json::from_slice(&body)?;
-
-        assert_eq!(health.status, "ok");
-        assert_eq!(health.tasks, 0);
-        Ok(())
-    }
-}
+mod tests;

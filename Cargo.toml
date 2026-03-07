@@ -82,10 +82,11 @@ async-trait = "0.1"
 # Futures
 futures = "0.3"
 tokio-stream = "0.1"
+hmac = "0.12"
+sha2 = "0.10"
 
 # HTTP client (for Anthropic API)
 reqwest = { version = "0.12", features = ["json", "stream"] }
-sha2 = "0.10"
 
 # Testing
 tempfile = "3"
