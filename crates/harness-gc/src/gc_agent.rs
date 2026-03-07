@@ -227,10 +227,7 @@ fn parse_artifacts(output: &str, signal: &Signal) -> Vec<Artifact> {
     // For now, treat the entire output as a single artifact
     vec![Artifact {
         artifact_type,
-        target_path: std::path::PathBuf::from(format!(
-            ".harness/drafts/{}.md",
-            signal.id
-        )),
+        target_path: std::path::PathBuf::from(format!(".harness/drafts/{}.md", signal.id)),
         content: output.to_string(),
     }]
 }
