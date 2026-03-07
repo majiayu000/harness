@@ -5,7 +5,7 @@ pub use parser::ExecPolicyParser;
 pub use requirements::RequirementsToml;
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -164,9 +164,21 @@ impl ExecPolicy {
                 .or_default()
                 .extend(rules.iter().cloned());
         }
-        combined
-            .host_executables_by_name
-            .extend(overlay.host_executables_by_name.clone());
+        for (name, overlay_paths) in &overlay.host_executables_by_name {
+            let mut merged_paths: Vec<PathBuf> = combined
+                .host_executables_by_name
+                .get(name)
+                .map(|existing| existing.iter().cloned().collect())
+                .unwrap_or_default();
+            for path in overlay_paths.iter() {
+                if !merged_paths.iter().any(|existing| existing == path) {
+                    merged_paths.push(path.clone());
+                }
+            }
+            combined
+                .host_executables_by_name
+                .insert(name.clone(), merged_paths.into());
+        }
         combined
     }
 
@@ -178,7 +190,20 @@ impl ExecPolicy {
     }
 
     pub fn set_host_executable_paths(&mut self, name: String, paths: Vec<PathBuf>) {
-        self.host_executables_by_name.insert(name, paths.into());
+        match self.host_executables_by_name.entry(name) {
+            Entry::Vacant(slot) => {
+                slot.insert(paths.into());
+            }
+            Entry::Occupied(mut slot) => {
+                let mut merged_paths = slot.get().to_vec();
+                for path in paths {
+                    if !merged_paths.iter().any(|existing| existing == &path) {
+                        merged_paths.push(path);
+                    }
+                }
+                slot.insert(merged_paths.into());
+            }
+        }
     }
 
     pub fn check_command(
@@ -263,4 +288,80 @@ impl ExecPolicy {
 
 pub(crate) fn executable_name(path: &Path) -> Option<&str> {
     path.file_name().and_then(|name| name.to_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allow_git_status_rule() -> PrefixRule {
+        PrefixRule {
+            pattern: PrefixPattern {
+                first: Arc::from("git"),
+                rest: vec![PatternToken::Single("status".to_string())].into(),
+            },
+            decision: ExecDecision::Allow,
+            justification: None,
+        }
+    }
+
+    #[test]
+    fn merge_overlay_merges_host_executable_paths_without_overwrite() {
+        let mut base = ExecPolicy::empty();
+        base.add_rule(allow_git_status_rule());
+        base.set_host_executable_paths("git".to_string(), vec![PathBuf::from("/usr/bin/git")]);
+
+        let mut overlay = ExecPolicy::empty();
+        overlay.set_host_executable_paths(
+            "git".to_string(),
+            vec![
+                PathBuf::from("/opt/homebrew/bin/git"),
+                PathBuf::from("/usr/bin/git"),
+            ],
+        );
+
+        let merged = base.merge_overlay(&overlay);
+        let options = MatchOptions {
+            resolve_host_executables: true,
+        };
+
+        let first_result = merged.check_command(
+            &["/usr/bin/git".to_string(), "status".to_string()],
+            &options,
+        );
+        assert_eq!(first_result.decision, Some(ExecDecision::Allow));
+
+        let second_result = merged.check_command(
+            &["/opt/homebrew/bin/git".to_string(), "status".to_string()],
+            &options,
+        );
+        assert_eq!(second_result.decision, Some(ExecDecision::Allow));
+
+        assert_eq!(merged.host_executables_by_name["git"].len(), 2);
+    }
+
+    #[test]
+    fn set_host_executable_paths_merges_repeated_declarations() {
+        let mut policy = ExecPolicy::empty();
+        policy.add_rule(allow_git_status_rule());
+        policy.set_host_executable_paths("git".to_string(), vec![PathBuf::from("/usr/bin/git")]);
+        policy.set_host_executable_paths(
+            "git".to_string(),
+            vec![PathBuf::from("/opt/homebrew/bin/git")],
+        );
+
+        let options = MatchOptions {
+            resolve_host_executables: true,
+        };
+        let usr_bin = policy.check_command(
+            &["/usr/bin/git".to_string(), "status".to_string()],
+            &options,
+        );
+        assert_eq!(usr_bin.decision, Some(ExecDecision::Allow));
+        let homebrew = policy.check_command(
+            &["/opt/homebrew/bin/git".to_string(), "status".to_string()],
+            &options,
+        );
+        assert_eq!(homebrew.decision, Some(ExecDecision::Allow));
+    }
 }

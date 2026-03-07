@@ -53,7 +53,7 @@ impl ExecPolicyParser {
             enable_lambda: false,
             enable_load: false,
             enable_load_reexport: false,
-            enable_top_level_stmt: true,
+            enable_top_level_stmt: false,
             ..Dialect::Standard
         };
         let ast = AstModule::parse(identifier, policy_contents.to_string(), &dialect)
@@ -164,14 +164,15 @@ struct PendingExampleValidation {
     not_matches: Vec<Vec<String>>,
 }
 
-fn policy_builder<'v, 'a>(eval: &Evaluator<'v, 'a, '_>) -> RefMut<'a, PolicyBuilder> {
-    #[expect(clippy::expect_used)]
-    eval.extra
+fn policy_builder<'v, 'a>(
+    eval: &Evaluator<'v, 'a, '_>,
+) -> anyhow::Result<RefMut<'a, PolicyBuilder>> {
+    let builder_cell = eval
+        .extra
         .as_ref()
-        .expect("policy builder requires Evaluator.extra to be populated")
-        .downcast_ref::<RefCell<PolicyBuilder>>()
-        .expect("Evaluator.extra must contain a PolicyBuilder")
-        .borrow_mut()
+        .and_then(|extra| extra.downcast_ref::<RefCell<PolicyBuilder>>())
+        .ok_or_else(|| anyhow!("internal error: policy builder missing in evaluator context"))?;
+    Ok(builder_cell.borrow_mut())
 }
 
 fn parse_decision(raw: &str) -> anyhow::Result<ExecDecision> {
@@ -317,13 +318,15 @@ fn policy_builtins(builder: &mut GlobalsBuilder) {
             .map(parse_decision)
             .transpose()?
             .unwrap_or(ExecDecision::Allow);
-        let justification = match justification {
-            Some(raw) if raw.trim().is_empty() => {
-                return Err(anyhow!("justification cannot be empty"));
-            }
-            Some(raw) => Some(raw.to_string()),
-            None => None,
-        };
+        let justification = justification
+            .map(|raw| {
+                if raw.trim().is_empty() {
+                    Err(anyhow!("justification cannot be empty"))
+                } else {
+                    Ok(raw.to_string())
+                }
+            })
+            .transpose()?;
 
         let pattern_tokens = parse_pattern(pattern)?;
         let matches = r#match.map(parse_examples).transpose()?.unwrap_or_default();
@@ -332,7 +335,7 @@ fn policy_builtins(builder: &mut GlobalsBuilder) {
             .transpose()?
             .unwrap_or_default();
 
-        let mut policy_builder = policy_builder(eval);
+        let mut policy_builder = policy_builder(eval)?;
         let (first_token, remaining_tokens) = pattern_tokens
             .split_first()
             .ok_or_else(|| anyhow!("pattern cannot be empty"))?;
@@ -379,7 +382,7 @@ fn policy_builtins(builder: &mut GlobalsBuilder) {
                 parsed_paths.push(path);
             }
         }
-        policy_builder(eval).add_host_executable(name.to_string(), parsed_paths);
+        policy_builder(eval)?.add_host_executable(name.to_string(), parsed_paths);
         Ok(NoneType)
     }
 }
@@ -512,5 +515,37 @@ def ignored():
             )
             .expect_err("function definitions should be rejected");
         assert!(error.to_string().contains("parse failed"));
+    }
+
+    #[test]
+    fn parser_rejects_top_level_for_statements() {
+        let mut parser = ExecPolicyParser::new();
+        let error = parser
+            .parse(
+                "inline",
+                r#"
+for name in ["git"]:
+  prefix_rule(pattern = [name, "status"], decision = "allow")
+"#,
+            )
+            .expect_err("top-level for statements should be rejected");
+        assert!(error.to_string().contains("for"));
+    }
+
+    #[test]
+    fn parser_rejects_while_keyword() {
+        let mut parser = ExecPolicyParser::new();
+        let error = parser
+            .parse(
+                "inline",
+                r#"
+while True:
+  pass
+"#,
+            )
+            .expect_err("while should be rejected");
+        let message = error.to_string();
+        assert!(message.contains("while"));
+        assert!(message.contains("reserved keyword"));
     }
 }

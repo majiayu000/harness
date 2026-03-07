@@ -71,19 +71,15 @@ impl RequirementsToml {
                 ));
             }
 
-            let decision = match rule.decision {
-                Some(RequirementsDecisionToml::Allow) => {
-                    return Err(anyhow!(
-                        "rules.prefix_rules[{rule_index}] decision `allow` is not permitted in requirements.toml"
-                    ));
-                }
-                Some(decision) => decision.as_decision(),
-                None => {
-                    return Err(anyhow!(
-                        "rules.prefix_rules[{rule_index}] is missing `decision`"
-                    ));
-                }
-            };
+            let decision = rule
+                .decision
+                .ok_or_else(|| anyhow!("rules.prefix_rules[{rule_index}] is missing `decision`"))?;
+            if let RequirementsDecisionToml::Allow = decision {
+                return Err(anyhow!(
+                    "rules.prefix_rules[{rule_index}] decision `allow` is not permitted in requirements.toml"
+                ));
+            }
+            let decision = decision.as_decision();
 
             let pattern_tokens = rule
                 .pattern

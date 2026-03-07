@@ -1,6 +1,7 @@
 use crate::exec_policy::{
     ExecPolicy, ExecPolicyCheckOutput, ExecPolicyParser, MatchOptions, RequirementsToml,
 };
+use anyhow::Context;
 use harness_core::{Category, GuardId, Language, RuleId, Severity, Violation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -380,16 +381,12 @@ impl RuleEngine {
         }
         let mut parser = ExecPolicyParser::new();
         for path in policy_paths {
-            let content = std::fs::read_to_string(path).map_err(|error| {
-                anyhow::anyhow!("failed to read execpolicy file {}: {error}", path.display())
-            })?;
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read execpolicy file {}", path.display()))?;
             let identifier = path.to_string_lossy().to_string();
-            parser.parse(&identifier, &content).map_err(|error| {
-                anyhow::anyhow!(
-                    "failed to parse execpolicy file {}: {error}",
-                    path.display()
-                )
-            })?;
+            parser
+                .parse(&identifier, &content)
+                .with_context(|| format!("failed to parse execpolicy file {}", path.display()))?;
         }
         self.exec_policy = self.exec_policy.merge_overlay(&parser.build());
         Ok(())
@@ -599,6 +596,52 @@ prefix_rule(pattern = ["git", "push"], decision = "prompt")
         assert_eq!(
             result.decision,
             Some(crate::exec_policy::ExecDecision::Prompt)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_exec_policy_files_merges_host_executable_paths_for_same_name() -> anyhow::Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let first_policy_path = sandbox.path().join("first.star");
+        let second_policy_path = sandbox.path().join("second.star");
+        std::fs::write(
+            &first_policy_path,
+            r#"
+prefix_rule(pattern = ["git", "status"], decision = "allow")
+host_executable(name = "git", paths = ["/usr/bin/git"])
+"#,
+        )?;
+        std::fs::write(
+            &second_policy_path,
+            r#"
+prefix_rule(pattern = ["git", "status"], decision = "allow")
+host_executable(name = "git", paths = ["/opt/homebrew/bin/git"])
+"#,
+        )?;
+
+        let mut engine = RuleEngine::new();
+        engine.load_exec_policy_files(&[first_policy_path, second_policy_path])?;
+        let options = MatchOptions {
+            resolve_host_executables: true,
+        };
+
+        let usr_bin_result = engine.check_command_policy(
+            &["/usr/bin/git".to_string(), "status".to_string()],
+            &options,
+        );
+        assert_eq!(
+            usr_bin_result.decision,
+            Some(crate::exec_policy::ExecDecision::Allow)
+        );
+
+        let homebrew_result = engine.check_command_policy(
+            &["/opt/homebrew/bin/git".to_string(), "status".to_string()],
+            &options,
+        );
+        assert_eq!(
+            homebrew_result.decision,
+            Some(crate::exec_policy::ExecDecision::Allow)
         );
         Ok(())
     }
