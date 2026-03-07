@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn parse_unsupported_event_returns_static_reason() {
         let (request, reason) =
-            parse_github_webhook_task_request("something-weird", br#"{}"#).unwrap();
+            parse_github_webhook_task_request("unknown_event", br#"{}"#).unwrap();
         assert!(request.is_none());
         assert_eq!(reason, "unsupported event");
     }

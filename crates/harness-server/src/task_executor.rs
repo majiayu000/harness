@@ -80,7 +80,7 @@ pub(crate) fn build_fix_ci_prompt(
          1. Inspect failing checks for PR #{pr_number} (`gh pr checks {pr_number}`)\n\
          2. Investigate CI failure details from logs and failing tests\n\
          3. Implement a minimal fix that makes CI green\n\
-         4. Run `cargo check` and `cargo test`\n\
+         4. Run the repository's standard validation commands for the affected changes (including all failing/required CI checks)\n\
          5. Commit and push to the existing PR branch\n\n\
          On the last line, print PR_URL={canonical_pr_url}"
     )
