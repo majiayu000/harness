@@ -18,6 +18,12 @@ default_model = "sonnet"
 [agents.codex]
 cli_path = "codex"
 
+[agents.codex.cloud]
+enabled = false
+cache_ttl_hours = 12
+setup_commands = []
+setup_secret_env = []
+
 [agents.anthropic_api]
 base_url = "https://api.anthropic.com"
 default_model = "claude-sonnet-4-20250514"

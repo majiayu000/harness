@@ -82,6 +82,7 @@ tokio-stream = "0.1"
 
 # HTTP client (for Anthropic API)
 reqwest = { version = "0.12", features = ["json", "stream"] }
+sha2 = "0.10"
 
 # Testing
 tempfile = "3"

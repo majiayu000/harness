@@ -493,7 +493,7 @@ pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
     );
     agent_registry.register(
         "codex",
-        Arc::new(CodexAgent::new(config.agents.codex.cli_path.clone())),
+        Arc::new(CodexAgent::from_config(config.agents.codex.clone())),
     );
 
     let executor = Arc::new(RegistryExecutor::new(Arc::new(agent_registry)));

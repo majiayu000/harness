@@ -151,12 +151,42 @@ impl Default for ClaudeAgentConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexAgentConfig {
     pub cli_path: PathBuf,
+    #[serde(default)]
+    pub cloud: CodexCloudConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexCloudConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_codex_cloud_cache_ttl_hours")]
+    pub cache_ttl_hours: u64,
+    #[serde(default)]
+    pub setup_commands: Vec<String>,
+    #[serde(default)]
+    pub setup_secret_env: Vec<String>,
+}
+
+impl Default for CodexCloudConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cache_ttl_hours: default_codex_cloud_cache_ttl_hours(),
+            setup_commands: Vec::new(),
+            setup_secret_env: Vec::new(),
+        }
+    }
+}
+
+fn default_codex_cloud_cache_ttl_hours() -> u64 {
+    12
 }
 
 impl Default for CodexAgentConfig {
     fn default() -> Self {
         Self {
             cli_path: PathBuf::from("codex"),
+            cloud: CodexCloudConfig::default(),
         }
     }
 }
@@ -442,6 +472,35 @@ mod tests {
         "#;
         let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.max_tokens, default_anthropic_api_max_tokens());
+    }
+
+    #[test]
+    fn codex_cloud_config_defaults() {
+        let config = CodexCloudConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.cache_ttl_hours, 12);
+        assert!(config.setup_commands.is_empty());
+        assert!(config.setup_secret_env.is_empty());
+    }
+
+    #[test]
+    fn codex_agent_config_deserializes_cloud_block() {
+        let toml_str = r#"
+            cli_path = "codex"
+            [cloud]
+            enabled = true
+            cache_ttl_hours = 6
+            setup_commands = ["npm ci", "cargo fetch"]
+            setup_secret_env = ["NPM_TOKEN"]
+        "#;
+        let config: CodexAgentConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.cloud.enabled);
+        assert_eq!(config.cloud.cache_ttl_hours, 6);
+        assert_eq!(
+            config.cloud.setup_commands,
+            vec!["npm ci".to_string(), "cargo fetch".to_string()]
+        );
+        assert_eq!(config.cloud.setup_secret_env, vec!["NPM_TOKEN".to_string()]);
     }
 
     #[test]
