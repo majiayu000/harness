@@ -10,6 +10,7 @@ notification_lag_log_every = 1
 
 [agents]
 default_agent = "claude"
+sandbox_mode = "workspace-write"
 
 [agents.claude]
 cli_path = "claude"

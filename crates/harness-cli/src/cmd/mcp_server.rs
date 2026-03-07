@@ -489,11 +489,15 @@ pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
         Arc::new(ClaudeCodeAgent::new(
             config.agents.claude.cli_path.clone(),
             config.agents.claude.default_model.clone(),
+            config.agents.sandbox_mode,
         )),
     );
     agent_registry.register(
         "codex",
-        Arc::new(CodexAgent::new(config.agents.codex.cli_path.clone())),
+        Arc::new(CodexAgent::new(
+            config.agents.codex.cli_path.clone(),
+            config.agents.sandbox_mode,
+        )),
     );
 
     let executor = Arc::new(RegistryExecutor::new(Arc::new(agent_registry)));

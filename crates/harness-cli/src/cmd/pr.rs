@@ -7,6 +7,7 @@ fn create_agent(config: &HarnessConfig) -> ClaudeCodeAgent {
     ClaudeCodeAgent::new(
         config.agents.claude.cli_path.clone(),
         config.agents.claude.default_model.clone(),
+        config.agents.sandbox_mode,
     )
 }
 
