@@ -1,9 +1,12 @@
-use harness_core::{Decision, Event, EventFilters, EventId, SessionId, Severity, Violation};
+use harness_core::{
+    Decision, Event, EventFilters, EventId, OtelConfig, SessionId, Severity, Violation,
+};
 use std::path::{Path, PathBuf};
 
 /// Event store backed by JSONL files (SQLite upgrade path available).
 pub struct EventStore {
     data_dir: PathBuf,
+    otel_pipeline: Option<crate::otel_export::OtelPipeline>,
 }
 
 impl EventStore {
@@ -11,15 +14,40 @@ impl EventStore {
         std::fs::create_dir_all(data_dir)?;
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
+            otel_pipeline: None,
         })
     }
 
     pub fn with_policies(
         data_dir: &Path,
+        session_renewal_secs: u64,
+        log_retention_days: u32,
+    ) -> anyhow::Result<Self> {
+        Self::with_policies_and_otel(
+            data_dir,
+            session_renewal_secs,
+            log_retention_days,
+            &OtelConfig::default(),
+        )
+    }
+
+    pub fn with_policies_and_otel(
+        data_dir: &Path,
         _session_renewal_secs: u64,
         _log_retention_days: u32,
+        otel_config: &OtelConfig,
     ) -> anyhow::Result<Self> {
-        Self::new(data_dir)
+        let mut store = Self::new(data_dir)?;
+        store.otel_pipeline = match crate::otel_export::OtelPipeline::from_config(otel_config) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                tracing::warn!(
+                    "OpenTelemetry initialization failed; continuing without export: {err}"
+                );
+                None
+            }
+        };
+        Ok(store)
     }
 
     fn events_file(&self) -> PathBuf {
@@ -34,6 +62,9 @@ impl EventStore {
             .open(self.events_file())?;
         let line = serde_json::to_string(event)?;
         writeln!(file, "{line}")?;
+        if let Some(pipeline) = &self.otel_pipeline {
+            pipeline.record_event(event);
+        }
         Ok(event.id.clone())
     }
 
