@@ -79,6 +79,7 @@ pub async fn serve(mut state: AppState) -> anyhow::Result<()> {
         }
     }
 
+    state.events.shutdown().await;
     Ok(())
 }
 
