@@ -156,6 +156,55 @@ test("run returns completed status and extracted output", async () => {
   assert.ok(emitted.length >= 3);
 });
 
+test("run validates status-event turn payload before storing snapshot", async () => {
+  let statusPollCount = 0;
+
+  const mock = createMockFetch((method) => {
+    if (method === "thread/start") {
+      return { result: { thread_id: "thread-5" } };
+    }
+    if (method === "turn/start") {
+      return { result: { turn_id: "turn-5" } };
+    }
+    if (method === "turn/status") {
+      statusPollCount += 1;
+      if (statusPollCount === 1) {
+        return {
+          result: {
+            id: "turn-5",
+            thread_id: "thread-5",
+            status: "completed",
+            items: "invalid-items",
+          },
+        };
+      }
+      return {
+        result: {
+          id: "turn-5",
+          thread_id: "thread-5",
+          status: "completed",
+          items: [{ type: "agent_reasoning", content: "final answer" }],
+        },
+      };
+    }
+    return { result: {} };
+  });
+
+  const harness = new Harness({
+    fetch: mock.fetch,
+    defaultPollIntervalMs: 1,
+    defaultRunTimeoutMs: 500,
+  });
+
+  const thread = await harness.startThread();
+  const result = await thread.run("Summarize");
+
+  assert.equal(result.turnId, "turn-5");
+  assert.equal(result.status, "completed");
+  assert.equal(result.output, "final answer");
+  assert.equal(statusPollCount, 2);
+});
+
 test("run handles timeout when turn never reaches terminal status", async () => {
   const mock = createMockFetch((method) => {
     if (method === "thread/start") {
