@@ -145,4 +145,47 @@ mod tests {
             .await;
         assert_eq!(result.decision, Decision::Pass);
     }
+
+    #[tokio::test]
+    async fn blocks_whitespace_only_prompt() {
+        let v = ContractValidator::new();
+        let result = v.pre_execute(&make_req("          ")).await;
+        assert_eq!(result.decision, Decision::Block);
+    }
+
+    #[tokio::test]
+    async fn action_verb_with_punctuation_still_detected() {
+        let v = ContractValidator::new();
+        // "fix," should still match "fix"
+        let result = v
+            .pre_execute(&make_req("fix, the broken test. Ensure it passes."))
+            .await;
+        assert_eq!(result.decision, Decision::Pass);
+    }
+
+    #[tokio::test]
+    async fn all_acceptance_criteria_keywords_accepted() {
+        let v = ContractValidator::new();
+        for keyword in &["should", "must", "expect", "verify", "ensure", "assert", "confirm"] {
+            let prompt = format!("Add input validation. Users {keyword} see error messages.");
+            let result = v.pre_execute(&make_req(&prompt)).await;
+            assert_eq!(
+                result.decision,
+                Decision::Pass,
+                "keyword `{keyword}` should be accepted as acceptance criteria"
+            );
+        }
+    }
+
+    #[test]
+    fn has_action_verb_is_case_insensitive() {
+        assert!(ContractValidator::has_action_verb("FIX the bug"));
+        assert!(ContractValidator::has_action_verb("REVIEW this PR"));
+    }
+
+    #[test]
+    fn interceptor_name_is_contract_validator() {
+        let v = ContractValidator::new();
+        assert_eq!(v.name(), "contract_validator");
+    }
 }
