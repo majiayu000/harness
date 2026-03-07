@@ -17,12 +17,13 @@ export class Harness {
 
   async startThread(options: StartThreadOptions = {}): Promise<HarnessThread> {
     const cwd = options.cwd ?? this.defaultCwd;
-    const params: Record<string, unknown> = {};
-    if (typeof cwd !== "undefined") {
-      params.cwd = cwd;
+    if (typeof cwd !== "string" || cwd.length === 0) {
+      throw new Error("`cwd` is required for thread/start; pass Harness({ cwd }) or startThread({ cwd }).");
     }
 
-    const result = await this.transport.request<{ thread_id: string }>("thread/start", params);
+    const result = await this.transport.request<{ thread_id: string }>("thread/start", {
+      cwd,
+    });
     return new HarnessThread(this, result.thread_id);
   }
 

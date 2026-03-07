@@ -20,7 +20,7 @@ Harness now includes first-party SDK scaffolds for programmatic JSON-RPC usage.
 ```ts
 import { Harness } from "harness-sdk";
 
-const harness = new Harness({ baseUrl: "http://127.0.0.1:9800" });
+const harness = new Harness({ baseUrl: "http://127.0.0.1:9800", cwd: "/repo" });
 const thread = await harness.startThread();
 const result = await thread.run("Analyze this repository");
 ```
@@ -30,10 +30,12 @@ const result = await thread.run("Analyze this repository");
 ```python
 from harness_sdk import Harness
 
-harness = Harness(base_url="http://127.0.0.1:9800")
+harness = Harness(base_url="http://127.0.0.1:9800", cwd="/repo")
 thread = harness.start_thread()
 result = thread.run("Analyze this repository")
 ```
+
+Python SDK polling is synchronous/blocking; use it from non-async contexts or run it in a worker thread.
 
 The SDK event names are intentionally prefixed (`sdk:*`) to distinguish synthesized polling events from raw server-side notification method names.
 

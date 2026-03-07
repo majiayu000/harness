@@ -105,6 +105,11 @@ export interface ErrorItem {
   message: string;
 }
 
+export interface UnknownTurnItem {
+  type: string;
+  [key: string]: unknown;
+}
+
 export type TurnItem =
   | UserMessageItem
   | AgentReasoningItem
@@ -113,7 +118,8 @@ export type TurnItem =
   | FileReadItem
   | ToolCallItem
   | ApprovalRequestItem
-  | ErrorItem;
+  | ErrorItem
+  | UnknownTurnItem;
 
 export type TurnStatus = "running" | "completed" | "cancelled" | "failed";
 
@@ -126,7 +132,6 @@ export interface TurnSnapshot {
   started_at?: string | null;
   token_usage?: TokenUsage;
   completed_at?: string | null;
-  [key: string]: unknown;
 }
 
 export type SdkThreadEventMethod =
