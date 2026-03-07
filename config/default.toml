@@ -5,6 +5,7 @@ transport = "stdio"
 http_addr = "127.0.0.1:9800"
 data_dir = "~/.local/share/harness"
 project_root = "."
+# github_webhook_secret = "your-secret-here"
 notification_broadcast_capacity = 256
 notification_lag_log_every = 1
 
