@@ -38,7 +38,7 @@ impl CodeAgent for CodexAgent {
             OsString::from("exec"),
             OsString::from("--skip-git-repo-check"),
             OsString::from("-a"),
-            OsString::from(codex_sandbox_mode(self.sandbox_mode)),
+            OsString::from(self.sandbox_mode.to_string()),
             OsString::from("-C"),
             req.project_root.as_os_str().to_os_string(),
             OsString::from(req.prompt.clone()),
@@ -53,7 +53,8 @@ impl CodeAgent for CodexAgent {
             })?;
 
         let mut cmd = Command::new(&wrapped_command.program);
-        cmd.args(&wrapped_command.args);
+        cmd.args(&wrapped_command.args)
+            .current_dir(&req.project_root);
 
         let output = cmd.output().await.map_err(|e| {
             harness_core::HarnessError::AgentExecution(format!("failed to run codex: {e}"))
@@ -98,14 +99,6 @@ impl CodeAgent for CodexAgent {
         .await?;
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
-    }
-}
-
-fn codex_sandbox_mode(mode: SandboxMode) -> &'static str {
-    match mode {
-        SandboxMode::ReadOnly => "read-only",
-        SandboxMode::WorkspaceWrite => "workspace-write",
-        SandboxMode::DangerFullAccess => "danger-full-access",
     }
 }
 
