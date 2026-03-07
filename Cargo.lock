@@ -735,6 +735,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "harness-core",
+ "harness-sandbox",
  "reqwest",
  "serde",
  "serde_json",
@@ -859,6 +860,14 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "harness-sandbox"
+version = "0.1.0"
+dependencies = [
+ "harness-core",
+ "thiserror",
 ]
 
 [[package]]

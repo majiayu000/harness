@@ -5,6 +5,7 @@ members = [
     "crates/harness-protocol",
     "crates/harness-server",
     "crates/harness-agents",
+    "crates/harness-sandbox",
     "crates/harness-gc",
     "crates/harness-rules",
     "crates/harness-skills",
@@ -25,6 +26,7 @@ harness-core = { path = "crates/harness-core" }
 harness-protocol = { path = "crates/harness-protocol" }
 harness-server = { path = "crates/harness-server" }
 harness-agents = { path = "crates/harness-agents" }
+harness-sandbox = { path = "crates/harness-sandbox" }
 harness-gc = { path = "crates/harness-gc" }
 harness-rules = { path = "crates/harness-rules" }
 harness-skills = { path = "crates/harness-skills" }

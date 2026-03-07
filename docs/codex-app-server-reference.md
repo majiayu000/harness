@@ -239,7 +239,7 @@ Three modes: `apikey` (OpenAI API key), `chatgpt` (OAuth), `chatgptAuthTokens` (
 | Agent | Built-in gpt-5.3-codex | Pluggable: Claude Code, Codex CLI, Anthropic API |
 | Thread | Full persistence + resume + fork | In-memory (planned: SQLite) |
 | Protocol | Complete JSON-RPC 2.0 | Partial implementation |
-| Sandbox | Seatbelt/Landlock native | None (delegates to agent) |
+| Sandbox | Seatbelt/Landlock native | Seatbelt (macOS), Landlock/bwrap strategy (Linux) for CLI agent subprocesses |
 | Value | Single-agent deep integration | Multi-agent orchestration + rules + GC |
 
 ## Sources

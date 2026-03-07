@@ -239,12 +239,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 Arc::new(harness_agents::claude::ClaudeCodeAgent::new(
                     serve_config.agents.claude.cli_path.clone(),
                     serve_config.agents.claude.default_model.clone(),
+                    serve_config.agents.sandbox_mode,
                 )),
             );
             agent_registry.register(
                 "codex",
                 Arc::new(harness_agents::codex::CodexAgent::new(
                     serve_config.agents.codex.cli_path.clone(),
+                    serve_config.agents.sandbox_mode,
                 )),
             );
             let server = harness_server::server::HarnessServer::new(
@@ -280,6 +282,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let agent = harness_agents::claude::ClaudeCodeAgent::new(
                 config.agents.claude.cli_path.clone(),
                 config.agents.claude.default_model.clone(),
+                config.agents.sandbox_mode,
             );
 
             let req = harness_core::AgentRequest {

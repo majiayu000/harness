@@ -1,18 +1,25 @@
 use crate::streaming::send_stream_item;
 use async_trait::async_trait;
+use harness_core::SandboxMode;
 use harness_core::{
     AgentRequest, AgentResponse, Capability, CodeAgent, Item, StreamItem, TokenUsage,
 };
+use harness_sandbox::{wrap_command, SandboxSpec};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use tokio::process::Command;
 
 pub struct CodexAgent {
     pub cli_path: PathBuf,
+    pub sandbox_mode: SandboxMode,
 }
 
 impl CodexAgent {
-    pub fn new(cli_path: PathBuf) -> Self {
-        Self { cli_path }
+    pub fn new(cli_path: PathBuf, sandbox_mode: SandboxMode) -> Self {
+        Self {
+            cli_path,
+            sandbox_mode,
+        }
     }
 }
 
@@ -27,14 +34,26 @@ impl CodeAgent for CodexAgent {
     }
 
     async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
-        let mut cmd = Command::new(&self.cli_path);
-        cmd.arg("exec")
-            .arg("--skip-git-repo-check")
-            .arg("-a")
-            .arg("read-only")
-            .arg("-C")
-            .arg(&req.project_root)
-            .arg(&req.prompt);
+        let base_args = vec![
+            OsString::from("exec"),
+            OsString::from("--skip-git-repo-check"),
+            OsString::from("-a"),
+            OsString::from(codex_sandbox_mode(self.sandbox_mode)),
+            OsString::from("-C"),
+            req.project_root.as_os_str().to_os_string(),
+            OsString::from(req.prompt.clone()),
+        ];
+
+        let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
+        let wrapped_command =
+            wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
+                harness_core::HarnessError::AgentExecution(format!(
+                    "sandbox setup failed for codex: {error}"
+                ))
+            })?;
+
+        let mut cmd = Command::new(&wrapped_command.program);
+        cmd.args(&wrapped_command.args);
 
         let output = cmd.output().await.map_err(|e| {
             harness_core::HarnessError::AgentExecution(format!("failed to run codex: {e}"))
@@ -82,13 +101,24 @@ impl CodeAgent for CodexAgent {
     }
 }
 
+fn codex_sandbox_mode(mode: SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::ReadOnly => "read-only",
+        SandboxMode::WorkspaceWrite => "workspace-write",
+        SandboxMode::DangerFullAccess => "danger-full-access",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
     async fn execute_stream_returns_error_when_channel_closed() {
-        let agent = CodexAgent::new(PathBuf::from("/usr/bin/true"));
+        let agent = CodexAgent::new(
+            PathBuf::from("/usr/bin/true"),
+            SandboxMode::DangerFullAccess,
+        );
         let request = AgentRequest::default();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
