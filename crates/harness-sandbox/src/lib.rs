@@ -1,5 +1,8 @@
 use harness_core::SandboxMode;
 use std::ffi::OsString;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -44,6 +47,13 @@ pub enum SandboxError {
     },
     #[error("sandbox tool not found: {0}")]
     MissingTool(&'static str),
+    #[error("invalid sandbox path `{path}`: {reason}")]
+    InvalidPath { path: PathBuf, reason: &'static str },
+    #[error("sandbox helper `{helper}` does not support mode `{mode}`")]
+    InvalidHelperMode {
+        helper: &'static str,
+        mode: SandboxMode,
+    },
 }
 
 pub fn wrap_command(
@@ -86,7 +96,7 @@ fn wrap_macos_command(
 ) -> Result<WrappedCommand, SandboxError> {
     let sandbox_exec =
         find_tool("sandbox-exec").ok_or(SandboxError::MissingTool("sandbox-exec"))?;
-    let policy = seatbelt_policy(spec.mode, &spec.project_root);
+    let policy = seatbelt_policy(spec)?;
 
     let mut wrapped_args = vec![OsString::from("-p"), OsString::from(policy)];
     wrapped_args.push(program.as_os_str().to_os_string());
@@ -108,7 +118,7 @@ fn wrap_linux_command(
     if let Some(landlock_runner) = find_tool("harness-landlock") {
         return Ok(WrappedCommand {
             program: landlock_runner,
-            args: linux_landlock_args(program, args, spec),
+            args: linux_landlock_args(program, args, spec)?,
             engine: SandboxEngine::Landlock,
         });
     }
@@ -116,13 +126,15 @@ fn wrap_linux_command(
     let bwrap = find_tool("bwrap").ok_or(SandboxError::MissingTool("harness-landlock or bwrap"))?;
     Ok(WrappedCommand {
         program: bwrap,
-        args: linux_bwrap_args(program, args, spec),
+        args: linux_bwrap_args(program, args, spec)?,
         engine: SandboxEngine::Bubblewrap,
     })
 }
 
-#[allow(dead_code)]
-fn seatbelt_policy(mode: SandboxMode, project_root: &Path) -> String {
+#[cfg(any(target_os = "macos", test))]
+fn seatbelt_policy(spec: &SandboxSpec) -> Result<String, SandboxError> {
+    let workspace_path = seatbelt_escape_path(&spec.project_root)?;
+
     let mut lines = vec![
         "(version 1)".to_string(),
         "(deny default)".to_string(),
@@ -134,41 +146,49 @@ fn seatbelt_policy(mode: SandboxMode, project_root: &Path) -> String {
             .to_string(),
     ];
 
-    match mode {
+    match spec.mode {
         SandboxMode::ReadOnly => {}
         SandboxMode::WorkspaceWrite => {
             lines.push(format!(
                 "(allow file-write* (subpath \"{}\"))",
-                seatbelt_escape_path(project_root)
+                workspace_path
             ));
-            for protected_path in protected_paths(project_root) {
+            for protected_path in protected_paths(&spec.project_root) {
                 lines.push(format!(
                     "(deny file-write* (subpath \"{}\"))",
-                    seatbelt_escape_path(&protected_path)
+                    seatbelt_escape_path(&protected_path)?
                 ));
             }
         }
-        SandboxMode::DangerFullAccess => {}
+        SandboxMode::DangerFullAccess => {
+            return Err(invalid_helper_mode("seatbelt_policy", spec.mode));
+        }
     }
 
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
-#[allow(dead_code)]
-fn linux_landlock_args(program: &Path, args: &[OsString], spec: &SandboxSpec) -> Vec<OsString> {
+#[cfg(any(target_os = "linux", test))]
+fn linux_landlock_args(
+    program: &Path,
+    args: &[OsString],
+    spec: &SandboxSpec,
+) -> Result<Vec<OsString>, SandboxError> {
+    let network_mode = match spec.mode {
+        SandboxMode::ReadOnly | SandboxMode::WorkspaceWrite => "deny",
+        SandboxMode::DangerFullAccess => {
+            return Err(invalid_helper_mode("linux_landlock_args", spec.mode));
+        }
+    };
+
     let mut wrapped_args = vec![
         OsString::from("--mode"),
-        OsString::from(sandbox_mode_cli(spec.mode)),
+        OsString::from(spec.mode.to_string()),
         OsString::from("--workspace"),
         spec.project_root.as_os_str().to_os_string(),
         OsString::from("--network"),
+        OsString::from(network_mode),
     ];
-
-    if spec.mode == SandboxMode::WorkspaceWrite {
-        wrapped_args.push(OsString::from("deny"));
-    } else {
-        wrapped_args.push(OsString::from("allow"));
-    }
 
     for protected_path in protected_paths(&spec.project_root) {
         wrapped_args.push(OsString::from("--readonly-path"));
@@ -178,11 +198,15 @@ fn linux_landlock_args(program: &Path, args: &[OsString], spec: &SandboxSpec) ->
     wrapped_args.push(OsString::from("--"));
     wrapped_args.push(program.as_os_str().to_os_string());
     wrapped_args.extend(args.iter().cloned());
-    wrapped_args
+    Ok(wrapped_args)
 }
 
-#[allow(dead_code)]
-fn linux_bwrap_args(program: &Path, args: &[OsString], spec: &SandboxSpec) -> Vec<OsString> {
+#[cfg(any(target_os = "linux", test))]
+fn linux_bwrap_args(
+    program: &Path,
+    args: &[OsString],
+    spec: &SandboxSpec,
+) -> Result<Vec<OsString>, SandboxError> {
     let mut wrapped_args = vec![
         OsString::from("--die-with-parent"),
         OsString::from("--new-session"),
@@ -214,17 +238,19 @@ fn linux_bwrap_args(program: &Path, args: &[OsString], spec: &SandboxSpec) -> Ve
                     wrapped_args.push(protected_path.as_os_str().to_os_string());
                 }
             }
-            wrapped_args.push(OsString::from("--unshare-net"));
         }
-        SandboxMode::DangerFullAccess => {}
+        SandboxMode::DangerFullAccess => {
+            return Err(invalid_helper_mode("linux_bwrap_args", spec.mode));
+        }
     }
 
+    wrapped_args.push(OsString::from("--unshare-net"));
     wrapped_args.push(OsString::from("--chdir"));
     wrapped_args.push(spec.project_root.as_os_str().to_os_string());
     wrapped_args.push(OsString::from("--"));
     wrapped_args.push(program.as_os_str().to_os_string());
     wrapped_args.extend(args.iter().cloned());
-    wrapped_args
+    Ok(wrapped_args)
 }
 
 fn protected_paths(project_root: &Path) -> Vec<PathBuf> {
@@ -234,43 +260,91 @@ fn protected_paths(project_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn seatbelt_escape_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('\"', "\\\"")
+#[cfg(any(target_os = "macos", test))]
+fn seatbelt_escape_path(path: &Path) -> Result<String, SandboxError> {
+    let path_string = path.to_string_lossy();
+
+    if path_string.chars().any(|ch| ch == '\n' || ch == '\r') {
+        return Err(SandboxError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "newlines are not allowed",
+        });
+    }
+
+    if path_string.chars().any(|ch| matches!(ch, '(' | ')' | ';')) {
+        return Err(SandboxError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "contains seatbelt control characters",
+        });
+    }
+
+    if path_string.chars().any(|ch| ch.is_control()) {
+        return Err(SandboxError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "contains control characters",
+        });
+    }
+
+    Ok(path_string.replace('\\', "\\\\").replace('\"', "\\\""))
 }
 
 fn find_tool(name: &str) -> Option<PathBuf> {
     let candidate = Path::new(name);
-    if candidate.is_absolute() && candidate.exists() {
+    if candidate.is_absolute() && is_executable(candidate) {
         return Some(candidate.to_path_buf());
     }
 
     let path_var = std::env::var_os("PATH")?;
     std::env::split_paths(&path_var)
         .map(|directory| directory.join(name))
-        .find(|path| path.is_file())
+        .find(|path| is_executable(path))
 }
 
-fn sandbox_mode_cli(mode: SandboxMode) -> &'static str {
-    match mode {
-        SandboxMode::ReadOnly => "read-only",
-        SandboxMode::WorkspaceWrite => "workspace-write",
-        SandboxMode::DangerFullAccess => "danger-full-access",
+fn is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
     }
+
+    #[cfg(unix)]
+    {
+        fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn invalid_helper_mode(helper: &'static str, mode: SandboxMode) -> SandboxError {
+    SandboxError::InvalidHelperMode { helper, mode }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn workspace_write_seatbelt_policy_protects_git_and_harness() {
-        let project_root = PathBuf::from("/tmp/project");
-        let policy = seatbelt_policy(SandboxMode::WorkspaceWrite, &project_root);
+        let spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, "/tmp/project");
+        let policy = seatbelt_policy(&spec).unwrap();
         assert!(policy.contains("(allow file-write* (subpath \"/tmp/project\"))"));
         assert!(policy.contains("(deny file-write* (subpath \"/tmp/project/.git\"))"));
         assert!(policy.contains("(deny file-write* (subpath \"/tmp/project/.harness\"))"));
+    }
+
+    #[test]
+    fn seatbelt_policy_rejects_injection_characters() {
+        let spec = SandboxSpec::new(
+            SandboxMode::WorkspaceWrite,
+            "/tmp/project;(allow file-write* (subpath \"/\"))",
+        );
+        let error = seatbelt_policy(&spec).expect_err("policy path should be rejected");
+        assert!(matches!(error, SandboxError::InvalidPath { .. }));
     }
 
     #[test]
@@ -278,7 +352,7 @@ mod tests {
         let project_root = PathBuf::from("/tmp/project");
         let spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, &project_root);
         let command_args = vec![OsString::from("--flag"), OsString::from("value")];
-        let args = linux_bwrap_args(Path::new("/usr/bin/claude"), &command_args, &spec);
+        let args = linux_bwrap_args(Path::new("/usr/bin/claude"), &command_args, &spec).unwrap();
         assert!(args.contains(&OsString::from("--unshare-net")));
         assert!(args.ends_with(&[
             OsString::from("--"),
@@ -289,16 +363,94 @@ mod tests {
     }
 
     #[test]
+    fn read_only_bwrap_args_disable_network() {
+        let spec = SandboxSpec::new(SandboxMode::ReadOnly, "/tmp/project");
+        let args = linux_bwrap_args(Path::new("/usr/bin/claude"), &[], &spec).unwrap();
+        assert!(args.contains(&OsString::from("--unshare-net")));
+        assert!(args.ends_with(&[OsString::from("--"), OsString::from("/usr/bin/claude"),]));
+    }
+
+    #[test]
     fn landlock_args_include_mode_network_and_protected_paths() {
         let project_root = PathBuf::from("/tmp/project");
         let spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, &project_root);
-        let args = linux_landlock_args(Path::new("/usr/bin/codex"), &[], &spec);
+        let args = linux_landlock_args(Path::new("/usr/bin/codex"), &[], &spec).unwrap();
         assert!(args.contains(&OsString::from("--mode")));
         assert!(args.contains(&OsString::from("workspace-write")));
         assert!(args.contains(&OsString::from("--network")));
         assert!(args.contains(&OsString::from("deny")));
         assert!(args.contains(&OsString::from("/tmp/project/.git")));
         assert!(args.contains(&OsString::from("/tmp/project/.harness")));
+    }
+
+    #[test]
+    fn landlock_read_only_denies_network() {
+        let spec = SandboxSpec::new(SandboxMode::ReadOnly, "/tmp/project");
+        let args = linux_landlock_args(Path::new("/usr/bin/codex"), &[], &spec).unwrap();
+        assert!(args.contains(&OsString::from("read-only")));
+        assert!(args.contains(&OsString::from("deny")));
+    }
+
+    #[test]
+    fn helper_builders_reject_danger_mode() {
+        let spec = SandboxSpec::new(SandboxMode::DangerFullAccess, "/tmp/project");
+        let seatbelt_error = seatbelt_policy(&spec).expect_err("danger mode should be rejected");
+        assert!(matches!(
+            seatbelt_error,
+            SandboxError::InvalidHelperMode {
+                helper: "seatbelt_policy",
+                ..
+            }
+        ));
+
+        let bwrap_error =
+            linux_bwrap_args(Path::new("/usr/bin/claude"), &[], &spec).expect_err("must fail");
+        assert!(matches!(
+            bwrap_error,
+            SandboxError::InvalidHelperMode {
+                helper: "linux_bwrap_args",
+                ..
+            }
+        ));
+
+        let landlock_error =
+            linux_landlock_args(Path::new("/usr/bin/codex"), &[], &spec).expect_err("must fail");
+        assert!(matches!(
+            landlock_error,
+            SandboxError::InvalidHelperMode {
+                helper: "linux_landlock_args",
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_tool_requires_executable_permissions() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let tool_path = std::env::temp_dir().join(format!(
+            "harness-sandbox-tool-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::write(&tool_path, "#!/bin/sh\nexit 0\n").expect("should write tool");
+
+        let mut permissions = fs::metadata(&tool_path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&tool_path, permissions).unwrap();
+        assert_eq!(find_tool(tool_path.to_str().expect("utf-8 path")), None);
+
+        let mut permissions = fs::metadata(&tool_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tool_path, permissions).unwrap();
+        assert_eq!(
+            find_tool(tool_path.to_str().expect("utf-8 path")),
+            Some(tool_path.clone())
+        );
+
+        fs::remove_file(tool_path).expect("should remove temp tool");
     }
 
     #[test]
