@@ -43,7 +43,7 @@ impl CodexAgent {
         let mut args = vec![
             OsString::from("exec"),
             OsString::from("--skip-git-repo-check"),
-            OsString::from("--sandbox"),
+            OsString::from("-s"),
             OsString::from(self.sandbox_mode()),
         ];
 
@@ -132,14 +132,10 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    const SETUP_ENV_ALLOWLIST: [&str; 10] = [
-        "PATH", "HOME", "USER", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE",
-    ];
-
     fn find_existing_secret_env() -> Option<(String, String)> {
         std::env::vars().find(|(key, value)| {
             !value.is_empty()
-                && !SETUP_ENV_ALLOWLIST
+                && !cloud_setup::SETUP_ENV_ALLOWLIST
                     .iter()
                     .any(|allowlisted| allowlisted == &key.as_str())
         })
@@ -179,9 +175,7 @@ mod tests {
             .map(|value| value.to_string_lossy().to_string())
             .collect();
 
-        assert!(args
-            .windows(2)
-            .any(|window| window == ["--sandbox", "read-only"]));
+        assert!(args.windows(2).any(|window| window == ["-s", "read-only"]));
         assert!(!args.iter().any(|arg| arg == "--ephemeral"));
     }
 
@@ -208,7 +202,7 @@ mod tests {
 
         assert!(args
             .windows(2)
-            .any(|window| window == ["--sandbox", "workspace-write"]));
+            .any(|window| window == ["-s", "workspace-write"]));
         assert!(args.iter().any(|arg| arg == "--ephemeral"));
     }
 

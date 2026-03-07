@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 const SETUP_OUTPUT_MAX_BYTES: usize = 512;
-const SETUP_ENV_ALLOWLIST: [&str; 10] = [
+pub(crate) const SETUP_ENV_ALLOWLIST: [&str; 10] = [
     "PATH", "HOME", "USER", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE",
 ];
 
@@ -20,7 +20,6 @@ pub(crate) fn setup_cache_key(cloud: &CodexCloudConfig, project_root: &Path) -> 
         "project_root": project_root.to_string_lossy(),
         "setup_commands": cloud.setup_commands,
         "setup_secret_env": cloud.setup_secret_env,
-        "cache_ttl_hours": cloud.cache_ttl_hours,
     })
     .to_string();
 
@@ -255,6 +254,28 @@ mod tests {
         };
 
         assert_ne!(
+            setup_cache_key(&first, project_root),
+            setup_cache_key(&second, project_root)
+        );
+    }
+
+    #[test]
+    fn setup_cache_key_ignores_ttl_hours() {
+        let project_root = Path::new("/tmp/project");
+        let first = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 1,
+            setup_commands: vec!["npm ci".to_string()],
+            setup_secret_env: vec!["NPM_TOKEN".to_string()],
+        };
+        let second = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 24,
+            setup_commands: vec!["npm ci".to_string()],
+            setup_secret_env: vec!["NPM_TOKEN".to_string()],
+        };
+
+        assert_eq!(
             setup_cache_key(&first, project_root),
             setup_cache_key(&second, project_root)
         );
