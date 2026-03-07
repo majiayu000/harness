@@ -8,7 +8,6 @@ use opentelemetry_sdk::logs::LoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::Resource;
 use std::collections::{HashSet, VecDeque};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -66,13 +65,13 @@ pub struct OtelPipeline {
 }
 
 impl OtelPipeline {
-    pub fn from_config(config: &OtelConfig) -> anyhow::Result<Option<Self>> {
+    pub async fn from_config(config: &OtelConfig) -> anyhow::Result<Option<Self>> {
         if config.exporter == OtelExporter::Disabled {
             return Ok(None);
         }
 
         let endpoint = resolve_endpoint(config.exporter, config.endpoint.as_deref());
-        ensure_endpoint_reachable(config.exporter, endpoint.as_str())?;
+        ensure_endpoint_reachable(config.exporter, endpoint.as_str()).await?;
 
         let resource = Resource::new(vec![
             KeyValue::new("service.name", SERVICE_NAME),
@@ -201,31 +200,41 @@ impl OtelPipeline {
         }
         self.logger.emit(record);
     }
-}
 
-impl Drop for OtelPipeline {
-    fn drop(&mut self) {
-        for result in self.tracer_provider.force_flush() {
-            if let Err(err) = result {
-                report_pipeline_error("failed to force flush tracer provider", err);
+    pub async fn shutdown(self) {
+        let Self {
+            tracer_provider,
+            logger_provider,
+            meter_provider,
+            ..
+        } = self;
+        let shutdown_result = tokio::task::spawn_blocking(move || {
+            for result in tracer_provider.force_flush() {
+                if let Err(err) = result {
+                    report_pipeline_error("failed to force flush tracer provider", err);
+                }
             }
-        }
-        if let Err(err) = self.tracer_provider.shutdown() {
-            report_pipeline_error("failed to shut down tracer provider", err);
-        }
-        if let Err(err) = self.meter_provider.force_flush() {
-            report_pipeline_error("failed to force flush meter provider", err);
-        }
-        if let Err(err) = self.meter_provider.shutdown() {
-            report_pipeline_error("failed to shut down meter provider", err);
-        }
-        for result in self.logger_provider.force_flush() {
-            if let Err(err) = result {
-                report_pipeline_error("failed to force flush logger provider", err);
+            if let Err(err) = tracer_provider.shutdown() {
+                report_pipeline_error("failed to shut down tracer provider", err);
             }
-        }
-        if let Err(err) = self.logger_provider.shutdown() {
-            report_pipeline_error("failed to shut down logger provider", err);
+            if let Err(err) = meter_provider.force_flush() {
+                report_pipeline_error("failed to force flush meter provider", err);
+            }
+            if let Err(err) = meter_provider.shutdown() {
+                report_pipeline_error("failed to shut down meter provider", err);
+            }
+            for result in logger_provider.force_flush() {
+                if let Err(err) = result {
+                    report_pipeline_error("failed to force flush logger provider", err);
+                }
+            }
+            if let Err(err) = logger_provider.shutdown() {
+                report_pipeline_error("failed to shut down logger provider", err);
+            }
+        })
+        .await;
+        if let Err(err) = shutdown_result {
+            tracing::warn!("failed to join OpenTelemetry shutdown task: {err}");
         }
     }
 }
@@ -331,19 +340,29 @@ fn resolve_endpoint(exporter: OtelExporter, config_endpoint: Option<&str>) -> St
     }
 }
 
-fn ensure_endpoint_reachable(exporter: OtelExporter, endpoint: &str) -> anyhow::Result<()> {
+async fn ensure_endpoint_reachable(exporter: OtelExporter, endpoint: &str) -> anyhow::Result<()> {
     let (host, port) = endpoint_host_and_port(exporter, endpoint)?;
     let mut attempted = false;
     let mut connection_errors: Vec<String> = Vec::new();
 
-    for addr in (host.as_str(), port).to_socket_addrs()? {
+    let lookup_target = format!("{host}:{port}");
+    let addrs = tokio::net::lookup_host(lookup_target)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to resolve OTLP endpoint `{endpoint}`: {err}"))?;
+    for addr in addrs {
         attempted = true;
-        match TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
-            Ok(stream) => {
+        match tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
                 drop(stream);
                 return Ok(());
             }
-            Err(err) => connection_errors.push(format!("{addr}: {err}")),
+            Ok(Err(err)) => connection_errors.push(format!("{addr}: {err}")),
+            Err(_) => connection_errors.push(format!("{addr}: connection timed out")),
         }
     }
 
@@ -494,24 +513,24 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn from_config_returns_none_when_disabled() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn from_config_returns_none_when_disabled() -> anyhow::Result<()> {
         let config = OtelConfig {
             exporter: OtelExporter::Disabled,
             ..OtelConfig::default()
         };
-        assert!(OtelPipeline::from_config(&config)?.is_none());
+        assert!(OtelPipeline::from_config(&config).await?.is_none());
         Ok(())
     }
 
-    #[test]
-    fn from_config_reports_error_when_endpoint_unreachable() {
+    #[tokio::test]
+    async fn from_config_reports_error_when_endpoint_unreachable() {
         let config = OtelConfig {
             exporter: OtelExporter::OtlpHttp,
             endpoint: Some("http://127.0.0.1:1".to_string()),
             ..OtelConfig::default()
         };
-        let result = OtelPipeline::from_config(&config);
+        let result = OtelPipeline::from_config(&config).await;
         assert!(result.is_err());
     }
 }

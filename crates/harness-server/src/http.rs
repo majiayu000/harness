@@ -116,7 +116,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         server.config.observe.session_renewal_secs,
         server.config.observe.log_retention_days,
         &server.config.otel,
-    )?);
+    )
+    .await?);
 
     let signal_detector = harness_gc::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
@@ -256,10 +257,12 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .route("/tasks", post(create_task))
         .route("/tasks", get(list_tasks))
         .route("/tasks/{id}", get(get_task))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    let serve_result = axum::serve(listener, app).await;
+    state.events.shutdown().await;
+    serve_result?;
     Ok(())
 }
 

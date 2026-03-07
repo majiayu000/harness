@@ -2,11 +2,12 @@ use harness_core::{
     Decision, Event, EventFilters, EventId, OtelConfig, SessionId, Severity, Violation,
 };
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Event store backed by JSONL files (SQLite upgrade path available).
 pub struct EventStore {
     data_dir: PathBuf,
-    otel_pipeline: Option<crate::otel_export::OtelPipeline>,
+    otel_pipeline: Mutex<Option<crate::otel_export::OtelPipeline>>,
 }
 
 impl EventStore {
@@ -14,23 +15,23 @@ impl EventStore {
         std::fs::create_dir_all(data_dir)?;
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
-            otel_pipeline: None,
+            otel_pipeline: Mutex::new(None),
         })
     }
 
-    pub fn with_policies_and_otel(
+    pub async fn with_policies_and_otel(
         data_dir: &Path,
         session_renewal_secs: u64,
         log_retention_days: u32,
         otel_config: &OtelConfig,
     ) -> anyhow::Result<Self> {
-        let mut store = Self::new(data_dir)?;
+        let store = Self::new(data_dir)?;
         tracing::debug!(
             session_renewal_secs,
             log_retention_days,
             "event store policy values accepted"
         );
-        store.otel_pipeline = match crate::otel_export::OtelPipeline::from_config(otel_config) {
+        let pipeline = match crate::otel_export::OtelPipeline::from_config(otel_config).await {
             Ok(pipeline) => pipeline,
             Err(err) => {
                 tracing::warn!(
@@ -39,6 +40,13 @@ impl EventStore {
                 None
             }
         };
+        match store.otel_pipeline.lock() {
+            Ok(mut slot) => *slot = pipeline,
+            Err(poisoned) => {
+                tracing::error!("OpenTelemetry pipeline mutex poisoned during init; recovering");
+                *poisoned.into_inner() = pipeline;
+            }
+        }
         Ok(store)
     }
 
@@ -54,8 +62,19 @@ impl EventStore {
             .open(self.events_file())?;
         let line = serde_json::to_string(event)?;
         writeln!(file, "{line}")?;
-        if let Some(pipeline) = &self.otel_pipeline {
-            pipeline.record_event(event);
+        match self.otel_pipeline.lock() {
+            Ok(slot) => {
+                if let Some(pipeline) = slot.as_ref() {
+                    pipeline.record_event(event);
+                }
+            }
+            Err(poisoned) => {
+                tracing::error!("OpenTelemetry pipeline mutex poisoned during log; recovering");
+                let slot = poisoned.into_inner();
+                if let Some(pipeline) = slot.as_ref() {
+                    pipeline.record_event(event);
+                }
+            }
         }
         Ok(event.id.clone())
     }
@@ -85,6 +104,19 @@ impl EventStore {
         }
 
         Ok(events)
+    }
+
+    pub async fn shutdown(&self) {
+        let pipeline = match self.otel_pipeline.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => {
+                tracing::error!("OpenTelemetry pipeline mutex poisoned during shutdown; recovering");
+                poisoned.into_inner().take()
+            }
+        };
+        if let Some(pipeline) = pipeline {
+            pipeline.shutdown().await;
+        }
     }
 
     /// Persist a full rule scan into the event store.
@@ -391,16 +423,20 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn log_with_unreachable_otel_endpoint_still_persists_event() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn log_with_unreachable_otel_endpoint_still_persists_event() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let config = OtelConfig {
             exporter: OtelExporter::OtlpHttp,
             endpoint: Some("http://127.0.0.1:1".to_string()),
             ..OtelConfig::default()
         };
-        let store = EventStore::with_policies_and_otel(dir.path(), 1800, 90, &config)?;
-        assert!(store.otel_pipeline.is_none());
+        let store = EventStore::with_policies_and_otel(dir.path(), 1800, 90, &config).await?;
+        assert!(store
+            .otel_pipeline
+            .lock()
+            .expect("otel pipeline mutex should not be poisoned")
+            .is_none());
         let event = Event::new(
             SessionId::new(),
             "api_request",

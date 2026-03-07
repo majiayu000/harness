@@ -697,9 +697,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         config.observe.session_renewal_secs,
                         config.observe.log_retention_days,
                         &config.otel,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(store) => {
                             store.persist_rule_scan(&project, &violations);
+                            store.shutdown().await;
                         }
                         Err(e) => tracing::warn!(
                             "Failed to initialize event store, rule scan not persisted: {e}"
