@@ -20,10 +20,7 @@ pub async fn learn_rules(
     };
 
     if draft_contents.is_empty() {
-        return RpcResponse::success(
-            id,
-            serde_json::json!({ "rules_learned": 0, "rules": [] }),
-        );
+        return RpcResponse::success(id, serde_json::json!({ "rules_learned": 0, "rules": [] }));
     }
 
     let agent = match state.server.agent_registry.default_agent() {
@@ -78,10 +75,7 @@ pub async fn learn_skills(
     };
 
     if draft_contents.is_empty() {
-        return RpcResponse::success(
-            id,
-            serde_json::json!({ "skills_learned": 0, "skills": [] }),
-        );
+        return RpcResponse::success(id, serde_json::json!({ "skills_learned": 0, "skills": [] }));
     }
 
     let agent = match state.server.agent_registry.default_agent() {
@@ -134,7 +128,9 @@ fn validate_skill_name(name: &str) -> Result<(), String> {
         return Err("skill name must not be empty".to_string());
     }
     if name.contains('/') || name.contains('\\') || name.contains("..") {
-        return Err(format!("skill name contains path traversal characters: '{name}'"));
+        return Err(format!(
+            "skill name contains path traversal characters: '{name}'"
+        ));
     }
     if !name
         .chars()
@@ -293,7 +289,8 @@ mod tests {
 
     #[test]
     fn parse_rules_extracts_single_rule() {
-        let output = "## LEARN-001: No hardcoded secrets\nseverity: high\nNever put secrets in source code.";
+        let output =
+            "## LEARN-001: No hardcoded secrets\nseverity: high\nNever put secrets in source code.";
         let rules = parse_rules_from_output(output);
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].id, RuleId::from_str("LEARN-001"));
@@ -366,7 +363,8 @@ mod tests {
 
     #[test]
     fn parse_skills_extracts_multiple_skills() {
-        let output = "=== skill: alpha ===\n# Alpha\nContent A.\n=== skill: beta ===\n# Beta\nContent B.";
+        let output =
+            "=== skill: alpha ===\n# Alpha\nContent A.\n=== skill: beta ===\n# Beta\nContent B.";
         let skills = parse_skills_from_output(output);
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0].0, "alpha");

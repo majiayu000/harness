@@ -68,12 +68,13 @@ pub async fn ws_handler(
     if let Err(err) = validate_origin_header(&headers) {
         match err {
             OriginValidationError::InvalidUtf8 => {
-                tracing::warn!(
-                    "WebSocket connection rejected: Origin header is not valid UTF-8"
-                );
+                tracing::warn!("WebSocket connection rejected: Origin header is not valid UTF-8");
             }
             OriginValidationError::NonLocal(origin) => {
-                tracing::warn!("WebSocket connection rejected: non-local Origin {:?}", origin);
+                tracing::warn!(
+                    "WebSocket connection rejected: non-local Origin {:?}",
+                    origin
+                );
             }
         }
         return StatusCode::FORBIDDEN.into_response();

@@ -266,12 +266,7 @@ pub struct Event {
 }
 
 impl Event {
-    pub fn new(
-        session_id: SessionId,
-        hook: &str,
-        tool: &str,
-        decision: Decision,
-    ) -> Self {
+    pub fn new(session_id: SessionId, hook: &str, tool: &str, decision: Decision) -> Self {
         Self {
             id: EventId::new(),
             ts: Utc::now(),
@@ -569,7 +564,9 @@ mod tests {
 
     #[test]
     fn item_user_message_roundtrip() -> anyhow::Result<()> {
-        let item = Item::UserMessage { content: "hello world".to_string() };
+        let item = Item::UserMessage {
+            content: "hello world".to_string(),
+        };
         let json = serde_json::to_string(&item)?;
         let back: Item = serde_json::from_str(&json)?;
         match back {

@@ -381,8 +381,7 @@ mod tests {
 
     #[test]
     fn invalid_payload_json_returns_error() {
-        let result =
-            parse_github_webhook_task_request("issues", b"not valid json");
+        let result = parse_github_webhook_task_request("issues", b"not valid json");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid issues payload"));
     }
@@ -394,6 +393,10 @@ mod tests {
 
     #[test]
     fn verify_github_signature_rejects_invalid_hex() {
-        assert!(!verify_github_signature("secret", "sha256=zzzz", b"payload"));
+        assert!(!verify_github_signature(
+            "secret",
+            "sha256=zzzz",
+            b"payload"
+        ));
     }
 }

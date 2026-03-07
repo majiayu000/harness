@@ -84,13 +84,27 @@ pub enum TaskComplexity {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     TurnStarted,
-    ItemStarted { item_type: String },
-    MessageDelta { text: String },
-    ToolCall { name: String, input: serde_json::Value },
-    ApprovalRequest { id: String, command: String },
+    ItemStarted {
+        item_type: String,
+    },
+    MessageDelta {
+        text: String,
+    },
+    ToolCall {
+        name: String,
+        input: serde_json::Value,
+    },
+    ApprovalRequest {
+        id: String,
+        command: String,
+    },
     ItemCompleted,
-    TurnCompleted { output: String },
-    Error { message: String },
+    TurnCompleted {
+        output: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// Decision for an approval request from the agent.
@@ -213,4 +227,3 @@ mod tests {
         }
     }
 }
-

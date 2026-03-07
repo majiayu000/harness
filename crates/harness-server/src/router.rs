@@ -152,7 +152,10 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         // === Agent management ===
         Method::AgentList => {
             let agents = state.server.agent_registry.list();
-            Some(RpcResponse::success(id, serde_json::json!({ "agents": agents })))
+            Some(RpcResponse::success(
+                id,
+                serde_json::json!({ "agents": agents }),
+            ))
         }
 
         // === VibeGuard ===
@@ -780,14 +783,10 @@ mod tests {
             .await
             .expect("expected response for request with id");
 
-        assert!(
-            resp.error.is_none(),
-            "expected success: {:?}",
-            resp.error
-        );
-        let result =
-            resp.result
-                .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
         let coverage = result["dimensions"]["coverage"]
             .as_f64()
             .ok_or_else(|| anyhow::anyhow!("missing coverage"))?;
@@ -805,8 +804,7 @@ mod tests {
         let linked_checks = events
             .iter()
             .filter(|event| {
-                event.hook == "rule_check"
-                    && event.session_id == latest_scan.session_id
+                event.hook == "rule_check" && event.session_id == latest_scan.session_id
             })
             .count();
         assert_eq!(linked_checks, violations.len());

@@ -1,5 +1,5 @@
 use harness_core::{
-    DraftId, EventFilters, ExecPlanId, MetricFilters, ProjectId, SkillId, ThreadId, TurnId, Event,
+    DraftId, Event, EventFilters, ExecPlanId, MetricFilters, ProjectId, SkillId, ThreadId, TurnId,
 };
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
@@ -15,56 +15,126 @@ pub enum Method {
     Initialized,
 
     // === Thread management ===
-    ThreadStart { cwd: PathBuf },
-    ThreadResume { thread_id: ThreadId },
-    ThreadFork { thread_id: ThreadId, from_turn: Option<TurnId> },
+    ThreadStart {
+        cwd: PathBuf,
+    },
+    ThreadResume {
+        thread_id: ThreadId,
+    },
+    ThreadFork {
+        thread_id: ThreadId,
+        from_turn: Option<TurnId>,
+    },
     ThreadList,
-    ThreadDelete { thread_id: ThreadId },
-    ThreadCompact { thread_id: ThreadId },
+    ThreadDelete {
+        thread_id: ThreadId,
+    },
+    ThreadCompact {
+        thread_id: ThreadId,
+    },
 
     // === Turn control ===
-    TurnStart { thread_id: ThreadId, input: String },
-    TurnSteer { turn_id: TurnId, instruction: String },
-    TurnCancel { turn_id: TurnId },
-    TurnStatus { turn_id: TurnId },
+    TurnStart {
+        thread_id: ThreadId,
+        input: String,
+    },
+    TurnSteer {
+        turn_id: TurnId,
+        instruction: String,
+    },
+    TurnCancel {
+        turn_id: TurnId,
+    },
+    TurnStatus {
+        turn_id: TurnId,
+    },
 
     // === GC Agent ===
-    GcRun { project_id: Option<ProjectId> },
+    GcRun {
+        project_id: Option<ProjectId>,
+    },
     GcStatus,
-    GcDrafts { project_id: Option<ProjectId> },
-    GcAdopt { draft_id: DraftId },
-    GcReject { draft_id: DraftId, reason: Option<String> },
+    GcDrafts {
+        project_id: Option<ProjectId>,
+    },
+    GcAdopt {
+        draft_id: DraftId,
+    },
+    GcReject {
+        draft_id: DraftId,
+        reason: Option<String>,
+    },
 
     // === Skill system ===
-    SkillCreate { name: String, content: String },
-    SkillList { query: Option<String> },
-    SkillGet { skill_id: SkillId },
-    SkillDelete { skill_id: SkillId },
+    SkillCreate {
+        name: String,
+        content: String,
+    },
+    SkillList {
+        query: Option<String>,
+    },
+    SkillGet {
+        skill_id: SkillId,
+    },
+    SkillDelete {
+        skill_id: SkillId,
+    },
 
     // === Rule engine ===
-    RuleLoad { project_root: PathBuf },
-    RuleCheck { project_root: PathBuf, files: Option<Vec<PathBuf>> },
+    RuleLoad {
+        project_root: PathBuf,
+    },
+    RuleCheck {
+        project_root: PathBuf,
+        files: Option<Vec<PathBuf>>,
+    },
 
     // === ExecPlan ===
-    ExecPlanInit { spec: String, project_root: PathBuf },
-    ExecPlanUpdate { plan_id: ExecPlanId, updates: serde_json::Value },
-    ExecPlanStatus { plan_id: ExecPlanId },
+    ExecPlanInit {
+        spec: String,
+        project_root: PathBuf,
+    },
+    ExecPlanUpdate {
+        plan_id: ExecPlanId,
+        updates: serde_json::Value,
+    },
+    ExecPlanStatus {
+        plan_id: ExecPlanId,
+    },
 
     // === Observability ===
-    EventLog { event: Event },
-    EventQuery { filters: EventFilters },
-    MetricsCollect { project_root: PathBuf },
-    MetricsQuery { filters: MetricFilters },
+    EventLog {
+        event: Event,
+    },
+    EventQuery {
+        filters: EventFilters,
+    },
+    MetricsCollect {
+        project_root: PathBuf,
+    },
+    MetricsQuery {
+        filters: MetricFilters,
+    },
 
     // === Task classification ===
-    TaskClassify { prompt: String, issue: Option<u64>, pr: Option<u64> },
+    TaskClassify {
+        prompt: String,
+        issue: Option<u64>,
+        pr: Option<u64>,
+    },
 
     // === Learn feedback loop ===
-    LearnRules { project_root: PathBuf },
-    LearnSkills { project_root: PathBuf },
+    LearnRules {
+        project_root: PathBuf,
+    },
+    LearnSkills {
+        project_root: PathBuf,
+    },
 
     // === Health & Stats ===
-    HealthCheck { project_root: PathBuf },
+    HealthCheck {
+        project_root: PathBuf,
+    },
     StatsQuery {
         since: Option<chrono::DateTime<chrono::Utc>>,
         until: Option<chrono::DateTime<chrono::Utc>>,
@@ -74,8 +144,15 @@ pub enum Method {
     AgentList,
 
     // === VibeGuard ===
-    Preflight { project_root: PathBuf, task_description: String },
-    CrossReview { project_root: PathBuf, target: String, max_rounds: Option<u32> },
+    Preflight {
+        project_root: PathBuf,
+        task_description: String,
+    },
+    CrossReview {
+        project_root: PathBuf,
+        target: String,
+        max_rounds: Option<u32>,
+    },
 }
 
 /// JSON-RPC 2.0 request envelope.
@@ -103,7 +180,12 @@ impl<'de> Deserialize<'de> for RpcRequest {
             params: Option<serde_json::Value>,
         }
 
-        let RawRpcRequest { jsonrpc, id, method, params } = RawRpcRequest::deserialize(deserializer)?;
+        let RawRpcRequest {
+            jsonrpc,
+            id,
+            method,
+            params,
+        } = RawRpcRequest::deserialize(deserializer)?;
 
         // Normalize slash-style method names to snake_case for serde:
         // "thread/start" -> "thread_start", "exec_plan/init" -> "exec_plan_init"
@@ -123,10 +205,15 @@ impl<'de> Deserialize<'de> for RpcRequest {
             if let Some(params) = params {
                 raw_method.insert("params".to_string(), params);
             }
-            serde_json::from_value::<Method>(serde_json::Value::Object(raw_method)).map_err(de::Error::custom)?
+            serde_json::from_value::<Method>(serde_json::Value::Object(raw_method))
+                .map_err(de::Error::custom)?
         };
 
-        Ok(Self { jsonrpc, id, method })
+        Ok(Self {
+            jsonrpc,
+            id,
+            method,
+        })
     }
 }
 

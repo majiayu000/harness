@@ -13,7 +13,11 @@ pub struct InterceptResult {
 
 impl InterceptResult {
     pub fn pass() -> Self {
-        Self { decision: Decision::Pass, reason: None, request: None }
+        Self {
+            decision: Decision::Pass,
+            reason: None,
+            request: None,
+        }
     }
 
     pub fn block(reason: impl Into<String>) -> Self {

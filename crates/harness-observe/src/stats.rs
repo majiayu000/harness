@@ -100,7 +100,11 @@ pub fn compute_trends(events: &[Event], period_days: u32) -> Vec<ComplianceTrend
             })
             .count();
 
-        let pass_rate = if total == 0 { 1.0 } else { pass_count as f64 / total as f64 };
+        let pass_rate = if total == 0 {
+            1.0
+        } else {
+            pass_count as f64 / total as f64
+        };
         let grade = Grade::from_score(pass_rate * 100.0);
 
         trends.push(ComplianceTrend {
@@ -150,7 +154,11 @@ pub fn aggregate_rule_stats(events: &[Event]) -> Vec<RuleStats> {
             last_seen: counts.last_seen,
         })
         .collect();
-    stats.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.rule_id.cmp(&b.rule_id)));
+    stats.sort_by(|a, b| {
+        b.total
+            .cmp(&a.total)
+            .then_with(|| a.rule_id.cmp(&b.rule_id))
+    });
     stats
 }
 
@@ -194,7 +202,6 @@ pub fn compute_rule_trends(events: &[Event], period_days: u32) -> Vec<RuleTrend>
 
     trends
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -276,12 +283,16 @@ mod tests {
         let stats = aggregate_rule_stats(&events);
         assert_eq!(stats.len(), 2);
         assert!(
-            stats.iter().any(|s| s.rule_id == "SEC-01" && s.total == 2
-                && s.block_count == 1 && s.warn_count == 1),
+            stats.iter().any(|s| s.rule_id == "SEC-01"
+                && s.total == 2
+                && s.block_count == 1
+                && s.warn_count == 1),
             "expected SEC-01 with 2 total, 1 block, 1 warn"
         );
         assert!(
-            stats.iter().any(|s| s.rule_id == "SEC-02" && s.total == 1 && s.pass_count == 1),
+            stats
+                .iter()
+                .any(|s| s.rule_id == "SEC-02" && s.total == 1 && s.pass_count == 1),
             "expected SEC-02 with 1 total, 1 pass"
         );
     }

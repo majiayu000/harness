@@ -71,7 +71,10 @@ fn aggregate_violations(violations: &[Violation]) -> Vec<ViolationSummary> {
 
 fn derive_signals(events: &[Event]) -> Vec<SignalSummary> {
     let mut map: HashMap<String, (usize, Option<chrono::DateTime<chrono::Utc>>)> = HashMap::new();
-    for e in events.iter().filter(|e| matches!(e.decision, Decision::Escalate)) {
+    for e in events
+        .iter()
+        .filter(|e| matches!(e.decision, Decision::Escalate))
+    {
         let entry = map.entry(e.hook.clone()).or_insert((0, None));
         entry.0 += 1;
         entry.1 = Some(match entry.1 {
@@ -216,7 +219,12 @@ mod tests {
 
     #[test]
     fn event_summary_counts_correctly() {
-        let events = vec![pass_event(), pass_event(), block_event(), escalate_event("sig")];
+        let events = vec![
+            pass_event(),
+            pass_event(),
+            block_event(),
+            escalate_event("sig"),
+        ];
         let report = generate_health_report(&events, &[]);
         assert_eq!(report.event_summary.total, 4);
         assert_eq!(report.event_summary.pass_count, 2);
@@ -237,17 +245,15 @@ mod tests {
     fn recommendations_include_violation_when_present() {
         let violations = vec![make_violation("SEC-01", Severity::Critical)];
         let report = generate_health_report(&[], &violations);
-        let has_violation_rec = report
-            .recommendations
-            .iter()
-            .any(|r| r.contains("SEC-01"));
+        let has_violation_rec = report.recommendations.iter().any(|r| r.contains("SEC-01"));
         assert!(has_violation_rec);
     }
 
     #[test]
     fn quality_degrades_with_violations() {
-        let violations: Vec<Violation> =
-            (0..50).map(|_| make_violation("SEC-01", Severity::High)).collect();
+        let violations: Vec<Violation> = (0..50)
+            .map(|_| make_violation("SEC-01", Severity::High))
+            .collect();
         let report = generate_health_report(&[], &violations);
         assert!(report.quality.dimensions.coverage < 100.0);
     }

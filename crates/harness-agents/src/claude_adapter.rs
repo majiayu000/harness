@@ -200,8 +200,7 @@ mod tests {
 
     #[test]
     fn parse_tool_use() {
-        let line =
-            r#"{"type": "tool_use", "name": "Read", "input": {"path": "src/main.rs"}}"#;
+        let line = r#"{"type": "tool_use", "name": "Read", "input": {"path": "src/main.rs"}}"#;
         let event = parse_stream_json_line(line).unwrap();
         match event {
             AgentEvent::ToolCall { name, input } => {

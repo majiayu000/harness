@@ -505,7 +505,17 @@ mod tests {
         };
 
         let events = Arc::new(harness_observe::EventStore::new(dir.path())?);
-        spawn_task(store, agent_clone, None, Default::default(), skills, events, vec![], req).await;
+        spawn_task(
+            store,
+            agent_clone,
+            None,
+            Default::default(),
+            skills,
+            events,
+            vec![],
+            req,
+        )
+        .await;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -564,7 +574,17 @@ mod tests {
             turn_timeout_secs: 30,
         };
 
-        let task_id = spawn_task(store.clone(), agent, None, Default::default(), skills, events, interceptors, req).await;
+        let task_id = spawn_task(
+            store.clone(),
+            agent,
+            None,
+            Default::default(),
+            skills,
+            events,
+            interceptors,
+            req,
+        )
+        .await;
 
         // Allow async task to complete.
         tokio::time::sleep(Duration::from_millis(200)).await;

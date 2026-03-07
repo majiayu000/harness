@@ -1,6 +1,4 @@
-use harness_core::{
-    Decision, Event, ProjectId, RemediationType, Signal, SignalType, Violation,
-};
+use harness_core::{Decision, Event, ProjectId, RemediationType, Signal, SignalType, Violation};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -70,7 +68,10 @@ impl SignalDetector {
     pub fn from_violations(&self, violations: &[Violation]) -> Vec<Signal> {
         let mut by_rule: HashMap<String, Vec<&Violation>> = HashMap::new();
         for v in violations {
-            by_rule.entry(v.rule_id.as_str().to_string()).or_default().push(v);
+            by_rule
+                .entry(v.rule_id.as_str().to_string())
+                .or_default()
+                .push(v);
         }
 
         by_rule
@@ -263,7 +264,7 @@ impl SignalDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Decision, Event, ProjectId, SessionId, SignalType, Violation, Severity};
+    use harness_core::{Decision, Event, ProjectId, SessionId, Severity, SignalType, Violation};
     use std::path::PathBuf;
 
     fn detector() -> SignalDetector {
@@ -297,7 +298,9 @@ mod tests {
         let det = detector();
         let events: Vec<Event> = (0..10).map(|_| warn_event("unwrap usage")).collect();
         let signals = det.detect(&events);
-        assert!(signals.iter().any(|s| s.signal_type == SignalType::RepeatedWarn));
+        assert!(signals
+            .iter()
+            .any(|s| s.signal_type == SignalType::RepeatedWarn));
     }
 
     #[test]
@@ -305,7 +308,9 @@ mod tests {
         let det = detector();
         let events: Vec<Event> = (0..9).map(|_| warn_event("test")).collect();
         let signals = det.detect(&events);
-        assert!(!signals.iter().any(|s| s.signal_type == SignalType::RepeatedWarn));
+        assert!(!signals
+            .iter()
+            .any(|s| s.signal_type == SignalType::RepeatedWarn));
     }
 
     #[test]
@@ -313,7 +318,9 @@ mod tests {
         let det = detector();
         let events: Vec<Event> = (0..5).map(|_| block_event("security")).collect();
         let signals = det.detect(&events);
-        assert!(signals.iter().any(|s| s.signal_type == SignalType::ChronicBlock));
+        assert!(signals
+            .iter()
+            .any(|s| s.signal_type == SignalType::ChronicBlock));
     }
 
     #[test]
@@ -321,7 +328,9 @@ mod tests {
         let det = detector();
         let events: Vec<Event> = (0..20).map(|_| edit_event("/src/main.rs")).collect();
         let signals = det.detect(&events);
-        assert!(signals.iter().any(|s| s.signal_type == SignalType::HotFiles));
+        assert!(signals
+            .iter()
+            .any(|s| s.signal_type == SignalType::HotFiles));
     }
 
     #[test]
@@ -329,13 +338,18 @@ mod tests {
         let det = detector();
         let events: Vec<Event> = (0..10).map(|_| slow_event(6000)).collect();
         let signals = det.detect(&events);
-        assert!(signals.iter().any(|s| s.signal_type == SignalType::SlowSessions));
+        assert!(signals
+            .iter()
+            .any(|s| s.signal_type == SignalType::SlowSessions));
     }
 
     #[test]
     fn detects_warn_escalation() {
         let det = SignalDetector::new(
-            SignalThresholds { escalation_ratio: 1.5, ..Default::default() },
+            SignalThresholds {
+                escalation_ratio: 1.5,
+                ..Default::default()
+            },
             ProjectId::new(),
         );
         // First half: 2 warns out of 10 → rate 0.2
@@ -354,21 +368,27 @@ mod tests {
             events.push(warn_event("reason"));
         }
         let signals = det.detect(&events);
-        assert!(signals.iter().any(|s| s.signal_type == SignalType::WarnEscalation));
+        assert!(signals
+            .iter()
+            .any(|s| s.signal_type == SignalType::WarnEscalation));
     }
 
     #[test]
     fn detects_linter_violations_signal() {
         let det = detector();
-        let violations: Vec<Violation> = (0..5).map(|_| Violation {
-            rule_id: harness_core::RuleId::from_str("SEC-01"),
-            file: PathBuf::from("/src/lib.rs"),
-            line: Some(1),
-            message: "issue".to_string(),
-            severity: Severity::High,
-        }).collect();
+        let violations: Vec<Violation> = (0..5)
+            .map(|_| Violation {
+                rule_id: harness_core::RuleId::from_str("SEC-01"),
+                file: PathBuf::from("/src/lib.rs"),
+                line: Some(1),
+                message: "issue".to_string(),
+                severity: Severity::High,
+            })
+            .collect();
         let signals = det.from_violations(&violations);
-        assert!(signals.iter().any(|s| s.signal_type == SignalType::LinterViolations));
+        assert!(signals
+            .iter()
+            .any(|s| s.signal_type == SignalType::LinterViolations));
     }
 
     #[test]
@@ -382,6 +402,8 @@ mod tests {
             events.push(e);
         }
         let signals = det.detect(&events);
-        assert!(signals.iter().any(|s| s.signal_type == SignalType::LinterViolations));
+        assert!(signals
+            .iter()
+            .any(|s| s.signal_type == SignalType::LinterViolations));
     }
 }

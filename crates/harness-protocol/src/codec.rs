@@ -89,7 +89,10 @@ mod tests {
         };
         let json = serde_json::to_string(&req)?;
         // method field must be "initialized"
-        assert!(json.contains("\"method\":\"initialized\""), "serialized: {json}");
+        assert!(
+            json.contains("\"method\":\"initialized\""),
+            "serialized: {json}"
+        );
         let back: RpcRequest = decode_request(&json)?;
         assert!(matches!(back.method, Method::Initialized));
 
@@ -157,7 +160,9 @@ mod tests {
 
     #[test]
     fn method_name_returns_slash_style() {
-        let m = Method::ThreadStart { cwd: PathBuf::from("/tmp") };
+        let m = Method::ThreadStart {
+            cwd: PathBuf::from("/tmp"),
+        };
         assert_eq!(m.method_name(), "thread/start");
 
         let m = Method::Initialize;
