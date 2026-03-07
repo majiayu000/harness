@@ -36,15 +36,17 @@ export function extractOutput(turn: TurnSnapshot | undefined): string {
       continue;
     }
 
-    if (pushCandidate(messages, (item as { content?: unknown }).content)) {
+    if ("content" in item && pushCandidate(messages, item.content)) {
       continue;
     }
 
-    if (pushCandidate(messages, (item as { stdout?: unknown }).stdout)) {
+    if ("stdout" in item && pushCandidate(messages, item.stdout)) {
       continue;
     }
 
-    pushCandidate(messages, (item as { message?: unknown }).message);
+    if ("message" in item) {
+      pushCandidate(messages, item.message);
+    }
   }
 
   return messages.join("\n\n");
