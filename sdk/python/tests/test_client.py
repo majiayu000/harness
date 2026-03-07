@@ -1,15 +1,20 @@
+from pathlib import Path
+import sys
 import unittest
-from typing import Any, Dict, List, Tuple
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from harness_sdk import Harness, HarnessRpcError
+from harness_sdk.client import _extract_output
 
 
 class MockRpc:
     def __init__(self) -> None:
-        self.calls: List[Tuple[str, Dict[str, Any]]] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
         self.status_polls = 0
 
-    def start_thread_and_run_complete(self, method: str, params: Dict[str, Any]) -> Any:
+    def start_thread_and_run_complete(self, method: str, params: dict[str, Any]) -> Any:
         self.calls.append((method, params))
         if method == "thread/start":
             return {"thread_id": "thread-1"}
@@ -37,7 +42,7 @@ class MockRpc:
             return {"resumed": True}
         raise AssertionError(f"unexpected RPC method: {method}")
 
-    def run_timeout(self, method: str, params: Dict[str, Any]) -> Any:
+    def run_timeout(self, method: str, params: dict[str, Any]) -> Any:
         self.calls.append((method, params))
         if method == "thread/start":
             return {"thread_id": "thread-2"}
@@ -52,7 +57,7 @@ class MockRpc:
             }
         raise AssertionError(f"unexpected RPC method: {method}")
 
-    def rpc_error(self, method: str, params: Dict[str, Any]) -> Any:
+    def rpc_error(self, method: str, params: dict[str, Any]) -> Any:
         self.calls.append((method, params))
         raise HarnessRpcError(-32001, "thread not found")
 
@@ -68,11 +73,21 @@ class HarnessSdkTests(unittest.TestCase):
         self.assertEqual(mock.calls[0][0], "thread/start")
         self.assertEqual(mock.calls[0][1]["cwd"], "/repo")
 
+    def test_start_thread_omits_cwd_when_not_configured(self) -> None:
+        mock = MockRpc()
+        harness = Harness(rpc_handler=mock.start_thread_and_run_complete)
+
+        thread = harness.start_thread()
+
+        self.assertEqual(thread.id, "thread-1")
+        self.assertEqual(mock.calls[0][0], "thread/start")
+        self.assertNotIn("cwd", mock.calls[0][1])
+
     def test_run_collects_events_and_output(self) -> None:
         mock = MockRpc()
         harness = Harness(rpc_handler=mock.start_thread_and_run_complete)
         thread = harness.start_thread(cwd="/repo")
-        emitted: List[Dict[str, Any]] = []
+        emitted: list[dict[str, Any]] = []
 
         result = thread.run(
             "Summarize repository",
@@ -86,7 +101,9 @@ class HarnessSdkTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.output, "done")
         self.assertFalse(result.timed_out)
-        self.assertTrue(any(event["method"] == "turn/completed" for event in result.events))
+        self.assertTrue(
+            any(event["method"] == "sdk:turn/completed" for event in result.events)
+        )
         self.assertGreaterEqual(len(emitted), 3)
 
     def test_run_returns_timeout_when_turn_never_completes(self) -> None:
@@ -104,7 +121,19 @@ class HarnessSdkTests(unittest.TestCase):
         self.assertEqual(result.turn_id, "turn-2")
         self.assertEqual(result.status, "running")
         self.assertTrue(result.timed_out)
-        self.assertTrue(any(event["method"] == "turn/timeout" for event in result.events))
+        self.assertTrue(any(event["method"] == "sdk:turn/timeout" for event in result.events))
+
+    def test_extract_output_handles_multiple_item_shapes(self) -> None:
+        turn = {
+            "items": [
+                {"type": "user_message", "content": "ignored"},
+                {"type": "agent_reasoning", "content": "done"},
+                {"type": "shell_command", "stdout": "ls output"},
+                {"type": "error", "message": "tool failed"},
+            ]
+        }
+
+        self.assertEqual(_extract_output(turn), "done\n\nls output\n\ntool failed")
 
     def test_resume_thread_surfaces_rpc_errors(self) -> None:
         mock = MockRpc()
