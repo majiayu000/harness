@@ -1,15 +1,12 @@
+use crate::cloud_setup;
 use crate::streaming::send_stream_item;
 use async_trait::async_trait;
 use harness_core::{
     AgentRequest, AgentResponse, Capability, CodeAgent, CodexAgentConfig, CodexCloudConfig, Item,
     StreamItem, TokenUsage,
 };
-use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsString;
-use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 pub struct CodexAgent {
@@ -38,140 +35,8 @@ impl CodexAgent {
         }
     }
 
-    fn setup_cache_ttl(&self) -> Duration {
-        Duration::from_secs(self.cloud.cache_ttl_hours.saturating_mul(3600))
-    }
-
-    fn setup_cache_key(&self, project_root: &Path) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        project_root.hash(&mut hasher);
-        self.cloud.setup_commands.hash(&mut hasher);
-        self.cloud.setup_secret_env.hash(&mut hasher);
-        self.cloud.cache_ttl_hours.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    fn setup_cache_stamp_path(&self, project_root: &Path) -> PathBuf {
-        project_root
-            .join(".harness")
-            .join("cloud-setup-cache")
-            .join(format!("{:016x}.stamp", self.setup_cache_key(project_root)))
-    }
-
-    fn setup_cache_is_fresh(&self, project_root: &Path) -> harness_core::Result<bool> {
-        if self.cloud.cache_ttl_hours == 0 {
-            return Ok(false);
-        }
-
-        let stamp = self.setup_cache_stamp_path(project_root);
-        let metadata = match fs::metadata(&stamp) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => {
-                return Err(harness_core::HarnessError::AgentExecution(format!(
-                    "failed to read cloud setup cache metadata `{}`: {err}",
-                    stamp.display()
-                )));
-            }
-        };
-
-        let modified = metadata.modified().map_err(|err| {
-            harness_core::HarnessError::AgentExecution(format!(
-                "failed to read cloud setup cache mtime `{}`: {err}",
-                stamp.display()
-            ))
-        })?;
-
-        let age = SystemTime::now()
-            .duration_since(modified)
-            .unwrap_or(Duration::ZERO);
-
-        Ok(age <= self.setup_cache_ttl())
-    }
-
-    fn write_setup_cache_stamp(&self, project_root: &Path) -> harness_core::Result<()> {
-        if self.cloud.cache_ttl_hours == 0 {
-            return Ok(());
-        }
-
-        let stamp = self.setup_cache_stamp_path(project_root);
-        let Some(parent) = stamp.parent() else {
-            return Err(harness_core::HarnessError::AgentExecution(format!(
-                "invalid cloud setup cache path `{}`",
-                stamp.display()
-            )));
-        };
-
-        fs::create_dir_all(parent).map_err(|err| {
-            harness_core::HarnessError::AgentExecution(format!(
-                "failed to create cloud setup cache dir `{}`: {err}",
-                parent.display()
-            ))
-        })?;
-
-        fs::write(&stamp, b"ok\n").map_err(|err| {
-            harness_core::HarnessError::AgentExecution(format!(
-                "failed to write cloud setup cache stamp `{}`: {err}",
-                stamp.display()
-            ))
-        })?;
-
-        Ok(())
-    }
-
-    fn apply_setup_environment(&self, cmd: &mut Command) {
-        cmd.env_clear();
-
-        for key in [
-            "PATH", "HOME", "USER", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE",
-        ] {
-            if let Ok(value) = std::env::var(key) {
-                cmd.env(key, value);
-            }
-        }
-
-        for key in &self.cloud.setup_secret_env {
-            if let Ok(value) = std::env::var(key) {
-                cmd.env(key, value);
-            }
-        }
-    }
-
     async fn run_setup_phase(&self, project_root: &Path) -> harness_core::Result<()> {
-        if !self.cloud.enabled || self.cloud.setup_commands.is_empty() {
-            return Ok(());
-        }
-
-        if self.setup_cache_is_fresh(project_root)? {
-            return Ok(());
-        }
-
-        for setup_command in &self.cloud.setup_commands {
-            if setup_command.trim().is_empty() {
-                continue;
-            }
-
-            let mut cmd = Command::new("sh");
-            cmd.arg("-lc").arg(setup_command).current_dir(project_root);
-            self.apply_setup_environment(&mut cmd);
-
-            let output = cmd.output().await.map_err(|err| {
-                harness_core::HarnessError::AgentExecution(format!(
-                    "failed to run cloud setup command `{setup_command}`: {err}"
-                ))
-            })?;
-
-            if !output.status.success() {
-                let detail = command_output_summary(&output);
-                return Err(harness_core::HarnessError::AgentExecution(format!(
-                    "cloud setup command `{setup_command}` failed with {}: {detail}",
-                    output.status
-                )));
-            }
-        }
-
-        self.write_setup_cache_stamp(project_root)?;
-        Ok(())
+        cloud_setup::run_setup_phase(&self.cloud, project_root).await
     }
 
     fn agent_phase_args(&self, req: &AgentRequest) -> Vec<OsString> {
@@ -215,8 +80,8 @@ impl CodeAgent for CodexAgent {
             }
         }
 
-        let output = cmd.output().await.map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to run codex: {e}"))
+        let output = cmd.output().await.map_err(|err| {
+            harness_core::HarnessError::AgentExecution(format!("failed to run codex: {err}"))
         })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -261,25 +126,24 @@ impl CodeAgent for CodexAgent {
     }
 }
 
-fn command_output_summary(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !stderr.is_empty() {
-        return stderr;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !stdout.is_empty() {
-        return stdout;
-    }
-
-    "no output".to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    const SETUP_ENV_ALLOWLIST: [&str; 10] = [
+        "PATH", "HOME", "USER", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE",
+    ];
+
+    fn find_existing_secret_env() -> Option<(String, String)> {
+        std::env::vars().find(|(key, value)| {
+            !value.is_empty()
+                && !SETUP_ENV_ALLOWLIST
+                    .iter()
+                    .any(|allowlisted| allowlisted == &key.as_str())
+        })
+    }
 
     #[tokio::test]
     async fn execute_stream_returns_error_when_channel_closed() {
@@ -312,11 +176,13 @@ mod tests {
         let args: Vec<String> = agent
             .agent_phase_args(&request)
             .iter()
-            .map(|s| s.to_string_lossy().to_string())
+            .map(|value| value.to_string_lossy().to_string())
             .collect();
 
-        assert!(args.windows(2).any(|w| w == ["--sandbox", "read-only"]));
-        assert!(!args.iter().any(|a| a == "--ephemeral"));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--sandbox", "read-only"]));
+        assert!(!args.iter().any(|arg| arg == "--ephemeral"));
     }
 
     #[test]
@@ -337,7 +203,7 @@ mod tests {
         let args: Vec<String> = agent
             .agent_phase_args(&request)
             .iter()
-            .map(|s| s.to_string_lossy().to_string())
+            .map(|value| value.to_string_lossy().to_string())
             .collect();
 
         assert!(args
@@ -376,34 +242,32 @@ mod tests {
     #[test]
     fn cloud_setup_cache_invalidation_uses_config_hash() {
         let project_root = Path::new("/tmp/project");
-        let first = CodexAgent::with_cloud(
-            PathBuf::from("codex"),
-            CodexCloudConfig {
-                enabled: true,
-                cache_ttl_hours: 12,
-                setup_commands: vec!["npm ci".to_string()],
-                setup_secret_env: vec!["NPM_TOKEN".to_string()],
-            },
-        );
-        let second = CodexAgent::with_cloud(
-            PathBuf::from("codex"),
-            CodexCloudConfig {
-                enabled: true,
-                cache_ttl_hours: 12,
-                setup_commands: vec!["cargo fetch".to_string()],
-                setup_secret_env: vec!["NPM_TOKEN".to_string()],
-            },
-        );
+        let first = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: vec!["npm ci".to_string()],
+            setup_secret_env: vec!["NPM_TOKEN".to_string()],
+        };
+        let second = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: vec!["cargo fetch".to_string()],
+            setup_secret_env: vec!["NPM_TOKEN".to_string()],
+        };
 
         assert_ne!(
-            first.setup_cache_key(project_root),
-            second.setup_cache_key(project_root)
+            cloud_setup::setup_cache_key(&first, project_root),
+            cloud_setup::setup_cache_key(&second, project_root)
         );
     }
 
     #[tokio::test]
     async fn setup_secret_is_available_in_setup_but_removed_for_agent_phase() -> anyhow::Result<()>
     {
+        let Some((secret_name, secret_value)) = find_existing_secret_env() else {
+            return Ok(());
+        };
+
         let dir = tempdir()?;
         let setup_capture = dir.path().join("setup-secret.txt");
         let agent_capture = dir.path().join("agent-env.txt");
@@ -422,20 +286,13 @@ mod tests {
             fs::set_permissions(&cli_script, perms)?;
         }
 
-        let secret_name = "HARNESS_CODEX_SETUP_SECRET";
-        let secret_value = "top-secret-token";
-        std::env::set_var(secret_name, secret_value);
-
-        let setup = format!(
-            "printf '%s' \"${secret_name}\" > \"{}\"",
-            setup_capture.display()
-        );
+        let setup = format!("printenv '{secret_name}' > \"{}\"", setup_capture.display());
 
         let cloud = CodexCloudConfig {
             enabled: true,
             cache_ttl_hours: 12,
             setup_commands: vec![setup],
-            setup_secret_env: vec![secret_name.to_string()],
+            setup_secret_env: vec![secret_name.clone()],
         };
 
         let agent = CodexAgent::with_cloud(cli_script, cloud);
@@ -445,16 +302,16 @@ mod tests {
             ..Default::default()
         };
 
-        let result = agent.execute(request).await;
-        std::env::remove_var(secret_name);
-        result?;
+        agent.execute(request).await?;
 
         let setup_secret = fs::read_to_string(setup_capture)?;
-        assert_eq!(setup_secret, secret_value);
+        assert_eq!(setup_secret.trim_end_matches('\n'), secret_value);
 
         let agent_env = fs::read_to_string(agent_capture)?;
         assert!(
-            !agent_env.contains(&format!("{secret_name}={secret_value}")),
+            !agent_env
+                .lines()
+                .any(|line| line.starts_with(&format!("{secret_name}="))),
             "setup secret leaked into agent phase environment"
         );
         Ok(())

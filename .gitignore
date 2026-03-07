@@ -1,2 +1,3 @@
 /target/
 exec-plan-*.md
+.harness/cloud-setup-cache/
