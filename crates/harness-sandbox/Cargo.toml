@@ -6,3 +6,6 @@ edition.workspace = true
 [dependencies]
 harness-core = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

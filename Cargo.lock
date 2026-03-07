@@ -1240,7 +1240,8 @@ name = "harness-sandbox"
 version = "0.1.0"
 dependencies = [
  "harness-core",
- "thiserror",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
