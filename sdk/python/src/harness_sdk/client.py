@@ -6,9 +6,23 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Generator
+from typing import Any, Callable, Generator, Literal, TypedDict
 
-Event = dict[str, Any]
+
+EventMethod = Literal[
+    "sdk:turn/started",
+    "sdk:turn/status",
+    "sdk:turn/completed",
+    "sdk:turn/timeout",
+]
+
+
+class Event(TypedDict):
+    method: EventMethod
+    params: dict[str, Any]
+    timestamp: str
+
+
 RpcHandler = Callable[[str, dict[str, Any]], Any]
 EventHandler = Callable[[Event], None]
 
@@ -246,7 +260,7 @@ def _notify(on_event: EventHandler | None, event: Event) -> None:
         on_event(event)
 
 
-def _new_event(method: str, params: dict[str, Any]) -> Event:
+def _new_event(method: EventMethod, params: dict[str, Any]) -> Event:
     timestamp = (
         datetime.now(timezone.utc)
         .isoformat(timespec="milliseconds")

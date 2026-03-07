@@ -1,12 +1,8 @@
-from pathlib import Path
-import sys
 import unittest
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from harness_sdk import Harness, HarnessRpcError
-from harness_sdk.client import _extract_output
+from sdk.python.src.harness_sdk import Harness, HarnessRpcError
+from sdk.python.src.harness_sdk.client import _extract_output
 
 
 class MockRpc:

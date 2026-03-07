@@ -13,5 +13,6 @@ export type {
   RunResult,
   StartThreadOptions,
   ThreadEvent,
+  TurnStatus,
   TurnSnapshot,
 } from "./types";
