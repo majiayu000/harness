@@ -6,6 +6,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+// Intentional scope: keep VCS/agent metadata immutable inside workspace-write mode.
+// `.env` is user-managed project content and is not forced read-only here.
 const PROTECTED_RELATIVE_PATHS: [&str; 2] = [".git", ".harness"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +133,7 @@ fn wrap_linux_command(
     })
 }
 
+// Keep `test` enabled so non-macOS CI can validate policy-generation logic.
 #[cfg(any(target_os = "macos", test))]
 fn seatbelt_policy(spec: &SandboxSpec) -> Result<String, SandboxError> {
     let workspace_path = seatbelt_escape_path(&spec.project_root)?;
@@ -222,11 +225,7 @@ fn linux_bwrap_args(
     ];
 
     match spec.mode {
-        SandboxMode::ReadOnly => {
-            wrapped_args.push(OsString::from("--ro-bind"));
-            wrapped_args.push(spec.project_root.as_os_str().to_os_string());
-            wrapped_args.push(spec.project_root.as_os_str().to_os_string());
-        }
+        SandboxMode::ReadOnly => {}
         SandboxMode::WorkspaceWrite => {
             wrapped_args.push(OsString::from("--bind"));
             wrapped_args.push(spec.project_root.as_os_str().to_os_string());
@@ -262,7 +261,10 @@ fn protected_paths(project_root: &Path) -> Vec<PathBuf> {
 
 #[cfg(any(target_os = "macos", test))]
 fn seatbelt_escape_path(path: &Path) -> Result<String, SandboxError> {
-    let path_string = path.to_string_lossy();
+    let path_string = path.to_str().ok_or(SandboxError::InvalidPath {
+        path: path.to_path_buf(),
+        reason: "path is not valid UTF-8",
+    })?;
 
     if path_string.chars().any(|ch| ch == '\n' || ch == '\r') {
         return Err(SandboxError::InvalidPath {
@@ -347,6 +349,23 @@ mod tests {
         assert!(matches!(error, SandboxError::InvalidPath { .. }));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn seatbelt_policy_rejects_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let non_utf8 = std::ffi::OsString::from_vec(vec![0x66, 0x6f, 0x80]);
+        let spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, PathBuf::from(non_utf8));
+        let error = seatbelt_policy(&spec).expect_err("policy path should be rejected");
+        assert!(matches!(
+            error,
+            SandboxError::InvalidPath {
+                reason: "path is not valid UTF-8",
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn workspace_write_bwrap_args_disable_network_and_preserve_command() {
         let project_root = PathBuf::from("/tmp/project");
@@ -364,9 +383,18 @@ mod tests {
 
     #[test]
     fn read_only_bwrap_args_disable_network() {
-        let spec = SandboxSpec::new(SandboxMode::ReadOnly, "/tmp/project");
+        let project_root = PathBuf::from("/tmp/project");
+        let spec = SandboxSpec::new(SandboxMode::ReadOnly, &project_root);
         let args = linux_bwrap_args(Path::new("/usr/bin/claude"), &[], &spec).unwrap();
         assert!(args.contains(&OsString::from("--unshare-net")));
+        let project_occurrences = args
+            .iter()
+            .filter(|value| value == &&project_root.as_os_str().to_os_string())
+            .count();
+        assert_eq!(
+            project_occurrences, 1,
+            "read-only mode should only reference project root in --chdir"
+        );
         assert!(args.ends_with(&[OsString::from("--"), OsString::from("/usr/bin/claude"),]));
     }
 

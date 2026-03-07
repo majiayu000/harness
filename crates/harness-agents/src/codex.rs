@@ -38,7 +38,7 @@ impl CodeAgent for CodexAgent {
             OsString::from("exec"),
             OsString::from("--skip-git-repo-check"),
             OsString::from("-a"),
-            OsString::from(self.sandbox_mode.to_string()),
+            OsString::from(codex_approval_mode(self.sandbox_mode)),
             OsString::from("-C"),
             req.project_root.as_os_str().to_os_string(),
             OsString::from(req.prompt.clone()),
@@ -102,6 +102,14 @@ impl CodeAgent for CodexAgent {
     }
 }
 
+fn codex_approval_mode(mode: SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::ReadOnly => "read-only",
+        SandboxMode::WorkspaceWrite => "read-write",
+        SandboxMode::DangerFullAccess => "full-access",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +133,19 @@ mod tests {
         assert!(
             message.contains("stream send failed"),
             "expected send failure in error message, got: {message}"
+        );
+    }
+
+    #[test]
+    fn codex_approval_mode_maps_to_codex_cli_values() {
+        assert_eq!(codex_approval_mode(SandboxMode::ReadOnly), "read-only");
+        assert_eq!(
+            codex_approval_mode(SandboxMode::WorkspaceWrite),
+            "read-write"
+        );
+        assert_eq!(
+            codex_approval_mode(SandboxMode::DangerFullAccess),
+            "full-access"
         );
     }
 }
