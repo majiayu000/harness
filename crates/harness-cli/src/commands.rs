@@ -692,10 +692,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     engine.load(&project)?;
                     let violations = engine.scan(&project).await?;
                     // Persist rule scan results for observability/GC even when running via CLI.
-                    match harness_observe::EventStore::with_policies(
+                    match harness_observe::EventStore::with_policies_and_otel(
                         &config.server.data_dir,
                         config.observe.session_renewal_secs,
                         config.observe.log_retention_days,
+                        &config.otel,
                     ) {
                         Ok(store) => {
                             store.persist_rule_scan(&project, &violations);

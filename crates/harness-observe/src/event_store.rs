@@ -1,9 +1,12 @@
-use harness_core::{Decision, Event, EventFilters, EventId, SessionId, Severity, Violation};
+use harness_core::{
+    Decision, Event, EventFilters, EventId, OtelConfig, SessionId, Severity, Violation,
+};
 use std::path::{Path, PathBuf};
 
 /// Event store backed by JSONL files (SQLite upgrade path available).
 pub struct EventStore {
     data_dir: PathBuf,
+    otel_pipeline: Option<crate::otel_export::OtelPipeline>,
 }
 
 impl EventStore {
@@ -11,15 +14,32 @@ impl EventStore {
         std::fs::create_dir_all(data_dir)?;
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
+            otel_pipeline: None,
         })
     }
 
-    pub fn with_policies(
+    pub fn with_policies_and_otel(
         data_dir: &Path,
-        _session_renewal_secs: u64,
-        _log_retention_days: u32,
+        session_renewal_secs: u64,
+        log_retention_days: u32,
+        otel_config: &OtelConfig,
     ) -> anyhow::Result<Self> {
-        Self::new(data_dir)
+        let mut store = Self::new(data_dir)?;
+        tracing::debug!(
+            session_renewal_secs,
+            log_retention_days,
+            "event store policy values accepted"
+        );
+        store.otel_pipeline = match crate::otel_export::OtelPipeline::from_config(otel_config) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                tracing::warn!(
+                    "OpenTelemetry initialization failed; continuing without export: {err}"
+                );
+                None
+            }
+        };
+        Ok(store)
     }
 
     fn events_file(&self) -> PathBuf {
@@ -34,6 +54,9 @@ impl EventStore {
             .open(self.events_file())?;
         let line = serde_json::to_string(event)?;
         writeln!(file, "{line}")?;
+        if let Some(pipeline) = &self.otel_pipeline {
+            pipeline.record_event(event);
+        }
         Ok(event.id.clone())
     }
 
@@ -161,7 +184,7 @@ impl EventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Decision, Event, EventFilters, RuleId, SessionId};
+    use harness_core::{Decision, Event, EventFilters, OtelExporter, RuleId, SessionId};
     use std::path::Path;
 
     fn make_event(hook: &str, decision: Decision) -> Event {
@@ -365,6 +388,32 @@ mod tests {
         })?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].detail.as_deref(), Some("/tmp/my-project"));
+        Ok(())
+    }
+
+    #[test]
+    fn log_with_unreachable_otel_endpoint_still_persists_event() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = OtelConfig {
+            exporter: OtelExporter::OtlpHttp,
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            ..OtelConfig::default()
+        };
+        let store = EventStore::with_policies_and_otel(dir.path(), 1800, 90, &config)?;
+        assert!(store.otel_pipeline.is_none());
+        let event = Event::new(
+            SessionId::new(),
+            "api_request",
+            "http_client",
+            Decision::Pass,
+        );
+        store.log(&event)?;
+        let events = store.query(&EventFilters {
+            session_id: Some(event.session_id.clone()),
+            ..Default::default()
+        })?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, event.id);
         Ok(())
     }
 }
