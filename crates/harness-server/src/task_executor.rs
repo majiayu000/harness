@@ -4,13 +4,14 @@ use crate::task_runner::{
 };
 use harness_core::{
     interceptor::TurnInterceptor, prompts, AgentRequest, AgentResponse, CodeAgent, ContextItem,
-    Decision, Event, SessionId,
+    Decision, Event, Item, SessionId, StreamItem, ThreadId, TurnId, TurnStatus,
 };
+use harness_protocol::{Notification, RpcNotification};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +163,249 @@ async fn find_existing_pr_for_issue(
         .into_iter()
         .next()
         .map(|item| (item.number, item.head_ref_name)))
+}
+
+fn emit_runtime_notification(
+    notify_tx: &Option<crate::notify::NotifySender>,
+    notification_tx: &tokio::sync::broadcast::Sender<RpcNotification>,
+    notification: Notification,
+) {
+    crate::notify::emit(notify_tx, notification.clone());
+    let _ = notification_tx.send(RpcNotification::new(notification));
+}
+
+async fn persist_runtime_thread(
+    thread_db: &Option<crate::thread_db::ThreadDb>,
+    server: &crate::server::HarnessServer,
+    thread_id: &ThreadId,
+) {
+    if let Some(db) = thread_db {
+        if let Some(thread) = server.thread_manager.get_thread(thread_id) {
+            if let Err(err) = db.update(&thread).await {
+                tracing::warn!("thread_db persist failed during turn execution: {err}");
+            }
+        }
+    }
+}
+
+async fn process_stream_item(
+    server: &crate::server::HarnessServer,
+    thread_db: &Option<crate::thread_db::ThreadDb>,
+    notify_tx: &Option<crate::notify::NotifySender>,
+    notification_tx: &tokio::sync::broadcast::Sender<RpcNotification>,
+    thread_id: &ThreadId,
+    turn_id: &TurnId,
+    stream_item: StreamItem,
+) {
+    match stream_item {
+        StreamItem::ItemStarted { item } => {
+            if let Err(err) = server
+                .thread_manager
+                .add_item(thread_id, turn_id, item.clone())
+            {
+                tracing::warn!("failed to append stream item_started to turn: {err}");
+            } else {
+                persist_runtime_thread(thread_db, server, thread_id).await;
+            }
+            emit_runtime_notification(
+                notify_tx,
+                notification_tx,
+                Notification::ItemStarted {
+                    turn_id: turn_id.clone(),
+                    item,
+                },
+            );
+        }
+        StreamItem::ItemCompleted { item } => {
+            if let Err(err) = server
+                .thread_manager
+                .add_item(thread_id, turn_id, item.clone())
+            {
+                tracing::warn!("failed to append stream item_completed to turn: {err}");
+            } else {
+                persist_runtime_thread(thread_db, server, thread_id).await;
+            }
+            emit_runtime_notification(
+                notify_tx,
+                notification_tx,
+                Notification::ItemCompleted {
+                    turn_id: turn_id.clone(),
+                    item,
+                },
+            );
+        }
+        StreamItem::TokenUsage { usage } => {
+            match server
+                .thread_manager
+                .set_turn_token_usage(thread_id, turn_id, usage.clone())
+            {
+                Ok(true) => persist_runtime_thread(thread_db, server, thread_id).await,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!("failed to update token usage for turn: {err}");
+                }
+            }
+            emit_runtime_notification(
+                notify_tx,
+                notification_tx,
+                Notification::TokenUsageUpdated {
+                    thread_id: thread_id.clone(),
+                    usage,
+                },
+            );
+        }
+        StreamItem::Error { message } => {
+            if let Err(err) = server.thread_manager.add_item(
+                thread_id,
+                turn_id,
+                Item::Error { code: -1, message },
+            ) {
+                tracing::warn!("failed to append stream error item to turn: {err}");
+            } else {
+                persist_runtime_thread(thread_db, server, thread_id).await;
+            }
+        }
+        StreamItem::Done => {}
+    }
+}
+
+async fn mark_turn_failed(
+    server: &crate::server::HarnessServer,
+    thread_db: &Option<crate::thread_db::ThreadDb>,
+    notify_tx: &Option<crate::notify::NotifySender>,
+    notification_tx: &tokio::sync::broadcast::Sender<RpcNotification>,
+    thread_id: &ThreadId,
+    turn_id: &TurnId,
+    error_message: String,
+) {
+    match server
+        .thread_manager
+        .mark_turn_failed_with_error(thread_id, turn_id, error_message)
+    {
+        Ok(Some(usage)) => {
+            persist_runtime_thread(thread_db, server, thread_id).await;
+            emit_runtime_notification(
+                notify_tx,
+                notification_tx,
+                Notification::TurnCompleted {
+                    turn_id: turn_id.clone(),
+                    status: TurnStatus::Failed,
+                    token_usage: usage,
+                },
+            );
+        }
+        Ok(None) => {}
+        Err(err) => tracing::warn!("failed to move turn to failed state: {err}"),
+    }
+}
+
+pub(crate) async fn run_turn_lifecycle(
+    server: Arc<crate::server::HarnessServer>,
+    thread_db: Option<crate::thread_db::ThreadDb>,
+    notify_tx: Option<crate::notify::NotifySender>,
+    notification_tx: tokio::sync::broadcast::Sender<RpcNotification>,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+    prompt: String,
+    agent_name: String,
+) {
+    let Some(project_root) = server
+        .thread_manager
+        .get_thread(&thread_id)
+        .map(|thread| thread.project_root)
+    else {
+        tracing::warn!(
+            "run_turn_lifecycle skipped because thread {} no longer exists",
+            thread_id
+        );
+        return;
+    };
+
+    let Some(agent) = server.agent_registry.get(&agent_name) else {
+        mark_turn_failed(
+            &server,
+            &thread_db,
+            &notify_tx,
+            &notification_tx,
+            &thread_id,
+            &turn_id,
+            format!("agent `{agent_name}` not found in registry"),
+        )
+        .await;
+        return;
+    };
+
+    let req = AgentRequest {
+        prompt,
+        project_root,
+        ..Default::default()
+    };
+
+    let (stream_tx, mut stream_rx) = mpsc::channel(128);
+    let mut execution = std::pin::pin!(agent.execute_stream(req, stream_tx));
+    let mut stream_closed = false;
+    let mut execution_result: Option<harness_core::Result<()>> = None;
+
+    while execution_result.is_none() || !stream_closed {
+        tokio::select! {
+            result = &mut execution, if execution_result.is_none() => {
+                execution_result = Some(result);
+            }
+            incoming = stream_rx.recv(), if !stream_closed => {
+                match incoming {
+                    Some(item) => {
+                        process_stream_item(
+                            &server,
+                            &thread_db,
+                            &notify_tx,
+                            &notification_tx,
+                            &thread_id,
+                            &turn_id,
+                            item,
+                        ).await;
+                    }
+                    None => {
+                        stream_closed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    match execution_result.unwrap_or_else(|| {
+        Err(harness_core::HarnessError::AgentExecution(
+            "turn execution ended without agent result".to_string(),
+        ))
+    }) {
+        Ok(()) => match server.thread_manager.complete_turn(&thread_id, &turn_id) {
+            Ok(Some(usage)) => {
+                persist_runtime_thread(&thread_db, &server, &thread_id).await;
+                emit_runtime_notification(
+                    &notify_tx,
+                    &notification_tx,
+                    Notification::TurnCompleted {
+                        turn_id: turn_id.clone(),
+                        status: TurnStatus::Completed,
+                        token_usage: usage,
+                    },
+                );
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!("failed to complete turn after execution: {err}"),
+        },
+        Err(err) => {
+            mark_turn_failed(
+                &server,
+                &thread_db,
+                &notify_tx,
+                &notification_tx,
+                &thread_id,
+                &turn_id,
+                err.to_string(),
+            )
+            .await;
+        }
+    }
 }
 
 pub(crate) async fn run_task(

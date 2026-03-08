@@ -1,14 +1,19 @@
 use dashmap::DashMap;
-use harness_core::{AgentId, Item, Thread, ThreadId, ThreadStatus, Turn, TurnId};
+use harness_core::{
+    AgentId, Item, Thread, ThreadId, ThreadStatus, TokenUsage, Turn, TurnId, TurnStatus,
+};
+use tokio::task::JoinHandle;
 
 pub struct ThreadManager {
     threads: DashMap<String, Thread>,
+    running_turn_tasks: DashMap<String, JoinHandle<()>>,
 }
 
 impl ThreadManager {
     pub fn new() -> Self {
         Self {
             threads: DashMap::new(),
+            running_turn_tasks: DashMap::new(),
         }
     }
 
@@ -36,6 +41,27 @@ impl ThreadManager {
         self.threads.remove(id.as_str()).is_some()
     }
 
+    pub fn register_turn_task(&self, turn_id: &TurnId, handle: JoinHandle<()>) {
+        if let Some((_, previous)) = self.running_turn_tasks.remove(turn_id.as_str()) {
+            previous.abort();
+        }
+        self.running_turn_tasks
+            .insert(turn_id.as_str().to_string(), handle);
+    }
+
+    pub fn clear_turn_task(&self, turn_id: &TurnId) {
+        self.running_turn_tasks.remove(turn_id.as_str());
+    }
+
+    pub fn abort_turn_task(&self, turn_id: &TurnId) -> bool {
+        if let Some((_, handle)) = self.running_turn_tasks.remove(turn_id.as_str()) {
+            handle.abort();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn start_turn(
         &self,
         thread_id: &ThreadId,
@@ -58,36 +84,74 @@ impl ThreadManager {
         Ok(turn_id)
     }
 
+    fn sync_thread_status(thread: &mut Thread) {
+        let has_running_turn = thread
+            .turns
+            .iter()
+            .any(|turn| matches!(turn.status, TurnStatus::Running));
+        thread.status = if has_running_turn {
+            ThreadStatus::Active
+        } else {
+            ThreadStatus::Idle
+        };
+    }
+
+    fn transition_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        target_status: TurnStatus,
+    ) -> harness_core::Result<Option<TokenUsage>> {
+        let mut thread = self
+            .threads
+            .get_mut(thread_id.as_str())
+            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(thread_id.to_string()))?;
+
+        let transitioned_usage =
+            if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
+                if matches!(turn.status, TurnStatus::Running) {
+                    match target_status {
+                        TurnStatus::Completed => turn.complete(),
+                        TurnStatus::Cancelled => turn.cancel(),
+                        TurnStatus::Failed => turn.fail(),
+                        TurnStatus::Running => {}
+                    }
+                    Some(turn.token_usage.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        Self::sync_thread_status(&mut thread);
+        thread.updated_at = chrono::Utc::now();
+        Ok(transitioned_usage)
+    }
+
     pub fn complete_turn(
         &self,
         thread_id: &ThreadId,
         turn_id: &TurnId,
-    ) -> harness_core::Result<()> {
-        let mut thread = self
-            .threads
-            .get_mut(thread_id.as_str())
-            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(thread_id.to_string()))?;
-
-        if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
-            turn.complete();
-        }
-        thread.status = ThreadStatus::Idle;
-        thread.updated_at = chrono::Utc::now();
-        Ok(())
+    ) -> harness_core::Result<Option<TokenUsage>> {
+        self.transition_turn(thread_id, turn_id, TurnStatus::Completed)
     }
 
-    pub fn cancel_turn(&self, thread_id: &ThreadId, turn_id: &TurnId) -> harness_core::Result<()> {
-        let mut thread = self
-            .threads
-            .get_mut(thread_id.as_str())
-            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(thread_id.to_string()))?;
+    pub fn fail_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+    ) -> harness_core::Result<Option<TokenUsage>> {
+        self.transition_turn(thread_id, turn_id, TurnStatus::Failed)
+    }
 
-        if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
-            turn.cancel();
-        }
-        thread.status = ThreadStatus::Idle;
-        thread.updated_at = chrono::Utc::now();
-        Ok(())
+    pub fn cancel_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+    ) -> harness_core::Result<Option<TokenUsage>> {
+        self.abort_turn_task(turn_id);
+        self.transition_turn(thread_id, turn_id, TurnStatus::Cancelled)
     }
 
     pub fn add_item(
@@ -104,7 +168,68 @@ impl ThreadManager {
         if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
             turn.items.push(item);
         }
+        thread.updated_at = chrono::Utc::now();
         Ok(())
+    }
+
+    pub fn set_turn_token_usage(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        usage: TokenUsage,
+    ) -> harness_core::Result<bool> {
+        let mut thread = self
+            .threads
+            .get_mut(thread_id.as_str())
+            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(thread_id.to_string()))?;
+
+        let mut updated = false;
+        if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
+            turn.token_usage = usage;
+            updated = true;
+        }
+        if updated {
+            thread.updated_at = chrono::Utc::now();
+        }
+        Ok(updated)
+    }
+
+    pub fn get_turn(&self, thread_id: &ThreadId, turn_id: &TurnId) -> Option<Turn> {
+        self.threads
+            .get(thread_id.as_str())
+            .and_then(|thread| thread.turns.iter().find(|t| t.id == *turn_id).cloned())
+    }
+
+    pub fn is_turn_running(&self, thread_id: &ThreadId, turn_id: &TurnId) -> bool {
+        self.get_turn(thread_id, turn_id)
+            .is_some_and(|turn| matches!(turn.status, TurnStatus::Running))
+    }
+
+    pub fn mark_turn_failed_with_error(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        message: String,
+    ) -> harness_core::Result<Option<TokenUsage>> {
+        let _ = self.add_item(thread_id, turn_id, Item::Error { code: -1, message });
+        self.fail_turn(thread_id, turn_id)
+    }
+
+    pub fn active_turn_task_count(&self) -> usize {
+        self.running_turn_tasks.len()
+    }
+
+    pub fn has_turn_task(&self, turn_id: &TurnId) -> bool {
+        self.running_turn_tasks.contains_key(turn_id.as_str())
+    }
+
+    pub fn find_thread_and_turn(&self, turn_id: &TurnId) -> Option<(ThreadId, Turn)> {
+        for entry in self.threads.iter() {
+            if let Some(turn) = entry.value().turns.iter().find(|turn| turn.id == *turn_id) {
+                return Some((entry.value().id.clone(), turn.clone()));
+            }
+        }
+        None
     }
 
     /// Find which thread contains a given turn.
@@ -203,7 +328,7 @@ impl Default for ThreadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{AgentId, Item, TurnStatus};
+    use harness_core::{AgentId, Item, TokenUsage, TurnStatus};
     use std::path::PathBuf;
 
     #[test]
@@ -252,7 +377,8 @@ mod tests {
         let tm = ThreadManager::new();
         let thread_id = tm.start_thread(PathBuf::from("/tmp"));
         let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
-        tm.complete_turn(&thread_id, &turn_id)?;
+        let usage = tm.complete_turn(&thread_id, &turn_id)?;
+        assert!(usage.is_some());
         let thread = tm
             .get_thread(&thread_id)
             .ok_or_else(|| anyhow::anyhow!("thread missing"))?;
@@ -262,6 +388,73 @@ mod tests {
             .find(|t| t.id == turn_id)
             .ok_or_else(|| anyhow::anyhow!("turn missing"))?;
         assert_eq!(turn.status, TurnStatus::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn fail_turn_updates_status() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        let usage = tm.fail_turn(&thread_id, &turn_id)?;
+        assert!(usage.is_some());
+
+        let thread = tm
+            .get_thread(&thread_id)
+            .ok_or_else(|| anyhow::anyhow!("thread missing"))?;
+        let turn = thread
+            .turns
+            .iter()
+            .find(|t| t.id == turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn missing"))?;
+        assert_eq!(turn.status, TurnStatus::Failed);
+        Ok(())
+    }
+
+    #[test]
+    fn set_turn_token_usage_updates_usage() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        let updated = tm.set_turn_token_usage(
+            &thread_id,
+            &turn_id,
+            TokenUsage {
+                input_tokens: 3,
+                output_tokens: 5,
+                total_tokens: 8,
+                cost_usd: 0.1,
+            },
+        )?;
+        assert!(updated);
+
+        let turn = tm
+            .get_turn(&thread_id, &turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn missing"))?;
+        assert_eq!(turn.token_usage.total_tokens, 8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_aborts_registered_task() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        tm.register_turn_task(&turn_id, handle);
+        assert!(tm.has_turn_task(&turn_id));
+
+        let usage = tm.cancel_turn(&thread_id, &turn_id)?;
+        assert!(usage.is_some());
+        assert!(!tm.has_turn_task(&turn_id));
+
+        let turn = tm
+            .get_turn(&thread_id, &turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn missing"))?;
+        assert_eq!(turn.status, TurnStatus::Cancelled);
         Ok(())
     }
 

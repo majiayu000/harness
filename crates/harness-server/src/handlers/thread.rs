@@ -113,11 +113,12 @@ pub async fn turn_start(
     input: String,
 ) -> RpcResponse {
     let input = harness_core::prompts::wrap_external_data(&input);
-    let agent_id = harness_core::AgentId::from_str(&state.server.config.agents.default_agent);
+    let agent_name = state.server.config.agents.default_agent.clone();
+    let agent_id = harness_core::AgentId::from_str(&agent_name);
     match state
         .server
         .thread_manager
-        .start_turn(&thread_id, input, agent_id)
+        .start_turn(&thread_id, input.clone(), agent_id)
     {
         Ok(turn_id) => {
             persist_thread(state, &thread_id).await;
@@ -128,6 +129,39 @@ pub async fn turn_start(
                     turn_id: turn_id.clone(),
                 },
             );
+
+            let lifecycle_server = state.server.clone();
+            let cleanup_server = state.server.clone();
+            let lifecycle_thread_db = state.thread_db.clone();
+            let lifecycle_notify_tx = state.notify_tx.clone();
+            let lifecycle_notification_tx = state.notification_tx.clone();
+            let lifecycle_thread_id = thread_id.clone();
+            let lifecycle_turn_id = turn_id.clone();
+            let cleanup_turn_id = turn_id.clone();
+            let lifecycle_prompt = input;
+            let lifecycle_agent = agent_name;
+
+            let handle = tokio::spawn(async move {
+                crate::task_executor::run_turn_lifecycle(
+                    lifecycle_server,
+                    lifecycle_thread_db,
+                    lifecycle_notify_tx,
+                    lifecycle_notification_tx,
+                    lifecycle_thread_id,
+                    lifecycle_turn_id,
+                    lifecycle_prompt,
+                    lifecycle_agent,
+                )
+                .await;
+                cleanup_server
+                    .thread_manager
+                    .clear_turn_task(&cleanup_turn_id);
+            });
+            state
+                .server
+                .thread_manager
+                .register_turn_task(&turn_id, handle);
+
             RpcResponse::success(id, serde_json::json!({ "turn_id": turn_id }))
         }
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -146,17 +180,20 @@ pub async fn turn_cancel(
                 .thread_manager
                 .cancel_turn(&thread_id, &turn_id)
             {
-                Ok(()) => {
+                Ok(cancel_usage) => {
+                    let cancelled = cancel_usage.is_some();
                     persist_thread(state, &thread_id).await;
-                    crate::notify::emit(
-                        &state.notify_tx,
-                        Notification::TurnCompleted {
-                            turn_id: turn_id.clone(),
-                            status: TurnStatus::Cancelled,
-                            token_usage: harness_core::TokenUsage::default(),
-                        },
-                    );
-                    RpcResponse::success(id, serde_json::json!({ "cancelled": true }))
+                    if let Some(token_usage) = cancel_usage {
+                        crate::notify::emit(
+                            &state.notify_tx,
+                            Notification::TurnCompleted {
+                                turn_id: turn_id.clone(),
+                                status: TurnStatus::Cancelled,
+                                token_usage,
+                            },
+                        );
+                    }
+                    RpcResponse::success(id, serde_json::json!({ "cancelled": cancelled }))
                 }
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             }
