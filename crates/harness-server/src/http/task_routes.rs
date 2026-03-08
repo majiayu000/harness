@@ -26,11 +26,16 @@ pub(super) async fn enqueue_task(
                 EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
             })?
         } else {
+            let classification = crate::complexity_router::classify(
+                req.prompt.as_deref().unwrap_or_default(),
+                req.issue,
+                req.pr,
+            );
             state
                 .server
                 .agent_registry
-                .default_agent()
-                .ok_or_else(|| EnqueueTaskError::Internal("no agent registered".to_string()))?
+                .dispatch(&classification)
+                .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?
         };
 
     let (reviewer, review_config) = resolve_reviewer(

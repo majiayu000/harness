@@ -591,6 +591,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     serve_config.agents.sandbox_mode,
                 )),
             );
+            if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+                agent_registry.register(
+                    "anthropic-api",
+                    Arc::new(
+                        harness_agents::anthropic_api::AnthropicApiAgent::from_config(
+                            api_key,
+                            &serve_config.agents.anthropic_api,
+                        ),
+                    ),
+                );
+            }
             let server = harness_server::server::HarnessServer::new(
                 serve_config.clone(),
                 thread_manager,
