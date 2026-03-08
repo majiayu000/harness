@@ -1,3 +1,5 @@
+mod common;
+
 use anyhow::Context;
 use async_trait::async_trait;
 use harness_agents::AgentRegistry;
@@ -113,21 +115,6 @@ impl CodeAgent for MockAgent {
     }
 }
 
-fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().expect("resolve cwd"));
-    if let Ok(dir) = tempfile::Builder::new().prefix(prefix).tempdir_in(&home) {
-        return Ok(dir);
-    }
-    let fallback = std::env::current_dir()?.join(".harness-test-home");
-    std::fs::create_dir_all(&fallback)?;
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(&fallback)
-        .map_err(Into::into)
-}
-
 async fn make_state(
     root: &Path,
     agent: Arc<dyn CodeAgent>,
@@ -225,7 +212,7 @@ async fn start_thread_and_turn(
 
 #[tokio::test]
 async fn running_to_completed_updates_items_and_usage() -> anyhow::Result<()> {
-    let sandbox = tempdir_in_home("harness-turn-lifecycle-")?;
+    let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
     let state = make_state(
         sandbox.path(),
         MockAgent::complete_after(Duration::from_millis(120)),
@@ -262,7 +249,7 @@ async fn running_to_completed_updates_items_and_usage() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn running_to_failed_is_persisted() -> anyhow::Result<()> {
-    let sandbox = tempdir_in_home("harness-turn-lifecycle-")?;
+    let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
     let state = make_state(
         sandbox.path(),
         MockAgent::fail_after(Duration::from_millis(120), "mock failure"),
@@ -289,7 +276,7 @@ async fn running_to_failed_is_persisted() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn running_to_cancelled_stops_turn() -> anyhow::Result<()> {
-    let sandbox = tempdir_in_home("harness-turn-lifecycle-")?;
+    let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
     let state = make_state(sandbox.path(), MockAgent::block_forever()).await?;
 
     let (_, turn_id) =
