@@ -21,10 +21,38 @@ fn gc_adopt_task_request(
 
 pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcResponse {
     let project_root = state.project_root.clone();
-    let violations = {
+    let (violations, guard_count) = {
         let rules = state.rules.read().await;
-        rules.scan(&project_root).await.unwrap_or_default()
+        if let Err(err) = rules.validate_scan_request(None) {
+            tracing::warn!(
+                project_root = %project_root.display(),
+                guard_count = rules.guards().len(),
+                error = %err,
+                "gc/run rejected before scan"
+            );
+            return RpcResponse::error(id, INTERNAL_ERROR, err.to_string());
+        }
+        let guard_count = rules.guards().len();
+        let violations = match rules.scan(&project_root).await {
+            Ok(violations) => violations,
+            Err(err) => {
+                tracing::warn!(
+                    project_root = %project_root.display(),
+                    guard_count,
+                    error = %err,
+                    "gc/run scan failed"
+                );
+                return RpcResponse::error(id, INTERNAL_ERROR, err.to_string());
+            }
+        };
+        (violations, guard_count)
     };
+    tracing::info!(
+        project_root = %project_root.display(),
+        guard_count,
+        violation_count = violations.len(),
+        "gc/run scan completed"
+    );
     state.events.persist_rule_scan(&project_root, &violations);
 
     let events = match state.events.query(&harness_core::EventFilters::default()) {

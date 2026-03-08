@@ -123,6 +123,18 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     if let Err(e) = rule_engine.load_builtin() {
         tracing::warn!("failed to load builtin rules: {e}");
     }
+    match rule_engine.auto_register_builtin_guards(&dir) {
+        Ok(registered) => {
+            tracing::info!(
+                registered_guard_count = registered,
+                total_guard_count = rule_engine.guards().len(),
+                "rules: builtin guard auto-registration completed"
+            );
+        }
+        Err(e) => {
+            tracing::warn!("failed to auto-register builtin guards: {e}");
+        }
+    }
     rule_engine
         .load_exec_policy_files(&server.config.rules.exec_policy_paths)
         .context("failed to load rules.exec_policy_paths")?;
@@ -418,6 +430,43 @@ async fn get_task(State(state): State<Arc<AppState>>, Path(id): Path<String>) ->
             Json(json!({"error": "task not found"})),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::build_app_state;
+    use crate::{server::HarnessServer, thread_manager::ThreadManager};
+    use harness_agents::AgentRegistry;
+    use harness_core::HarnessConfig;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn build_app_state_auto_registers_builtin_guard() -> anyhow::Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let project_root = sandbox.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+
+        let mut config = HarnessConfig::default();
+        config.server.project_root = project_root;
+        config.server.data_dir = sandbox.path().join("data");
+
+        let server = Arc::new(HarnessServer::new(
+            config,
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        ));
+        let state = build_app_state(server).await?;
+        let rules = state.rules.read().await;
+
+        assert!(
+            rules
+                .guards()
+                .iter()
+                .any(|guard| guard.id.as_str() == harness_rules::engine::BUILTIN_BASELINE_GUARD_ID),
+            "expected build_app_state to auto-register builtin guard"
+        );
+        Ok(())
     }
 }
 
