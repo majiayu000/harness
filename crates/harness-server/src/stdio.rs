@@ -133,24 +133,6 @@ mod tests {
         })
     }
 
-    fn writable_home() -> std::path::PathBuf {
-        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-        if tempfile::Builder::new()
-            .prefix("harness-home-probe-")
-            .tempdir_in(&home)
-            .is_ok()
-        {
-            return home;
-        }
-
-        let fallback = std::env::current_dir()
-            .expect("resolve cwd")
-            .join(".harness-test-home");
-        std::fs::create_dir_all(&fallback).expect("create fallback HOME");
-        std::env::set_var("HOME", &fallback);
-        fallback
-    }
-
     #[tokio::test]
     async fn stdio_processes_initialize_then_initialized() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -207,10 +189,7 @@ mod tests {
         let (notify_tx, mut notify_rx) = crate::notify::channel(8);
         state.notify_tx = Some(notify_tx);
 
-        let home = writable_home();
-        let proj_dir = tempfile::Builder::new()
-            .prefix("harness-test-")
-            .tempdir_in(&home)?;
+        let proj_dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
 
         let line = serde_json::to_string(&RpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -249,10 +228,7 @@ mod tests {
         let (notify_tx, mut notify_rx) = crate::notify::channel(8);
         state.notify_tx = Some(notify_tx);
 
-        let home = writable_home();
-        let proj_dir = tempfile::Builder::new()
-            .prefix("harness-test-")
-            .tempdir_in(&home)?;
+        let proj_dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
 
         // First create a thread.
         let thread_line = serde_json::to_string(&RpcRequest {

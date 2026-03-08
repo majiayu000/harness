@@ -113,22 +113,19 @@ impl CodeAgent for MockAgent {
     }
 }
 
-fn writable_home() -> PathBuf {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-    if tempfile::Builder::new()
-        .prefix("harness-home-probe-")
-        .tempdir_in(&home)
-        .is_ok()
-    {
-        return home;
+fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().expect("resolve cwd"));
+    if let Ok(dir) = tempfile::Builder::new().prefix(prefix).tempdir_in(&home) {
+        return Ok(dir);
     }
-
-    let fallback = std::env::current_dir()
-        .expect("resolve cwd")
-        .join(".harness-test-home");
-    std::fs::create_dir_all(&fallback).expect("create fallback HOME");
-    unsafe { std::env::set_var("HOME", &fallback) };
-    fallback
+    let fallback = std::env::current_dir()?.join(".harness-test-home");
+    std::fs::create_dir_all(&fallback)?;
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(&fallback)
+        .map_err(Into::into)
 }
 
 async fn make_state(
@@ -228,10 +225,7 @@ async fn start_thread_and_turn(
 
 #[tokio::test]
 async fn running_to_completed_updates_items_and_usage() -> anyhow::Result<()> {
-    let home = writable_home();
-    let sandbox = tempfile::Builder::new()
-        .prefix("harness-turn-lifecycle-")
-        .tempdir_in(&home)?;
+    let sandbox = tempdir_in_home("harness-turn-lifecycle-")?;
     let state = make_state(
         sandbox.path(),
         MockAgent::complete_after(Duration::from_millis(120)),
@@ -268,10 +262,7 @@ async fn running_to_completed_updates_items_and_usage() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn running_to_failed_is_persisted() -> anyhow::Result<()> {
-    let home = writable_home();
-    let sandbox = tempfile::Builder::new()
-        .prefix("harness-turn-lifecycle-")
-        .tempdir_in(&home)?;
+    let sandbox = tempdir_in_home("harness-turn-lifecycle-")?;
     let state = make_state(
         sandbox.path(),
         MockAgent::fail_after(Duration::from_millis(120), "mock failure"),
@@ -298,10 +289,7 @@ async fn running_to_failed_is_persisted() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn running_to_cancelled_stops_turn() -> anyhow::Result<()> {
-    let home = writable_home();
-    let sandbox = tempfile::Builder::new()
-        .prefix("harness-turn-lifecycle-")
-        .tempdir_in(&home)?;
+    let sandbox = tempdir_in_home("harness-turn-lifecycle-")?;
     let state = make_state(sandbox.path(), MockAgent::block_forever()).await?;
 
     let (_, turn_id) =
