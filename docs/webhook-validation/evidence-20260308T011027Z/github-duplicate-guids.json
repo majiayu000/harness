@@ -1,0 +1,22 @@
+[
+  {
+    "guid": "d1be72be-1a3b-11f1-98ae-3157e02427b4",
+    "attempts": 2,
+    "deliveries": [
+      {
+        "id": 3807339753299247104,
+        "delivered_at": "2026-03-08T00:45:30.791Z",
+        "status_code": 503,
+        "status": "Invalid HTTP Response: 503",
+        "redelivery": true
+      },
+      {
+        "id": 3807269392553607168,
+        "delivered_at": "2026-03-07T15:39:26.496Z",
+        "status_code": 202,
+        "status": "OK",
+        "redelivery": false
+      }
+    ]
+  }
+]
