@@ -35,12 +35,31 @@ pub async fn exec_plan_status(
     plan_id: ExecPlanId,
 ) -> RpcResponse {
     let plans = state.plans.read().await;
-    match plans.get(&plan_id) {
-        Some(plan) => match serde_json::to_value(plan) {
+    if let Some(plan) = plans.get(&plan_id) {
+        return match serde_json::to_value(plan) {
             Ok(v) => RpcResponse::success(id, v),
             Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
-        },
-        None => RpcResponse::error(id, NOT_FOUND, "plan not found"),
+        };
+    }
+    drop(plans);
+
+    // Fallback: query DB if plan not in memory.
+    if let Some(db) = &state.plan_db {
+        match db.get(&plan_id).await {
+            Ok(Some(plan)) => {
+                let resp = match serde_json::to_value(&plan) {
+                    Ok(v) => RpcResponse::success(id, v),
+                    Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                };
+                // Cache for subsequent lookups.
+                state.plans.write().await.insert(plan_id, plan);
+                resp
+            }
+            Ok(None) => RpcResponse::error(id, NOT_FOUND, "plan not found"),
+            Err(e) => RpcResponse::error(id, INTERNAL_ERROR, format!("db error: {e}")),
+        }
+    } else {
+        RpcResponse::error(id, NOT_FOUND, "plan not found")
     }
 }
 
@@ -51,6 +70,20 @@ pub async fn exec_plan_update(
     updates: serde_json::Value,
 ) -> RpcResponse {
     let mut plans = state.plans.write().await;
+
+    // If not in memory, try loading from DB first.
+    if !plans.contains_key(&plan_id) {
+        if let Some(db) = &state.plan_db {
+            match db.get(&plan_id).await {
+                Ok(Some(plan)) => {
+                    plans.insert(plan_id.clone(), plan);
+                }
+                Ok(None) => return RpcResponse::error(id, NOT_FOUND, "plan not found"),
+                Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, format!("db error: {e}")),
+            }
+        }
+    }
+
     match plans.get_mut(&plan_id) {
         Some(plan) => {
             let action = updates.get("action").and_then(|a| a.as_str()).unwrap_or("");

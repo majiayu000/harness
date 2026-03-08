@@ -196,7 +196,18 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         rules: Arc::new(RwLock::new(rule_engine)),
         events,
         gc_agent,
-        plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        plans: {
+            let mut map = std::collections::HashMap::new();
+            match plan_db.list().await {
+                Ok(persisted) => {
+                    for plan in persisted {
+                        map.insert(plan.id.clone(), plan);
+                    }
+                }
+                Err(e) => tracing::warn!("failed to load persisted plans on startup: {e}"),
+            }
+            Arc::new(RwLock::new(map))
+        },
         thread_db: Some(thread_db),
         plan_db: Some(plan_db),
         interceptors: vec![Arc::new(crate::contract_validator::ContractValidator::new())],
