@@ -53,6 +53,7 @@ pub struct AgentResponse {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamItem {
     ItemStarted { item: Item },
+    MessageDelta { text: String },
     ItemCompleted { item: Item },
     TokenUsage { usage: TokenUsage },
     Error { message: String },

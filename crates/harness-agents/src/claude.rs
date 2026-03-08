@@ -7,6 +7,8 @@ use harness_core::{
 use harness_sandbox::{wrap_command, SandboxSpec};
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::Stdio;
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 pub struct ClaudeCodeAgent {
@@ -23,19 +25,8 @@ impl ClaudeCodeAgent {
             sandbox_mode,
         }
     }
-}
 
-#[async_trait]
-impl CodeAgent for ClaudeCodeAgent {
-    fn name(&self) -> &str {
-        "claude"
-    }
-
-    fn capabilities(&self) -> Vec<Capability> {
-        vec![Capability::Read, Capability::Write, Capability::Execute]
-    }
-
-    async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+    fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
         let model = req.model.as_deref().unwrap_or(&self.default_model);
         let mut base_args = vec![
             OsString::from("-p"),
@@ -58,6 +49,23 @@ impl CodeAgent for ClaudeCodeAgent {
         }
 
         base_args.push(OsString::from(req.prompt.clone()));
+        base_args
+    }
+}
+
+#[async_trait]
+impl CodeAgent for ClaudeCodeAgent {
+    fn name(&self) -> &str {
+        "claude"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![Capability::Read, Capability::Write, Capability::Execute]
+    }
+
+    async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+        let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let base_args = self.base_args(&req);
 
         let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
         let wrapped_command =
@@ -101,13 +109,70 @@ impl CodeAgent for ClaudeCodeAgent {
         req: AgentRequest,
         tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::Result<()> {
-        let resp = self.execute(req).await?;
+        let base_args = self.base_args(&req);
+        let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
+        let wrapped_command =
+            wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
+                harness_core::HarnessError::AgentExecution(format!(
+                    "sandbox setup failed for claude: {error}"
+                ))
+            })?;
+
+        let mut cmd = Command::new(&wrapped_command.program);
+        cmd.args(&wrapped_command.args)
+            .current_dir(&req.project_root)
+            .env_remove("CLAUDECODE")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+
+        let mut child = cmd.spawn().map_err(|error| {
+            harness_core::HarnessError::AgentExecution(format!("failed to run claude: {error}"))
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            harness_core::HarnessError::AgentExecution("claude stdout unavailable".to_string())
+        })?;
+
+        let mut reader = BufReader::new(stdout);
+        let mut output = String::new();
+        let mut chunk = [0_u8; 1024];
+
+        loop {
+            let read = reader.read(&mut chunk).await.map_err(|error| {
+                harness_core::HarnessError::AgentExecution(format!(
+                    "failed reading claude stdout: {error}"
+                ))
+            })?;
+            if read == 0 {
+                break;
+            }
+
+            let delta = String::from_utf8_lossy(&chunk[..read]).to_string();
+            output.push_str(&delta);
+            send_stream_item(
+                &tx,
+                StreamItem::MessageDelta { text: delta },
+                self.name(),
+                "message_delta",
+            )
+            .await?;
+        }
+
+        let status = child.wait().await.map_err(|error| {
+            harness_core::HarnessError::AgentExecution(format!(
+                "failed waiting for claude process: {error}"
+            ))
+        })?;
+        if !status.success() {
+            return Err(harness_core::HarnessError::AgentExecution(format!(
+                "claude exited with {status}"
+            )));
+        }
+
         send_stream_item(
             &tx,
             StreamItem::ItemCompleted {
-                item: Item::AgentReasoning {
-                    content: resp.output.clone(),
-                },
+                item: Item::AgentReasoning { content: output },
             },
             self.name(),
             "item_completed",
@@ -116,7 +181,7 @@ impl CodeAgent for ClaudeCodeAgent {
         send_stream_item(
             &tx,
             StreamItem::TokenUsage {
-                usage: resp.token_usage,
+                usage: TokenUsage::default(),
             },
             self.name(),
             "token_usage",
@@ -130,6 +195,24 @@ impl CodeAgent for ClaudeCodeAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    fn write_executable_script(script_body: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("mock-claude.sh");
+        let script = format!("#!/bin/sh\nset -eu\n{script_body}\n");
+        fs::write(&path, script).expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&path).expect("script metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).expect("set executable permissions");
+        }
+        (dir, path)
+    }
 
     #[tokio::test]
     async fn execute_stream_returns_error_when_channel_closed() {
@@ -151,6 +234,172 @@ mod tests {
         assert!(
             message.contains("stream send failed"),
             "expected send failure in error message, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_emits_delta_before_completion_and_done() {
+        let (dir, script) = write_executable_script(
+            r#"
+printf 'hello\n'
+sleep 0.2
+printf 'world\n'
+"#,
+        );
+        let agent = ClaudeCodeAgent::new(
+            script,
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
+        let request = AgentRequest {
+            prompt: "ignored".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..AgentRequest::default()
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        agent
+            .execute_stream(request, tx)
+            .await
+            .expect("stream execution should succeed");
+
+        let mut events = Vec::new();
+        loop {
+            let item = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timed out waiting for stream item")
+                .expect("stream should not close before done");
+            let is_done = matches!(item, StreamItem::Done);
+            events.push(item);
+            if is_done {
+                break;
+            }
+        }
+
+        let first_delta = events
+            .iter()
+            .position(|item| matches!(item, StreamItem::MessageDelta { .. }))
+            .expect("expected at least one message delta");
+        let completed = events
+            .iter()
+            .position(|item| matches!(item, StreamItem::ItemCompleted { .. }))
+            .expect("expected item completed event");
+        let done = events
+            .iter()
+            .position(|item| matches!(item, StreamItem::Done))
+            .expect("expected done event");
+        assert!(
+            first_delta < completed,
+            "delta must precede item completed: {events:?}"
+        );
+        assert!(
+            completed < done,
+            "item completed must precede done: {events:?}"
+        );
+
+        match &events[completed] {
+            StreamItem::ItemCompleted {
+                item: Item::AgentReasoning { content },
+            } => {
+                assert!(
+                    content.contains("hello") && content.contains("world"),
+                    "completed content should include streamed output, got: {content:?}"
+                );
+            }
+            other => panic!("unexpected completed event payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_stream_cancel_path_converges_when_receiver_dropped_mid_stream() {
+        let (dir, script) = write_executable_script(
+            r#"
+printf 'first\n'
+sleep 0.3
+printf 'second\n'
+"#,
+        );
+        let agent = ClaudeCodeAgent::new(
+            script,
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
+        let request = AgentRequest {
+            prompt: "ignored".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..AgentRequest::default()
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let handle = tokio::spawn(async move { agent.execute_stream(request, tx).await });
+
+        let first = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for first stream item")
+            .expect("stream closed before first item");
+        assert!(
+            matches!(first, StreamItem::MessageDelta { .. }),
+            "expected first event to be delta, got {first:?}"
+        );
+
+        drop(rx);
+
+        let result = timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("execute_stream task should converge after cancellation")
+            .expect("join should succeed");
+        let err = result.expect_err("receiver drop should surface send failure");
+        assert!(
+            err.to_string().contains("stream send failed"),
+            "expected stream send failure after cancellation, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_timeout_drop_does_not_leave_hanging_process() {
+        let (dir, script) = write_executable_script("sleep 1\n");
+        let marker = dir.path().join("timeout-marker.txt");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nset -eu\nsleep 1\necho reached > \"{}\"\n",
+                marker.display()
+            ),
+        )
+        .expect("rewrite timeout script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script)
+                .expect("script metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).expect("set executable permissions");
+        }
+
+        let agent = ClaudeCodeAgent::new(
+            script,
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
+        let request = AgentRequest {
+            prompt: "ignored".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..AgentRequest::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        let timed = timeout(
+            Duration::from_millis(100),
+            agent.execute_stream(request, tx),
+        )
+        .await;
+        assert!(timed.is_err(), "expected timeout on long-running stream");
+
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(
+            !marker.exists(),
+            "process should be killed when stream future is dropped on timeout"
         );
     }
 }
