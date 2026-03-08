@@ -421,24 +421,6 @@ mod tests {
         }
     }
 
-    fn writable_home() -> std::path::PathBuf {
-        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-        if tempfile::Builder::new()
-            .prefix("harness-home-probe-")
-            .tempdir_in(&home)
-            .is_ok()
-        {
-            return home;
-        }
-
-        let fallback = std::env::current_dir()
-            .expect("resolve cwd")
-            .join(".harness-test-home");
-        std::fs::create_dir_all(&fallback).expect("create fallback HOME");
-        std::env::set_var("HOME", &fallback);
-        fallback
-    }
-
     #[async_trait]
     impl harness_core::CodeAgent for CapturingAgent {
         fn name(&self) -> &str {
@@ -480,10 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn skills_are_injected_into_agent_context() -> anyhow::Result<()> {
-        let home = writable_home();
-        let dir = tempfile::Builder::new()
-            .prefix("harness-test-")
-            .tempdir_in(&home)?;
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
 
         let mut skill_store = harness_skills::SkillStore::new();
@@ -551,10 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_interceptor_fails_task() -> anyhow::Result<()> {
-        let home = writable_home();
-        let dir = tempfile::Builder::new()
-            .prefix("harness-test-")
-            .tempdir_in(&home)?;
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
         let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
         let agent = CapturingAgent::new();
@@ -610,10 +586,7 @@ mod tests {
     #[tokio::test]
     async fn mutate_and_persist_with_counts_waiting_entries_in_single_snapshot(
     ) -> anyhow::Result<()> {
-        let home = writable_home();
-        let dir = tempfile::Builder::new()
-            .prefix("harness-test-")
-            .tempdir_in(&home)?;
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
 
         let task_id = TaskId::new();

@@ -244,24 +244,6 @@ mod tests {
         })
     }
 
-    fn writable_home() -> std::path::PathBuf {
-        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-        if tempfile::Builder::new()
-            .prefix("harness-home-probe-")
-            .tempdir_in(&home)
-            .is_ok()
-        {
-            return home;
-        }
-
-        let fallback = std::env::current_dir()
-            .expect("resolve cwd")
-            .join(".harness-test-home");
-        std::fs::create_dir_all(&fallback).expect("create fallback HOME");
-        std::env::set_var("HOME", &fallback);
-        fallback
-    }
-
     #[tokio::test]
     async fn initialized_returns_success() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -499,10 +481,7 @@ mod tests {
     }
 
     async fn run_gc_adopt_and_wait_for_failure_turn(max_rounds: u32) -> anyhow::Result<u32> {
-        let home = writable_home();
-        let dir = tempfile::Builder::new()
-            .prefix("harness-gc-test-")
-            .tempdir_in(&home)?;
+        let dir = crate::test_helpers::tempdir_in_home("harness-gc-test-")?;
         let mut config = HarnessConfig::default();
         config.gc.adopt_wait_secs = 0;
         config.gc.adopt_max_rounds = max_rounds;
@@ -660,10 +639,7 @@ mod tests {
     async fn rule_check_returns_warning_when_no_guards_loaded() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
-        let home = writable_home();
-        let proj_dir = tempfile::Builder::new()
-            .prefix("harness-test-")
-            .tempdir_in(&home)?;
+        let proj_dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -823,10 +799,7 @@ mod tests {
     async fn thread_start_persists_to_db() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
-        let home = writable_home();
-        let proj_dir = tempfile::Builder::new()
-            .prefix("harness-test-")
-            .tempdir_in(&home)?;
+        let proj_dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let canonical_proj = proj_dir.path().canonicalize()?;
 
         let req = RpcRequest {
