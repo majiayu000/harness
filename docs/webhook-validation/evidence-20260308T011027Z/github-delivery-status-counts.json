@@ -1,0 +1,17 @@
+[
+  {
+    "status_code": 202,
+    "count": 37,
+    "status": "OK"
+  },
+  {
+    "status_code": 503,
+    "count": 5,
+    "status": "Invalid HTTP Response: 503"
+  },
+  {
+    "status_code": 530,
+    "count": 1,
+    "status": "Invalid HTTP Response: 530"
+  }
+]
