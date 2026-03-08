@@ -1,6 +1,5 @@
 //! Prompt templates and output parsers shared across CLI and HTTP entries.
 
-
 /// Build prompt: continue work on an existing PR for a GitHub issue.
 ///
 /// Used when a prior task already created a PR for this issue. Instead of
