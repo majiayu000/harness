@@ -265,6 +265,16 @@ async fn process_stream_item(
                 persist_runtime_thread(thread_db, server, thread_id).await;
             }
         }
+        StreamItem::MessageDelta { text } => {
+            emit_runtime_notification(
+                notify_tx,
+                notification_tx,
+                Notification::MessageDelta {
+                    turn_id: turn_id.clone(),
+                    text,
+                },
+            );
+        }
         StreamItem::Done => {}
     }
 }
