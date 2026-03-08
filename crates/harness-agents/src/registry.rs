@@ -135,8 +135,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dispatch_complex_task_prefers_claude() {
+    fn registry_with_default() -> AgentRegistry {
         let mut registry = AgentRegistry::new("default-agent");
         registry.register(
             "default-agent",
@@ -144,6 +143,12 @@ mod tests {
                 agent_name: "default-agent",
             }),
         );
+        registry
+    }
+
+    #[test]
+    fn dispatch_complex_task_prefers_claude() {
+        let mut registry = registry_with_default();
         registry.register(
             "claude",
             Arc::new(StubAgent {
@@ -159,13 +164,7 @@ mod tests {
 
     #[test]
     fn dispatch_complex_task_falls_back_to_anthropic_api_when_no_claude() {
-        let mut registry = AgentRegistry::new("default-agent");
-        registry.register(
-            "default-agent",
-            Arc::new(StubAgent {
-                agent_name: "default-agent",
-            }),
-        );
+        let mut registry = registry_with_default();
         registry.register(
             "anthropic-api",
             Arc::new(StubAgent {
@@ -181,13 +180,7 @@ mod tests {
 
     #[test]
     fn dispatch_simple_task_uses_default_agent() {
-        let mut registry = AgentRegistry::new("default-agent");
-        registry.register(
-            "default-agent",
-            Arc::new(StubAgent {
-                agent_name: "default-agent",
-            }),
-        );
+        let mut registry = registry_with_default();
         registry.register(
             "claude",
             Arc::new(StubAgent {
