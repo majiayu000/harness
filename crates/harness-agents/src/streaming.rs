@@ -28,9 +28,10 @@ pub(crate) async fn stream_child_output(
     tx: &Sender<StreamItem>,
     agent_name: &str,
 ) -> harness_core::Result<String> {
-    let stdout = child.stdout.take().ok_or_else(|| {
-        HarnessError::AgentExecution(format!("{agent_name} stdout unavailable"))
-    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HarnessError::AgentExecution(format!("{agent_name} stdout unavailable")))?;
 
     let mut reader = BufReader::new(stdout);
     let mut output = String::new();
@@ -38,9 +39,7 @@ pub(crate) async fn stream_child_output(
 
     loop {
         let read = reader.read(&mut chunk).await.map_err(|error| {
-            HarnessError::AgentExecution(format!(
-                "failed reading {agent_name} stdout: {error}"
-            ))
+            HarnessError::AgentExecution(format!("failed reading {agent_name} stdout: {error}"))
         })?;
         if read == 0 {
             break;
@@ -58,9 +57,7 @@ pub(crate) async fn stream_child_output(
     }
 
     let status = child.wait().await.map_err(|error| {
-        HarnessError::AgentExecution(format!(
-            "failed waiting for {agent_name} process: {error}"
-        ))
+        HarnessError::AgentExecution(format!("failed waiting for {agent_name} process: {error}"))
     })?;
     if !status.success() {
         return Err(HarnessError::AgentExecution(format!(
