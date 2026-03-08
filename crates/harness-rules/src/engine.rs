@@ -7,6 +7,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+pub const BUILTIN_BASELINE_GUARD_ID: &str = "BUILTIN-BASELINE-SCAN";
+pub const WARN_NO_GUARDS_REGISTERED: &str = "rule scan warning: no guards registered";
+pub const WARN_EMPTY_SCAN_INPUT: &str = "rule scan warning: empty scan input";
+
+const BUILTIN_BASELINE_GUARD_FILE: &str = "builtin-baseline-scan.sh";
+const BUILTIN_BASELINE_GUARD_SCRIPT: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+# Baseline built-in guard. It exists to make default scan execution observable
+# and intentionally emits no violations.
+project_root="${1:-}"
+if [[ -z "${project_root}" ]]; then
+  exit 0
+fi
+exit 0
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub id: RuleId,
@@ -283,7 +299,79 @@ impl RuleEngine {
     }
 
     pub fn register_guard(&mut self, guard: Guard) {
+        if self.guards.iter().any(|existing| existing.id == guard.id) {
+            return;
+        }
         self.guards.push(guard);
+    }
+
+    pub fn auto_register_builtin_guards(&mut self, data_dir: &Path) -> anyhow::Result<usize> {
+        if self
+            .guards
+            .iter()
+            .any(|guard| guard.id.as_str() == BUILTIN_BASELINE_GUARD_ID)
+        {
+            return Ok(0);
+        }
+
+        let guard_dir = data_dir.join("guards");
+        std::fs::create_dir_all(&guard_dir).with_context(|| {
+            format!(
+                "failed to create builtin guard directory: {}",
+                guard_dir.display()
+            )
+        })?;
+
+        let script_path = guard_dir.join(BUILTIN_BASELINE_GUARD_FILE);
+        std::fs::write(&script_path, BUILTIN_BASELINE_GUARD_SCRIPT).with_context(|| {
+            format!(
+                "failed to write builtin guard script: {}",
+                script_path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .with_context(|| {
+                    format!(
+                        "failed to read builtin guard metadata: {}",
+                        script_path.display()
+                    )
+                })?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).with_context(|| {
+                format!(
+                    "failed to set builtin guard executable bit: {}",
+                    script_path.display()
+                )
+            })?;
+        }
+
+        self.register_guard(Guard {
+            id: GuardId::from_str(BUILTIN_BASELINE_GUARD_ID),
+            script_path,
+            language: Language::Common,
+            rules: Vec::new(),
+        });
+        Ok(1)
+    }
+
+    pub fn validate_scan_request(&self, files: Option<&[PathBuf]>) -> anyhow::Result<()> {
+        if let Some(files) = files {
+            if files.is_empty() {
+                tracing::warn!("{WARN_EMPTY_SCAN_INPUT}");
+                anyhow::bail!(WARN_EMPTY_SCAN_INPUT);
+            }
+        }
+
+        if self.guards.is_empty() {
+            tracing::warn!("{WARN_NO_GUARDS_REGISTERED}");
+            anyhow::bail!(WARN_NO_GUARDS_REGISTERED);
+        }
+
+        Ok(())
     }
 
     /// Scan a project for violations using registered guards.
@@ -574,6 +662,54 @@ mod tests {
         engine.add_rule(make("duplicate"));
         assert_eq!(engine.rules().len(), 1, "duplicate rule_id must be skipped");
         assert_eq!(engine.rules()[0].title, "first");
+    }
+
+    #[test]
+    fn auto_register_builtin_guards_registers_guard_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut engine = RuleEngine::new();
+        let first = engine.auto_register_builtin_guards(dir.path())?;
+        let second = engine.auto_register_builtin_guards(dir.path())?;
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 0);
+        assert_eq!(engine.guards().len(), 1);
+        assert_eq!(engine.guards()[0].id.as_str(), BUILTIN_BASELINE_GUARD_ID);
+        assert!(
+            engine.guards()[0].script_path.is_file(),
+            "builtin guard script should be materialized on disk"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_scan_request_rejects_missing_guards() {
+        let engine = RuleEngine::new();
+        let err = engine
+            .validate_scan_request(None)
+            .expect_err("missing guards should be rejected");
+        assert!(
+            err.to_string().contains(WARN_NO_GUARDS_REGISTERED),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_scan_request_rejects_empty_file_input() {
+        let mut engine = RuleEngine::new();
+        engine.register_guard(Guard {
+            id: GuardId::from_str("TEST-GUARD"),
+            script_path: PathBuf::from("unused.sh"),
+            language: Language::Common,
+            rules: vec![],
+        });
+        let err = engine
+            .validate_scan_request(Some(&[]))
+            .expect_err("empty scan input should be rejected");
+        assert!(
+            err.to_string().contains(WARN_EMPTY_SCAN_INPUT),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

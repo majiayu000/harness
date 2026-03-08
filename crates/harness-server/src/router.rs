@@ -179,7 +179,7 @@ mod tests {
     use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
     use harness_agents::AgentRegistry;
     use harness_core::HarnessConfig;
-    use harness_protocol::{Method, RpcRequest};
+    use harness_protocol::{Method, RpcRequest, INTERNAL_ERROR};
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -657,7 +657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_check_logs_no_violations_when_no_guards_loaded() -> anyhow::Result<()> {
+    async fn rule_check_returns_warning_when_no_guards_loaded() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
         let home = writable_home();
@@ -677,23 +677,30 @@ mod tests {
             .await
             .expect("expected response for request with id");
 
-        assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
-        let violations: Vec<serde_json::Value> = serde_json::from_value(
-            resp.result
-                .ok_or_else(|| anyhow::anyhow!("missing result"))?,
-        )?;
+        let error = resp
+            .error
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("expected warning error response"))?;
+        assert_eq!(error.code, INTERNAL_ERROR);
         assert!(
-            violations.is_empty(),
-            "no guards loaded, violations must be empty"
+            error
+                .message
+                .contains(harness_rules::engine::WARN_NO_GUARDS_REGISTERED),
+            "expected explicit warning message, got: {}",
+            error.message
+        );
+        assert!(
+            resp.result.is_none(),
+            "warning path should not return a success payload"
         );
 
         let events = state.events.query(&harness_core::EventFilters {
-            hook: Some("rule_check".to_string()),
+            hook: Some("rule_scan".to_string()),
             ..Default::default()
         })?;
         assert!(
             events.is_empty(),
-            "no events should be logged when there are no violations"
+            "no scan event should be logged when scan request is rejected"
         );
         Ok(())
     }
