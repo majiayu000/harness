@@ -2,7 +2,10 @@ use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager
 use harness_agents::AgentRegistry;
 use harness_core::HarnessConfig;
 use std::path::PathBuf;
-use std::sync::{atomic::{AtomicBool, AtomicU64}, Arc};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64},
+    Arc,
+};
 use tokio::sync::{broadcast, RwLock};
 
 /// Create a temp directory under a writable base path without mutating
