@@ -1,5 +1,5 @@
 use harness_agents::AgentRegistry;
-use harness_core::{HarnessConfig, ThreadId, TurnId};
+use harness_core::{HarnessConfig, ThreadId};
 use harness_server::{
     handlers::thread::{thread_start, turn_start},
     http::build_app_state,
@@ -59,7 +59,11 @@ async fn thread_start_delivers_status_changed_notification() -> anyhow::Result<(
 
     let cwd = sandbox.path().join("project");
     let resp = thread_start(&state, Some(serde_json::json!(1)), cwd).await;
-    assert!(resp.error.is_none(), "thread_start failed: {:?}", resp.error);
+    assert!(
+        resp.error.is_none(),
+        "thread_start failed: {:?}",
+        resp.error
+    );
     let thread_id_str = parse_str_field(resp.result.as_ref().unwrap(), "thread_id")?;
 
     let notif = notify_rx

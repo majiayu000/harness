@@ -82,7 +82,146 @@ impl AdapterRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{AgentEvent, TurnRequest};
+    use harness_core::{
+        AgentEvent, AgentRequest, AgentResponse, Capability, CodeAgent, StreamItem,
+        TaskClassification, TaskComplexity, TokenUsage, TurnRequest,
+    };
+
+    struct StubAgent {
+        agent_name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl CodeAgent for StubAgent {
+        fn name(&self) -> &str {
+            self.agent_name
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+
+        async fn execute(&self, _req: AgentRequest) -> harness_core::Result<AgentResponse> {
+            Ok(AgentResponse {
+                output: String::new(),
+                stderr: String::new(),
+                items: vec![],
+                token_usage: TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    cost_usd: 0.0,
+                },
+                model: self.agent_name.to_string(),
+                exit_code: Some(0),
+            })
+        }
+
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            _tx: tokio::sync::mpsc::Sender<StreamItem>,
+        ) -> harness_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn classification(complexity: TaskComplexity) -> TaskClassification {
+        TaskClassification {
+            complexity,
+            language: None,
+            requires_write: false,
+            requires_network: false,
+        }
+    }
+
+    #[test]
+    fn dispatch_complex_task_prefers_claude() {
+        let mut registry = AgentRegistry::new("default-agent");
+        registry.register(
+            "default-agent",
+            Arc::new(StubAgent {
+                agent_name: "default-agent",
+            }),
+        );
+        registry.register(
+            "claude",
+            Arc::new(StubAgent {
+                agent_name: "claude",
+            }),
+        );
+
+        let agent = registry
+            .dispatch(&classification(TaskComplexity::Complex))
+            .unwrap();
+        assert_eq!(agent.name(), "claude");
+    }
+
+    #[test]
+    fn dispatch_complex_task_falls_back_to_anthropic_api_when_no_claude() {
+        let mut registry = AgentRegistry::new("default-agent");
+        registry.register(
+            "default-agent",
+            Arc::new(StubAgent {
+                agent_name: "default-agent",
+            }),
+        );
+        registry.register(
+            "anthropic-api",
+            Arc::new(StubAgent {
+                agent_name: "anthropic-api",
+            }),
+        );
+
+        let agent = registry
+            .dispatch(&classification(TaskComplexity::Complex))
+            .unwrap();
+        assert_eq!(agent.name(), "anthropic-api");
+    }
+
+    #[test]
+    fn dispatch_simple_task_uses_default_agent() {
+        let mut registry = AgentRegistry::new("default-agent");
+        registry.register(
+            "default-agent",
+            Arc::new(StubAgent {
+                agent_name: "default-agent",
+            }),
+        );
+        registry.register(
+            "claude",
+            Arc::new(StubAgent {
+                agent_name: "claude",
+            }),
+        );
+
+        let agent = registry
+            .dispatch(&classification(TaskComplexity::Simple))
+            .unwrap();
+        assert_eq!(agent.name(), "default-agent");
+    }
+
+    #[test]
+    fn dispatch_returns_error_when_no_agents_registered() {
+        let registry = AgentRegistry::new("missing");
+        let result = registry.dispatch(&classification(TaskComplexity::Simple));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn anthropic_api_agent_is_registered_and_retrievable() {
+        let mut registry = AgentRegistry::new("anthropic-api");
+        registry.register(
+            "anthropic-api",
+            Arc::new(StubAgent {
+                agent_name: "anthropic-api",
+            }),
+        );
+
+        let agent = registry.get("anthropic-api");
+        assert!(agent.is_some());
+        assert_eq!(agent.unwrap().name(), "anthropic-api");
+    }
 
     struct MockAdapter;
 
