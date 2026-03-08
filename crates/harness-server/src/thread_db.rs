@@ -3,6 +3,7 @@ use harness_core::{Thread, ThreadId, ThreadStatus};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 
+#[derive(Clone)]
 pub struct ThreadDb {
     pool: SqlitePool,
 }
