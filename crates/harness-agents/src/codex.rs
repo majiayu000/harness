@@ -1,16 +1,15 @@
 use crate::cloud_setup;
-use crate::streaming::send_stream_item;
+use crate::streaming::{send_stream_item, stream_child_output};
 use async_trait::async_trait;
 use harness_core::SandboxMode;
 use harness_core::{
-    AgentRequest, AgentResponse, Capability, CodeAgent, CodexAgentConfig, CodexCloudConfig, Item,
+    AgentRequest, AgentResponse, Capability, CodeAgent, CodexAgentConfig, CodexCloudConfig,
     StreamItem, TokenUsage,
 };
 use harness_sandbox::{wrap_command, SandboxSpec};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 pub struct CodexAgent {
@@ -151,55 +150,8 @@ impl CodeAgent for CodexAgent {
         let mut child = cmd.spawn().map_err(|error| {
             harness_core::HarnessError::AgentExecution(format!("failed to run codex: {error}"))
         })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            harness_core::HarnessError::AgentExecution("codex stdout unavailable".to_string())
-        })?;
 
-        let mut reader = BufReader::new(stdout);
-        let mut output = String::new();
-        let mut chunk = [0_u8; 1024];
-
-        loop {
-            let read = reader.read(&mut chunk).await.map_err(|error| {
-                harness_core::HarnessError::AgentExecution(format!(
-                    "failed reading codex stdout: {error}"
-                ))
-            })?;
-            if read == 0 {
-                break;
-            }
-
-            let delta = String::from_utf8_lossy(&chunk[..read]).to_string();
-            output.push_str(&delta);
-            send_stream_item(
-                &tx,
-                StreamItem::MessageDelta { text: delta },
-                self.name(),
-                "message_delta",
-            )
-            .await?;
-        }
-
-        let status = child.wait().await.map_err(|error| {
-            harness_core::HarnessError::AgentExecution(format!(
-                "failed waiting for codex process: {error}"
-            ))
-        })?;
-        if !status.success() {
-            return Err(harness_core::HarnessError::AgentExecution(format!(
-                "codex exited with {status}"
-            )));
-        }
-
-        send_stream_item(
-            &tx,
-            StreamItem::ItemCompleted {
-                item: Item::AgentReasoning { content: output },
-            },
-            self.name(),
-            "item_completed",
-        )
-        .await?;
+        stream_child_output(&mut child, &tx, self.name()).await?;
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
     }
@@ -215,6 +167,7 @@ fn codex_approval_mode(mode: SandboxMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::Item;
     use std::fs;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
