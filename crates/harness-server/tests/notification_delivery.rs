@@ -1,5 +1,8 @@
+mod common;
+
 use harness_agents::AgentRegistry;
-use harness_core::{HarnessConfig, ThreadId};
+use harness_core::{HarnessConfig, ThreadId, ThreadStatus};
+use harness_protocol::Notification;
 use harness_server::{
     handlers::thread::{thread_start, turn_start},
     http::build_app_state,
@@ -8,18 +11,6 @@ use harness_server::{
     thread_manager::ThreadManager,
 };
 use std::sync::Arc;
-
-fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
-    if let Ok(home) = std::env::var("HOME") {
-        if let Ok(dir) = tempfile::Builder::new().prefix(prefix).tempdir_in(home) {
-            return Ok(dir);
-        }
-    }
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir()
-        .map_err(Into::into)
-}
 
 async fn make_state(root: &std::path::Path) -> anyhow::Result<harness_server::http::AppState> {
     let project_root = root.join("project");
@@ -47,7 +38,7 @@ fn parse_str_field(value: &serde_json::Value, field: &str) -> anyhow::Result<Str
 
 #[tokio::test]
 async fn thread_start_delivers_status_changed_notification() -> anyhow::Result<()> {
-    let sandbox = tempdir_in_home("harness-notif-")?;
+    let sandbox = common::tempdir_in_home("harness-notif-")?;
     let mut state = make_state(sandbox.path()).await?;
 
     let (notify_tx, mut notify_rx) = notify::channel(8);
@@ -65,21 +56,21 @@ async fn thread_start_delivers_status_changed_notification() -> anyhow::Result<(
     let notif = notify_rx
         .try_recv()
         .expect("thread_start should emit a notification");
-    let json = serde_json::to_string(&notif)?;
-    assert!(
-        json.contains("thread/status_changed"),
-        "expected thread/status_changed notification, got: {json}"
-    );
-    assert!(
-        json.contains(&thread_id_str),
-        "notification should contain the thread_id, got: {json}"
-    );
+    if let Notification::ThreadStatusChanged { thread_id, status } = notif.notification {
+        assert_eq!(thread_id.as_str(), thread_id_str);
+        assert_eq!(status, ThreadStatus::Idle);
+    } else {
+        panic!(
+            "expected thread/status_changed notification, got: {:?}",
+            notif.notification
+        );
+    }
     Ok(())
 }
 
 #[tokio::test]
 async fn turn_start_delivers_turn_started_notification() -> anyhow::Result<()> {
-    let sandbox = tempdir_in_home("harness-notif-")?;
+    let sandbox = common::tempdir_in_home("harness-notif-")?;
     let mut state = make_state(sandbox.path()).await?;
 
     let (notify_tx, mut notify_rx) = notify::channel(8);
@@ -118,18 +109,14 @@ async fn turn_start_delivers_turn_started_notification() -> anyhow::Result<()> {
     let notif = notify_rx
         .try_recv()
         .expect("turn_start should emit a turn/started notification");
-    let json = serde_json::to_string(&notif)?;
-    assert!(
-        json.contains("turn/started"),
-        "expected turn/started notification, got: {json}"
-    );
-    assert!(
-        json.contains(&thread_id_str),
-        "notification should contain the thread_id, got: {json}"
-    );
-    assert!(
-        json.contains(&turn_id_str),
-        "notification should contain the turn_id, got: {json}"
-    );
+    if let Notification::TurnStarted { thread_id, turn_id } = notif.notification {
+        assert_eq!(thread_id.as_str(), thread_id_str);
+        assert_eq!(turn_id.as_str(), turn_id_str);
+    } else {
+        panic!(
+            "expected turn/started notification, got: {:?}",
+            notif.notification
+        );
+    }
     Ok(())
 }
