@@ -2,9 +2,17 @@ use crate::task_db::TaskDb;
 use dashmap::DashMap;
 use harness_core::{CodeAgent, Decision, Event, SessionId};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+
+/// Async callback invoked when a task reaches a terminal state (Done/Failed).
+/// Receives a snapshot of the final `TaskState`. Implemented in the intake layer
+/// to call `IntakeSource::on_task_complete` without creating circular dependencies.
+pub type CompletionCallback =
+    Arc<dyn Fn(TaskState) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TaskId(pub String);
@@ -42,6 +50,12 @@ pub struct TaskState {
     pub pr_url: Option<String>,
     pub rounds: Vec<RoundResult>,
     pub error: Option<String>,
+    /// Intake source name that created this task (e.g. "github", "feishu").
+    /// Persisted so the association survives server restart.
+    pub source: Option<String>,
+    /// Source-specific identifier for the originating issue/message.
+    /// Used by `CompletionCallback` to call `IntakeSource::on_task_complete`.
+    pub external_id: Option<String>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -63,6 +77,8 @@ impl TaskState {
             pr_url: None,
             rounds: Vec::new(),
             error: None,
+            source: None,
+            external_id: None,
         }
     }
 
