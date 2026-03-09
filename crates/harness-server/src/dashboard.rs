@@ -51,6 +51,12 @@ pub async fn index() -> impl IntoResponse {
 </section>
 
 <section class="section-card">
+  <h2 class="section-title">Intake Channels</h2>
+  <div id="pipeline-row" class="pipeline-row"></div>
+  <div id="channel-grid" class="channel-grid"></div>
+</section>
+
+<section class="section-card">
   <h2 class="section-title">Submit Task</h2>
   <form id="task-form" class="task-form" novalidate>
     <div class="form-group">

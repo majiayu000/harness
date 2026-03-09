@@ -66,6 +66,8 @@ pub struct TaskSummary {
     pub turn: u32,
     pub pr_url: Option<String>,
     pub error: Option<String>,
+    /// Intake source name (e.g. "github", "feishu", "dashboard"). None for manual tasks.
+    pub source: Option<String>,
 }
 
 impl TaskState {
@@ -89,6 +91,7 @@ impl TaskState {
             turn: self.turn,
             pr_url: self.pr_url.clone(),
             error: self.error.clone(),
+            source: self.source.clone(),
         }
     }
 }

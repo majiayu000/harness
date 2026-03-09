@@ -138,6 +138,12 @@ fn task_app(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+fn intake_app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/api/intake", get(intake_status))
+        .with_state(state)
+}
+
 fn webhook_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route(
@@ -571,5 +577,131 @@ async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
     let get_body = get_resp.into_body().collect().await?.to_bytes();
     let task_json: serde_json::Value = serde_json::from_slice(&get_body)?;
     assert_eq!(task_json["id"], task_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn intake_status_returns_three_channels() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = intake_app(state);
+
+    use http_body_util::BodyExt;
+    let response = app
+        .oneshot(Request::builder().uri("/api/intake").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await?.to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+
+    let channels = json["channels"].as_array().expect("channels is array");
+    assert_eq!(channels.len(), 3);
+    let names: Vec<&str> = channels
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"github"));
+    assert!(names.contains(&"feishu"));
+    assert!(names.contains(&"dashboard"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn intake_status_github_disabled_by_default() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = intake_app(state);
+
+    use http_body_util::BodyExt;
+    let response = app
+        .oneshot(Request::builder().uri("/api/intake").body(Body::empty())?)
+        .await?;
+
+    let body = response.into_body().collect().await?.to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    let github = json["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "github")
+        .expect("github channel present");
+    assert_eq!(github["enabled"], false);
+    Ok(())
+}
+
+#[tokio::test]
+async fn intake_status_dashboard_always_enabled() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = intake_app(state);
+
+    use http_body_util::BodyExt;
+    let response = app
+        .oneshot(Request::builder().uri("/api/intake").body(Body::empty())?)
+        .await?;
+
+    let body = response.into_body().collect().await?.to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    let dashboard = json["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "dashboard")
+        .expect("dashboard channel present");
+    assert_eq!(dashboard["enabled"], true);
+    Ok(())
+}
+
+#[tokio::test]
+async fn intake_status_shows_github_repo_when_configured() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::HarnessConfig::default();
+    config.intake.github = Some(harness_core::GitHubIntakeConfig {
+        enabled: true,
+        repo: "owner/myrepo".to_string(),
+        label: "harness".to_string(),
+        poll_interval_secs: 30,
+    });
+    let state = make_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = intake_app(state);
+
+    use http_body_util::BodyExt;
+    let response = app
+        .oneshot(Request::builder().uri("/api/intake").body(Body::empty())?)
+        .await?;
+
+    let body = response.into_body().collect().await?.to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    let github = json["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "github")
+        .expect("github channel present");
+    assert_eq!(github["enabled"], true);
+    assert_eq!(github["repo"], "owner/myrepo");
+    Ok(())
+}
+
+#[tokio::test]
+async fn intake_status_recent_dispatches_empty_initially() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = intake_app(state);
+
+    use http_body_util::BodyExt;
+    let response = app
+        .oneshot(Request::builder().uri("/api/intake").body(Body::empty())?)
+        .await?;
+
+    let body = response.into_body().collect().await?.to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert!(json["recent_dispatches"].as_array().unwrap().is_empty());
     Ok(())
 }
