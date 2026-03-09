@@ -25,9 +25,21 @@ async function fetchTasks() {
     const tasks = await resp.json();
     renderBoard(tasks);
     updateMetrics(tasks);
+    renderPipeline(tasks);
     updateStatus(true);
   } catch {
     updateStatus(false);
+  }
+}
+
+async function fetchIntake() {
+  try {
+    const resp = await fetch("/api/intake");
+    if (!resp.ok) return;
+    const data = await resp.json();
+    renderIntakeChannels(data.channels || []);
+  } catch {
+    // intake api unavailable — leave channel grid empty
   }
 }
 
@@ -52,6 +64,56 @@ function updateStatus(connected) {
     badge.textContent = "Offline";
     badge.className = "status-badge";
   }
+}
+
+function renderPipeline(tasks) {
+  const row = document.getElementById("pipeline-row");
+  if (!row) return;
+
+  const stages = [
+    { keys: ["pending"], label: "Queued" },
+    { keys: ["implementing", "agent_review", "waiting"], label: "Building" },
+    { keys: ["reviewing"], label: "Review" },
+    { keys: ["done"], label: "Done" },
+    { keys: ["failed"], label: "Failed" },
+  ];
+
+  const counts = {};
+  tasks.forEach(t => { counts[t.status] = (counts[t.status] || 0) + 1; });
+
+  row.innerHTML = stages.map((s, i) => {
+    const count = s.keys.reduce((acc, k) => acc + (counts[k] || 0), 0);
+    const arrow = i > 0 ? '<span class="pipeline-arrow">&#8594;</span>' : "";
+    return arrow +
+      `<div class="pipeline-step">` +
+        `<span class="pipeline-count">${count}</span>` +
+        `<span class="pipeline-label">${s.label}</span>` +
+      `</div>`;
+  }).join("");
+}
+
+function renderIntakeChannels(channels) {
+  const grid = document.getElementById("channel-grid");
+  if (!grid) return;
+  grid.innerHTML = "";
+
+  channels.forEach(ch => {
+    const enabled = Boolean(ch.enabled);
+    const card = document.createElement("div");
+    card.className = "channel-card" + (enabled ? " channel-card-enabled" : " channel-card-disabled");
+
+    let detail = "";
+    if (ch.repo) detail = ch.repo;
+    else if (ch.keyword) detail = "keyword: " + ch.keyword;
+
+    card.innerHTML =
+      `<div class="channel-name">${escapeHtml(ch.name)}</div>` +
+      (detail ? `<div class="channel-detail">${escapeHtml(detail)}</div>` : "") +
+      `<div class="channel-status">${enabled ? "enabled" : "disabled"}</div>` +
+      `<div class="channel-active">${ch.active} active</div>`;
+
+    grid.appendChild(card);
+  });
 }
 
 function renderBoard(tasks) {
@@ -91,6 +153,11 @@ function renderCard(task, status) {
   const shortId = task.id.length > 8 ? task.id.slice(0, 8) : task.id;
 
   let html = `<span class="state-badge badge-${status}">${status}</span>`;
+
+  if (task.source) {
+    html += `<span class="source-badge source-badge-${escapeHtml(task.source)}">${escapeHtml(task.source)}</span>`;
+  }
+
   html += `<div class="task-id" title="${task.id}">${shortId}</div>`;
 
   if (task.turn > 0) {
@@ -125,7 +192,7 @@ function connectWebSocket() {
     ws = new WebSocket(url);
   } catch { return; }
 
-  ws.onopen = () => fetchTasks();
+  ws.onopen = () => { fetchTasks(); fetchIntake(); };
 
   ws.onmessage = (event) => {
     try {
@@ -133,6 +200,7 @@ function connectWebSocket() {
       const method = msg.method || "";
       if (method.startsWith("turn/") || method.startsWith("task/")) {
         fetchTasks();
+        fetchIntake();
       }
     } catch { /* ignore non-JSON */ }
   };
@@ -173,7 +241,7 @@ function initForm() {
     feedback.textContent = "";
     feedback.className = "form-feedback";
     btn.disabled = true;
-    btn.textContent = "Submitting…";
+    btn.textContent = "Submitting\u2026";
 
     const prompt = `${title}\n\n${description}`;
     try {
@@ -200,9 +268,11 @@ function initForm() {
 
 function init() {
   fetchTasks();
+  fetchIntake();
   connectWebSocket();
   initForm();
   pollTimer = setInterval(fetchTasks, POLL_INTERVAL_MS);
+  setInterval(fetchIntake, POLL_INTERVAL_MS);
 }
 
 document.addEventListener("DOMContentLoaded", init);

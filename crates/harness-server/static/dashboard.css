@@ -351,6 +351,121 @@ body {
 
 .form-feedback-error { color: var(--danger); }
 
+/* --- Intake channel cards --- */
+
+.channel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.85rem;
+}
+
+.channel-card {
+  border-radius: 14px;
+  padding: 0.85rem;
+  border: 1px solid var(--line);
+  background: var(--card-muted);
+}
+
+.channel-card-enabled {
+  background: var(--accent-soft);
+  border-color: rgba(16, 163, 127, 0.18);
+}
+
+.channel-card-disabled { opacity: 0.55; }
+
+.channel-name {
+  font-size: 0.9rem;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+
+.channel-detail {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.2rem;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.channel-status {
+  font-size: 0.75rem;
+  font-weight: 600;
+  margin-top: 0.35rem;
+}
+
+.channel-card-enabled .channel-status { color: var(--accent-ink); }
+.channel-card-disabled .channel-status { color: var(--muted); }
+
+.channel-active {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.15rem;
+}
+
+/* --- Pipeline view --- */
+
+.pipeline-row {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+.pipeline-step {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 4rem;
+}
+
+.pipeline-count {
+  font-size: 1.1rem;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.pipeline-label {
+  font-size: 0.68rem;
+  color: var(--muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-top: 0.15rem;
+}
+
+.pipeline-arrow {
+  color: var(--muted);
+  font-size: 0.9rem;
+  padding: 0 0.1rem;
+  margin-bottom: 0.9rem;
+}
+
+/* --- Source badges on task cards --- */
+
+.source-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  margin-left: 0.3rem;
+  border: 1px solid var(--line);
+  background: var(--card-muted);
+  color: var(--muted);
+  vertical-align: middle;
+}
+
+.source-badge-github { background: var(--blue-soft); color: var(--blue); border-color: var(--blue-border); }
+.source-badge-feishu { background: var(--purple-soft); color: var(--purple); border-color: var(--purple-border); }
+.source-badge-dashboard { background: var(--accent-soft); color: var(--accent-ink); border-color: rgba(16, 163, 127, 0.18); }
+.source-badge-webhook { background: var(--orange-soft); color: var(--orange); border-color: var(--orange-border); }
+
 @media (max-width: 860px) {
   .app-shell { padding: 1rem 0.85rem 2rem; }
   .hero-grid { grid-template-columns: 1fr; }

@@ -364,6 +364,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .route("/tasks", post(task_routes::create_task))
         .route("/tasks", get(list_tasks))
         .route("/tasks/{id}", get(get_task))
+        .route("/api/intake", get(intake_status))
         .route(
             "/webhook",
             post(github_webhook).layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES)),
@@ -510,6 +511,85 @@ async fn get_task(State(state): State<Arc<AppState>>, Path(id): Path<String>) ->
         )
             .into_response(),
     }
+}
+
+/// GET /api/intake — current status of all intake channels and recent dispatches.
+async fn intake_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let intake_config = &state.server.config.intake;
+    let all_tasks = state.tasks.list_all();
+
+    let github_active: u64 = all_tasks
+        .iter()
+        .filter(|t| {
+            t.source.as_deref() == Some("github")
+                && !matches!(
+                    t.status,
+                    task_runner::TaskStatus::Done | task_runner::TaskStatus::Failed
+                )
+        })
+        .count() as u64;
+
+    let feishu_active: u64 = all_tasks
+        .iter()
+        .filter(|t| {
+            t.source.as_deref() == Some("feishu")
+                && !matches!(
+                    t.status,
+                    task_runner::TaskStatus::Done | task_runner::TaskStatus::Failed
+                )
+        })
+        .count() as u64;
+
+    let dashboard_active: u64 = all_tasks
+        .iter()
+        .filter(|t| {
+            (t.source.as_deref() == Some("dashboard") || t.source.is_none())
+                && !matches!(
+                    t.status,
+                    task_runner::TaskStatus::Done | task_runner::TaskStatus::Failed
+                )
+        })
+        .count() as u64;
+
+    let github_channel = json!({
+        "name": "github",
+        "enabled": intake_config.github.as_ref().map(|c| c.enabled).unwrap_or(false),
+        "repo": intake_config.github.as_ref().map(|c| c.repo.as_str()).unwrap_or(""),
+        "active": github_active,
+    });
+
+    let feishu_channel = json!({
+        "name": "feishu",
+        "enabled": intake_config.feishu.as_ref().map(|c| c.enabled).unwrap_or(false),
+        "keyword": intake_config.feishu.as_ref().map(|c| c.trigger_keyword.as_str()).unwrap_or(""),
+        "active": feishu_active,
+    });
+
+    let dashboard_channel = json!({
+        "name": "dashboard",
+        "enabled": true,
+        "active": dashboard_active,
+    });
+
+    let mut recent_dispatches: Vec<serde_json::Value> = all_tasks
+        .iter()
+        .filter(|t| t.source.is_some())
+        .map(|t| {
+            json!({
+                "source": t.source,
+                "external_id": t.external_id,
+                "task_id": t.id.0,
+                "status": serde_json::to_value(&t.status).unwrap_or(json!("unknown")),
+                "pr_url": t.pr_url,
+            })
+        })
+        .collect();
+    recent_dispatches.truncate(10);
+
+    Json(json!({
+        "channels": [github_channel, feishu_channel, dashboard_channel],
+        "recent_dispatches": recent_dispatches,
+    }))
 }
 
 #[cfg(test)]
