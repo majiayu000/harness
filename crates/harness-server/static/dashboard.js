@@ -147,9 +147,61 @@ function connectWebSocket() {
   };
 }
 
+function showFeedback(el, msg, type) {
+  el.textContent = msg;
+  el.className = `form-feedback form-feedback-${type}`;
+}
+
+function initForm() {
+  const form = document.getElementById("task-form");
+  if (!form) return;
+
+  const feedback = document.getElementById("task-form-feedback");
+  const btn = document.getElementById("task-submit-btn");
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+
+    const title = form.elements["title"].value.trim();
+    const description = form.elements["description"].value.trim();
+
+    if (!title || !description) {
+      showFeedback(feedback, "Title and description are required.", "error");
+      return;
+    }
+
+    feedback.textContent = "";
+    feedback.className = "form-feedback";
+    btn.disabled = true;
+    btn.textContent = "Submitting…";
+
+    const prompt = `${title}\n\n${description}`;
+    try {
+      const resp = await fetch("/tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt }),
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(`${resp.status}: ${text}`);
+      }
+      form.reset();
+      showFeedback(feedback, "Task submitted successfully.", "success");
+      fetchTasks();
+    } catch (err) {
+      showFeedback(feedback, `Error: ${err.message}`, "error");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Submit Task";
+    }
+  });
+}
+
 function init() {
   fetchTasks();
   connectWebSocket();
+  initForm();
   pollTimer = setInterval(fetchTasks, POLL_INTERVAL_MS);
 }
 
