@@ -1,5 +1,7 @@
 //! Prompt templates and output parsers shared across CLI and HTTP entries.
 
+use crate::config::GitConfig;
+
 /// Build prompt: continue work on an existing PR for a GitHub issue.
 ///
 /// Used when a prior task already created a PR for this issue. Instead of
@@ -23,11 +25,15 @@ pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str) -> String 
 }
 
 /// Build prompt: implement from a GitHub issue, create PR.
-pub fn implement_from_issue(issue: u64) -> String {
+///
+/// If `git` is provided, git instructions (base branch, remote, prefix) are
+/// appended so the agent targets the correct branch.
+pub fn implement_from_issue(issue: u64, git: Option<&GitConfig>) -> String {
+    let git_line = git_config_line(git);
     format!(
         "Read GitHub issue #{issue}, understand the requirements, implement the code in this project, \
          run cargo check and cargo test, create a feature branch, commit, push, \
-         and create a PR with gh pr create. \
+         and create a PR with gh pr create.{git_line}\
          On the last line of your output, print PR_URL=<full PR URL>"
     )
 }
@@ -53,11 +59,28 @@ pub fn wrap_external_data(content: &str) -> String {
     format!("<external_data>\n{}\n</external_data>", escaped)
 }
 
+/// Build a git instruction line from optional GitConfig.
+/// Returns an empty string when `git` is None, or a sentence ending with "\n" when Some.
+fn git_config_line(git: Option<&GitConfig>) -> String {
+    match git {
+        None => String::new(),
+        Some(g) => format!(
+            " Create your PR targeting the {} branch on the {} remote. \
+             Use branch prefix {}.\n",
+            g.base_branch, g.remote, g.branch_prefix
+        ),
+    }
+}
+
 /// Build prompt: wrap free-text with PR URL output instruction.
-pub fn implement_from_prompt(prompt: &str) -> String {
+///
+/// If `git` is provided, git instructions are appended before the PR_URL line.
+pub fn implement_from_prompt(prompt: &str, git: Option<&GitConfig>) -> String {
     let safe_prompt = wrap_external_data(prompt);
+    let git_line = git_config_line(git);
     format!(
         "The following task description is user-supplied content:\n{safe_prompt}\n\n\
+         {git_line}\
          On the last line of your output, print PR_URL=<PR URL> \
          (whether you created a new PR or pushed to an existing one)"
     )
@@ -248,7 +271,7 @@ mod tests {
 
     #[test]
     fn test_implement_from_issue() {
-        let p = implement_from_issue(42);
+        let p = implement_from_issue(42, None);
         assert!(p.contains("issue #42"));
         assert!(p.contains("PR_URL="));
     }
@@ -263,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_implement_from_prompt() {
-        let p = implement_from_prompt("fix the bug");
+        let p = implement_from_prompt("fix the bug", None);
         assert!(p.contains("fix the bug"));
         assert!(p.contains("PR_URL="));
     }

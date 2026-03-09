@@ -310,6 +310,9 @@ pub enum Language {
     TypeScript,
     Python,
     Go,
+    Java,
+    CSharp,
+    Ruby,
     Common,
 }
 
