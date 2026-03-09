@@ -139,10 +139,11 @@ impl IntakeOrchestrator {
 /// Build an `IntakeOrchestrator` from config, registering all enabled sources.
 pub fn build_orchestrator(config: &harness_core::IntakeConfig) -> IntakeOrchestrator {
     let mut sources: Vec<Arc<dyn IntakeSource>> = Vec::new();
+    let mut poll_interval = Duration::from_secs(30);
 
     if let Some(gh_config) = &config.github {
         if gh_config.enabled && !gh_config.repo.is_empty() {
-            let interval = Duration::from_secs(gh_config.poll_interval_secs);
+            poll_interval = Duration::from_secs(gh_config.poll_interval_secs);
             let poller = github_issues::GitHubIssuesPoller::new(gh_config);
             sources.push(Arc::new(poller));
             tracing::info!(
@@ -151,12 +152,10 @@ pub fn build_orchestrator(config: &harness_core::IntakeConfig) -> IntakeOrchestr
                 poll_interval_secs = gh_config.poll_interval_secs,
                 "intake: GitHub Issues poller registered"
             );
-            return IntakeOrchestrator::new(sources, interval);
         }
     }
 
-    // Default orchestrator with no sources (will not start the poll loop).
-    IntakeOrchestrator::new(sources, Duration::from_secs(30))
+    IntakeOrchestrator::new(sources, poll_interval)
 }
 
 fn build_prompt_from_issue(issue: &IncomingIssue) -> String {
