@@ -23,18 +23,16 @@ impl PostExecutionValidator {
         Self { config }
     }
 
+    /// Run a shell command via `sh -c` to support pipes, quotes, and complex expressions.
     async fn run_command(cmd_str: &str, project: &Path, timeout_secs: u64) -> Result<(), String> {
-        let mut parts = cmd_str.split_whitespace();
-        let program = match parts.next() {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        let args: Vec<&str> = parts.collect();
+        if cmd_str.trim().is_empty() {
+            return Ok(());
+        }
 
         let result = timeout(
             Duration::from_secs(timeout_secs),
-            Command::new(program)
-                .args(&args)
+            Command::new("sh")
+                .args(["-c", cmd_str])
                 .current_dir(project)
                 .output(),
         )
@@ -58,19 +56,29 @@ impl PostExecutionValidator {
     }
 
     /// Verify a PR number exists on GitHub via `gh pr view`.
-    async fn verify_pr_exists(project: &Path, pr_number: u64) -> bool {
-        let result = Command::new("gh")
-            .args(["pr", "view", &pr_number.to_string(), "--json", "number"])
-            .current_dir(project)
-            .output()
-            .await;
+    async fn verify_pr_exists(project: &Path, pr_number: u64, timeout_secs: u64) -> bool {
+        let result = timeout(
+            Duration::from_secs(timeout_secs),
+            Command::new("gh")
+                .args(["pr", "view", &pr_number.to_string(), "--json", "number"])
+                .current_dir(project)
+                .output(),
+        )
+        .await;
         match result {
-            Ok(output) => output.status.success(),
-            Err(e) => {
+            Ok(Ok(output)) => output.status.success(),
+            Ok(Err(e)) => {
                 tracing::warn!(
                     pr = pr_number,
                     error = %e,
                     "post_validator: failed to run `gh pr view` for PR verification"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    pr = pr_number,
+                    "post_validator: `gh pr view` timed out after {timeout_secs}s"
                 );
                 false
             }
@@ -145,7 +153,7 @@ impl TurnInterceptor for PostExecutionValidator {
                     pr = pr_number,
                     "post_execution_validator: verifying PR exists"
                 );
-                if !Self::verify_pr_exists(project, pr_number).await {
+                if !Self::verify_pr_exists(project, pr_number, self.config.timeout_secs).await {
                     errors.push(format!(
                         "PR #{pr_number} could not be verified on GitHub — \
                          run `gh pr view {pr_number}` to diagnose"
