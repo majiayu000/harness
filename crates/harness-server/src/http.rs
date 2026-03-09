@@ -302,6 +302,8 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
 
     let app = Router::new()
+        .route("/", get(crate::dashboard::index))
+        .route("/favicon.ico", get(crate::dashboard::favicon))
         .route("/health", get(health_check))
         .route("/rpc", post(handle_rpc))
         .route("/ws", get(crate::websocket::ws_handler))
