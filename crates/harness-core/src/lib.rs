@@ -3,6 +3,7 @@ pub mod agents_md;
 pub mod config;
 pub mod error;
 pub mod interceptor;
+pub mod lang_detect;
 pub mod prompts;
 pub mod types;
 

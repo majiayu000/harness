@@ -112,14 +112,20 @@ async fn run_pre_execute(
     Ok(req)
 }
 
+/// Run all post_execute interceptors in order.
+/// Returns the first validation error found, or None if all pass.
 async fn run_post_execute(
     interceptors: &[Arc<dyn TurnInterceptor>],
     req: &AgentRequest,
     resp: &AgentResponse,
-) {
+) -> Option<String> {
     for interceptor in interceptors {
-        interceptor.post_execute(req, resp).await;
+        let result = interceptor.post_execute(req, resp).await;
+        if let Some(error) = result.error {
+            return Some(format!("[{}] {}", interceptor.name(), error));
+        }
     }
+    None
 }
 
 async fn run_on_error(interceptors: &[Arc<dyn TurnInterceptor>], req: &AgentRequest, error: &str) {
@@ -482,20 +488,49 @@ pub(crate) async fn run_task(
     // Run pre_execute interceptors; Block aborts the task.
     let first_req = run_pre_execute(&interceptors, initial_req).await?;
 
-    let resp = tokio::time::timeout(turn_timeout, agent.execute(first_req.clone())).await;
-    let resp = match resp {
-        Ok(Ok(r)) => {
-            run_post_execute(&interceptors, &first_req, &r).await;
-            r
-        }
-        Ok(Err(e)) => {
-            run_on_error(&interceptors, &first_req, &e.to_string()).await;
-            return Err(e.into());
-        }
-        Err(_) => {
-            let msg = format!("Turn 1 timed out after {}s", req.turn_timeout_secs);
-            run_on_error(&interceptors, &first_req, &msg).await;
-            return Err(anyhow::anyhow!("{msg}"));
+    // Execute implementation turn with post-execution validation and auto-retry.
+    // Max retries matches ValidationConfig default; interceptor drives the actual commands.
+    let max_validation_retries: u32 = 2;
+    let mut validation_attempt = 0u32;
+    let mut impl_req = first_req.clone();
+
+    let resp = loop {
+        let raw = tokio::time::timeout(turn_timeout, agent.execute(impl_req.clone())).await;
+        match raw {
+            Ok(Ok(r)) => {
+                if let Some(err) = run_post_execute(&interceptors, &impl_req, &r).await {
+                    if validation_attempt < max_validation_retries {
+                        validation_attempt += 1;
+                        tracing::warn!(
+                            attempt = validation_attempt,
+                            max = max_validation_retries,
+                            error = %err,
+                            "post-execution validation failed; retrying with error context"
+                        );
+                        impl_req = AgentRequest {
+                            prompt: format!(
+                                "{}\n\nValidation failed (attempt {validation_attempt}/{max_validation_retries}):\n{err}\n\nFix the issues and re-push.",
+                                first_req.prompt
+                            ),
+                            ..first_req.clone()
+                        };
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "Validation failed after {validation_attempt} retries: {err}"
+                    ));
+                }
+                break r;
+            }
+            Ok(Err(e)) => {
+                run_on_error(&interceptors, &impl_req, &e.to_string()).await;
+                return Err(e.into());
+            }
+            Err(_) => {
+                let msg = format!("Turn 1 timed out after {}s", req.turn_timeout_secs);
+                run_on_error(&interceptors, &impl_req, &msg).await;
+                return Err(anyhow::anyhow!("{msg}"));
+            }
         }
     };
 
@@ -579,7 +614,13 @@ pub(crate) async fn run_task(
         let resp = tokio::time::timeout(turn_timeout, agent.execute(review_req.clone())).await;
         let resp = match resp {
             Ok(Ok(r)) => {
-                run_post_execute(&interceptors, &review_req, &r).await;
+                if let Some(val_err) = run_post_execute(&interceptors, &review_req, &r).await {
+                    tracing::warn!(
+                        round,
+                        error = %val_err,
+                        "post-execute validation failed in review round; continuing"
+                    );
+                }
                 r
             }
             Ok(Err(e)) => {
@@ -698,7 +739,13 @@ async fn run_agent_review(
         let resp = tokio::time::timeout(turn_timeout, reviewer.execute(review_req.clone())).await;
         let resp = match resp {
             Ok(Ok(r)) => {
-                run_post_execute(interceptors, &review_req, &r).await;
+                if let Some(val_err) = run_post_execute(interceptors, &review_req, &r).await {
+                    tracing::warn!(
+                        agent_round,
+                        error = %val_err,
+                        "post-execute validation failed in agent review; continuing"
+                    );
+                }
                 r
             }
             Ok(Err(e)) => {
@@ -776,7 +823,13 @@ async fn run_agent_review(
         let fix_resp = tokio::time::timeout(turn_timeout, agent.execute(fix_req.clone())).await;
         match fix_resp {
             Ok(Ok(r)) => {
-                run_post_execute(interceptors, &fix_req, &r).await;
+                if let Some(val_err) = run_post_execute(interceptors, &fix_req, &r).await {
+                    tracing::warn!(
+                        agent_round,
+                        error = %val_err,
+                        "post-execute validation failed in agent review fix; continuing"
+                    );
+                }
             }
             Ok(Err(e)) => {
                 run_on_error(interceptors, &fix_req, &e.to_string()).await;

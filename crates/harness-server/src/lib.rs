@@ -15,6 +15,7 @@ pub mod handlers;
 pub mod http;
 pub mod notify;
 pub mod plan_db;
+pub mod post_validator;
 pub mod router;
 pub mod scheduler;
 pub mod server;
