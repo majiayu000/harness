@@ -2,6 +2,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use super::{IncomingIssue, IntakeSource, TaskCompletionResult};
 use crate::task_runner::{TaskId, TaskStatus};
@@ -10,14 +12,67 @@ pub struct GitHubIssuesPoller {
     repo: String,
     label: String,
     dispatched: DashMap<String, TaskId>,
+    persist_path: Option<PathBuf>,
 }
 
 impl GitHubIssuesPoller {
-    pub fn new(config: &harness_core::GitHubIntakeConfig) -> Self {
+    pub fn new(config: &harness_core::GitHubIntakeConfig, data_dir: Option<&Path>) -> Self {
+        let repo_slug = config.repo.replace('/', "_");
+        let persist_path =
+            data_dir.map(|d| d.join(format!("github_dispatched_{repo_slug}.json")));
+        let dispatched = Self::load_dispatched(persist_path.as_deref());
         Self {
             repo: config.repo.clone(),
             label: config.label.clone(),
-            dispatched: DashMap::new(),
+            dispatched,
+            persist_path,
+        }
+    }
+
+    fn load_dispatched(path: Option<&Path>) -> DashMap<String, TaskId> {
+        let Some(path) = path else {
+            return DashMap::new();
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return DashMap::new(),
+        };
+        let map: HashMap<String, String> = match serde_json::from_slice(&bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("failed to load dispatched state from {}: {e}", path.display());
+                return DashMap::new();
+            }
+        };
+        let dm = DashMap::new();
+        for (k, v) in map {
+            dm.insert(k, TaskId(v));
+        }
+        dm
+    }
+
+    fn persist_dispatched(&self) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!("failed to create dispatched state directory: {e}");
+                return;
+            }
+        }
+        let map: HashMap<String, String> = self
+            .dispatched
+            .iter()
+            .map(|e| (e.key().clone(), e.value().0.clone()))
+            .collect();
+        match serde_json::to_vec(&map) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, bytes) {
+                    tracing::warn!("failed to persist dispatched state: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("failed to serialize dispatched state: {e}"),
         }
     }
 }
@@ -85,6 +140,8 @@ impl IntakeSource for GitHubIssuesPoller {
                 "open",
                 "--json",
                 "number,title,body,url,labels,createdAt",
+                "--limit",
+                "1000",
             ])
             .output()
             .await?;
@@ -100,6 +157,7 @@ impl IntakeSource for GitHubIssuesPoller {
     async fn mark_dispatched(&self, external_id: &str, task_id: &TaskId) -> anyhow::Result<()> {
         self.dispatched
             .insert(external_id.to_string(), task_id.clone());
+        self.persist_dispatched();
 
         let comment = format!("Harness task `{}` created. Working on it...", task_id.0);
         if let Err(e) = tokio::process::Command::new("gh")
@@ -168,7 +226,12 @@ impl IntakeSource for GitHubIssuesPoller {
                     "failed to post {context} comment: {e}"
                 );
             }
-            self.dispatched.remove(external_id);
+            // Only remove from dispatched on failure to allow retry.
+            // Done tasks remain in dispatched so re-labeled open issues are not re-processed.
+            if matches!(result.status, TaskStatus::Failed) {
+                self.dispatched.remove(external_id);
+                self.persist_dispatched();
+            }
         }
 
         Ok(())
@@ -271,7 +334,7 @@ mod tests {
             label: "harness".to_string(),
             poll_interval_secs: 30,
         };
-        let poller = GitHubIssuesPoller::new(&config);
+        let poller = GitHubIssuesPoller::new(&config, None);
         assert_eq!(poller.name(), "github");
     }
 }

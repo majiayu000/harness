@@ -137,14 +137,17 @@ impl IntakeOrchestrator {
 }
 
 /// Build an `IntakeOrchestrator` from config, registering all enabled sources.
-pub fn build_orchestrator(config: &harness_core::IntakeConfig) -> IntakeOrchestrator {
+pub fn build_orchestrator(
+    config: &harness_core::IntakeConfig,
+    data_dir: Option<&std::path::Path>,
+) -> IntakeOrchestrator {
     let mut sources: Vec<Arc<dyn IntakeSource>> = Vec::new();
     let mut poll_interval = Duration::from_secs(30);
 
     if let Some(gh_config) = &config.github {
         if gh_config.enabled && !gh_config.repo.is_empty() {
             poll_interval = Duration::from_secs(gh_config.poll_interval_secs);
-            let poller = github_issues::GitHubIssuesPoller::new(gh_config);
+            let poller = github_issues::GitHubIssuesPoller::new(gh_config, data_dir);
             sources.push(Arc::new(poller));
             tracing::info!(
                 repo = %gh_config.repo,
@@ -224,7 +227,7 @@ mod tests {
     #[test]
     fn build_orchestrator_with_no_config_returns_empty_orchestrator() {
         let config = harness_core::IntakeConfig::default();
-        let orchestrator = build_orchestrator(&config);
+        let orchestrator = build_orchestrator(&config, None);
         assert!(orchestrator.sources.is_empty());
     }
 
@@ -236,7 +239,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             ..Default::default()
         });
-        let orchestrator = build_orchestrator(&config);
+        let orchestrator = build_orchestrator(&config, None);
         assert!(orchestrator.sources.is_empty());
     }
 
@@ -249,7 +252,7 @@ mod tests {
             label: "harness".to_string(),
             poll_interval_secs: 60,
         });
-        let orchestrator = build_orchestrator(&config);
+        let orchestrator = build_orchestrator(&config, None);
         assert_eq!(orchestrator.sources.len(), 1);
         assert_eq!(orchestrator.sources[0].name(), "github");
         assert_eq!(orchestrator.poll_interval, Duration::from_secs(60));
