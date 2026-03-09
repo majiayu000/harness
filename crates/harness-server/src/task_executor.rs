@@ -87,6 +87,16 @@ pub(crate) fn build_fix_ci_prompt(
     )
 }
 
+/// Truncate validation error output to `max_chars` to avoid bloating agent prompts.
+/// Preserves the first portion which typically contains the most actionable info.
+fn truncate_validation_error(error: &str, max_chars: usize) -> String {
+    if error.len() <= max_chars {
+        return error.to_string();
+    }
+    let truncated = &error[..error.floor_char_boundary(max_chars)];
+    format!("{truncated}\n\n... (output truncated, {total} chars total)", total = error.len())
+}
+
 /// Run all pre_execute interceptors in order. Returns the (possibly modified) request,
 /// or an error if any interceptor returns Block.
 async fn run_pre_execute(
@@ -489,8 +499,11 @@ pub(crate) async fn run_task(
     let first_req = run_pre_execute(&interceptors, initial_req).await?;
 
     // Execute implementation turn with post-execution validation and auto-retry.
-    // Max retries matches ValidationConfig default; interceptor drives the actual commands.
-    let max_validation_retries: u32 = 2;
+    let max_validation_retries: u32 = interceptors
+        .iter()
+        .filter_map(|i| i.max_validation_retries())
+        .min()
+        .unwrap_or(2);
     let mut validation_attempt = 0u32;
     let mut impl_req = first_req.clone();
 
@@ -507,9 +520,16 @@ pub(crate) async fn run_task(
                             error = %err,
                             "post-execution validation failed; retrying with error context"
                         );
+                        // Truncate error to avoid bloating the prompt with huge
+                        // compiler output. Keep only the summary of which commands
+                        // failed and the first portion of each error.
+                        let truncated = truncate_validation_error(&err, 1500);
                         impl_req = AgentRequest {
                             prompt: format!(
-                                "{}\n\nValidation failed (attempt {validation_attempt}/{max_validation_retries}):\n{err}\n\nFix the issues and re-push.",
+                                "{}\n\n\
+                                 Post-execution validation failed (attempt {validation_attempt}/{max_validation_retries}).\n\
+                                 Fix these errors, then commit and push:\n\n\
+                                 {truncated}",
                                 first_req.prompt
                             ),
                             ..first_req.clone()
