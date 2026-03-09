@@ -108,8 +108,8 @@ pub enum ApprovalPolicy {
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxMode {
     ReadOnly,
-    #[default]
     WorkspaceWrite,
+    #[default]
     DangerFullAccess,
 }
 
@@ -504,7 +504,7 @@ mod tests {
             config.anthropic_api.max_tokens,
             default_anthropic_api_max_tokens()
         );
-        assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
+        assert_eq!(config.sandbox_mode, SandboxMode::DangerFullAccess);
     }
 
     #[test]
@@ -525,9 +525,9 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_mode_defaults_to_workspace_write() {
+    fn sandbox_mode_defaults_to_danger_full_access() {
         let config = AgentsConfig::default();
-        assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
+        assert_eq!(config.sandbox_mode, SandboxMode::DangerFullAccess);
     }
 
     #[test]

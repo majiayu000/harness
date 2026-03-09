@@ -46,7 +46,7 @@ pub enum Command {
         #[arg(long)]
         model: Option<String>,
         /// Sandbox mode hint injected into the exec prompt
-        #[arg(long, default_value = "workspace-write")]
+        #[arg(long, default_value = "danger-full-access")]
         sandbox_mode: String,
         /// Optional output file for final response
         #[arg(long)]
@@ -1158,7 +1158,7 @@ mod tests {
             } => {
                 assert_eq!(prompt, "fix the bug");
                 assert_eq!(agent, "claude");
-                assert_eq!(sandbox_mode, "workspace-write");
+                assert_eq!(sandbox_mode, "danger-full-access");
                 assert!(drop_sudo);
             }
             _ => panic!("expected Exec command"),
