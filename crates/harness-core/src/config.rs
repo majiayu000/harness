@@ -62,7 +62,13 @@ pub fn load_project_config(project_root: &Path) -> ProjectConfig {
     let Ok(contents) = std::fs::read_to_string(&path) else {
         return ProjectConfig::default();
     };
-    toml::from_str(&contents).unwrap_or_default()
+    toml::from_str(&contents).unwrap_or_else(|e| {
+        eprintln!(
+            "warning: failed to parse project config at {}: {e}",
+            path.display()
+        );
+        ProjectConfig::default()
+    })
 }
 
 /// GitHub Issues intake configuration.
