@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::http::AppState;
 use crate::task_runner::{TaskId, TaskStatus};
 
+pub mod feishu;
 pub mod github_issues;
 
 /// Normalized issue from any intake source.
@@ -158,10 +159,21 @@ pub fn build_orchestrator(
         }
     }
 
+    if let Some(feishu_config) = &config.feishu {
+        if feishu_config.enabled {
+            let intake = feishu::FeishuIntake::new(feishu_config.clone());
+            sources.push(Arc::new(intake));
+            tracing::info!(
+                trigger_keyword = %feishu_config.trigger_keyword,
+                "intake: Feishu bot registered in orchestrator"
+            );
+        }
+    }
+
     IntakeOrchestrator::new(sources, poll_interval)
 }
 
-fn build_prompt_from_issue(issue: &IncomingIssue) -> String {
+pub(crate) fn build_prompt_from_issue(issue: &IncomingIssue) -> String {
     format!(
         "You are working on {source} issue {id}: {title}\n\n\
          URL: {url}\n\n\

@@ -48,6 +48,8 @@ pub struct AppState {
     pub workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     /// Bounded task queue for concurrency limiting.
     pub task_queue: Arc<crate::task_queue::TaskQueue>,
+    /// Feishu Bot intake handler. None when feishu intake is disabled or not configured.
+    pub feishu_intake: Option<Arc<crate::intake::feishu::FeishuIntake>>,
 }
 
 impl AppState {
@@ -220,6 +222,20 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         "task queue initialized"
     );
 
+    let feishu_intake = server.config.intake.feishu.as_ref().and_then(|cfg| {
+        if cfg.enabled {
+            tracing::info!(
+                trigger_keyword = %cfg.trigger_keyword,
+                "intake: Feishu bot registered"
+            );
+            Some(Arc::new(crate::intake::feishu::FeishuIntake::new(
+                cfg.clone(),
+            )))
+        } else {
+            None
+        }
+    });
+
     Ok(AppState {
         server,
         project_root,
@@ -255,6 +271,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         initialized: Arc::new(AtomicBool::new(false)),
         workspace_mgr,
         task_queue,
+        feishu_intake,
     })
 }
 
@@ -350,6 +367,11 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .route(
             "/webhook",
             post(github_webhook).layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES)),
+        )
+        .route(
+            "/webhook/feishu",
+            post(crate::intake::feishu::feishu_webhook)
+                .layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES)),
         )
         .with_state(state.clone());
 

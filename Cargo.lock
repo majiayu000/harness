@@ -1264,6 +1264,7 @@ dependencies = [
  "harness-skills",
  "hmac",
  "http-body-util",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

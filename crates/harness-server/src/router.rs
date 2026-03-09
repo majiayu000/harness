@@ -242,6 +242,7 @@ mod tests {
             notify_tx: None,
             initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             workspace_mgr: None,
+            feishu_intake: None,
             task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         })
     }
