@@ -229,8 +229,8 @@ pub async fn feishu_webhook(
 
     // 6. Extract description (text after keyword).
     let description = text
-        .splitn(2, feishu.config.trigger_keyword.as_str())
-        .nth(1)
+        .split_once(feishu.config.trigger_keyword.as_str())
+        .map(|x| x.1)
         .unwrap_or("")
         .trim()
         .to_string();
