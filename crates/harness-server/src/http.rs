@@ -18,7 +18,7 @@ use tokio::sync::{broadcast, RwLock};
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 512 * 1024;
 
-mod task_routes;
+pub(crate) mod task_routes;
 
 pub struct AppState {
     pub server: Arc<HarnessServer>,
@@ -332,6 +332,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         harness_observe::quality::QualityGrader::grade(&events, violation_count).grade
     };
     crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
+    crate::intake::build_orchestrator(&state.server.config.intake).start(state.clone());
 
     let app = Router::new()
         .route("/", get(crate::dashboard::index))
