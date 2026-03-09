@@ -332,7 +332,11 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         harness_observe::quality::QualityGrader::grade(&events, violation_count).grade
     };
     crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
-    crate::intake::build_orchestrator(&state.server.config.intake).start(state.clone());
+    crate::intake::build_orchestrator(
+        &state.server.config.intake,
+        Some(&state.server.config.server.data_dir),
+    )
+    .start(state.clone());
 
     let app = Router::new()
         .route("/", get(crate::dashboard::index))
