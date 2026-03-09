@@ -14,6 +14,7 @@ pub mod contract_validator;
 pub mod dashboard;
 pub mod handlers;
 pub mod http;
+pub mod intake;
 pub mod notify;
 pub mod plan_db;
 pub mod post_validator;
