@@ -130,60 +130,47 @@ impl IntakeSource for GitHubIssuesPoller {
         external_id: &str,
         result: &TaskCompletionResult,
     ) -> anyhow::Result<()> {
-        match result.status {
+        let body_and_context = match result.status {
             TaskStatus::Done => {
                 let body = match &result.pr_url {
                     Some(pr_url) => format!("Task complete. PR: {pr_url}\n\n{}", result.summary),
                     None => format!("Task complete.\n\n{}", result.summary),
                 };
-                if let Err(e) = tokio::process::Command::new("gh")
-                    .args([
-                        "issue",
-                        "comment",
-                        external_id,
-                        "--repo",
-                        &self.repo,
-                        "--body",
-                        &body,
-                    ])
-                    .output()
-                    .await
-                {
-                    tracing::warn!(
-                        repo = %self.repo,
-                        issue = %external_id,
-                        "failed to post completion comment: {e}"
-                    );
-                }
+                Some((body, "completion"))
             }
             TaskStatus::Failed => {
                 let body = format!(
                     "Task failed: {}",
                     result.error.as_deref().unwrap_or("unknown error")
                 );
-                if let Err(e) = tokio::process::Command::new("gh")
-                    .args([
-                        "issue",
-                        "comment",
-                        external_id,
-                        "--repo",
-                        &self.repo,
-                        "--body",
-                        &body,
-                    ])
-                    .output()
-                    .await
-                {
-                    tracing::warn!(
-                        repo = %self.repo,
-                        issue = %external_id,
-                        "failed to post failure comment: {e}"
-                    );
-                }
+                Some((body, "failure"))
             }
-            _ => {}
+            _ => None,
+        };
+
+        if let Some((body, context)) = body_and_context {
+            if let Err(e) = tokio::process::Command::new("gh")
+                .args([
+                    "issue",
+                    "comment",
+                    external_id,
+                    "--repo",
+                    &self.repo,
+                    "--body",
+                    &body,
+                ])
+                .output()
+                .await
+            {
+                tracing::warn!(
+                    repo = %self.repo,
+                    issue = %external_id,
+                    "failed to post {context} comment: {e}"
+                );
+            }
+            self.dispatched.remove(external_id);
         }
-        self.dispatched.remove(external_id);
+
         Ok(())
     }
 }
