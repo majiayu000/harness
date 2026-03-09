@@ -217,10 +217,12 @@ pub async fn feishu_webhook(
     };
 
     // 4. Parse message content text.
-    let content: serde_json::Value =
-        serde_json::from_str(message["content"].as_str().unwrap_or("{}"))
-            .unwrap_or(serde_json::Value::Object(Default::default()));
-    let text = content["text"].as_str().unwrap_or("");
+    let text_owned: String = message["content"]
+        .as_str()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v["text"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    let text = text_owned.as_str();
 
     // 5. Check trigger keyword.
     if !text.contains(feishu.config.trigger_keyword.as_str()) {
@@ -240,11 +242,7 @@ pub async fn feishu_webhook(
     }
 
     // 7. Build IncomingIssue.
-    let short_id = if message_id.len() >= 8 {
-        &message_id[..8]
-    } else {
-        &message_id
-    };
+    let short_id: String = message_id.chars().take(8).collect();
     let issue = IncomingIssue {
         source: "feishu".to_string(),
         external_id: message_id.clone(),
@@ -428,7 +426,7 @@ mod tests {
     fn incoming_issue_built_from_description() {
         let description = "fix login bug\nUsers cannot log in after password reset.";
         let message_id = "om_abc12345xyz";
-        let short_id = &message_id[..8];
+        let short_id: String = message_id.chars().take(8).collect();
         let issue = IncomingIssue {
             source: "feishu".to_string(),
             external_id: message_id.to_string(),
