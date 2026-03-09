@@ -65,6 +65,50 @@ pub fn load_project_config(project_root: &Path) -> ProjectConfig {
     toml::from_str(&contents).unwrap_or_default()
 }
 
+/// GitHub Issues intake configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubIntakeConfig {
+    /// Enable polling GitHub Issues for tasks. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// GitHub repository in "owner/repo" format.
+    #[serde(default)]
+    pub repo: String,
+    /// Issue label to filter on. Default: "harness".
+    #[serde(default = "default_intake_label")]
+    pub label: String,
+    /// Polling interval in seconds. Default: 30.
+    #[serde(default = "default_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_intake_label() -> String {
+    "harness".to_string()
+}
+
+fn default_poll_interval_secs() -> u64 {
+    30
+}
+
+impl Default for GitHubIntakeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repo: String::new(),
+            label: default_intake_label(),
+            poll_interval_secs: default_poll_interval_secs(),
+        }
+    }
+}
+
+/// Multi-channel task intake configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IntakeConfig {
+    /// GitHub Issues poller configuration.
+    #[serde(default)]
+    pub github: Option<GitHubIntakeConfig>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HarnessConfig {
     pub server: ServerConfig,
@@ -79,6 +123,8 @@ pub struct HarnessConfig {
     pub workspace: WorkspaceConfig,
     #[serde(default)]
     pub concurrency: ConcurrencyConfig,
+    #[serde(default)]
+    pub intake: IntakeConfig,
 }
 
 /// Workspace isolation configuration for parallel task execution.
@@ -942,6 +988,42 @@ mod tests {
     fn invalid_toml_returns_parse_error() {
         let result = toml::from_str::<HarnessConfig>("not valid toml {{{}}}");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn github_intake_config_defaults() {
+        let config = GitHubIntakeConfig::default();
+        assert!(!config.enabled);
+        assert!(config.repo.is_empty());
+        assert_eq!(config.label, "harness");
+        assert_eq!(config.poll_interval_secs, 30);
+    }
+
+    #[test]
+    fn github_intake_config_deserializes_from_toml() {
+        let toml_str = r#"
+            enabled = true
+            repo = "owner/repo"
+            label = "autofix"
+            poll_interval_secs = 60
+        "#;
+        let config: GitHubIntakeConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.repo, "owner/repo");
+        assert_eq!(config.label, "autofix");
+        assert_eq!(config.poll_interval_secs, 60);
+    }
+
+    #[test]
+    fn intake_config_defaults_to_no_github() {
+        let config = IntakeConfig::default();
+        assert!(config.github.is_none());
+    }
+
+    #[test]
+    fn harness_config_includes_intake() {
+        let config = HarnessConfig::default();
+        assert!(config.intake.github.is_none());
     }
 
     #[test]

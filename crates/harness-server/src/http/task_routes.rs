@@ -5,12 +5,21 @@ use serde_json::json;
 use std::sync::Arc;
 
 #[derive(Debug)]
-pub(super) enum EnqueueTaskError {
+pub(crate) enum EnqueueTaskError {
     BadRequest(String),
     Internal(String),
 }
 
-pub(super) async fn enqueue_task(
+impl std::fmt::Display for EnqueueTaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadRequest(msg) => write!(f, "bad request: {msg}"),
+            Self::Internal(msg) => write!(f, "internal error: {msg}"),
+        }
+    }
+}
+
+pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
     req: task_runner::CreateTaskRequest,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
