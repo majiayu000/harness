@@ -18,8 +18,7 @@ pub struct GitHubIssuesPoller {
 impl GitHubIssuesPoller {
     pub fn new(config: &harness_core::GitHubIntakeConfig, data_dir: Option<&Path>) -> Self {
         let repo_slug = config.repo.replace('/', "_");
-        let persist_path =
-            data_dir.map(|d| d.join(format!("github_dispatched_{repo_slug}.json")));
+        let persist_path = data_dir.map(|d| d.join(format!("github_dispatched_{repo_slug}.json")));
         let dispatched = Self::load_dispatched(persist_path.as_deref());
         Self {
             repo: config.repo.clone(),
@@ -40,7 +39,10 @@ impl GitHubIssuesPoller {
         let map: HashMap<String, String> = match serde_json::from_slice(&bytes) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("failed to load dispatched state from {}: {e}", path.display());
+                tracing::warn!(
+                    "failed to load dispatched state from {}: {e}",
+                    path.display()
+                );
                 return DashMap::new();
             }
         };
