@@ -19,6 +19,9 @@ impl TaskDb {
     }
 
     async fn migrate(&self) -> anyhow::Result<()> {
+        // Create table with all columns (including source/external_id added in Task 3.1).
+        // New databases get the full schema in one shot; existing databases are handled
+        // by the additive ALTER TABLE steps below.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -27,12 +30,27 @@ impl TaskDb {
                 pr_url TEXT,
                 rounds TEXT NOT NULL DEFAULT '[]',
                 error TEXT,
+                source TEXT,
+                external_id TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )",
         )
         .execute(&self.pool)
         .await?;
+
+        // Additive migrations for existing DBs that predate Task 3.1.
+        // "duplicate column name" errors mean the column was already added — safe to ignore.
+        for col in &["source TEXT", "external_id TEXT"] {
+            let sql = format!("ALTER TABLE tasks ADD COLUMN {col}");
+            if let Err(e) = sqlx::query(&sql).execute(&self.pool).await {
+                let msg = e.to_string().to_lowercase();
+                if !msg.contains("duplicate column name") {
+                    return Err(anyhow::anyhow!("tasks migration failed ({col}): {e}"));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -97,6 +115,8 @@ struct TaskRow {
     pr_url: Option<String>,
     rounds: String,
     error: Option<String>,
+    source: Option<String>,
+    external_id: Option<String>,
     #[allow(dead_code)]
     created_at: String,
     #[allow(dead_code)]
@@ -122,6 +142,8 @@ impl TaskRow {
             pr_url,
             rounds,
             error,
+            source,
+            external_id,
             created_at: _,
             updated_at: _,
         } = self;
@@ -140,6 +162,8 @@ impl TaskRow {
             pr_url,
             rounds: decoded_rounds,
             error,
+            source,
+            external_id,
         })
     }
 }
@@ -182,6 +206,8 @@ mod tests {
             pr_url: None,
             rounds: rounds.to_string(),
             error: None,
+            source: None,
+            external_id: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
@@ -233,6 +259,8 @@ mod tests {
             pr_url: None,
             rounds: vec![],
             error: None,
+            source: None,
+            external_id: None,
         }
     }
 
