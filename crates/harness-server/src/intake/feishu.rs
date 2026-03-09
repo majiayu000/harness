@@ -394,8 +394,8 @@ mod tests {
         let text = "harness fix the login bug\nExtra context here";
         let keyword = "harness";
         let description = text
-            .splitn(2, keyword)
-            .nth(1)
+            .split_once(keyword)
+            .map(|x| x.1)
             .unwrap_or("")
             .trim()
             .to_string();
@@ -407,8 +407,8 @@ mod tests {
         let text = "harness";
         let keyword = "harness";
         let description = text
-            .splitn(2, keyword)
-            .nth(1)
+            .split_once(keyword)
+            .map(|x| x.1)
             .unwrap_or("")
             .trim()
             .to_string();
