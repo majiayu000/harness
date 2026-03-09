@@ -101,6 +101,7 @@ async fn make_test_state_with(
         notify_tx: None,
         initialized: Arc::new(AtomicBool::new(true)),
         workspace_mgr: None,
+        feishu_intake: None,
         task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
     }))
 }
