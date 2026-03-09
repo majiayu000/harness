@@ -106,14 +106,14 @@ impl TurnInterceptor for PostExecutionValidator {
 
         // Resolve pre_commit commands: config takes precedence over language detection.
         let pre_commit = if self.config.pre_commit.is_empty() {
-            lang_detect::default_pre_commit_commands(lang)
+            lang_detect::default_pre_commit_commands(lang, project)
         } else {
             self.config.pre_commit.clone()
         };
 
         // Resolve pre_push commands: config takes precedence over language detection.
         let pre_push = if self.config.pre_push.is_empty() {
-            lang_detect::default_pre_push_commands(lang)
+            lang_detect::default_pre_push_commands(lang, project)
         } else {
             self.config.pre_push.clone()
         };

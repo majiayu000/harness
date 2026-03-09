@@ -23,7 +23,7 @@ pub async fn fix(
     println!("[harness] Round 1 — Implementing issue #{issue} and creating PR");
 
     let req = AgentRequest {
-        prompt: prompts::implement_from_issue(issue),
+        prompt: prompts::implement_from_issue(issue, None),
         project_root: project.clone(),
         ..Default::default()
     };
