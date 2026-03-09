@@ -270,6 +270,7 @@ pub async fn spawn_task(
     events: Arc<harness_observe::EventStore>,
     interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     req: CreateTaskRequest,
+    workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
 ) -> TaskId {
     spawn_task_with_worktree_detector(
         store,
@@ -281,6 +282,7 @@ pub async fn spawn_task(
         interceptors,
         req,
         detect_main_worktree,
+        workspace_mgr,
     )
     .await
 }
@@ -295,6 +297,7 @@ async fn spawn_task_with_worktree_detector<F>(
     interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     req: CreateTaskRequest,
     detect_worktree: F,
+    workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
 ) -> TaskId
 where
     F: Fn() -> PathBuf + Send + Sync + 'static,
@@ -314,9 +317,19 @@ where
         let detect_worktree = detect_worktree.clone();
         let raw_project =
             resolve_project_root_with(req.project.clone(), move || detect_worktree()).await?;
-        let project = crate::handlers::validate_project_root(&raw_project)
+        let project_root = crate::handlers::validate_project_root(&raw_project)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        crate::task_executor::run_task(
+
+        // If workspace isolation is configured, create a per-task git worktree.
+        let run_project = if let Some(ref wmgr) = workspace_mgr {
+            let project_config = harness_core::config::load_project_config(&project_root);
+            wmgr.create_workspace(&id, &project_root, &project_config.git.base_branch)
+                .await?
+        } else {
+            project_root
+        };
+
+        let task_result = crate::task_executor::run_task(
             &store,
             &id,
             agent.as_ref(),
@@ -326,9 +339,20 @@ where
             events,
             interceptors,
             &req,
-            project,
+            run_project,
         )
-        .await
+        .await;
+
+        // Cleanup workspace when task ends (Done or Failed) if auto_cleanup is set.
+        if let Some(wmgr) = workspace_mgr {
+            if wmgr.config.auto_cleanup {
+                if let Err(e) = wmgr.remove_workspace(&id).await {
+                    tracing::warn!("workspace cleanup failed for {id:?}: {e}");
+                }
+            }
+        }
+
+        task_result
     });
 
     tokio::spawn(async move {
@@ -493,6 +517,7 @@ mod tests {
             events,
             vec![],
             req,
+            None,
         )
         .await;
 
@@ -559,6 +584,7 @@ mod tests {
             events,
             interceptors,
             req,
+            None,
         )
         .await;
 
@@ -677,6 +703,7 @@ mod tests {
             || -> PathBuf {
                 panic!("forced detect_main_worktree panic");
             },
+            None,
         )
         .await;
 

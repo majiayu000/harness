@@ -28,6 +28,7 @@ pub mod thread_db;
 pub mod thread_manager;
 pub mod webhook;
 pub mod websocket;
+pub mod workspace;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;

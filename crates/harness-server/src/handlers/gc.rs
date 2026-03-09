@@ -143,6 +143,7 @@ pub async fn gc_adopt(
                     state.events.clone(),
                     state.interceptors.clone(),
                     req,
+                    state.workspace_mgr.clone(),
                 )
                 .await;
                 Some(tid.0)
