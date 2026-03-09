@@ -155,7 +155,7 @@ impl IntakeSource for FeishuIntake {
             }
         }
 
-        if matches!(result.status, TaskStatus::Failed) {
+        if matches!(result.status, TaskStatus::Done | TaskStatus::Failed) {
             self.dispatched.remove(external_id);
             self.chat_ids.remove(external_id);
         }
