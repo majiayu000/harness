@@ -23,6 +23,7 @@ pub mod server;
 pub mod stdio;
 pub mod task_db;
 pub mod task_executor;
+pub mod task_queue;
 pub mod task_runner;
 pub mod thread_db;
 pub mod thread_manager;

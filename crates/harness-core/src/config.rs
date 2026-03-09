@@ -77,6 +77,8 @@ pub struct HarnessConfig {
     pub validation: ValidationConfig,
     #[serde(default)]
     pub workspace: WorkspaceConfig,
+    #[serde(default)]
+    pub concurrency: ConcurrencyConfig,
 }
 
 /// Workspace isolation configuration for parallel task execution.
@@ -122,6 +124,37 @@ impl Default for WorkspaceConfig {
             before_remove_hook: None,
             hook_timeout_secs: default_hook_timeout_secs(),
             auto_cleanup: default_auto_cleanup(),
+        }
+    }
+}
+
+/// Concurrency limiting configuration for task execution.
+///
+/// Controls how many tasks run simultaneously and how many can wait
+/// in the queue before new submissions are rejected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConcurrencyConfig {
+    /// Maximum number of tasks executing concurrently. Default: 4.
+    #[serde(default = "default_max_concurrent_tasks")]
+    pub max_concurrent_tasks: usize,
+    /// Maximum number of tasks waiting for a slot. Excess tasks are rejected. Default: 32.
+    #[serde(default = "default_max_queue_size")]
+    pub max_queue_size: usize,
+}
+
+fn default_max_concurrent_tasks() -> usize {
+    4
+}
+
+fn default_max_queue_size() -> usize {
+    32
+}
+
+impl Default for ConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_tasks: default_max_concurrent_tasks(),
+            max_queue_size: default_max_queue_size(),
         }
     }
 }

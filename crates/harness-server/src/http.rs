@@ -46,6 +46,8 @@ pub struct AppState {
     pub initialized: Arc<AtomicBool>,
     /// Optional workspace isolation manager. None when workspace config is unavailable.
     pub workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
+    /// Bounded task queue for concurrency limiting.
+    pub task_queue: Arc<crate::task_queue::TaskQueue>,
 }
 
 impl AppState {
@@ -209,6 +211,15 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             }
         };
 
+    let task_queue = Arc::new(crate::task_queue::TaskQueue::new(
+        &server.config.concurrency,
+    ));
+    tracing::info!(
+        max_concurrent = server.config.concurrency.max_concurrent_tasks,
+        max_queue_size = server.config.concurrency.max_queue_size,
+        "task queue initialized"
+    );
+
     Ok(AppState {
         server,
         project_root,
@@ -243,6 +254,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         notify_tx: None,
         initialized: Arc::new(AtomicBool::new(false)),
         workspace_mgr,
+        task_queue,
     })
 }
 
