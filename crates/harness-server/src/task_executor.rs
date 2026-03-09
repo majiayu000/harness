@@ -3,8 +3,9 @@ use crate::task_runner::{
     TaskId, TaskStatus, TaskStore,
 };
 use harness_core::{
-    interceptor::TurnInterceptor, prompts, AgentRequest, AgentResponse, CodeAgent, ContextItem,
-    Decision, Event, Item, SessionId, StreamItem, ThreadId, TurnId, TurnStatus,
+    config::load_project_config, interceptor::TurnInterceptor, prompts, AgentRequest,
+    AgentResponse, CodeAgent, ContextItem, Decision, Event, Item, SessionId, StreamItem, ThreadId,
+    TurnId, TurnStatus,
 };
 use harness_protocol::{Notification, RpcNotification};
 use serde::Deserialize;
@@ -456,6 +457,9 @@ pub(crate) async fn run_task(
 ) -> anyhow::Result<()> {
     update_status(store, task_id, TaskStatus::Implementing, 1).await;
 
+    let project_config = load_project_config(&project);
+    let git = Some(&project_config.git);
+
     let first_prompt = if let Some(issue) = req.issue {
         match find_existing_pr_for_issue(&project, issue).await {
             Ok(Some((pr_num, branch))) => {
@@ -464,16 +468,16 @@ pub(crate) async fn run_task(
                 );
                 prompts::continue_existing_pr(issue, pr_num, &branch)
             }
-            Ok(None) => prompts::implement_from_issue(issue),
+            Ok(None) => prompts::implement_from_issue(issue, git),
             Err(e) => {
                 tracing::warn!("failed to check for existing PR for issue #{issue}: {e}");
-                prompts::implement_from_issue(issue)
+                prompts::implement_from_issue(issue, git)
             }
         }
     } else if let Some(pr) = req.pr {
         prompts::check_existing_pr(pr, &review_config.review_bot_command)
     } else {
-        prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default())
+        prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default(), git)
     };
 
     let mut context_items: Vec<ContextItem> = {
