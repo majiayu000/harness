@@ -94,7 +94,10 @@ fn truncate_validation_error(error: &str, max_chars: usize) -> String {
         return error.to_string();
     }
     let truncated = &error[..error.floor_char_boundary(max_chars)];
-    format!("{truncated}\n\n... (output truncated, {total} chars total)", total = error.len())
+    format!(
+        "{truncated}\n\n... (output truncated, {total} chars total)",
+        total = error.len()
+    )
 }
 
 /// Run all pre_execute interceptors in order. Returns the (possibly modified) request,
