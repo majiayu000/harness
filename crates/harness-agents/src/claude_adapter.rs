@@ -48,6 +48,7 @@ impl AgentAdapter for ClaudeAdapter {
             .arg("--verbose")
             .current_dir(&req.project_root)
             .env_remove("CLAUDECODE")
+            .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
