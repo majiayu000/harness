@@ -79,4 +79,10 @@ pub trait TurnInterceptor: Send + Sync {
 
     /// Called when agent execution fails with an error.
     async fn on_error(&self, _req: &AgentRequest, _error: &str) {}
+
+    /// Maximum number of automatic retries on post-execution validation failure.
+    /// Returns None to use the executor's default (2).
+    fn max_validation_retries(&self) -> Option<u32> {
+        None
+    }
 }

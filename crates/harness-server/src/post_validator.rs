@@ -88,27 +88,52 @@ impl TurnInterceptor for PostExecutionValidator {
         InterceptResult::pass()
     }
 
+    fn max_validation_retries(&self) -> Option<u32> {
+        Some(self.config.max_retries)
+    }
+
     async fn post_execute(&self, req: &AgentRequest, resp: &AgentResponse) -> PostExecuteResult {
         let project = &req.project_root;
+        let lang = lang_detect::detect_language(project);
 
-        // Resolve validation commands: config takes precedence over language detection.
-        let commands = if self.config.pre_commit.is_empty() {
-            let lang = lang_detect::detect_language(project);
+        // Resolve pre_commit commands: config takes precedence over language detection.
+        let pre_commit = if self.config.pre_commit.is_empty() {
             lang_detect::default_pre_commit_commands(lang)
         } else {
             self.config.pre_commit.clone()
         };
 
+        // Resolve pre_push commands: config takes precedence over language detection.
+        let pre_push = if self.config.pre_push.is_empty() {
+            lang_detect::default_pre_push_commands(lang)
+        } else {
+            self.config.pre_push.clone()
+        };
+
         let mut errors: Vec<String> = Vec::new();
 
-        // Run each validation command and collect failures.
-        for cmd in &commands {
-            tracing::info!(cmd = %cmd, "post_execution_validator: running command");
+        // Run pre_commit commands (format, compile, lint).
+        for cmd in &pre_commit {
+            tracing::info!(cmd = %cmd, "post_validator: pre_commit");
             match Self::run_command(cmd, project, self.config.timeout_secs).await {
-                Ok(()) => tracing::debug!(cmd = %cmd, "post_execution_validator: passed"),
+                Ok(()) => tracing::debug!(cmd = %cmd, "post_validator: passed"),
                 Err(e) => {
-                    tracing::warn!(cmd = %cmd, error = %e, "post_execution_validator: failed");
+                    tracing::warn!(cmd = %cmd, error = %e, "post_validator: failed");
                     errors.push(e);
+                }
+            }
+        }
+
+        // Run pre_push commands (tests) only if pre_commit passed.
+        if errors.is_empty() {
+            for cmd in &pre_push {
+                tracing::info!(cmd = %cmd, "post_validator: pre_push");
+                match Self::run_command(cmd, project, self.config.timeout_secs).await {
+                    Ok(()) => tracing::debug!(cmd = %cmd, "post_validator: passed"),
+                    Err(e) => {
+                        tracing::warn!(cmd = %cmd, error = %e, "post_validator: failed");
+                        errors.push(e);
+                    }
                 }
             }
         }
@@ -231,5 +256,55 @@ mod tests {
         let req = make_req(dir.path().to_path_buf());
         let result = v.pre_execute(&req).await;
         assert_eq!(result.decision, harness_core::Decision::Pass);
+    }
+
+    #[test]
+    fn max_validation_retries_reads_from_config() {
+        let config = ValidationConfig {
+            max_retries: 5,
+            ..Default::default()
+        };
+        let v = PostExecutionValidator::new(config);
+        assert_eq!(v.max_validation_retries(), Some(5));
+    }
+
+    #[test]
+    fn max_validation_retries_default_is_two() {
+        let v = PostExecutionValidator::new(ValidationConfig::default());
+        assert_eq!(v.max_validation_retries(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn pre_push_runs_when_pre_commit_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ValidationConfig {
+            pre_commit: vec!["true".to_string()],
+            pre_push: vec!["false".to_string()],
+            ..Default::default()
+        };
+        let validator = PostExecutionValidator::new(config);
+        let req = make_req(dir.path().to_path_buf());
+        let resp = make_resp("done");
+        let result = validator.post_execute(&req, &resp).await;
+        // pre_commit passes but pre_push fails
+        assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn pre_push_skipped_when_pre_commit_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // Use a command that creates a marker file to detect if it ran.
+        let marker = dir.path().join("pre_push_ran");
+        let config = ValidationConfig {
+            pre_commit: vec!["false".to_string()],
+            pre_push: vec![format!("touch {}", marker.display())],
+            ..Default::default()
+        };
+        let validator = PostExecutionValidator::new(config);
+        let req = make_req(dir.path().to_path_buf());
+        let resp = make_resp("done");
+        let _result = validator.post_execute(&req, &resp).await;
+        // pre_push should NOT have run because pre_commit failed
+        assert!(!marker.exists());
     }
 }
