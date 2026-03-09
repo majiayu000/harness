@@ -826,4 +826,40 @@ mod tests {
         assert_eq!(config.notification_broadcast_capacity, 256);
         assert_eq!(config.notification_lag_log_every, 1);
     }
+
+    #[test]
+    fn validation_config_defaults() {
+        let config = ValidationConfig::default();
+        assert!(config.pre_commit.is_empty());
+        assert!(config.pre_push.is_empty());
+        assert_eq!(config.timeout_secs, 120);
+        assert_eq!(config.max_retries, 2);
+    }
+
+    #[test]
+    fn validation_config_deserializes_from_toml() {
+        let toml_str = r#"
+            pre_commit = ["cargo fmt --all -- --check", "cargo check"]
+            pre_push = ["cargo test"]
+            timeout_secs = 60
+            max_retries = 3
+        "#;
+        let config: ValidationConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.pre_commit.len(), 2);
+        assert_eq!(config.pre_push, vec!["cargo test"]);
+        assert_eq!(config.timeout_secs, 60);
+        assert_eq!(config.max_retries, 3);
+    }
+
+    #[test]
+    fn validation_config_deserializes_with_defaults() {
+        let toml_str = r#"
+            pre_commit = ["ruff check ."]
+        "#;
+        let config: ValidationConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.pre_commit, vec!["ruff check ."]);
+        assert!(config.pre_push.is_empty());
+        assert_eq!(config.timeout_secs, 120);
+        assert_eq!(config.max_retries, 2);
+    }
 }

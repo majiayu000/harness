@@ -36,7 +36,10 @@ pub fn default_pre_commit_commands(lang: Language) -> Vec<String> {
         ],
         Language::TypeScript => vec!["npx tsc --noEmit".to_string()],
         Language::Python => vec!["ruff check .".to_string()],
-        Language::Go => vec!["gofmt -l .".to_string(), "go build ./...".to_string()],
+        Language::Go => vec![
+            "test -z \"$(gofmt -l .)\"".to_string(),
+            "go build ./...".to_string(),
+        ],
         Language::Common => vec![],
     }
 }

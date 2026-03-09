@@ -93,7 +93,12 @@ fn truncate_validation_error(error: &str, max_chars: usize) -> String {
     if error.len() <= max_chars {
         return error.to_string();
     }
-    let truncated = &error[..error.floor_char_boundary(max_chars)];
+    // Find the last valid char boundary at or before max_chars.
+    let mut boundary = max_chars;
+    while boundary > 0 && !error.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let truncated = &error[..boundary];
     format!(
         "{truncated}\n\n... (output truncated, {total} chars total)",
         total = error.len()
@@ -502,10 +507,12 @@ pub(crate) async fn run_task(
     let first_req = run_pre_execute(&interceptors, initial_req).await?;
 
     // Execute implementation turn with post-execution validation and auto-retry.
+    // Use the largest max_retries declared by any interceptor.
+    // A single interceptor returning 0 should not suppress retries for others.
     let max_validation_retries: u32 = interceptors
         .iter()
         .filter_map(|i| i.max_validation_retries())
-        .min()
+        .max()
         .unwrap_or(2);
     let mut validation_attempt = 0u32;
     let mut impl_req = first_req.clone();
@@ -945,5 +952,30 @@ mod tests {
         assert!(prompt.contains("majiayu000/harness"));
         assert!(prompt.contains("<external_data>"));
         assert!(prompt.contains("PR_URL=https://github.com/majiayu000/harness/pull/42"));
+    }
+
+    #[test]
+    fn truncate_short_string_passes_through() {
+        let input = "short error";
+        let result = truncate_validation_error(input, 100);
+        assert_eq!(result, "short error");
+    }
+
+    #[test]
+    fn truncate_at_max_chars_boundary() {
+        let input = "a".repeat(200);
+        let result = truncate_validation_error(&input, 50);
+        assert!(result.starts_with(&"a".repeat(50)));
+        assert!(result.contains("(output truncated, 200 chars total)"));
+    }
+
+    #[test]
+    fn truncate_preserves_utf8_boundary() {
+        // "é" is 2 bytes; build a string where max_chars lands mid-character.
+        let input = "ééééé"; // 10 bytes, 5 chars
+        let result = truncate_validation_error(input, 3); // byte 3 is mid-char
+                                                          // Should back up to byte 2 (1 full "é").
+        assert!(result.starts_with("é"));
+        assert!(result.contains("(output truncated,"));
     }
 }
