@@ -62,15 +62,6 @@ pub async fn index() -> impl IntoResponse {
       <textarea id="f-description" class="form-input form-textarea" name="description" placeholder="Describe the task in detail..." rows="4" required></textarea>
     </div>
     <div class="form-row">
-      <div class="form-group form-group-inline">
-        <label class="form-label" for="f-priority">Priority</label>
-        <select id="f-priority" class="form-input form-select" name="priority">
-          <option value="">Normal</option>
-          <option value="1">Urgent</option>
-          <option value="2">High</option>
-          <option value="3">Medium</option>
-        </select>
-      </div>
       <button id="task-submit-btn" class="btn-primary" type="submit">Submit Task</button>
     </div>
     <div id="task-form-feedback" class="form-feedback" aria-live="polite"></div>
