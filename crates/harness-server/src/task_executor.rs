@@ -88,6 +88,60 @@ pub(crate) fn build_fix_ci_prompt(
     )
 }
 
+pub(crate) fn build_pr_rework_prompt(
+    repository: &str,
+    pr_number: u64,
+    review_state: &str,
+    review_body: &str,
+    review_url: Option<&str>,
+    pr_url: Option<&str>,
+) -> String {
+    let wrapped_body = prompts::wrap_external_data(review_body);
+    let review_url_line = review_url
+        .map(|url| format!("- Review URL: {url}\n"))
+        .unwrap_or_default();
+    let pr_url_line = pr_url
+        .map(|url| format!("- PR URL: {url}\n"))
+        .unwrap_or_default();
+    let canonical_pr_url = format!("https://github.com/{repository}/pull/{pr_number}");
+
+    format!(
+        "PR review feedback received on PR #{pr_number} in `{repository}`.\n\
+         Review state: {review_state}\n\
+         {review_url_line}\
+         {pr_url_line}\
+         Review feedback:\n\
+         {wrapped_body}\n\n\
+         Required workflow:\n\
+         1. Read the review feedback above carefully.\n\
+         2. Address all requested changes.\n\
+         3. Run the repository's standard validation commands.\n\
+         4. Commit and push to the existing PR branch (do not create a new PR).\n\n\
+         On the last line, print PR_URL={canonical_pr_url}"
+    )
+}
+
+pub(crate) fn build_pr_approved_prompt(
+    repository: &str,
+    pr_number: u64,
+    review_url: Option<&str>,
+) -> String {
+    let review_url_line = review_url
+        .map(|url| format!("- Review URL: {url}\n"))
+        .unwrap_or_default();
+    let canonical_pr_url = format!("https://github.com/{repository}/pull/{pr_number}");
+
+    format!(
+        "PR #{pr_number} in `{repository}` has been approved by a reviewer.\n\
+         {review_url_line}\n\
+         Action required:\n\
+         Post a comment on the PR indicating it is ready to merge:\n\
+         gh pr comment {pr_number} --repo {repository} --body \"Approved — ready to merge.\"\n\n\
+         Then stop. There is nothing else to implement.\n\n\
+         On the last line, print PR_URL={canonical_pr_url}"
+    )
+}
+
 /// Truncate validation error output to `max_chars` to avoid bloating agent prompts.
 /// Preserves the first portion which typically contains the most actionable info.
 fn truncate_validation_error(error: &str, max_chars: usize) -> String {

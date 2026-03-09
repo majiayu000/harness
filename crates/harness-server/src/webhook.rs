@@ -1,5 +1,6 @@
 use crate::task_executor::{
-    build_fix_ci_prompt, parse_harness_mention_command, HarnessMentionCommand,
+    build_fix_ci_prompt, build_pr_approved_prompt, build_pr_rework_prompt,
+    parse_harness_mention_command, HarnessMentionCommand,
 };
 use crate::task_runner::CreateTaskRequest;
 use serde::Deserialize;
@@ -41,6 +42,30 @@ struct GitHubIssuesEvent {
     issue: GitHubIssueRef,
 }
 
+#[derive(Debug, Deserialize)]
+struct GitHubPullRequestRef {
+    number: u64,
+    #[serde(default)]
+    html_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubReviewRef {
+    state: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubPullRequestReviewEvent {
+    action: String,
+    review: GitHubReviewRef,
+    pull_request: GitHubPullRequestRef,
+    repository: GitHubRepositoryRef,
+}
+
 fn issue_task_request(issue_number: u64) -> CreateTaskRequest {
     let mut req = CreateTaskRequest::default();
     req.issue = Some(issue_number);
@@ -50,6 +75,29 @@ fn issue_task_request(issue_number: u64) -> CreateTaskRequest {
 fn review_task_request(pr_number: u64) -> CreateTaskRequest {
     let mut req = CreateTaskRequest::default();
     req.pr = Some(pr_number);
+    req
+}
+
+fn pr_rework_task_request(event: &GitHubPullRequestReviewEvent) -> CreateTaskRequest {
+    let mut req = CreateTaskRequest::default();
+    req.prompt = Some(build_pr_rework_prompt(
+        &event.repository.full_name,
+        event.pull_request.number,
+        &event.review.state,
+        event.review.body.as_deref().unwrap_or(""),
+        event.review.html_url.as_deref(),
+        event.pull_request.html_url.as_deref(),
+    ));
+    req
+}
+
+fn pr_approved_task_request(event: &GitHubPullRequestReviewEvent) -> CreateTaskRequest {
+    let mut req = CreateTaskRequest::default();
+    req.prompt = Some(build_pr_approved_prompt(
+        &event.repository.full_name,
+        event.pull_request.number,
+        event.review.html_url.as_deref(),
+    ));
     req
 }
 
@@ -137,6 +185,34 @@ pub(crate) fn parse_github_webhook_task_request(
                 HarnessMentionCommand::FixCi => {
                     Ok((None, "fix ci command ignored on issue comment".to_string()))
                 }
+            }
+        }
+        "pull_request_review" => {
+            let parsed: GitHubPullRequestReviewEvent = serde_json::from_slice(payload)
+                .map_err(|err| format!("invalid pull_request_review payload: {err}"))?;
+            if parsed.action != "submitted" {
+                return Ok((None, "ignored pull_request_review action".to_string()));
+            }
+            match parsed.review.state.as_str() {
+                "changes_requested" => Ok((
+                    Some(pr_rework_task_request(&parsed)),
+                    "pr review changes_requested".to_string(),
+                )),
+                "approved" => Ok((
+                    Some(pr_approved_task_request(&parsed)),
+                    "pr review approved".to_string(),
+                )),
+                "commented" => {
+                    let body = parsed.review.body.as_deref().unwrap_or("").trim();
+                    if body.is_empty() {
+                        return Ok((None, "pr review comment: empty body ignored".to_string()));
+                    }
+                    Ok((
+                        Some(pr_rework_task_request(&parsed)),
+                        "pr review comment: actionable feedback".to_string(),
+                    ))
+                }
+                _ => Ok((None, "unsupported review state".to_string())),
             }
         }
         _ => Ok((None, "unsupported event".to_string())),
@@ -398,5 +474,168 @@ mod tests {
             "sha256=zzzz",
             b"payload"
         ));
+    }
+
+    #[test]
+    fn pull_request_review_changes_requested_creates_rework_task() {
+        let payload = serde_json::json!({
+            "action": "submitted",
+            "review": {
+                "state": "changes_requested",
+                "body": "Please fix the error handling in this function.",
+                "html_url": "https://github.com/org/repo/pull/10#pullrequestreview-1"
+            },
+            "pull_request": {
+                "number": 10,
+                "html_url": "https://github.com/org/repo/pull/10"
+            },
+            "repository": { "full_name": "org/repo" }
+        });
+
+        let (request, reason) = parse_github_webhook_task_request(
+            "pull_request_review",
+            payload.to_string().as_bytes(),
+        )
+        .unwrap();
+        let request = request.expect("request should exist");
+        assert_eq!(reason, "pr review changes_requested");
+        let prompt = request.prompt.unwrap();
+        assert!(prompt.contains("PR #10"));
+        assert!(prompt.contains("org/repo"));
+        assert!(prompt.contains("changes_requested"));
+        assert!(prompt.contains("Please fix the error handling"));
+    }
+
+    #[test]
+    fn pull_request_review_approved_creates_approved_task() {
+        let payload = serde_json::json!({
+            "action": "submitted",
+            "review": {
+                "state": "approved",
+                "body": "LGTM!",
+                "html_url": "https://github.com/org/repo/pull/10#pullrequestreview-2"
+            },
+            "pull_request": {
+                "number": 10,
+                "html_url": "https://github.com/org/repo/pull/10"
+            },
+            "repository": { "full_name": "org/repo" }
+        });
+
+        let (request, reason) = parse_github_webhook_task_request(
+            "pull_request_review",
+            payload.to_string().as_bytes(),
+        )
+        .unwrap();
+        let request = request.expect("request should exist");
+        assert_eq!(reason, "pr review approved");
+        let prompt = request.prompt.unwrap();
+        assert!(prompt.contains("PR #10"));
+        assert!(prompt.contains("org/repo"));
+        assert!(prompt.contains("approved"));
+        assert!(prompt.contains("ready to merge"));
+    }
+
+    #[test]
+    fn pull_request_review_commented_with_body_creates_rework_task() {
+        let payload = serde_json::json!({
+            "action": "submitted",
+            "review": {
+                "state": "commented",
+                "body": "Consider renaming this variable for clarity.",
+                "html_url": "https://github.com/org/repo/pull/10#pullrequestreview-3"
+            },
+            "pull_request": {
+                "number": 10,
+                "html_url": "https://github.com/org/repo/pull/10"
+            },
+            "repository": { "full_name": "org/repo" }
+        });
+
+        let (request, reason) = parse_github_webhook_task_request(
+            "pull_request_review",
+            payload.to_string().as_bytes(),
+        )
+        .unwrap();
+        let request = request.expect("request should exist");
+        assert_eq!(reason, "pr review comment: actionable feedback");
+        let prompt = request.prompt.unwrap();
+        assert!(prompt.contains("Consider renaming this variable"));
+    }
+
+    #[test]
+    fn pull_request_review_commented_with_empty_body_is_ignored() {
+        let payload = serde_json::json!({
+            "action": "submitted",
+            "review": {
+                "state": "commented",
+                "body": "",
+                "html_url": "https://github.com/org/repo/pull/10#pullrequestreview-4"
+            },
+            "pull_request": {
+                "number": 10,
+                "html_url": "https://github.com/org/repo/pull/10"
+            },
+            "repository": { "full_name": "org/repo" }
+        });
+
+        let (request, reason) = parse_github_webhook_task_request(
+            "pull_request_review",
+            payload.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert!(request.is_none());
+        assert_eq!(reason, "pr review comment: empty body ignored");
+    }
+
+    #[test]
+    fn pull_request_review_non_submitted_action_is_ignored() {
+        let payload = serde_json::json!({
+            "action": "dismissed",
+            "review": {
+                "state": "changes_requested",
+                "body": "Some feedback"
+            },
+            "pull_request": { "number": 10 },
+            "repository": { "full_name": "org/repo" }
+        });
+
+        let (request, reason) = parse_github_webhook_task_request(
+            "pull_request_review",
+            payload.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert!(request.is_none());
+        assert_eq!(reason, "ignored pull_request_review action");
+    }
+
+    #[test]
+    fn pull_request_review_invalid_payload_returns_error() {
+        let result = parse_github_webhook_task_request("pull_request_review", b"not valid json");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("invalid pull_request_review payload"));
+    }
+
+    #[test]
+    fn pull_request_review_unsupported_state_is_ignored() {
+        let payload = serde_json::json!({
+            "action": "submitted",
+            "review": {
+                "state": "pending",
+                "body": "Still reviewing"
+            },
+            "pull_request": { "number": 10 },
+            "repository": { "full_name": "org/repo" }
+        });
+
+        let (request, reason) = parse_github_webhook_task_request(
+            "pull_request_review",
+            payload.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert!(request.is_none());
+        assert_eq!(reason, "unsupported review state");
     }
 }
