@@ -100,6 +100,7 @@ async fn make_test_state_with(
         notification_lag_log_every: 1,
         notify_tx: None,
         initialized: Arc::new(AtomicBool::new(true)),
+        workspace_mgr: None,
     }))
 }
 

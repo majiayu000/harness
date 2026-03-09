@@ -53,6 +53,7 @@ pub(super) async fn enqueue_task(
         state.events.clone(),
         state.interceptors.clone(),
         req,
+        state.workspace_mgr.clone(),
     )
     .await;
 

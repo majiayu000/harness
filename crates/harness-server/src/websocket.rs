@@ -223,6 +223,7 @@ mod tests {
             notification_lag_log_every,
             notify_tx: None,
             initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            workspace_mgr: None,
         })
     }
 
