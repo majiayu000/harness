@@ -75,6 +75,55 @@ pub struct HarnessConfig {
     pub otel: OtelConfig,
     #[serde(default)]
     pub validation: ValidationConfig,
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
+}
+
+/// Workspace isolation configuration for parallel task execution.
+///
+/// WorkspaceManager provisions an isolated git worktree per task,
+/// preventing merge conflicts when multiple agents edit the same project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    /// Root directory for all task worktrees. Default: `~/.local/share/harness/workspaces`.
+    #[serde(default = "default_workspace_root")]
+    pub root: std::path::PathBuf,
+    /// Shell script run after worktree creation (cwd = workspace). Fatal on failure.
+    #[serde(default)]
+    pub after_create_hook: Option<String>,
+    /// Shell script run before worktree removal (cwd = workspace). Non-fatal on failure.
+    #[serde(default)]
+    pub before_remove_hook: Option<String>,
+    /// Timeout in seconds for hook execution. Default: 60.
+    #[serde(default = "default_hook_timeout_secs")]
+    pub hook_timeout_secs: u64,
+    /// If true, remove workspace when task reaches Done or Failed state. Default: true.
+    #[serde(default = "default_auto_cleanup")]
+    pub auto_cleanup: bool,
+}
+
+fn default_workspace_root() -> std::path::PathBuf {
+    dirs_data_dir().join("harness").join("workspaces")
+}
+
+fn default_hook_timeout_secs() -> u64 {
+    60
+}
+
+fn default_auto_cleanup() -> bool {
+    true
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            root: default_workspace_root(),
+            after_create_hook: None,
+            before_remove_hook: None,
+            hook_timeout_secs: default_hook_timeout_secs(),
+            auto_cleanup: default_auto_cleanup(),
+        }
+    }
 }
 
 /// Per-project post-execution validation configuration.
@@ -860,6 +909,37 @@ mod tests {
     fn invalid_toml_returns_parse_error() {
         let result = toml::from_str::<HarnessConfig>("not valid toml {{{}}}");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn workspace_config_defaults() {
+        let config = WorkspaceConfig::default();
+        assert!(config.after_create_hook.is_none());
+        assert!(config.before_remove_hook.is_none());
+        assert_eq!(config.hook_timeout_secs, 60);
+        assert!(config.auto_cleanup);
+    }
+
+    #[test]
+    fn workspace_config_deserializes_from_toml() {
+        let toml_str = r#"
+            after_create_hook = "npm install"
+            before_remove_hook = "echo cleanup"
+            hook_timeout_secs = 30
+            auto_cleanup = false
+        "#;
+        let config: WorkspaceConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.after_create_hook.as_deref(), Some("npm install"));
+        assert_eq!(config.before_remove_hook.as_deref(), Some("echo cleanup"));
+        assert_eq!(config.hook_timeout_secs, 30);
+        assert!(!config.auto_cleanup);
+    }
+
+    #[test]
+    fn harness_config_includes_workspace() {
+        let config = HarnessConfig::default();
+        assert!(config.workspace.auto_cleanup);
+        assert_eq!(config.workspace.hook_timeout_secs, 60);
     }
 
     #[test]

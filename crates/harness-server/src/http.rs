@@ -44,6 +44,8 @@ pub struct AppState {
     pub notify_tx: Option<crate::notify::NotifySender>,
     /// Whether the client has completed the initialize/initialized handshake.
     pub initialized: Arc<AtomicBool>,
+    /// Optional workspace isolation manager. None when workspace config is unavailable.
+    pub workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
 }
 
 impl AppState {
@@ -190,6 +192,23 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     let validation_config = server.config.validation.clone();
 
+    let workspace_mgr =
+        match crate::workspace::WorkspaceManager::new(server.config.workspace.clone()) {
+            Ok(mgr) => {
+                tracing::info!(
+                    root = %server.config.workspace.root.display(),
+                    "workspace manager initialized"
+                );
+                Some(Arc::new(mgr))
+            }
+            Err(e) => {
+                tracing::warn!(
+                "failed to initialize workspace manager: {e}; running without workspace isolation"
+            );
+                None
+            }
+        };
+
     Ok(AppState {
         server,
         project_root,
@@ -223,6 +242,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         notification_lag_log_every,
         notify_tx: None,
         initialized: Arc::new(AtomicBool::new(false)),
+        workspace_mgr,
     })
 }
 
