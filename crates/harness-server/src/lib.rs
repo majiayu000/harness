@@ -11,6 +11,7 @@
 
 pub mod complexity_router;
 pub mod contract_validator;
+pub mod dashboard;
 pub mod handlers;
 pub mod http;
 pub mod notify;
