@@ -10,6 +10,47 @@ pub struct HarnessConfig {
     pub rules: RulesConfig,
     pub observe: ObserveConfig,
     pub otel: OtelConfig,
+    #[serde(default)]
+    pub validation: ValidationConfig,
+}
+
+/// Per-project post-execution validation configuration.
+///
+/// Commands run after agent output to verify code quality before
+/// continuing to the review loop. Empty `pre_commit` triggers language detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationConfig {
+    /// Commands run after each implementation turn (format check, compile, lint).
+    #[serde(default)]
+    pub pre_commit: Vec<String>,
+    /// Commands run before pushing (e.g., full test suite).
+    #[serde(default)]
+    pub pre_push: Vec<String>,
+    /// Timeout in seconds for each individual validation command.
+    #[serde(default = "default_validation_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum number of auto-retry attempts on validation failure.
+    #[serde(default = "default_validation_max_retries")]
+    pub max_retries: u32,
+}
+
+fn default_validation_timeout_secs() -> u64 {
+    120
+}
+
+fn default_validation_max_retries() -> u32 {
+    2
+}
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            pre_commit: Vec::new(),
+            pre_push: Vec::new(),
+            timeout_secs: default_validation_timeout_secs(),
+            max_retries: default_validation_max_retries(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

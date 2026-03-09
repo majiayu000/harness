@@ -188,6 +188,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         tracing::warn!("Failed to reload persisted skills on startup: {}", e);
     }
 
+    let validation_config = server.config.validation.clone();
+
     Ok(AppState {
         server,
         project_root,
@@ -210,7 +212,12 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         },
         thread_db: Some(thread_db),
         plan_db: Some(plan_db),
-        interceptors: vec![Arc::new(crate::contract_validator::ContractValidator::new())],
+        interceptors: vec![
+            Arc::new(crate::contract_validator::ContractValidator::new()),
+            Arc::new(crate::post_validator::PostExecutionValidator::new(
+                validation_config,
+            )),
+        ],
         notification_tx: broadcast::channel(notification_broadcast_capacity).0,
         notification_lagged_total: Arc::new(AtomicU64::new(0)),
         notification_lag_log_every,

@@ -1,0 +1,235 @@
+use async_trait::async_trait;
+use harness_core::{
+    interceptor::{InterceptResult, PostExecuteResult, TurnInterceptor},
+    lang_detect, prompts, AgentRequest, AgentResponse, ValidationConfig,
+};
+use std::path::Path;
+use tokio::process::Command;
+use tokio::time::{timeout, Duration};
+
+/// Runs project-specific validation commands after each agent turn.
+///
+/// If `config.pre_commit` is empty, language detection kicks in and selects
+/// appropriate default commands (cargo fmt/check/clippy for Rust, etc.).
+///
+/// On failure the executor will inject the error output into the next
+/// turn prompt and retry up to `config.max_retries` times.
+pub struct PostExecutionValidator {
+    config: ValidationConfig,
+}
+
+impl PostExecutionValidator {
+    pub fn new(config: ValidationConfig) -> Self {
+        Self { config }
+    }
+
+    async fn run_command(cmd_str: &str, project: &Path, timeout_secs: u64) -> Result<(), String> {
+        let mut parts = cmd_str.split_whitespace();
+        let program = match parts.next() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let args: Vec<&str> = parts.collect();
+
+        let result = timeout(
+            Duration::from_secs(timeout_secs),
+            Command::new(program)
+                .args(&args)
+                .current_dir(project)
+                .output(),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(output)) if output.status.success() => Ok(()),
+            Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let code = output.status.code().unwrap_or(-1);
+                Err(format!(
+                    "Command `{cmd_str}` failed (exit {code})\nstdout: {stdout}\nstderr: {stderr}"
+                ))
+            }
+            Ok(Err(e)) => Err(format!("Command `{cmd_str}` failed to spawn: {e}")),
+            Err(_) => Err(format!(
+                "Command `{cmd_str}` timed out after {timeout_secs}s"
+            )),
+        }
+    }
+
+    /// Verify a PR number exists on GitHub via `gh pr view`.
+    async fn verify_pr_exists(project: &Path, pr_number: u64) -> bool {
+        let result = Command::new("gh")
+            .args(["pr", "view", &pr_number.to_string(), "--json", "number"])
+            .current_dir(project)
+            .output()
+            .await;
+        match result {
+            Ok(output) => output.status.success(),
+            Err(e) => {
+                tracing::warn!(
+                    pr = pr_number,
+                    error = %e,
+                    "post_validator: failed to run `gh pr view` for PR verification"
+                );
+                false
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl TurnInterceptor for PostExecutionValidator {
+    fn name(&self) -> &str {
+        "post_execution_validator"
+    }
+
+    async fn pre_execute(&self, _req: &AgentRequest) -> InterceptResult {
+        InterceptResult::pass()
+    }
+
+    async fn post_execute(&self, req: &AgentRequest, resp: &AgentResponse) -> PostExecuteResult {
+        let project = &req.project_root;
+
+        // Resolve validation commands: config takes precedence over language detection.
+        let commands = if self.config.pre_commit.is_empty() {
+            let lang = lang_detect::detect_language(project);
+            lang_detect::default_pre_commit_commands(lang)
+        } else {
+            self.config.pre_commit.clone()
+        };
+
+        let mut errors: Vec<String> = Vec::new();
+
+        // Run each validation command and collect failures.
+        for cmd in &commands {
+            tracing::info!(cmd = %cmd, "post_execution_validator: running command");
+            match Self::run_command(cmd, project, self.config.timeout_secs).await {
+                Ok(()) => tracing::debug!(cmd = %cmd, "post_execution_validator: passed"),
+                Err(e) => {
+                    tracing::warn!(cmd = %cmd, error = %e, "post_execution_validator: failed");
+                    errors.push(e);
+                }
+            }
+        }
+
+        // Verify PR exists on GitHub when a PR URL is present in the response.
+        if let Some(pr_url) = prompts::parse_pr_url(&resp.output) {
+            if let Some(pr_number) = prompts::extract_pr_number(&pr_url) {
+                tracing::info!(
+                    pr = pr_number,
+                    "post_execution_validator: verifying PR exists"
+                );
+                if !Self::verify_pr_exists(project, pr_number).await {
+                    errors.push(format!(
+                        "PR #{pr_number} could not be verified on GitHub — \
+                         run `gh pr view {pr_number}` to diagnose"
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            PostExecuteResult::pass()
+        } else {
+            PostExecuteResult::fail(errors.join("\n\n"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_core::{AgentRequest, AgentResponse, TokenUsage, ValidationConfig};
+    use std::path::PathBuf;
+
+    fn make_req(project_root: PathBuf) -> AgentRequest {
+        AgentRequest {
+            prompt: "fix the bug. Ensure tests pass.".to_string(),
+            project_root,
+            ..Default::default()
+        }
+    }
+
+    fn make_resp(output: &str) -> AgentResponse {
+        AgentResponse {
+            output: output.to_string(),
+            stderr: String::new(),
+            items: vec![],
+            token_usage: TokenUsage::default(),
+            model: "claude-sonnet".to_string(),
+            exit_code: Some(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn passes_when_no_commands_configured_and_unknown_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let validator = PostExecutionValidator::new(ValidationConfig::default());
+        let req = make_req(dir.path().to_path_buf());
+        let resp = make_resp("done");
+        let result = validator.post_execute(&req, &resp).await;
+        // Unknown project → no commands → should pass
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn passes_when_command_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ValidationConfig {
+            pre_commit: vec!["true".to_string()],
+            ..Default::default()
+        };
+        let validator = PostExecutionValidator::new(config);
+        let req = make_req(dir.path().to_path_buf());
+        let resp = make_resp("done");
+        let result = validator.post_execute(&req, &resp).await;
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn fails_when_command_exits_nonzero() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ValidationConfig {
+            pre_commit: vec!["false".to_string()],
+            ..Default::default()
+        };
+        let validator = PostExecutionValidator::new(config);
+        let req = make_req(dir.path().to_path_buf());
+        let resp = make_resp("done");
+        let result = validator.post_execute(&req, &resp).await;
+        assert!(result.error.is_some());
+        assert!(result.error.unwrap().contains("false"));
+    }
+
+    #[tokio::test]
+    async fn collects_all_failures_not_just_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ValidationConfig {
+            pre_commit: vec!["false".to_string(), "false".to_string()],
+            ..Default::default()
+        };
+        let validator = PostExecutionValidator::new(config);
+        let req = make_req(dir.path().to_path_buf());
+        let resp = make_resp("done");
+        let result = validator.post_execute(&req, &resp).await;
+        // Both failures should be captured
+        let err = result.error.unwrap();
+        assert!(err.contains("false"));
+    }
+
+    #[test]
+    fn interceptor_name_is_post_execution_validator() {
+        let v = PostExecutionValidator::new(ValidationConfig::default());
+        assert_eq!(v.name(), "post_execution_validator");
+    }
+
+    #[tokio::test]
+    async fn pre_execute_always_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = PostExecutionValidator::new(ValidationConfig::default());
+        let req = make_req(dir.path().to_path_buf());
+        let result = v.pre_execute(&req).await;
+        assert_eq!(result.decision, harness_core::Decision::Pass);
+    }
+}

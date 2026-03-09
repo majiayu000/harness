@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use harness_core::{
     interceptor::{InterceptResult, TurnInterceptor},
-    AgentRequest, AgentResponse,
+    AgentRequest,
 };
 
 /// Minimum prompt length required to allow execution.
@@ -108,8 +108,6 @@ impl TurnInterceptor for ContractValidator {
 
         InterceptResult::pass()
     }
-
-    async fn post_execute(&self, _req: &AgentRequest, _resp: &AgentResponse) {}
 
     async fn on_error(&self, _req: &AgentRequest, _error: &str) {}
 }
