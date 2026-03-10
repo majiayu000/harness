@@ -71,6 +71,15 @@ impl TaskQueue {
     pub fn queued_count(&self) -> usize {
         self.queued_count.load(Ordering::Relaxed)
     }
+
+    /// Create an unbounded queue for tests (effectively no limit).
+    #[cfg(test)]
+    pub fn unbounded() -> Self {
+        Self::new(&ConcurrencyConfig {
+            max_concurrent_tasks: 1024,
+            max_queue_size: 1024,
+        })
+    }
 }
 
 #[cfg(test)]

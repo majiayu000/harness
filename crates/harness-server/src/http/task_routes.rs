@@ -29,6 +29,14 @@ pub(crate) async fn enqueue_task(
         ));
     }
 
+    // Acquire concurrency permit before spawning. Blocks if all slots are
+    // occupied; rejects immediately if the waiting queue is full.
+    let permit = state
+        .task_queue
+        .acquire()
+        .await
+        .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+
     let agent =
         if let Some(name) = &req.agent {
             state.server.agent_registry.get(name).ok_or_else(|| {
@@ -63,6 +71,7 @@ pub(crate) async fn enqueue_task(
         state.interceptors.clone(),
         req,
         state.workspace_mgr.clone(),
+        permit,
     )
     .await;
 
