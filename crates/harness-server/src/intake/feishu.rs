@@ -112,6 +112,11 @@ impl IntakeSource for FeishuIntake {
         Ok(vec![])
     }
 
+    async fn unmark_dispatched(&self, external_id: &str) {
+        self.dispatched.remove(external_id);
+        self.chat_ids.remove(external_id);
+    }
+
     async fn mark_dispatched(&self, external_id: &str, task_id: &TaskId) -> anyhow::Result<()> {
         self.dispatched
             .insert(external_id.to_string(), task_id.clone());
