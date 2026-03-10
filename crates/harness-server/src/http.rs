@@ -352,6 +352,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     crate::intake::build_orchestrator(
         &state.server.config.intake,
         Some(&state.server.config.server.data_dir),
+        state.feishu_intake.clone(),
     )
     .start(state.clone());
 
