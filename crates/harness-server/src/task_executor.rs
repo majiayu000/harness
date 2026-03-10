@@ -64,12 +64,12 @@ pub(crate) fn build_fix_ci_prompt(
     pr_url: Option<&str>,
 ) -> String {
     let wrapped_comment = prompts::wrap_external_data(comment_body);
-    let safe_comment_url = comment_url.map(|url| prompts::wrap_external_data(url));
+    let safe_comment_url = comment_url.map(prompts::wrap_external_data);
     let comment_url_line = safe_comment_url
         .as_deref()
         .map(|url| format!("- Trigger comment: {url}\n"))
         .unwrap_or_default();
-    let safe_pr_url = pr_url.map(|url| prompts::wrap_external_data(url));
+    let safe_pr_url = pr_url.map(prompts::wrap_external_data);
     let pr_url_line = safe_pr_url
         .as_deref()
         .map(|url| format!("- PR URL: {url}\n"))
@@ -101,12 +101,12 @@ pub(crate) fn build_pr_rework_prompt(
     pr_url: Option<&str>,
 ) -> String {
     let wrapped_body = prompts::wrap_external_data(review_body);
-    let safe_review_url = review_url.map(|url| prompts::wrap_external_data(url));
+    let safe_review_url = review_url.map(prompts::wrap_external_data);
     let review_url_line = safe_review_url
         .as_deref()
         .map(|url| format!("- Review URL: {url}\n"))
         .unwrap_or_default();
-    let safe_pr_url = pr_url.map(|url| prompts::wrap_external_data(url));
+    let safe_pr_url = pr_url.map(prompts::wrap_external_data);
     let pr_url_line = safe_pr_url
         .as_deref()
         .map(|url| format!("- PR URL: {url}\n"))
@@ -134,7 +134,7 @@ pub(crate) fn build_pr_approved_prompt(
     pr_number: u64,
     review_url: Option<&str>,
 ) -> String {
-    let safe_review_url = review_url.map(|url| prompts::wrap_external_data(url));
+    let safe_review_url = review_url.map(prompts::wrap_external_data);
     let review_url_line = safe_review_url
         .as_deref()
         .map(|url| format!("- Review URL: {url}\n"))
