@@ -134,6 +134,16 @@ pub async fn gc_adopt(
                     &state.server.config.gc,
                     state.project_root.clone(),
                 );
+                let permit = match state.task_queue.acquire().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return RpcResponse::error(
+                            id,
+                            INTERNAL_ERROR,
+                            format!("task queue full: {e}"),
+                        );
+                    }
+                };
                 let tid = crate::task_runner::spawn_task(
                     state.tasks.clone(),
                     agent,
@@ -144,6 +154,7 @@ pub async fn gc_adopt(
                     state.interceptors.clone(),
                     req,
                     state.workspace_mgr.clone(),
+                    permit,
                 )
                 .await;
                 Some(tid.0)

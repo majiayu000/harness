@@ -290,6 +290,7 @@ pub async fn spawn_task(
     interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     req: CreateTaskRequest,
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
+    permit: crate::task_queue::TaskPermit,
 ) -> TaskId {
     spawn_task_with_worktree_detector(
         store,
@@ -302,6 +303,7 @@ pub async fn spawn_task(
         req,
         detect_main_worktree,
         workspace_mgr,
+        permit,
     )
     .await
 }
@@ -317,6 +319,7 @@ async fn spawn_task_with_worktree_detector<F>(
     req: CreateTaskRequest,
     detect_worktree: F,
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
+    permit: crate::task_queue::TaskPermit,
 ) -> TaskId
 where
     F: Fn() -> PathBuf + Send + Sync + 'static,
@@ -333,6 +336,9 @@ where
     let detect_worktree = Arc::new(detect_worktree);
 
     let handle = tokio::spawn(async move {
+        // Hold the concurrency permit for the task's lifetime.
+        // Dropped automatically when this future completes (including on panic).
+        let _permit = permit;
         let detect_worktree = detect_worktree.clone();
         let raw_project =
             resolve_project_root_with(req.project.clone(), move || detect_worktree()).await?;
@@ -527,6 +533,8 @@ mod tests {
         };
 
         let events = Arc::new(harness_observe::EventStore::new(dir.path())?);
+        let queue = crate::task_queue::TaskQueue::unbounded();
+        let permit = queue.acquire().await.unwrap();
         spawn_task(
             store,
             agent_clone,
@@ -537,6 +545,7 @@ mod tests {
             vec![],
             req,
             None,
+            permit,
         )
         .await;
 
@@ -594,6 +603,8 @@ mod tests {
             turn_timeout_secs: 30,
         };
 
+        let queue = crate::task_queue::TaskQueue::unbounded();
+        let permit = queue.acquire().await.unwrap();
         let task_id = spawn_task(
             store.clone(),
             agent,
@@ -604,6 +615,7 @@ mod tests {
             interceptors,
             req,
             None,
+            permit,
         )
         .await;
 
@@ -710,6 +722,8 @@ mod tests {
             turn_timeout_secs: 30,
         };
 
+        let queue = crate::task_queue::TaskQueue::unbounded();
+        let permit = queue.acquire().await.unwrap();
         let task_id = spawn_task_with_worktree_detector(
             store.clone(),
             agent,
@@ -723,6 +737,7 @@ mod tests {
                 panic!("forced detect_main_worktree panic");
             },
             None,
+            permit,
         )
         .await;
 
