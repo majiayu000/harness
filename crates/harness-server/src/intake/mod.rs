@@ -159,9 +159,14 @@ impl IntakeOrchestrator {
 }
 
 /// Build an `IntakeOrchestrator` from config, registering all enabled sources.
+///
+/// `feishu_intake` — a pre-built `Arc<FeishuIntake>` to share with the webhook handler so
+/// both use the same `chat_ids` / `dispatched` maps. When `None`, a new instance is created
+/// from config (useful in tests or standalone use).
 pub fn build_orchestrator(
     config: &harness_core::IntakeConfig,
     data_dir: Option<&std::path::Path>,
+    feishu_intake: Option<Arc<feishu::FeishuIntake>>,
 ) -> IntakeOrchestrator {
     let mut sources: Vec<Arc<dyn IntakeSource>> = Vec::new();
     let mut poll_interval = Duration::from_secs(30);
@@ -182,8 +187,9 @@ pub fn build_orchestrator(
 
     if let Some(feishu_config) = &config.feishu {
         if feishu_config.enabled {
-            let intake = feishu::FeishuIntake::new(feishu_config.clone());
-            sources.push(Arc::new(intake));
+            let intake = feishu_intake
+                .unwrap_or_else(|| Arc::new(feishu::FeishuIntake::new(feishu_config.clone())));
+            sources.push(intake);
             tracing::info!(
                 trigger_keyword = %feishu_config.trigger_keyword,
                 "intake: Feishu bot registered in orchestrator"
@@ -260,7 +266,7 @@ mod tests {
     #[test]
     fn build_orchestrator_with_no_config_returns_empty_orchestrator() {
         let config = harness_core::IntakeConfig::default();
-        let orchestrator = build_orchestrator(&config, None);
+        let orchestrator = build_orchestrator(&config, None, None);
         assert!(orchestrator.sources.is_empty());
     }
 
@@ -272,7 +278,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             ..Default::default()
         });
-        let orchestrator = build_orchestrator(&config, None);
+        let orchestrator = build_orchestrator(&config, None, None);
         assert!(orchestrator.sources.is_empty());
     }
 
@@ -285,7 +291,7 @@ mod tests {
             label: "harness".to_string(),
             poll_interval_secs: 60,
         });
-        let orchestrator = build_orchestrator(&config, None);
+        let orchestrator = build_orchestrator(&config, None, None);
         assert_eq!(orchestrator.sources.len(), 1);
         assert_eq!(orchestrator.sources[0].name(), "github");
         assert_eq!(orchestrator.poll_interval, Duration::from_secs(60));

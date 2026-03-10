@@ -24,19 +24,25 @@ impl PostExecutionValidator {
     }
 
     /// Run a shell command via `sh -c` to support pipes, quotes, and complex expressions.
+    ///
+    /// Uses `kill_on_drop(true)` so that if the timeout fires and the future is dropped,
+    /// the child process is killed rather than left running as an orphan.
     async fn run_command(cmd_str: &str, project: &Path, timeout_secs: u64) -> Result<(), String> {
         if cmd_str.trim().is_empty() {
             return Ok(());
         }
 
-        let result = timeout(
-            Duration::from_secs(timeout_secs),
-            Command::new("sh")
-                .args(["-c", cmd_str])
-                .current_dir(project)
-                .output(),
-        )
-        .await;
+        let child = match Command::new("sh")
+            .args(["-c", cmd_str])
+            .current_dir(project)
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return Err(format!("Command `{cmd_str}` failed to spawn: {e}")),
+        };
+
+        let result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
 
         match result {
             Ok(Ok(output)) if output.status.success() => Ok(()),
@@ -48,7 +54,7 @@ impl PostExecutionValidator {
                     "Command `{cmd_str}` failed (exit {code})\nstdout: {stdout}\nstderr: {stderr}"
                 ))
             }
-            Ok(Err(e)) => Err(format!("Command `{cmd_str}` failed to spawn: {e}")),
+            Ok(Err(e)) => Err(format!("Command `{cmd_str}` failed to wait: {e}")),
             Err(_) => Err(format!(
                 "Command `{cmd_str}` timed out after {timeout_secs}s"
             )),
@@ -250,6 +256,26 @@ mod tests {
         let result = validator.post_execute(&req, &resp).await;
         // pre_commit passes but pre_push fails
         assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_child_process() {
+        let dir = tempfile::tempdir().unwrap();
+        // sleep 999 should be killed after 1s timeout.
+        let config = ValidationConfig {
+            pre_commit: vec!["sleep 999".to_string()],
+            timeout_secs: 1,
+            ..Default::default()
+        };
+        let validator = PostExecutionValidator::new(config);
+        let req = make_req(dir.path().to_path_buf());
+        let resp = make_resp("done");
+        let result = validator.post_execute(&req, &resp).await;
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("timed out"),
+            "expected timeout error, got: {err}"
+        );
     }
 
     #[tokio::test]
