@@ -48,6 +48,9 @@ pub trait IntakeSource: Send + Sync {
     /// Mark an issue as dispatched so it won't be returned by future polls.
     async fn mark_dispatched(&self, external_id: &str, task_id: &TaskId) -> anyhow::Result<()>;
 
+    /// Remove an issue from the dispatched set (e.g. on enqueue failure).
+    async fn unmark_dispatched(&self, external_id: &str);
+
     /// Called when a task spawned from this source reaches a terminal state.
     async fn on_task_complete(
         &self,
@@ -108,6 +111,21 @@ impl IntakeOrchestrator {
                     ..Default::default()
                 };
 
+                // Mark dispatched first to prevent duplicate tasks if enqueue
+                // succeeds but we crash before persisting the dispatched state.
+                let placeholder_id = TaskId(format!("pending-{}", issue.external_id));
+                if let Err(e) = source
+                    .mark_dispatched(&issue.external_id, &placeholder_id)
+                    .await
+                {
+                    tracing::warn!(
+                        source = source.name(),
+                        external_id = %issue.external_id,
+                        "mark_dispatched failed: {e}"
+                    );
+                    continue;
+                }
+
                 match crate::http::task_routes::enqueue_task(state, req).await {
                     Ok(task_id) => {
                         tracing::info!(
@@ -116,11 +134,12 @@ impl IntakeOrchestrator {
                             task_id = %task_id.0,
                             "intake: task dispatched"
                         );
+                        // Update with the real task ID.
                         if let Err(e) = source.mark_dispatched(&issue.external_id, &task_id).await {
                             tracing::warn!(
                                 source = source.name(),
                                 external_id = %issue.external_id,
-                                "mark_dispatched failed: {e}"
+                                "mark_dispatched update failed: {e}"
                             );
                         }
                     }
@@ -130,6 +149,8 @@ impl IntakeOrchestrator {
                             external_id = %issue.external_id,
                             "intake: failed to spawn task: {e:?}"
                         );
+                        // Un-mark on enqueue failure so the issue is retried next poll.
+                        source.unmark_dispatched(&issue.external_id).await;
                     }
                 }
             }
