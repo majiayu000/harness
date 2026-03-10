@@ -170,18 +170,27 @@ impl IntakeSource for FeishuIntake {
 /// - Returns `{"challenge": ...}` for verification handshake.
 /// - For `im.message.receive_v1` events containing the trigger keyword,
 ///   creates a Harness task and replies in the originating chat.
+/// Verify the token field in a Feishu webhook payload against the configured verification_token.
+/// Returns true if no verification_token is configured (open mode) or if the token matches.
+fn verify_feishu_token(
+    config: &harness_core::FeishuIntakeConfig,
+    payload: &serde_json::Value,
+) -> bool {
+    let Some(expected) = &config.verification_token else {
+        return true;
+    };
+    // Challenge payloads carry "token" at root; event payloads carry "header.token".
+    let token = payload["token"]
+        .as_str()
+        .or_else(|| payload["header"]["token"].as_str())
+        .unwrap_or("");
+    token == expected.as_str()
+}
+
 pub async fn feishu_webhook(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // 1. Handle Feishu verification challenge.
-    if let Some(challenge) = payload.get("challenge") {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({ "challenge": challenge })),
-        );
-    }
-
     let Some(feishu) = state.feishu_intake.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -189,13 +198,29 @@ pub async fn feishu_webhook(
         );
     };
 
-    // 2. Only handle im.message.receive_v1 events.
+    // 1. Verify token before processing any payload.
+    if !verify_feishu_token(&feishu.config, &payload) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid verification token"})),
+        );
+    }
+
+    // 2. Handle Feishu verification challenge.
+    if let Some(challenge) = payload.get("challenge") {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "challenge": challenge })),
+        );
+    }
+
+    // 3. Only handle im.message.receive_v1 events.
     let event_type = payload["header"]["event_type"].as_str();
     if event_type != Some("im.message.receive_v1") {
         return (StatusCode::OK, Json(serde_json::json!({"ok": true})));
     }
 
-    // 3. Extract message fields.
+    // 4. Extract message fields.
     let message = &payload["event"]["message"];
     let message_id = match message["message_id"].as_str() {
         Some(id) => id.to_string(),
@@ -216,7 +241,7 @@ pub async fn feishu_webhook(
         }
     };
 
-    // 4. Parse message content text.
+    // 5. Parse message content text.
     let text_owned: String = message["content"]
         .as_str()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
@@ -224,12 +249,12 @@ pub async fn feishu_webhook(
         .unwrap_or_default();
     let text = text_owned.as_str();
 
-    // 5. Check trigger keyword.
+    // 6. Check trigger keyword.
     if !text.contains(feishu.config.trigger_keyword.as_str()) {
         return (StatusCode::OK, Json(serde_json::json!({"ok": true})));
     }
 
-    // 6. Extract description (text after keyword).
+    // 7. Extract description (text after keyword).
     let description = text
         .split_once(feishu.config.trigger_keyword.as_str())
         .map(|x| x.1)
@@ -241,7 +266,7 @@ pub async fn feishu_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"ok": true})));
     }
 
-    // 7. Build IncomingIssue.
+    // 8. Build IncomingIssue.
     let short_id: String = message_id.chars().take(8).collect();
     let issue = IncomingIssue {
         source: "feishu".to_string(),
@@ -260,10 +285,10 @@ pub async fn feishu_webhook(
         created_at: None,
     };
 
-    // 8. Store chat_id before dispatching so mark_dispatched can reply.
+    // 9. Store chat_id before dispatching so mark_dispatched can reply.
     feishu.store_chat_id(&message_id, &chat_id);
 
-    // 9. Dispatch task.
+    // 10. Dispatch task.
     let prompt = super::build_prompt_from_issue(&issue);
     let req = crate::task_runner::CreateTaskRequest {
         prompt: Some(prompt),
@@ -282,7 +307,7 @@ pub async fn feishu_webhook(
         }
     };
 
-    // 10. Reply in chat asynchronously (don't block the webhook response).
+    // 11. Reply in chat asynchronously (don't block the webhook response).
     let feishu_arc = feishu.clone();
     let message_id_reply = message_id.clone();
     let task_id_reply = task_id.clone();
@@ -311,6 +336,47 @@ mod tests {
             trigger_keyword: "harness".to_string(),
             default_repo: None,
         }
+    }
+
+    #[test]
+    fn verify_token_passes_when_no_token_configured() {
+        let config = make_feishu_config();
+        let payload = serde_json::json!({"challenge": "test"});
+        assert!(verify_feishu_token(&config, &payload));
+    }
+
+    #[test]
+    fn verify_token_passes_with_matching_root_token() {
+        let mut config = make_feishu_config();
+        config.verification_token = Some("secret-123".to_string());
+        let payload = serde_json::json!({"challenge": "test", "token": "secret-123"});
+        assert!(verify_feishu_token(&config, &payload));
+    }
+
+    #[test]
+    fn verify_token_passes_with_matching_header_token() {
+        let mut config = make_feishu_config();
+        config.verification_token = Some("secret-123".to_string());
+        let payload = serde_json::json!({
+            "header": { "token": "secret-123", "event_type": "im.message.receive_v1" }
+        });
+        assert!(verify_feishu_token(&config, &payload));
+    }
+
+    #[test]
+    fn verify_token_rejects_wrong_token() {
+        let mut config = make_feishu_config();
+        config.verification_token = Some("secret-123".to_string());
+        let payload = serde_json::json!({"challenge": "test", "token": "wrong"});
+        assert!(!verify_feishu_token(&config, &payload));
+    }
+
+    #[test]
+    fn verify_token_rejects_missing_token() {
+        let mut config = make_feishu_config();
+        config.verification_token = Some("secret-123".to_string());
+        let payload = serde_json::json!({"challenge": "test"});
+        assert!(!verify_feishu_token(&config, &payload));
     }
 
     #[test]
