@@ -110,7 +110,7 @@ function renderIntakeChannels(channels) {
       `<div class="channel-name">${escapeHtml(ch.name)}</div>` +
       (detail ? `<div class="channel-detail">${escapeHtml(detail)}</div>` : "") +
       `<div class="channel-status">${enabled ? "enabled" : "disabled"}</div>` +
-      `<div class="channel-active">${ch.active} active</div>`;
+      `<div class="channel-active">${escapeHtml(String(ch.active))} active</div>`;
 
     grid.appendChild(card);
   });
@@ -158,10 +158,10 @@ function renderCard(task, status) {
     html += `<span class="source-badge source-badge-${escapeHtml(task.source)}">${escapeHtml(task.source)}</span>`;
   }
 
-  html += `<div class="task-id" title="${task.id}">${shortId}</div>`;
+  html += `<div class="task-id" title="${escapeHtml(task.id)}">${escapeHtml(shortId)}</div>`;
 
   if (task.turn > 0) {
-    html += `<div class="task-turn">Turn ${task.turn}</div>`;
+    html += `<div class="task-turn">Turn ${escapeHtml(String(task.turn))}</div>`;
   }
 
   if (task.pr_url) {
