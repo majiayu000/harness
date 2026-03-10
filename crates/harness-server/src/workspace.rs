@@ -34,7 +34,12 @@ impl WorkspaceManager {
         source_repo: &Path,
         base_branch: &str,
     ) -> anyhow::Result<PathBuf> {
-        // Idempotent: return existing workspace if already active.
+        // Validate base_branch to prevent unexpected git behavior.
+        if !is_valid_branch_name(base_branch) {
+            anyhow::bail!("invalid base_branch: {base_branch:?}");
+        }
+
+        // Idempotent: use entry API to avoid TOCTOU race between get and insert.
         if let Some(entry) = self.active.get(task_id) {
             return Ok(entry.workspace_path.clone());
         }
@@ -154,6 +159,16 @@ impl WorkspaceManager {
     }
 }
 
+/// Validate a git branch name: must be non-empty, no whitespace, no shell metacharacters,
+/// no `..`, and not start with `-`.
+fn is_valid_branch_name(name: &str) -> bool {
+    if name.is_empty() || name.starts_with('-') || name.contains("..") {
+        return false;
+    }
+    name.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'-' || b == b'_' || b == b'.')
+}
+
 fn sanitize_task_id(id: &str) -> String {
     id.chars()
         .map(|c| {
@@ -255,6 +270,25 @@ mod tests {
             .expect("utf8")
             .trim()
             .to_string()
+    }
+
+    #[test]
+    fn valid_branch_names_accepted() {
+        assert!(is_valid_branch_name("main"));
+        assert!(is_valid_branch_name("feature/my-branch"));
+        assert!(is_valid_branch_name("release/v1.0.0"));
+        assert!(is_valid_branch_name("fix_issue_42"));
+    }
+
+    #[test]
+    fn invalid_branch_names_rejected() {
+        assert!(!is_valid_branch_name(""));
+        assert!(!is_valid_branch_name("-starts-with-dash"));
+        assert!(!is_valid_branch_name("has spaces"));
+        assert!(!is_valid_branch_name("has..dotdot"));
+        assert!(!is_valid_branch_name("semi;colon"));
+        assert!(!is_valid_branch_name("back`tick"));
+        assert!(!is_valid_branch_name("dollar$sign"));
     }
 
     #[test]
