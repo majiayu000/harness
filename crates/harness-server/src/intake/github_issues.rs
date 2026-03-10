@@ -34,7 +34,14 @@ impl GitHubIssuesPoller {
         };
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
-            Err(_) => return DashMap::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DashMap::new(),
+            Err(e) => {
+                tracing::warn!(
+                    "failed to read dispatched state from {}: {e}",
+                    path.display()
+                );
+                return DashMap::new();
+            }
         };
         let map: HashMap<String, String> = match serde_json::from_slice(&bytes) {
             Ok(m) => m,
@@ -96,15 +103,25 @@ struct GhLabel {
     name: String,
 }
 
+/// Parsed result from `gh issue list` output.
+struct ParsedGhOutput {
+    /// New issues not yet dispatched.
+    new_issues: Vec<IncomingIssue>,
+    /// All open issue numbers from the API response (for eviction).
+    open_issue_ids: std::collections::HashSet<String>,
+}
+
 /// Parse the JSON output of `gh issue list --json number,title,body,url,labels,createdAt`
-/// into a vec of `IncomingIssue`, filtering out already-dispatched issues.
+/// into new issues (filtering out dispatched) and the full set of open issue IDs.
 fn parse_gh_output(
     json: &[u8],
     repo: &str,
     dispatched: &DashMap<String, TaskId>,
-) -> anyhow::Result<Vec<IncomingIssue>> {
+) -> anyhow::Result<ParsedGhOutput> {
     let issues: Vec<GhIssue> = serde_json::from_slice(json)?;
-    let result = issues
+    let open_issue_ids: std::collections::HashSet<String> =
+        issues.iter().map(|i| i.number.to_string()).collect();
+    let new_issues = issues
         .into_iter()
         .filter(|issue| !dispatched.contains_key(&issue.number.to_string()))
         .map(|issue| IncomingIssue {
@@ -120,7 +137,10 @@ fn parse_gh_output(
             created_at: issue.created_at,
         })
         .collect();
-    Ok(result)
+    Ok(ParsedGhOutput {
+        new_issues,
+        open_issue_ids,
+    })
 }
 
 #[async_trait]
@@ -153,7 +173,28 @@ impl IntakeSource for GitHubIssuesPoller {
             anyhow::bail!("gh issue list failed: {stderr}");
         }
 
-        parse_gh_output(&output.stdout, &self.repo, &self.dispatched)
+        let parsed = parse_gh_output(&output.stdout, &self.repo, &self.dispatched)?;
+
+        // Evict dispatched entries for issues no longer open (closed/deleted).
+        // This prevents unbounded growth of the dispatched map.
+        let stale: Vec<String> = self
+            .dispatched
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|id| !parsed.open_issue_ids.contains(id))
+            .collect();
+        if !stale.is_empty() {
+            for id in &stale {
+                self.dispatched.remove(id);
+            }
+            tracing::debug!(
+                count = stale.len(),
+                "intake: evicted dispatched entries for closed issues"
+            );
+            self.persist_dispatched();
+        }
+
+        Ok(parsed.new_issues)
     }
 
     async fn mark_dispatched(&self, external_id: &str, task_id: &TaskId) -> anyhow::Result<()> {
@@ -209,10 +250,12 @@ mod tests {
         ]"#;
 
         let dispatched = DashMap::new();
-        let issues = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
 
-        assert_eq!(issues.len(), 1);
-        let issue = &issues[0];
+        assert_eq!(parsed.new_issues.len(), 1);
+        assert_eq!(parsed.open_issue_ids.len(), 1);
+        assert!(parsed.open_issue_ids.contains("42"));
+        let issue = &parsed.new_issues[0];
         assert_eq!(issue.source, "github");
         assert_eq!(issue.external_id, "42");
         assert_eq!(issue.identifier, "#42");
@@ -239,18 +282,20 @@ mod tests {
 
         // Issues 1 and 2 already dispatched
         let dispatched = make_dispatched(&["1", "2"]);
-        let issues = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
 
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].external_id, "3");
+        assert_eq!(parsed.new_issues.len(), 1);
+        assert_eq!(parsed.new_issues[0].external_id, "3");
+        assert_eq!(parsed.open_issue_ids.len(), 3);
     }
 
     #[test]
     fn parse_gh_output_empty_array() {
         let json = b"[]";
         let dispatched = DashMap::new();
-        let issues = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
-        assert!(issues.is_empty());
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
+        assert!(parsed.new_issues.is_empty());
+        assert!(parsed.open_issue_ids.is_empty());
     }
 
     #[test]
@@ -267,8 +312,29 @@ mod tests {
             {"number": 5, "title": "No body", "body": null, "url": "u", "labels": [], "createdAt": null}
         ]"#;
         let dispatched = DashMap::new();
-        let issues = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
-        assert_eq!(issues[0].description, None);
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
+        assert_eq!(parsed.new_issues[0].description, None);
+    }
+
+    #[test]
+    fn parse_gh_output_returns_open_issue_ids_for_eviction() {
+        let json = br#"[
+            {"number": 10, "title": "A", "body": null, "url": "u1", "labels": [], "createdAt": null},
+            {"number": 20, "title": "B", "body": null, "url": "u2", "labels": [], "createdAt": null}
+        ]"#;
+
+        // Issue 5 was dispatched but is no longer in the open list (closed).
+        let dispatched = make_dispatched(&["5", "10"]);
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
+
+        // Only issue 20 is new (10 already dispatched).
+        assert_eq!(parsed.new_issues.len(), 1);
+        assert_eq!(parsed.new_issues[0].external_id, "20");
+        // open_issue_ids contains both open issues from the API.
+        assert!(parsed.open_issue_ids.contains("10"));
+        assert!(parsed.open_issue_ids.contains("20"));
+        // Issue 5 is NOT in open_issue_ids — caller can evict it.
+        assert!(!parsed.open_issue_ids.contains("5"));
     }
 
     #[test]

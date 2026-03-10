@@ -302,6 +302,8 @@ pub async fn feishu_webhook(
         Ok(id) => id,
         Err(e) => {
             tracing::error!("feishu: failed to enqueue task: {e:?}");
+            // Clean up stored chat_id to prevent leak on failure.
+            feishu.chat_ids.remove(&message_id);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "failed to enqueue task"})),
