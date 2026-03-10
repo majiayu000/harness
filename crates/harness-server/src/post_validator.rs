@@ -42,6 +42,7 @@ impl PostExecutionValidator {
             ">>", // append redirection (must precede ">")
             "|",  // piping — enables pipe-to-interpreter attacks
             ";",  // command separator — enables secondary command injection
+            "&",  // background execution / chaining — e.g. `cmd & rm -rf /`
             ">",  // output redirection
             "<",  // input redirection
             "`",  // backtick command substitution
