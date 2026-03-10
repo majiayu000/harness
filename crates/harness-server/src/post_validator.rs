@@ -23,7 +23,41 @@ impl PostExecutionValidator {
         Self { config }
     }
 
+    /// Reject commands that pipe output to a shell interpreter, the most common
+    /// code-execution escalation vector.
+    ///
+    /// Legitimate CI commands (cargo, go, npm, ruff, …) never need to feed their
+    /// output into another shell.  Commands that do — e.g. `cmd | bash` or
+    /// `cmd | sh -` — indicate either an attacker-supplied payload or a
+    /// misconfigured `ValidationConfig`.
+    ///
+    /// Note: the check is a fast prefix/substring scan, not a full shell parser.
+    /// It is defence-in-depth against the most dangerous class of injection, not a
+    /// complete sandbox.
+    fn reject_shell_pipe(cmd_str: &str) -> Result<(), String> {
+        const DANGEROUS: &[&str] = &[
+            "| bash", "|bash", "| sh ", "|sh ", "| sh\t", "|sh\t", "| zsh", "|zsh", "| fish",
+            "|fish", "| python", "|python", "| perl", "|perl", "| ruby", "|ruby", "; bash ",
+            ";bash ", "; sh ", ";sh ",
+        ];
+        if let Some(pat) = DANGEROUS.iter().find(|&&p| cmd_str.contains(p)) {
+            return Err(format!(
+                "Command `{cmd_str}` rejected: contains unsafe shell pipe pattern `{pat}`. \
+                 Validation commands must invoke toolchain binaries directly."
+            ));
+        }
+        Ok(())
+    }
+
     /// Run a shell command via `sh -c` to support pipes, quotes, and complex expressions.
+    ///
+    /// # Security
+    ///
+    /// `cmd_str` MUST come from a trusted source — either the server's own startup
+    /// `ValidationConfig` (loaded from the operator-controlled config file) or the
+    /// hardcoded language defaults in `harness_core::lang_detect`.  Never pass a string
+    /// derived from a checked-out worktree or any user-supplied request body; doing so
+    /// would allow arbitrary code execution.
     ///
     /// Uses `kill_on_drop(true)` so that if the timeout fires and the future is dropped,
     /// the child process is killed rather than left running as an orphan.
@@ -31,6 +65,8 @@ impl PostExecutionValidator {
         if cmd_str.trim().is_empty() {
             return Ok(());
         }
+
+        Self::reject_shell_pipe(cmd_str)?;
 
         let child = match Command::new("sh")
             .args(["-c", cmd_str])
@@ -294,5 +330,50 @@ mod tests {
         let _result = validator.post_execute(&req, &resp).await;
         // pre_push should NOT have run because pre_commit failed
         assert!(!marker.exists());
+    }
+
+    // ── reject_shell_pipe ─────────────────────────────────────────────────────
+
+    #[test]
+    fn safe_commands_pass_shell_pipe_check() {
+        let safe = [
+            "cargo check --workspace",
+            "go test ./...",
+            "npx tsc --noEmit",
+            "test -z \"$(gofmt -l .)\"",
+            "ruff check .",
+            "./gradlew check",
+            "bundle exec rubocop",
+            "true",
+            "false",
+        ];
+        for cmd in safe {
+            assert!(
+                PostExecutionValidator::reject_shell_pipe(cmd).is_ok(),
+                "expected `{cmd}` to pass but it was rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn dangerous_commands_are_rejected() {
+        let dangerous = [
+            "echo foo | bash",
+            "echo foo |bash",
+            "echo foo | sh -",
+            "echo foo |sh ",
+            "something ; bash -c evil",
+            "something ;bash -c evil",
+            "cmd | zsh",
+            "cmd | python3 -",
+            "cmd | perl -e 'code'",
+            "cmd | ruby -e 'code'",
+        ];
+        for cmd in dangerous {
+            assert!(
+                PostExecutionValidator::reject_shell_pipe(cmd).is_err(),
+                "expected `{cmd}` to be rejected but it passed"
+            );
+        }
     }
 }
