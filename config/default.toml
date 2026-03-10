@@ -32,8 +32,8 @@ default_model = "claude-sonnet-4-20250514"
 max_tokens = 4096
 
 [agents.review]
-enabled = false
-reviewer_agent = ""
+enabled = true
+reviewer_agent = "codex"
 max_rounds = 3
 
 [gc]
