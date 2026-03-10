@@ -193,7 +193,7 @@ pub(crate) fn parse_github_webhook_task_request(
             if parsed.action != "submitted" {
                 return Ok((None, "ignored pull_request_review action".to_string()));
             }
-            match parsed.review.state.as_str() {
+            match parsed.review.state.to_ascii_lowercase().as_str() {
                 "changes_requested" => Ok((
                     Some(pr_rework_task_request(&parsed)),
                     "pr review changes_requested".to_string(),
@@ -616,6 +616,31 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("invalid pull_request_review payload"));
+    }
+
+    #[test]
+    fn pull_request_review_state_matching_is_case_insensitive() {
+        let payload = serde_json::json!({
+            "action": "submitted",
+            "review": {
+                "state": "APPROVED",
+                "body": "Looks good",
+                "html_url": "https://github.com/org/repo/pull/10#pullrequestreview-5"
+            },
+            "pull_request": {
+                "number": 10,
+                "html_url": "https://github.com/org/repo/pull/10"
+            },
+            "repository": { "full_name": "org/repo" }
+        });
+
+        let (request, reason) = parse_github_webhook_task_request(
+            "pull_request_review",
+            payload.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert!(request.is_some());
+        assert_eq!(reason, "pr review approved");
     }
 
     #[test]
