@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use harness_core::{
     interceptor::{InterceptResult, PostExecuteResult, TurnInterceptor},
-    lang_detect, prompts, AgentRequest, AgentResponse, ValidationConfig,
+    lang_detect, AgentRequest, AgentResponse, ValidationConfig,
 };
 use std::path::Path;
 use tokio::process::Command;
@@ -54,36 +54,6 @@ impl PostExecutionValidator {
             )),
         }
     }
-
-    /// Verify a PR number exists on GitHub via `gh pr view`.
-    async fn verify_pr_exists(project: &Path, pr_number: u64, timeout_secs: u64) -> bool {
-        let result = timeout(
-            Duration::from_secs(timeout_secs),
-            Command::new("gh")
-                .args(["pr", "view", &pr_number.to_string(), "--json", "number"])
-                .current_dir(project)
-                .output(),
-        )
-        .await;
-        match result {
-            Ok(Ok(output)) => output.status.success(),
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    pr = pr_number,
-                    error = %e,
-                    "post_validator: failed to run `gh pr view` for PR verification"
-                );
-                false
-            }
-            Err(_) => {
-                tracing::warn!(
-                    pr = pr_number,
-                    "post_validator: `gh pr view` timed out after {timeout_secs}s"
-                );
-                false
-            }
-        }
-    }
 }
 
 #[async_trait]
@@ -100,7 +70,7 @@ impl TurnInterceptor for PostExecutionValidator {
         Some(self.config.max_retries)
     }
 
-    async fn post_execute(&self, req: &AgentRequest, resp: &AgentResponse) -> PostExecuteResult {
+    async fn post_execute(&self, req: &AgentRequest, _resp: &AgentResponse) -> PostExecuteResult {
         let project = &req.project_root;
         let lang = lang_detect::detect_language(project);
 
@@ -142,22 +112,6 @@ impl TurnInterceptor for PostExecutionValidator {
                         tracing::warn!(cmd = %cmd, error = %e, "post_validator: failed");
                         errors.push(e);
                     }
-                }
-            }
-        }
-
-        // Verify PR exists on GitHub when a PR URL is present in the response.
-        if let Some(pr_url) = prompts::parse_pr_url(&resp.output) {
-            if let Some(pr_number) = prompts::extract_pr_number(&pr_url) {
-                tracing::info!(
-                    pr = pr_number,
-                    "post_execution_validator: verifying PR exists"
-                );
-                if !Self::verify_pr_exists(project, pr_number, self.config.timeout_secs).await {
-                    errors.push(format!(
-                        "PR #{pr_number} could not be verified on GitHub — \
-                         run `gh pr view {pr_number}` to diagnose"
-                    ));
                 }
             }
         }
