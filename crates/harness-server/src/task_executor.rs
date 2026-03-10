@@ -64,10 +64,14 @@ pub(crate) fn build_fix_ci_prompt(
     pr_url: Option<&str>,
 ) -> String {
     let wrapped_comment = prompts::wrap_external_data(comment_body);
-    let comment_url_line = comment_url
+    let safe_comment_url = comment_url.map(|url| prompts::wrap_external_data(url));
+    let comment_url_line = safe_comment_url
+        .as_deref()
         .map(|url| format!("- Trigger comment: {url}\n"))
         .unwrap_or_default();
-    let pr_url_line = pr_url
+    let safe_pr_url = pr_url.map(|url| prompts::wrap_external_data(url));
+    let pr_url_line = safe_pr_url
+        .as_deref()
         .map(|url| format!("- PR URL: {url}\n"))
         .unwrap_or_default();
     let canonical_pr_url = format!("https://github.com/{repository}/pull/{pr_number}");
@@ -97,10 +101,14 @@ pub(crate) fn build_pr_rework_prompt(
     pr_url: Option<&str>,
 ) -> String {
     let wrapped_body = prompts::wrap_external_data(review_body);
-    let review_url_line = review_url
+    let safe_review_url = review_url.map(|url| prompts::wrap_external_data(url));
+    let review_url_line = safe_review_url
+        .as_deref()
         .map(|url| format!("- Review URL: {url}\n"))
         .unwrap_or_default();
-    let pr_url_line = pr_url
+    let safe_pr_url = pr_url.map(|url| prompts::wrap_external_data(url));
+    let pr_url_line = safe_pr_url
+        .as_deref()
         .map(|url| format!("- PR URL: {url}\n"))
         .unwrap_or_default();
     let canonical_pr_url = format!("https://github.com/{repository}/pull/{pr_number}");
@@ -126,7 +134,9 @@ pub(crate) fn build_pr_approved_prompt(
     pr_number: u64,
     review_url: Option<&str>,
 ) -> String {
-    let review_url_line = review_url
+    let safe_review_url = review_url.map(|url| prompts::wrap_external_data(url));
+    let review_url_line = safe_review_url
+        .as_deref()
         .map(|url| format!("- Review URL: {url}\n"))
         .unwrap_or_default();
     let canonical_pr_url = format!("https://github.com/{repository}/pull/{pr_number}");
