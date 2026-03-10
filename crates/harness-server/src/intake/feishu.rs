@@ -170,7 +170,9 @@ impl IntakeSource for FeishuIntake {
 /// - Returns `{"challenge": ...}` for verification handshake.
 /// - For `im.message.receive_v1` events containing the trigger keyword,
 ///   creates a Harness task and replies in the originating chat.
+///
 /// Verify the token field in a Feishu webhook payload against the configured verification_token.
+///
 /// Returns true if no verification_token is configured (open mode) or if the token matches.
 fn verify_feishu_token(
     config: &harness_core::FeishuIntakeConfig,
