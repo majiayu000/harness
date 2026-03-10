@@ -160,29 +160,12 @@ impl IntakeSource for GitHubIssuesPoller {
         self.dispatched
             .insert(external_id.to_string(), task_id.clone());
         self.persist_dispatched();
-
-        let comment = format!("Harness task `{}` created. Working on it...", task_id.0);
-        if let Err(e) = tokio::process::Command::new("gh")
-            .args([
-                "issue",
-                "comment",
-                external_id,
-                "--repo",
-                &self.repo,
-                "--body",
-                &comment,
-            ])
-            .output()
-            .await
-        {
-            tracing::warn!(
-                repo = %self.repo,
-                issue = %external_id,
-                "failed to post task-created comment: {e}"
-            );
-        }
-
         Ok(())
+    }
+
+    async fn unmark_dispatched(&self, external_id: &str) {
+        self.dispatched.remove(external_id);
+        self.persist_dispatched();
     }
 
     async fn on_task_complete(
@@ -190,52 +173,12 @@ impl IntakeSource for GitHubIssuesPoller {
         external_id: &str,
         result: &TaskCompletionResult,
     ) -> anyhow::Result<()> {
-        let body_and_context = match result.status {
-            TaskStatus::Done => {
-                let body = match &result.pr_url {
-                    Some(pr_url) => format!("Task complete. PR: {pr_url}\n\n{}", result.summary),
-                    None => format!("Task complete.\n\n{}", result.summary),
-                };
-                Some((body, "completion"))
-            }
-            TaskStatus::Failed => {
-                let body = format!(
-                    "Task failed: {}",
-                    result.error.as_deref().unwrap_or("unknown error")
-                );
-                Some((body, "failure"))
-            }
-            _ => None,
-        };
-
-        if let Some((body, context)) = body_and_context {
-            if let Err(e) = tokio::process::Command::new("gh")
-                .args([
-                    "issue",
-                    "comment",
-                    external_id,
-                    "--repo",
-                    &self.repo,
-                    "--body",
-                    &body,
-                ])
-                .output()
-                .await
-            {
-                tracing::warn!(
-                    repo = %self.repo,
-                    issue = %external_id,
-                    "failed to post {context} comment: {e}"
-                );
-            }
-            // Only remove from dispatched on failure to allow retry.
-            // Done tasks remain in dispatched so re-labeled open issues are not re-processed.
-            if matches!(result.status, TaskStatus::Failed) {
-                self.dispatched.remove(external_id);
-                self.persist_dispatched();
-            }
+        // Only remove from dispatched on failure to allow retry.
+        // Done tasks remain in dispatched so re-labeled open issues are not re-processed.
+        if matches!(result.status, TaskStatus::Failed) {
+            self.dispatched.remove(external_id);
+            self.persist_dispatched();
         }
-
         Ok(())
     }
 }
