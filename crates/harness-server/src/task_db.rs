@@ -381,4 +381,28 @@ mod tests {
         assert!(matches!(loaded.status, TaskStatus::Done));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn task_db_rejects_unknown_status() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("tasks.db");
+        let db = TaskDb::open(&db_path).await?;
+
+        let task = make_task("task-unknown", TaskStatus::Pending);
+        db.insert(&task).await?;
+
+        sqlx::query("UPDATE tasks SET status = ? WHERE id = ?")
+            .bind("unknown_status")
+            .bind("task-unknown")
+            .execute(&db.pool)
+            .await?;
+
+        let err = db
+            .get("task-unknown")
+            .await
+            .expect_err("unknown status must return an explicit error");
+        let message = format!("{err:#}");
+        assert!(message.contains("unknown task status"));
+        Ok(())
+    }
 }
