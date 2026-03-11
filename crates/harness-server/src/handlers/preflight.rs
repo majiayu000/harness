@@ -203,16 +203,16 @@ pub async fn preflight(
 ) -> RpcResponse {
     let project_root = validate_root!(&project_root, id);
 
-    let agent = match state.server.agent_registry.default_agent() {
+    let agent = match state.core.server.agent_registry.default_agent() {
         Some(a) => a,
         None => return RpcResponse::error(id, INTERNAL_ERROR, "no agent registered"),
     };
 
     match run_preflight(
         agent,
-        state.skills.clone(),
-        state.rules.clone(),
-        state.events.clone(),
+        state.engines.skills.clone(),
+        state.engines.rules.clone(),
+        state.observability.events.clone(),
         project_root,
         task_description,
     )

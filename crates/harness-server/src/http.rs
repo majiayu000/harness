@@ -20,19 +20,37 @@ const MAX_WEBHOOK_BODY_BYTES: usize = 512 * 1024;
 
 pub(crate) mod task_routes;
 
-pub struct AppState {
+/// Core services: thread/task management and persistence.
+pub struct CoreServices {
     pub server: Arc<HarnessServer>,
     pub project_root: std::path::PathBuf,
     pub tasks: Arc<task_runner::TaskStore>,
-    pub skills: Arc<RwLock<harness_skills::SkillStore>>,
-    pub rules: Arc<RwLock<harness_rules::engine::RuleEngine>>,
-    pub events: Arc<harness_observe::EventStore>,
-    pub gc_agent: Arc<harness_gc::GcAgent>,
+    pub thread_db: Option<crate::thread_db::ThreadDb>,
+    pub plan_db: Option<crate::plan_db::PlanDb>,
     pub plans:
         Arc<RwLock<std::collections::HashMap<harness_core::ExecPlanId, harness_exec::ExecPlan>>>,
-    pub plan_db: Option<crate::plan_db::PlanDb>,
-    pub thread_db: Option<crate::thread_db::ThreadDb>,
-    pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
+}
+
+/// Engine services: skills, rules, and garbage collection.
+pub struct EngineServices {
+    pub skills: Arc<RwLock<harness_skills::SkillStore>>,
+    pub rules: Arc<RwLock<harness_rules::engine::RuleEngine>>,
+    pub gc_agent: Arc<harness_gc::GcAgent>,
+}
+
+/// Observability services: event store and telemetry.
+pub struct ObservabilityServices {
+    pub events: Arc<harness_observe::EventStore>,
+}
+
+/// Concurrency services: task queue and workspace isolation.
+pub struct ConcurrencyServices {
+    pub task_queue: Arc<crate::task_queue::TaskQueue>,
+    pub workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
+}
+
+/// Notification services: broadcast channels and lag tracking.
+pub struct NotificationServices {
     /// Broadcast channel for server-push notifications (WebSocket and stdio transports).
     pub notification_tx: broadcast::Sender<RpcNotification>,
     /// Total number of dropped broadcast notifications due to lagged receivers.
@@ -44,10 +62,15 @@ pub struct AppState {
     pub notify_tx: Option<crate::notify::NotifySender>,
     /// Whether the client has completed the initialize/initialized handshake.
     pub initialized: Arc<AtomicBool>,
-    /// Optional workspace isolation manager. None when workspace config is unavailable.
-    pub workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
-    /// Bounded task queue for concurrency limiting.
-    pub task_queue: Arc<crate::task_queue::TaskQueue>,
+}
+
+pub struct AppState {
+    pub core: CoreServices,
+    pub engines: EngineServices,
+    pub observability: ObservabilityServices,
+    pub concurrency: ConcurrencyServices,
+    pub notifications: NotificationServices,
+    pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     /// Feishu Bot intake handler. None when feishu intake is disabled or not configured.
     pub feishu_intake: Option<Arc<crate::intake::feishu::FeishuIntake>>,
     /// Pre-built GitHub intake poller, shared between orchestrator and completion callback.
@@ -59,10 +82,11 @@ pub struct AppState {
 impl AppState {
     pub fn observe_notification_lag(&self, dropped: u64) -> u64 {
         let previous_total = self
+            .notifications
             .notification_lagged_total
             .fetch_add(dropped, Ordering::Relaxed);
         let dropped_total = previous_total.saturating_add(dropped);
-        let log_every = self.notification_lag_log_every;
+        let log_every = self.notifications.notification_lag_log_every;
         if log_every > 0 && previous_total / log_every < dropped_total / log_every {
             tracing::warn!(
                 dropped_since_last_recv = dropped,
@@ -256,40 +280,48 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let completion_callback = build_completion_callback(&feishu_intake, &github_intake);
 
     Ok(AppState {
-        server,
-        project_root,
-        tasks,
-        skills: Arc::new(RwLock::new(skill_store)),
-        rules: Arc::new(RwLock::new(rule_engine)),
-        events,
-        gc_agent,
-        plans: {
-            let mut map = std::collections::HashMap::new();
-            match plan_db.list().await {
-                Ok(persisted) => {
-                    for plan in persisted {
-                        map.insert(plan.id.clone(), plan);
+        core: CoreServices {
+            server,
+            project_root,
+            tasks,
+            thread_db: Some(thread_db),
+            plans: {
+                let mut map = std::collections::HashMap::new();
+                match plan_db.list().await {
+                    Ok(persisted) => {
+                        for plan in persisted {
+                            map.insert(plan.id.clone(), plan);
+                        }
                     }
+                    Err(e) => tracing::warn!("failed to load persisted plans on startup: {e}"),
                 }
-                Err(e) => tracing::warn!("failed to load persisted plans on startup: {e}"),
-            }
-            Arc::new(RwLock::new(map))
+                Arc::new(RwLock::new(map))
+            },
+            plan_db: Some(plan_db),
         },
-        thread_db: Some(thread_db),
-        plan_db: Some(plan_db),
+        engines: EngineServices {
+            skills: Arc::new(RwLock::new(skill_store)),
+            rules: Arc::new(RwLock::new(rule_engine)),
+            gc_agent,
+        },
+        observability: ObservabilityServices { events },
+        concurrency: ConcurrencyServices {
+            task_queue,
+            workspace_mgr,
+        },
+        notifications: NotificationServices {
+            notification_tx: broadcast::channel(notification_broadcast_capacity).0,
+            notification_lagged_total: Arc::new(AtomicU64::new(0)),
+            notification_lag_log_every,
+            notify_tx: None,
+            initialized: Arc::new(AtomicBool::new(false)),
+        },
         interceptors: vec![
             Arc::new(crate::contract_validator::ContractValidator::new()),
             Arc::new(crate::post_validator::PostExecutionValidator::new(
                 validation_config,
             )),
         ],
-        notification_tx: broadcast::channel(notification_broadcast_capacity).0,
-        notification_lagged_total: Arc::new(AtomicU64::new(0)),
-        notification_lag_log_every,
-        notify_tx: None,
-        initialized: Arc::new(AtomicBool::new(false)),
-        workspace_mgr,
-        task_queue,
         feishu_intake,
         github_intake,
         completion_callback,
@@ -425,6 +457,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
     let initial_grade = {
         let events = state
+            .observability
             .events
             .query(&harness_core::EventFilters::default())
             .unwrap_or_default();
@@ -445,8 +478,8 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     };
     crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
     crate::intake::build_orchestrator(
-        &state.server.config.intake,
-        Some(&state.server.config.server.data_dir),
+        &state.core.server.config.intake,
+        Some(&state.core.server.config.server.data_dir),
         state.feishu_intake.clone(),
     )
     .start(state.clone());
@@ -474,13 +507,13 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let serve_result = axum::serve(listener, app).await;
-    state.events.shutdown().await;
+    state.observability.events.shutdown().await;
     serve_result?;
     Ok(())
 }
 
 async fn health_check(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let count = state.tasks.count();
+    let count = state.core.tasks.count();
     Json(json!({"status": "ok", "tasks": count}))
 }
 
@@ -496,7 +529,7 @@ async fn github_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let secret = match state.server.config.server.github_webhook_secret.as_deref() {
+    let secret = match state.core.server.config.server.github_webhook_secret.as_deref() {
         Some("") => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -566,7 +599,7 @@ async fn github_webhook(
     };
 
     if req.project.is_none() {
-        req.project = Some(state.project_root.clone());
+        req.project = Some(state.core.project_root.clone());
     }
 
     match task_routes::enqueue_task(&state, req).await {
@@ -590,6 +623,7 @@ async fn github_webhook(
 
 async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<task_runner::TaskSummary>> {
     let tasks = state
+        .core
         .tasks
         .list_all()
         .into_iter()
@@ -599,7 +633,7 @@ async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<task_runner:
 }
 
 async fn get_task(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    match state.tasks.get(&task_runner::TaskId(id)) {
+    match state.core.tasks.get(&task_runner::TaskId(id)) {
         Some(task) => Json(task).into_response(),
         None => (
             StatusCode::NOT_FOUND,
@@ -611,8 +645,8 @@ async fn get_task(State(state): State<Arc<AppState>>, Path(id): Path<String>) ->
 
 /// GET /api/intake — current status of all intake channels and recent dispatches.
 async fn intake_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let intake_config = &state.server.config.intake;
-    let all_tasks = state.tasks.list_all();
+    let intake_config = &state.core.server.config.intake;
+    let all_tasks = state.core.tasks.list_all();
 
     let github_active: u64 = all_tasks
         .iter()
@@ -712,7 +746,7 @@ mod startup_tests {
             AgentRegistry::new("test"),
         ));
         let state = build_app_state(server).await?;
-        let rules = state.rules.read().await;
+        let rules = state.engines.rules.read().await;
 
         assert!(
             rules

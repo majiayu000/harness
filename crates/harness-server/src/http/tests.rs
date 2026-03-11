@@ -82,29 +82,37 @@ async fn make_test_state_with(
     ));
     let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
     Ok(Arc::new(AppState {
-        server,
-        project_root: dir.to_path_buf(),
-        tasks,
-        skills: Arc::new(tokio::sync::RwLock::new(harness_skills::SkillStore::new())),
-        rules: Arc::new(tokio::sync::RwLock::new(
-            harness_rules::engine::RuleEngine::new(),
-        )),
-        events,
-        gc_agent,
-        plans: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        thread_db: Some(thread_db),
-        plan_db: None,
+        core: crate::http::CoreServices {
+            server,
+            project_root: dir.to_path_buf(),
+            tasks,
+            thread_db: Some(thread_db),
+            plan_db: None,
+            plans: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        },
+        engines: crate::http::EngineServices {
+            skills: Arc::new(tokio::sync::RwLock::new(harness_skills::SkillStore::new())),
+            rules: Arc::new(tokio::sync::RwLock::new(
+                harness_rules::engine::RuleEngine::new(),
+            )),
+            gc_agent,
+        },
+        observability: crate::http::ObservabilityServices { events },
+        concurrency: crate::http::ConcurrencyServices {
+            task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            workspace_mgr: None,
+        },
+        notifications: crate::http::NotificationServices {
+            notification_tx: tokio::sync::broadcast::channel(32).0,
+            notification_lagged_total: Arc::new(AtomicU64::new(0)),
+            notification_lag_log_every: 1,
+            notify_tx: None,
+            initialized: Arc::new(AtomicBool::new(true)),
+        },
         interceptors: vec![],
-        notification_tx: tokio::sync::broadcast::channel(32).0,
-        notification_lagged_total: Arc::new(AtomicU64::new(0)),
-        notification_lag_log_every: 1,
-        notify_tx: None,
-        initialized: Arc::new(AtomicBool::new(true)),
-        workspace_mgr: None,
         feishu_intake: None,
-        github_intake: None,
-        completion_callback: None,
-        task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            github_intake: None,
+            completion_callback: None,
     }))
 }
 
@@ -198,7 +206,7 @@ async fn webhook_issue_mention_creates_issue_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
-    let before_count = state.tasks.count();
+    let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -223,7 +231,7 @@ async fn webhook_issue_mention_creates_issue_task() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(state.tasks.count(), before_count + 1);
+    assert_eq!(state.core.tasks.count(), before_count + 1);
     Ok(())
 }
 
@@ -232,7 +240,7 @@ async fn webhook_review_on_pr_creates_pr_review_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
-    let before_count = state.tasks.count();
+    let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -257,7 +265,7 @@ async fn webhook_review_on_pr_creates_pr_review_task() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(state.tasks.count(), before_count + 1);
+    assert_eq!(state.core.tasks.count(), before_count + 1);
     Ok(())
 }
 
@@ -266,7 +274,7 @@ async fn webhook_fix_ci_on_pr_creates_fix_ci_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
-    let before_count = state.tasks.count();
+    let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -298,7 +306,7 @@ async fn webhook_fix_ci_on_pr_creates_fix_ci_task() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(state.tasks.count(), before_count + 1);
+    assert_eq!(state.core.tasks.count(), before_count + 1);
     Ok(())
 }
 
@@ -479,7 +487,7 @@ async fn webhook_body_limit_rejects_large_payload() -> anyhow::Result<()> {
 async fn create_task_with_prompt_returns_accepted() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
-    let before_count = state.tasks.count();
+    let before_count = state.core.tasks.count();
     let app = task_app(state.clone());
 
     let body = serde_json::json!({ "prompt": "fix the bug" });
@@ -499,7 +507,7 @@ async fn create_task_with_prompt_returns_accepted() -> anyhow::Result<()> {
     let resp_body = response.into_body().collect().await?.to_bytes();
     let resp: serde_json::Value = serde_json::from_slice(&resp_body)?;
     assert!(resp["task_id"].is_string());
-    assert_eq!(state.tasks.count(), before_count + 1);
+    assert_eq!(state.core.tasks.count(), before_count + 1);
     Ok(())
 }
 

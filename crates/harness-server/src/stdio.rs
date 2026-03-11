@@ -30,7 +30,7 @@ pub async fn serve(mut state: AppState) -> anyhow::Result<()> {
 
     // Notification sub-channel: handlers call `notify::emit` which sends here.
     let (notify_tx, mut notify_rx) = crate::notify::channel(64);
-    state.notify_tx = Some(notify_tx);
+    state.notifications.notify_tx = Some(notify_tx);
 
     // Notification encoder: RpcNotification -> JSON line -> out_tx.
     let out_tx_notif = out_tx.clone();
@@ -79,7 +79,7 @@ pub async fn serve(mut state: AppState) -> anyhow::Result<()> {
         }
     }
 
-    state.events.shutdown().await;
+    state.observability.events.shutdown().await;
     Ok(())
 }
 
@@ -114,27 +114,35 @@ mod tests {
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
 
         Ok(AppState {
-            server,
-            project_root: dir.to_path_buf(),
-            tasks,
-            skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
-            rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
-            events,
-            gc_agent,
-            plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            thread_db: Some(thread_db),
-            plan_db: None,
+            core: crate::http::CoreServices {
+                server,
+                project_root: dir.to_path_buf(),
+                tasks,
+                thread_db: Some(thread_db),
+                plan_db: None,
+                plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            },
+            engines: crate::http::EngineServices {
+                skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
+                rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
+                gc_agent,
+            },
+            observability: crate::http::ObservabilityServices { events },
+            concurrency: crate::http::ConcurrencyServices {
+                task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+                workspace_mgr: None,
+            },
+            notifications: crate::http::NotificationServices {
+                notification_tx: tokio::sync::broadcast::channel(32).0,
+                notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                notification_lag_log_every: 1,
+                notify_tx: None,
+                initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            },
             interceptors: vec![],
-            notification_tx: tokio::sync::broadcast::channel(32).0,
-            notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            notification_lag_log_every: 1,
-            notify_tx: None,
-            initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            workspace_mgr: None,
             feishu_intake: None,
             github_intake: None,
             completion_callback: None,
-            task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         })
     }
 
@@ -142,7 +150,7 @@ mod tests {
     async fn stdio_processes_initialize_then_initialized() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut state = make_test_state(dir.path()).await?;
-        state.initialized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.notifications.initialized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let init_line = serde_json::to_string(&RpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -192,7 +200,7 @@ mod tests {
         let mut state = make_test_state(dir.path()).await?;
 
         let (notify_tx, mut notify_rx) = crate::notify::channel(8);
-        state.notify_tx = Some(notify_tx);
+        state.notifications.notify_tx = Some(notify_tx);
 
         let proj_dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
 
@@ -231,7 +239,7 @@ mod tests {
         let mut state = make_test_state(dir.path()).await?;
 
         let (notify_tx, mut notify_rx) = crate::notify::channel(8);
-        state.notify_tx = Some(notify_tx);
+        state.notifications.notify_tx = Some(notify_tx);
 
         let proj_dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
 

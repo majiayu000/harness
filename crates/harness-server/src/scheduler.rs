@@ -45,12 +45,13 @@ impl Scheduler {
         // Query historical events before persisting the current scan to avoid the
         // just-persisted rule_check events inflating the quality stability score.
         let events = state
+            .observability
             .events
             .query(&EventFilters::default())
             .map_err(|err| anyhow::anyhow!("failed to query events: {err}"))?;
-        let project_root = state.project_root.clone();
+        let project_root = state.core.project_root.clone();
         let violations = {
-            let rules = state.rules.read().await;
+            let rules = state.engines.rules.read().await;
             rules.scan(&project_root).await.map_err(|err| {
                 anyhow::anyhow!(
                     "failed to scan rules for '{}': {err}",
@@ -58,7 +59,7 @@ impl Scheduler {
                 )
             })?
         };
-        state.events.persist_rule_scan(&project_root, &violations);
+        state.observability.events.persist_rule_scan(&project_root, &violations);
         let report = generate_health_report(&events, &violations);
         tracing::info!(
             grade = ?report.quality.grade,
@@ -100,32 +101,40 @@ mod tests {
         ));
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
         Ok(Arc::new(AppState {
-            server,
-            project_root: project_root.to_path_buf(),
-            tasks,
-            skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
-            rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
-            events,
-            gc_agent,
-            plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            thread_db: Some(thread_db),
-            plan_db: None,
+            core: crate::http::CoreServices {
+                server,
+                project_root: project_root.to_path_buf(),
+                tasks,
+                thread_db: Some(thread_db),
+                plan_db: None,
+                plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            },
+            engines: crate::http::EngineServices {
+                skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
+                rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
+                gc_agent,
+            },
+            observability: crate::http::ObservabilityServices { events },
+            concurrency: crate::http::ConcurrencyServices {
+                task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+                workspace_mgr: None,
+            },
+            notifications: crate::http::NotificationServices {
+                notification_tx: tokio::sync::broadcast::channel(32).0,
+                notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                notification_lag_log_every: 1,
+                notify_tx: None,
+                initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            },
             interceptors: vec![],
-            notification_tx: tokio::sync::broadcast::channel(32).0,
-            notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            notification_lag_log_every: 1,
-            notify_tx: None,
-            initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            workspace_mgr: None,
             feishu_intake: None,
             github_intake: None,
             completion_callback: None,
-            task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         }))
     }
 
     async fn register_failing_guard(state: &AppState) {
-        let mut rules = state.rules.write().await;
+        let mut rules = state.engines.rules.write().await;
         rules.register_guard(Guard {
             id: GuardId::from_str("FAIL-SCAN-GUARD"),
             script_path: std::path::PathBuf::from("fail\0scan.sh"),
@@ -171,7 +180,7 @@ mod tests {
 
         Scheduler::run_health_tick(&state).await?;
 
-        let events = state.events.query(&EventFilters::default())?;
+        let events = state.observability.events.query(&EventFilters::default())?;
         let scan = events
             .iter()
             .rev()
@@ -199,7 +208,7 @@ mod tests {
             "unexpected scheduler scan failure message: {message}"
         );
 
-        let events = state.events.query(&EventFilters::default())?;
+        let events = state.observability.events.query(&EventFilters::default())?;
         assert!(
             events.iter().all(|event| event.hook != "rule_scan"),
             "scan failure should not persist a rule_scan event"

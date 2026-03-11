@@ -16,7 +16,7 @@ pub async fn skill_create(
             "skill name must not contain path separators or '..'",
         );
     }
-    let mut skills = state.skills.write().await;
+    let mut skills = state.engines.skills.write().await;
     let skill = skills.create(name, content).clone();
     match serde_json::to_value(&skill) {
         Ok(v) => RpcResponse::success(id, v),
@@ -29,7 +29,7 @@ pub async fn skill_list(
     id: Option<serde_json::Value>,
     query: Option<String>,
 ) -> RpcResponse {
-    let skills = state.skills.read().await;
+    let skills = state.engines.skills.read().await;
     let result = match query {
         Some(q) => skills.search(&q).into_iter().cloned().collect::<Vec<_>>(),
         None => skills.list().to_vec(),
@@ -45,7 +45,7 @@ pub async fn skill_get(
     id: Option<serde_json::Value>,
     skill_id: SkillId,
 ) -> RpcResponse {
-    let skills = state.skills.read().await;
+    let skills = state.engines.skills.read().await;
     match skills.get(&skill_id) {
         Some(skill) => match serde_json::to_value(skill) {
             Ok(v) => RpcResponse::success(id, v),
@@ -60,7 +60,7 @@ pub async fn skill_delete(
     id: Option<serde_json::Value>,
     skill_id: SkillId,
 ) -> RpcResponse {
-    let mut skills = state.skills.write().await;
+    let mut skills = state.engines.skills.write().await;
     let deleted = skills.delete(&skill_id);
     RpcResponse::success(id, serde_json::json!({ "deleted": deleted }))
 }

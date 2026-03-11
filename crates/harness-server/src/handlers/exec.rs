@@ -13,12 +13,12 @@ pub async fn exec_plan_init(
     match harness_exec::ExecPlan::from_spec(&spec, &project_root) {
         Ok(plan) => {
             let plan_id = plan.id.clone();
-            if let Some(db) = &state.plan_db {
+            if let Some(db) = &state.core.plan_db {
                 if let Err(e) = db.upsert(&plan).await {
                     tracing::warn!("failed to persist plan: {e}");
                 }
             }
-            let mut plans = state.plans.write().await;
+            let mut plans = state.core.plans.write().await;
             plans.insert(plan_id.clone(), plan);
             RpcResponse::success(id, serde_json::json!({ "plan_id": plan_id }))
         }
@@ -31,7 +31,7 @@ pub async fn exec_plan_status(
     id: Option<serde_json::Value>,
     plan_id: ExecPlanId,
 ) -> RpcResponse {
-    let plans = state.plans.read().await;
+    let plans = state.core.plans.read().await;
     if let Some(plan) = plans.get(&plan_id) {
         return match serde_json::to_value(plan) {
             Ok(v) => RpcResponse::success(id, v),
@@ -41,7 +41,7 @@ pub async fn exec_plan_status(
     drop(plans);
 
     // Fallback: query DB if plan not in memory.
-    if let Some(db) = &state.plan_db {
+    if let Some(db) = &state.core.plan_db {
         match db.get(&plan_id).await {
             Ok(Some(plan)) => {
                 let resp = match serde_json::to_value(&plan) {
@@ -49,7 +49,7 @@ pub async fn exec_plan_status(
                     Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
                 };
                 // Cache for subsequent lookups.
-                state.plans.write().await.insert(plan_id, plan);
+                state.core.plans.write().await.insert(plan_id, plan);
                 resp
             }
             Ok(None) => RpcResponse::error(id, NOT_FOUND, "plan not found"),
@@ -66,11 +66,11 @@ pub async fn exec_plan_update(
     plan_id: ExecPlanId,
     updates: serde_json::Value,
 ) -> RpcResponse {
-    let mut plans = state.plans.write().await;
+    let mut plans = state.core.plans.write().await;
 
     // If not in memory, try loading from DB first.
     if !plans.contains_key(&plan_id) {
-        if let Some(db) = &state.plan_db {
+        if let Some(db) = &state.core.plan_db {
             match db.get(&plan_id).await {
                 Ok(Some(plan)) => {
                     plans.insert(plan_id.clone(), plan);
@@ -112,7 +112,7 @@ pub async fn exec_plan_update(
                     )
                 }
             }
-            if let Some(db) = &state.plan_db {
+            if let Some(db) = &state.core.plan_db {
                 if let Err(e) = db.upsert(plan).await {
                     tracing::warn!("failed to persist plan update: {e}");
                 }

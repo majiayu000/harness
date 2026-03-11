@@ -20,7 +20,7 @@ pub async fn learn_rules(
         return RpcResponse::success(id, serde_json::json!({ "rules_learned": 0, "rules": [] }));
     }
 
-    let agent = match state.server.agent_registry.default_agent() {
+    let agent = match state.core.server.agent_registry.default_agent() {
         Some(a) => a,
         None => return RpcResponse::error(id, INTERNAL_ERROR, "no agent registered"),
     };
@@ -41,7 +41,7 @@ pub async fn learn_rules(
     let count = rules.len();
 
     {
-        let mut engine = state.rules.write().await;
+        let mut engine = state.engines.rules.write().await;
         for rule in &rules {
             engine.add_rule(rule.clone());
         }
@@ -72,7 +72,7 @@ pub async fn learn_skills(
         return RpcResponse::success(id, serde_json::json!({ "skills_learned": 0, "skills": [] }));
     }
 
-    let agent = match state.server.agent_registry.default_agent() {
+    let agent = match state.core.server.agent_registry.default_agent() {
         Some(a) => a,
         None => return RpcResponse::error(id, INTERNAL_ERROR, "no agent registered"),
     };
@@ -93,7 +93,7 @@ pub async fn learn_skills(
     let mut created = Vec::new();
 
     {
-        let mut skills = state.skills.write().await;
+        let mut skills = state.engines.skills.write().await;
         for (name, content) in skill_items {
             if let Err(e) = validate_skill_name(&name) {
                 tracing::warn!("skipping skill with invalid name: {e}");
@@ -136,7 +136,7 @@ fn validate_skill_name(name: &str) -> Result<(), String> {
 }
 
 fn collect_adopted_draft_contents(state: &AppState) -> Result<Vec<String>, String> {
-    let drafts = state.gc_agent.drafts().map_err(|e| e.to_string())?;
+    let drafts = state.engines.gc_agent.drafts().map_err(|e| e.to_string())?;
     let contents = drafts
         .iter()
         .filter(|d| d.status == DraftStatus::Adopted)

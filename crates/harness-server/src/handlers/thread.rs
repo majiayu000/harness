@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 /// Persist an existing thread to the optional ThreadDb after a mutation.
 pub(crate) async fn persist_thread(state: &AppState, thread_id: &ThreadId) {
-    if let Some(db) = &state.thread_db {
-        if let Some(thread) = state.server.thread_manager.get_thread(thread_id) {
+    if let Some(db) = &state.core.thread_db {
+        if let Some(thread) = state.core.server.thread_manager.get_thread(thread_id) {
             if let Err(e) = db.update(&thread).await {
                 tracing::warn!("thread_db persist failed: {e}");
             }
@@ -16,8 +16,8 @@ pub(crate) async fn persist_thread(state: &AppState, thread_id: &ThreadId) {
 
 /// Insert a newly created thread into the optional ThreadDb.
 pub(crate) async fn persist_thread_insert(state: &AppState, thread_id: &ThreadId) {
-    if let Some(db) = &state.thread_db {
-        if let Some(thread) = state.server.thread_manager.get_thread(thread_id) {
+    if let Some(db) = &state.core.thread_db {
+        if let Some(thread) = state.core.server.thread_manager.get_thread(thread_id) {
             if let Err(e) = db.insert(&thread).await {
                 tracing::warn!("thread_db insert failed: {e}");
             }
@@ -56,10 +56,10 @@ pub async fn thread_start(
     cwd: PathBuf,
 ) -> RpcResponse {
     let cwd = validate_root!(&cwd, id);
-    let thread_id = state.server.thread_manager.start_thread(cwd);
+    let thread_id = state.core.server.thread_manager.start_thread(cwd);
     persist_thread_insert(state, &thread_id).await;
     crate::notify::emit(
-        &state.notify_tx,
+        &state.notifications.notify_tx,
         Notification::ThreadStatusChanged {
             thread_id: thread_id.clone(),
             status: ThreadStatus::Idle,
@@ -69,7 +69,7 @@ pub async fn thread_start(
 }
 
 pub async fn thread_list(state: &AppState, id: Option<serde_json::Value>) -> RpcResponse {
-    let threads = state.server.thread_manager.list_threads();
+    let threads = state.core.server.thread_manager.list_threads();
     thread_list_response(id, threads)
 }
 
@@ -92,9 +92,9 @@ pub async fn thread_delete(
     id: Option<serde_json::Value>,
     thread_id: ThreadId,
 ) -> RpcResponse {
-    let deleted = state.server.thread_manager.delete_thread(&thread_id);
+    let deleted = state.core.server.thread_manager.delete_thread(&thread_id);
     if deleted {
-        if let Some(db) = &state.thread_db {
+        if let Some(db) = &state.core.thread_db {
             if let Err(e) = db.delete(thread_id.as_str()).await {
                 tracing::warn!("thread_db delete failed: {e}");
             }
@@ -110,9 +110,10 @@ pub async fn turn_start(
     input: String,
 ) -> RpcResponse {
     let input = harness_core::prompts::wrap_external_data(&input);
-    let agent_name = state.server.config.agents.default_agent.clone();
+    let agent_name = state.core.server.config.agents.default_agent.clone();
     let agent_id = harness_core::AgentId::from_str(&agent_name);
     match state
+        .core
         .server
         .thread_manager
         .start_turn(&thread_id, input.clone(), agent_id)
@@ -120,18 +121,18 @@ pub async fn turn_start(
         Ok(turn_id) => {
             persist_thread(state, &thread_id).await;
             crate::notify::emit(
-                &state.notify_tx,
+                &state.notifications.notify_tx,
                 Notification::TurnStarted {
                     thread_id: thread_id.clone(),
                     turn_id: turn_id.clone(),
                 },
             );
 
-            let lifecycle_server = state.server.clone();
-            let cleanup_server = state.server.clone();
-            let lifecycle_thread_db = state.thread_db.clone();
-            let lifecycle_notify_tx = state.notify_tx.clone();
-            let lifecycle_notification_tx = state.notification_tx.clone();
+            let lifecycle_server = state.core.server.clone();
+            let cleanup_server = state.core.server.clone();
+            let lifecycle_thread_db = state.core.thread_db.clone();
+            let lifecycle_notify_tx = state.notifications.notify_tx.clone();
+            let lifecycle_notification_tx = state.notifications.notification_tx.clone();
             let lifecycle_thread_id = thread_id.clone();
             let lifecycle_turn_id = turn_id.clone();
             let cleanup_turn_id = turn_id.clone();
@@ -155,6 +156,7 @@ pub async fn turn_start(
                     .clear_turn_task(&cleanup_turn_id);
             });
             state
+                .core
                 .server
                 .thread_manager
                 .register_turn_task(&turn_id, handle);
@@ -170,9 +172,10 @@ pub async fn turn_cancel(
     id: Option<serde_json::Value>,
     turn_id: harness_core::TurnId,
 ) -> RpcResponse {
-    match state.server.thread_manager.find_thread_for_turn(&turn_id) {
+    match state.core.server.thread_manager.find_thread_for_turn(&turn_id) {
         Some(thread_id) => {
             match state
+                .core
                 .server
                 .thread_manager
                 .cancel_turn(&thread_id, &turn_id)
@@ -182,7 +185,7 @@ pub async fn turn_cancel(
                     persist_thread(state, &thread_id).await;
                     if let Some(token_usage) = cancel_usage {
                         crate::notify::emit(
-                            &state.notify_tx,
+                            &state.notifications.notify_tx,
                             Notification::TurnCompleted {
                                 turn_id: turn_id.clone(),
                                 status: TurnStatus::Cancelled,
@@ -204,9 +207,9 @@ pub async fn turn_status(
     id: Option<serde_json::Value>,
     turn_id: harness_core::TurnId,
 ) -> RpcResponse {
-    match state.server.thread_manager.find_thread_for_turn(&turn_id) {
+    match state.core.server.thread_manager.find_thread_for_turn(&turn_id) {
         Some(thread_id) => {
-            if let Some(thread) = state.server.thread_manager.get_thread(&thread_id) {
+            if let Some(thread) = state.core.server.thread_manager.get_thread(&thread_id) {
                 if let Some(turn) = thread.turns.iter().find(|t| t.id == turn_id) {
                     match serde_json::to_value(turn) {
                         Ok(v) => RpcResponse::success(id, v),
@@ -230,9 +233,10 @@ pub async fn turn_steer(
     instruction: String,
 ) -> RpcResponse {
     let instruction = harness_core::prompts::wrap_external_data(&instruction);
-    match state.server.thread_manager.find_thread_for_turn(&turn_id) {
+    match state.core.server.thread_manager.find_thread_for_turn(&turn_id) {
         Some(thread_id) => {
             match state
+                .core
                 .server
                 .thread_manager
                 .steer_turn(&thread_id, &turn_id, instruction)
@@ -253,7 +257,7 @@ pub async fn thread_resume(
     id: Option<serde_json::Value>,
     thread_id: ThreadId,
 ) -> RpcResponse {
-    match state.server.thread_manager.resume_thread(&thread_id) {
+    match state.core.server.thread_manager.resume_thread(&thread_id) {
         Ok(()) => {
             persist_thread(state, &thread_id).await;
             RpcResponse::success(id, serde_json::json!({ "resumed": true }))
@@ -269,6 +273,7 @@ pub async fn thread_fork(
     from_turn: Option<harness_core::TurnId>,
 ) -> RpcResponse {
     match state
+        .core
         .server
         .thread_manager
         .fork_thread(&thread_id, from_turn.as_ref())
@@ -286,7 +291,7 @@ pub async fn thread_compact(
     id: Option<serde_json::Value>,
     thread_id: ThreadId,
 ) -> RpcResponse {
-    match state.server.thread_manager.compact_thread(&thread_id) {
+    match state.core.server.thread_manager.compact_thread(&thread_id) {
         Ok(()) => {
             persist_thread(state, &thread_id).await;
             RpcResponse::success(id, serde_json::json!({ "compacted": true }))
