@@ -73,6 +73,25 @@ pub enum ThreadStatus {
     Archived,
 }
 
+impl crate::DbSerializable for ThreadStatus {
+    fn to_db_str(&self) -> &'static str {
+        match self {
+            ThreadStatus::Idle => "idle",
+            ThreadStatus::Active => "active",
+            ThreadStatus::Archived => "archived",
+        }
+    }
+
+    fn from_db_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "idle" => Ok(ThreadStatus::Idle),
+            "active" => Ok(ThreadStatus::Active),
+            "archived" => Ok(ThreadStatus::Archived),
+            _ => anyhow::bail!("unknown thread status `{s}`"),
+        }
+    }
+}
+
 impl Thread {
     pub fn new(project_root: PathBuf) -> Self {
         let now = Utc::now();

@@ -1,5 +1,5 @@
 use anyhow::Context;
-use harness_core::{Thread, ThreadId, ThreadStatus};
+use harness_core::{DbSerializable, Thread, ThreadId, ThreadStatus};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 
@@ -46,7 +46,7 @@ impl ThreadDb {
         )
         .bind(thread.id.as_str())
         .bind(thread.project_root.to_string_lossy().as_ref())
-        .bind(status_to_str(thread.status))
+        .bind(thread.status.to_db_str())
         .bind(&turns_json)
         .bind(&metadata_json)
         .bind(thread.created_at.to_rfc3339())
@@ -64,7 +64,7 @@ impl ThreadDb {
              WHERE id = ?",
         )
         .bind(thread.project_root.to_string_lossy().as_ref())
-        .bind(status_to_str(thread.status))
+        .bind(thread.status.to_db_str())
         .bind(&turns_json)
         .bind(&metadata_json)
         .bind(thread.updated_at.to_rfc3339())
@@ -112,7 +112,7 @@ struct ThreadRow {
 impl ThreadRow {
     fn into_thread(self) -> anyhow::Result<Thread> {
         let id = ThreadId::from_str(&self.id);
-        let status = str_to_status(&self.status)
+        let status = ThreadStatus::from_db_str(&self.status)
             .with_context(|| format!("invalid status for thread `{}`", id.as_str()))?;
         Ok(Thread {
             id,
@@ -125,25 +125,6 @@ impl ThreadRow {
             updated_at: chrono::DateTime::parse_from_rfc3339(&self.updated_at)
                 .map(|d| d.with_timezone(&chrono::Utc))?,
         })
-    }
-}
-
-fn status_to_str(s: ThreadStatus) -> &'static str {
-    match s {
-        ThreadStatus::Idle => "idle",
-        ThreadStatus::Active => "active",
-        ThreadStatus::Archived => "archived",
-    }
-}
-
-/// Persisted thread statuses are strict. Unknown values are surfaced as errors
-/// so state-machine drift is visible during load instead of silently downgraded.
-fn str_to_status(s: &str) -> anyhow::Result<ThreadStatus> {
-    match s {
-        "idle" => Ok(ThreadStatus::Idle),
-        "active" => Ok(ThreadStatus::Active),
-        "archived" => Ok(ThreadStatus::Archived),
-        _ => anyhow::bail!("unknown thread status `{s}`"),
     }
 }
 

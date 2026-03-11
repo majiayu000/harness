@@ -1,4 +1,5 @@
 use crate::task_runner::{TaskId, TaskState, TaskStatus};
+use harness_core::DbSerializable;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 
@@ -56,7 +57,7 @@ impl TaskDb {
 
     pub async fn insert(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
-        let status = status_to_str(&state.status);
+        let status = state.status.to_db_str();
         sqlx::query(
             "INSERT INTO tasks (id, status, turn, pr_url, rounds, error)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -74,7 +75,7 @@ impl TaskDb {
 
     pub async fn update(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
-        let status = status_to_str(&state.status);
+        let status = state.status.to_db_str();
         sqlx::query(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
                     updated_at = datetime('now')
@@ -157,7 +158,7 @@ impl TaskRow {
 
         Ok(TaskState {
             id: TaskId(id),
-            status: str_to_status(&status),
+            status: TaskStatus::from_db_str(&status)?,
             turn: turn as u32,
             pr_url,
             rounds: decoded_rounds,
@@ -165,31 +166,6 @@ impl TaskRow {
             source,
             external_id,
         })
-    }
-}
-
-fn status_to_str(s: &TaskStatus) -> &'static str {
-    match s {
-        TaskStatus::Pending => "pending",
-        TaskStatus::Implementing => "implementing",
-        TaskStatus::AgentReview => "agent_review",
-        TaskStatus::Waiting => "waiting",
-        TaskStatus::Reviewing => "reviewing",
-        TaskStatus::Done => "done",
-        TaskStatus::Failed => "failed",
-    }
-}
-
-fn str_to_status(s: &str) -> TaskStatus {
-    match s {
-        "pending" => TaskStatus::Pending,
-        "implementing" => TaskStatus::Implementing,
-        "agent_review" => TaskStatus::AgentReview,
-        "waiting" => TaskStatus::Waiting,
-        "reviewing" => TaskStatus::Reviewing,
-        "done" => TaskStatus::Done,
-        "failed" => TaskStatus::Failed,
-        _ => TaskStatus::Failed,
     }
 }
 

@@ -35,6 +35,33 @@ pub enum TaskStatus {
     Failed,
 }
 
+impl harness_core::DbSerializable for TaskStatus {
+    fn to_db_str(&self) -> &'static str {
+        match self {
+            TaskStatus::Pending => "pending",
+            TaskStatus::Implementing => "implementing",
+            TaskStatus::AgentReview => "agent_review",
+            TaskStatus::Waiting => "waiting",
+            TaskStatus::Reviewing => "reviewing",
+            TaskStatus::Done => "done",
+            TaskStatus::Failed => "failed",
+        }
+    }
+
+    fn from_db_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "pending" => Ok(TaskStatus::Pending),
+            "implementing" => Ok(TaskStatus::Implementing),
+            "agent_review" => Ok(TaskStatus::AgentReview),
+            "waiting" => Ok(TaskStatus::Waiting),
+            "reviewing" => Ok(TaskStatus::Reviewing),
+            "done" => Ok(TaskStatus::Done),
+            "failed" => Ok(TaskStatus::Failed),
+            _ => anyhow::bail!("unknown task status `{s}`"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoundResult {
     pub turn: u32,
