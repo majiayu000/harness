@@ -116,6 +116,9 @@ function renderIntakeChannels(channels) {
   });
 }
 
+const ACTIVE_KEYS = new Set(["pending", "implementing", "agent_review", "waiting", "reviewing"]);
+const TERMINAL_KEYS = new Set(["done", "failed"]);
+
 function renderBoard(tasks) {
   const grouped = {};
   COLUMNS.forEach(c => grouped[c.key] = []);
@@ -125,6 +128,12 @@ function renderBoard(tasks) {
 
   const board = $("#board");
   board.innerHTML = "";
+
+  const activeRow = document.createElement("div");
+  activeRow.className = "board-active";
+
+  const terminalRow = document.createElement("div");
+  terminalRow.className = "board-terminal";
 
   COLUMNS.forEach(col => {
     const items = grouped[col.key];
@@ -142,8 +151,15 @@ function renderBoard(tasks) {
       items.forEach(task => div.appendChild(renderCard(task, col.key)));
     }
 
-    board.appendChild(div);
+    if (TERMINAL_KEYS.has(col.key)) {
+      terminalRow.appendChild(div);
+    } else {
+      activeRow.appendChild(div);
+    }
   });
+
+  board.appendChild(activeRow);
+  board.appendChild(terminalRow);
 }
 
 function renderCard(task, status) {

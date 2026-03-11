@@ -160,8 +160,18 @@ body {
 }
 
 .board {
+  margin-top: 1rem;
+}
+
+.board-active {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  grid-template-columns: repeat(5, 1fr);
+  gap: 0.85rem;
+}
+
+.board-terminal {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
   gap: 0.85rem;
   margin-top: 1rem;
 }
@@ -469,12 +479,14 @@ body {
 @media (max-width: 860px) {
   .app-shell { padding: 1rem 0.85rem 2rem; }
   .hero-grid { grid-template-columns: 1fr; }
-  .board { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+  .board-active { grid-template-columns: repeat(3, 1fr); }
+  .board-terminal { grid-template-columns: repeat(2, 1fr); }
 }
 
 @media (max-width: 560px) {
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
-  .board { grid-template-columns: 1fr; }
+  .board-active { grid-template-columns: repeat(2, 1fr); }
+  .board-terminal { grid-template-columns: 1fr; }
   .hero-card { border-radius: 20px; padding: 1rem; }
   .section-card { border-radius: 20px; padding: 1rem; }
 }
