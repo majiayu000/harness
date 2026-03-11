@@ -3,27 +3,10 @@ use crate::remediation::signal_priority;
 use crate::signal_detector::SignalDetector;
 use chrono::Utc;
 use harness_core::{
-    AgentRequest, Artifact, ArtifactType, CodeAgent, Draft, DraftId, DraftStatus, Project,
-    RemediationType, Signal, SignalType,
+    AgentRequest, Artifact, ArtifactType, CodeAgent, Draft, DraftId, DraftStatus, GcConfig,
+    Project, RemediationType, Signal, SignalType,
 };
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GcConfig {
-    pub max_drafts_per_run: usize,
-    pub budget_per_signal_usd: f64,
-    pub total_budget_usd: f64,
-}
-
-impl Default for GcConfig {
-    fn default() -> Self {
-        Self {
-            max_drafts_per_run: 5,
-            budget_per_signal_usd: 0.50,
-            total_budget_usd: 5.0,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcReport {

@@ -1,5 +1,4 @@
-use harness_core::{Draft, DraftId, DraftStatus, EventFilters, Project, ProjectId};
-use harness_gc::gc_agent::GcConfig as GcAgentConfig;
+use harness_core::{Draft, DraftId, DraftStatus, EventFilters, GcConfig, Project, ProjectId};
 use harness_gc::signal_detector::SignalThresholds as GcThresholds;
 use harness_gc::{DraftStore, GcAgent, SignalDetector};
 use harness_observe::EventStore;
@@ -99,7 +98,7 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
 fn make_agent_for_draft_ops(data_dir: &std::path::Path) -> anyhow::Result<GcAgent> {
     let draft_store = DraftStore::new(data_dir)?;
     Ok(GcAgent::new(
-        GcAgentConfig::default(),
+        GcConfig::default(),
         SignalDetector::new(GcThresholds::default(), ProjectId::new()),
         draft_store,
     ))
@@ -121,10 +120,6 @@ fn map_thresholds(t: &harness_core::SignalThresholds) -> GcThresholds {
     }
 }
 
-fn map_gc_config(c: &harness_core::GcConfig) -> GcAgentConfig {
-    GcAgentConfig {
-        max_drafts_per_run: c.max_drafts_per_run,
-        budget_per_signal_usd: c.budget_per_signal_usd,
-        total_budget_usd: c.total_budget_usd,
-    }
+fn map_gc_config(c: &harness_core::GcConfig) -> GcConfig {
+    c.clone()
 }
