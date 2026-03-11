@@ -86,7 +86,9 @@ impl CodeAgent for CodexAgent {
 
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
-            .current_dir(&req.project_root);
+            .current_dir(&req.project_root)
+            .env_remove("CLAUDECODE")
+            .env_remove("CLAUDE_CODE_ENTRYPOINT");
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {
@@ -137,6 +139,8 @@ impl CodeAgent for CodexAgent {
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
+            .env_remove("CLAUDECODE")
+            .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
@@ -528,6 +532,56 @@ printf 'second\n'
                 .lines()
                 .any(|line| line.starts_with(&format!("{secret_name}="))),
             "setup secret leaked into agent phase environment"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_removes_claude_code_env_vars() -> anyhow::Result<()> {
+        // Use a single ScopedEnvVar to hold the env lock; set both vars while
+        // the lock is already held to avoid a re-entrant deadlock.
+        let _guard = ScopedEnvVar::set("CLAUDECODE", "1");
+        unsafe { std::env::set_var("CLAUDE_CODE_ENTRYPOINT", "claude-code") };
+
+        let dir = tempdir()?;
+        let agent_capture = dir.path().join("agent-env.txt");
+        let cli_script = dir.path().join("capture-env.sh");
+
+        fs::write(
+            &cli_script,
+            format!("#!/bin/sh\nenv > \"{}\"\nexit 0\n", agent_capture.display()),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&cli_script)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&cli_script, perms)?;
+        }
+
+        let agent = CodexAgent::new(cli_script, SandboxMode::DangerFullAccess);
+        let request = AgentRequest {
+            prompt: "ping".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        agent.execute(request).await?;
+
+        unsafe { std::env::remove_var("CLAUDE_CODE_ENTRYPOINT") };
+
+        let agent_env = fs::read_to_string(agent_capture)?;
+        assert!(
+            !agent_env
+                .lines()
+                .any(|line| line.starts_with("CLAUDECODE=")),
+            "CLAUDECODE must not be passed to codex agent"
+        );
+        assert!(
+            !agent_env
+                .lines()
+                .any(|line| line.starts_with("CLAUDE_CODE_ENTRYPOINT=")),
+            "CLAUDE_CODE_ENTRYPOINT must not be passed to codex agent"
         );
         Ok(())
     }
