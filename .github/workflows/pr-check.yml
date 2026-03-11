@@ -4,6 +4,9 @@ on:
   pull_request:
     types: [opened, edited, synchronize]
 
+permissions:
+  pull-requests: write
+
 jobs:
   pr-body:
     name: PR Description
@@ -18,3 +21,19 @@ jobs:
             exit 1
           fi
           echo "PR description looks good (${#PR_BODY} chars)."
+
+  gemini-review:
+    name: Gemini Re-review
+    runs-on: ubuntu-latest
+    if: github.event.action == 'synchronize' && vars.GEMINI_REVIEW_ENABLED == 'true'
+    steps:
+      - name: Request Gemini re-review
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '/gemini review'
+            });
