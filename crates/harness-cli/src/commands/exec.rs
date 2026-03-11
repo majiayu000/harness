@@ -350,18 +350,40 @@ pub async fn run(
         ..Default::default()
     };
 
-    let selected_agent: Arc<dyn harness_core::CodeAgent> = match agent.as_str() {
-        "claude" => Arc::new(harness_agents::claude::ClaudeCodeAgent::new(
+    let mut agent_registry = harness_agents::AgentRegistry::new(&config.agents.default_agent);
+    agent_registry.register(
+        "claude",
+        Arc::new(harness_agents::claude::ClaudeCodeAgent::new(
             config.agents.claude.cli_path.clone(),
             config.agents.claude.default_model.clone(),
             runtime_sandbox_mode,
         )),
-        "codex" => Arc::new(harness_agents::codex::CodexAgent::from_config(
+    );
+    agent_registry.register(
+        "codex",
+        Arc::new(harness_agents::codex::CodexAgent::from_config(
             config.agents.codex.clone(),
             runtime_sandbox_mode,
         )),
-        other => anyhow::bail!("unknown exec agent `{other}`; supported values are: claude, codex"),
-    };
+    );
+    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+        agent_registry.register(
+            "anthropic-api",
+            Arc::new(
+                harness_agents::anthropic_api::AnthropicApiAgent::from_config(
+                    api_key,
+                    &config.agents.anthropic_api,
+                ),
+            ),
+        );
+    }
+
+    let selected_agent = agent_registry.get(&agent).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown exec agent `{agent}`; supported values are: {}",
+            agent_registry.list().join(", ")
+        )
+    })?;
 
     let resp = selected_agent.execute(req).await?;
     if let Some(output_path) = output_path {

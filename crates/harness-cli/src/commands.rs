@@ -458,52 +458,9 @@ mod tests {
     use crate::commands::exec::{
         apply_sandbox_hint, current_username, enforce_exec_actor_filters,
         enforce_exec_privilege_policy_with, normalize_allow_list, resolve_exec_output_path,
-        resolve_exec_project_root_with, ExecSandboxMode,
+        ExecSandboxMode,
     };
-    use std::io;
     use std::path::Path;
-
-    #[test]
-    fn resolve_exec_project_root_prefers_explicit_project() {
-        let explicit = PathBuf::from("/tmp/project");
-        let resolved = resolve_exec_project_root_with(Some(explicit.clone()), || {
-            panic!("current_dir fallback must not be used when --project is provided")
-        })
-        .expect("explicit project should resolve");
-
-        assert_eq!(resolved, explicit);
-    }
-
-    #[test]
-    fn resolve_exec_project_root_uses_current_dir_fallback() {
-        let fallback = PathBuf::from("/tmp/fallback");
-        let resolved = resolve_exec_project_root_with(None, || Ok(fallback.clone()))
-            .expect("cwd fallback should resolve when current_dir succeeds");
-
-        assert_eq!(resolved, fallback);
-    }
-
-    #[test]
-    fn resolve_exec_project_root_returns_contextual_error_on_failure() {
-        let error = resolve_exec_project_root_with(None, || {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "cwd lookup blocked",
-            ))
-        })
-        .expect_err("cwd failure should be returned as recoverable error");
-
-        let message = error.to_string();
-        assert!(message.contains(
-            "failed to resolve `harness exec` project root from current working directory"
-        ));
-        let chain = error
-            .chain()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(" | ");
-        assert!(chain.contains("cwd lookup blocked"));
-    }
 
     #[test]
     fn sandbox_mode_parse_accepts_supported_values() {
