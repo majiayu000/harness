@@ -1,4 +1,5 @@
 use crate::task_runner::{TaskId, TaskState, TaskStatus};
+use harness_core::TaskDbDecodeError;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 
@@ -123,16 +124,6 @@ struct TaskRow {
     updated_at: String,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum TaskDbDecodeError {
-    #[error("failed to deserialize rounds for task `{task_id}`")]
-    RoundsDeserialize {
-        task_id: String,
-        #[source]
-        source: serde_json::Error,
-    },
-}
-
 impl TaskRow {
     fn try_into_task_state(self) -> anyhow::Result<TaskState> {
         let Self {
@@ -195,8 +186,9 @@ fn str_to_status(s: &str) -> TaskStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{TaskDb, TaskDbDecodeError, TaskRow};
+    use super::{TaskDb, TaskRow};
     use crate::task_runner::{RoundResult, TaskId, TaskState, TaskStatus};
+    use harness_core::TaskDbDecodeError;
 
     fn build_task_row(rounds: &str) -> TaskRow {
         TaskRow {
