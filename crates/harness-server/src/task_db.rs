@@ -299,6 +299,7 @@ mod tests {
             turn: 1,
             action: "implement".to_string(),
             result: "created PR".to_string(),
+            detail: None,
         });
         db.update(&task).await?;
 
