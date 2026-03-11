@@ -1,3 +1,4 @@
 /target/
 exec-plan-*.md
-.harness/cloud-setup-cache/
+.harness/
+crates/*/.harness/
