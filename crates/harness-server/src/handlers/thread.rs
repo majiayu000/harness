@@ -172,7 +172,12 @@ pub async fn turn_cancel(
     id: Option<serde_json::Value>,
     turn_id: harness_core::TurnId,
 ) -> RpcResponse {
-    match state.core.server.thread_manager.find_thread_for_turn(&turn_id) {
+    match state
+        .core
+        .server
+        .thread_manager
+        .find_thread_for_turn(&turn_id)
+    {
         Some(thread_id) => {
             match state
                 .core
@@ -207,7 +212,12 @@ pub async fn turn_status(
     id: Option<serde_json::Value>,
     turn_id: harness_core::TurnId,
 ) -> RpcResponse {
-    match state.core.server.thread_manager.find_thread_for_turn(&turn_id) {
+    match state
+        .core
+        .server
+        .thread_manager
+        .find_thread_for_turn(&turn_id)
+    {
         Some(thread_id) => {
             if let Some(thread) = state.core.server.thread_manager.get_thread(&thread_id) {
                 if let Some(turn) = thread.turns.iter().find(|t| t.id == turn_id) {
@@ -233,7 +243,12 @@ pub async fn turn_steer(
     instruction: String,
 ) -> RpcResponse {
     let instruction = harness_core::prompts::wrap_external_data(&instruction);
-    match state.core.server.thread_manager.find_thread_for_turn(&turn_id) {
+    match state
+        .core
+        .server
+        .thread_manager
+        .find_thread_for_turn(&turn_id)
+    {
         Some(thread_id) => {
             match state
                 .core

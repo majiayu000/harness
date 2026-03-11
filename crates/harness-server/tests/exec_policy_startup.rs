@@ -39,7 +39,7 @@ decision = "forbidden"
         AgentRegistry::new("test"),
     ));
     let state = build_app_state(server).await?;
-    let rules = state.rules.read().await;
+    let rules = state.engines.rules.read().await;
 
     let allow_result = rules.check_command_policy(
         &["git".to_string(), "status".to_string()],

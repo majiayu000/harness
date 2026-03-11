@@ -472,7 +472,8 @@ mod tests {
 
         for _ in 0..512 {
             state
-                .notifications.notification_tx
+                .notifications
+                .notification_tx
                 .send(RpcNotification::new(Notification::TurnStarted {
                     thread_id: harness_core::ThreadId::new(),
                     turn_id: harness_core::TurnId::new(),
@@ -493,7 +494,8 @@ mod tests {
         assert!(dropped_total >= skipped as u64);
         assert_eq!(
             state
-                .notifications.notification_lagged_total
+                .notifications
+                .notification_lagged_total
                 .load(std::sync::atomic::Ordering::Relaxed),
             dropped_total
         );

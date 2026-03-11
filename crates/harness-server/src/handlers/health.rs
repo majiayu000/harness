@@ -32,7 +32,10 @@ pub async fn health_check(
             }
         }
     };
-    state.observability.events.persist_rule_scan(&project_root, &violations);
+    state
+        .observability
+        .events
+        .persist_rule_scan(&project_root, &violations);
 
     let report = generate_health_report(&events, &violations);
     match serde_json::to_value(&report) {

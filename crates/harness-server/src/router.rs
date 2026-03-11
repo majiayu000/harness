@@ -34,7 +34,10 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
             Some(handlers::thread::initialize(id).await)
         }
         Method::Initialized => {
-            state.notifications.initialized.store(true, Ordering::Relaxed);
+            state
+                .notifications
+                .initialized
+                .store(true, Ordering::Relaxed);
             handlers::thread::initialized().await;
             if id.is_none() {
                 None
@@ -683,10 +686,13 @@ mod tests {
             "warning path should not return a success payload"
         );
 
-        let events = state.observability.events.query(&harness_core::EventFilters {
-            hook: Some("rule_scan".to_string()),
-            ..Default::default()
-        })?;
+        let events = state
+            .observability
+            .events
+            .query(&harness_core::EventFilters {
+                hook: Some("rule_scan".to_string()),
+                ..Default::default()
+            })?;
         assert!(
             events.is_empty(),
             "no scan event should be logged when scan request is rejected"
@@ -766,7 +772,10 @@ mod tests {
                 severity: harness_core::Severity::Low,
             },
         ];
-        state.observability.events.persist_rule_scan(&project_root, &violations);
+        state
+            .observability
+            .events
+            .persist_rule_scan(&project_root, &violations);
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -791,7 +800,10 @@ mod tests {
             "coverage should degrade with persisted violations, got {coverage}"
         );
 
-        let events = state.observability.events.query(&harness_core::EventFilters::default())?;
+        let events = state
+            .observability
+            .events
+            .query(&harness_core::EventFilters::default())?;
         let latest_scan = events
             .iter()
             .rev()

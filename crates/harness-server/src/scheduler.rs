@@ -59,7 +59,10 @@ impl Scheduler {
                 )
             })?
         };
-        state.observability.events.persist_rule_scan(&project_root, &violations);
+        state
+            .observability
+            .events
+            .persist_rule_scan(&project_root, &violations);
         let report = generate_health_report(&events, &violations);
         tracing::info!(
             grade = ?report.quality.grade,

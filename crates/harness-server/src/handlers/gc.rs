@@ -53,9 +53,16 @@ pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcRespo
         violation_count = violations.len(),
         "gc/run scan completed"
     );
-    state.observability.events.persist_rule_scan(&project_root, &violations);
+    state
+        .observability
+        .events
+        .persist_rule_scan(&project_root, &violations);
 
-    let events = match state.observability.events.query(&harness_core::EventFilters::default()) {
+    let events = match state
+        .observability
+        .events
+        .query(&harness_core::EventFilters::default())
+    {
         Ok(e) => e,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     };

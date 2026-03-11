@@ -49,7 +49,7 @@ async fn gc_run_uses_configured_project_root_across_cwd() -> anyhow::Result<()> 
     ));
     let state = build_app_state(server).await?;
     {
-        let mut rules = state.rules.write().await;
+        let mut rules = state.engines.rules.write().await;
         rules.register_guard(harness_rules::engine::Guard {
             id: GuardId::from_str("TEST-GUARD"),
             script_path: guard_script,

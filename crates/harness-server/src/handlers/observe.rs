@@ -52,9 +52,16 @@ pub async fn metrics_collect(
             }
         }
     };
-    state.observability.events.persist_rule_scan(&project_root, &violations);
+    state
+        .observability
+        .events
+        .persist_rule_scan(&project_root, &violations);
 
-    let evts = match state.observability.events.query(&harness_core::EventFilters::default()) {
+    let evts = match state
+        .observability
+        .events
+        .query(&harness_core::EventFilters::default())
+    {
         Ok(e) => e,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     };

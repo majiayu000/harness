@@ -150,7 +150,8 @@ mod tests {
     async fn stdio_processes_initialize_then_initialized() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut state = make_test_state(dir.path()).await?;
-        state.notifications.initialized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.notifications.initialized =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let init_line = serde_json::to_string(&RpcRequest {
             jsonrpc: "2.0".to_string(),

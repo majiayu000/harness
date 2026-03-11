@@ -111,8 +111,8 @@ async fn make_test_state_with(
         },
         interceptors: vec![],
         feishu_intake: None,
-            github_intake: None,
-            completion_callback: None,
+        github_intake: None,
+        completion_callback: None,
     }))
 }
 

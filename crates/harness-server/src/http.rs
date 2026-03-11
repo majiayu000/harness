@@ -529,7 +529,14 @@ async fn github_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let secret = match state.core.server.config.server.github_webhook_secret.as_deref() {
+    let secret = match state
+        .core
+        .server
+        .config
+        .server
+        .github_webhook_secret
+        .as_deref()
+    {
         Some("") => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,

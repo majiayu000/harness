@@ -66,7 +66,10 @@ pub async fn rule_check(
                 violation_count = violations.len(),
                 "rule/check scan completed"
             );
-            state.observability.events.persist_rule_scan(&project_root, &violations);
+            state
+                .observability
+                .events
+                .persist_rule_scan(&project_root, &violations);
             match serde_json::to_value(&violations) {
                 Ok(v) => RpcResponse::success(id, v),
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
