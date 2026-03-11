@@ -300,12 +300,14 @@ fn build_completion_callback(
     feishu_intake: &Option<Arc<crate::intake::feishu::FeishuIntake>>,
     github_intake: &Option<Arc<dyn crate::intake::IntakeSource>>,
 ) -> Option<task_runner::CompletionCallback> {
-    let mut sources: Vec<Arc<dyn crate::intake::IntakeSource>> = Vec::new();
+    let mut sources: std::collections::HashMap<String, Arc<dyn crate::intake::IntakeSource>> =
+        std::collections::HashMap::new();
     if let Some(gh) = github_intake {
-        sources.push(gh.clone());
+        sources.insert(gh.name().to_string(), gh.clone());
     }
     if let Some(fi) = feishu_intake {
-        sources.push(fi.clone() as Arc<dyn crate::intake::IntakeSource>);
+        let fi_source: Arc<dyn crate::intake::IntakeSource> = fi.clone();
+        sources.insert(fi_source.name().to_string(), fi_source);
     }
     if sources.is_empty() {
         return None;
@@ -325,7 +327,7 @@ fn build_completion_callback(
                 );
                 return;
             };
-            let Some(source) = sources.iter().find(|s| s.name() == source_name) else {
+            let Some(source) = sources.get(source_name) else {
                 tracing::warn!(
                     task_id = ?task.id,
                     source = source_name,
@@ -342,7 +344,14 @@ fn build_completion_callback(
                 task_runner::TaskStatus::Failed => {
                     task.error.as_deref().unwrap_or("unknown error").to_string()
                 }
-                _ => String::new(),
+                _ => {
+                    tracing::warn!(
+                        task_id = ?task.id,
+                        status = ?task.status,
+                        "completion_callback: called with non-terminal status, skipping"
+                    );
+                    return;
+                }
             };
             let result = crate::intake::TaskCompletionResult {
                 status: task.status.clone(),
