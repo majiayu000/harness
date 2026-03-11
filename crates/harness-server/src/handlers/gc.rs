@@ -155,6 +155,7 @@ pub async fn gc_adopt(
                     req,
                     state.workspace_mgr.clone(),
                     permit,
+                    None,
                 )
                 .await;
                 Some(tid.0)

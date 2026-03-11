@@ -291,6 +291,7 @@ pub async fn spawn_task(
     req: CreateTaskRequest,
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
+    completion_callback: Option<CompletionCallback>,
 ) -> TaskId {
     spawn_task_with_worktree_detector(
         store,
@@ -304,6 +305,7 @@ pub async fn spawn_task(
         detect_main_worktree,
         workspace_mgr,
         permit,
+        completion_callback,
     )
     .await
 }
@@ -320,6 +322,7 @@ async fn spawn_task_with_worktree_detector<F>(
     detect_worktree: F,
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
+    completion_callback: Option<CompletionCallback>,
 ) -> TaskId
 where
     F: Fn() -> PathBuf + Send + Sync + 'static,
@@ -391,6 +394,15 @@ where
                 tracing::error!("task {id_watcher:?} panicked or was cancelled: {join_err}");
                 let reason = format!("task failed unexpectedly: {join_err}");
                 record_task_failure(&store_watcher, &events_watcher, &id_watcher, reason).await;
+            }
+        }
+        if let Some(cb) = completion_callback {
+            match store_watcher.get(&id_watcher) {
+                Some(final_state) => cb(final_state).await,
+                None => tracing::warn!(
+                    "completion_callback: task {:?} not found in store after completion",
+                    id_watcher
+                ),
             }
         }
     });
@@ -546,6 +558,7 @@ mod tests {
             req,
             None,
             permit,
+            None,
         )
         .await;
 
@@ -616,6 +629,7 @@ mod tests {
             req,
             None,
             permit,
+            None,
         )
         .await;
 
@@ -738,6 +752,7 @@ mod tests {
             },
             None,
             permit,
+            None,
         )
         .await;
 

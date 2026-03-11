@@ -225,6 +225,8 @@ mod tests {
             initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             workspace_mgr: None,
             feishu_intake: None,
+            github_intake: None,
+            completion_callback: None,
             task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         })
     }
