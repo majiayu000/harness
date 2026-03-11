@@ -648,6 +648,7 @@ pub(crate) async fn run_task(
             } else {
                 "implemented".into()
             },
+            detail: None,
         });
     })
     .await;
@@ -738,6 +739,7 @@ pub(crate) async fn run_task(
                     turn: round,
                     action: "review".into(),
                     result: "waiting".into(),
+                    detail: None,
                 });
                 s.rounds
                     .iter()
@@ -761,6 +763,7 @@ pub(crate) async fn run_task(
                 turn: round,
                 action: "review".into(),
                 result: if lgtm { "lgtm".into() } else { "fixed".into() },
+                detail: None,
             });
         })
         .await;
@@ -860,8 +863,15 @@ async fn run_agent_review(
             }
         };
 
-        let approved = prompts::is_approved(&resp.output);
-        let issues = prompts::extract_review_issues(&resp.output);
+        let AgentResponse { output, stderr, .. } = resp;
+
+        if !stderr.is_empty() {
+            tracing::warn!(agent_round, stderr = %stderr, "agent reviewer stderr");
+        }
+
+        let approved = prompts::is_approved(&output);
+        let issues = prompts::extract_review_issues(&output);
+        let review_detail = output;
 
         mutate_and_persist(store, task_id, |s| {
             s.rounds.push(RoundResult {
@@ -872,6 +882,7 @@ async fn run_agent_review(
                 } else {
                     format!("{} issues", issues.len())
                 },
+                detail: Some(review_detail),
             });
         })
         .await;
@@ -948,6 +959,7 @@ async fn run_agent_review(
                 turn: 0,
                 action: "agent_review_fix".into(),
                 result: "fixed".into(),
+                detail: None,
             });
         })
         .await;

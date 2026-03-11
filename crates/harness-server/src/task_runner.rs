@@ -40,6 +40,9 @@ pub struct RoundResult {
     pub turn: u32,
     pub action: String,
     pub result: String,
+    /// Raw output from the reviewer agent, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -663,6 +666,7 @@ mod tests {
                         turn: round,
                         action: "review".into(),
                         result: "waiting".into(),
+                        detail: None,
                     });
                     state
                         .rounds
