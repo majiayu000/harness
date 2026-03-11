@@ -58,7 +58,7 @@ pub enum HarnessError {
     Sandbox(#[from] SandboxError),
 
     #[error(transparent)]
-    TaskDb(#[from] TaskDbDecodeError),
+    TaskDbDecode(#[from] TaskDbDecodeError),
 
     #[error("{0}")]
     Other(String),
