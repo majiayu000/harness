@@ -112,7 +112,9 @@ struct ThreadRow {
 impl ThreadRow {
     fn into_thread(self) -> anyhow::Result<Thread> {
         let id = ThreadId::from_str(&self.id);
-        let status = self.status.parse::<ThreadStatus>()
+        let status = self
+            .status
+            .parse::<ThreadStatus>()
             .with_context(|| format!("invalid status for thread `{}`", id.as_str()))?;
         Ok(Thread {
             id,
