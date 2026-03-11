@@ -14,8 +14,7 @@ pub async fn run(
         serve_config.server.project_root = project_root;
     }
     let thread_manager = harness_server::thread_manager::ThreadManager::new();
-    let mut agent_registry =
-        harness_agents::AgentRegistry::new(&serve_config.agents.default_agent);
+    let mut agent_registry = harness_agents::AgentRegistry::new(&serve_config.agents.default_agent);
     agent_registry.register(
         "claude",
         Arc::new(harness_agents::claude::ClaudeCodeAgent::new(

@@ -1,402 +1,27 @@
+mod helpers;
+mod pr_detection;
+
 use crate::task_runner::{
-    mutate_and_persist, mutate_and_persist_with, update_status, CreateTaskRequest, RoundResult,
-    TaskId, TaskStatus, TaskStore,
+    mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
 use harness_core::{
-    config::load_project_config, interceptor::TurnInterceptor, prompts, AgentRequest,
-    AgentResponse, CodeAgent, ContextItem, Decision, Event, Item, SessionId, StreamItem, ThreadId,
-    TurnId, TurnStatus,
+    config::load_project_config, prompts, AgentRequest, AgentResponse, CodeAgent, ContextItem,
+    Event, SessionId, ThreadId, TurnId, TurnStatus,
 };
 use harness_protocol::{Notification, RpcNotification};
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, Duration};
 
-#[derive(Debug, Deserialize)]
-struct GhPrListItem {
-    number: u64,
-    #[serde(rename = "headRefName")]
-    head_ref_name: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HarnessMentionCommand {
-    Mention,
-    Review,
-    FixCi,
-}
-
-/// Parse the first `@harness` mention found while scanning line-by-line.
-/// For each line, only the first `@harness` occurrence is considered.
-pub(crate) fn parse_harness_mention_command(body: &str) -> Option<HarnessMentionCommand> {
-    for line in body.lines() {
-        let lowercase = line.trim().to_ascii_lowercase();
-        if let Some(idx) = lowercase.find("@harness") {
-            let mut command = lowercase[idx + "@harness".len()..].trim_start();
-            command = command.trim_start_matches(|ch: char| {
-                ch.is_whitespace() || ch == ':' || ch == ',' || ch == '-' || ch == '.'
-            });
-
-            if command.starts_with("fix ci")
-                || command.starts_with("fix-ci")
-                || command.starts_with("fix_ci")
-            {
-                return Some(HarnessMentionCommand::FixCi);
-            }
-            if command.starts_with("review") {
-                return Some(HarnessMentionCommand::Review);
-            }
-            return Some(HarnessMentionCommand::Mention);
-        }
-    }
-
-    None
-}
-
-pub(crate) fn build_fix_ci_prompt(
-    repository: &str,
-    pr_number: u64,
-    comment_body: &str,
-    comment_url: Option<&str>,
-    pr_url: Option<&str>,
-) -> String {
-    let wrapped_comment = prompts::wrap_external_data(comment_body);
-    let safe_comment_url = comment_url.map(prompts::wrap_external_data);
-    let comment_url_line = safe_comment_url
-        .as_deref()
-        .map(|url| format!("- Trigger comment: {url}\n"))
-        .unwrap_or_default();
-    let safe_pr_url = pr_url.map(prompts::wrap_external_data);
-    let pr_url_line = safe_pr_url
-        .as_deref()
-        .map(|url| format!("- PR URL: {url}\n"))
-        .unwrap_or_default();
-    let canonical_pr_url = format!("https://github.com/{repository}/pull/{pr_number}");
-
-    format!(
-        "CI failure repair requested for PR #{pr_number} in `{repository}`.\n\
-         {comment_url_line}\
-         {pr_url_line}\
-         Command payload:\n\
-         {wrapped_comment}\n\n\
-         Required workflow:\n\
-         1. Inspect failing checks for PR #{pr_number} (`gh pr checks {pr_number}`)\n\
-         2. Investigate CI failure details from logs and failing tests\n\
-         3. Implement a minimal fix that makes CI green\n\
-         4. Run the repository's standard validation commands for the affected changes (including all failing/required CI checks)\n\
-         5. Commit and push to the existing PR branch\n\n\
-         On the last line, print PR_URL={canonical_pr_url}"
-    )
-}
-
-pub(crate) fn build_pr_rework_prompt(
-    repository: &str,
-    pr_number: u64,
-    review_state: &str,
-    review_body: &str,
-    review_url: Option<&str>,
-    pr_url: Option<&str>,
-) -> String {
-    let wrapped_body = prompts::wrap_external_data(review_body);
-    let safe_review_url = review_url.map(prompts::wrap_external_data);
-    let review_url_line = safe_review_url
-        .as_deref()
-        .map(|url| format!("- Review URL: {url}\n"))
-        .unwrap_or_default();
-    let safe_pr_url = pr_url.map(prompts::wrap_external_data);
-    let pr_url_line = safe_pr_url
-        .as_deref()
-        .map(|url| format!("- PR URL: {url}\n"))
-        .unwrap_or_default();
-    let canonical_pr_url = format!("https://github.com/{repository}/pull/{pr_number}");
-
-    format!(
-        "PR review feedback received on PR #{pr_number} in `{repository}`.\n\
-         Review state: {review_state}\n\
-         {review_url_line}\
-         {pr_url_line}\
-         Review feedback:\n\
-         {wrapped_body}\n\n\
-         Required workflow:\n\
-         1. Read the review feedback above carefully.\n\
-         2. Address all requested changes.\n\
-         3. Run the repository's standard validation commands.\n\
-         4. Commit and push to the existing PR branch (do not create a new PR).\n\n\
-         On the last line, print PR_URL={canonical_pr_url}"
-    )
-}
-
-pub(crate) fn build_pr_approved_prompt(
-    repository: &str,
-    pr_number: u64,
-    review_url: Option<&str>,
-) -> String {
-    let safe_review_url = review_url.map(prompts::wrap_external_data);
-    let review_url_line = safe_review_url
-        .as_deref()
-        .map(|url| format!("- Review URL: {url}\n"))
-        .unwrap_or_default();
-    let canonical_pr_url = format!("https://github.com/{repository}/pull/{pr_number}");
-
-    format!(
-        "PR #{pr_number} in `{repository}` has been approved by a reviewer.\n\
-         {review_url_line}\n\
-         Action required:\n\
-         Post a comment on the PR indicating it is ready to merge:\n\
-         gh pr comment {pr_number} --repo {repository} --body \"Approved — ready to merge.\"\n\n\
-         Then stop. There is nothing else to implement.\n\n\
-         On the last line, print PR_URL={canonical_pr_url}"
-    )
-}
-
-/// Truncate validation error output to `max_chars` to avoid bloating agent prompts.
-/// Preserves the first portion which typically contains the most actionable info.
-fn truncate_validation_error(error: &str, max_chars: usize) -> String {
-    if error.len() <= max_chars {
-        return error.to_string();
-    }
-    // Find the last valid char boundary at or before max_chars.
-    let mut boundary = max_chars;
-    while boundary > 0 && !error.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    let truncated = &error[..boundary];
-    format!(
-        "{truncated}\n\n... (output truncated, {total} chars total)",
-        total = error.len()
-    )
-}
-
-/// Run all pre_execute interceptors in order. Returns the (possibly modified) request,
-/// or an error if any interceptor returns Block.
-async fn run_pre_execute(
-    interceptors: &[Arc<dyn TurnInterceptor>],
-    mut req: AgentRequest,
-) -> anyhow::Result<AgentRequest> {
-    for interceptor in interceptors {
-        let result = interceptor.pre_execute(&req).await;
-        if let Decision::Block = result.decision {
-            let reason = result
-                .reason
-                .unwrap_or_else(|| interceptor.name().to_string());
-            return Err(anyhow::anyhow!(
-                "Blocked by interceptor '{}': {}",
-                interceptor.name(),
-                reason
-            ));
-        }
-        if let Some(modified) = result.request {
-            req = modified;
-        }
-    }
-    Ok(req)
-}
-
-/// Run all post_execute interceptors in order.
-/// Returns the first validation error found, or None if all pass.
-async fn run_post_execute(
-    interceptors: &[Arc<dyn TurnInterceptor>],
-    req: &AgentRequest,
-    resp: &AgentResponse,
-) -> Option<String> {
-    for interceptor in interceptors {
-        let result = interceptor.post_execute(req, resp).await;
-        if let Some(error) = result.error {
-            return Some(format!("[{}] {}", interceptor.name(), error));
-        }
-    }
-    None
-}
-
-async fn run_on_error(interceptors: &[Arc<dyn TurnInterceptor>], req: &AgentRequest, error: &str) {
-    for interceptor in interceptors {
-        interceptor.on_error(req, error).await;
-    }
-}
-
-/// Query GitHub for an existing open PR linked to the given issue.
-/// Returns `(pr_number, branch_name)` if found.
-async fn find_existing_pr_for_issue(
-    project: &Path,
-    issue: u64,
-) -> anyhow::Result<Option<(u64, String)>> {
-    let output = Command::new("gh")
-        .current_dir(project)
-        .args([
-            "pr",
-            "list",
-            "--search",
-            &format!("#{issue}"),
-            "--state",
-            "open",
-        ])
-        .args(["--json", "number,headRefName", "--limit", "1"])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to run `gh pr list` for issue #{issue}: {e}"))?;
-
-    if !output.status.success() {
-        return Err(anyhow::anyhow!(
-            "`gh pr list` for issue #{issue} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    let items: Vec<GhPrListItem> = serde_json::from_slice(&output.stdout)
-        .map_err(|e| anyhow::anyhow!("invalid JSON from `gh pr list`: {e}"))?;
-
-    Ok(items
-        .into_iter()
-        .next()
-        .map(|item| (item.number, item.head_ref_name)))
-}
-
-fn emit_runtime_notification(
-    notify_tx: &Option<crate::notify::NotifySender>,
-    notification_tx: &tokio::sync::broadcast::Sender<RpcNotification>,
-    notification: Notification,
-) {
-    crate::notify::emit(notify_tx, notification.clone());
-    let _ = notification_tx.send(RpcNotification::new(notification));
-}
-
-async fn persist_runtime_thread(
-    thread_db: &Option<crate::thread_db::ThreadDb>,
-    server: &crate::server::HarnessServer,
-    thread_id: &ThreadId,
-) {
-    if let Some(db) = thread_db {
-        if let Some(thread) = server.thread_manager.get_thread(thread_id) {
-            if let Err(err) = db.update(&thread).await {
-                tracing::warn!("thread_db persist failed during turn execution: {err}");
-            }
-        }
-    }
-}
-
-async fn process_stream_item(
-    server: &crate::server::HarnessServer,
-    thread_db: &Option<crate::thread_db::ThreadDb>,
-    notify_tx: &Option<crate::notify::NotifySender>,
-    notification_tx: &tokio::sync::broadcast::Sender<RpcNotification>,
-    thread_id: &ThreadId,
-    turn_id: &TurnId,
-    stream_item: StreamItem,
-) {
-    match stream_item {
-        StreamItem::ItemStarted { item } => {
-            if let Err(err) = server
-                .thread_manager
-                .add_item(thread_id, turn_id, item.clone())
-            {
-                tracing::warn!("failed to append stream item_started to turn: {err}");
-            } else {
-                persist_runtime_thread(thread_db, server, thread_id).await;
-            }
-            emit_runtime_notification(
-                notify_tx,
-                notification_tx,
-                Notification::ItemStarted {
-                    turn_id: turn_id.clone(),
-                    item,
-                },
-            );
-        }
-        StreamItem::ItemCompleted { item } => {
-            if let Err(err) = server
-                .thread_manager
-                .add_item(thread_id, turn_id, item.clone())
-            {
-                tracing::warn!("failed to append stream item_completed to turn: {err}");
-            } else {
-                persist_runtime_thread(thread_db, server, thread_id).await;
-            }
-            emit_runtime_notification(
-                notify_tx,
-                notification_tx,
-                Notification::ItemCompleted {
-                    turn_id: turn_id.clone(),
-                    item,
-                },
-            );
-        }
-        StreamItem::TokenUsage { usage } => {
-            match server
-                .thread_manager
-                .set_turn_token_usage(thread_id, turn_id, usage.clone())
-            {
-                Ok(true) => persist_runtime_thread(thread_db, server, thread_id).await,
-                Ok(false) => {}
-                Err(err) => {
-                    tracing::warn!("failed to update token usage for turn: {err}");
-                }
-            }
-            emit_runtime_notification(
-                notify_tx,
-                notification_tx,
-                Notification::TokenUsageUpdated {
-                    thread_id: thread_id.clone(),
-                    usage,
-                },
-            );
-        }
-        StreamItem::Error { message } => {
-            if let Err(err) = server.thread_manager.add_item(
-                thread_id,
-                turn_id,
-                Item::Error { code: -1, message },
-            ) {
-                tracing::warn!("failed to append stream error item to turn: {err}");
-            } else {
-                persist_runtime_thread(thread_db, server, thread_id).await;
-            }
-        }
-        StreamItem::MessageDelta { text } => {
-            emit_runtime_notification(
-                notify_tx,
-                notification_tx,
-                Notification::MessageDelta {
-                    turn_id: turn_id.clone(),
-                    text,
-                },
-            );
-        }
-        StreamItem::Done => {}
-    }
-}
-
-async fn mark_turn_failed(
-    server: &crate::server::HarnessServer,
-    thread_db: &Option<crate::thread_db::ThreadDb>,
-    notify_tx: &Option<crate::notify::NotifySender>,
-    notification_tx: &tokio::sync::broadcast::Sender<RpcNotification>,
-    thread_id: &ThreadId,
-    turn_id: &TurnId,
-    error_message: String,
-) {
-    match server
-        .thread_manager
-        .mark_turn_failed_with_error(thread_id, turn_id, error_message)
-    {
-        Ok(Some(usage)) => {
-            persist_runtime_thread(thread_db, server, thread_id).await;
-            emit_runtime_notification(
-                notify_tx,
-                notification_tx,
-                Notification::TurnCompleted {
-                    turn_id: turn_id.clone(),
-                    status: TurnStatus::Failed,
-                    token_usage: usage,
-                },
-            );
-        }
-        Ok(None) => {}
-        Err(err) => tracing::warn!("failed to move turn to failed state: {err}"),
-    }
-}
+pub(crate) use helpers::{
+    emit_runtime_notification, mark_turn_failed, persist_runtime_thread, process_stream_item,
+    run_on_error, run_post_execute, run_pre_execute, truncate_validation_error, update_status,
+};
+pub(crate) use pr_detection::{
+    build_fix_ci_prompt, build_pr_approved_prompt, build_pr_rework_prompt,
+    find_existing_pr_for_issue, parse_harness_mention_command, HarnessMentionCommand,
+};
 
 pub(crate) async fn run_turn_lifecycle(
     server: Arc<crate::server::HarnessServer>,
@@ -493,6 +118,19 @@ pub(crate) async fn run_turn_lifecycle(
             Err(err) => tracing::warn!("failed to complete turn after execution: {err}"),
         },
         Err(err) => {
+            let error_msg = err.to_string();
+            if let Err(e) = server.thread_manager.add_item(
+                &thread_id,
+                &turn_id,
+                harness_core::Item::Error {
+                    code: -1,
+                    message: error_msg.clone(),
+                },
+            ) {
+                tracing::warn!("failed to add error item to turn: {e}");
+            } else {
+                persist_runtime_thread(&thread_db, &server, &thread_id).await;
+            }
             mark_turn_failed(
                 &server,
                 &thread_db,
@@ -500,7 +138,7 @@ pub(crate) async fn run_turn_lifecycle(
                 &notification_tx,
                 &thread_id,
                 &turn_id,
-                err.to_string(),
+                error_msg,
             )
             .await;
         }
@@ -515,7 +153,7 @@ pub(crate) async fn run_task(
     review_config: &harness_core::AgentReviewConfig,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
-    interceptors: Arc<Vec<Arc<dyn TurnInterceptor>>>,
+    interceptors: Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
     req: &CreateTaskRequest,
     project: PathBuf,
 ) -> anyhow::Result<()> {
@@ -598,25 +236,25 @@ pub(crate) async fn run_task(
                             error = %err,
                             "post-execution validation failed; retrying with error context"
                         );
-                        // Truncate error to avoid bloating the prompt with huge
-                        // compiler output. Keep only the summary of which commands
-                        // failed and the first portion of each error.
-                        let truncated = truncate_validation_error(&err, 1500);
-                        impl_req = AgentRequest {
-                            prompt: format!(
-                                "{}\n\n\
-                                 Post-execution validation failed (attempt {validation_attempt}/{max_validation_retries}).\n\
-                                 Fix these errors, then commit and push:\n\n\
-                                 {truncated}",
-                                first_req.prompt
-                            ),
-                            ..first_req.clone()
-                        };
+                        let truncated = truncate_validation_error(&err, 2000);
+                        impl_req.prompt = format!(
+                            "{}\n\nPost-execution validation failed (attempt {}/{}):\n{}",
+                            first_req.prompt, validation_attempt, max_validation_retries, truncated
+                        );
                         continue;
+                    } else {
+                        tracing::error!(
+                            max = max_validation_retries,
+                            error = %err,
+                            "post-execution validation failed after max retries; aborting task"
+                        );
+                        run_on_error(&interceptors, &impl_req, &err).await;
+                        return Err(anyhow::anyhow!(
+                            "Post-execution validation failed after {} attempts: {}",
+                            max_validation_retries,
+                            err
+                        ));
                     }
-                    return Err(anyhow::anyhow!(
-                        "Validation failed after {validation_attempt} retries: {err}"
-                    ));
                 }
                 break r;
             }
@@ -625,45 +263,65 @@ pub(crate) async fn run_task(
                 return Err(e.into());
             }
             Err(_) => {
-                let msg = format!("Turn 1 timed out after {}s", req.turn_timeout_secs);
+                let msg = format!(
+                    "Implementation turn timed out after {}s",
+                    turn_timeout.as_secs()
+                );
                 run_on_error(&interceptors, &impl_req, &msg).await;
                 return Err(anyhow::anyhow!("{msg}"));
             }
         }
     };
 
-    let pr_url = prompts::parse_pr_url(&resp.output);
-    let pr_number = pr_url
-        .as_ref()
-        .and_then(|u| prompts::extract_pr_number(u))
-        .or(req.pr);
+    let AgentResponse { output, stderr, .. } = resp;
+
+    if !stderr.is_empty() {
+        tracing::warn!(stderr = %stderr, "agent stderr during implementation");
+    }
+
+    let pr_num = prompts::extract_pr_number(&output);
 
     mutate_and_persist(store, task_id, |s| {
-        s.pr_url = pr_url.clone();
+        s.pr_url = pr_num.map(|n| format!("https://github.com/REPO/pull/{n}"));
         s.rounds.push(RoundResult {
             turn: 1,
             action: "implement".into(),
-            result: if pr_url.is_some() || req.pr.is_some() {
+            result: if pr_num.is_some() {
                 "pr_created".into()
             } else {
-                "implemented".into()
+                "no_pr".into()
             },
             detail: None,
         });
     })
     .await;
 
-    let pr_num = match pr_number {
-        Some(n) => n,
-        None => {
-            update_status(store, task_id, TaskStatus::Done, 1).await;
-            return Ok(());
-        }
+    // Log implementation event
+    let mut ev = Event::new(
+        SessionId::new(),
+        "task_implement",
+        "task_runner",
+        harness_core::Decision::Complete,
+    );
+    ev.detail = pr_num.map(|n| format!("pr={n}"));
+    if let Err(e) = events.log(&ev) {
+        tracing::warn!("failed to log task_implement event: {e}");
+    }
+
+    let Some(pr_num) = pr_num else {
+        tracing::warn!("no PR number found in agent output; skipping review");
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Done;
+            s.turn = 2;
+        })
+        .await;
+        return Ok(());
     };
 
-    // Agent review phase: independent reviewer evaluates PR diff before GitHub review
+    // Agent review loop (if enabled and reviewer available)
     if review_config.enabled {
         if let Some(reviewer) = reviewer {
+            tracing::info!("starting agent review for PR #{pr_num}");
             run_agent_review(
                 store,
                 task_id,
@@ -679,84 +337,62 @@ pub(crate) async fn run_task(
             )
             .await?;
         } else {
-            tracing::info!("agent review enabled but no reviewer available, skipping");
+            tracing::warn!("agent review enabled but no reviewer agent configured; skipping");
         }
     }
 
-    // Review loop: Turn 2..N
-    let last_review_round = req.max_rounds.saturating_add(1);
-    let mut prev_fixed = false;
-    let mut round = 2u32;
-    let max_waiting_retries = 3u32;
+    // Wait for external review bot
+    update_status(store, task_id, TaskStatus::Waiting, 1).await;
 
-    while round <= last_review_round {
-        update_status(store, task_id, TaskStatus::Waiting, round).await;
-        sleep(Duration::from_secs(req.wait_secs)).await;
+    let wait_secs = req.wait_secs;
+    tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
+    sleep(Duration::from_secs(wait_secs)).await;
 
+    // Review loop
+    for round in 1..=req.max_rounds {
         update_status(store, task_id, TaskStatus::Reviewing, round).await;
 
-        let review_req = AgentRequest {
-            prompt: prompts::review_prompt(
-                req.issue,
-                pr_num,
-                round,
-                prev_fixed,
-                &review_config.review_bot_command,
-            ),
+        let check_req = AgentRequest {
+            prompt: prompts::check_existing_pr(pr_num, &review_config.review_bot_command),
             project_root: project.clone(),
             context: context_items.clone(),
             ..Default::default()
         };
+        let check_req = run_pre_execute(&interceptors, check_req).await?;
 
-        let review_req = run_pre_execute(&interceptors, review_req).await?;
-
-        let resp = tokio::time::timeout(turn_timeout, agent.execute(review_req.clone())).await;
+        let resp = tokio::time::timeout(turn_timeout, agent.execute(check_req.clone())).await;
         let resp = match resp {
             Ok(Ok(r)) => {
-                if let Some(val_err) = run_post_execute(&interceptors, &review_req, &r).await {
+                if let Some(val_err) = run_post_execute(&interceptors, &check_req, &r).await {
                     tracing::warn!(
                         round,
                         error = %val_err,
-                        "post-execute validation failed in review round; continuing"
+                        "post-execute validation failed in review check; continuing"
                     );
                 }
                 r
             }
             Ok(Err(e)) => {
-                run_on_error(&interceptors, &review_req, &e.to_string()).await;
+                run_on_error(&interceptors, &check_req, &e.to_string()).await;
                 return Err(e.into());
             }
             Err(_) => {
-                let msg = format!("Turn {round} timed out after {}s", req.turn_timeout_secs);
-                run_on_error(&interceptors, &review_req, &msg).await;
+                let msg = format!(
+                    "Review check round {round} timed out after {}s",
+                    turn_timeout.as_secs()
+                );
+                run_on_error(&interceptors, &check_req, &msg).await;
                 return Err(anyhow::anyhow!("{msg}"));
             }
         };
 
-        if prompts::is_waiting(&resp.output) {
-            let waiting_count = mutate_and_persist_with(store, task_id, |s| {
-                s.rounds.push(RoundResult {
-                    turn: round,
-                    action: "review".into(),
-                    result: "waiting".into(),
-                    detail: None,
-                });
-                s.rounds
-                    .iter()
-                    .filter(|r| r.result == "waiting" && r.turn == round)
-                    .count() as u32
-            })
-            .await
-            .unwrap_or(0);
+        let AgentResponse { output, stderr, .. } = resp;
 
-            if waiting_count >= max_waiting_retries {
-                prev_fixed = true;
-                round += 1;
-            }
-            continue;
+        if !stderr.is_empty() {
+            tracing::warn!(round, stderr = %stderr, "agent stderr during review check");
         }
 
-        let lgtm = prompts::is_lgtm(&resp.output);
+        let lgtm = prompts::is_lgtm(&output);
 
         mutate_and_persist(store, task_id, |s| {
             s.rounds.push(RoundResult {
@@ -774,9 +410,9 @@ pub(crate) async fn run_task(
             "pr_review",
             "task_runner",
             if lgtm {
-                Decision::Complete
+                harness_core::Decision::Complete
             } else {
-                Decision::Warn
+                harness_core::Decision::Warn
             },
         );
         ev.detail = Some(format!("pr={pr_num}"));
@@ -790,12 +426,19 @@ pub(crate) async fn run_task(
         }
 
         if lgtm {
-            update_status(store, task_id, TaskStatus::Done, round).await;
+            tracing::info!("PR #{pr_num} approved at round {round}");
+            mutate_and_persist(store, task_id, |s| {
+                s.status = TaskStatus::Done;
+                s.turn = round.saturating_add(1);
+            })
+            .await;
             return Ok(());
         }
 
-        prev_fixed = true;
-        round += 1;
+        tracing::info!("PR #{pr_num} not yet approved at round {round}; waiting");
+        if round < req.max_rounds {
+            sleep(Duration::from_secs(wait_secs)).await;
+        }
     }
 
     mutate_and_persist(store, task_id, |s| {
@@ -819,7 +462,7 @@ async fn run_agent_review(
     review_config: &harness_core::AgentReviewConfig,
     context_items: &[ContextItem],
     project: &Path,
-    interceptors: &[Arc<dyn TurnInterceptor>],
+    interceptors: &[Arc<dyn harness_core::interceptor::TurnInterceptor>],
     turn_timeout: Duration,
     pr_num: u64,
     events: &harness_observe::EventStore,
@@ -888,8 +531,8 @@ async fn run_agent_review(
         .await;
 
         // Log agent_review event
-        let mut ev = harness_core::Event::new(
-            harness_core::SessionId::new(),
+        let mut ev = Event::new(
+            SessionId::new(),
             "agent_review",
             "task_runner",
             if approved {
@@ -971,22 +614,6 @@ async fn run_agent_review(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn gh_pr_list_item_parses_from_json() {
-        let json = r#"[{"number":50,"headRefName":"fix/issue-29"}]"#;
-        let items: Vec<GhPrListItem> = serde_json::from_str(json).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].number, 50);
-        assert_eq!(items[0].head_ref_name, "fix/issue-29");
-    }
-
-    #[test]
-    fn gh_pr_list_empty_array_parses() {
-        let json = r#"[]"#;
-        let items: Vec<GhPrListItem> = serde_json::from_str(json).unwrap();
-        assert!(items.is_empty());
-    }
 
     #[test]
     fn parse_harness_review_command() {

@@ -360,9 +360,7 @@ pub async fn run(
             config.agents.codex.clone(),
             runtime_sandbox_mode,
         )),
-        other => anyhow::bail!(
-            "unknown exec agent `{other}`; supported values are: claude, codex"
-        ),
+        other => anyhow::bail!("unknown exec agent `{other}`; supported values are: claude, codex"),
     };
 
     let resp = selected_agent.execute(req).await?;
