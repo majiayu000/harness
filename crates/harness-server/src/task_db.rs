@@ -1,5 +1,4 @@
 use crate::task_runner::{TaskId, TaskState, TaskStatus};
-use harness_core::DbSerializable;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 
@@ -57,7 +56,7 @@ impl TaskDb {
 
     pub async fn insert(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
-        let status = state.status.to_db_str();
+        let status = state.status.as_ref();
         sqlx::query(
             "INSERT INTO tasks (id, status, turn, pr_url, rounds, error)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -75,7 +74,7 @@ impl TaskDb {
 
     pub async fn update(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
-        let status = state.status.to_db_str();
+        let status = state.status.as_ref();
         sqlx::query(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
                     updated_at = datetime('now')
@@ -158,7 +157,7 @@ impl TaskRow {
 
         Ok(TaskState {
             id: TaskId(id),
-            status: TaskStatus::from_db_str(&status)?,
+            status: status.parse::<TaskStatus>()?,
             turn: turn as u32,
             pr_url,
             rounds: decoded_rounds,

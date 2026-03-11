@@ -35,8 +35,8 @@ pub enum TaskStatus {
     Failed,
 }
 
-impl harness_core::DbSerializable for TaskStatus {
-    fn to_db_str(&self) -> &'static str {
+impl AsRef<str> for TaskStatus {
+    fn as_ref(&self) -> &str {
         match self {
             TaskStatus::Pending => "pending",
             TaskStatus::Implementing => "implementing",
@@ -47,8 +47,12 @@ impl harness_core::DbSerializable for TaskStatus {
             TaskStatus::Failed => "failed",
         }
     }
+}
 
-    fn from_db_str(s: &str) -> anyhow::Result<Self> {
+impl std::str::FromStr for TaskStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "pending" => Ok(TaskStatus::Pending),
             "implementing" => Ok(TaskStatus::Implementing),

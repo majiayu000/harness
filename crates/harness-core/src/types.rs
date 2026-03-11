@@ -73,16 +73,20 @@ pub enum ThreadStatus {
     Archived,
 }
 
-impl crate::DbSerializable for ThreadStatus {
-    fn to_db_str(&self) -> &'static str {
+impl AsRef<str> for ThreadStatus {
+    fn as_ref(&self) -> &str {
         match self {
             ThreadStatus::Idle => "idle",
             ThreadStatus::Active => "active",
             ThreadStatus::Archived => "archived",
         }
     }
+}
 
-    fn from_db_str(s: &str) -> anyhow::Result<Self> {
+impl std::str::FromStr for ThreadStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "idle" => Ok(ThreadStatus::Idle),
             "active" => Ok(ThreadStatus::Active),

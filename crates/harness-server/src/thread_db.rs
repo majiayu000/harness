@@ -1,5 +1,5 @@
 use anyhow::Context;
-use harness_core::{DbSerializable, Thread, ThreadId, ThreadStatus};
+use harness_core::{Thread, ThreadId, ThreadStatus};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 
@@ -46,7 +46,7 @@ impl ThreadDb {
         )
         .bind(thread.id.as_str())
         .bind(thread.project_root.to_string_lossy().as_ref())
-        .bind(thread.status.to_db_str())
+        .bind(thread.status.as_ref())
         .bind(&turns_json)
         .bind(&metadata_json)
         .bind(thread.created_at.to_rfc3339())
@@ -64,7 +64,7 @@ impl ThreadDb {
              WHERE id = ?",
         )
         .bind(thread.project_root.to_string_lossy().as_ref())
-        .bind(thread.status.to_db_str())
+        .bind(thread.status.as_ref())
         .bind(&turns_json)
         .bind(&metadata_json)
         .bind(thread.updated_at.to_rfc3339())
@@ -112,7 +112,7 @@ struct ThreadRow {
 impl ThreadRow {
     fn into_thread(self) -> anyhow::Result<Thread> {
         let id = ThreadId::from_str(&self.id);
-        let status = ThreadStatus::from_db_str(&self.status)
+        let status = self.status.parse::<ThreadStatus>()
             .with_context(|| format!("invalid status for thread `{}`", id.as_str()))?;
         Ok(Thread {
             id,
