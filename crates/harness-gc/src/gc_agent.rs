@@ -225,7 +225,7 @@ mod tests {
 
     fn make_test_gc_agent(dir: &std::path::Path) -> GcAgent {
         let signal_detector = SignalDetector::new(
-            crate::signal_detector::SignalThresholds::default(),
+            harness_core::SignalThresholdsConfig::default(),
             ProjectId::new(),
         );
         let draft_store = DraftStore::new(dir).unwrap();

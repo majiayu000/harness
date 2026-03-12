@@ -1,5 +1,4 @@
 use harness_core::{Draft, DraftId, DraftStatus, EventFilters, GcConfig, Project, ProjectId};
-use harness_gc::signal_detector::SignalThresholds as GcThresholds;
 use harness_gc::{DraftStore, GcAgent, SignalDetector};
 use harness_observe::EventStore;
 
@@ -99,7 +98,10 @@ fn make_agent_for_draft_ops(data_dir: &std::path::Path) -> anyhow::Result<GcAgen
     let draft_store = DraftStore::new(data_dir)?;
     Ok(GcAgent::new(
         GcConfig::default(),
-        SignalDetector::new(GcThresholds::default(), ProjectId::new()),
+        SignalDetector::new(
+            harness_core::SignalThresholdsConfig::default(),
+            ProjectId::new(),
+        ),
         draft_store,
     ))
 }
@@ -108,16 +110,10 @@ fn count_by_status(drafts: &[Draft], status: DraftStatus) -> usize {
     drafts.iter().filter(|d| d.status == status).count()
 }
 
-fn map_thresholds(t: &harness_core::SignalThresholdsConfig) -> GcThresholds {
-    GcThresholds {
-        repeated_warn_min: t.repeated_warn_min,
-        chronic_block_min: t.chronic_block_min,
-        hot_file_edits_min: t.hot_file_edits_min,
-        slow_op_threshold_ms: t.slow_op_threshold_ms,
-        slow_op_count_min: t.slow_op_count_min,
-        escalation_ratio: t.escalation_ratio,
-        violation_min: t.violation_min,
-    }
+fn map_thresholds(
+    t: &harness_core::SignalThresholdsConfig,
+) -> harness_core::SignalThresholdsConfig {
+    t.clone()
 }
 
 fn map_gc_config(c: &harness_core::GcConfig) -> GcConfig {
