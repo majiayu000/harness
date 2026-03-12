@@ -1,10 +1,9 @@
-use harness_core::SandboxMode;
+use harness_core::{SandboxError, SandboxMode};
 use std::ffi::OsString;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use thiserror::Error;
 
 // Intentional scope: keep VCS/agent metadata immutable inside workspace-write mode.
 // `.env` is user-managed project content and is not forced read-only here.
@@ -36,24 +35,6 @@ pub struct WrappedCommand {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub engine: SandboxEngine,
-}
-
-#[derive(Debug, Error)]
-pub enum SandboxError {
-    #[error("sandbox mode `{mode}` is unsupported on `{platform}`")]
-    UnsupportedPlatform {
-        mode: SandboxMode,
-        platform: &'static str,
-    },
-    #[error("sandbox tool not found: {0}")]
-    MissingTool(&'static str),
-    #[error("invalid sandbox path `{path}`: {reason}")]
-    InvalidPath { path: PathBuf, reason: &'static str },
-    #[error("sandbox helper `{helper}` does not support mode `{mode}`")]
-    InvalidHelperMode {
-        helper: &'static str,
-        mode: SandboxMode,
-    },
 }
 
 pub fn wrap_command(

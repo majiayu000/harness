@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -53,8 +54,42 @@ pub enum HarnessError {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
+    #[error(transparent)]
+    Sandbox(#[from] SandboxError),
+
+    #[error(transparent)]
+    TaskDbDecode(#[from] TaskDbDecodeError),
+
     #[error("{0}")]
     Other(String),
+}
+
+#[derive(Debug, Error)]
+pub enum SandboxError {
+    #[error("sandbox mode `{mode}` is unsupported on `{platform}`")]
+    UnsupportedPlatform {
+        mode: crate::SandboxMode,
+        platform: &'static str,
+    },
+    #[error("sandbox tool not found: {0}")]
+    MissingTool(&'static str),
+    #[error("invalid sandbox path `{path}`: {reason}")]
+    InvalidPath { path: PathBuf, reason: &'static str },
+    #[error("sandbox helper `{helper}` does not support mode `{mode}`")]
+    InvalidHelperMode {
+        helper: &'static str,
+        mode: crate::SandboxMode,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum TaskDbDecodeError {
+    #[error("failed to deserialize rounds for task `{task_id}`")]
+    RoundsDeserialize {
+        task_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 pub type Error = HarnessError;
