@@ -1,6 +1,7 @@
+use crate::db::open_pool;
 use anyhow::Context;
 use harness_core::{Thread, ThreadId, ThreadStatus};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::SqlitePool;
 use std::path::Path;
 
 #[derive(Clone)]
@@ -10,11 +11,7 @@ pub struct ThreadDb {
 
 impl ThreadDb {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
-        let url = format!("sqlite:{}?mode=rwc", path.display());
-        let pool = SqlitePoolOptions::new()
-            .max_connections(4)
-            .connect(&url)
-            .await?;
+        let pool = open_pool(path).await?;
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
