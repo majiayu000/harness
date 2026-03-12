@@ -12,7 +12,7 @@ pub use agents::{
 pub use intake::{FeishuIntakeConfig, GitHubIntakeConfig, IntakeConfig};
 pub use misc::{
     ConcurrencyConfig, GcConfig, ObserveConfig, OtelConfig, OtelExporter, RulesConfig,
-    SignalThresholds, ValidationConfig, WorkspaceConfig,
+    SignalThresholdsConfig, ValidationConfig, WorkspaceConfig,
 };
 pub use project::{load_project_config, GitConfig, ProjectConfig};
 pub use server::{ServerConfig, Transport};
@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn signal_thresholds_defaults_are_consistent() {
-        let thresholds = SignalThresholds::default();
+        let thresholds = SignalThresholdsConfig::default();
         assert_eq!(thresholds.repeated_warn_min, 10);
         assert_eq!(thresholds.chronic_block_min, 5);
         assert_eq!(thresholds.hot_file_edits_min, 20);

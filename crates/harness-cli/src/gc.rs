@@ -108,7 +108,7 @@ fn count_by_status(drafts: &[Draft], status: DraftStatus) -> usize {
     drafts.iter().filter(|d| d.status == status).count()
 }
 
-fn map_thresholds(t: &harness_core::SignalThresholds) -> GcThresholds {
+fn map_thresholds(t: &harness_core::SignalThresholdsConfig) -> GcThresholds {
     GcThresholds {
         repeated_warn_min: t.repeated_warn_min,
         chronic_block_min: t.chronic_block_min,

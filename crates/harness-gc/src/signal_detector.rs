@@ -27,8 +27,8 @@ impl Default for SignalThresholds {
     }
 }
 
-impl From<harness_core::config::SignalThresholds> for SignalThresholds {
-    fn from(t: harness_core::config::SignalThresholds) -> Self {
+impl From<harness_core::config::SignalThresholdsConfig> for SignalThresholds {
+    fn from(t: harness_core::config::SignalThresholdsConfig) -> Self {
         Self {
             repeated_warn_min: t.repeated_warn_min,
             chronic_block_min: t.chronic_block_min,

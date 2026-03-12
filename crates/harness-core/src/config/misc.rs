@@ -131,7 +131,7 @@ pub struct GcConfig {
     pub adopt_max_rounds: u32,
     #[serde(default = "default_gc_adopt_turn_timeout_secs")]
     pub adopt_turn_timeout_secs: u64,
-    pub signal_thresholds: SignalThresholds,
+    pub signal_thresholds: SignalThresholdsConfig,
 }
 
 impl Default for GcConfig {
@@ -143,7 +143,7 @@ impl Default for GcConfig {
             adopt_wait_secs: default_gc_adopt_wait_secs(),
             adopt_max_rounds: default_gc_adopt_max_rounds(),
             adopt_turn_timeout_secs: default_gc_adopt_turn_timeout_secs(),
-            signal_thresholds: SignalThresholds::default(),
+            signal_thresholds: SignalThresholdsConfig::default(),
         }
     }
 }
@@ -161,7 +161,7 @@ fn default_gc_adopt_turn_timeout_secs() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignalThresholds {
+pub struct SignalThresholdsConfig {
     pub repeated_warn_min: usize,
     pub chronic_block_min: usize,
     pub hot_file_edits_min: usize,
@@ -171,7 +171,7 @@ pub struct SignalThresholds {
     pub violation_min: usize,
 }
 
-impl Default for SignalThresholds {
+impl Default for SignalThresholdsConfig {
     fn default() -> Self {
         Self {
             repeated_warn_min: 10,
