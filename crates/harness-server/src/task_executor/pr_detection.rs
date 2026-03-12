@@ -44,6 +44,54 @@ pub(crate) fn parse_harness_mention_command(body: &str) -> Option<HarnessMention
     None
 }
 
+pub(crate) struct PromptBuilder {
+    title: String,
+    sections: Vec<(String, String)>,
+}
+
+impl PromptBuilder {
+    pub(crate) fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            sections: Vec::new(),
+        }
+    }
+
+    /// Add a named section with `content` wrapped in external_data tags.
+    pub(crate) fn add_section(mut self, name: &str, content: &str) -> Self {
+        self.sections
+            .push((name.to_string(), prompts::wrap_external_data(content)));
+        self
+    }
+
+    /// Add an optional URL metadata line. No-op if `url` is `None`.
+    pub(crate) fn add_optional_url(mut self, label: &str, url: Option<&str>) -> Self {
+        if let Some(u) = url {
+            let safe = prompts::wrap_external_data(u);
+            self.sections
+                .push((String::new(), format!("- {label}: {safe}")));
+        }
+        self
+    }
+
+    /// Assemble the prompt: title, then each section, with a trailing newline.
+    pub(crate) fn build(self) -> String {
+        let mut out = self.title;
+        for (name, content) in &self.sections {
+            out.push('\n');
+            if name.is_empty() {
+                out.push_str(content);
+            } else {
+                out.push_str(name);
+                out.push_str(":\n");
+                out.push_str(content);
+            }
+        }
+        out.push('\n');
+        out
+    }
+}
+
 pub(crate) fn build_fix_ci_prompt(
     repository: &str,
     pr_number: u64,
@@ -51,25 +99,17 @@ pub(crate) fn build_fix_ci_prompt(
     comment_url: Option<&str>,
     pr_url: Option<&str>,
 ) -> String {
-    let wrapped_comment = prompts::wrap_external_data(comment_body);
-    let safe_comment_url = comment_url.map(prompts::wrap_external_data);
-    let comment_url_line = safe_comment_url
-        .as_deref()
-        .map(|url| format!("- Trigger comment: {url}\n"))
-        .unwrap_or_default();
-    let safe_pr_url = pr_url.map(prompts::wrap_external_data);
-    let pr_url_line = safe_pr_url
-        .as_deref()
-        .map(|url| format!("- PR URL: {url}\n"))
-        .unwrap_or_default();
     let canonical_pr_url = format!("https://github.com/{repository}/pull/{pr_number}");
+    let preamble = PromptBuilder::new(format!(
+        "CI failure repair requested for PR #{pr_number} in `{repository}`."
+    ))
+    .add_optional_url("Trigger comment", comment_url)
+    .add_optional_url("PR URL", pr_url)
+    .add_section("Command payload", comment_body)
+    .build();
 
     format!(
-        "CI failure repair requested for PR #{pr_number} in `{repository}`.\n\
-         {comment_url_line}\
-         {pr_url_line}\
-         Command payload:\n\
-         {wrapped_comment}\n\n\
+        "{preamble}\n\
          Required workflow:\n\
          1. Inspect failing checks for PR #{pr_number} (`gh pr checks {pr_number}`)\n\
          2. Investigate CI failure details from logs and failing tests\n\
@@ -88,26 +128,17 @@ pub(crate) fn build_pr_rework_prompt(
     review_url: Option<&str>,
     pr_url: Option<&str>,
 ) -> String {
-    let wrapped_body = prompts::wrap_external_data(review_body);
-    let safe_review_url = review_url.map(prompts::wrap_external_data);
-    let review_url_line = safe_review_url
-        .as_deref()
-        .map(|url| format!("- Review URL: {url}\n"))
-        .unwrap_or_default();
-    let safe_pr_url = pr_url.map(prompts::wrap_external_data);
-    let pr_url_line = safe_pr_url
-        .as_deref()
-        .map(|url| format!("- PR URL: {url}\n"))
-        .unwrap_or_default();
     let canonical_pr_url = format!("https://github.com/{repository}/pull/{pr_number}");
+    let preamble = PromptBuilder::new(format!(
+        "PR review feedback received on PR #{pr_number} in `{repository}`.\nReview state: {review_state}"
+    ))
+    .add_optional_url("Review URL", review_url)
+    .add_optional_url("PR URL", pr_url)
+    .add_section("Review feedback", review_body)
+    .build();
 
     format!(
-        "PR review feedback received on PR #{pr_number} in `{repository}`.\n\
-         Review state: {review_state}\n\
-         {review_url_line}\
-         {pr_url_line}\
-         Review feedback:\n\
-         {wrapped_body}\n\n\
+        "{preamble}\n\
          Required workflow:\n\
          1. Read the review feedback above carefully.\n\
          2. Address all requested changes.\n\
@@ -122,16 +153,15 @@ pub(crate) fn build_pr_approved_prompt(
     pr_number: u64,
     review_url: Option<&str>,
 ) -> String {
-    let safe_review_url = review_url.map(prompts::wrap_external_data);
-    let review_url_line = safe_review_url
-        .as_deref()
-        .map(|url| format!("- Review URL: {url}\n"))
-        .unwrap_or_default();
     let canonical_pr_url = format!("https://github.com/{repository}/pull/{pr_number}");
+    let preamble = PromptBuilder::new(format!(
+        "PR #{pr_number} in `{repository}` has been approved by a reviewer."
+    ))
+    .add_optional_url("Review URL", review_url)
+    .build();
 
     format!(
-        "PR #{pr_number} in `{repository}` has been approved by a reviewer.\n\
-         {review_url_line}\n\
+        "{preamble}\n\
          Action required:\n\
          Post a comment on the PR indicating it is ready to merge:\n\
          gh pr comment {pr_number} --repo {repository} --body \"Approved — ready to merge.\"\n\n\

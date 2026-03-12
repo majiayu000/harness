@@ -22,6 +22,9 @@ pub(crate) use pr_detection::{
     build_fix_ci_prompt, build_pr_approved_prompt, build_pr_rework_prompt,
     find_existing_pr_for_issue, parse_harness_mention_command, HarnessMentionCommand,
 };
+// PromptBuilder is used internally by pr_detection and re-exported for tests.
+#[cfg(test)]
+pub(crate) use pr_detection::PromptBuilder;
 
 pub(crate) async fn run_turn_lifecycle(
     server: Arc<crate::server::HarnessServer>,
@@ -643,6 +646,54 @@ mod tests {
     fn parse_harness_first_mention_per_line_is_used() {
         let cmd = parse_harness_mention_command("@harness review then @harness fix ci");
         assert_eq!(cmd, Some(HarnessMentionCommand::Review));
+    }
+
+    #[test]
+    fn prompt_builder_no_sections_adds_trailing_newline() {
+        let result = PromptBuilder::new("Title line.").build();
+        assert_eq!(result, "Title line.\n");
+    }
+
+    #[test]
+    fn prompt_builder_optional_url_absent_is_skipped() {
+        let result = PromptBuilder::new("Title.")
+            .add_optional_url("Link", None)
+            .build();
+        assert_eq!(result, "Title.\n");
+    }
+
+    #[test]
+    fn prompt_builder_optional_url_present_appears_in_output() {
+        let result = PromptBuilder::new("Title.")
+            .add_optional_url("Link", Some("https://example.com"))
+            .build();
+        assert!(result.contains("- Link: "));
+        assert!(result.contains("https://example.com"));
+        assert!(result.ends_with('\n'));
+    }
+
+    #[test]
+    fn prompt_builder_add_section_wraps_external_data() {
+        let result = PromptBuilder::new("Title.")
+            .add_section("Payload", "content here")
+            .build();
+        assert!(result.contains("Payload:\n"));
+        assert!(result.contains("<external_data>"));
+        assert!(result.contains("content here"));
+    }
+
+    #[test]
+    fn prompt_builder_multiple_urls_all_appear() {
+        let result = PromptBuilder::new("Title.")
+            .add_optional_url("First", Some("url1"))
+            .add_optional_url("Second", None)
+            .add_optional_url("Third", Some("url3"))
+            .build();
+        assert!(result.contains("- First: "));
+        assert!(result.contains("url1"));
+        assert!(!result.contains("Second"));
+        assert!(result.contains("- Third: "));
+        assert!(result.contains("url3"));
     }
 
     #[test]
