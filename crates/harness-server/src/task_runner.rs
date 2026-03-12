@@ -1,5 +1,6 @@
 use crate::task_db::TaskDb;
 use dashmap::DashMap;
+pub use harness_core::TaskId;
 use harness_core::{CodeAgent, Decision, Event, SessionId};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -13,15 +14,6 @@ use tokio::sync::{Mutex, RwLock};
 /// to call `IntakeSource::on_task_complete` without creating circular dependencies.
 pub type CompletionCallback =
     Arc<dyn Fn(TaskState) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct TaskId(pub String);
-
-impl TaskId {
-    pub fn new() -> Self {
-        Self(uuid::Uuid::new_v4().to_string())
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
