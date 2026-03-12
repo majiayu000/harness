@@ -51,6 +51,7 @@ define_id!(RuleId);
 define_id!(GuardId);
 define_id!(SessionId);
 define_id!(EventId);
+define_id!(TaskId);
 
 // === Thread ===
 
