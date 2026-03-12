@@ -1,4 +1,4 @@
-use crate::http::AppState;
+use crate::{http::AppState, validate_root};
 use harness_core::{AgentRequest, CodeAgent};
 use harness_protocol::{RpcResponse, INTERNAL_ERROR};
 use serde::{Deserialize, Serialize};
@@ -25,10 +25,7 @@ pub async fn cross_review(
     target: String,
     max_rounds: Option<u32>,
 ) -> RpcResponse {
-    let project_root = match crate::handlers::validate_project_root(&project_root) {
-        Ok(p) => p,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-    };
+    let project_root = validate_root!(&project_root, id);
 
     let primary = match state.server.agent_registry.default_agent() {
         Some(a) => a,

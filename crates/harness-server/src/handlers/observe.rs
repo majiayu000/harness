@@ -1,4 +1,4 @@
-use crate::http::AppState;
+use crate::{http::AppState, validate_root};
 use harness_protocol::{RpcResponse, INTERNAL_ERROR};
 use std::path::PathBuf;
 
@@ -35,10 +35,7 @@ pub async fn metrics_collect(
     id: Option<serde_json::Value>,
     project_root: PathBuf,
 ) -> RpcResponse {
-    let project_root = match crate::handlers::validate_project_root(&project_root) {
-        Ok(p) => p,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-    };
+    let project_root = validate_root!(&project_root, id);
 
     // scan -> persist -> query -> grade
     let violations = {

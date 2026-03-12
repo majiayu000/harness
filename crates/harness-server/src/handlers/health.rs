@@ -1,4 +1,4 @@
-use crate::http::AppState;
+use crate::{http::AppState, validate_root};
 use harness_core::{EventFilters, Violation};
 use harness_observe::{health::generate_health_report, stats};
 use harness_protocol::{RpcResponse, INTERNAL_ERROR};
@@ -9,10 +9,7 @@ pub async fn health_check(
     id: Option<serde_json::Value>,
     project_root: PathBuf,
 ) -> RpcResponse {
-    let project_root = match crate::handlers::validate_project_root(&project_root) {
-        Ok(p) => p,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-    };
+    let project_root = validate_root!(&project_root, id);
 
     // Query historical events before persisting the current scan to avoid the
     // just-persisted rule_check events inflating the quality stability score.

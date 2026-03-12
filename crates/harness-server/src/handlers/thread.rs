@@ -1,4 +1,4 @@
-use crate::http::AppState;
+use crate::{http::AppState, validate_root};
 use harness_core::{ThreadId, ThreadStatus, TurnStatus};
 use harness_protocol::{Notification, RpcResponse, INTERNAL_ERROR, NOT_FOUND};
 use std::path::PathBuf;
@@ -55,10 +55,7 @@ pub async fn thread_start(
     id: Option<serde_json::Value>,
     cwd: PathBuf,
 ) -> RpcResponse {
-    let cwd = match crate::handlers::validate_project_root(&cwd) {
-        Ok(p) => p,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-    };
+    let cwd = validate_root!(&cwd, id);
     let thread_id = state.server.thread_manager.start_thread(cwd);
     persist_thread_insert(state, &thread_id).await;
     crate::notify::emit(
