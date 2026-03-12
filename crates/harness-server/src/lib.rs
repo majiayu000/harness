@@ -21,6 +21,7 @@ pub mod parallel_dispatch;
 pub mod plan_db;
 pub mod post_validator;
 pub mod router;
+pub mod rule_enforcer;
 pub mod scheduler;
 pub mod server;
 pub mod stdio;
