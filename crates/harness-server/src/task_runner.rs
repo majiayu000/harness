@@ -397,7 +397,7 @@ where
                     let base_branch = project_config.git.base_branch.clone();
 
                     let context_items =
-                        crate::task_executor::collect_context_items(&*skills, &project_root).await;
+                        crate::task_executor::collect_context_items(&skills, &project_root).await;
 
                     let turn_timeout = tokio::time::Duration::from_secs(req.turn_timeout_secs);
                     let results = crate::parallel_dispatch::run_parallel_subtasks(
