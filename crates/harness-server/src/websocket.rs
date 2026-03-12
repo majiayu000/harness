@@ -106,7 +106,7 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
 
     // Task 2: subscribe to the notification broadcast and forward to client.
     let notif_out_tx = out_tx.clone();
-    let mut notif_rx = state.notification_tx.subscribe();
+    let mut notif_rx = state.notifications.notification_tx.subscribe();
     let notif_state = state.clone();
     let notif_task = tokio::spawn(async move {
         loop {
@@ -207,27 +207,35 @@ mod tests {
         let (notification_tx, _) = broadcast::channel(notification_broadcast_capacity);
 
         Ok(AppState {
-            server,
-            project_root: dir.to_path_buf(),
-            tasks,
-            skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
-            rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
-            events,
-            gc_agent,
-            plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            thread_db: Some(thread_db),
-            plan_db: None,
+            core: crate::http::CoreServices {
+                server,
+                project_root: dir.to_path_buf(),
+                tasks,
+                thread_db: Some(thread_db),
+                plan_db: None,
+                plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            },
+            engines: crate::http::EngineServices {
+                skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
+                rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
+                gc_agent,
+            },
+            observability: crate::http::ObservabilityServices { events },
+            concurrency: crate::http::ConcurrencyServices {
+                task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+                workspace_mgr: None,
+            },
+            notifications: crate::http::NotificationServices {
+                notification_tx,
+                notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                notification_lag_log_every,
+                notify_tx: None,
+                initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            },
             interceptors: vec![],
-            notification_tx,
-            notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            notification_lag_log_every,
-            notify_tx: None,
-            initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            workspace_mgr: None,
             feishu_intake: None,
             github_intake: None,
             completion_callback: None,
-            task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         })
     }
 
@@ -316,7 +324,7 @@ mod tests {
     async fn websocket_initialize_roundtrip() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut state = make_test_state(dir.path()).await?;
-        state.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.notifications.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let state = Arc::new(state);
 
         let listener = match bind_ws_test_listener().await? {
@@ -374,7 +382,7 @@ mod tests {
     async fn websocket_receives_server_push_notification() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = Arc::new(make_test_state(dir.path()).await?);
-        let notif_tx = state.notification_tx.clone();
+        let notif_tx = state.notifications.notification_tx.clone();
 
         let listener = match bind_ws_test_listener().await? {
             Some(listener) => listener,
@@ -460,10 +468,11 @@ mod tests {
         config.server.notification_broadcast_capacity = 4;
         config.server.notification_lag_log_every = 1;
         let state = make_test_state_with_config(dir.path(), config).await?;
-        let mut rx = state.notification_tx.subscribe();
+        let mut rx = state.notifications.notification_tx.subscribe();
 
         for _ in 0..512 {
             state
+                .notifications
                 .notification_tx
                 .send(RpcNotification::new(Notification::TurnStarted {
                     thread_id: harness_core::ThreadId::new(),
@@ -485,6 +494,7 @@ mod tests {
         assert!(dropped_total >= skipped as u64);
         assert_eq!(
             state
+                .notifications
                 .notification_lagged_total
                 .load(std::sync::atomic::Ordering::Relaxed),
             dropped_total

@@ -20,9 +20,9 @@ fn gc_adopt_task_request(
 }
 
 pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcResponse {
-    let project_root = state.project_root.clone();
+    let project_root = state.core.project_root.clone();
     let (violations, guard_count) = {
-        let rules = state.rules.read().await;
+        let rules = state.engines.rules.read().await;
         if let Err(err) = rules.validate_scan_request(None) {
             tracing::warn!(
                 project_root = %project_root.display(),
@@ -53,18 +53,26 @@ pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcRespo
         violation_count = violations.len(),
         "gc/run scan completed"
     );
-    state.events.persist_rule_scan(&project_root, &violations);
+    state
+        .observability
+        .events
+        .persist_rule_scan(&project_root, &violations);
 
-    let events = match state.events.query(&harness_core::EventFilters::default()) {
+    let events = match state
+        .observability
+        .events
+        .query(&harness_core::EventFilters::default())
+    {
         Ok(e) => e,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     };
     let project = harness_core::Project::from_path(project_root);
-    let agent = match state.server.agent_registry.default_agent() {
+    let agent = match state.core.server.agent_registry.default_agent() {
         Some(a) => a,
         None => return RpcResponse::error(id, INTERNAL_ERROR, "no agent registered"),
     };
     match state
+        .engines
         .gc_agent
         .run(&project, &events, &violations, agent.as_ref())
         .await
@@ -78,14 +86,14 @@ pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcRespo
 }
 
 pub async fn gc_status(state: &AppState, id: Option<serde_json::Value>) -> RpcResponse {
-    match state.gc_agent.drafts() {
+    match state.engines.gc_agent.drafts() {
         Ok(drafts) => RpcResponse::success(id, serde_json::json!({ "draft_count": drafts.len() })),
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     }
 }
 
 pub async fn gc_drafts(state: &AppState, id: Option<serde_json::Value>) -> RpcResponse {
-    match state.gc_agent.drafts() {
+    match state.engines.gc_agent.drafts() {
         Ok(drafts) => match serde_json::to_value(&drafts) {
             Ok(v) => RpcResponse::success(id, v),
             Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -99,7 +107,7 @@ pub async fn gc_adopt(
     id: Option<serde_json::Value>,
     draft_id: DraftId,
 ) -> RpcResponse {
-    let draft = match state.gc_agent.draft_store().get(&draft_id) {
+    let draft = match state.engines.gc_agent.draft_store().get(&draft_id) {
         Ok(Some(d)) => d,
         Ok(None) => {
             return RpcResponse::error(id, NOT_FOUND, format!("draft {} not found", draft_id));
@@ -112,7 +120,7 @@ pub async fn gc_adopt(
         .map(|a| a.target_path.display().to_string())
         .collect();
 
-    match state.gc_agent.adopt(&draft_id) {
+    match state.engines.gc_agent.adopt(&draft_id) {
         Ok(()) => {
             if artifact_paths.is_empty() {
                 return RpcResponse::success(
@@ -120,7 +128,7 @@ pub async fn gc_adopt(
                     serde_json::json!({ "adopted": true, "task_id": null }),
                 );
             }
-            let task_id = if let Some(agent) = state.server.agent_registry.default_agent() {
+            let task_id = if let Some(agent) = state.core.server.agent_registry.default_agent() {
                 let paths_list = artifact_paths.join(", ");
                 let safe_paths = harness_core::prompts::wrap_external_data(&paths_list);
                 let prompt = format!(
@@ -131,10 +139,10 @@ pub async fn gc_adopt(
                 );
                 let req = gc_adopt_task_request(
                     prompt,
-                    &state.server.config.gc,
-                    state.project_root.clone(),
+                    &state.core.server.config.gc,
+                    state.core.project_root.clone(),
                 );
-                let permit = match state.task_queue.acquire().await {
+                let permit = match state.concurrency.task_queue.acquire().await {
                     Ok(p) => p,
                     Err(e) => {
                         return RpcResponse::error(
@@ -145,15 +153,15 @@ pub async fn gc_adopt(
                     }
                 };
                 let tid = crate::task_runner::spawn_task(
-                    state.tasks.clone(),
+                    state.core.tasks.clone(),
                     agent,
                     None,
                     harness_core::AgentReviewConfig::default(),
-                    state.skills.clone(),
-                    state.events.clone(),
+                    state.engines.skills.clone(),
+                    state.observability.events.clone(),
                     state.interceptors.clone(),
                     req,
-                    state.workspace_mgr.clone(),
+                    state.concurrency.workspace_mgr.clone(),
                     permit,
                     None,
                 )
@@ -225,7 +233,7 @@ pub async fn gc_reject(
     draft_id: DraftId,
     reason: Option<String>,
 ) -> RpcResponse {
-    match state.gc_agent.reject(&draft_id, reason.as_deref()) {
+    match state.engines.gc_agent.reject(&draft_id, reason.as_deref()) {
         Ok(()) => RpcResponse::success(id, serde_json::json!({ "rejected": true })),
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     }

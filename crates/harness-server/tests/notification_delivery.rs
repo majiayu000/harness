@@ -42,7 +42,7 @@ async fn thread_start_delivers_status_changed_notification() -> anyhow::Result<(
     let mut state = make_state(sandbox.path()).await?;
 
     let (notify_tx, mut notify_rx) = notify::channel(8);
-    state.notify_tx = Some(notify_tx);
+    state.notifications.notify_tx = Some(notify_tx);
 
     let cwd = sandbox.path().join("project");
     let resp = thread_start(&state, Some(serde_json::json!(1)), cwd).await;
@@ -74,7 +74,7 @@ async fn turn_start_delivers_turn_started_notification() -> anyhow::Result<()> {
     let mut state = make_state(sandbox.path()).await?;
 
     let (notify_tx, mut notify_rx) = notify::channel(8);
-    state.notify_tx = Some(notify_tx);
+    state.notifications.notify_tx = Some(notify_tx);
 
     let cwd = sandbox.path().join("project");
 

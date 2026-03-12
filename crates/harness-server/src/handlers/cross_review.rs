@@ -27,12 +27,12 @@ pub async fn cross_review(
 ) -> RpcResponse {
     let project_root = validate_root!(&project_root, id);
 
-    let primary = match state.server.agent_registry.default_agent() {
+    let primary = match state.core.server.agent_registry.default_agent() {
         Some(a) => a,
         None => return RpcResponse::error(id, INTERNAL_ERROR, "no agent registered"),
     };
 
-    let challenger = state.server.agent_registry.get("codex");
+    let challenger = state.core.server.agent_registry.get("codex");
     let rounds = max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS);
 
     let result = match run_cross_review(primary, challenger, project_root, target, rounds).await {

@@ -8,7 +8,7 @@ pub async fn rule_load(
     project_root: PathBuf,
 ) -> RpcResponse {
     let project_root = validate_root!(&project_root, id);
-    let mut rules = state.rules.write().await;
+    let mut rules = state.engines.rules.write().await;
     match rules.load(&project_root) {
         Ok(()) => {
             let count = rules.rules().len();
@@ -27,7 +27,7 @@ pub async fn rule_check(
     let project_root = validate_root!(&project_root, id);
     let file_count = files.as_ref().map_or(0, |paths| paths.len());
     let result = {
-        let rules = state.rules.read().await;
+        let rules = state.engines.rules.read().await;
         if let Err(err) = rules.validate_scan_request(files.as_deref()) {
             tracing::warn!(
                 project_root = %project_root.display(),
@@ -56,7 +56,7 @@ pub async fn rule_check(
     match result {
         Ok(violations) => {
             let guard_count = {
-                let rules = state.rules.read().await;
+                let rules = state.engines.rules.read().await;
                 rules.guards().len()
             };
             tracing::info!(
@@ -66,7 +66,10 @@ pub async fn rule_check(
                 violation_count = violations.len(),
                 "rule/check scan completed"
             );
-            state.events.persist_rule_scan(&project_root, &violations);
+            state
+                .observability
+                .events
+                .persist_rule_scan(&project_root, &violations);
             match serde_json::to_value(&violations) {
                 Ok(v) => RpcResponse::success(id, v),
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -120,27 +123,35 @@ mod tests {
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
         let (notification_tx, _) = broadcast::channel(64);
         Ok(AppState {
-            server,
-            project_root: dir.to_path_buf(),
-            tasks,
-            skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
-            rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
-            events,
-            gc_agent,
-            plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            thread_db: Some(thread_db),
-            plan_db: None,
+            core: crate::http::CoreServices {
+                server,
+                project_root: dir.to_path_buf(),
+                tasks,
+                thread_db: Some(thread_db),
+                plan_db: None,
+                plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            },
+            engines: crate::http::EngineServices {
+                skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
+                rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
+                gc_agent,
+            },
+            observability: crate::http::ObservabilityServices { events },
+            concurrency: crate::http::ConcurrencyServices {
+                task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+                workspace_mgr: None,
+            },
+            notifications: crate::http::NotificationServices {
+                notification_tx,
+                notification_lagged_total: Arc::new(AtomicU64::new(0)),
+                notification_lag_log_every: 1,
+                notify_tx: None,
+                initialized: Arc::new(AtomicBool::new(true)),
+            },
             interceptors: vec![],
-            notification_tx,
-            notification_lagged_total: Arc::new(AtomicU64::new(0)),
-            notification_lag_log_every: 1,
-            notify_tx: None,
-            initialized: Arc::new(AtomicBool::new(true)),
-            workspace_mgr: None,
             feishu_intake: None,
             github_intake: None,
             completion_callback: None,
-            task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         })
     }
 
@@ -169,7 +180,7 @@ mod tests {
             "warning path must not return result"
         );
 
-        let events = state.events.query(&EventFilters {
+        let events = state.observability.events.query(&EventFilters {
             hook: Some("rule_scan".to_string()),
             ..Default::default()
         })?;
@@ -185,7 +196,7 @@ mod tests {
         let dir = tempdir_in_home("rule-check-empty-input-")?;
         let state = make_test_state(dir.path()).await?;
         {
-            let mut rules = state.rules.write().await;
+            let mut rules = state.engines.rules.write().await;
             rules.register_guard(Guard {
                 id: GuardId::from_str("TEST-GUARD"),
                 script_path: PathBuf::from("unused-guard.sh"),

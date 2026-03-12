@@ -13,13 +13,13 @@ pub async fn health_check(
 
     // Query historical events before persisting the current scan to avoid the
     // just-persisted rule_check events inflating the quality stability score.
-    let events = match state.events.query(&EventFilters::default()) {
+    let events = match state.observability.events.query(&EventFilters::default()) {
         Ok(evts) => evts,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     };
 
     let violations: Vec<Violation> = {
-        let rules = state.rules.read().await;
+        let rules = state.engines.rules.read().await;
         match rules.scan(&project_root).await {
             Ok(violations) => violations,
             Err(err) => {
@@ -32,7 +32,10 @@ pub async fn health_check(
             }
         }
     };
-    state.events.persist_rule_scan(&project_root, &violations);
+    state
+        .observability
+        .events
+        .persist_rule_scan(&project_root, &violations);
 
     let report = generate_health_report(&events, &violations);
     match serde_json::to_value(&report) {
@@ -66,7 +69,7 @@ mod tests {
     }
 
     async fn register_failing_guard(state: &AppState) {
-        let mut rules = state.rules.write().await;
+        let mut rules = state.engines.rules.write().await;
         rules.register_guard(Guard {
             id: GuardId::from_str("FAIL-SCAN-GUARD"),
             script_path: PathBuf::from("fail\0scan.sh"),
@@ -103,7 +106,7 @@ mod tests {
             "scan failure must not return a success payload"
         );
 
-        let events = state.events.query(&EventFilters::default())?;
+        let events = state.observability.events.query(&EventFilters::default())?;
         assert!(
             events.iter().all(|event| event.hook != "rule_scan"),
             "scan failure should not persist a rule_scan event"
@@ -123,7 +126,7 @@ pub async fn stats_query(
         until,
         ..Default::default()
     };
-    let events = match state.events.query(&filters) {
+    let events = match state.observability.events.query(&filters) {
         Ok(evts) => evts,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     };

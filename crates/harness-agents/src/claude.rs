@@ -320,12 +320,12 @@ printf 'second\n'
 
     #[tokio::test]
     async fn execute_stream_timeout_drop_does_not_leave_hanging_process() {
-        let (dir, script) = write_executable_script("sleep 1\n");
+        let (dir, script) = write_executable_script("sleep 5\n");
         let marker = dir.path().join("timeout-marker.txt");
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\nset -eu\nsleep 1\necho reached > \"{}\"\n",
+                "#!/bin/sh\nset -eu\nsleep 5\necho reached > \"{}\"\n",
                 marker.display()
             ),
         )
@@ -353,13 +353,13 @@ printf 'second\n'
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
 
         let timed = timeout(
-            Duration::from_millis(100),
+            Duration::from_millis(500),
             agent.execute_stream(request, tx),
         )
         .await;
         assert!(timed.is_err(), "expected timeout on long-running stream");
 
-        tokio::time::sleep(Duration::from_millis(1300)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             !marker.exists(),
             "process should be killed when stream future is dropped on timeout"

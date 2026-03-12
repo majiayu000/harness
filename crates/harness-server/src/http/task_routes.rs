@@ -32,6 +32,7 @@ pub(crate) async fn enqueue_task(
     // Acquire concurrency permit before spawning. Blocks if all slots are
     // occupied; rejects immediately if the waiting queue is full.
     let permit = state
+        .concurrency
         .task_queue
         .acquire()
         .await
@@ -39,7 +40,7 @@ pub(crate) async fn enqueue_task(
 
     let agent =
         if let Some(name) = &req.agent {
-            state.server.agent_registry.get(name).ok_or_else(|| {
+            state.core.server.agent_registry.get(name).ok_or_else(|| {
                 EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
             })?
         } else {
@@ -49,6 +50,7 @@ pub(crate) async fn enqueue_task(
                 req.pr,
             );
             state
+                .core
                 .server
                 .agent_registry
                 .dispatch(&classification)
@@ -56,21 +58,21 @@ pub(crate) async fn enqueue_task(
         };
 
     let (reviewer, review_config) = resolve_reviewer(
-        &state.server.agent_registry,
-        &state.server.config.agents.review,
+        &state.core.server.agent_registry,
+        &state.core.server.config.agents.review,
         agent.name(),
     );
 
     let task_id = task_runner::spawn_task(
-        state.tasks.clone(),
+        state.core.tasks.clone(),
         agent,
         reviewer,
         review_config,
-        state.skills.clone(),
-        state.events.clone(),
+        state.engines.skills.clone(),
+        state.observability.events.clone(),
         state.interceptors.clone(),
         req,
-        state.workspace_mgr.clone(),
+        state.concurrency.workspace_mgr.clone(),
         permit,
         state.completion_callback.clone(),
     )

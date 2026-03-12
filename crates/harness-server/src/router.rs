@@ -11,7 +11,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
     // Handshake gate: only Initialize and Initialized are allowed before handshake.
     match &req.method {
         Method::Initialize | Method::Initialized => {}
-        _ if !state.initialized.load(Ordering::Relaxed) => {
+        _ if !state.notifications.initialized.load(Ordering::Relaxed) => {
             return Some(RpcResponse::error(
                 id,
                 harness_protocol::NOT_INITIALIZED,
@@ -24,7 +24,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
     match req.method {
         // === Initialization ===
         Method::Initialize => {
-            if state.initialized.load(Ordering::Relaxed) {
+            if state.notifications.initialized.load(Ordering::Relaxed) {
                 return Some(RpcResponse::error(
                     id,
                     harness_protocol::INVALID_REQUEST,
@@ -34,7 +34,10 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
             Some(handlers::thread::initialize(id).await)
         }
         Method::Initialized => {
-            state.initialized.store(true, Ordering::Relaxed);
+            state
+                .notifications
+                .initialized
+                .store(true, Ordering::Relaxed);
             handlers::thread::initialized().await;
             if id.is_none() {
                 None
@@ -151,7 +154,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
 
         // === Agent management ===
         Method::AgentList => {
-            let agents = state.server.agent_registry.list();
+            let agents = state.core.server.agent_registry.list();
             Some(RpcResponse::success(
                 id,
                 serde_json::json!({ "agents": agents }),
@@ -225,27 +228,35 @@ mod tests {
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
         let (notification_tx, _) = tokio::sync::broadcast::channel(64);
         Ok(AppState {
-            server,
-            project_root: dir.to_path_buf(),
-            tasks,
-            skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
-            rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
-            events,
-            gc_agent,
-            plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            thread_db: Some(thread_db),
-            plan_db: None,
+            core: crate::http::CoreServices {
+                server,
+                project_root: dir.to_path_buf(),
+                tasks,
+                thread_db: Some(thread_db),
+                plan_db: None,
+                plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            },
+            engines: crate::http::EngineServices {
+                skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
+                rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
+                gc_agent,
+            },
+            observability: crate::http::ObservabilityServices { events },
+            concurrency: crate::http::ConcurrencyServices {
+                task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+                workspace_mgr: None,
+            },
+            notifications: crate::http::NotificationServices {
+                notification_tx,
+                notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                notification_lag_log_every: 1,
+                notify_tx: None,
+                initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            },
             interceptors: vec![],
-            notification_tx,
-            notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            notification_lag_log_every: 1,
-            notify_tx: None,
-            initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            workspace_mgr: None,
             feishu_intake: None,
             github_intake: None,
             completion_callback: None,
-            task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         })
     }
 
@@ -279,7 +290,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut state = make_test_state(dir.path()).await?;
         // Start uninitialised to test the full handshake.
-        state.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.notifications.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Step 1: initialize
         let init_req = RpcRequest {
@@ -349,7 +360,7 @@ mod tests {
             generated_at: chrono::Utc::now(),
             agent_model: "test".to_string(),
         };
-        state.gc_agent.draft_store().save(&draft)?;
+        state.engines.gc_agent.draft_store().save(&draft)?;
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -472,7 +483,7 @@ mod tests {
 
         let tid = crate::task_runner::TaskId(task_id.to_string());
         for _ in 0..120 {
-            if let Some(task) = state.tasks.get(&tid) {
+            if let Some(task) = state.core.tasks.get(&tid) {
                 if matches!(
                     task.status,
                     crate::task_runner::TaskStatus::Done | crate::task_runner::TaskStatus::Failed
@@ -517,7 +528,7 @@ mod tests {
             generated_at: chrono::Utc::now(),
             agent_model: "test".to_string(),
         };
-        state.gc_agent.draft_store().save(&draft)?;
+        state.engines.gc_agent.draft_store().save(&draft)?;
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -582,7 +593,7 @@ mod tests {
             generated_at: chrono::Utc::now(),
             agent_model: "test".to_string(),
         };
-        state.gc_agent.draft_store().save(&draft)?;
+        state.engines.gc_agent.draft_store().save(&draft)?;
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -611,7 +622,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("task_id should be a string"))?;
         assert!(!task_id.is_empty(), "task_id should be non-empty");
         let tid = crate::task_runner::TaskId(task_id.to_string());
-        let task = state.tasks.get(&tid);
+        let task = state.core.tasks.get(&tid);
         assert!(task.is_some(), "task should exist in the task store");
         Ok(())
     }
@@ -675,10 +686,13 @@ mod tests {
             "warning path should not return a success payload"
         );
 
-        let events = state.events.query(&harness_core::EventFilters {
-            hook: Some("rule_scan".to_string()),
-            ..Default::default()
-        })?;
+        let events = state
+            .observability
+            .events
+            .query(&harness_core::EventFilters {
+                hook: Some("rule_scan".to_string()),
+                ..Default::default()
+            })?;
         assert!(
             events.is_empty(),
             "no scan event should be logged when scan request is rejected"
@@ -700,7 +714,7 @@ mod tests {
             "RuleEngine",
             harness_core::Decision::Block,
         );
-        state.events.log(&scan_event)?;
+        state.observability.events.log(&scan_event)?;
         for _ in 0..5 {
             let event = harness_core::Event::new(
                 session_id.clone(),
@@ -708,7 +722,7 @@ mod tests {
                 "SEC-01",
                 harness_core::Decision::Block,
             );
-            state.events.log(&event)?;
+            state.observability.events.log(&event)?;
         }
 
         let req = RpcRequest {
@@ -758,7 +772,10 @@ mod tests {
                 severity: harness_core::Severity::Low,
             },
         ];
-        state.events.persist_rule_scan(&project_root, &violations);
+        state
+            .observability
+            .events
+            .persist_rule_scan(&project_root, &violations);
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -783,7 +800,10 @@ mod tests {
             "coverage should degrade with persisted violations, got {coverage}"
         );
 
-        let events = state.events.query(&harness_core::EventFilters::default())?;
+        let events = state
+            .observability
+            .events
+            .query(&harness_core::EventFilters::default())?;
         let latest_scan = events
             .iter()
             .rev()
@@ -828,7 +848,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let db = state.thread_db.as_ref().unwrap();
+        let db = state.core.thread_db.as_ref().unwrap();
         let thread = db
             .get(&thread_id_str)
             .await?
@@ -841,7 +861,7 @@ mod tests {
     async fn pre_init_request_rejected() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut state = make_test_state(dir.path()).await?;
-        state.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.notifications.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -860,7 +880,7 @@ mod tests {
     async fn double_initialize_rejected() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
-        // state.initialized is already true from make_test_state
+        // state.notifications.initialized is already true from make_test_state
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -878,7 +898,7 @@ mod tests {
     async fn handshake_unlocks_methods() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut state = make_test_state(dir.path()).await?;
-        state.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.notifications.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Before handshake: ThreadList rejected
         let req = RpcRequest {

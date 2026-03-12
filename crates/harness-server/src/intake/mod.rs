@@ -107,7 +107,7 @@ impl IntakeOrchestrator {
                 let req = crate::task_runner::CreateTaskRequest {
                     prompt: Some(prompt),
                     issue: issue.external_id.parse().ok(),
-                    project: issue.repo.as_ref().map(|_| state.project_root.clone()),
+                    project: issue.repo.as_ref().map(|_| state.core.project_root.clone()),
                     ..Default::default()
                 };
 

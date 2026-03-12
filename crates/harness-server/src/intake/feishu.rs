@@ -299,7 +299,7 @@ pub async fn feishu_webhook(
     let prompt = super::build_prompt_from_issue(&issue);
     let req = crate::task_runner::CreateTaskRequest {
         prompt: Some(prompt),
-        project: Some(state.project_root.clone()),
+        project: Some(state.core.project_root.clone()),
         ..Default::default()
     };
 
