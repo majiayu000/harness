@@ -1,71 +1,50 @@
+use crate::db::{Db, DbEntity};
 use harness_core::ExecPlanId;
 use harness_exec::ExecPlan;
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 
+const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS plans (
+    id         TEXT PRIMARY KEY,
+    data       TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)";
+
+impl DbEntity for ExecPlan {
+    fn table_name() -> &'static str {
+        "plans"
+    }
+
+    fn id(&self) -> &str {
+        self.id.as_str()
+    }
+
+    fn create_table_sql() -> &'static str {
+        CREATE_TABLE_SQL
+    }
+}
+
 pub struct PlanDb {
-    pool: SqlitePool,
+    inner: Db<ExecPlan>,
 }
 
 impl PlanDb {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
-        let url = format!("sqlite:{}?mode=rwc", path.display());
-        let pool = SqlitePoolOptions::new()
-            .max_connections(4)
-            .connect(&url)
-            .await?;
-        let db = Self { pool };
-        db.migrate().await?;
-        Ok(db)
-    }
-
-    async fn migrate(&self) -> anyhow::Result<()> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS plans (
-                id TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        Ok(Self {
+            inner: Db::open(path).await?,
+        })
     }
 
     pub async fn upsert(&self, plan: &ExecPlan) -> anyhow::Result<()> {
-        let data = serde_json::to_string(plan)?;
-        sqlx::query(
-            "INSERT INTO plans (id, data) VALUES (?, ?)
-             ON CONFLICT(id) DO UPDATE SET data = excluded.data,
-                updated_at = datetime('now')",
-        )
-        .bind(plan.id.as_str())
-        .bind(&data)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.inner.upsert(plan).await
     }
 
     pub async fn get(&self, id: &ExecPlanId) -> anyhow::Result<Option<ExecPlan>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT data FROM plans WHERE id = ?")
-            .bind(id.as_str())
-            .fetch_optional(&self.pool)
-            .await?;
-        match row {
-            Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
-            None => Ok(None),
-        }
+        self.inner.get(id.as_str()).await
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<ExecPlan>> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT data FROM plans ORDER BY created_at DESC")
-                .fetch_all(&self.pool)
-                .await?;
-        rows.into_iter()
-            .map(|(data,)| Ok(serde_json::from_str(&data)?))
-            .collect()
+        self.inner.list().await
     }
 }
 

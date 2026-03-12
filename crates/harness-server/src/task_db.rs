@@ -1,6 +1,7 @@
+use crate::db::open_pool;
 use crate::task_runner::{TaskId, TaskState, TaskStatus};
 use harness_core::TaskDbDecodeError;
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::SqlitePool;
 use std::path::Path;
 
 pub struct TaskDb {
@@ -9,11 +10,7 @@ pub struct TaskDb {
 
 impl TaskDb {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
-        let url = format!("sqlite:{}?mode=rwc", path.display());
-        let pool = SqlitePoolOptions::new()
-            .max_connections(4)
-            .connect(&url)
-            .await?;
+        let pool = open_pool(path).await?;
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
