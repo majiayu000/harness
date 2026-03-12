@@ -187,6 +187,9 @@ fn default_max_rounds() -> u32 {
     5
 }
 fn default_turn_timeout() -> u64 {
+    // 1 hour: parallel subtasks and complex agent turns on large codebases
+    // regularly exceed the previous 10-minute default when running CI checks,
+    // building dependencies from source, or iterating on review feedback.
     3600
 }
 
@@ -393,22 +396,8 @@ where
                     let project_config = harness_core::config::load_project_config(&project_root);
                     let base_branch = project_config.git.base_branch.clone();
 
-                    let mut context_items: Vec<harness_core::ContextItem> = {
-                        let guard = skills.read().await;
-                        guard
-                            .list()
-                            .iter()
-                            .map(|s| harness_core::ContextItem::Skill {
-                                id: s.id.to_string(),
-                                content: s.content.clone(),
-                            })
-                            .collect()
-                    };
-                    let agents_md = harness_core::agents_md::load_agents_md(&project_root);
-                    if !agents_md.is_empty() {
-                        context_items
-                            .push(harness_core::ContextItem::AgentsMd { content: agents_md });
-                    }
+                    let context_items =
+                        crate::task_executor::collect_context_items(&*skills, &project_root).await;
 
                     let turn_timeout = tokio::time::Duration::from_secs(req.turn_timeout_secs);
                     let results = crate::parallel_dispatch::run_parallel_subtasks(

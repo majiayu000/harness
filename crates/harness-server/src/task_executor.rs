@@ -15,8 +15,9 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, Duration};
 
 pub(crate) use helpers::{
-    emit_runtime_notification, mark_turn_failed, persist_runtime_thread, process_stream_item,
-    run_on_error, run_post_execute, run_pre_execute, truncate_validation_error, update_status,
+    collect_context_items, emit_runtime_notification, mark_turn_failed, persist_runtime_thread,
+    process_stream_item, run_on_error, run_post_execute, run_pre_execute,
+    truncate_validation_error, update_status,
 };
 pub(crate) use pr_detection::{
     build_fix_ci_prompt, build_pr_approved_prompt, build_pr_rework_prompt,
@@ -185,23 +186,7 @@ pub(crate) async fn run_task(
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default(), git)
     };
 
-    let mut context_items: Vec<ContextItem> = {
-        let guard = skills.read().await;
-        guard
-            .list()
-            .iter()
-            .map(|s| ContextItem::Skill {
-                id: s.id.to_string(),
-                content: s.content.clone(),
-            })
-            .collect()
-    };
-
-    // Load cascading AGENTS.md files and inject as context
-    let agents_md = harness_core::agents_md::load_agents_md(&project);
-    if !agents_md.is_empty() {
-        context_items.push(ContextItem::AgentsMd { content: agents_md });
-    }
+    let context_items = collect_context_items(&*skills, &project).await;
 
     let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
 

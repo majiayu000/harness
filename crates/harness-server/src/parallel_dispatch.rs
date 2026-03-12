@@ -131,7 +131,7 @@ pub async fn run_parallel_subtasks(
     }
 
     let mut results = Vec::with_capacity(count);
-    for handle in handles {
+    for (i, handle) in handles.into_iter().enumerate() {
         match handle.await {
             Ok((index, Ok(resp))) => results.push(SubtaskResult {
                 index,
@@ -147,9 +147,9 @@ pub async fn run_parallel_subtasks(
                 });
             }
             Err(join_err) => {
-                tracing::warn!("parallel subtask join error: {join_err}");
+                tracing::warn!("parallel subtask {i} join error: {join_err}");
                 results.push(SubtaskResult {
-                    index: usize::MAX,
+                    index: i,
                     response: None,
                     error: Some(format!("subtask panicked: {join_err}")),
                 });

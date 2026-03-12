@@ -1,10 +1,12 @@
 use crate::task_runner::{TaskId, TaskStatus, TaskStore};
 use harness_core::{
-    interceptor::TurnInterceptor, AgentRequest, AgentResponse, Decision, StreamItem, ThreadId,
-    TurnId, TurnStatus,
+    interceptor::TurnInterceptor, AgentRequest, AgentResponse, ContextItem, Decision, StreamItem,
+    ThreadId, TurnId, TurnStatus,
 };
 use harness_protocol::{Notification, RpcNotification};
+use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Truncate validation error output to `max_chars` to avoid bloating agent prompts.
 /// Preserves the first portion which typically contains the most actionable info.
@@ -221,4 +223,28 @@ pub(crate) async fn update_status(
     round: u32,
 ) {
     crate::task_runner::update_status(store, task_id, status, round).await;
+}
+
+/// Build the context item list for an agent request: loaded skills plus any
+/// cascading AGENTS.md content found under `project_root`.
+pub(crate) async fn collect_context_items(
+    skills: &RwLock<harness_skills::SkillStore>,
+    project_root: &Path,
+) -> Vec<ContextItem> {
+    let mut items: Vec<ContextItem> = {
+        let guard = skills.read().await;
+        guard
+            .list()
+            .iter()
+            .map(|s| ContextItem::Skill {
+                id: s.id.to_string(),
+                content: s.content.clone(),
+            })
+            .collect()
+    };
+    let agents_md = harness_core::agents_md::load_agents_md(project_root);
+    if !agents_md.is_empty() {
+        items.push(ContextItem::AgentsMd { content: agents_md });
+    }
+    items
 }
