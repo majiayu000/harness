@@ -20,7 +20,7 @@ pub mod thread;
 #[macro_export]
 macro_rules! validate_root {
     ($path:expr, $id:expr) => {
-        match crate::handlers::validate_project_root($path) {
+        match $crate::handlers::validate_project_root($path) {
             Ok(p) => p,
             Err(e) => {
                 return harness_protocol::RpcResponse::error(
