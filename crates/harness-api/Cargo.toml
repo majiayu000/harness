@@ -1,0 +1,11 @@
+[package]
+name = "harness-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-core = { workspace = true }
+harness-protocol = { workspace = true }
+harness-sandbox = { workspace = true }
+harness-exec = { workspace = true }

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/harness-core",
     "crates/harness-protocol",
+    "crates/harness-api",
     "crates/harness-server",
     "crates/harness-agents",
     "crates/harness-sandbox",
@@ -24,6 +25,7 @@ rust-version = "1.75"
 # Internal crates
 harness-core = { path = "crates/harness-core" }
 harness-protocol = { path = "crates/harness-protocol" }
+harness-api = { path = "crates/harness-api" }
 harness-server = { path = "crates/harness-server" }
 harness-agents = { path = "crates/harness-agents" }
 harness-sandbox = { path = "crates/harness-sandbox" }
