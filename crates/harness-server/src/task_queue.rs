@@ -1,4 +1,4 @@
-use harness_core::config::ConcurrencyConfig;
+use harness_core::{config::ConcurrencyConfig, HarnessError};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -35,16 +35,16 @@ impl TaskQueue {
     ///
     /// Returns `Err` immediately if `max_queue_size` tasks are already waiting.
     /// The returned permit releases its slot on drop (even on panic).
-    pub async fn acquire(&self) -> anyhow::Result<TaskPermit> {
+    pub async fn acquire(&self) -> harness_core::Result<TaskPermit> {
         // Reserve a queue slot atomically. fetch_add returns the value before
         // the increment, so if prev == max_queue_size the queue is already full.
         let prev = self.queued_count.fetch_add(1, Ordering::SeqCst);
         if prev >= self.max_queue_size {
             self.queued_count.fetch_sub(1, Ordering::SeqCst);
-            return Err(anyhow::anyhow!(
+            return Err(HarnessError::Other(format!(
                 "task queue is full (max_queue_size={})",
                 self.max_queue_size
-            ));
+            )));
         }
 
         // Block until an execution slot opens.
@@ -53,7 +53,7 @@ impl TaskQueue {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| anyhow::anyhow!("task queue closed"))?;
+            .map_err(|_| HarnessError::Other("task queue closed".to_string()))?;
 
         // Slot acquired; decrement the waiting count.
         self.queued_count.fetch_sub(1, Ordering::SeqCst);

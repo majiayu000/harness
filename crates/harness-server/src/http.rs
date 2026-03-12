@@ -618,12 +618,13 @@ async fn github_webhook(
                 "task_id": task_id.0,
             })),
         ),
-        Err(task_routes::EnqueueTaskError::BadRequest(error)) => {
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
-        }
-        Err(task_routes::EnqueueTaskError::Internal(error)) => (
+        Err(err) if err.is_client_error() => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        ),
+        Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": error })),
+            Json(json!({ "error": err.to_string() })),
         ),
     }
 }

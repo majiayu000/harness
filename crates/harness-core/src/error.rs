@@ -92,5 +92,25 @@ pub enum TaskDbDecodeError {
     },
 }
 
+impl HarnessError {
+    /// Returns true for errors caused by the caller (4xx), false for
+    /// infrastructure failures (5xx).
+    pub fn is_client_error(&self) -> bool {
+        matches!(
+            self,
+            HarnessError::ThreadNotFound(_)
+                | HarnessError::TurnNotFound(_)
+                | HarnessError::AgentNotFound(_)
+                | HarnessError::DraftNotFound(_)
+                | HarnessError::SkillNotFound(_)
+                | HarnessError::ExecPlanNotFound(_)
+                | HarnessError::RuleNotFound(_)
+                | HarnessError::InvalidState(_)
+                | HarnessError::BudgetExceeded { .. }
+                | HarnessError::Unsupported(_)
+        )
+    }
+}
+
 pub type Error = HarnessError;
 pub type Result<T> = std::result::Result<T, HarnessError>;

@@ -1,47 +1,28 @@
 use super::{resolve_reviewer, AppState};
 use crate::task_runner;
 use axum::{extract::State, http::StatusCode, Json};
+use harness_core::HarnessError;
 use serde_json::json;
 use std::sync::Arc;
-
-#[derive(Debug)]
-pub(crate) enum EnqueueTaskError {
-    BadRequest(String),
-    Internal(String),
-}
-
-impl std::fmt::Display for EnqueueTaskError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BadRequest(msg) => write!(f, "bad request: {msg}"),
-            Self::Internal(msg) => write!(f, "internal error: {msg}"),
-        }
-    }
-}
 
 pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
     req: task_runner::CreateTaskRequest,
-) -> Result<task_runner::TaskId, EnqueueTaskError> {
+) -> harness_core::Result<task_runner::TaskId> {
     if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
-        return Err(EnqueueTaskError::BadRequest(
+        return Err(HarnessError::InvalidState(
             "at least one of prompt, issue, or pr must be provided".to_string(),
         ));
     }
 
     // Acquire concurrency permit before spawning. Blocks if all slots are
     // occupied; rejects immediately if the waiting queue is full.
-    let permit = state
-        .concurrency
-        .task_queue
-        .acquire()
-        .await
-        .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+    let permit = state.concurrency.task_queue.acquire().await?;
 
     let agent =
         if let Some(name) = &req.agent {
             state.core.server.agent_registry.get(name).ok_or_else(|| {
-                EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
+                HarnessError::AgentNotFound(format!("agent '{name}' not registered"))
             })?
         } else {
             let classification = crate::complexity_router::classify(
@@ -49,12 +30,7 @@ pub(crate) async fn enqueue_task(
                 req.issue,
                 req.pr,
             );
-            state
-                .core
-                .server
-                .agent_registry
-                .dispatch(&classification)
-                .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?
+            state.core.server.agent_registry.dispatch(&classification)?
         };
 
     let (reviewer, review_config) = resolve_reviewer(
@@ -93,12 +69,13 @@ pub(super) async fn create_task(
                 "status": "running"
             })),
         ),
-        Err(EnqueueTaskError::BadRequest(error)) => {
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
-        }
-        Err(EnqueueTaskError::Internal(error)) => (
+        Err(err) if err.is_client_error() => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        ),
+        Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": error })),
+            Json(json!({ "error": err.to_string() })),
         ),
     }
 }
