@@ -56,7 +56,7 @@ impl TaskDb {
 
     pub async fn insert(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
-        let status = status_to_str(&state.status);
+        let status = state.status.as_ref();
         sqlx::query(
             "INSERT INTO tasks (id, status, turn, pr_url, rounds, error)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -74,7 +74,7 @@ impl TaskDb {
 
     pub async fn update(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
-        let status = status_to_str(&state.status);
+        let status = state.status.as_ref();
         sqlx::query(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
                     updated_at = datetime('now')
@@ -157,7 +157,7 @@ impl TaskRow {
 
         Ok(TaskState {
             id: TaskId(id),
-            status: str_to_status(&status),
+            status: status.parse::<TaskStatus>()?,
             turn: turn as u32,
             pr_url,
             rounds: decoded_rounds,
@@ -165,31 +165,6 @@ impl TaskRow {
             source,
             external_id,
         })
-    }
-}
-
-fn status_to_str(s: &TaskStatus) -> &'static str {
-    match s {
-        TaskStatus::Pending => "pending",
-        TaskStatus::Implementing => "implementing",
-        TaskStatus::AgentReview => "agent_review",
-        TaskStatus::Waiting => "waiting",
-        TaskStatus::Reviewing => "reviewing",
-        TaskStatus::Done => "done",
-        TaskStatus::Failed => "failed",
-    }
-}
-
-fn str_to_status(s: &str) -> TaskStatus {
-    match s {
-        "pending" => TaskStatus::Pending,
-        "implementing" => TaskStatus::Implementing,
-        "agent_review" => TaskStatus::AgentReview,
-        "waiting" => TaskStatus::Waiting,
-        "reviewing" => TaskStatus::Reviewing,
-        "done" => TaskStatus::Done,
-        "failed" => TaskStatus::Failed,
-        _ => TaskStatus::Failed,
     }
 }
 
@@ -404,6 +379,30 @@ mod tests {
             .await?
             .expect("task should survive reopen");
         assert!(matches!(loaded.status, TaskStatus::Done));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_db_rejects_unknown_status() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db_path = tmp.path().join("tasks.db");
+        let db = TaskDb::open(&db_path).await?;
+
+        let task = make_task("task-unknown", TaskStatus::Pending);
+        db.insert(&task).await?;
+
+        sqlx::query("UPDATE tasks SET status = ? WHERE id = ?")
+            .bind("unknown_status")
+            .bind("task-unknown")
+            .execute(&db.pool)
+            .await?;
+
+        let err = db
+            .get("task-unknown")
+            .await
+            .expect_err("unknown status must return an explicit error");
+        let message = format!("{err:#}");
+        assert!(message.contains("unknown task status"));
         Ok(())
     }
 }

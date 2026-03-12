@@ -73,6 +73,29 @@ pub enum ThreadStatus {
     Archived,
 }
 
+impl AsRef<str> for ThreadStatus {
+    fn as_ref(&self) -> &str {
+        match self {
+            ThreadStatus::Idle => "idle",
+            ThreadStatus::Active => "active",
+            ThreadStatus::Archived => "archived",
+        }
+    }
+}
+
+impl std::str::FromStr for ThreadStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "idle" => Ok(ThreadStatus::Idle),
+            "active" => Ok(ThreadStatus::Active),
+            "archived" => Ok(ThreadStatus::Archived),
+            _ => anyhow::bail!("unknown thread status `{s}`"),
+        }
+    }
+}
+
 impl Thread {
     pub fn new(project_root: PathBuf) -> Self {
         let now = Utc::now();

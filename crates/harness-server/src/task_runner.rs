@@ -35,6 +35,37 @@ pub enum TaskStatus {
     Failed,
 }
 
+impl AsRef<str> for TaskStatus {
+    fn as_ref(&self) -> &str {
+        match self {
+            TaskStatus::Pending => "pending",
+            TaskStatus::Implementing => "implementing",
+            TaskStatus::AgentReview => "agent_review",
+            TaskStatus::Waiting => "waiting",
+            TaskStatus::Reviewing => "reviewing",
+            TaskStatus::Done => "done",
+            TaskStatus::Failed => "failed",
+        }
+    }
+}
+
+impl std::str::FromStr for TaskStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(TaskStatus::Pending),
+            "implementing" => Ok(TaskStatus::Implementing),
+            "agent_review" => Ok(TaskStatus::AgentReview),
+            "waiting" => Ok(TaskStatus::Waiting),
+            "reviewing" => Ok(TaskStatus::Reviewing),
+            "done" => Ok(TaskStatus::Done),
+            "failed" => Ok(TaskStatus::Failed),
+            _ => anyhow::bail!("unknown task status `{s}`"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoundResult {
     pub turn: u32,
