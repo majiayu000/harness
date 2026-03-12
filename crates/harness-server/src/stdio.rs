@@ -102,7 +102,7 @@ mod tests {
         let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
         let events = Arc::new(harness_observe::EventStore::new(dir)?);
         let signal_detector = harness_gc::SignalDetector::new(
-            harness_gc::signal_detector::SignalThresholds::default(),
+            harness_core::SignalThresholdsConfig::default(),
             harness_core::ProjectId::new(),
         );
         let draft_store = harness_gc::DraftStore::new(dir)?;

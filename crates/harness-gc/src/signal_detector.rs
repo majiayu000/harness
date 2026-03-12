@@ -1,53 +1,16 @@
-use harness_core::{Decision, Event, ProjectId, RemediationType, Signal, SignalType, Violation};
-use serde::{Deserialize, Serialize};
+use harness_core::{
+    config::SignalThresholdsConfig, Decision, Event, ProjectId, RemediationType, Signal,
+    SignalType, Violation,
+};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignalThresholds {
-    pub repeated_warn_min: usize,
-    pub chronic_block_min: usize,
-    pub hot_file_edits_min: usize,
-    pub slow_op_threshold_ms: u64,
-    pub slow_op_count_min: usize,
-    pub escalation_ratio: f64,
-    pub violation_min: usize,
-}
-
-impl Default for SignalThresholds {
-    fn default() -> Self {
-        Self {
-            repeated_warn_min: 10,
-            chronic_block_min: 5,
-            hot_file_edits_min: 20,
-            slow_op_threshold_ms: 5000,
-            slow_op_count_min: 10,
-            escalation_ratio: 1.5,
-            violation_min: 5,
-        }
-    }
-}
-
-impl From<harness_core::config::SignalThresholdsConfig> for SignalThresholds {
-    fn from(t: harness_core::config::SignalThresholdsConfig) -> Self {
-        Self {
-            repeated_warn_min: t.repeated_warn_min,
-            chronic_block_min: t.chronic_block_min,
-            hot_file_edits_min: t.hot_file_edits_min,
-            slow_op_threshold_ms: t.slow_op_threshold_ms,
-            slow_op_count_min: t.slow_op_count_min,
-            escalation_ratio: t.escalation_ratio,
-            violation_min: t.violation_min,
-        }
-    }
-}
-
 pub struct SignalDetector {
-    thresholds: SignalThresholds,
+    thresholds: SignalThresholdsConfig,
     project_id: ProjectId,
 }
 
 impl SignalDetector {
-    pub fn new(thresholds: SignalThresholds, project_id: ProjectId) -> Self {
+    pub fn new(thresholds: SignalThresholdsConfig, project_id: ProjectId) -> Self {
         Self {
             thresholds,
             project_id,
@@ -264,11 +227,14 @@ impl SignalDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Decision, Event, ProjectId, SessionId, Severity, SignalType, Violation};
+    use harness_core::{
+        config::SignalThresholdsConfig, Decision, Event, ProjectId, SessionId, Severity,
+        SignalType, Violation,
+    };
     use std::path::PathBuf;
 
     fn detector() -> SignalDetector {
-        SignalDetector::new(SignalThresholds::default(), ProjectId::new())
+        SignalDetector::new(SignalThresholdsConfig::default(), ProjectId::new())
     }
 
     fn warn_event(reason: &str) -> Event {
@@ -346,7 +312,7 @@ mod tests {
     #[test]
     fn detects_warn_escalation() {
         let det = SignalDetector::new(
-            SignalThresholds {
+            SignalThresholdsConfig {
                 escalation_ratio: 1.5,
                 ..Default::default()
             },
