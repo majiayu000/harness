@@ -892,7 +892,7 @@ mod tests {
         let event_id = result["event_id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing event_id"))?;
-        assert!(!event_id.is_empty());
+        assert_eq!(event_id, event.id.as_str());
 
         // Query the event via EventQuery RPC
         let query_req = RpcRequest {
