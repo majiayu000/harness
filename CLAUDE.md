@@ -31,6 +31,12 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 - If Gemini leaves review comments, address valid feedback before merge
 - If no comments or only false positives, proceed with merge
 
+## Server Operation
+
+- NEVER start `harness serve` from within a Claude Code session — the `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` env vars cause spawned agents to SIGTRAP
+- Always start the server from a standalone terminal: `./target/release/harness serve --transport http --port 9800 --project-root <path>`
+- If already running inside Claude Code, only stop/kill the server — let the user start it manually
+
 ## Dependencies
 
 - NEVER downgrade dependency versions unless explicitly requested
