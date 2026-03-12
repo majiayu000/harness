@@ -168,7 +168,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     );
     let draft_store = harness_gc::DraftStore::new(&dir)?;
     let gc_agent = Arc::new(harness_gc::GcAgent::new(
-        harness_gc::gc_agent::GcConfig::default(),
+        harness_core::GcConfig::default(),
         signal_detector,
         draft_store,
     ));
