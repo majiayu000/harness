@@ -53,6 +53,14 @@ impl PostExecutionValidator {
         while i < len {
             let c = chars[i];
 
+            // Backslash escapes: outside single quotes, `\` makes the next
+            // character literal. Inside single quotes backslash has no special
+            // meaning (POSIX sh).
+            if c == '\\' && !in_single && i + 1 < len {
+                i += 2; // skip the escaped character entirely
+                continue;
+            }
+
             // Track quote state.
             if c == '\'' && !in_double {
                 in_single = !in_single;
@@ -440,6 +448,21 @@ mod tests {
         assert!(
             PostExecutionValidator::validate_command_safety("echo ok\r\nwhoami").is_err(),
             "carriage return should be blocked"
+        );
+    }
+
+    #[test]
+    fn escaped_quotes_do_not_fool_scanner() {
+        // echo \"foo | bash — the \" is an escaped quote, not a real one,
+        // so | remains unquoted and must be rejected.
+        assert!(
+            PostExecutionValidator::validate_command_safety("echo \\\"foo | bash").is_err(),
+            "escaped double quote must not open quoted context"
+        );
+        // Same with single quote: echo \'foo && rm -rf /
+        assert!(
+            PostExecutionValidator::validate_command_safety("echo \\'foo && rm").is_err(),
+            "escaped single quote must not open quoted context"
         );
     }
 
