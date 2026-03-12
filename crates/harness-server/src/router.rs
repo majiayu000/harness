@@ -858,6 +858,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_log_then_query_roundtrip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+        let session_id = harness_core::SessionId::new();
+        let event = harness_core::Event::new(
+            session_id.clone(),
+            "pre_tool_use",
+            "Edit",
+            harness_core::Decision::Pass,
+        );
+
+        // Log the event via EventLog RPC
+        let log_req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::EventLog {
+                event: event.clone(),
+            },
+        };
+        let log_resp = handle_request(&state, log_req)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("expected response for EventLog"))?;
+        assert!(
+            log_resp.error.is_none(),
+            "EventLog should succeed: {:?}",
+            log_resp.error
+        );
+        let result = log_resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert_eq!(result["logged"], serde_json::json!(true));
+        let event_id = result["event_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing event_id"))?;
+        assert!(!event_id.is_empty());
+
+        // Query the event via EventQuery RPC
+        let query_req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(2)),
+            method: Method::EventQuery {
+                filters: harness_core::EventFilters {
+                    session_id: Some(session_id),
+                    ..Default::default()
+                },
+            },
+        };
+        let query_resp = handle_request(&state, query_req)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("expected response for EventQuery"))?;
+        assert!(
+            query_resp.error.is_none(),
+            "EventQuery should succeed: {:?}",
+            query_resp.error
+        );
+        let events_val = query_resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        let events_arr = events_val
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("expected JSON array"))?;
+        assert_eq!(events_arr.len(), 1, "expected exactly one event");
+        assert_eq!(
+            events_arr[0]["id"],
+            serde_json::json!(event.id.as_str()),
+            "returned event id should match logged event"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn pre_init_request_rejected() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut state = make_test_state(dir.path()).await?;
