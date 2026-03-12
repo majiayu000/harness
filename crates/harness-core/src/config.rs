@@ -94,7 +94,7 @@ mod tests {
         assert!(config.review.enabled);
         assert_eq!(config.review.reviewer_agent, "codex");
         assert_eq!(config.review.max_rounds, 2);
-        assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
+        assert_eq!(config.sandbox_mode, SandboxMode::DangerFullAccess);
     }
 
     #[test]
@@ -115,9 +115,9 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_mode_defaults_to_workspace_write() {
+    fn sandbox_mode_defaults_to_danger_full_access() {
         let config = AgentsConfig::default();
-        assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
+        assert_eq!(config.sandbox_mode, SandboxMode::DangerFullAccess);
     }
 
     #[test]
