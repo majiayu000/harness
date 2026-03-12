@@ -3,7 +3,7 @@ use harness_core::ExecPlanId;
 use harness_exec::ExecPlan;
 use std::path::Path;
 
-const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS plans (
+const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS exec_plans (
     id         TEXT PRIMARY KEY,
     data       TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -12,7 +12,7 @@ const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS plans (
 
 impl DbEntity for ExecPlan {
     fn table_name() -> &'static str {
-        "plans"
+        "exec_plans"
     }
 
     fn id(&self) -> &str {
