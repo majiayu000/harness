@@ -93,17 +93,23 @@ impl TaskDb {
     }
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
-        let row = sqlx::query_as::<_, TaskRow>("SELECT * FROM tasks WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query_as::<_, TaskRow>(
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id
+             FROM tasks WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(TaskRow::try_into_task_state).transpose()
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
-        let rows = sqlx::query_as::<_, TaskRow>("SELECT * FROM tasks ORDER BY created_at DESC")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query_as::<_, TaskRow>(
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id
+             FROM tasks ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 }
@@ -118,10 +124,6 @@ struct TaskRow {
     error: Option<String>,
     source: Option<String>,
     external_id: Option<String>,
-    #[allow(dead_code)]
-    created_at: String,
-    #[allow(dead_code)]
-    updated_at: String,
 }
 
 impl TaskRow {
@@ -135,8 +137,6 @@ impl TaskRow {
             error,
             source,
             external_id,
-            created_at: _,
-            updated_at: _,
         } = self;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
@@ -175,8 +175,6 @@ mod tests {
             error: None,
             source: None,
             external_id: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
     }
 
