@@ -138,7 +138,7 @@ pub struct CreateTaskRequest {
     pub wait_secs: u64,
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
-    /// Per-turn timeout in seconds; defaults to 600 (10 min).
+    /// Per-turn timeout in seconds; defaults to 3600 (1 hour).
     #[serde(default = "default_turn_timeout")]
     pub turn_timeout_secs: u64,
 }
@@ -187,7 +187,7 @@ fn default_max_rounds() -> u32 {
     5
 }
 fn default_turn_timeout() -> u64 {
-    600
+    3600
 }
 
 fn describe_detect_main_worktree_join_error(join_err: &tokio::task::JoinError) -> String {
@@ -373,6 +373,82 @@ where
             resolve_project_root_with(req.project.clone(), move || detect_worktree()).await?;
         let project_root = crate::handlers::validate_project_root(&raw_project)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Parallel dispatch for Complex+ prompt-only tasks when workspace isolation is active.
+        // Issue and PR tasks have their own structured prompt flow and are not decomposed.
+        let classification = crate::complexity_router::classify(
+            req.prompt.as_deref().unwrap_or_default(),
+            req.issue,
+            req.pr,
+        );
+        let is_complex = matches!(
+            classification.complexity,
+            harness_core::TaskComplexity::Complex | harness_core::TaskComplexity::Critical
+        );
+        if req.issue.is_none() && req.pr.is_none() && is_complex {
+            if let Some(ref wmgr) = workspace_mgr {
+                let subtask_prompts =
+                    crate::parallel_dispatch::decompose(req.prompt.as_deref().unwrap_or_default());
+                if subtask_prompts.len() > 1 {
+                    let project_config = harness_core::config::load_project_config(&project_root);
+                    let base_branch = project_config.git.base_branch.clone();
+
+                    let mut context_items: Vec<harness_core::ContextItem> = {
+                        let guard = skills.read().await;
+                        guard
+                            .list()
+                            .iter()
+                            .map(|s| harness_core::ContextItem::Skill {
+                                id: s.id.to_string(),
+                                content: s.content.clone(),
+                            })
+                            .collect()
+                    };
+                    let agents_md = harness_core::agents_md::load_agents_md(&project_root);
+                    if !agents_md.is_empty() {
+                        context_items
+                            .push(harness_core::ContextItem::AgentsMd { content: agents_md });
+                    }
+
+                    let turn_timeout = tokio::time::Duration::from_secs(req.turn_timeout_secs);
+                    let results = crate::parallel_dispatch::run_parallel_subtasks(
+                        &id,
+                        agent.clone(),
+                        subtask_prompts,
+                        wmgr.clone(),
+                        &project_root,
+                        &base_branch,
+                        context_items,
+                        turn_timeout,
+                    )
+                    .await;
+
+                    let any_success = results.iter().any(|r| r.response.is_some());
+                    mutate_and_persist(&store, &id, |s| {
+                        for r in &results {
+                            s.rounds.push(RoundResult {
+                                turn: (r.index as u32).saturating_add(1),
+                                action: format!("parallel_subtask_{}", r.index),
+                                result: if r.response.is_some() {
+                                    "success".into()
+                                } else {
+                                    "failed".into()
+                                },
+                                detail: r.error.clone(),
+                            });
+                        }
+                        if any_success {
+                            s.status = TaskStatus::Done;
+                        } else {
+                            s.status = TaskStatus::Failed;
+                            s.error = Some("all parallel subtasks failed".to_string());
+                        }
+                    })
+                    .await;
+                    return Ok(());
+                }
+            }
+        }
 
         // If workspace isolation is configured, create a per-task git worktree.
         let run_project = if let Some(ref wmgr) = workspace_mgr {
