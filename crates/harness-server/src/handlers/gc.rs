@@ -159,7 +159,7 @@ pub async fn gc_adopt(
                     harness_core::AgentReviewConfig::default(),
                     state.engines.skills.clone(),
                     state.observability.events.clone(),
-                    state.interceptors.clone(),
+                    state.engines.interceptors.clone(),
                     req,
                     state.concurrency.workspace_mgr.clone(),
                     permit,

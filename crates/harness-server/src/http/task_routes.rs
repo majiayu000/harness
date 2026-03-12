@@ -70,11 +70,11 @@ pub(crate) async fn enqueue_task(
         review_config,
         state.engines.skills.clone(),
         state.observability.events.clone(),
-        state.interceptors.clone(),
+        state.engines.interceptors.clone(),
         req,
         state.concurrency.workspace_mgr.clone(),
         permit,
-        state.completion_callback.clone(),
+        state.core.completion_callback.clone(),
     )
     .await;
 

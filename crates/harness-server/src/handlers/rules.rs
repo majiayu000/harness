@@ -130,11 +130,15 @@ mod tests {
                 thread_db: Some(thread_db),
                 plan_db: None,
                 plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+                feishu_intake: None,
+                github_intake: None,
+                completion_callback: None,
             },
             engines: crate::http::EngineServices {
                 skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
                 rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
                 gc_agent,
+                interceptors: vec![],
             },
             observability: crate::http::ObservabilityServices { events },
             concurrency: crate::http::ConcurrencyServices {
@@ -148,10 +152,6 @@ mod tests {
                 notify_tx: None,
                 initialized: Arc::new(AtomicBool::new(true)),
             },
-            interceptors: vec![],
-            feishu_intake: None,
-            github_intake: None,
-            completion_callback: None,
         })
     }
 

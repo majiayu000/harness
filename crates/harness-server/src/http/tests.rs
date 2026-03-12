@@ -89,6 +89,9 @@ async fn make_test_state_with(
             thread_db: Some(thread_db),
             plan_db: None,
             plans: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            feishu_intake: None,
+            github_intake: None,
+            completion_callback: None,
         },
         engines: crate::http::EngineServices {
             skills: Arc::new(tokio::sync::RwLock::new(harness_skills::SkillStore::new())),
@@ -96,6 +99,7 @@ async fn make_test_state_with(
                 harness_rules::engine::RuleEngine::new(),
             )),
             gc_agent,
+            interceptors: vec![],
         },
         observability: crate::http::ObservabilityServices { events },
         concurrency: crate::http::ConcurrencyServices {
@@ -109,10 +113,6 @@ async fn make_test_state_with(
             notify_tx: None,
             initialized: Arc::new(AtomicBool::new(true)),
         },
-        interceptors: vec![],
-        feishu_intake: None,
-        github_intake: None,
-        completion_callback: None,
     }))
 }
 

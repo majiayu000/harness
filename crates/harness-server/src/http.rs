@@ -20,7 +20,7 @@ const MAX_WEBHOOK_BODY_BYTES: usize = 512 * 1024;
 
 pub(crate) mod task_routes;
 
-/// Core services: thread/task management and persistence.
+/// Core services: thread/task management, persistence, and intake sources.
 pub struct CoreServices {
     pub server: Arc<HarnessServer>,
     pub project_root: std::path::PathBuf,
@@ -29,13 +29,20 @@ pub struct CoreServices {
     pub plan_db: Option<crate::plan_db::PlanDb>,
     pub plans:
         Arc<RwLock<std::collections::HashMap<harness_core::ExecPlanId, harness_exec::ExecPlan>>>,
+    /// Feishu Bot intake handler. None when feishu intake is disabled or not configured.
+    pub feishu_intake: Option<Arc<crate::intake::feishu::FeishuIntake>>,
+    /// Pre-built GitHub intake poller, shared between orchestrator and completion callback.
+    pub github_intake: Option<Arc<dyn crate::intake::IntakeSource>>,
+    /// Completion callback invoked when a task reaches a terminal state.
+    pub completion_callback: Option<task_runner::CompletionCallback>,
 }
 
-/// Engine services: skills, rules, and garbage collection.
+/// Engine services: skills, rules, garbage collection, and execution interceptors.
 pub struct EngineServices {
     pub skills: Arc<RwLock<harness_skills::SkillStore>>,
     pub rules: Arc<RwLock<harness_rules::engine::RuleEngine>>,
     pub gc_agent: Arc<harness_gc::GcAgent>,
+    pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
 }
 
 /// Observability services: event store and telemetry.
@@ -70,13 +77,6 @@ pub struct AppState {
     pub observability: ObservabilityServices,
     pub concurrency: ConcurrencyServices,
     pub notifications: NotificationServices,
-    pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
-    /// Feishu Bot intake handler. None when feishu intake is disabled or not configured.
-    pub feishu_intake: Option<Arc<crate::intake::feishu::FeishuIntake>>,
-    /// Pre-built GitHub intake poller, shared between orchestrator and completion callback.
-    pub github_intake: Option<Arc<dyn crate::intake::IntakeSource>>,
-    /// Completion callback invoked when a task reaches a terminal state.
-    pub completion_callback: Option<task_runner::CompletionCallback>,
 }
 
 impl AppState {
@@ -298,11 +298,20 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                 Arc::new(RwLock::new(map))
             },
             plan_db: Some(plan_db),
+            feishu_intake,
+            github_intake,
+            completion_callback,
         },
         engines: EngineServices {
             skills: Arc::new(RwLock::new(skill_store)),
             rules: Arc::new(RwLock::new(rule_engine)),
             gc_agent,
+            interceptors: vec![
+                Arc::new(crate::contract_validator::ContractValidator::new()),
+                Arc::new(crate::post_validator::PostExecutionValidator::new(
+                    validation_config,
+                )),
+            ],
         },
         observability: ObservabilityServices { events },
         concurrency: ConcurrencyServices {
@@ -316,15 +325,6 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             notify_tx: None,
             initialized: Arc::new(AtomicBool::new(false)),
         },
-        interceptors: vec![
-            Arc::new(crate::contract_validator::ContractValidator::new()),
-            Arc::new(crate::post_validator::PostExecutionValidator::new(
-                validation_config,
-            )),
-        ],
-        feishu_intake,
-        github_intake,
-        completion_callback,
     })
 }
 
@@ -480,7 +480,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     crate::intake::build_orchestrator(
         &state.core.server.config.intake,
         Some(&state.core.server.config.server.data_dir),
-        state.feishu_intake.clone(),
+        state.core.feishu_intake.clone(),
     )
     .start(state.clone());
 
