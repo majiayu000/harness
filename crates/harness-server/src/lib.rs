@@ -18,6 +18,7 @@ pub mod http;
 pub mod intake;
 pub mod notify;
 pub mod plan_db;
+pub mod policy_enforcer;
 pub mod post_validator;
 pub mod router;
 pub mod scheduler;

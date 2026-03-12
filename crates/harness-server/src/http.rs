@@ -175,6 +175,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     rule_engine
         .load_configured_requirements()
         .context("failed to load configured rules.requirements_path")?;
+    let rule_engine_arc = Arc::new(RwLock::new(rule_engine));
 
     let events = Arc::new(
         harness_observe::EventStore::with_policies_and_otel(
@@ -301,7 +302,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         },
         engines: EngineServices {
             skills: Arc::new(RwLock::new(skill_store)),
-            rules: Arc::new(RwLock::new(rule_engine)),
+            rules: rule_engine_arc.clone(),
             gc_agent,
         },
         observability: ObservabilityServices { events },
@@ -317,6 +318,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             initialized: Arc::new(AtomicBool::new(false)),
         },
         interceptors: vec![
+            Arc::new(crate::policy_enforcer::PolicyEnforcer::new(rule_engine_arc)),
             Arc::new(crate::contract_validator::ContractValidator::new()),
             Arc::new(crate::post_validator::PostExecutionValidator::new(
                 validation_config,
