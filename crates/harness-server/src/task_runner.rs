@@ -138,7 +138,7 @@ pub struct CreateTaskRequest {
     pub wait_secs: u64,
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
-    /// Per-turn timeout in seconds; defaults to 600 (10 min).
+    /// Per-turn timeout in seconds; defaults to 3600 (1 hour).
     #[serde(default = "default_turn_timeout")]
     pub turn_timeout_secs: u64,
 }
@@ -187,7 +187,7 @@ fn default_max_rounds() -> u32 {
     5
 }
 fn default_turn_timeout() -> u64 {
-    600
+    3600
 }
 
 fn describe_detect_main_worktree_join_error(join_err: &tokio::task::JoinError) -> String {
