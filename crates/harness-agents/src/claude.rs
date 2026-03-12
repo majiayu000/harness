@@ -1,4 +1,6 @@
-use crate::streaming::{send_stream_item, stream_child_output};
+use crate::streaming::{
+    filter_agent_stderr, log_captured_stderr, send_stream_item, stream_child_output,
+};
 use async_trait::async_trait;
 use harness_core::SandboxMode;
 use harness_core::{AgentRequest, AgentResponse, Capability, CodeAgent, StreamItem, TokenUsage};
@@ -84,6 +86,7 @@ impl CodeAgent for ClaudeCodeAgent {
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        log_captured_stderr(&stderr, self.name());
 
         if !output.status.success() {
             return Err(harness_core::HarnessError::AgentExecution(format!(
@@ -122,12 +125,19 @@ impl CodeAgent for ClaudeCodeAgent {
             .env_remove("CLAUDECODE")
             .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
 
         let mut child = cmd.spawn().map_err(|error| {
             harness_core::HarnessError::AgentExecution(format!("failed to run claude: {error}"))
         })?;
+
+        if let Some(stderr) = child.stderr.take() {
+            let agent = self.name().to_string();
+            tokio::spawn(async move {
+                filter_agent_stderr(stderr, &agent).await;
+            });
+        }
 
         stream_child_output(&mut child, &tx, self.name()).await?;
         send_stream_item(
