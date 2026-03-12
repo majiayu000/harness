@@ -10,6 +10,29 @@ pub mod rules;
 pub mod skills;
 pub mod thread;
 
+/// Validate a project root path, returning early with an `INTERNAL_ERROR`
+/// response on failure.
+///
+/// # Example
+/// ```ignore
+/// let project_root = validate_root!(&project_root, id);
+/// ```
+#[macro_export]
+macro_rules! validate_root {
+    ($path:expr, $id:expr) => {
+        match crate::handlers::validate_project_root($path) {
+            Ok(p) => p,
+            Err(e) => {
+                return harness_protocol::RpcResponse::error(
+                    $id,
+                    harness_protocol::INTERNAL_ERROR,
+                    e,
+                )
+            }
+        }
+    };
+}
+
 /// Validate that `file` is an existing path within `project_root` (already canonicalized).
 /// Returns the canonicalized file path on success.
 pub(crate) fn validate_file_in_root(

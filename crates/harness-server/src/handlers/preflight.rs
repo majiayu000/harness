@@ -1,4 +1,4 @@
-use crate::http::AppState;
+use crate::{http::AppState, validate_root};
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use harness_core::{AgentRequest, CodeAgent, Event, EventFilters, SessionId, TaskComplexity};
@@ -201,10 +201,7 @@ pub async fn preflight(
     project_root: PathBuf,
     task_description: String,
 ) -> RpcResponse {
-    let project_root = match crate::handlers::validate_project_root(&project_root) {
-        Ok(p) => p,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-    };
+    let project_root = validate_root!(&project_root, id);
 
     let agent = match state.server.agent_registry.default_agent() {
         Some(a) => a,

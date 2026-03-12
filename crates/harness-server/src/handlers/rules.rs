@@ -1,4 +1,4 @@
-use crate::http::AppState;
+use crate::{http::AppState, validate_root};
 use harness_protocol::{RpcResponse, INTERNAL_ERROR};
 use std::path::PathBuf;
 
@@ -7,10 +7,7 @@ pub async fn rule_load(
     id: Option<serde_json::Value>,
     project_root: PathBuf,
 ) -> RpcResponse {
-    let project_root = match crate::handlers::validate_project_root(&project_root) {
-        Ok(p) => p,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-    };
+    let project_root = validate_root!(&project_root, id);
     let mut rules = state.rules.write().await;
     match rules.load(&project_root) {
         Ok(()) => {
@@ -27,10 +24,7 @@ pub async fn rule_check(
     project_root: PathBuf,
     files: Option<Vec<PathBuf>>,
 ) -> RpcResponse {
-    let project_root = match crate::handlers::validate_project_root(&project_root) {
-        Ok(p) => p,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-    };
+    let project_root = validate_root!(&project_root, id);
     let file_count = files.as_ref().map_or(0, |paths| paths.len());
     let result = {
         let rules = state.rules.read().await;

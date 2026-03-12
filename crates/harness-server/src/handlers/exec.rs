@@ -1,4 +1,4 @@
-use crate::http::AppState;
+use crate::{http::AppState, validate_root};
 use harness_core::ExecPlanId;
 use harness_protocol::{RpcResponse, INTERNAL_ERROR, NOT_FOUND};
 use std::path::PathBuf;
@@ -9,10 +9,7 @@ pub async fn exec_plan_init(
     spec: String,
     project_root: PathBuf,
 ) -> RpcResponse {
-    let project_root = match crate::handlers::validate_project_root(&project_root) {
-        Ok(p) => p,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-    };
+    let project_root = validate_root!(&project_root, id);
     match harness_exec::ExecPlan::from_spec(&spec, &project_root) {
         Ok(plan) => {
             let plan_id = plan.id.clone();
