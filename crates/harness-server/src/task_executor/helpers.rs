@@ -225,17 +225,19 @@ pub(crate) async fn update_status(
     crate::task_runner::update_status(store, task_id, status, round).await;
 }
 
-/// Build the context item list for an agent request: loaded skills plus any
-/// cascading AGENTS.md content found under `project_root`.
+/// Build the context item list for an agent request: skills matching the prompt
+/// trigger patterns plus any cascading AGENTS.md content found under
+/// `project_root`.
 pub(crate) async fn collect_context_items(
     skills: &RwLock<harness_skills::SkillStore>,
     project_root: &Path,
+    prompt: &str,
 ) -> Vec<ContextItem> {
     let mut items: Vec<ContextItem> = {
         let guard = skills.read().await;
         guard
-            .list()
-            .iter()
+            .match_prompt(prompt)
+            .into_iter()
             .map(|s| ContextItem::Skill {
                 id: s.id.to_string(),
                 content: s.content.clone(),

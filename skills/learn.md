@@ -1,5 +1,7 @@
 # Learn
 
+<!-- trigger-patterns: extract rules, learn from, reusable rules, after fixing, after implementation -->
+
 ## Trigger
 Use after fixing a bug or completing a successful implementation to extract reusable rules or skills from the experience.
 

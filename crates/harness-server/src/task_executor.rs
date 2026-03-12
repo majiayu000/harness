@@ -186,7 +186,7 @@ pub(crate) async fn run_task(
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default(), git)
     };
 
-    let context_items = collect_context_items(&skills, &project).await;
+    let context_items = collect_context_items(&skills, &project, &first_prompt).await;
 
     let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
 

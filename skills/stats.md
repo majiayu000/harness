@@ -1,5 +1,7 @@
 # Stats
 
+<!-- trigger-patterns: hook stats, hook statistics, compliance trends, violated rules, aggregated stats -->
+
 ## Trigger
 Use to view aggregated hook statistics, compliance trends, and identify the most violated rules.
 

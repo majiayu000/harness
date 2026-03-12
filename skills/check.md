@@ -1,5 +1,7 @@
 # Check
 
+<!-- trigger-patterns: health report, project check, run guards, guard scripts, project health -->
+
 ## Trigger
 Use to run all guard scripts and produce a project health report. Run before committing or after significant changes.
 

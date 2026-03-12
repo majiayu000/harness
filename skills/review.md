@@ -1,5 +1,7 @@
 # Review
 
+<!-- trigger-patterns: code review, review pr, review the, review this, review diff -->
+
 ## Trigger
 Use to perform structured code review on a changeset (diff, PR, or set of modified files).
 

@@ -1,5 +1,7 @@
 # GC
 
+<!-- trigger-patterns: garbage collect, disk usage, clean worktrees, archive logs, code smells -->
+
 ## Trigger
 Use periodically (weekly or when disk usage is high) to archive old logs, clean worktrees, and scan for code smells.
 

@@ -1,5 +1,7 @@
 # Cross Review
 
+<!-- trigger-patterns: cross review, adversarial review, dual model, high stakes, security sensitive -->
+
 ## Trigger
 Use for adversarial dual-model review on high-stakes changes (security-sensitive code, public API changes, data migrations).
 

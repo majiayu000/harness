@@ -1,5 +1,7 @@
 # Preflight
 
+<!-- trigger-patterns: preflight, before changes, 3-5 files, medium complexity, identify constraints -->
+
 ## Trigger
 Use before medium-complexity changes (3-5 files) to identify constraints and risks before writing any code.
 

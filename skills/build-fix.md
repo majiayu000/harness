@@ -1,5 +1,7 @@
 # Build Fix
 
+<!-- trigger-patterns: build error, build failed, compilation error, compile error, cargo error, fix build -->
+
 ## Trigger
 Use when a build or compilation fails to locate root cause and apply the minimal fix.
 

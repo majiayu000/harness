@@ -1,5 +1,7 @@
 # Exec Plan
 
+<!-- trigger-patterns: exec plan, execution plan, long running, multi-session, milestone plan -->
+
 ## Trigger
 Use after a SPEC is approved to generate a milestone-based execution plan for long-running tasks (multi-session).
 
