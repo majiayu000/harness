@@ -187,7 +187,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     );
 
     let signal_detector = harness_gc::SignalDetector::new(
-        server.config.gc.signal_thresholds.clone().into(),
+        server.config.gc.signal_thresholds.clone(),
         harness_core::ProjectId::new(),
     );
     let draft_store = harness_gc::DraftStore::new(&dir)?;
