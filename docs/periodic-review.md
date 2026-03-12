@@ -66,8 +66,7 @@ modules stabilize.
 
 #### 7. Declaration-Execution Gap *
 
-Components built but never wired into the actual execution path. Config structs
-defined but code uses `Default::default()` instead of loading from config. Modules
+Components built but never wired into the actual execution path. Modules
 registered in `lib.rs` but never imported or called. Functions or traits implemented
 but never invoked from startup/runtime code.
 
@@ -76,12 +75,12 @@ no context about Agent A's work. The component compiles, tests pass in isolation
 the feature is non-functional end-to-end.
 
 **Detection:** Check `build_app_state()`, `main()`, and startup code to verify all
-declared components are actually connected. Trace config load paths to ensure
-`load_config()` results propagate to consuming code.
+declared components are actually connected.
 
 **Example:** `SkillStore` implements persistence, but `discover()` is never called.
-`SignalThresholds` defined in config with tunable fields, but code constructs via
-`Default::default()`.
+
+**Note:** Config structs using `Default::default()` instead of loaded values belong
+to #11 (Config-Default Divergence), not here. This item covers component wiring only.
 
 ### HIGH
 
