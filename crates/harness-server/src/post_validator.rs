@@ -23,36 +23,92 @@ impl PostExecutionValidator {
         Self { config }
     }
 
-    /// Validate that a command string does not contain shell operators that
-    /// could enable command injection or execution escalation.
+    /// Validate that a command string does not contain unquoted shell operators
+    /// that could enable command chaining or execution escalation.
     ///
-    /// Legitimate CI tool invocations (cargo, go, npm, ruff, etc.) never
-    /// require shell operators; their presence indicates either an
-    /// attacker-supplied payload or a misconfigured `ValidationConfig`.
+    /// The check is quote-aware: operators inside single quotes (`'...'`) are
+    /// ignored because the shell treats them as literal text. Inside double
+    /// quotes (`"..."`), only command substitution (`` ` `` and `$(`) is
+    /// blocked since `|`, `&`, `;`, `>`, `<` are inactive there.
     ///
     /// Applied only to operator-configured commands (from `ValidationConfig`).
     /// Hardcoded defaults from `lang_detect` are trusted at compile time and
     /// bypass this check.
     fn validate_command_safety(cmd_str: &str) -> Result<(), String> {
-        const SHELL_OPERATORS: &[&str] = &[
-            "&&", "||", // logical chaining
-            ">>", // append redirection (must precede ">")
-            "|",  // piping
-            ";",  // command separator
-            "&",  // background execution
-            ">",  // output redirection
-            "<",  // input redirection
-            "`",  // backtick command substitution
-            "$(", // $() command substitution
-        ];
-        if let Some(op) = SHELL_OPERATORS.iter().find(|&&op| cmd_str.contains(op)) {
+        // Newlines and carriage returns are command separators in sh -c.
+        if cmd_str.contains('\n') || cmd_str.contains('\r') {
             return Err(format!(
-                "Command `{cmd_str}` rejected: contains shell operator `{op}`. \
-                 Validation commands must invoke toolchain binaries directly \
-                 without shell operators."
+                "Command `{}` rejected: contains newline character. \
+                 Validation commands must be single-line.",
+                cmd_str.lines().next().unwrap_or(cmd_str)
             ));
         }
+
+        let chars: Vec<char> = cmd_str.chars().collect();
+        let len = chars.len();
+        let mut i = 0;
+        let mut in_single = false;
+        let mut in_double = false;
+
+        while i < len {
+            let c = chars[i];
+
+            // Track quote state.
+            if c == '\'' && !in_double {
+                in_single = !in_single;
+                i += 1;
+                continue;
+            }
+            if c == '"' && !in_single {
+                in_double = !in_double;
+                i += 1;
+                continue;
+            }
+
+            // Inside single quotes everything is literal — skip.
+            if in_single {
+                i += 1;
+                continue;
+            }
+
+            // Command substitution is active in both unquoted and double-quoted contexts.
+            if c == '`' {
+                return Err(Self::safety_error(cmd_str, "`"));
+            }
+            if c == '$' && i + 1 < len && chars[i + 1] == '(' {
+                return Err(Self::safety_error(cmd_str, "$("));
+            }
+
+            // Remaining shell operators are only active when fully unquoted.
+            if !in_double {
+                let op = match c {
+                    '|' if i + 1 < len && chars[i + 1] == '|' => Some("||"),
+                    '|' => Some("|"),
+                    '&' if i + 1 < len && chars[i + 1] == '&' => Some("&&"),
+                    '&' => Some("&"),
+                    ';' => Some(";"),
+                    '>' if i + 1 < len && chars[i + 1] == '>' => Some(">>"),
+                    '>' => Some(">"),
+                    '<' => Some("<"),
+                    _ => None,
+                };
+                if let Some(op) = op {
+                    return Err(Self::safety_error(cmd_str, op));
+                }
+            }
+
+            i += 1;
+        }
+
         Ok(())
+    }
+
+    fn safety_error(cmd_str: &str, op: &str) -> String {
+        format!(
+            "Command `{cmd_str}` rejected: contains shell operator `{op}`. \
+             Validation commands must invoke toolchain binaries directly \
+             without shell operators."
+        )
     }
 
     /// Run a shell command via `sh -c` to support pipes, quotes, and complex expressions.
@@ -335,6 +391,13 @@ mod tests {
             "bundle exec rubocop",
             "true",
             "false",
+            // Operators inside single quotes are literal — must pass.
+            "go test -run 'TestA|TestB'",
+            "grep -E 'foo|bar' src/",
+            "curl 'https://example.com?a=1&b=2'",
+            // Operators inside double quotes (except $( and `) are inactive.
+            "echo \"hello | world\"",
+            "echo \"a && b\"",
         ];
         for cmd in safe {
             assert!(
@@ -369,10 +432,24 @@ mod tests {
     }
 
     #[test]
-    fn command_substitution_is_blocked_in_config_commands() {
+    fn newline_bypasses_are_blocked() {
+        assert!(
+            PostExecutionValidator::validate_command_safety("echo ok\nwhoami").is_err(),
+            "newline should be blocked"
+        );
+        assert!(
+            PostExecutionValidator::validate_command_safety("echo ok\r\nwhoami").is_err(),
+            "carriage return should be blocked"
+        );
+    }
+
+    #[test]
+    fn command_substitution_blocked_even_inside_double_quotes() {
+        // $( and ` are active inside double quotes in sh.
         assert!(
             PostExecutionValidator::validate_command_safety("test -z \"$(gofmt -l .)\"").is_err()
         );
+        assert!(PostExecutionValidator::validate_command_safety("echo \"`whoami`\"").is_err());
     }
 
     #[tokio::test]
