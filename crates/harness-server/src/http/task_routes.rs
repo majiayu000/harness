@@ -72,6 +72,7 @@ pub(crate) async fn enqueue_task(
         req,
         state.workspace_mgr.clone(),
         permit,
+        state.completion_callback.clone(),
     )
     .await;
 

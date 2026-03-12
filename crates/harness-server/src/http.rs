@@ -50,6 +50,10 @@ pub struct AppState {
     pub task_queue: Arc<crate::task_queue::TaskQueue>,
     /// Feishu Bot intake handler. None when feishu intake is disabled or not configured.
     pub feishu_intake: Option<Arc<crate::intake::feishu::FeishuIntake>>,
+    /// Pre-built GitHub intake poller, shared between orchestrator and completion callback.
+    pub github_intake: Option<Arc<dyn crate::intake::IntakeSource>>,
+    /// Completion callback invoked when a task reaches a terminal state.
+    pub completion_callback: Option<task_runner::CompletionCallback>,
 }
 
 impl AppState {
@@ -236,6 +240,21 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         }
     });
 
+    let github_intake: Option<Arc<dyn crate::intake::IntakeSource>> = server
+        .config
+        .intake
+        .github
+        .as_ref()
+        .filter(|cfg| cfg.enabled && !cfg.repo.is_empty())
+        .map(|cfg| {
+            Arc::new(crate::intake::github_issues::GitHubIssuesPoller::new(
+                cfg,
+                Some(&dir),
+            )) as Arc<dyn crate::intake::IntakeSource>
+        });
+
+    let completion_callback = build_completion_callback(&feishu_intake, &github_intake);
+
     Ok(AppState {
         server,
         project_root,
@@ -272,7 +291,83 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         workspace_mgr,
         task_queue,
         feishu_intake,
+        github_intake,
+        completion_callback,
     })
+}
+
+fn build_completion_callback(
+    feishu_intake: &Option<Arc<crate::intake::feishu::FeishuIntake>>,
+    github_intake: &Option<Arc<dyn crate::intake::IntakeSource>>,
+) -> Option<task_runner::CompletionCallback> {
+    let mut sources: std::collections::HashMap<String, Arc<dyn crate::intake::IntakeSource>> =
+        std::collections::HashMap::new();
+    if let Some(gh) = github_intake {
+        sources.insert(gh.name().to_string(), gh.clone());
+    }
+    if let Some(fi) = feishu_intake {
+        let fi_source: Arc<dyn crate::intake::IntakeSource> = fi.clone();
+        sources.insert(fi_source.name().to_string(), fi_source);
+    }
+    if sources.is_empty() {
+        return None;
+    }
+    let sources = Arc::new(sources);
+    Some(Arc::new(move |task: task_runner::TaskState| {
+        let sources = sources.clone();
+        Box::pin(async move {
+            let Some(source_name) = task.source.as_deref() else {
+                return;
+            };
+            let Some(external_id) = task.external_id.as_deref() else {
+                tracing::warn!(
+                    task_id = ?task.id,
+                    source = source_name,
+                    "completion_callback: task missing external_id, skipping"
+                );
+                return;
+            };
+            let Some(source) = sources.get(source_name) else {
+                tracing::warn!(
+                    task_id = ?task.id,
+                    source = source_name,
+                    "completion_callback: intake source not found, skipping"
+                );
+                return;
+            };
+            let summary = match &task.status {
+                task_runner::TaskStatus::Done => task
+                    .pr_url
+                    .as_deref()
+                    .map(|url| format!("PR: {url}"))
+                    .unwrap_or_else(|| "Task completed.".to_string()),
+                task_runner::TaskStatus::Failed => {
+                    task.error.as_deref().unwrap_or("unknown error").to_string()
+                }
+                _ => {
+                    tracing::warn!(
+                        task_id = ?task.id,
+                        status = ?task.status,
+                        "completion_callback: called with non-terminal status, skipping"
+                    );
+                    return;
+                }
+            };
+            let result = crate::intake::TaskCompletionResult {
+                status: task.status.clone(),
+                pr_url: task.pr_url.clone(),
+                error: task.error.clone(),
+                summary,
+            };
+            if let Err(e) = source.on_task_complete(external_id, &result).await {
+                tracing::warn!(
+                    task_id = ?task.id,
+                    source = source_name,
+                    "on_task_complete failed: {e}"
+                );
+            }
+        })
+    }))
 }
 
 /// Resolve the reviewer agent for independent agent review.
