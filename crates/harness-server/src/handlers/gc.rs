@@ -16,6 +16,7 @@ fn gc_adopt_task_request(
         wait_secs: gc_config.adopt_wait_secs,
         max_rounds: gc_config.adopt_max_rounds,
         turn_timeout_secs: gc_config.adopt_turn_timeout_secs,
+        max_budget_usd: Some(gc_config.budget_per_signal_usd),
     }
 }
 
@@ -129,13 +130,12 @@ pub async fn gc_adopt(
                 );
             }
             let task_id = if let Some(agent) = state.core.server.agent_registry.default_agent() {
-                let paths_list = artifact_paths.join(", ");
-                let safe_paths = harness_core::prompts::wrap_external_data(&paths_list);
-                let prompt = format!(
-                    "GC drafted the following files:\n{safe_paths}\n\
-                         Review these changes, create a branch named gc/{draft_id}, \
-                         commit, push, and open a PR. \
-                         Print PR_URL=<url> on the last line."
+                let path_refs: Vec<&str> = artifact_paths.iter().map(String::as_str).collect();
+                let prompt = harness_core::prompts::gc_adopt_prompt(
+                    &draft_id.to_string(),
+                    &draft.rationale,
+                    &draft.validation,
+                    &path_refs,
                 );
                 let req = gc_adopt_task_request(
                     prompt,
@@ -214,6 +214,21 @@ mod tests {
         assert_eq!(req.wait_secs, 120);
         assert_eq!(req.max_rounds, 3);
         assert_eq!(req.turn_timeout_secs, 600);
+        assert_eq!(req.max_budget_usd, Some(0.5));
+    }
+
+    #[test]
+    fn gc_adopt_task_request_respects_budget_per_signal() {
+        let mut gc_config = harness_core::GcConfig::default();
+        gc_config.budget_per_signal_usd = 1.25;
+
+        let req = gc_adopt_task_request(
+            "prompt".to_string(),
+            &gc_config,
+            std::path::PathBuf::from("/tmp/project"),
+        );
+
+        assert_eq!(req.max_budget_usd, Some(1.25));
     }
 
     #[test]

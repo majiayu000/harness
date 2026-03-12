@@ -209,6 +209,7 @@ pub(crate) async fn run_task(
         prompt: first_prompt,
         project_root: project.clone(),
         context: context_items.clone(),
+        max_budget_usd: req.max_budget_usd,
         ..Default::default()
     };
 

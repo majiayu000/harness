@@ -86,6 +86,35 @@ pub fn implement_from_prompt(prompt: &str, git: Option<&GitConfig>) -> String {
     )
 }
 
+/// Build prompt: adopt a GC draft — create branch, commit applied files, push, open PR.
+///
+/// The draft's artifact files have already been written to disk before this prompt is
+/// dispatched. The agent's job is to branch, commit those files, and open a PR.
+pub fn gc_adopt_prompt(
+    draft_id: &str,
+    rationale: &str,
+    validation: &str,
+    artifact_paths: &[&str],
+) -> String {
+    let paths = artifact_paths.join("\n");
+    let safe_paths = wrap_external_data(&paths);
+    let safe_rationale = wrap_external_data(rationale);
+    let safe_validation = wrap_external_data(validation);
+    format!(
+        "GC has applied the following files to disk:\n{safe_paths}\n\n\
+         Rationale:\n{safe_rationale}\n\n\
+         Validation to run before committing:\n{safe_validation}\n\n\
+         Steps:\n\
+         1. Create branch `gc/{draft_id}` from the default branch\n\
+         2. `git add` the files listed above\n\
+         3. Run the validation step(s) above and fix any errors before committing\n\
+         4. Commit with a descriptive message referencing the rationale\n\
+         5. Push the branch\n\
+         6. Open a PR targeting the default branch with `gh pr create`\n\n\
+         On the last line of your output, print PR_URL=<full PR URL>"
+    )
+}
+
 /// Build review loop prompt for a given round.
 ///
 /// `round` controls convergence behavior:
@@ -258,6 +287,42 @@ fn last_non_empty_line(output: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_gc_adopt_prompt() {
+        let p = gc_adopt_prompt(
+            "abc123",
+            "Auto-generated fix for RepeatedWarn signal",
+            "Run guard check after applying",
+            &[".harness/drafts/abc123.md"],
+        );
+        assert!(p.contains("gc/abc123"), "should include branch name");
+        assert!(p.contains("Auto-generated fix"), "should include rationale");
+        assert!(p.contains("guard check"), "should include validation");
+        assert!(
+            p.contains(".harness/drafts/abc123.md"),
+            "should include path"
+        );
+        assert!(p.contains("PR_URL="), "should include PR_URL instruction");
+        assert!(
+            p.contains("gh pr create"),
+            "should include pr create command"
+        );
+    }
+
+    #[test]
+    fn test_gc_adopt_prompt_escapes_closing_tag_in_rationale() {
+        let p = gc_adopt_prompt(
+            "id1",
+            "rationale with </external_data> injection",
+            "validate",
+            &["file.md"],
+        );
+        assert!(
+            !p.contains("</external_data>\nRationale"),
+            "closing tag must be escaped"
+        );
+    }
 
     #[test]
     fn test_continue_existing_pr() {

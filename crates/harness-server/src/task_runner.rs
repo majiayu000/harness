@@ -141,6 +141,9 @@ pub struct CreateTaskRequest {
     /// Per-turn timeout in seconds; defaults to 600 (10 min).
     #[serde(default = "default_turn_timeout")]
     pub turn_timeout_secs: u64,
+    /// Maximum spend budget for the agent in USD; None means unlimited.
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
 }
 
 impl Default for CreateTaskRequest {
@@ -154,6 +157,7 @@ impl Default for CreateTaskRequest {
             wait_secs: default_wait(),
             max_rounds: default_max_rounds(),
             turn_timeout_secs: default_turn_timeout(),
+            max_budget_usd: None,
         }
     }
 }
@@ -568,6 +572,7 @@ mod tests {
             wait_secs: 0,
             max_rounds: 0,
             turn_timeout_secs: 30,
+            max_budget_usd: None,
         };
 
         let events = Arc::new(harness_observe::EventStore::new(dir.path())?);
@@ -640,6 +645,7 @@ mod tests {
             wait_secs: 0,
             max_rounds: 0,
             turn_timeout_secs: 30,
+            max_budget_usd: None,
         };
 
         let queue = crate::task_queue::TaskQueue::unbounded();
@@ -761,6 +767,7 @@ mod tests {
             wait_secs: 0,
             max_rounds: 0,
             turn_timeout_secs: 30,
+            max_budget_usd: None,
         };
 
         let queue = crate::task_queue::TaskQueue::unbounded();
