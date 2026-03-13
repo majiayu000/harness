@@ -5,3 +5,4 @@ exec-plan-*.md
 crates/*/.harness/
 **/.harness/drafts/
 .claude/
+~/.local/
