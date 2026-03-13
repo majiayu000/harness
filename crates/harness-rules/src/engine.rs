@@ -3,6 +3,7 @@ use crate::exec_policy::{
 };
 use anyhow::Context;
 use harness_core::{Category, GuardId, Language, RuleId, Severity, Violation};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -222,6 +223,7 @@ impl RuleEngine {
         }
 
         let paths = Self::parse_frontmatter_paths(&frontmatter)?;
+        let fix_pattern = Self::parse_frontmatter_fix_pattern(&frontmatter)?;
 
         // Extract rule blocks from markdown body (## ID: Title pattern)
         for section in body.split("\n## ") {
@@ -268,7 +270,7 @@ impl RuleEngine {
                     category,
                     paths: paths.clone(),
                     description: section.to_string(),
-                    fix_pattern: None,
+                    fix_pattern: fix_pattern.clone(),
                 });
             }
         }
@@ -296,6 +298,95 @@ impl RuleEngine {
             _ => Vec::new(),
         };
         Ok(paths)
+    }
+
+    /// Parse `fix_pattern:` field from YAML frontmatter.
+    ///
+    /// The value is a sed-style replacement string: `s<DELIM>PATTERN<DELIM>REPLACEMENT<DELIM>`.
+    /// The character immediately after `s` is used as the delimiter (e.g. `/`, `|`, `#`).
+    /// Returns `None` when the field is absent or the frontmatter is empty.
+    fn parse_frontmatter_fix_pattern(frontmatter: &str) -> anyhow::Result<Option<String>> {
+        if frontmatter.is_empty() {
+            return Ok(None);
+        }
+        let value = serde_yaml::from_str::<serde_yaml::Value>(frontmatter)?;
+        let fix_pattern = match value.get("fix_pattern") {
+            Some(serde_yaml::Value::String(s)) => Some(s.clone()),
+            _ => None,
+        };
+        Ok(fix_pattern)
+    }
+
+    /// Parse a sed-style fix_pattern string into a compiled `Regex` and replacement string.
+    ///
+    /// Format: `s<DELIM>PATTERN<DELIM>REPLACEMENT[<DELIM>]`
+    /// Returns `None` when the string does not match the expected format or the regex is invalid.
+    pub fn parse_fix_pattern(fix_pattern: &str) -> Option<(Regex, String)> {
+        let bytes = fix_pattern.as_bytes();
+        if bytes.len() < 2 || bytes[0] != b's' {
+            return None;
+        }
+        let delim = bytes[1] as char;
+        let rest = &fix_pattern[2..];
+        let parts: Vec<&str> = rest.splitn(3, delim).collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        let pattern = parts[0];
+        let replacement = parts[1].trim_end_matches(delim);
+        let re = Regex::new(pattern).ok()?;
+        Some((re, replacement.to_string()))
+    }
+
+    /// Apply the fix_pattern of the matching rule to the violating file.
+    ///
+    /// Returns `true` when the file was modified, `false` when no fix was applicable or needed.
+    pub fn apply_fix(&self, violation: &Violation, project_root: &Path) -> anyhow::Result<bool> {
+        let rule = self.rules.iter().find(|r| r.id == violation.rule_id);
+        let Some(rule) = rule else {
+            return Ok(false);
+        };
+        let Some(fix_pattern) = &rule.fix_pattern else {
+            return Ok(false);
+        };
+
+        let (re, replacement) = Self::parse_fix_pattern(fix_pattern)
+            .ok_or_else(|| anyhow::anyhow!("invalid fix_pattern syntax: {}", fix_pattern))?;
+
+        let file_path = if violation.file.is_absolute() {
+            violation.file.clone()
+        } else {
+            project_root.join(&violation.file)
+        };
+
+        let content = std::fs::read_to_string(&file_path)
+            .with_context(|| format!("failed to read {}", file_path.display()))?;
+        let new_content = re.replace_all(&content, replacement.as_str()).to_string();
+        if new_content == content {
+            return Ok(false);
+        }
+        std::fs::write(&file_path, &new_content)
+            .with_context(|| format!("failed to write {}", file_path.display()))?;
+        Ok(true)
+    }
+
+    /// Apply fixes for all violations that have a matching rule with a fix_pattern.
+    ///
+    /// Returns the number of files that were modified.
+    pub fn apply_fixes(
+        &self,
+        violations: &[Violation],
+        project_root: &Path,
+    ) -> anyhow::Result<usize> {
+        let mut fixed = 0usize;
+        for violation in violations {
+            match self.apply_fix(violation, project_root) {
+                Ok(true) => fixed += 1,
+                Ok(false) => {}
+                Err(e) => tracing::warn!("auto-fix failed for {}: {e}", violation.rule_id),
+            }
+        }
+        Ok(fixed)
     }
 
     pub fn register_guard(&mut self, guard: Guard) {
@@ -834,6 +925,192 @@ host_executable(name = "git", paths = ["/opt/homebrew/bin/git"])
             homebrew_result.decision,
             Some(crate::exec_policy::ExecDecision::Allow)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_frontmatter_fix_pattern_returns_none_when_absent() -> anyhow::Result<()> {
+        let frontmatter = "paths: [\"*.rs\"]\n";
+        let result = RuleEngine::parse_frontmatter_fix_pattern(frontmatter)?;
+        assert!(result.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_frontmatter_fix_pattern_returns_none_for_empty_frontmatter() -> anyhow::Result<()> {
+        let result = RuleEngine::parse_frontmatter_fix_pattern("")?;
+        assert!(result.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_frontmatter_fix_pattern_extracts_value() -> anyhow::Result<()> {
+        let frontmatter = "paths: [\"*.rs\"]\nfix_pattern: 's/foo/bar/'\n";
+        let result = RuleEngine::parse_frontmatter_fix_pattern(frontmatter)?;
+        assert_eq!(result.as_deref(), Some("s/foo/bar/"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_fix_pattern_parses_slash_delimited_sed_string() {
+        let (re, replacement) = RuleEngine::parse_fix_pattern("s/foo/bar/").expect("should parse");
+        assert_eq!(re.as_str(), "foo");
+        assert_eq!(replacement, "bar");
+    }
+
+    #[test]
+    fn parse_fix_pattern_accepts_pipe_delimiter() {
+        let (re, replacement) = RuleEngine::parse_fix_pattern("s|foo|bar|").expect("should parse");
+        assert_eq!(re.as_str(), "foo");
+        assert_eq!(replacement, "bar");
+    }
+
+    #[test]
+    fn parse_fix_pattern_returns_none_for_invalid_format() {
+        assert!(RuleEngine::parse_fix_pattern("not-a-pattern").is_none());
+        assert!(RuleEngine::parse_fix_pattern("s/only_pattern").is_none());
+        assert!(RuleEngine::parse_fix_pattern("").is_none());
+    }
+
+    #[test]
+    fn apply_fix_rewrites_file_when_pattern_matches() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file_path = dir.path().join("sample.rs");
+        std::fs::write(&file_path, "let x = foo();\nlet y = foo();\n")?;
+
+        let mut engine = RuleEngine::new();
+        engine.add_rule(Rule {
+            id: RuleId::from_str("FIX-01"),
+            title: "Replace foo with bar".to_string(),
+            severity: Severity::Low,
+            category: Category::Style,
+            paths: vec![],
+            description: String::new(),
+            fix_pattern: Some("s/foo/bar/".to_string()),
+        });
+
+        let violation = Violation {
+            rule_id: RuleId::from_str("FIX-01"),
+            file: file_path.clone(),
+            line: Some(1),
+            message: "use bar".to_string(),
+            severity: Severity::Low,
+        };
+
+        let modified = engine.apply_fix(&violation, dir.path())?;
+        assert!(modified);
+        let content = std::fs::read_to_string(&file_path)?;
+        assert_eq!(content, "let x = bar();\nlet y = bar();\n");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_fix_returns_false_when_no_fix_pattern() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file_path = dir.path().join("sample.rs");
+        std::fs::write(&file_path, "let x = foo();\n")?;
+
+        let mut engine = RuleEngine::new();
+        engine.add_rule(Rule {
+            id: RuleId::from_str("FIX-02"),
+            title: "No fix".to_string(),
+            severity: Severity::Low,
+            category: Category::Style,
+            paths: vec![],
+            description: String::new(),
+            fix_pattern: None,
+        });
+
+        let violation = Violation {
+            rule_id: RuleId::from_str("FIX-02"),
+            file: file_path,
+            line: Some(1),
+            message: "some issue".to_string(),
+            severity: Severity::Low,
+        };
+
+        let modified = engine.apply_fix(&violation, dir.path())?;
+        assert!(!modified);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_fix_returns_false_when_pattern_does_not_match() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file_path = dir.path().join("sample.rs");
+        std::fs::write(&file_path, "let x = baz();\n")?;
+
+        let mut engine = RuleEngine::new();
+        engine.add_rule(Rule {
+            id: RuleId::from_str("FIX-03"),
+            title: "Replace foo".to_string(),
+            severity: Severity::Low,
+            category: Category::Style,
+            paths: vec![],
+            description: String::new(),
+            fix_pattern: Some("s/foo/bar/".to_string()),
+        });
+
+        let violation = Violation {
+            rule_id: RuleId::from_str("FIX-03"),
+            file: file_path,
+            line: Some(1),
+            message: "use bar".to_string(),
+            severity: Severity::Low,
+        };
+
+        let modified = engine.apply_fix(&violation, dir.path())?;
+        assert!(!modified);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_fixes_returns_count_of_modified_files() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file1 = dir.path().join("a.rs");
+        let file2 = dir.path().join("b.rs");
+        std::fs::write(&file1, "foo()\n")?;
+        std::fs::write(&file2, "foo()\n")?;
+
+        let mut engine = RuleEngine::new();
+        engine.add_rule(Rule {
+            id: RuleId::from_str("FIX-04"),
+            title: "Replace foo".to_string(),
+            severity: Severity::Low,
+            category: Category::Style,
+            paths: vec![],
+            description: String::new(),
+            fix_pattern: Some("s/foo/bar/".to_string()),
+        });
+
+        let violations = vec![
+            Violation {
+                rule_id: RuleId::from_str("FIX-04"),
+                file: file1,
+                line: Some(1),
+                message: "use bar".to_string(),
+                severity: Severity::Low,
+            },
+            Violation {
+                rule_id: RuleId::from_str("FIX-04"),
+                file: file2,
+                line: Some(1),
+                message: "use bar".to_string(),
+                severity: Severity::Low,
+            },
+        ];
+
+        let fixed = engine.apply_fixes(&violations, dir.path())?;
+        assert_eq!(fixed, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_rule_file_sets_fix_pattern_from_frontmatter() -> anyhow::Result<()> {
+        let md = "---\npaths: [\"*.rs\"]\nfix_pattern: \"s/foo/bar/\"\n---\n\n## FIX-10: Replace foo\n\nlow severity\n";
+        let engine = make_engine_with_content(md)?;
+        assert_eq!(engine.rules().len(), 1);
+        assert_eq!(engine.rules()[0].fix_pattern.as_deref(), Some("s/foo/bar/"));
         Ok(())
     }
 

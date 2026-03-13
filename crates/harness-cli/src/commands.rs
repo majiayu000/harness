@@ -141,6 +141,9 @@ pub enum RuleCommand {
         /// Project directory
         #[arg(default_value = ".")]
         project: PathBuf,
+        /// Automatically apply fix_pattern replacements for violations that have one
+        #[arg(long)]
+        auto_fix: bool,
     },
 }
 
@@ -306,7 +309,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     engine.load(&project)?;
                     println!("Loaded {} rules", engine.rules().len());
                 }
-                RuleCommand::Check { project } => {
+                RuleCommand::Check { project, auto_fix } => {
                     let mut engine = configured_rule_engine(&config);
                     engine.load(&project)?;
                     let violations = engine.scan(&project).await?;
@@ -339,6 +342,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                                 v.rule_id,
                                 v.message
                             );
+                        }
+                        if auto_fix {
+                            let fixed = engine.apply_fixes(&violations, &project)?;
+                            println!("Auto-fixed {fixed} file(s)");
                         }
                     }
                 }

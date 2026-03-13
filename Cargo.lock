@@ -1233,6 +1233,7 @@ dependencies = [
  "chrono",
  "glob",
  "harness-core",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",
