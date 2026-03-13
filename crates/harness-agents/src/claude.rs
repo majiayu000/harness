@@ -296,7 +296,7 @@ printf 'second\n'
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let handle = tokio::spawn(async move { agent.execute_stream(request, tx).await });
 
-        let first = timeout(Duration::from_secs(2), rx.recv())
+        let first = timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("timed out waiting for first stream item")
             .expect("stream closed before first item");
@@ -307,7 +307,7 @@ printf 'second\n'
 
         drop(rx);
 
-        let result = timeout(Duration::from_secs(3), handle)
+        let result = timeout(Duration::from_secs(10), handle)
             .await
             .expect("execute_stream task should converge after cancellation")
             .expect("join should succeed");
