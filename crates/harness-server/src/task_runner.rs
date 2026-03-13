@@ -398,6 +398,7 @@ where
                     crate::parallel_dispatch::decompose(req.prompt.as_deref().unwrap_or_default());
                 if subtask_prompts.len() > 1 {
                     let project_config = harness_core::config::load_project_config(&project_root);
+                    let remote = project_config.git.remote.clone();
                     let base_branch = project_config.git.base_branch.clone();
 
                     let context_items = crate::task_executor::collect_context_items(
@@ -414,6 +415,7 @@ where
                         subtask_prompts,
                         wmgr.clone(),
                         &project_root,
+                        &remote,
                         &base_branch,
                         context_items,
                         turn_timeout,
@@ -450,8 +452,13 @@ where
         // If workspace isolation is configured, create a per-task git worktree.
         let run_project = if let Some(ref wmgr) = workspace_mgr {
             let project_config = harness_core::config::load_project_config(&project_root);
-            wmgr.create_workspace(&id, &project_root, &project_config.git.base_branch)
-                .await?
+            wmgr.create_workspace(
+                &id,
+                &project_root,
+                &project_config.git.remote,
+                &project_config.git.base_branch,
+            )
+            .await?
         } else {
             project_root
         };

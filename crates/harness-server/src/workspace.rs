@@ -26,17 +26,23 @@ impl WorkspaceManager {
 
     /// Create a git worktree for the given task under `config.root/<sanitized_task_id>`.
     ///
-    /// Creates branch `harness/<task_id>` based on `base_branch`. Runs `after_create_hook`
-    /// on new creation only. Idempotent: returns existing path if already active.
+    /// Fetches `remote/base_branch` first to ensure the worktree starts from the latest
+    /// upstream state. Creates branch `harness/<task_id>` based on `remote/base_branch`.
+    /// Runs `after_create_hook` on new creation only. Idempotent: returns existing path
+    /// if already active.
     pub async fn create_workspace(
         &self,
         task_id: &TaskId,
         source_repo: &Path,
+        remote: &str,
         base_branch: &str,
     ) -> anyhow::Result<PathBuf> {
-        // Validate base_branch to prevent unexpected git behavior.
+        // Validate inputs to prevent unexpected git behavior.
         if !is_valid_branch_name(base_branch) {
             anyhow::bail!("invalid base_branch: {base_branch:?}");
+        }
+        if !is_valid_branch_name(remote) {
+            anyhow::bail!("invalid remote: {remote:?}");
         }
 
         // Idempotent: use entry API to avoid TOCTOU race between get and insert.
@@ -44,10 +50,32 @@ impl WorkspaceManager {
             return Ok(entry.workspace_path.clone());
         }
 
+        // Fetch latest base_branch from remote so the worktree starts from upstream HEAD.
+        let fetch_output = tokio::process::Command::new("git")
+            .args([
+                "-C",
+                &source_repo.to_string_lossy(),
+                "fetch",
+                remote,
+                base_branch,
+            ])
+            .output()
+            .await?;
+
+        if !fetch_output.status.success() {
+            let stderr = String::from_utf8_lossy(&fetch_output.stderr);
+            tracing::warn!(
+                "git fetch {remote} {base_branch} failed (continuing with local): {}",
+                stderr.trim()
+            );
+        }
+
         let sanitized = sanitize_task_id(&task_id.0);
         let workspace_path = self.config.root.join(&sanitized);
 
-        // Create git worktree with a new branch based on base_branch.
+        // Create git worktree based on remote/base_branch (latest upstream).
+        // Falls back to local base_branch if fetch failed above.
+        let remote_ref = format!("{remote}/{base_branch}");
         let branch = format!("harness/{}", task_id.0);
         let output = tokio::process::Command::new("git")
             .args([
@@ -58,18 +86,35 @@ impl WorkspaceManager {
                 "-B",
                 &branch,
                 &workspace_path.to_string_lossy(),
-                base_branch,
+                &remote_ref,
             ])
             .output()
             .await?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "git worktree add failed for task {}: {}",
-                task_id.0,
-                stderr.trim()
-            );
+            // Fallback: try local base_branch (useful for repos without remotes, e.g. tests).
+            let fallback = tokio::process::Command::new("git")
+                .args([
+                    "-C",
+                    &source_repo.to_string_lossy(),
+                    "worktree",
+                    "add",
+                    "-B",
+                    &branch,
+                    &workspace_path.to_string_lossy(),
+                    base_branch,
+                ])
+                .output()
+                .await?;
+
+            if !fallback.status.success() {
+                let stderr = String::from_utf8_lossy(&fallback.stderr);
+                anyhow::bail!(
+                    "git worktree add failed for task {}: {}",
+                    task_id.0,
+                    stderr.trim()
+                );
+            }
         }
 
         // Run after_create_hook if set. Fatal on failure: cleanup partial worktree.
@@ -328,7 +373,7 @@ mod tests {
         let task_id = TaskId("test-task-001".to_string());
 
         let ws_path = mgr
-            .create_workspace(&task_id, source.path(), &branch)
+            .create_workspace(&task_id, source.path(), "origin", &branch)
             .await
             .expect("create");
         assert!(ws_path.is_dir());
@@ -368,11 +413,11 @@ mod tests {
         let task_id = TaskId("test-task-002".to_string());
 
         let path1 = mgr
-            .create_workspace(&task_id, source.path(), &branch)
+            .create_workspace(&task_id, source.path(), "origin", &branch)
             .await
             .expect("create first");
         let path2 = mgr
-            .create_workspace(&task_id, source.path(), &branch)
+            .create_workspace(&task_id, source.path(), "origin", &branch)
             .await
             .expect("create second");
         assert_eq!(path1, path2);
@@ -398,7 +443,7 @@ mod tests {
         let mgr = WorkspaceManager::new(config).expect("new");
         let task_id = TaskId("test-task-003".to_string());
 
-        mgr.create_workspace(&task_id, source.path(), &branch)
+        mgr.create_workspace(&task_id, source.path(), "origin", &branch)
             .await
             .expect("create");
         assert!(
@@ -424,7 +469,9 @@ mod tests {
         let mgr = WorkspaceManager::new(config).expect("new");
         let task_id = TaskId("test-task-004".to_string());
 
-        let result = mgr.create_workspace(&task_id, source.path(), &branch).await;
+        let result = mgr
+            .create_workspace(&task_id, source.path(), "origin", &branch)
+            .await;
         assert!(result.is_err(), "should fail when hook exits 1");
         assert!(
             result
@@ -455,7 +502,7 @@ mod tests {
             .collect();
 
         for id in &ids {
-            mgr.create_workspace(id, source.path(), &branch)
+            mgr.create_workspace(id, source.path(), "origin", &branch)
                 .await
                 .expect("create");
         }

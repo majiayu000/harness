@@ -82,6 +82,7 @@ pub async fn run_parallel_subtasks(
     subtask_prompts: Vec<String>,
     workspace_mgr: Arc<WorkspaceManager>,
     source_repo: &Path,
+    remote: &str,
     base_branch: &str,
     context: Vec<ContextItem>,
     turn_timeout: Duration,
@@ -94,7 +95,7 @@ pub async fn run_parallel_subtasks(
     for (i, prompt) in subtask_prompts.into_iter().enumerate() {
         let sub_id = TaskId(format!("{}-p{i}", task_id.0));
         match workspace_mgr
-            .create_workspace(&sub_id, source_repo, base_branch)
+            .create_workspace(&sub_id, source_repo, remote, base_branch)
             .await
         {
             Ok(workspace) => {
