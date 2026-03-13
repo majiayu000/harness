@@ -18,7 +18,8 @@ pub trait DbEntity: Serialize + for<'de> Deserialize<'de> + Send + Unpin + 'stat
 pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {
     let url = format!("sqlite:{}?mode=rwc", path.display());
     let pool = SqlitePoolOptions::new()
-        .max_connections(4)
+        .max_connections(8)
+        .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(&url)
         .await?;
     Ok(pool)
