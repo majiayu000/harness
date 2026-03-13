@@ -39,7 +39,7 @@ pub fn default_checkpoint_path(project_root: &Path) -> PathBuf {
 
 /// Filter `events` to only those with `ts > since`. When `since` is `None`,
 /// all events are returned (full scan).
-pub fn filter_events_since<'a>(events: &'a [Event], since: Option<DateTime<Utc>>) -> &'a [Event] {
+pub fn filter_events_since(events: &[Event], since: Option<DateTime<Utc>>) -> &[Event] {
     let Some(cutoff) = since else {
         return events;
     };
