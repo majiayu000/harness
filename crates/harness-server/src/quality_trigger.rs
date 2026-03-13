@@ -57,7 +57,7 @@ impl QualityTrigger {
 
     /// Grade recent events, log the result, and auto-trigger GC if warranted.
     pub async fn check_and_maybe_trigger(&self) {
-        let events = match self.events.query(&EventFilters::default()) {
+        let events = match self.events.query(&EventFilters::default()).await {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!("quality_trigger: failed to query events: {e}");
@@ -66,7 +66,9 @@ impl QualityTrigger {
         };
 
         let report = QualityGrader::grade(&events, 0);
-        self.events.log_quality_grade(report.grade, report.score);
+        self.events
+            .log_quality_grade(report.grade, report.score)
+            .await;
 
         tracing::info!(
             grade = ?report.grade,
@@ -115,8 +117,12 @@ mod tests {
     use harness_gc::{DraftStore, GcAgent, SignalDetector};
     use std::path::Path;
 
-    fn make_trigger(dir: &Path, auto_gc_grades: Vec<Grade>, cooldown_secs: u64) -> QualityTrigger {
-        let events = Arc::new(EventStore::new(dir).expect("event store"));
+    async fn make_trigger(
+        dir: &Path,
+        auto_gc_grades: Vec<Grade>,
+        cooldown_secs: u64,
+    ) -> QualityTrigger {
+        let events = Arc::new(EventStore::new(dir).await.expect("event store"));
         let signal_detector = SignalDetector::new(
             harness_gc::signal_detector::SignalThresholds::default(),
             harness_core::ProjectId::new(),
@@ -140,48 +146,48 @@ mod tests {
 
     // --- grade_triggers_gc mapping tests ---
 
-    #[test]
-    fn grade_d_triggers_gc_by_default() {
+    #[tokio::test]
+    async fn grade_d_triggers_gc_by_default() {
         let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300);
+        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
         assert!(trigger.grade_triggers_gc(Grade::D));
     }
 
-    #[test]
-    fn grade_a_does_not_trigger_gc_by_default() {
+    #[tokio::test]
+    async fn grade_a_does_not_trigger_gc_by_default() {
         let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300);
+        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
         assert!(!trigger.grade_triggers_gc(Grade::A));
     }
 
-    #[test]
-    fn grade_b_does_not_trigger_gc_by_default() {
+    #[tokio::test]
+    async fn grade_b_does_not_trigger_gc_by_default() {
         let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300);
+        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
         assert!(!trigger.grade_triggers_gc(Grade::B));
     }
 
-    #[test]
-    fn grade_c_does_not_trigger_gc_by_default() {
+    #[tokio::test]
+    async fn grade_c_does_not_trigger_gc_by_default() {
         let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300);
+        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
         assert!(!trigger.grade_triggers_gc(Grade::C));
     }
 
-    #[test]
-    fn configuring_c_and_d_both_trigger() {
+    #[tokio::test]
+    async fn configuring_c_and_d_both_trigger() {
         let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::C, Grade::D], 300);
+        let trigger = make_trigger(dir.path(), vec![Grade::C, Grade::D], 300).await;
         assert!(trigger.grade_triggers_gc(Grade::C));
         assert!(trigger.grade_triggers_gc(Grade::D));
         assert!(!trigger.grade_triggers_gc(Grade::A));
         assert!(!trigger.grade_triggers_gc(Grade::B));
     }
 
-    #[test]
-    fn empty_auto_gc_grades_never_triggers() {
+    #[tokio::test]
+    async fn empty_auto_gc_grades_never_triggers() {
         let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![], 300);
+        let trigger = make_trigger(dir.path(), vec![], 300).await;
         assert!(!trigger.grade_triggers_gc(Grade::A));
         assert!(!trigger.grade_triggers_gc(Grade::B));
         assert!(!trigger.grade_triggers_gc(Grade::C));
@@ -190,35 +196,35 @@ mod tests {
 
     // --- cooldown tests ---
 
-    #[test]
-    fn cooldown_elapsed_when_never_triggered() {
+    #[tokio::test]
+    async fn cooldown_elapsed_when_never_triggered() {
         let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300);
+        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
         assert!(trigger.cooldown_elapsed());
     }
 
-    #[test]
-    fn cooldown_not_elapsed_immediately_after_trigger() {
+    #[tokio::test]
+    async fn cooldown_not_elapsed_immediately_after_trigger() {
         let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300);
+        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
         trigger.last_triggered.store(unix_now(), Ordering::Relaxed);
         assert!(!trigger.cooldown_elapsed());
     }
 
-    #[test]
-    fn zero_cooldown_always_elapsed() {
+    #[tokio::test]
+    async fn zero_cooldown_always_elapsed() {
         let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 0);
+        let trigger = make_trigger(dir.path(), vec![Grade::D], 0).await;
         trigger.last_triggered.store(unix_now(), Ordering::Relaxed);
         assert!(trigger.cooldown_elapsed());
     }
 
     // --- log_quality_grade integration test ---
 
-    #[test]
-    fn check_logs_quality_grade_event() {
+    #[tokio::test]
+    async fn check_logs_quality_grade_event() {
         let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300);
+        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
 
         // Seed a passing event so grade comes back as A (score ~ 100)
         trigger
@@ -229,11 +235,10 @@ mod tests {
                 "Edit",
                 Decision::Pass,
             ))
+            .await
             .unwrap();
 
-        // Run synchronously (no agent needed for just the grading path)
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(trigger.check_and_maybe_trigger());
+        trigger.check_and_maybe_trigger().await;
 
         let events = trigger
             .events
@@ -241,6 +246,7 @@ mod tests {
                 hook: Some("quality_grade".to_string()),
                 ..Default::default()
             })
+            .await
             .unwrap();
         assert_eq!(events.len(), 1, "expected exactly one quality_grade event");
         assert!(events[0]

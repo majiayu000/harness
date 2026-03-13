@@ -55,12 +55,14 @@ pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcRespo
     state
         .observability
         .events
-        .persist_rule_scan(&project_root, &violations);
+        .persist_rule_scan(&project_root, &violations)
+        .await;
 
     let events = match state
         .observability
         .events
         .query(&harness_core::EventFilters::default())
+        .await
     {
         Ok(e) => e,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),

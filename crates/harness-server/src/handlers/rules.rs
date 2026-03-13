@@ -69,7 +69,8 @@ pub async fn rule_check(
             state
                 .observability
                 .events
-                .persist_rule_scan(&project_root, &violations);
+                .persist_rule_scan(&project_root, &violations)
+                .await;
             match serde_json::to_value(&violations) {
                 Ok(v) => RpcResponse::success(id, v),
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -109,7 +110,7 @@ mod tests {
             AgentRegistry::new("test"),
         ));
         let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
-        let events = Arc::new(harness_observe::EventStore::new(dir)?);
+        let events = Arc::new(harness_observe::EventStore::new(dir).await?);
         let signal_detector = harness_gc::SignalDetector::new(
             server.config.gc.signal_thresholds.clone().into(),
             harness_core::ProjectId::new(),
@@ -183,10 +184,14 @@ mod tests {
             "warning path must not return result"
         );
 
-        let events = state.observability.events.query(&EventFilters {
-            hook: Some("rule_scan".to_string()),
-            ..Default::default()
-        })?;
+        let events = state
+            .observability
+            .events
+            .query(&EventFilters {
+                hook: Some("rule_scan".to_string()),
+                ..Default::default()
+            })
+            .await?;
         assert!(
             events.is_empty(),
             "warning path should not persist rule_scan events"

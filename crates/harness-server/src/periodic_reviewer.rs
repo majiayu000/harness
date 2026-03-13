@@ -42,6 +42,7 @@ async fn run_review_tick(state: &Arc<AppState>, config: &ReviewConfig) -> anyhow
             hook: Some("periodic_review".to_string()),
             ..EventFilters::default()
         })
+        .await
         .map_err(|e| anyhow::anyhow!("failed to query periodic_review events: {e}"))?;
 
     let last_review_ts = events.iter().map(|e| e.ts).max();
@@ -107,7 +108,7 @@ async fn run_review_tick(state: &Arc<AppState>, config: &ReviewConfig) -> anyhow
         "scheduler",
         Decision::Pass,
     );
-    if let Err(err) = state.observability.events.log(&event) {
+    if let Err(err) = state.observability.events.log(&event).await {
         tracing::warn!("scheduler: failed to log periodic_review event: {err}");
     }
 

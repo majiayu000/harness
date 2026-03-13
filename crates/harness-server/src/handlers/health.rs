@@ -13,7 +13,12 @@ pub async fn health_check(
 
     // Query historical events before persisting the current scan to avoid the
     // just-persisted rule_check events inflating the quality stability score.
-    let events = match state.observability.events.query(&EventFilters::default()) {
+    let events = match state
+        .observability
+        .events
+        .query(&EventFilters::default())
+        .await
+    {
         Ok(evts) => evts,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     };
@@ -35,7 +40,8 @@ pub async fn health_check(
     state
         .observability
         .events
-        .persist_rule_scan(&project_root, &violations);
+        .persist_rule_scan(&project_root, &violations)
+        .await;
 
     let report = generate_health_report(&events, &violations);
     match serde_json::to_value(&report) {
@@ -106,7 +112,11 @@ mod tests {
             "scan failure must not return a success payload"
         );
 
-        let events = state.observability.events.query(&EventFilters::default())?;
+        let events = state
+            .observability
+            .events
+            .query(&EventFilters::default())
+            .await?;
         assert!(
             events.iter().all(|event| event.hook != "rule_scan"),
             "scan failure should not persist a rule_scan event"
@@ -126,7 +136,7 @@ pub async fn stats_query(
         until,
         ..Default::default()
     };
-    let events = match state.observability.events.query(&filters) {
+    let events = match state.observability.events.query(&filters).await {
         Ok(evts) => evts,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     };

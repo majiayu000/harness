@@ -51,6 +51,7 @@ impl Scheduler {
             .observability
             .events
             .query(&EventFilters::default())
+            .await
             .map_err(|err| anyhow::anyhow!("failed to query events: {err}"))?;
         let project_root = state.core.project_root.clone();
         let violations = {
@@ -65,7 +66,8 @@ impl Scheduler {
         state
             .observability
             .events
-            .persist_rule_scan(&project_root, &violations);
+            .persist_rule_scan(&project_root, &violations)
+            .await;
         let report = generate_health_report(&events, &violations);
         tracing::info!(
             grade = ?report.quality.grade,
@@ -94,7 +96,7 @@ mod tests {
             AgentRegistry::new("test"),
         ));
         let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
-        let events = Arc::new(harness_observe::EventStore::new(dir)?);
+        let events = Arc::new(harness_observe::EventStore::new(dir).await?);
         let signal_detector = harness_gc::SignalDetector::new(
             harness_gc::signal_detector::SignalThresholds::default(),
             harness_core::ProjectId::new(),
@@ -189,7 +191,11 @@ mod tests {
 
         Scheduler::run_health_tick(&state).await?;
 
-        let events = state.observability.events.query(&EventFilters::default())?;
+        let events = state
+            .observability
+            .events
+            .query(&EventFilters::default())
+            .await?;
         let scan = events
             .iter()
             .rev()
@@ -217,7 +223,11 @@ mod tests {
             "unexpected scheduler scan failure message: {message}"
         );
 
-        let events = state.observability.events.query(&EventFilters::default())?;
+        let events = state
+            .observability
+            .events
+            .query(&EventFilters::default())
+            .await?;
         assert!(
             events.iter().all(|event| event.hook != "rule_scan"),
             "scan failure should not persist a rule_scan event"

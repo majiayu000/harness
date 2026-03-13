@@ -97,7 +97,7 @@ pub async fn run_preflight(
 
     let resp = agent.execute(req).await?;
     let parsed = parse_preflight_output(&resp.output)?;
-    let baseline = latest_baseline_scan(events.as_ref())?;
+    let baseline = latest_baseline_scan(events.as_ref()).await?;
 
     Ok(PreflightResult {
         constraints: parsed.constraints,
@@ -151,11 +151,12 @@ fn parse_preflight_output(output: &str) -> anyhow::Result<ParsedPreflightOutput>
     })
 }
 
-fn latest_baseline_scan(
+async fn latest_baseline_scan(
     events: &harness_observe::EventStore,
 ) -> anyhow::Result<BaselineScanSnapshot> {
     let all_events = events
         .query(&EventFilters::default())
+        .await
         .map_err(|e| anyhow!("failed to query event store for baseline scan: {e}"))?;
 
     select_latest_baseline_scan(&all_events).ok_or_else(|| {
@@ -389,7 +390,7 @@ COMPLEXITY: complex"
     #[tokio::test]
     async fn run_preflight_uses_scan_result_from_event_store() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
-        let events = Arc::new(harness_observe::EventStore::new(temp.path())?);
+        let events = Arc::new(harness_observe::EventStore::new(temp.path()).await?);
         let session_id = SessionId::new();
 
         let scan_event = Event::new(
@@ -398,19 +399,23 @@ COMPLEXITY: complex"
             "RuleEngine",
             Decision::Warn,
         );
-        events.log(&scan_event)?;
-        events.log(&Event::new(
-            session_id.clone(),
-            "rule_check",
-            "SEC-01",
-            Decision::Block,
-        ))?;
-        events.log(&Event::new(
-            session_id.clone(),
-            "rule_check",
-            "SEC-02",
-            Decision::Warn,
-        ))?;
+        events.log(&scan_event).await?;
+        events
+            .log(&Event::new(
+                session_id.clone(),
+                "rule_check",
+                "SEC-01",
+                Decision::Block,
+            ))
+            .await?;
+        events
+            .log(&Event::new(
+                session_id.clone(),
+                "rule_check",
+                "SEC-02",
+                Decision::Warn,
+            ))
+            .await?;
 
         let result = run_preflight(
             Arc::new(StaticAgent {
@@ -443,7 +448,7 @@ COMPLEXITY: complex"
             }),
             Arc::new(RwLock::new(SkillStore::new())),
             Arc::new(RwLock::new(RuleEngine::new())),
-            Arc::new(harness_observe::EventStore::new(temp.path())?),
+            Arc::new(harness_observe::EventStore::new(temp.path()).await?),
             temp.path().to_path_buf(),
             "test task".to_string(),
         )
@@ -461,7 +466,6 @@ COMPLEXITY: complex"
     #[tokio::test]
     async fn run_preflight_errors_when_event_store_query_fails() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
-        std::fs::create_dir_all(temp.path().join("events.jsonl"))?;
 
         let err = run_preflight(
             Arc::new(StaticAgent {
@@ -469,7 +473,7 @@ COMPLEXITY: complex"
             }),
             Arc::new(RwLock::new(SkillStore::new())),
             Arc::new(RwLock::new(RuleEngine::new())),
-            Arc::new(harness_observe::EventStore::new(temp.path())?),
+            Arc::new(harness_observe::EventStore::new(temp.path()).await?),
             temp.path().to_path_buf(),
             "test task".to_string(),
         )
@@ -478,7 +482,7 @@ COMPLEXITY: complex"
 
         assert!(
             err.to_string()
-                .contains("failed to query event store for baseline scan"),
+                .contains("no baseline scan results found in event store"),
             "unexpected error: {err}"
         );
         Ok(())

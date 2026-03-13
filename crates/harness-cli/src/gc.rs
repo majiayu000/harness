@@ -23,7 +23,7 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
                 &config.otel,
             )
             .await?;
-            let events = event_store.query(&EventFilters::default())?;
+            let events = event_store.query(&EventFilters::default()).await?;
             event_store.shutdown().await;
 
             let thresholds = map_thresholds(&config.gc.signal_thresholds);
