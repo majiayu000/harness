@@ -97,6 +97,8 @@ pub struct NotificationServices {
     pub notify_tx: Option<crate::notify::NotifySender>,
     /// Whether the client has completed the initialize/initialized handshake.
     pub initialized: Arc<AtomicBool>,
+    /// Broadcast channel used to signal all active WebSocket connections to close gracefully.
+    pub ws_shutdown_tx: broadcast::Sender<()>,
 }
 
 pub struct AppState {
@@ -386,6 +388,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             notification_lag_log_every,
             notify_tx: None,
             initialized: Arc::new(AtomicBool::new(false)),
+            ws_shutdown_tx: broadcast::channel(1).0,
         },
         interceptors: vec![
             Arc::new(crate::contract_validator::ContractValidator::new()),
@@ -662,8 +665,13 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let ws_shutdown_tx = state.notifications.ws_shutdown_tx.clone();
     let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            tracing::info!("server shutting down: closing WebSocket connections");
+            ws_shutdown_tx.send(()).ok();
+        })
         .await;
     tracing::info!("server shutting down");
     state.observability.events.shutdown().await;
