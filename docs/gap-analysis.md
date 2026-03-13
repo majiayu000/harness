@@ -1,24 +1,24 @@
 # Harness vs OpenAI Harness Engineering — Gap Analysis
 
-> Date: 2026-03-03
-> Scope: 8-dimension coverage comparison after completing PR review loop automation
+> Date: 2026-03-13 (updated)
+> Scope: 8-dimension coverage comparison — updated after 27 architectural PRs merged
 
 ## Summary
 
-**Overall coverage: 50%** — Type system and protocol layer are spec-complete, but ~20 protocol methods return `METHOD_NOT_FOUND` in `router.rs`. The skeleton is solid; the muscle is missing.
+**Overall coverage: 95%** — All 38 JSON-RPC methods are routed and functional. Thread persistence, parallel dispatch, skill persistence, ExecPlan DB, and all observability methods are implemented. Remaining gaps are minor: guard script library, auto-fix patterns, and SDK publishing.
 
 ## Coverage Table
 
-| Dimension | Coverage | Core Gap | Difficulty |
-|-----------|----------|----------|------------|
-| Golden Principles | 70% | Rules are static-only, no runtime interception hooks | Medium |
-| App Server (Thread/Turn/Item) | 55% | 20+ protocol methods return METHOD_NOT_FOUND, Thread not persisted | **High** |
-| GC Agent | 60% | Violations produce drafts only, no automatic PR creation | Medium |
-| Taste Invariants | 65% | Guard script library empty, fix_pattern always None | Medium |
-| Improvement Cycles | 35% | ExecPlan has no DB, Skills lack usage stats, no auto-trigger | **High** |
-| Feedback Loops | 40% | EventLog/EventQuery not wired, PR feedback doesn't flow back | Medium |
-| Multi-Agent Coordination | 25% | Single-agent serial execution, no parallel dispatch or tool isolation | **High** |
-| Skill System | 50% | Skills not persisted, not auto-injected into agent context | Medium |
+| Dimension | Coverage | Status | Notes |
+|-----------|----------|--------|-------|
+| Golden Principles | 95% | Rules enforce via pre-turn interceptor + Starlark exec policy | Minor: guard script library thin |
+| App Server (Thread/Turn/Item) | 95% | All 38 methods routed, Thread persisted to SQLite, WebSocket transport | Minor: approval flow untested |
+| GC Agent | 90% | Signal detection + draft lifecycle + adopt pipeline with git commit/PR | Minor: no incremental scanning |
+| Taste Invariants | 85% | 83 rules deployed, QualityGrader 4-axis scoring | Minor: fix_pattern always None |
+| Improvement Cycles | 90% | ExecPlan persisted, Skills with disk persistence + auto-injection | Minor: no usage stats |
+| Feedback Loops | 90% | EventLog/EventQuery wired, OTLP export, auto-trigger Gemini review | Minor: no external signal ingestion |
+| Multi-Agent Coordination | 90% | Parallel dispatch with file-aware decomposition + isolated worktrees | Minor: no agent tool isolation |
+| Skill System | 90% | CRUD + 4-layer discovery + disk persistence + trigger patterns | Minor: no versioning |
 
 ## Dimension Details
 

@@ -163,7 +163,7 @@ exporter = "otlp-http"
 
 ## JSON-RPC API
 
-Harness exposes 30 methods over JSON-RPC 2.0 (stdio, HTTP, or WebSocket):
+Harness exposes 38 methods over JSON-RPC 2.0 (stdio, HTTP, or WebSocket):
 
 | Category | Methods |
 |---|---|
@@ -177,6 +177,7 @@ Harness exposes 30 methods over JSON-RPC 2.0 (stdio, HTTP, or WebSocket):
 | Observability | `event/log`, `event/query`, `metrics/collect`, `metrics/query` |
 | Classification | `task/classify`, `learn/rules`, `learn/skills` |
 | Health | `health/check`, `stats/query`, `agent/list` |
+| VibeGuard | `preflight`, `cross_review` |
 
 ## Contributing
 
