@@ -207,12 +207,120 @@ fn parse_artifacts(output: &str, signal: &Signal) -> Vec<Artifact> {
         RemediationType::Skill => ArtifactType::Skill,
     };
 
-    // For now, treat the entire output as a single artifact
-    vec![Artifact {
-        artifact_type,
-        target_path: std::path::PathBuf::from(format!(".harness/drafts/{}.md", signal.id)),
-        content: output.to_string(),
-    }]
+    let code_artifacts = extract_code_block_artifacts(output, artifact_type);
+    let diff_artifacts = extract_diff_artifacts(output, artifact_type);
+
+    // Merge: code blocks take precedence over diffs for the same path
+    let mut seen = std::collections::HashSet::new();
+    let mut artifacts: Vec<Artifact> = Vec::new();
+    for artifact in code_artifacts.into_iter().chain(diff_artifacts) {
+        if seen.insert(artifact.target_path.clone()) {
+            artifacts.push(artifact);
+        }
+    }
+
+    // Fall back to single blob if no structured content found
+    if artifacts.is_empty() {
+        artifacts.push(Artifact {
+            artifact_type,
+            target_path: std::path::PathBuf::from(format!(".harness/drafts/{}.md", signal.id)),
+            content: output.to_string(),
+        });
+    }
+
+    artifacts
+}
+
+/// Extract artifacts from fenced code blocks that include a file path.
+///
+/// Matches patterns like:
+/// ` ```rust path/to/file.rs `
+/// ` ```python src/foo.py `
+fn extract_code_block_artifacts(output: &str, artifact_type: ArtifactType) -> Vec<Artifact> {
+    let mut artifacts = Vec::new();
+    let lines: Vec<&str> = output.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(rest) = line.strip_prefix("```") {
+            // Split into at most 2 parts: language and path
+            let mut parts = rest.splitn(2, ' ');
+            let _lang = parts.next().unwrap_or("");
+            if let Some(path) = parts.next() {
+                let path = path.trim();
+                if is_valid_file_path(path) {
+                    // Collect block content until closing ```
+                    let start = i + 1;
+                    let mut end = start;
+                    while end < lines.len() && lines[end] != "```" {
+                        end += 1;
+                    }
+                    artifacts.push(Artifact {
+                        artifact_type,
+                        target_path: std::path::PathBuf::from(path),
+                        content: lines[start..end].join("\n"),
+                    });
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    artifacts
+}
+
+/// Extract artifacts from unified diff hunks.
+///
+/// Matches `--- a/path` / `+++ b/path` headers and collects all following
+/// hunk lines (`@@` and context/add/remove lines).
+fn extract_diff_artifacts(output: &str, artifact_type: ArtifactType) -> Vec<Artifact> {
+    let mut artifacts = Vec::new();
+    let lines: Vec<&str> = output.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        if lines[i].starts_with("--- ") && i + 1 < lines.len() && lines[i + 1].starts_with("+++ ") {
+            let plus_line = lines[i + 1];
+            let raw_path = plus_line
+                .strip_prefix("+++ b/")
+                .or_else(|| plus_line.strip_prefix("+++ "))
+                .unwrap_or("")
+                .trim();
+
+            if !raw_path.is_empty() && raw_path != "/dev/null" && is_valid_file_path(raw_path) {
+                let start = i;
+                let mut end = i + 2;
+                // Collect hunk lines; stop at the next diff header
+                while end < lines.len() {
+                    if lines[end].starts_with("--- ")
+                        && end + 1 < lines.len()
+                        && lines[end + 1].starts_with("+++ ")
+                    {
+                        break;
+                    }
+                    end += 1;
+                }
+                artifacts.push(Artifact {
+                    artifact_type,
+                    target_path: std::path::PathBuf::from(raw_path),
+                    content: lines[start..end].join("\n"),
+                });
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    artifacts
+}
+
+/// Returns true when `s` looks like a file path (contains `/` or `.`).
+fn is_valid_file_path(s: &str) -> bool {
+    !s.is_empty() && (s.contains('/') || s.contains('.'))
 }
 
 #[cfg(test)]
@@ -305,5 +413,121 @@ mod tests {
         gc.draft_store.save(&draft).unwrap();
 
         gc.adopt(&draft.id).unwrap();
+    }
+
+    // --- parse_artifacts tests ---
+
+    fn make_signal(remediation: RemediationType) -> Signal {
+        Signal::new(
+            SignalType::RepeatedWarn,
+            ProjectId::new(),
+            serde_json::json!({}),
+            remediation,
+        )
+    }
+
+    #[test]
+    fn parse_artifacts_falls_back_to_single_blob_when_no_structure() {
+        let signal = make_signal(RemediationType::Guard);
+        let output = "Some plain text output with no code blocks or diffs.";
+        let artifacts = parse_artifacts(output, &signal);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].content, output);
+        assert!(artifacts[0].target_path.to_string_lossy().ends_with(".md"));
+    }
+
+    #[test]
+    fn parse_artifacts_extracts_code_blocks_with_paths() {
+        let signal = make_signal(RemediationType::Guard);
+        let output = "Here are the changes:\n\
+            ```rust src/main.rs\n\
+            fn main() {\n    println!(\"hello\");\n}\n\
+            ```\n\
+            And also:\n\
+            ```python tests/test_foo.py\n\
+            def test_foo():\n    pass\n\
+            ```\n";
+        let artifacts = parse_artifacts(output, &signal);
+        assert_eq!(artifacts.len(), 2);
+
+        let paths: Vec<_> = artifacts
+            .iter()
+            .map(|a| a.target_path.to_string_lossy().into_owned())
+            .collect();
+        assert!(paths.contains(&"src/main.rs".to_string()));
+        assert!(paths.contains(&"tests/test_foo.py".to_string()));
+
+        let main_rs = artifacts
+            .iter()
+            .find(|a| a.target_path.to_string_lossy() == "src/main.rs")
+            .unwrap();
+        assert!(main_rs.content.contains("fn main()"));
+    }
+
+    #[test]
+    fn parse_artifacts_skips_code_blocks_without_path() {
+        let signal = make_signal(RemediationType::Rule);
+        let output = "```rust\nfn foo() {}\n```\n";
+        let artifacts = parse_artifacts(output, &signal);
+        // No path in the block header → fall back to single blob
+        assert_eq!(artifacts.len(), 1);
+    }
+
+    #[test]
+    fn parse_artifacts_extracts_unified_diff() {
+        let signal = make_signal(RemediationType::Guard);
+        let output = "Apply this patch:\n\
+            --- a/src/lib.rs\n\
+            +++ b/src/lib.rs\n\
+            @@ -1,3 +1,4 @@\n\
+             fn foo() {}\n\
+            +fn bar() {}\n";
+        let artifacts = parse_artifacts(output, &signal);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].target_path.to_string_lossy(), "src/lib.rs");
+        assert!(artifacts[0].content.contains("+++ b/src/lib.rs"));
+    }
+
+    #[test]
+    fn parse_artifacts_multiple_diff_hunks() {
+        let signal = make_signal(RemediationType::Hook);
+        let output = "\
+            --- a/a.rs\n\
+            +++ b/a.rs\n\
+            @@ -1 +1 @@\n\
+            -old\n\
+            +new\n\
+            --- a/b.rs\n\
+            +++ b/b.rs\n\
+            @@ -1 +1 @@\n\
+            -foo\n\
+            +bar\n";
+        let artifacts = parse_artifacts(output, &signal);
+        assert_eq!(artifacts.len(), 2);
+        let paths: Vec<_> = artifacts
+            .iter()
+            .map(|a| a.target_path.to_string_lossy().into_owned())
+            .collect();
+        assert!(paths.contains(&"a.rs".to_string()));
+        assert!(paths.contains(&"b.rs".to_string()));
+    }
+
+    #[test]
+    fn parse_artifacts_code_block_takes_precedence_over_diff_same_path() {
+        let signal = make_signal(RemediationType::Skill);
+        let output = "\
+            ```rust src/lib.rs\n\
+            fn full_content() {}\n\
+            ```\n\
+            --- a/src/lib.rs\n\
+            +++ b/src/lib.rs\n\
+            @@ -1 +1 @@\n\
+            +fn full_content() {}\n";
+        let artifacts = parse_artifacts(output, &signal);
+        // Deduplication: same path, code block wins
+        assert_eq!(artifacts.len(), 1);
+        assert!(artifacts[0].content.contains("fn full_content()"));
+        // Content should be from the code block, not the diff header
+        assert!(!artifacts[0].content.contains("+++ b/src/lib.rs"));
     }
 }
