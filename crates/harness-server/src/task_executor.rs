@@ -314,10 +314,11 @@ pub(crate) async fn run_task(
         tracing::warn!(stderr = %stderr, "agent stderr during implementation");
     }
 
-    let pr_num = prompts::extract_pr_number(&output);
+    let pr_url = prompts::parse_pr_url(&output);
+    let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
 
     mutate_and_persist(store, task_id, |s| {
-        s.pr_url = pr_num.map(|n| format!("https://github.com/REPO/pull/{n}"));
+        s.pr_url = pr_url.clone();
         s.rounds.push(RoundResult {
             turn: 1,
             action: "implement".into(),

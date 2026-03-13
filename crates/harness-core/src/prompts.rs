@@ -562,6 +562,38 @@ mod tests {
         );
     }
 
+    /// Regression: extract_pr_number must NOT be called on raw multi-line agent
+    /// output — the `#` in markdown headers truncates the text before the PR URL.
+    /// The correct pipeline is parse_pr_url → extract_pr_number.
+    #[test]
+    fn test_parse_then_extract_from_markdown_output() {
+        let output = "\
+I'll implement the feature.
+
+## Plan
+1. Read the issue
+2. Write the code
+
+### Changes
+- Modified `src/lib.rs`
+
+PR_URL=https://github.com/owner/repo/pull/269";
+
+        // Direct call on raw output fails (the bug):
+        assert_eq!(extract_pr_number(output), None);
+
+        // Correct two-step pipeline succeeds:
+        let url = parse_pr_url(output).expect("should find PR_URL line");
+        assert_eq!(extract_pr_number(&url), Some(269));
+    }
+
+    #[test]
+    fn test_parse_pr_url_with_trailing_whitespace() {
+        let output = "done\nPR_URL=https://github.com/o/r/pull/5  \n";
+        let url = parse_pr_url(output).unwrap();
+        assert_eq!(extract_pr_number(&url), Some(5));
+    }
+
     #[test]
     fn test_is_lgtm_exact() {
         assert!(is_lgtm("some output\nLGTM"));
