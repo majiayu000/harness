@@ -473,8 +473,25 @@ mod tests {
         async fn execute_stream(
             &self,
             _req: harness_core::AgentRequest,
-            _tx: tokio::sync::mpsc::Sender<harness_core::StreamItem>,
+            tx: tokio::sync::mpsc::Sender<harness_core::StreamItem>,
         ) -> harness_core::Result<()> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let output = if call == 0 {
+                "Implemented\nPR_URL=https://github.com/example/repo/pull/123\n"
+            } else {
+                "Needs follow-up\nFIXED\n"
+            };
+            if tx
+                .send(harness_core::StreamItem::MessageDelta {
+                    text: output.to_string(),
+                })
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+            // Receiver may have dropped; ignore send error for Done sentinel.
+            tx.send(harness_core::StreamItem::Done).await.ok();
             Ok(())
         }
     }

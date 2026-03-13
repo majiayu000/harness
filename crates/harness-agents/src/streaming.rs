@@ -1,5 +1,5 @@
 use harness_core::{HarnessError, Item, StreamItem};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::Sender;
 
 const STDERR_ERROR_KEYWORDS: &[&str] = &[
@@ -69,7 +69,7 @@ pub(crate) async fn send_stream_item(
     })
 }
 
-/// Read stdout from a spawned child process, stream deltas via `tx`,
+/// Read stdout from a spawned child process line-by-line, stream deltas via `tx`,
 /// wait for exit, and return the collected output.
 pub(crate) async fn stream_child_output(
     child: &mut tokio::process::Child,
@@ -81,19 +81,17 @@ pub(crate) async fn stream_child_output(
         .take()
         .ok_or_else(|| HarnessError::AgentExecution(format!("{agent_name} stdout unavailable")))?;
 
-    let mut reader = BufReader::new(stdout);
+    let mut lines = BufReader::new(stdout).lines();
     let mut output = String::new();
-    let mut chunk = [0_u8; 1024];
 
     loop {
-        let read = reader.read(&mut chunk).await.map_err(|error| {
+        let maybe_line = lines.next_line().await.map_err(|error| {
             HarnessError::AgentExecution(format!("failed reading {agent_name} stdout: {error}"))
         })?;
-        if read == 0 {
+        let Some(line) = maybe_line else {
             break;
-        }
-
-        let delta = String::from_utf8_lossy(&chunk[..read]).to_string();
+        };
+        let delta = format!("{line}\n");
         output.push_str(&delta);
         send_stream_item(
             tx,
