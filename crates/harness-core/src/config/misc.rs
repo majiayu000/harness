@@ -1,3 +1,4 @@
+use crate::Grade;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -143,6 +144,12 @@ pub struct GcConfig {
     #[serde(default = "default_gc_draft_ttl_hours")]
     pub draft_ttl_hours: u64,
     pub signal_thresholds: SignalThresholdsConfig,
+    /// Grades that trigger an automatic GC run after task completion. Default: [D].
+    #[serde(default = "default_auto_gc_grades")]
+    pub auto_gc_grades: Vec<Grade>,
+    /// Minimum seconds between auto-triggered GC runs (cooldown). Default: 300.
+    #[serde(default = "default_auto_gc_cooldown_secs")]
+    pub auto_gc_cooldown_secs: u64,
 }
 
 impl Default for GcConfig {
@@ -156,6 +163,8 @@ impl Default for GcConfig {
             adopt_turn_timeout_secs: default_gc_adopt_turn_timeout_secs(),
             draft_ttl_hours: default_gc_draft_ttl_hours(),
             signal_thresholds: SignalThresholdsConfig::default(),
+            auto_gc_grades: default_auto_gc_grades(),
+            auto_gc_cooldown_secs: default_auto_gc_cooldown_secs(),
         }
     }
 }
@@ -174,6 +183,14 @@ fn default_gc_adopt_turn_timeout_secs() -> u64 {
 
 fn default_gc_draft_ttl_hours() -> u64 {
     72
+}
+
+fn default_auto_gc_grades() -> Vec<Grade> {
+    vec![Grade::D]
+}
+
+fn default_auto_gc_cooldown_secs() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
