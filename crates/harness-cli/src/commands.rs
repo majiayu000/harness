@@ -141,6 +141,9 @@ pub enum RuleCommand {
         /// Project directory
         #[arg(default_value = ".")]
         project: PathBuf,
+        /// Automatically apply fix patterns for violations that have one
+        #[arg(long)]
+        auto_fix: bool,
     },
 }
 
@@ -306,7 +309,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     engine.load(&project)?;
                     println!("Loaded {} rules", engine.rules().len());
                 }
-                RuleCommand::Check { project } => {
+                RuleCommand::Check { project, auto_fix } => {
                     let mut engine = configured_rule_engine(&config);
                     engine.load(&project)?;
                     let violations = engine.scan(&project).await?;
@@ -326,6 +329,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         Err(e) => tracing::warn!(
                             "Failed to initialize event store, rule scan not persisted: {e}"
                         ),
+                    }
+                    if auto_fix {
+                        let fixes = engine.apply_fix_patterns(&violations, &project)?;
+                        println!("Applied {fixes} fix(es)");
                     }
                     if violations.is_empty() {
                         println!("No violations found");
