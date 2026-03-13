@@ -6,8 +6,8 @@ mod project;
 mod server;
 
 pub use agents::{
-    AgentReviewConfig, AgentsConfig, AnthropicApiConfig, ApprovalPolicy, ClaudeAgentConfig,
-    CodexAgentConfig, CodexCloudConfig, SandboxMode,
+    AgentReviewConfig, AgentsConfig, AnthropicApiConfig, ApprovalPolicy, CapabilityProfile,
+    ClaudeAgentConfig, CodexAgentConfig, CodexCloudConfig, SandboxMode,
 };
 pub use intake::{FeishuIntakeConfig, GitHubIntakeConfig, IntakeConfig};
 pub use misc::{

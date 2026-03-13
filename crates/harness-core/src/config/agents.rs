@@ -1,6 +1,57 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Preset capability profile that determines which tools an agent may use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapabilityProfile {
+    /// Read-only access: Read, Grep, Glob only. Suitable for GC/review agents.
+    ReadOnly,
+    /// Standard access: Read, Write, Edit, Bash. Suitable for implementation agents.
+    Standard,
+    /// Full access — all tools. Default profile.
+    #[default]
+    Full,
+}
+
+impl CapabilityProfile {
+    /// Returns the explicit tool list for this profile, or `None` for `Full`
+    /// (meaning no restriction is applied to the CLI invocation).
+    pub fn tools(self) -> Option<Vec<String>> {
+        match self {
+            CapabilityProfile::ReadOnly => Some(vec![
+                "Read".to_string(),
+                "Grep".to_string(),
+                "Glob".to_string(),
+            ]),
+            CapabilityProfile::Standard => Some(vec![
+                "Read".to_string(),
+                "Write".to_string(),
+                "Edit".to_string(),
+                "Bash".to_string(),
+            ]),
+            CapabilityProfile::Full => None,
+        }
+    }
+
+    /// Human-readable description injected into the agent prompt as context.
+    pub fn prompt_note(self) -> Option<&'static str> {
+        match self {
+            CapabilityProfile::ReadOnly => Some(
+                "Tool restriction: you are operating in read-only mode. \
+                 Only Read, Grep, and Glob are permitted. \
+                 Do NOT call Write, Edit, Bash, or any other tool.",
+            ),
+            CapabilityProfile::Standard => Some(
+                "Tool restriction: you are operating in standard mode. \
+                 Only Read, Write, Edit, and Bash are permitted. \
+                 Do NOT call tools outside this list.",
+            ),
+            CapabilityProfile::Full => None,
+        }
+    }
+}
+
 /// Controls how much autonomy the agent has when executing tasks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +98,23 @@ pub struct AgentsConfig {
     pub approval_policy: ApprovalPolicy,
     #[serde(default)]
     pub sandbox_mode: SandboxMode,
+    /// Preset capability profile applied to all agents unless overridden.
+    #[serde(default)]
+    pub capability_profile: CapabilityProfile,
+    /// Explicit tool list. When set, takes precedence over `capability_profile`.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+impl AgentsConfig {
+    /// Resolve the effective tool list from `allowed_tools` (explicit override)
+    /// or `capability_profile` (preset). Returns `None` when no restriction applies.
+    pub fn resolve_allowed_tools(&self) -> Option<Vec<String>> {
+        if let Some(tools) = &self.allowed_tools {
+            return Some(tools.clone());
+        }
+        self.capability_profile.tools()
+    }
 }
 
 impl Default for AgentsConfig {
@@ -59,6 +127,8 @@ impl Default for AgentsConfig {
             review: AgentReviewConfig::default(),
             approval_policy: ApprovalPolicy::default(),
             sandbox_mode: SandboxMode::default(),
+            capability_profile: CapabilityProfile::default(),
+            allowed_tools: None,
         }
     }
 }
