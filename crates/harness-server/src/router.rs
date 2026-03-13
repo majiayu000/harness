@@ -1007,4 +1007,411 @@ mod tests {
         assert!(resp.error.is_none(), "post-init request should work");
         Ok(())
     }
+
+    // === Integration tests for previously unrouted methods ===
+
+    #[tokio::test]
+    async fn event_log_records_event() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+        let session_id = harness_core::SessionId::new();
+        let event = harness_core::Event::new(
+            session_id,
+            "test_hook",
+            "TestTool",
+            harness_core::Decision::Pass,
+        );
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::EventLog { event },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response");
+
+        assert!(
+            resp.error.is_none(),
+            "event_log should succeed: {:?}",
+            resp.error
+        );
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert_eq!(result["logged"], serde_json::json!(true));
+        assert!(result["event_id"].is_string(), "event_id should be present");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_query_returns_logged_events() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+        let session_id = harness_core::SessionId::new();
+        let event = harness_core::Event::new(
+            session_id,
+            "probe_hook",
+            "ProbeTarget",
+            harness_core::Decision::Pass,
+        );
+        state.observability.events.log(&event)?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::EventQuery {
+                filters: harness_core::EventFilters {
+                    hook: Some("probe_hook".to_string()),
+                    ..Default::default()
+                },
+            },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response");
+
+        assert!(
+            resp.error.is_none(),
+            "event_query should succeed: {:?}",
+            resp.error
+        );
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        let events = result
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("expected array result"))?;
+        assert_eq!(events.len(), 1, "should return exactly one matching event");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skill_create_and_get() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let create_req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::SkillCreate {
+                name: "test-skill".to_string(),
+                content: "# Test Skill\nDoes things.".to_string(),
+            },
+        };
+        let create_resp = handle_request(&state, create_req)
+            .await
+            .expect("expected response");
+        assert!(
+            create_resp.error.is_none(),
+            "skill_create should succeed: {:?}",
+            create_resp.error
+        );
+        let skill = create_resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        let skill_id_str = skill["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing id"))?
+            .to_string();
+        let skill_id = harness_core::SkillId::from_str(&skill_id_str);
+
+        let get_req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(2)),
+            method: Method::SkillGet { skill_id },
+        };
+        let get_resp = handle_request(&state, get_req)
+            .await
+            .expect("expected response");
+        assert!(
+            get_resp.error.is_none(),
+            "skill_get should succeed: {:?}",
+            get_resp.error
+        );
+        let retrieved = get_resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert_eq!(retrieved["name"], serde_json::json!("test-skill"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skill_list_returns_created_skills() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        for name in ["alpha-skill", "beta-skill"] {
+            let req = RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(serde_json::json!(1)),
+                method: Method::SkillCreate {
+                    name: name.to_string(),
+                    content: format!("# {name}\nDoes things."),
+                },
+            };
+            let resp = handle_request(&state, req).await.expect("response");
+            assert!(resp.error.is_none(), "skill_create should succeed");
+        }
+
+        let list_req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(2)),
+            method: Method::SkillList { query: None },
+        };
+        let list_resp = handle_request(&state, list_req)
+            .await
+            .expect("expected response");
+        assert!(
+            list_resp.error.is_none(),
+            "skill_list should succeed: {:?}",
+            list_resp.error
+        );
+        let skill_count = list_resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("expected array result"))?
+            .len();
+        assert_eq!(skill_count, 2, "should list both created skills");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skill_delete_removes_skill() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let create_req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::SkillCreate {
+                name: "to-delete".to_string(),
+                content: "# Delete Me".to_string(),
+            },
+        };
+        let create_resp = handle_request(&state, create_req).await.expect("response");
+        let skill_id_str = create_resp.result.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let skill_id = harness_core::SkillId::from_str(&skill_id_str);
+
+        let delete_req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(2)),
+            method: Method::SkillDelete { skill_id },
+        };
+        let delete_resp = handle_request(&state, delete_req).await.expect("response");
+        assert!(
+            delete_resp.error.is_none(),
+            "skill_delete should succeed: {:?}",
+            delete_resp.error
+        );
+        let result = delete_resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert_eq!(result["deleted"], serde_json::json!(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_resume_errors_for_unknown_thread() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::ThreadResume {
+                thread_id: harness_core::ThreadId::new(),
+            },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response");
+        assert!(
+            resp.error.is_some(),
+            "resume of unknown thread should return error"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_fork_errors_for_unknown_thread() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::ThreadFork {
+                thread_id: harness_core::ThreadId::new(),
+                from_turn: None,
+            },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response");
+        assert!(
+            resp.error.is_some(),
+            "fork of unknown thread should return error"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_compact_errors_for_unknown_thread() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::ThreadCompact {
+                thread_id: harness_core::ThreadId::new(),
+            },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response");
+        assert!(
+            resp.error.is_some(),
+            "compact of unknown thread should return error"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_steer_returns_not_found_for_unknown_turn() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::TurnSteer {
+                turn_id: harness_core::TurnId::new(),
+                instruction: "redirect here".to_string(),
+            },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response");
+        assert!(
+            resp.error.is_some(),
+            "steer of unknown turn should return error"
+        );
+        assert_eq!(
+            resp.error.unwrap().code,
+            harness_protocol::NOT_FOUND,
+            "should return NOT_FOUND for unknown turn"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stats_query_returns_expected_shape() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::StatsQuery {
+                since: None,
+                until: None,
+            },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response");
+        assert!(
+            resp.error.is_none(),
+            "stats_query should succeed: {:?}",
+            resp.error
+        );
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert!(
+            result["hook_stats"].is_array(),
+            "result should contain hook_stats array"
+        );
+        assert!(
+            result["rule_stats"].is_array(),
+            "result should contain rule_stats array"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learn_rules_returns_zero_when_no_adopted_drafts() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+        let proj_dir = crate::test_helpers::tempdir_in_home("harness-learn-rules-test-")?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::LearnRules {
+                project_root: proj_dir.path().to_path_buf(),
+            },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response");
+        assert!(
+            resp.error.is_none(),
+            "learn_rules should succeed with no drafts: {:?}",
+            resp.error
+        );
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert_eq!(result["rules_learned"], serde_json::json!(0));
+        assert!(
+            result["rules"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "rules array should be empty"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learn_skills_returns_zero_when_no_adopted_drafts() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_test_state(dir.path()).await?;
+        let proj_dir = crate::test_helpers::tempdir_in_home("harness-learn-skills-test-")?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::LearnSkills {
+                project_root: proj_dir.path().to_path_buf(),
+            },
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("expected response");
+        assert!(
+            resp.error.is_none(),
+            "learn_skills should succeed with no drafts: {:?}",
+            resp.error
+        );
+        let result = resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert_eq!(result["skills_learned"], serde_json::json!(0));
+        assert!(
+            result["skills"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "skills array should be empty"
+        );
+        Ok(())
+    }
 }
