@@ -222,6 +222,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         tracing::warn!("Failed to reload persisted skills on startup: {}", e);
     }
 
+    let rules = Arc::new(RwLock::new(rule_engine));
+
     let validation_config = server.config.validation.clone();
 
     let workspace_mgr =
@@ -301,7 +303,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         },
         engines: EngineServices {
             skills: Arc::new(RwLock::new(skill_store)),
-            rules: Arc::new(RwLock::new(rule_engine)),
+            rules: rules.clone(),
             gc_agent,
         },
         observability: ObservabilityServices { events },
@@ -318,6 +320,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         },
         interceptors: vec![
             Arc::new(crate::contract_validator::ContractValidator::new()),
+            Arc::new(crate::rule_enforcer::RuleEnforcer::new(rules)),
             Arc::new(crate::post_validator::PostExecutionValidator::new(
                 validation_config,
             )),
