@@ -347,6 +347,61 @@ mod tests {
     }
 
     #[test]
+    fn detect_severity_ignores_keywords_in_description() {
+        let section = "LEARN-104: Safe defaults\nThis is critical for high performance in medium-sized systems.\nNo explicit severity field.";
+        assert_eq!(detect_severity(section), Severity::Low);
+    }
+
+    #[test]
+    fn detect_severity_parses_all_valid_levels() {
+        assert_eq!(
+            detect_severity("severity: critical"),
+            Severity::Critical
+        );
+        assert_eq!(detect_severity("severity: high"), Severity::High);
+        assert_eq!(detect_severity("severity: medium"), Severity::Medium);
+        assert_eq!(detect_severity("severity: low"), Severity::Low);
+    }
+
+    #[test]
+    fn detect_severity_handles_uppercase_and_mixed_case() {
+        assert_eq!(detect_severity("severity: CRITICAL"), Severity::Critical);
+        assert_eq!(detect_severity("severity: High"), Severity::High);
+        assert_eq!(detect_severity("severity: MeDiUm"), Severity::Medium);
+    }
+
+    #[test]
+    fn detect_severity_ignores_invalid_severity_values() {
+        let section = "severity: unknown\nSome description.";
+        assert_eq!(detect_severity(section), Severity::Low);
+    }
+
+    #[test]
+    fn detect_severity_handles_severity_with_extra_text() {
+        assert_eq!(
+            detect_severity("severity: high (blocker)"),
+            Severity::High
+        );
+        assert_eq!(
+            detect_severity("severity: critical - must fix"),
+            Severity::Critical
+        );
+    }
+
+    #[test]
+    fn detect_severity_ignores_severity_in_middle_of_word() {
+        let section = "This is a highseverity issue but no explicit field.";
+        assert_eq!(detect_severity(section), Severity::Low);
+    }
+
+    #[test]
+    fn detect_severity_handles_markdown_list_markers() {
+        assert_eq!(detect_severity("- severity: high"), Severity::High);
+        assert_eq!(detect_severity("* severity: medium"), Severity::Medium);
+        assert_eq!(detect_severity("> severity: critical"), Severity::Critical);
+    }
+
+    #[test]
     fn parse_skills_extracts_single_skill() {
         let output = "=== skill: my-skill ===\n# My Skill\nDoes useful things.";
         let skills = parse_skills_from_output(output);
