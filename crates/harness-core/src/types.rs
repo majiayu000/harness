@@ -52,6 +52,7 @@ define_id!(GuardId);
 define_id!(SessionId);
 define_id!(EventId);
 define_id!(TaskId);
+define_id!(ExternalSignalId);
 
 // === Thread ===
 
@@ -260,6 +261,31 @@ impl Signal {
             details,
             remediation,
             detected_at: Utc::now(),
+        }
+    }
+}
+
+// === ExternalSignal ===
+
+/// A signal pushed from an external system (e.g. GitHub CI, PagerDuty).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalSignal {
+    pub id: ExternalSignalId,
+    /// Source system identifier, e.g. "github", "pagerduty", "generic".
+    pub source: String,
+    pub severity: Severity,
+    pub payload: serde_json::Value,
+    pub received_at: DateTime<Utc>,
+}
+
+impl ExternalSignal {
+    pub fn new(source: String, severity: Severity, payload: serde_json::Value) -> Self {
+        Self {
+            id: ExternalSignalId::new(),
+            source,
+            severity,
+            payload,
+            received_at: Utc::now(),
         }
     }
 }

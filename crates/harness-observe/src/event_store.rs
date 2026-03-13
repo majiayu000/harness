@@ -1,6 +1,7 @@
+use chrono::{DateTime, Utc};
 use harness_core::{
-    AutoFixReport, Decision, Event, EventFilters, EventId, Grade, OtelConfig, SessionId, Severity,
-    Violation,
+    AutoFixReport, Decision, Event, EventFilters, EventId, ExternalSignal, ExternalSignalId, Grade,
+    OtelConfig, SessionId, Severity, Violation,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -258,6 +259,52 @@ impl EventStore {
         })
     }
 
+    fn signals_file(&self) -> std::path::PathBuf {
+        self.data_dir.join("signals.jsonl")
+    }
+
+    /// Persist an external signal to the signals log.
+    pub fn log_external_signal(&self, signal: &ExternalSignal) -> anyhow::Result<ExternalSignalId> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.signals_file())?;
+        let line = serde_json::to_string(signal)?;
+        writeln!(file, "{line}")?;
+        Ok(signal.id.clone())
+    }
+
+    /// Query persisted external signals, optionally filtered by receive time.
+    pub fn query_external_signals(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<Vec<ExternalSignal>> {
+        let path = self.signals_file();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = std::fs::File::open(&path)?;
+        let reader = std::io::BufReader::new(file);
+        let mut signals = Vec::new();
+        use std::io::BufRead;
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(sig) = serde_json::from_str::<ExternalSignal>(&line) {
+                if let Some(since) = since {
+                    if sig.received_at < since {
+                        continue;
+                    }
+                }
+                signals.push(sig);
+            }
+        }
+        Ok(signals)
+    }
+
     fn matches_filters(event: &Event, filters: &EventFilters) -> bool {
         if let Some(ref sid) = filters.session_id {
             if event.session_id != *sid {
@@ -297,8 +344,8 @@ impl EventStore {
 mod tests {
     use super::*;
     use harness_core::{
-        AutoFixAttempt, AutoFixReport, Decision, Event, EventFilters, OtelExporter, RuleId,
-        SessionId,
+        AutoFixAttempt, AutoFixReport, Decision, Event, EventFilters, ExternalSignal, OtelExporter,
+        RuleId, SessionId, Severity,
     };
     use std::path::Path;
 
@@ -593,6 +640,52 @@ mod tests {
         })?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].decision, Decision::Warn);
+        Ok(())
+    }
+
+    #[test]
+    fn log_external_signal_and_query_roundtrip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        let signal = ExternalSignal::new(
+            "github".to_string(),
+            Severity::High,
+            serde_json::json!({"action": "completed", "conclusion": "failure"}),
+        );
+        store.log_external_signal(&signal)?;
+        let results = store.query_external_signals(None)?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, signal.id);
+        assert_eq!(results[0].source, "github");
+        Ok(())
+    }
+
+    #[test]
+    fn query_external_signals_filters_by_since() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        let old_signal =
+            ExternalSignal::new("github".to_string(), Severity::Low, serde_json::json!({}));
+        store.log_external_signal(&old_signal)?;
+        let cutoff = chrono::Utc::now();
+        let new_signal = ExternalSignal::new(
+            "github".to_string(),
+            Severity::High,
+            serde_json::json!({"conclusion": "failure"}),
+        );
+        store.log_external_signal(&new_signal)?;
+        let results = store.query_external_signals(Some(cutoff))?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, new_signal.id);
+        Ok(())
+    }
+
+    #[test]
+    fn query_external_signals_empty_when_no_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        let results = store.query_external_signals(None)?;
+        assert!(results.is_empty());
         Ok(())
     }
 
