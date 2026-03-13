@@ -257,3 +257,42 @@ pub enum OtelExporter {
 fn default_otel_environment() -> String {
     "development".to_string()
 }
+
+/// Periodic codebase review configuration.
+///
+/// When enabled, the scheduler spawns an agent review job at the configured interval.
+/// The review is skipped if no new commits have landed since the last review.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    /// Whether periodic review is enabled. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Interval between review runs in hours. Default: 24.
+    #[serde(default = "default_review_interval_hours")]
+    pub interval_hours: u64,
+    /// Agent to use for the review. Default: None (use the default agent).
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Per-turn timeout in seconds for the review agent. Default: 900.
+    #[serde(default = "default_review_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_review_interval_hours() -> u64 {
+    24
+}
+
+fn default_review_timeout_secs() -> u64 {
+    900
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_hours: default_review_interval_hours(),
+            agent: None,
+            timeout_secs: default_review_timeout_secs(),
+        }
+    }
+}

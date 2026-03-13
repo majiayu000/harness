@@ -221,6 +221,82 @@ pub fn agent_review_fix_prompt(pr: u64, issues: &[String], round: u32) -> String
     )
 }
 
+/// Build prompt: periodic codebase review with an 11-item checklist.
+///
+/// `repo_structure` is the output of a directory listing (e.g., `find . -type f -name '*.rs'`).
+/// `diff_stat` is the output of `git diff --stat` since the last review.
+/// `recent_commits` is the output of `git log --oneline` since the last review.
+pub fn periodic_review_prompt(
+    repo_structure: &str,
+    diff_stat: &str,
+    recent_commits: &str,
+) -> String {
+    let safe_structure = wrap_external_data(repo_structure);
+    let safe_diff_stat = wrap_external_data(diff_stat);
+    let safe_commits = wrap_external_data(recent_commits);
+    format!(
+        "You are conducting a periodic codebase health review. \
+         Examine the entire codebase for the 11 categories of issues below. \
+         Produce a structured markdown report with severity-ranked findings.\n\n\
+         ## Context\n\n\
+         Repository structure:\n{safe_structure}\n\n\
+         Changes since last review (diff stat):\n{safe_diff_stat}\n\n\
+         Recent commits:\n{safe_commits}\n\n\
+         ## Review Checklist\n\n\
+         Check for ALL of the following (mark each item even if no issues found):\n\n\
+         ### CRITICAL\n\
+         1. **Duplicate Type Definitions** — Structs or enums with the same name in multiple \
+         crates. Config structs duplicated across crate boundaries.\n\
+         7. **Declaration-Execution Gap** — Components built but never wired into the actual \
+         execution path. Modules registered in lib.rs but never called from startup/runtime code. \
+         (Note: config structs using Default::default() instead of loaded values belong to #11, \
+         not here.)\n\n\
+         ### HIGH\n\
+         2. **Oversized Files** — Any .rs file exceeding 400 lines. Report exact line count \
+         and suggest split points.\n\
+         3. **God Objects** — Structs with more than 10 public fields. Modules mixing unrelated concerns.\n\
+         8. **Dead Code** — pub functions with zero call sites outside their own module. \
+         Structs or enums defined but never instantiated. Entire modules exported via pub mod \
+         but never imported. (Exclude #[cfg(test)] code.)\n\
+         10. **Project Rule Violations** — Verify CLAUDE.md rules: ZERO Command::new(\"gh\") or \
+         Command::new(\"git\") calls (all git/GitHub interaction must be in agent prompts only); \
+         all user-facing strings and comments in English; no hardcoded ports/URLs/credentials; \
+         cargo fmt compliance.\n\n\
+         ### MEDIUM\n\
+         4. **Public API Leakage** — lib.rs files exporting more than 5 pub mod entries. \
+         Internal implementation details exposed as public.\n\
+         5. **Repeated Patterns** — Same function signature pattern appearing 3+ times across \
+         files. Boilerplate that should be abstracted.\n\
+         9. **Error Handling Inconsistency** — Mixing anyhow::Result and custom error types \
+         without clear boundary rules. Silently discarding meaningful errors with let _ or .ok(). \
+         .unwrap() in non-test async code.\n\
+         11. **Config-Default Divergence** — Config struct has fields with serde defaults, but \
+         consuming code constructs via Default::default() instead of loading from file.\n\n\
+         ### LOW\n\
+         6. **Dependency Issues** — Crates depending on more than 5 workspace siblings. \
+         Circular or unnecessary dependencies.\n\n\
+         ## Output Format\n\n\
+         For each finding:\n\
+         ```\n\
+         ## [SEVERITY] Category: Short Title\n\n\
+         **File:** path/to/file.rs:LINE\n\
+         **Details:** What the issue is and why it matters\n\
+         **Action:** Specific fix recommendation\n\
+         ```\n\n\
+         End with a summary table:\n\
+         ```\n\
+         | Severity | Count |\n\
+         |----------|-------|\n\
+         | CRITICAL | N     |\n\
+         | HIGH     | N     |\n\
+         | MEDIUM   | N     |\n\
+         | LOW      | N     |\n\
+         ```\n\n\
+         If a category has no findings, include a one-line note: \
+         `## [SEVERITY] Category: No issues found.`"
+    )
+}
+
 /// Check if agent output indicates approval (last non-empty line is "APPROVED").
 pub fn is_approved(output: &str) -> bool {
     last_non_empty_line(output) == Some("APPROVED")

@@ -29,7 +29,7 @@ impl Scheduler {
             }
         });
 
-        let health_state = state;
+        let health_state = state.clone();
         let health_interval = self.health_interval;
         tokio::spawn(async move {
             loop {
@@ -39,6 +39,9 @@ impl Scheduler {
                 }
             }
         });
+
+        let review_config = state.core.server.config.review.clone();
+        crate::periodic_reviewer::start(state, review_config);
     }
 
     async fn run_health_tick(state: &AppState) -> anyhow::Result<()> {

@@ -155,6 +155,9 @@ pub struct CreateTaskRequest {
     /// Overrides the global `concurrency.stall_timeout_secs` for this task.
     #[serde(default = "default_stall_timeout")]
     pub stall_timeout_secs: u64,
+    /// Intake source name (e.g. "github", "feishu", "periodic_review"). None for manual tasks.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 impl Default for CreateTaskRequest {
@@ -172,6 +175,7 @@ impl Default for CreateTaskRequest {
             retry_base_backoff_ms: default_retry_base_backoff_ms(),
             retry_max_backoff_ms: default_retry_max_backoff_ms(),
             stall_timeout_secs: default_stall_timeout(),
+            source: None,
         }
     }
 }
@@ -384,7 +388,8 @@ where
     F: Fn() -> PathBuf + Send + Sync + 'static,
 {
     let task_id = TaskId::new();
-    let state = TaskState::new(task_id.clone());
+    let mut state = TaskState::new(task_id.clone());
+    state.source = req.source.clone();
     store.insert(&state).await;
 
     let id = task_id.clone();
