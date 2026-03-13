@@ -73,6 +73,13 @@ impl CodeAgent for MockPrAgent {
 // ---------------------------------------------------------------------------
 
 async fn make_state(root: &Path) -> anyhow::Result<harness_server::http::AppState> {
+    make_state_with_auto_pr(root, true).await
+}
+
+async fn make_state_with_auto_pr(
+    root: &Path,
+    auto_pr: bool,
+) -> anyhow::Result<harness_server::http::AppState> {
     let project_root = root.join("project");
     std::fs::create_dir_all(&project_root)?;
 
@@ -80,6 +87,7 @@ async fn make_state(root: &Path) -> anyhow::Result<harness_server::http::AppStat
     config.server.data_dir = root.join("server-data");
     config.server.project_root = project_root;
     config.agents.default_agent = "mock-pr".to_string();
+    config.gc.auto_pr = auto_pr;
 
     let mut registry = AgentRegistry::new("mock-pr");
     registry.register("mock-pr", Arc::new(MockPrAgent));
@@ -188,6 +196,62 @@ async fn gc_adopt_unknown_draft_returns_not_found() -> anyhow::Result<()> {
 
     assert!(resp.error.is_some(), "expected error for unknown draft");
     assert_eq!(resp.error.unwrap().code, harness_protocol::NOT_FOUND);
+
+    Ok(())
+}
+
+/// gc_adopt with auto_pr=false skips task dispatch and returns null task_id.
+#[tokio::test]
+async fn gc_adopt_auto_pr_false_skips_task_dispatch() -> anyhow::Result<()> {
+    let sandbox = common::tempdir_in_home("gc-adopt-no-auto-pr-")?;
+    let state = make_state_with_auto_pr(sandbox.path(), false).await?;
+
+    let artifact_rel = std::path::PathBuf::from(".harness/drafts/test-guard.sh");
+    let draft = make_draft(&artifact_rel, "#!/usr/bin/env bash\necho 'guard'");
+    state.engines.gc_agent.draft_store().save(&draft)?;
+
+    let draft_id = draft.id.clone();
+    let resp = gc_adopt(&state, Some(serde_json::json!(1)), draft_id).await;
+
+    assert!(
+        resp.error.is_none(),
+        "expected success, got error: {:?}",
+        resp.error
+    );
+    let result = resp.result.expect("missing result");
+    assert_eq!(result["adopted"], true);
+    assert!(
+        result["task_id"].is_null(),
+        "task_id should be null when auto_pr=false"
+    );
+
+    Ok(())
+}
+
+/// gc_adopt with auto_pr=true (default) dispatches a task when artifacts exist.
+#[tokio::test]
+async fn gc_adopt_auto_pr_true_dispatches_task() -> anyhow::Result<()> {
+    let sandbox = common::tempdir_in_home("gc-adopt-auto-pr-true-")?;
+    let state = make_state_with_auto_pr(sandbox.path(), true).await?;
+
+    let artifact_rel = std::path::PathBuf::from(".harness/drafts/test-guard.sh");
+    let draft = make_draft(&artifact_rel, "#!/usr/bin/env bash\necho 'guard'");
+    state.engines.gc_agent.draft_store().save(&draft)?;
+
+    let draft_id = draft.id.clone();
+    let resp = gc_adopt(&state, Some(serde_json::json!(1)), draft_id).await;
+
+    assert!(
+        resp.error.is_none(),
+        "expected success, got error: {:?}",
+        resp.error
+    );
+    let result = resp.result.expect("missing result");
+    assert_eq!(result["adopted"], true);
+    assert!(
+        !result["task_id"].is_null(),
+        "task_id should be set when auto_pr=true and agent is registered"
+    );
 
     Ok(())
 }
