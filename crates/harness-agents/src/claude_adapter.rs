@@ -47,10 +47,10 @@ impl AgentAdapter for ClaudeAdapter {
             .arg(model)
             .arg("--verbose")
             .current_dir(&req.project_root)
-            .env_remove("CLAUDECODE")
-            .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        crate::strip_claude_env(&mut cmd);
 
         if !req.allowed_tools.is_empty() {
             cmd.arg("--allowedTools").arg(req.allowed_tools.join(","));

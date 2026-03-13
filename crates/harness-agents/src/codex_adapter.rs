@@ -122,7 +122,9 @@ impl AgentAdapter for CodexAdapter {
             cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .current_dir(&req.project_root);
+                .current_dir(&req.project_root)
+                .kill_on_drop(true);
+            crate::strip_claude_env(&mut cmd);
 
             let mut child = cmd.spawn().map_err(|e| {
                 harness_core::HarnessError::AgentExecution(format!("failed to spawn codex: {e}"))

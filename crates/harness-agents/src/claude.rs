@@ -76,9 +76,8 @@ impl CodeAgent for ClaudeCodeAgent {
 
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
-            .current_dir(&req.project_root)
-            .env_remove("CLAUDECODE")
-            .env_remove("CLAUDE_CODE_ENTRYPOINT");
+            .current_dir(&req.project_root);
+        crate::strip_claude_env(&mut cmd);
 
         let output = cmd.output().await.map_err(|e| {
             harness_core::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
@@ -122,11 +121,10 @@ impl CodeAgent for ClaudeCodeAgent {
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
-            .env_remove("CLAUDECODE")
-            .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        crate::strip_claude_env(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|error| {
             harness_core::HarnessError::AgentExecution(format!("failed to run claude: {error}"))
