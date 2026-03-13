@@ -144,6 +144,13 @@ pub struct CreateTaskRequest {
     /// Maximum spend budget for the agent in USD; None means unlimited.
     #[serde(default)]
     pub max_budget_usd: Option<f64>,
+    /// Base delay in milliseconds for the first validation retry; subsequent retries double the
+    /// delay up to `retry_max_backoff_ms`. Default: 10 000 ms (10 s).
+    #[serde(default = "default_retry_base_backoff_ms")]
+    pub retry_base_backoff_ms: u64,
+    /// Maximum backoff cap in milliseconds for validation retries. Default: 300 000 ms (5 min).
+    #[serde(default = "default_retry_max_backoff_ms")]
+    pub retry_max_backoff_ms: u64,
 }
 
 impl Default for CreateTaskRequest {
@@ -158,6 +165,8 @@ impl Default for CreateTaskRequest {
             max_rounds: default_max_rounds(),
             turn_timeout_secs: default_turn_timeout(),
             max_budget_usd: None,
+            retry_base_backoff_ms: default_retry_base_backoff_ms(),
+            retry_max_backoff_ms: default_retry_max_backoff_ms(),
         }
     }
 }
@@ -189,6 +198,12 @@ fn default_wait() -> u64 {
 }
 fn default_max_rounds() -> u32 {
     5
+}
+fn default_retry_base_backoff_ms() -> u64 {
+    10_000
+}
+fn default_retry_max_backoff_ms() -> u64 {
+    300_000
 }
 fn default_turn_timeout() -> u64 {
     // 1 hour: parallel subtasks and complex agent turns on large codebases
@@ -652,6 +667,7 @@ mod tests {
             max_rounds: 0,
             turn_timeout_secs: 30,
             max_budget_usd: None,
+            ..Default::default()
         };
 
         let events = Arc::new(harness_observe::EventStore::new(dir.path())?);
@@ -725,6 +741,7 @@ mod tests {
             max_rounds: 0,
             turn_timeout_secs: 30,
             max_budget_usd: None,
+            ..Default::default()
         };
 
         let queue = crate::task_queue::TaskQueue::unbounded();
@@ -847,6 +864,7 @@ mod tests {
             max_rounds: 0,
             turn_timeout_secs: 30,
             max_budget_usd: None,
+            ..Default::default()
         };
 
         let queue = crate::task_queue::TaskQueue::unbounded();
