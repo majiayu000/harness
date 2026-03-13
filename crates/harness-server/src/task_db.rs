@@ -39,7 +39,7 @@ impl TaskDb {
 
         // Additive migrations for existing DBs that predate Task 3.1.
         // "duplicate column name" errors mean the column was already added — safe to ignore.
-        for col in &["source TEXT", "external_id TEXT"] {
+        for col in &["source TEXT", "external_id TEXT", "parent_id TEXT"] {
             let sql = format!("ALTER TABLE tasks ADD COLUMN {col}");
             if let Err(e) = sqlx::query(&sql).execute(&self.pool).await {
                 let msg = e.to_string().to_lowercase();
@@ -56,8 +56,8 @@ impl TaskDb {
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let status = state.status.as_ref();
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, parent_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -65,6 +65,7 @@ impl TaskDb {
         .bind(&state.pr_url)
         .bind(&rounds_json)
         .bind(&state.error)
+        .bind(state.parent_id.as_ref().map(|id| &id.0))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -91,7 +92,7 @@ impl TaskDb {
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id
              FROM tasks WHERE id = ?",
         )
         .bind(id)
@@ -102,9 +103,21 @@ impl TaskDb {
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id
              FROM tasks ORDER BY created_at DESC",
         )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TaskRow::try_into_task_state).collect()
+    }
+
+    /// Return all tasks whose `parent_id` matches the given parent task ID.
+    pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
+        let rows = sqlx::query_as::<_, TaskRow>(
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id
+             FROM tasks WHERE parent_id = ? ORDER BY created_at DESC",
+        )
+        .bind(parent_id)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
@@ -121,6 +134,7 @@ struct TaskRow {
     error: Option<String>,
     source: Option<String>,
     external_id: Option<String>,
+    parent_id: Option<String>,
 }
 
 impl TaskRow {
@@ -134,6 +148,7 @@ impl TaskRow {
             error,
             source,
             external_id,
+            parent_id,
         } = self;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
@@ -152,6 +167,8 @@ impl TaskRow {
             error,
             source,
             external_id,
+            parent_id: parent_id.map(TaskId),
+            subtask_ids: Vec::new(),
         })
     }
 }
@@ -172,6 +189,7 @@ mod tests {
             error: None,
             source: None,
             external_id: None,
+            parent_id: None,
         }
     }
 
@@ -223,6 +241,8 @@ mod tests {
             error: None,
             source: None,
             external_id: None,
+            parent_id: None,
+            subtask_ids: vec![],
         }
     }
 
@@ -366,6 +386,39 @@ mod tests {
             .await?
             .expect("task should survive reopen");
         assert!(matches!(loaded.status, TaskStatus::Done));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_children_returns_subtasks_by_parent_id() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let parent = make_task("parent-1", TaskStatus::Pending);
+        db.insert(&parent).await?;
+
+        let mut child1 = make_task("child-1", TaskStatus::Pending);
+        child1.parent_id = Some(TaskId("parent-1".to_string()));
+        db.insert(&child1).await?;
+
+        let mut child2 = make_task("child-2", TaskStatus::Done);
+        child2.parent_id = Some(TaskId("parent-1".to_string()));
+        db.insert(&child2).await?;
+
+        // Unrelated task.
+        db.insert(&make_task("unrelated", TaskStatus::Pending))
+            .await?;
+
+        let children = db.list_children("parent-1").await?;
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().all(|c| c
+            .parent_id
+            .as_ref()
+            .map(|id| id.0 == "parent-1")
+            .unwrap_or(false)));
+
+        let no_children = db.list_children("nonexistent").await?;
+        assert!(no_children.is_empty());
         Ok(())
     }
 
