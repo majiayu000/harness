@@ -323,7 +323,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .await
                     {
                         Ok(store) => {
-                            store.persist_rule_scan(&project, &violations);
+                            store.persist_rule_scan(&project, &violations).await;
                             store.shutdown().await;
                         }
                         Err(e) => tracing::warn!(

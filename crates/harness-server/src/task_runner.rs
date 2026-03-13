@@ -262,7 +262,11 @@ async fn resolve_project_root_with(
     }
 }
 
-fn log_task_failure_event(events: &harness_observe::EventStore, task_id: &TaskId, reason: &str) {
+async fn log_task_failure_event(
+    events: &harness_observe::EventStore,
+    task_id: &TaskId,
+    reason: &str,
+) {
     let mut event = Event::new(
         SessionId::new(),
         "task_failure",
@@ -271,7 +275,7 @@ fn log_task_failure_event(events: &harness_observe::EventStore, task_id: &TaskId
     );
     event.reason = Some(reason.to_string());
     event.detail = Some(format!("task_id={}", task_id.0));
-    if let Err(e) = events.log(&event) {
+    if let Err(e) = events.log(&event).await {
         tracing::warn!("failed to log task_failure event for {task_id:?}: {e}");
     }
 }
@@ -282,7 +286,7 @@ async fn record_task_failure(
     task_id: &TaskId,
     reason: String,
 ) {
-    log_task_failure_event(events, task_id, &reason);
+    log_task_failure_event(events, task_id, &reason).await;
     mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Failed;
         s.error = Some(reason);
@@ -748,7 +752,7 @@ mod tests {
             ..Default::default()
         };
 
-        let events = Arc::new(harness_observe::EventStore::new(dir.path())?);
+        let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
         let queue = crate::task_queue::TaskQueue::unbounded();
         let permit = queue.acquire().await.unwrap();
         spawn_task(
@@ -804,7 +808,7 @@ mod tests {
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
         let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
         let agent = CapturingAgent::new();
-        let events = Arc::new(harness_observe::EventStore::new(dir.path())?);
+        let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
 
         let interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>> =
             vec![Arc::new(BlockingInterceptor)];
@@ -930,7 +934,7 @@ mod tests {
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
         let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
         let agent = CapturingAgent::new();
-        let events = Arc::new(harness_observe::EventStore::new(dir.path())?);
+        let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
 
         let req = CreateTaskRequest {
             prompt: Some("panic path".into()),
@@ -984,10 +988,12 @@ mod tests {
         );
 
         let expected_detail = format!("task_id={}", task_id.0);
-        let failure_events = events.query(&EventFilters {
-            hook: Some("task_failure".to_string()),
-            ..Default::default()
-        })?;
+        let failure_events = events
+            .query(&EventFilters {
+                hook: Some("task_failure".to_string()),
+                ..Default::default()
+            })
+            .await?;
         assert!(
             failure_events.iter().any(|event| {
                 event.detail.as_deref() == Some(expected_detail.as_str())

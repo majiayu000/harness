@@ -214,7 +214,7 @@ mod tests {
             agent_registry,
         ));
         let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
-        let events = Arc::new(harness_observe::EventStore::new(dir)?);
+        let events = Arc::new(harness_observe::EventStore::new(dir).await?);
         let signal_detector = harness_gc::SignalDetector::new(
             harness_gc::signal_detector::SignalThresholds::default(),
             harness_core::ProjectId::new(),
@@ -695,7 +695,8 @@ mod tests {
             .query(&harness_core::EventFilters {
                 hook: Some("rule_scan".to_string()),
                 ..Default::default()
-            })?;
+            })
+            .await?;
         assert!(
             events.is_empty(),
             "no scan event should be logged when scan request is rejected"
@@ -717,7 +718,7 @@ mod tests {
             "RuleEngine",
             harness_core::Decision::Block,
         );
-        state.observability.events.log(&scan_event)?;
+        state.observability.events.log(&scan_event).await?;
         for _ in 0..5 {
             let event = harness_core::Event::new(
                 session_id.clone(),
@@ -725,7 +726,7 @@ mod tests {
                 "SEC-01",
                 harness_core::Decision::Block,
             );
-            state.observability.events.log(&event)?;
+            state.observability.events.log(&event).await?;
         }
 
         let req = RpcRequest {
@@ -778,7 +779,8 @@ mod tests {
         state
             .observability
             .events
-            .persist_rule_scan(&project_root, &violations);
+            .persist_rule_scan(&project_root, &violations)
+            .await;
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -806,7 +808,8 @@ mod tests {
         let events = state
             .observability
             .events
-            .query(&harness_core::EventFilters::default())?;
+            .query(&harness_core::EventFilters::default())
+            .await?;
         let latest_scan = events
             .iter()
             .rev()
@@ -1058,7 +1061,7 @@ mod tests {
             "ProbeTarget",
             harness_core::Decision::Pass,
         );
-        state.observability.events.log(&event)?;
+        state.observability.events.log(&event).await?;
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -1427,7 +1430,7 @@ mod tests {
             AgentRegistry::new("test"),
         ));
         let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
-        let events = Arc::new(harness_observe::EventStore::new(dir)?);
+        let events = Arc::new(harness_observe::EventStore::new(dir).await?);
         let signal_detector = harness_gc::SignalDetector::new(
             harness_gc::signal_detector::SignalThresholds::default(),
             harness_core::ProjectId::new(),

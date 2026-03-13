@@ -611,6 +611,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             .observability
             .events
             .query(&harness_core::EventFilters::default())
+            .await
             .unwrap_or_default();
         // Use violations from the most recent scan (identified by the latest rule_scan session_id)
         // rather than all historical rule_check events, to avoid permanently depressing the grade.

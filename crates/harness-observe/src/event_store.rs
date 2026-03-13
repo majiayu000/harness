@@ -3,22 +3,72 @@ use harness_core::{
     AutoFixReport, Decision, Event, EventFilters, EventId, ExternalSignal, ExternalSignalId, Grade,
     OtelConfig, SessionId, Severity, Violation,
 };
+use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// Event store backed by JSONL files (SQLite upgrade path available).
+const CREATE_TABLE_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS events (
+        id          TEXT PRIMARY KEY,
+        ts          TEXT NOT NULL,
+        session_id  TEXT NOT NULL,
+        hook        TEXT NOT NULL,
+        tool        TEXT NOT NULL,
+        decision    TEXT NOT NULL,
+        reason      TEXT,
+        detail      TEXT,
+        duration_ms INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_events_session_id ON events (session_id);
+    CREATE INDEX IF NOT EXISTS idx_events_hook ON events (hook);
+    CREATE INDEX IF NOT EXISTS idx_events_decision ON events (decision);
+    CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
+";
+
+/// Event store backed by SQLite (same database as other harness stores).
+///
+/// Backward compatibility: on first startup the store imports any existing
+/// `events.jsonl` file found in the data directory, then leaves it in place as
+/// an archive.
 pub struct EventStore {
+    pool: SqlitePool,
     data_dir: PathBuf,
     otel_pipeline: Mutex<Option<crate::otel_export::OtelPipeline>>,
 }
 
 impl EventStore {
-    pub fn new(data_dir: &Path) -> anyhow::Result<Self> {
+    pub async fn new(data_dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
-        Ok(Self {
+        let db_path = data_dir.join("events.db");
+        let url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(8)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect(&url)
+            .await?;
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA busy_timeout=5000")
+            .execute(&pool)
+            .await?;
+
+        // Run migrations — SQLite requires each statement separately.
+        for stmt in CREATE_TABLE_SQL.split(';') {
+            let stmt = stmt.trim();
+            if !stmt.is_empty() {
+                sqlx::query(stmt).execute(&pool).await?;
+            }
+        }
+
+        let store = Self {
+            pool,
             data_dir: data_dir.to_path_buf(),
             otel_pipeline: Mutex::new(None),
-        })
+        };
+
+        store.migrate_from_jsonl().await;
+        Ok(store)
     }
 
     pub async fn with_policies_and_otel(
@@ -27,7 +77,7 @@ impl EventStore {
         log_retention_days: u32,
         otel_config: &OtelConfig,
     ) -> anyhow::Result<Self> {
-        let store = Self::new(data_dir)?;
+        let store = Self::new(data_dir).await?;
         tracing::debug!(
             session_renewal_secs,
             log_retention_days,
@@ -52,18 +102,65 @@ impl EventStore {
         Ok(store)
     }
 
-    fn events_file(&self) -> PathBuf {
-        self.data_dir.join("events.jsonl")
+    /// Import events from an existing `events.jsonl` file (backward compat).
+    ///
+    /// Silently skips lines that fail to parse or insert (duplicate id = IGNORE).
+    async fn migrate_from_jsonl(&self) {
+        let path = self.data_dir.join("events.jsonl");
+        if !path.exists() {
+            return;
+        }
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("event store: could not read events.jsonl for migration: {e}");
+                return;
+            }
+        };
+        let mut imported = 0usize;
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(event) = serde_json::from_str::<Event>(line) {
+                let _ = self.insert_event(&event).await;
+                imported += 1;
+            }
+        }
+        if imported > 0 {
+            tracing::info!(
+                imported,
+                "event store: migrated events from events.jsonl to SQLite"
+            );
+        }
     }
 
-    pub fn log(&self, event: &Event) -> anyhow::Result<EventId> {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.events_file())?;
-        let line = serde_json::to_string(event)?;
-        writeln!(file, "{line}")?;
+    async fn insert_event(&self, event: &Event) -> anyhow::Result<()> {
+        let decision = serde_json::to_string(&event.decision)?;
+        let decision = decision.trim_matches('"');
+        let ts = event.ts.to_rfc3339();
+        sqlx::query(
+            "INSERT OR IGNORE INTO events
+                (id, ts, session_id, hook, tool, decision, reason, detail, duration_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(event.id.as_str())
+        .bind(&ts)
+        .bind(event.session_id.as_str())
+        .bind(&event.hook)
+        .bind(&event.tool)
+        .bind(decision)
+        .bind(&event.reason)
+        .bind(&event.detail)
+        .bind(event.duration_ms.map(|v| v as i64))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn log(&self, event: &Event) -> anyhow::Result<EventId> {
+        self.insert_event(event).await?;
         match self.otel_pipeline.lock() {
             Ok(slot) => {
                 if let Some(pipeline) = slot.as_ref() {
@@ -81,35 +178,103 @@ impl EventStore {
         Ok(event.id.clone())
     }
 
-    pub fn query(&self, filters: &EventFilters) -> anyhow::Result<Vec<Event>> {
-        let path = self.events_file();
-        if !path.exists() {
-            return Ok(Vec::new());
+    pub async fn query(&self, filters: &EventFilters) -> anyhow::Result<Vec<Event>> {
+        let mut conditions: Vec<&str> = Vec::new();
+        let mut sql = String::from(
+            "SELECT id, ts, session_id, hook, tool, decision, reason, detail, duration_ms
+             FROM events WHERE 1=1",
+        );
+
+        if filters.session_id.is_some() {
+            conditions.push(" AND session_id = ?");
+        }
+        if filters.hook.is_some() {
+            conditions.push(" AND hook = ?");
+        }
+        if filters.tool.is_some() {
+            conditions.push(" AND tool = ?");
+        }
+        if filters.decision.is_some() {
+            conditions.push(" AND decision = ?");
+        }
+        if filters.since.is_some() {
+            conditions.push(" AND ts >= ?");
+        }
+        if filters.until.is_some() {
+            conditions.push(" AND ts <= ?");
         }
 
-        let file = std::fs::File::open(&path)?;
-        let reader = std::io::BufReader::new(file);
-        let mut events: Vec<Event> = Vec::new();
+        for cond in &conditions {
+            sql.push_str(cond);
+        }
+        sql.push_str(" ORDER BY ts ASC");
 
-        use std::io::BufRead;
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(event) = serde_json::from_str::<Event>(&line) {
-                if Self::matches_filters(&event, filters) {
-                    events.push(event);
-                    if let Some(limit) = filters.limit {
-                        if events.len() >= limit {
-                            break;
-                        }
-                    }
-                }
-            }
+        if let Some(limit) = filters.limit {
+            sql.push_str(&format!(" LIMIT {limit}"));
         }
 
+        let mut q = sqlx::query(&sql);
+
+        if let Some(ref sid) = filters.session_id {
+            q = q.bind(sid.as_str());
+        }
+        if let Some(ref hook) = filters.hook {
+            q = q.bind(hook.as_str());
+        }
+        if let Some(ref tool) = filters.tool {
+            q = q.bind(tool.as_str());
+        }
+        if let Some(ref decision) = filters.decision {
+            let d = serde_json::to_string(decision)?;
+            let d = d.trim_matches('"').to_string();
+            q = q.bind(d);
+        }
+        if let Some(ref since) = filters.since {
+            q = q.bind(since.to_rfc3339());
+        }
+        if let Some(ref until) = filters.until {
+            q = q.bind(until.to_rfc3339());
+        }
+
+        let rows = q.fetch_all(&self.pool).await?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event = Self::row_to_event(&row)?;
+            events.push(event);
+        }
         Ok(events)
+    }
+
+    fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Event> {
+        use sqlx::Row;
+        let id: String = row.try_get("id")?;
+        let ts_str: String = row.try_get("ts")?;
+        let session_id: String = row.try_get("session_id")?;
+        let hook: String = row.try_get("hook")?;
+        let tool: String = row.try_get("tool")?;
+        let decision_str: String = row.try_get("decision")?;
+        let reason: Option<String> = row.try_get("reason")?;
+        let detail: Option<String> = row.try_get("detail")?;
+        let duration_ms: Option<i64> = row.try_get("duration_ms")?;
+
+        let ts = chrono::DateTime::parse_from_rfc3339(&ts_str)
+            .map_err(|e| anyhow::anyhow!("invalid ts '{ts_str}': {e}"))?
+            .with_timezone(&chrono::Utc);
+
+        let decision: Decision = serde_json::from_str(&format!("\"{decision_str}\""))
+            .map_err(|e| anyhow::anyhow!("invalid decision '{decision_str}': {e}"))?;
+
+        Ok(Event {
+            id: EventId::from_str(&id),
+            ts,
+            session_id: SessionId::from_str(&session_id),
+            hook,
+            tool,
+            decision,
+            reason,
+            detail,
+            duration_ms: duration_ms.map(|v| v as u64),
+        })
     }
 
     pub async fn shutdown(&self) {
@@ -131,7 +296,11 @@ impl EventStore {
     ///
     /// - Always logs a single `rule_scan` event (even when `violations` is empty)
     /// - Logs one `rule_check` event per violation under the same `session_id`
-    pub fn persist_rule_scan(&self, project_root: &Path, violations: &[Violation]) -> SessionId {
+    pub async fn persist_rule_scan(
+        &self,
+        project_root: &Path,
+        violations: &[Violation],
+    ) -> SessionId {
         let session_id = SessionId::new();
         let decision = if violations.is_empty() {
             Decision::Pass
@@ -141,15 +310,16 @@ impl EventStore {
         let mut scan_event = Event::new(session_id.clone(), "rule_scan", "RuleEngine", decision);
         scan_event.reason = Some(format!("violations={}", violations.len()));
         scan_event.detail = Some(project_root.display().to_string());
-        if let Err(e) = self.log(&scan_event) {
+        if let Err(e) = self.log(&scan_event).await {
             tracing::warn!("failed to log rule_scan event: {e}");
         }
 
-        self.log_violations_with_session(&session_id, violations);
+        self.log_violations_with_session(&session_id, violations)
+            .await;
         session_id
     }
 
-    fn log_violations_with_session(&self, session_id: &SessionId, violations: &[Violation]) {
+    async fn log_violations_with_session(&self, session_id: &SessionId, violations: &[Violation]) {
         if violations.is_empty() {
             return;
         }
@@ -172,7 +342,7 @@ impl EventStore {
             } else {
                 violation.file.display().to_string()
             });
-            if let Err(e) = self.log(&event) {
+            if let Err(e) = self.log(&event).await {
                 tracing::warn!("failed to log rule violation event: {e}");
             }
         }
@@ -182,7 +352,7 @@ impl EventStore {
     ///
     /// Uses the "quality_grade" hook with decision mapped from grade:
     /// A/B → Pass, C → Warn, D → Block.
-    pub fn log_quality_grade(&self, grade: Grade, score: f64) {
+    pub async fn log_quality_grade(&self, grade: Grade, score: f64) {
         let decision = match grade {
             Grade::A | Grade::B => Decision::Pass,
             Grade::C => Decision::Warn,
@@ -190,7 +360,7 @@ impl EventStore {
         };
         let mut event = Event::new(SessionId::new(), "quality_grade", "QualityGrader", decision);
         event.detail = Some(format!("grade={grade:?} score={score:.1}"));
-        if let Err(e) = self.log(&event) {
+        if let Err(e) = self.log(&event).await {
             tracing::warn!("failed to log quality_grade event: {e}");
         }
     }
@@ -200,7 +370,7 @@ impl EventStore {
     /// Emits one `auto_fix` summary event followed by one `auto_fix_attempt` event per
     /// violation that had a fix_pattern. Uses `Decision::Pass` when all violations were
     /// resolved, `Decision::Warn` when some residual violations remain.
-    pub fn log_auto_fix_report(
+    pub async fn log_auto_fix_report(
         &self,
         session_id: &SessionId,
         report: &AutoFixReport,
@@ -218,7 +388,7 @@ impl EventStore {
             report.residual_violations.len()
         ));
         summary.detail = Some(project_root.display().to_string());
-        if let Err(e) = self.log(&summary) {
+        if let Err(e) = self.log(&summary).await {
             tracing::warn!("failed to log auto_fix event: {e}");
         }
 
@@ -245,18 +415,19 @@ impl EventStore {
             } else {
                 attempt.file.display().to_string()
             });
-            if let Err(e) = self.log(&evt) {
+            if let Err(e) = self.log(&evt).await {
                 tracing::warn!("failed to log auto_fix_attempt event: {e}");
             }
         }
     }
 
-    pub fn query_recent(&self, duration: std::time::Duration) -> anyhow::Result<Vec<Event>> {
+    pub async fn query_recent(&self, duration: std::time::Duration) -> anyhow::Result<Vec<Event>> {
         let since = chrono::Utc::now() - chrono::Duration::from_std(duration)?;
         self.query(&EventFilters {
             since: Some(since),
             ..Default::default()
         })
+        .await
     }
 
     fn signals_file(&self) -> std::path::PathBuf {
@@ -304,40 +475,6 @@ impl EventStore {
         }
         Ok(signals)
     }
-
-    fn matches_filters(event: &Event, filters: &EventFilters) -> bool {
-        if let Some(ref sid) = filters.session_id {
-            if event.session_id != *sid {
-                return false;
-            }
-        }
-        if let Some(ref hook) = filters.hook {
-            if event.hook != *hook {
-                return false;
-            }
-        }
-        if let Some(ref tool) = filters.tool {
-            if event.tool != *tool {
-                return false;
-            }
-        }
-        if let Some(ref decision) = filters.decision {
-            if event.decision != *decision {
-                return false;
-            }
-        }
-        if let Some(ref since) = filters.since {
-            if event.ts < *since {
-                return false;
-            }
-        }
-        if let Some(ref until) = filters.until {
-            if event.ts > *until {
-                return false;
-            }
-        }
-        true
-    }
 }
 
 #[cfg(test)]
@@ -353,92 +490,132 @@ mod tests {
         Event::new(SessionId::new(), hook, "Edit", decision)
     }
 
-    #[test]
-    fn query_empty_store_returns_empty() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn query_empty_store_returns_empty() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
-        let results = store.query(&EventFilters::default())?;
+        let store = EventStore::new(dir.path()).await?;
+        let results = store.query(&EventFilters::default()).await?;
         assert!(results.is_empty());
         Ok(())
     }
 
-    #[test]
-    fn log_and_query_roundtrip() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn log_and_query_roundtrip() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
+        let store = EventStore::new(dir.path()).await?;
         let event = make_event("pre_tool_use", Decision::Pass);
-        store.log(&event)?;
-        let results = store.query(&EventFilters::default())?;
+        store.log(&event).await?;
+        let results = store.query(&EventFilters::default()).await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, event.id);
         Ok(())
     }
 
-    #[test]
-    fn query_filters_by_hook() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn query_filters_by_hook() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
-        store.log(&make_event("pre_tool_use", Decision::Pass))?;
-        store.log(&make_event("post_tool_use", Decision::Pass))?;
-        let results = store.query(&EventFilters {
-            hook: Some("pre_tool_use".to_string()),
-            ..Default::default()
-        })?;
+        let store = EventStore::new(dir.path()).await?;
+        store
+            .log(&make_event("pre_tool_use", Decision::Pass))
+            .await?;
+        store
+            .log(&make_event("post_tool_use", Decision::Pass))
+            .await?;
+        let results = store
+            .query(&EventFilters {
+                hook: Some("pre_tool_use".to_string()),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].hook, "pre_tool_use");
         Ok(())
     }
 
-    #[test]
-    fn query_filters_by_decision() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn query_filters_by_decision() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
-        store.log(&make_event("h1", Decision::Pass))?;
-        store.log(&make_event("h2", Decision::Block))?;
-        let results = store.query(&EventFilters {
-            decision: Some(Decision::Block),
-            ..Default::default()
-        })?;
+        let store = EventStore::new(dir.path()).await?;
+        store.log(&make_event("h1", Decision::Pass)).await?;
+        store.log(&make_event("h2", Decision::Block)).await?;
+        let results = store
+            .query(&EventFilters {
+                decision: Some(Decision::Block),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].decision, Decision::Block);
         Ok(())
     }
 
-    #[test]
-    fn query_filters_by_tool() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn query_filters_by_tool() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
+        let store = EventStore::new(dir.path()).await?;
         let sid = SessionId::new();
-        store.log(&Event::new(sid.clone(), "hook", "tool_a", Decision::Pass))?;
-        store.log(&Event::new(sid, "hook", "tool_b", Decision::Pass))?;
-        let results = store.query(&EventFilters {
-            tool: Some("tool_a".to_string()),
-            ..Default::default()
-        })?;
+        store
+            .log(&Event::new(sid.clone(), "hook", "tool_a", Decision::Pass))
+            .await?;
+        store
+            .log(&Event::new(sid, "hook", "tool_b", Decision::Pass))
+            .await?;
+        let results = store
+            .query(&EventFilters {
+                tool: Some("tool_a".to_string()),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].tool, "tool_a");
         Ok(())
     }
 
-    #[test]
-    fn query_respects_limit() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn query_filters_by_session_id() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
+        let store = EventStore::new(dir.path()).await?;
+        let sid1 = SessionId::new();
+        let sid2 = SessionId::new();
+        store
+            .log(&Event::new(sid1.clone(), "hook", "tool", Decision::Pass))
+            .await?;
+        store
+            .log(&Event::new(sid2, "hook", "tool", Decision::Pass))
+            .await?;
+        let results = store
+            .query(&EventFilters {
+                session_id: Some(sid1.clone()),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session_id, sid1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn query_respects_limit() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path()).await?;
         for _ in 0..5 {
-            store.log(&make_event("hook", Decision::Pass))?;
+            store.log(&make_event("hook", Decision::Pass)).await?;
         }
-        let results = store.query(&EventFilters {
-            limit: Some(3),
-            ..Default::default()
-        })?;
+        let results = store
+            .query(&EventFilters {
+                limit: Some(3),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(results.len(), 3);
         Ok(())
     }
 
-    #[test]
-    fn persist_rule_scan_logs_one_event_per_violation_under_scan_session() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn persist_rule_scan_logs_one_event_per_violation_under_scan_session(
+    ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
+        let store = EventStore::new(dir.path()).await?;
         let violations = vec![
             Violation {
                 rule_id: RuleId::from_str("SEC-01"),
@@ -455,8 +632,10 @@ mod tests {
                 severity: Severity::Low,
             },
         ];
-        let session_id = store.persist_rule_scan(Path::new("/tmp/project"), &violations);
-        let events = store.query(&EventFilters::default())?;
+        let session_id = store
+            .persist_rule_scan(Path::new("/tmp/project"), &violations)
+            .await;
+        let events = store.query(&EventFilters::default()).await?;
         assert_eq!(events.len(), 3);
         assert_eq!(events.iter().filter(|e| e.hook == "rule_scan").count(), 1);
         let check_events: Vec<_> = events.iter().filter(|e| e.hook == "rule_check").collect();
@@ -467,30 +646,36 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn persist_rule_scan_logs_summary_even_when_empty() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn persist_rule_scan_logs_summary_even_when_empty() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
-        store.persist_rule_scan(Path::new("/tmp/project"), &[]);
-        let scan_events = store.query(&EventFilters {
-            hook: Some("rule_scan".to_string()),
-            ..Default::default()
-        })?;
+        let store = EventStore::new(dir.path()).await?;
+        store
+            .persist_rule_scan(Path::new("/tmp/project"), &[])
+            .await;
+        let scan_events = store
+            .query(&EventFilters {
+                hook: Some("rule_scan".to_string()),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(scan_events.len(), 1);
         assert_eq!(scan_events[0].decision, Decision::Pass);
 
-        let violation_events = store.query(&EventFilters {
-            hook: Some("rule_check".to_string()),
-            ..Default::default()
-        })?;
+        let violation_events = store
+            .query(&EventFilters {
+                hook: Some("rule_check".to_string()),
+                ..Default::default()
+            })
+            .await?;
         assert!(violation_events.is_empty());
         Ok(())
     }
 
-    #[test]
-    fn persist_rule_scan_maps_severity_to_decision() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn persist_rule_scan_maps_severity_to_decision() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
+        let store = EventStore::new(dir.path()).await?;
         let violations = vec![
             Violation {
                 rule_id: RuleId::from_str("R-CRIT"),
@@ -521,11 +706,15 @@ mod tests {
                 severity: Severity::Low,
             },
         ];
-        store.persist_rule_scan(Path::new("/tmp/project"), &violations);
-        let events = store.query(&EventFilters {
-            hook: Some("rule_check".to_string()),
-            ..Default::default()
-        })?;
+        store
+            .persist_rule_scan(Path::new("/tmp/project"), &violations)
+            .await;
+        let events = store
+            .query(&EventFilters {
+                hook: Some("rule_check".to_string()),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(events.len(), 4);
         let by_tool: std::collections::HashMap<_, _> = events
             .iter()
@@ -538,25 +727,27 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn persist_rule_scan_stores_project_path_on_anchor() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn persist_rule_scan_stores_project_path_on_anchor() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
+        let store = EventStore::new(dir.path()).await?;
         let project_root = Path::new("/tmp/my-project");
-        store.persist_rule_scan(project_root, &[]);
-        let events = store.query(&EventFilters {
-            hook: Some("rule_scan".to_string()),
-            ..Default::default()
-        })?;
+        store.persist_rule_scan(project_root, &[]).await;
+        let events = store
+            .query(&EventFilters {
+                hook: Some("rule_scan".to_string()),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].detail.as_deref(), Some("/tmp/my-project"));
         Ok(())
     }
 
-    #[test]
-    fn log_auto_fix_report_emits_summary_and_attempt_events() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn log_auto_fix_report_emits_summary_and_attempt_events() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
+        let store = EventStore::new(dir.path()).await?;
         let session_id = SessionId::new();
 
         let report = AutoFixReport {
@@ -580,12 +771,16 @@ mod tests {
             residual_violations: vec![],
         };
 
-        store.log_auto_fix_report(&session_id, &report, Path::new("/tmp/project"));
+        store
+            .log_auto_fix_report(&session_id, &report, Path::new("/tmp/project"))
+            .await;
 
-        let all_events = store.query(&EventFilters {
-            session_id: Some(session_id.clone()),
-            ..Default::default()
-        })?;
+        let all_events = store
+            .query(&EventFilters {
+                session_id: Some(session_id.clone()),
+                ..Default::default()
+            })
+            .await?;
         // 1 summary + 2 attempts = 3 events
         assert_eq!(all_events.len(), 3);
 
@@ -614,10 +809,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn log_auto_fix_report_summary_warns_when_residual_violations_remain() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn log_auto_fix_report_summary_warns_when_residual_violations_remain(
+    ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
+        let store = EventStore::new(dir.path()).await?;
         let session_id = SessionId::new();
 
         let report = AutoFixReport {
@@ -632,21 +828,25 @@ mod tests {
             }],
         };
 
-        store.log_auto_fix_report(&session_id, &report, Path::new("/tmp/project"));
+        store
+            .log_auto_fix_report(&session_id, &report, Path::new("/tmp/project"))
+            .await;
 
-        let events = store.query(&EventFilters {
-            hook: Some("auto_fix".to_string()),
-            ..Default::default()
-        })?;
+        let events = store
+            .query(&EventFilters {
+                hook: Some("auto_fix".to_string()),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].decision, Decision::Warn);
         Ok(())
     }
 
-    #[test]
-    fn log_external_signal_and_query_roundtrip() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn log_external_signal_and_query_roundtrip() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
+        let store = EventStore::new(dir.path()).await?;
         let signal = ExternalSignal::new(
             "github".to_string(),
             Severity::High,
@@ -660,10 +860,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn query_external_signals_filters_by_since() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn query_external_signals_filters_by_since() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
+        let store = EventStore::new(dir.path()).await?;
         let old_signal =
             ExternalSignal::new("github".to_string(), Severity::Low, serde_json::json!({}));
         store.log_external_signal(&old_signal)?;
@@ -680,16 +880,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn query_external_signals_empty_when_no_file() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn query_external_signals_empty_when_no_file() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = EventStore::new(dir.path())?;
+        let store = EventStore::new(dir.path()).await?;
         let results = store.query_external_signals(None)?;
         assert!(results.is_empty());
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn log_with_unreachable_otel_endpoint_still_persists_event() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let config = OtelConfig {
@@ -709,13 +909,31 @@ mod tests {
             "http_client",
             Decision::Pass,
         );
-        store.log(&event)?;
-        let events = store.query(&EventFilters {
-            session_id: Some(event.session_id.clone()),
-            ..Default::default()
-        })?;
+        store.log(&event).await?;
+        let events = store
+            .query(&EventFilters {
+                session_id: Some(event.session_id.clone()),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, event.id);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migrate_from_jsonl_imports_existing_events() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Write a JSONL file before opening the store
+        let event = make_event("pre_tool_use", Decision::Pass);
+        let line = serde_json::to_string(&event)?;
+        let jsonl_path = dir.path().join("events.jsonl");
+        std::fs::write(&jsonl_path, format!("{line}\n"))?;
+
+        let store = EventStore::new(dir.path()).await?;
+        let results = store.query(&EventFilters::default()).await?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, event.id);
         Ok(())
     }
 }

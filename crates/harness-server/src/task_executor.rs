@@ -339,7 +339,7 @@ pub(crate) async fn run_task(
         harness_core::Decision::Complete,
     );
     ev.detail = pr_num.map(|n| format!("pr={n}"));
-    if let Err(e) = events.log(&ev) {
+    if let Err(e) = events.log(&ev).await {
         tracing::warn!("failed to log task_implement event: {e}");
     }
 
@@ -457,7 +457,7 @@ pub(crate) async fn run_task(
         } else {
             format!("round {round}: fixed")
         });
-        if let Err(e) = events.log(&ev) {
+        if let Err(e) = events.log(&ev).await {
             tracing::warn!("failed to log pr_review event: {e}");
         }
 
@@ -584,7 +584,7 @@ async fn run_agent_review(
         } else {
             format!("round {agent_round}: {} issues", issues.len())
         });
-        if let Err(e) = events.log(&ev) {
+        if let Err(e) = events.log(&ev).await {
             tracing::warn!("failed to log agent_review event: {e}");
         }
 

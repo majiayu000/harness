@@ -7,7 +7,7 @@ pub async fn event_log(
     id: Option<serde_json::Value>,
     event: harness_core::Event,
 ) -> RpcResponse {
-    match state.observability.events.log(&event) {
+    match state.observability.events.log(&event).await {
         Ok(event_id) => RpcResponse::success(
             id,
             serde_json::json!({ "logged": true, "event_id": event_id }),
@@ -21,7 +21,7 @@ pub async fn event_query(
     id: Option<serde_json::Value>,
     filters: harness_core::EventFilters,
 ) -> RpcResponse {
-    match state.observability.events.query(&filters) {
+    match state.observability.events.query(&filters).await {
         Ok(events) => match serde_json::to_value(&events) {
             Ok(v) => RpcResponse::success(id, v),
             Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -55,12 +55,14 @@ pub async fn metrics_collect(
     state
         .observability
         .events
-        .persist_rule_scan(&project_root, &violations);
+        .persist_rule_scan(&project_root, &violations)
+        .await;
 
     let evts = match state
         .observability
         .events
         .query(&harness_core::EventFilters::default())
+        .await
     {
         Ok(e) => e,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -153,7 +155,7 @@ mod tests {
             "Read",
             harness_core::Decision::Pass,
         );
-        state.observability.events.log(&event)?;
+        state.observability.events.log(&event).await?;
 
         let filters = harness_core::EventFilters {
             session_id: Some(session_id),
@@ -209,7 +211,11 @@ mod tests {
             "scan failure must not return a success payload"
         );
 
-        let events = state.observability.events.query(&EventFilters::default())?;
+        let events = state
+            .observability
+            .events
+            .query(&EventFilters::default())
+            .await?;
         assert!(
             events.iter().all(|event| event.hook != "rule_scan"),
             "scan failure should not persist a rule_scan event"
@@ -228,7 +234,7 @@ pub async fn metrics_query(
         until: filters.until,
         ..Default::default()
     };
-    let events = state.observability.events.query(&event_filters);
+    let events = state.observability.events.query(&event_filters).await;
     match events {
         Ok(evts) => {
             let violation_count = evts
