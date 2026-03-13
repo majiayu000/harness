@@ -1,13 +1,17 @@
 use crate::task_db::TaskDb;
 use dashmap::DashMap;
 pub use harness_core::TaskId;
-use harness_core::{CodeAgent, Decision, Event, SessionId};
+use harness_core::{CodeAgent, Decision, Event, SessionId, StreamItem};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
+
+/// Broadcast channel capacity for per-task stream events.
+/// When the buffer is full, the oldest events are dropped for lagging receivers.
+const TASK_STREAM_CAPACITY: usize = 512;
 
 /// Async callback invoked when a task reaches a terminal state (Done/Failed).
 /// Receives a snapshot of the final `TaskState`. Implemented in the intake layer
@@ -299,6 +303,8 @@ pub struct TaskStore {
     pub(crate) cache: DashMap<TaskId, TaskState>,
     db: TaskDb,
     persist_locks: DashMap<TaskId, Arc<Mutex<()>>>,
+    /// Per-task broadcast channels for real-time stream forwarding to SSE clients.
+    stream_txs: DashMap<TaskId, broadcast::Sender<StreamItem>>,
 }
 
 impl TaskStore {
@@ -314,6 +320,7 @@ impl TaskStore {
             cache,
             db,
             persist_locks,
+            stream_txs: DashMap::new(),
         }))
     }
 
@@ -338,6 +345,34 @@ impl TaskStore {
             .filter(|e| e.value().parent_id.as_ref() == Some(parent_id))
             .map(|e| e.value().clone())
             .collect()
+    }
+
+    /// Register a broadcast channel for a task's stream. Call once before task execution starts.
+    pub(crate) fn register_task_stream(&self, id: &TaskId) {
+        let (tx, _rx) = broadcast::channel(TASK_STREAM_CAPACITY);
+        self.stream_txs.insert(id.clone(), tx);
+    }
+
+    /// Subscribe to a task's active stream. Returns `None` if no stream is registered.
+    pub fn subscribe_task_stream(&self, id: &TaskId) -> Option<broadcast::Receiver<StreamItem>> {
+        self.stream_txs.get(id).map(|tx| tx.subscribe())
+    }
+
+    /// Publish a [`StreamItem`] to all current subscribers of a task stream.
+    /// No-op when no stream is registered. Dropping the send result is intentional:
+    /// `SendError` only occurs when there are no active receivers, which is normal
+    /// when no SSE client is connected (backpressure: oldest events dropped on lag).
+    pub(crate) fn publish_stream_item(&self, id: &TaskId, item: StreamItem) {
+        if let Some(tx) = self.stream_txs.get(id) {
+            if let Err(e) = tx.send(item) {
+                tracing::trace!(task_id = %id.0, "stream publish dropped (no receivers): {e}");
+            }
+        }
+    }
+
+    /// Remove the task's stream channel after execution completes.
+    pub(crate) fn close_task_stream(&self, id: &TaskId) {
+        self.stream_txs.remove(id);
     }
 
     pub(crate) async fn insert(&self, state: &TaskState) {
@@ -418,6 +453,8 @@ where
     let mut state = TaskState::new(task_id.clone());
     state.source = req.source.clone();
     store.insert(&state).await;
+    // Register stream channel before spawning so SSE clients can subscribe immediately.
+    store.register_task_stream(&task_id);
 
     let id = task_id.clone();
     let store_watcher = store.clone();
@@ -566,6 +603,8 @@ where
                 record_task_failure(&store_watcher, &events_watcher, &id_watcher, reason).await;
             }
         }
+        // Close the stream channel so SSE clients receive EOF.
+        store_watcher.close_task_stream(&id_watcher);
         if let Some(cb) = completion_callback {
             match store_watcher.get(&id_watcher) {
                 Some(final_state) => cb(final_state).await,
@@ -630,6 +669,76 @@ mod tests {
         AgentRequest, AgentResponse, Capability, ContextItem, EventFilters, StreamItem, TokenUsage,
     };
     use tokio::time::Duration;
+
+    #[tokio::test]
+    async fn task_stream_subscribe_and_publish() -> anyhow::Result<()> {
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let id = TaskId("stream-test".to_string());
+
+        // No stream registered yet.
+        assert!(
+            store.subscribe_task_stream(&id).is_none(),
+            "subscribe before register should return None"
+        );
+
+        store.register_task_stream(&id);
+        let mut rx = store
+            .subscribe_task_stream(&id)
+            .ok_or_else(|| anyhow::anyhow!("subscribe after register should succeed"))?;
+
+        store.publish_stream_item(
+            &id,
+            StreamItem::MessageDelta {
+                text: "hello\n".into(),
+            },
+        );
+        store.publish_stream_item(&id, StreamItem::Done);
+
+        let item1 = rx.recv().await?;
+        let item2 = rx.recv().await?;
+        assert!(matches!(item1, StreamItem::MessageDelta { .. }));
+        assert!(matches!(item2, StreamItem::Done));
+
+        // After close_task_stream the channel sender is dropped.
+        store.close_task_stream(&id);
+        assert!(
+            store.subscribe_task_stream(&id).is_none(),
+            "subscribe after close should return None"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_stream_backpressure_drops_oldest_on_lag() -> anyhow::Result<()> {
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let id = TaskId("backpressure-test".to_string());
+
+        store.register_task_stream(&id);
+        let mut rx = store
+            .subscribe_task_stream(&id)
+            .ok_or_else(|| anyhow::anyhow!("subscribe should succeed after register"))?;
+
+        // Publish more items than TASK_STREAM_CAPACITY to trigger lag.
+        for i in 0..(TASK_STREAM_CAPACITY + 10) as u64 {
+            store.publish_stream_item(
+                &id,
+                StreamItem::MessageDelta {
+                    text: format!("line {i}\n"),
+                },
+            );
+        }
+
+        // Receiver should see RecvError::Lagged on overflow.
+        let result = rx.recv().await;
+        assert!(
+            result.is_err(),
+            "expected Lagged error after overflow, got: {:?}",
+            result
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn list_children_returns_subtasks_for_parent() -> anyhow::Result<()> {
@@ -717,9 +826,15 @@ mod tests {
 
         async fn execute_stream(
             &self,
-            _req: AgentRequest,
+            req: AgentRequest,
             _tx: tokio::sync::mpsc::Sender<StreamItem>,
         ) -> harness_core::Result<()> {
+            // Mirror execute(): capture context on first call so tests that
+            // verify skill injection work whether execute or execute_stream is called.
+            let mut guard = self.captured.lock().await;
+            if guard.is_empty() {
+                *guard = req.context.clone();
+            }
             Ok(())
         }
     }

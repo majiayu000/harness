@@ -5,7 +5,10 @@ use axum::{
     extract::DefaultBodyLimit,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
@@ -666,6 +669,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .route("/tasks", post(task_routes::create_task))
         .route("/tasks", get(list_tasks))
         .route("/tasks/{id}", get(get_task))
+        .route("/tasks/{id}/stream", get(stream_task_sse))
         .route("/api/intake", get(intake_status))
         .route(
             "/webhook",
@@ -857,6 +861,53 @@ async fn get_task(State(state): State<Arc<AppState>>, Path(id): Path<String>) ->
         )
             .into_response(),
     }
+}
+
+/// GET /tasks/{id}/stream — real-time SSE stream of agent execution events.
+///
+/// Subscribes to the task's broadcast channel and forwards each [`StreamItem`]
+/// as a JSON-encoded SSE data event. The stream ends when the task completes
+/// (channel closed). If the receiver lags, a synthetic "lag" event is emitted
+/// noting how many events were dropped; streaming then continues.
+async fn stream_task_sse(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let task_id = task_runner::TaskId(id);
+
+    let rx = match state.core.tasks.subscribe_task_stream(&task_id) {
+        Some(rx) => rx,
+        None => {
+            if state.core.tasks.get(&task_id).is_none() {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "task not found"})),
+                )
+                    .into_response();
+            }
+            // Task exists but stream already closed (task completed before client connected).
+            let stream = futures::stream::empty::<Result<Event, std::convert::Infallible>>();
+            return Sse::new(stream).into_response();
+        }
+    };
+
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Ok(item) => {
+                let data = serde_json::to_string(&item).unwrap_or_default();
+                Some((
+                    Ok::<Event, std::convert::Infallible>(Event::default().data(data)),
+                    rx,
+                ))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                let event = Event::default()
+                    .event("lag")
+                    .data(format!("dropped {n} events due to slow consumer"));
+                Some((Ok(event), rx))
+            }
+        }
+    });
+
+    Sse::new(stream).into_response()
 }
 
 /// GET /api/intake — current status of all intake channels and recent dispatches.

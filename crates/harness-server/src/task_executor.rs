@@ -6,7 +6,8 @@ use crate::task_runner::{
 };
 use harness_core::{
     config::load_project_config, interceptor::ToolUseEvent, prompts, AgentRequest, AgentResponse,
-    CodeAgent, ContextItem, Event, ExecutionPhase, SessionId, ThreadId, TurnId, TurnStatus,
+    CodeAgent, ContextItem, Event, ExecutionPhase, HarnessError, Item, SessionId, StreamItem,
+    ThreadId, TokenUsage, TurnId, TurnStatus,
 };
 use harness_protocol::{Notification, RpcNotification};
 use std::path::{Path, PathBuf};
@@ -187,6 +188,78 @@ fn compute_backoff_ms(base_ms: u64, max_ms: u64, attempt: u32) -> u64 {
     base_ms.saturating_mul(1u64 << shift).min(max_ms)
 }
 
+/// Execute an agent request via [`CodeAgent::execute_stream`], broadcasting
+/// each [`StreamItem`] to the per-task channel in real time, and reconstruct
+/// an [`AgentResponse`] from the collected stream events.
+async fn run_agent_streaming(
+    agent: &dyn CodeAgent,
+    req: AgentRequest,
+    task_id: &TaskId,
+    store: &TaskStore,
+) -> harness_core::Result<AgentResponse> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamItem>(128);
+    let mut exec = std::pin::pin!(agent.execute_stream(req, tx));
+    let mut exec_result: Option<harness_core::Result<()>> = None;
+    let mut channel_closed = false;
+    let mut output = String::new();
+    let mut token_usage = TokenUsage::default();
+
+    loop {
+        tokio::select! {
+            result = &mut exec, if exec_result.is_none() => {
+                exec_result = Some(result);
+            }
+            item = rx.recv(), if !channel_closed => {
+                match item {
+                    Some(item) => {
+                        store.publish_stream_item(task_id, item.clone());
+                        match &item {
+                            StreamItem::MessageDelta { text } => {
+                                output.push_str(text);
+                            }
+                            StreamItem::ItemCompleted {
+                                item: Item::AgentReasoning { content },
+                            } => {
+                                // Prefer the full content over accumulated deltas.
+                                output = content.clone();
+                            }
+                            StreamItem::TokenUsage { usage } => {
+                                token_usage = usage.clone();
+                            }
+                            StreamItem::Done => {
+                                channel_closed = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    None => {
+                        channel_closed = true;
+                    }
+                }
+            }
+        }
+        if exec_result.is_some() && channel_closed {
+            break;
+        }
+    }
+
+    match exec_result.unwrap_or_else(|| {
+        Err(HarnessError::AgentExecution(
+            "agent execution completed without result".into(),
+        ))
+    }) {
+        Ok(()) => Ok(AgentResponse {
+            output,
+            stderr: String::new(),
+            items: Vec::new(),
+            token_usage,
+            model: String::new(),
+            exit_code: Some(0),
+        }),
+        Err(e) => Err(e),
+    }
+}
+
 pub(crate) async fn run_task(
     store: &TaskStore,
     task_id: &TaskId,
@@ -252,7 +325,11 @@ pub(crate) async fn run_task(
     let mut impl_req = first_req.clone();
 
     let resp = loop {
-        let raw = tokio::time::timeout(turn_timeout, agent.execute(impl_req.clone())).await;
+        let raw = tokio::time::timeout(
+            turn_timeout,
+            run_agent_streaming(agent, impl_req.clone(), task_id, store),
+        )
+        .await;
         match raw {
             Ok(Ok(r)) => {
                 // PreToolUse / PostToolUse hook injection point:
