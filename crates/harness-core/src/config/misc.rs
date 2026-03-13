@@ -139,6 +139,9 @@ pub struct GcConfig {
     pub adopt_max_rounds: u32,
     #[serde(default = "default_gc_adopt_turn_timeout_secs")]
     pub adopt_turn_timeout_secs: u64,
+    /// Hours after which a pending draft is considered stale and removed. Default: 72.
+    #[serde(default = "default_gc_draft_ttl_hours")]
+    pub draft_ttl_hours: u64,
     pub signal_thresholds: SignalThresholdsConfig,
 }
 
@@ -151,6 +154,7 @@ impl Default for GcConfig {
             adopt_wait_secs: default_gc_adopt_wait_secs(),
             adopt_max_rounds: default_gc_adopt_max_rounds(),
             adopt_turn_timeout_secs: default_gc_adopt_turn_timeout_secs(),
+            draft_ttl_hours: default_gc_draft_ttl_hours(),
             signal_thresholds: SignalThresholdsConfig::default(),
         }
     }
@@ -166,6 +170,10 @@ fn default_gc_adopt_max_rounds() -> u32 {
 
 fn default_gc_adopt_turn_timeout_secs() -> u64 {
     600
+}
+
+fn default_gc_draft_ttl_hours() -> u64 {
+    72
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
