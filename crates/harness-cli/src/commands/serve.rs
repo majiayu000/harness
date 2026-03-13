@@ -29,14 +29,15 @@ pub async fn run(
     }
     let thread_manager = harness_server::thread_manager::ThreadManager::new();
     let mut agent_registry = harness_agents::AgentRegistry::new(&serve_config.agents.default_agent);
-    agent_registry.register(
-        "claude",
-        Arc::new(harness_agents::claude::ClaudeCodeAgent::new(
-            serve_config.agents.claude.cli_path.clone(),
-            serve_config.agents.claude.default_model.clone(),
-            serve_config.agents.sandbox_mode,
-        )),
+    let mut claude_agent = harness_agents::claude::ClaudeCodeAgent::new(
+        serve_config.agents.claude.cli_path.clone(),
+        serve_config.agents.claude.default_model.clone(),
+        serve_config.agents.sandbox_mode,
     );
+    if let Some(budget) = serve_config.agents.claude.reasoning_budget.clone() {
+        claude_agent = claude_agent.with_reasoning_budget(budget);
+    }
+    agent_registry.register("claude", Arc::new(claude_agent));
     agent_registry.register(
         "codex",
         Arc::new(harness_agents::codex::CodexAgent::from_config(

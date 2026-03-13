@@ -126,6 +126,7 @@ mod tests {
             model: None,
             max_budget_usd: None,
             context: vec![],
+            execution_phase: None,
         }
     }
 

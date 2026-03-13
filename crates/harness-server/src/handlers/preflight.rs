@@ -92,6 +92,7 @@ pub async fn run_preflight(
         model: None,
         max_budget_usd: None,
         context: vec![],
+        execution_phase: None,
     };
 
     let resp = agent.execute(req).await?;

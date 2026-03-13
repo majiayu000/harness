@@ -24,6 +24,11 @@ pub struct AgentRequest {
     pub model: Option<String>,
     pub max_budget_usd: Option<f64>,
     pub context: Vec<ContextItem>,
+    /// Execution phase for per-phase model selection via ReasoningBudget.
+    /// When set and the agent has a ReasoningBudget configured, the phase
+    /// determines which model is used. Defaults to None (uses req.model or default_model).
+    #[serde(default)]
+    pub execution_phase: Option<ExecutionPhase>,
 }
 
 impl Default for AgentRequest {
@@ -35,6 +40,7 @@ impl Default for AgentRequest {
             model: None,
             max_budget_usd: None,
             context: Vec::new(),
+            execution_phase: None,
         }
     }
 }

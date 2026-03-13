@@ -3,7 +3,9 @@ use crate::streaming::{
 };
 use async_trait::async_trait;
 use harness_core::SandboxMode;
-use harness_core::{AgentRequest, AgentResponse, Capability, CodeAgent, StreamItem, TokenUsage};
+use harness_core::{
+    AgentRequest, AgentResponse, Capability, CodeAgent, ReasoningBudget, StreamItem, TokenUsage,
+};
 use harness_sandbox::{wrap_command, SandboxSpec};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -14,6 +16,9 @@ pub struct ClaudeCodeAgent {
     pub cli_path: PathBuf,
     pub default_model: String,
     pub sandbox_mode: SandboxMode,
+    /// Per-phase model selection. When set, model is chosen based on
+    /// `req.execution_phase`. Falls back to `req.model` or `default_model`.
+    pub reasoning_budget: Option<ReasoningBudget>,
 }
 
 impl ClaudeCodeAgent {
@@ -22,11 +27,25 @@ impl ClaudeCodeAgent {
             cli_path,
             default_model,
             sandbox_mode,
+            reasoning_budget: None,
         }
     }
 
+    /// Attach a ReasoningBudget for per-phase model selection.
+    pub fn with_reasoning_budget(mut self, budget: ReasoningBudget) -> Self {
+        self.reasoning_budget = Some(budget);
+        self
+    }
+
+    fn resolve_model<'a>(&'a self, req: &'a AgentRequest) -> &'a str {
+        if let (Some(budget), Some(phase)) = (&self.reasoning_budget, req.execution_phase) {
+            return budget.model_for_phase(phase);
+        }
+        req.model.as_deref().unwrap_or(&self.default_model)
+    }
+
     fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
-        let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let model = self.resolve_model(req);
         let mut base_args = vec![
             OsString::from("-p"),
             OsString::from("--dangerously-skip-permissions"),
@@ -63,7 +82,7 @@ impl CodeAgent for ClaudeCodeAgent {
     }
 
     async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
-        let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let model = self.resolve_model(&req).to_string();
         let base_args = self.base_args(&req);
 
         let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
@@ -155,10 +174,83 @@ impl CodeAgent for ClaudeCodeAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::Item;
+    use harness_core::{ExecutionPhase, Item, ReasoningBudget};
     use std::fs;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    #[test]
+    fn resolve_model_uses_phase_when_budget_configured() {
+        let budget = ReasoningBudget::default();
+        let agent = ClaudeCodeAgent::new(
+            PathBuf::from("claude"),
+            "default-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        )
+        .with_reasoning_budget(budget);
+
+        let req_planning = AgentRequest {
+            execution_phase: Some(ExecutionPhase::Planning),
+            ..AgentRequest::default()
+        };
+        let req_execution = AgentRequest {
+            execution_phase: Some(ExecutionPhase::Execution),
+            ..AgentRequest::default()
+        };
+        let req_validation = AgentRequest {
+            execution_phase: Some(ExecutionPhase::Validation),
+            ..AgentRequest::default()
+        };
+        let req_no_phase = AgentRequest::default();
+
+        assert_eq!(agent.resolve_model(&req_planning), "claude-opus-4-20250514");
+        assert_eq!(
+            agent.resolve_model(&req_execution),
+            "claude-sonnet-4-20250514"
+        );
+        assert_eq!(
+            agent.resolve_model(&req_validation),
+            "claude-opus-4-20250514"
+        );
+        // No phase → falls back to default_model
+        assert_eq!(agent.resolve_model(&req_no_phase), "default-model");
+    }
+
+    #[test]
+    fn resolve_model_falls_back_to_req_model_when_no_budget() {
+        let agent = ClaudeCodeAgent::new(
+            PathBuf::from("claude"),
+            "default-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
+
+        let req_with_model = AgentRequest {
+            model: Some("explicit-model".to_string()),
+            execution_phase: Some(ExecutionPhase::Planning),
+            ..AgentRequest::default()
+        };
+        let req_no_model = AgentRequest {
+            execution_phase: Some(ExecutionPhase::Planning),
+            ..AgentRequest::default()
+        };
+
+        // No budget → req.model takes precedence over phase
+        assert_eq!(agent.resolve_model(&req_with_model), "explicit-model");
+        // No budget, no req.model → default_model
+        assert_eq!(agent.resolve_model(&req_no_model), "default-model");
+    }
+
+    #[test]
+    fn with_reasoning_budget_sets_field() {
+        let budget = ReasoningBudget::default();
+        let agent = ClaudeCodeAgent::new(
+            PathBuf::from("claude"),
+            "default-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        )
+        .with_reasoning_budget(budget);
+        assert!(agent.reasoning_budget.is_some());
+    }
 
     fn write_executable_script(script_body: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("create tempdir");
