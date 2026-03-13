@@ -53,6 +53,10 @@ impl GcAgent {
         violations: &[harness_core::Violation],
         agent: &dyn CodeAgent,
     ) -> anyhow::Result<GcReport> {
+        // 0. Expire stale drafts before generating new ones
+        self.draft_store
+            .expire_stale_drafts(self.config.draft_ttl_hours)?;
+
         // Determine incremental cutoff from checkpoint (None → full scan).
         let since = self
             .checkpoint_path
