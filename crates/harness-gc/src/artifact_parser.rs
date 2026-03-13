@@ -72,7 +72,7 @@ fn parse_fenced_blocks(output: &str, artifact_type: ArtifactType) -> Vec<Artifac
             if lang == "diff" {
                 // Diff block: target path from explicit hint or from +++ line
                 let target = path_hint
-                    .and_then(|p| valid_relative(p))
+                    .and_then(valid_relative)
                     .or_else(|| diff_target_path(block_lines));
                 if let Some(target_path) = target {
                     artifacts.push(Artifact {
@@ -81,7 +81,7 @@ fn parse_fenced_blocks(output: &str, artifact_type: ArtifactType) -> Vec<Artifac
                         content: block_lines.join("\n"),
                     });
                 }
-            } else if let Some(path_str) = path_hint.and_then(|p| valid_relative(p)) {
+            } else if let Some(path_str) = path_hint.and_then(valid_relative) {
                 // Code block with explicit file path
                 artifacts.push(Artifact {
                     artifact_type,
