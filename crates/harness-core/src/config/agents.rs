@@ -19,8 +19,8 @@ pub enum ApprovalPolicy {
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxMode {
     ReadOnly,
-    WorkspaceWrite,
     #[default]
+    WorkspaceWrite,
     DangerFullAccess,
 }
 
