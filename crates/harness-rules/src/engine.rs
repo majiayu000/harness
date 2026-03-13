@@ -1336,13 +1336,11 @@ host_executable(name = "git", paths = ["/opt/homebrew/bin/git"])
         let script = dir.path().join("detect-foo.sh");
         std::fs::write(
             &script,
-            format!(
-                "#!/usr/bin/env bash\n\
-                 file=\"$1/sample.rs\"\n\
-                 if grep -q 'foo()' \"$file\" 2>/dev/null; then\n\
-                   echo \"$file:1:FIX-AUTO:use bar instead of foo\"\n\
-                 fi\n"
-            ),
+            "#!/usr/bin/env bash\n\
+             file=\"$1/sample.rs\"\n\
+             if grep -q 'foo()' \"$file\" 2>/dev/null; then\n\
+               echo \"$file:1:FIX-AUTO:use bar instead of foo\"\n\
+             fi\n",
         )?;
         #[cfg(unix)]
         {
