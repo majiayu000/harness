@@ -241,7 +241,10 @@ mod tests {
                 rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
                 gc_agent,
             },
-            observability: crate::http::ObservabilityServices { events },
+            observability: crate::http::ObservabilityServices {
+                events,
+                signal_rate_limiter: std::sync::Arc::new(crate::http::SignalRateLimiter::new(100)),
+            },
             concurrency: crate::http::ConcurrencyServices {
                 task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
                 workspace_mgr: None,
@@ -1452,7 +1455,10 @@ mod tests {
                 rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
                 gc_agent,
             },
-            observability: crate::http::ObservabilityServices { events },
+            observability: crate::http::ObservabilityServices {
+                events,
+                signal_rate_limiter: std::sync::Arc::new(crate::http::SignalRateLimiter::new(100)),
+            },
             concurrency: crate::http::ConcurrencyServices {
                 task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
                 workspace_mgr: None,

@@ -1,4 +1,6 @@
-use harness_core::{Decision, Event, ProjectId, RemediationType, Signal, SignalType, Violation};
+use harness_core::{
+    Decision, Event, ExternalSignal, ProjectId, RemediationType, Signal, SignalType, Violation,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -63,6 +65,73 @@ impl SignalDetector {
         signals.extend(self.detect_warn_escalation(events));
         signals.extend(self.detect_linter_violations(events));
         signals
+    }
+
+    /// Convert external signals (from `POST /signals`) into GC-actionable `Signal`s.
+    ///
+    /// - GitHub CI failure (`check_run.completed` with `conclusion=failure`) → `ChronicBlock`
+    /// - GitHub PR review `changes_requested` → `RepeatedWarn`
+    pub fn detect_from_external(&self, external: &[ExternalSignal]) -> Vec<Signal> {
+        let mut signals = Vec::new();
+        for ext in external {
+            let maybe_signal = match ext.source.as_str() {
+                "github" => self.signal_from_github_payload(&ext.payload),
+                _ => None,
+            };
+            if let Some(signal) = maybe_signal {
+                signals.push(signal);
+            }
+        }
+        signals
+    }
+
+    fn signal_from_github_payload(&self, payload: &serde_json::Value) -> Option<Signal> {
+        let obj = payload.as_object()?;
+
+        // check_run completed with failure → ChronicBlock
+        if let (Some(action), Some(check_run)) = (
+            obj.get("action").and_then(|v| v.as_str()),
+            obj.get("check_run"),
+        ) {
+            if action == "completed" {
+                let conclusion = check_run
+                    .get("conclusion")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if conclusion == "failure" {
+                    let name = check_run
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    return Some(Signal::new(
+                        SignalType::ChronicBlock,
+                        self.project_id.clone(),
+                        serde_json::json!({"source": "github_ci", "check_name": name}),
+                        RemediationType::Rule,
+                    ));
+                }
+            }
+        }
+
+        // pull_request_review with changes_requested → RepeatedWarn
+        if let Some(review) = obj.get("review") {
+            let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("");
+            if state.to_ascii_lowercase() == "changes_requested" {
+                let pr_number = obj
+                    .get("pull_request")
+                    .and_then(|pr| pr.get("number"))
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(0);
+                return Some(Signal::new(
+                    SignalType::RepeatedWarn,
+                    self.project_id.clone(),
+                    serde_json::json!({"source": "github_review", "pr_number": pr_number}),
+                    RemediationType::Rule,
+                ));
+            }
+        }
+
+        None
     }
 
     pub fn from_violations(&self, violations: &[Violation]) -> Vec<Signal> {
@@ -264,7 +333,9 @@ impl SignalDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Decision, Event, ProjectId, SessionId, Severity, SignalType, Violation};
+    use harness_core::{
+        Decision, Event, ExternalSignal, ProjectId, SessionId, Severity, SignalType, Violation,
+    };
     use std::path::PathBuf;
 
     fn detector() -> SignalDetector {
@@ -389,6 +460,72 @@ mod tests {
         assert!(signals
             .iter()
             .any(|s| s.signal_type == SignalType::LinterViolations));
+    }
+
+    #[test]
+    fn detect_from_external_github_ci_failure_produces_chronic_block() {
+        let det = detector();
+        let payload = serde_json::json!({
+            "action": "completed",
+            "check_run": {
+                "name": "CI Tests",
+                "conclusion": "failure"
+            }
+        });
+        let signals = vec![ExternalSignal::new(
+            "github".to_string(),
+            Severity::High,
+            payload,
+        )];
+        let result = det.detect_from_external(&signals);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].signal_type, SignalType::ChronicBlock);
+    }
+
+    #[test]
+    fn detect_from_external_github_review_changes_requested_produces_repeated_warn() {
+        let det = detector();
+        let payload = serde_json::json!({
+            "action": "submitted",
+            "review": {"state": "changes_requested"},
+            "pull_request": {"number": 42}
+        });
+        let signals = vec![ExternalSignal::new(
+            "github".to_string(),
+            Severity::Medium,
+            payload,
+        )];
+        let result = det.detect_from_external(&signals);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].signal_type, SignalType::RepeatedWarn);
+    }
+
+    #[test]
+    fn detect_from_external_unknown_source_produces_no_signal() {
+        let det = detector();
+        let signals = vec![ExternalSignal::new(
+            "pagerduty".to_string(),
+            Severity::High,
+            serde_json::json!({"alert": "disk_full"}),
+        )];
+        let result = det.detect_from_external(&signals);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn detect_from_external_github_ci_success_produces_no_signal() {
+        let det = detector();
+        let payload = serde_json::json!({
+            "action": "completed",
+            "check_run": {"name": "CI Tests", "conclusion": "success"}
+        });
+        let signals = vec![ExternalSignal::new(
+            "github".to_string(),
+            Severity::Low,
+            payload,
+        )];
+        let result = det.detect_from_external(&signals);
+        assert!(result.is_empty());
     }
 
     #[test]

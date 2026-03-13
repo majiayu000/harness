@@ -97,7 +97,10 @@ async fn make_test_state_with(
             )),
             gc_agent,
         },
-        observability: crate::http::ObservabilityServices { events },
+        observability: crate::http::ObservabilityServices {
+            events,
+            signal_rate_limiter: Arc::new(crate::http::SignalRateLimiter::new(100)),
+        },
         concurrency: crate::http::ConcurrencyServices {
             task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             workspace_mgr: None,
