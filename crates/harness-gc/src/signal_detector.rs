@@ -116,7 +116,7 @@ impl SignalDetector {
         // pull_request_review with changes_requested → RepeatedWarn
         if let Some(review) = obj.get("review") {
             let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("");
-            if state.to_ascii_lowercase() == "changes_requested" {
+            if state.eq_ignore_ascii_case("changes_requested") {
                 let pr_number = obj
                     .get("pull_request")
                     .and_then(|pr| pr.get("number"))

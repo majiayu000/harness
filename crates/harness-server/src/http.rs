@@ -941,7 +941,7 @@ fn infer_github_severity(payload: &serde_json::Value) -> Option<harness_core::Se
         // pull_request_review with changes_requested
         if let Some(review) = obj.get("review") {
             let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("");
-            if state.to_ascii_lowercase() == "changes_requested" {
+            if state.eq_ignore_ascii_case("changes_requested") {
                 return Some(harness_core::Severity::Medium);
             }
         }
