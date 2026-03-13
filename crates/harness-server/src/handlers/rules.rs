@@ -151,6 +151,7 @@ mod tests {
                 notification_lag_log_every: 1,
                 notify_tx: None,
                 initialized: Arc::new(AtomicBool::new(true)),
+                ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
             },
             interceptors: vec![],
             feishu_intake: None,

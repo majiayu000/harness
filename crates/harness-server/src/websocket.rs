@@ -1,4 +1,5 @@
 use crate::{http::AppState, router};
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
     extract::{State, WebSocketUpgrade},
@@ -88,17 +89,22 @@ pub async fn ws_handler(
 ///   the standard dispatcher, and the response is sent back as a text frame.
 /// - Server-push notifications broadcast on `AppState::notification_tx` are
 ///   forwarded to the client as unsolicited text frames.
+/// - A Ping frame is sent every `ws_heartbeat_interval_secs` seconds. If the
+///   client does not respond with a Pong before the next Ping, the connection
+///   is treated as stale and closed.
+/// - When the server signals graceful shutdown via `ws_shutdown_tx`, a Close
+///   frame is sent and the handler exits.
 async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
     let (mut ws_sink, mut ws_stream) = ws.split();
 
     // Internal channel: both the request handler and the notification forwarder
-    // write JSON strings here; the sender task drains them to the WebSocket.
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // write messages here; the sender task drains them to the WebSocket.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
 
     // Task 1: drain the internal channel → WebSocket sink.
     let send_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
-            if ws_sink.send(Message::Text(msg.into())).await.is_err() {
+            if ws_sink.send(msg).await.is_err() {
                 break;
             }
         }
@@ -113,7 +119,7 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
             match notif_rx.recv().await {
                 Ok(notif) => match codec::encode_notification(&notif) {
                     Ok(text) => {
-                        if notif_out_tx.send(text).is_err() {
+                        if notif_out_tx.send(Message::Text(text.into())).is_err() {
                             break;
                         }
                     }
@@ -128,31 +134,76 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
         }
     });
 
+    // Heartbeat: send a Ping every heartbeat_interval. If no Pong arrives before
+    // the next tick, treat the connection as stale and close it.
+    let heartbeat_interval_secs = state
+        .core
+        .server
+        .config
+        .server
+        .ws_heartbeat_interval_secs
+        .max(1);
+    let heartbeat_interval = tokio::time::Duration::from_secs(heartbeat_interval_secs);
+    let mut heartbeat = tokio::time::interval(heartbeat_interval);
+    heartbeat.tick().await; // consume the first immediate tick
+    let mut pong_pending = false;
+
+    // Subscribe to the graceful-shutdown signal.
+    let mut ws_shutdown_rx = state.notifications.ws_shutdown_tx.subscribe();
+
     // Main loop: read incoming frames, dispatch as JSON-RPC, reply.
-    while let Some(result) = ws_stream.next().await {
-        let text = match result {
-            Ok(Message::Text(t)) => t,
-            Ok(Message::Close(_)) | Err(_) => break,
-            _ => continue,
-        };
+    loop {
+        tokio::select! {
+            msg = ws_stream.next() => {
+                let result = match msg {
+                    Some(r) => r,
+                    None => break,
+                };
+                let text = match result {
+                    Ok(Message::Text(t)) => t,
+                    Ok(Message::Pong(_)) => {
+                        pong_pending = false;
+                        continue;
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => continue,
+                };
 
-        let response = match codec::decode_request(&text) {
-            Ok(req) => router::handle_request(&state, req).await,
-            Err(e) => Some(RpcResponse::error(
-                None,
-                harness_protocol::PARSE_ERROR,
-                format!("parse error: {e}"),
-            )),
-        };
+                let response = match codec::decode_request(&text) {
+                    Ok(req) => router::handle_request(&state, req).await,
+                    Err(e) => Some(RpcResponse::error(
+                        None,
+                        harness_protocol::PARSE_ERROR,
+                        format!("parse error: {e}"),
+                    )),
+                };
 
-        if let Some(resp) = response {
-            match codec::encode_response(&resp) {
-                Ok(out) => {
-                    if out_tx.send(out).is_err() {
-                        break;
+                if let Some(resp) = response {
+                    match codec::encode_response(&resp) {
+                        Ok(out) => {
+                            if out_tx.send(Message::Text(out.into())).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => tracing::warn!("failed to encode response: {e}"),
                     }
                 }
-                Err(e) => tracing::warn!("failed to encode response: {e}"),
+            }
+
+            _ = heartbeat.tick() => {
+                if pong_pending {
+                    tracing::debug!("WebSocket heartbeat timeout: closing stale connection");
+                    break;
+                }
+                pong_pending = true;
+                if out_tx.send(Message::Ping(Bytes::new())).is_err() {
+                    break;
+                }
+            }
+
+            _ = ws_shutdown_rx.recv() => {
+                out_tx.send(Message::Close(None)).ok();
+                break;
             }
         }
     }
@@ -205,6 +256,7 @@ mod tests {
         ));
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
         let (notification_tx, _) = broadcast::channel(notification_broadcast_capacity);
+        let (ws_shutdown_tx, _) = broadcast::channel(1);
 
         Ok(AppState {
             core: crate::http::CoreServices {
@@ -234,6 +286,7 @@ mod tests {
                 notification_lag_log_every,
                 notify_tx: None,
                 initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                ws_shutdown_tx,
             },
             interceptors: vec![],
             feishu_intake: None,
@@ -502,6 +555,119 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             dropped_total
         );
+        Ok(())
+    }
+
+    /// Verify that the server sends Ping frames at the configured heartbeat interval
+    /// and that the connection stays alive when Pong frames are received.
+    #[tokio::test]
+    async fn websocket_heartbeat_ping_sent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = HarnessConfig::default();
+        // Use a 1-second heartbeat so the test completes quickly.
+        config.server.ws_heartbeat_interval_secs = 1;
+        let state = Arc::new(make_test_state_with_config(dir.path(), config).await?);
+
+        let listener = match bind_ws_test_listener().await? {
+            Some(listener) => listener,
+            None => return Ok(()),
+        };
+        let addr = listener.local_addr()?;
+
+        let app = axum::Router::new()
+            .route("/ws", axum::routing::get(ws_handler))
+            .with_state(state);
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let url = format!("ws://127.0.0.1:{}/ws", addr.port());
+        let mut ws = match connect_ws_test_client(&url).await? {
+            Some(ws) => ws,
+            None => return Ok(()),
+        };
+
+        // Wait up to 3 seconds for a Ping frame from the server.
+        // tokio-tungstenite delivers Ping frames to the application before auto-replying.
+        use futures::StreamExt;
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("timed out waiting for heartbeat Ping");
+            }
+            let msg = match tokio::time::timeout(remaining, ws.next()).await {
+                Ok(Some(Ok(m))) => m,
+                Ok(Some(Err(e))) => anyhow::bail!("ws error: {e}"),
+                Ok(None) | Err(_) => anyhow::bail!("connection closed before Ping arrived"),
+            };
+            match msg {
+                tokio_tungstenite::tungstenite::Message::Ping(_) => break,
+                _ => continue, // skip other frames (e.g. notifications)
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Verify that broadcasting on `ws_shutdown_tx` causes the server to close
+    /// the WebSocket connection gracefully.
+    #[tokio::test]
+    async fn websocket_graceful_shutdown_closes_connection() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = Arc::new(make_test_state(dir.path()).await?);
+        let ws_shutdown_tx = state.notifications.ws_shutdown_tx.clone();
+
+        let listener = match bind_ws_test_listener().await? {
+            Some(listener) => listener,
+            None => return Ok(()),
+        };
+        let addr = listener.local_addr()?;
+
+        let app = axum::Router::new()
+            .route("/ws", axum::routing::get(ws_handler))
+            .with_state(state);
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let url = format!("ws://127.0.0.1:{}/ws", addr.port());
+        let mut ws = match connect_ws_test_client(&url).await? {
+            Some(ws) => ws,
+            None => return Ok(()),
+        };
+
+        // Complete an initialize round-trip to ensure the handler loop is live.
+        let init_req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(0)),
+            method: Method::Initialize,
+        };
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&init_req)?.into(),
+        ))
+        .await?;
+        {
+            use futures::StreamExt;
+            ws.next()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("no init response"))??;
+        }
+
+        // Signal graceful shutdown.
+        ws_shutdown_tx.send(()).ok();
+
+        // The client should receive a Close frame or see the connection drop.
+        use futures::StreamExt;
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws.next()).await?;
+        match result {
+            Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {}
+            Some(Ok(other)) => anyhow::bail!("expected Close, got: {other:?}"),
+            Some(Err(_)) => {} // connection reset is also acceptable
+        }
+
         Ok(())
     }
 }

@@ -17,6 +17,9 @@ pub struct ServerConfig {
     pub notification_broadcast_capacity: usize,
     #[serde(default = "default_notification_lag_log_every")]
     pub notification_lag_log_every: u64,
+    /// Interval in seconds between WebSocket heartbeat pings. Must be >= 1.
+    #[serde(default = "default_ws_heartbeat_interval_secs")]
+    pub ws_heartbeat_interval_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -29,6 +32,7 @@ impl Default for ServerConfig {
             github_webhook_secret: None,
             notification_broadcast_capacity: default_notification_broadcast_capacity(),
             notification_lag_log_every: default_notification_lag_log_every(),
+            ws_heartbeat_interval_secs: default_ws_heartbeat_interval_secs(),
         }
     }
 }
@@ -51,4 +55,8 @@ fn default_notification_broadcast_capacity() -> usize {
 
 fn default_notification_lag_log_every() -> u64 {
     1
+}
+
+fn default_ws_heartbeat_interval_secs() -> u64 {
+    30
 }
