@@ -1,3 +1,4 @@
+use crate::checkpoint::{filter_events_since, GcCheckpoint};
 use crate::draft_store::DraftStore;
 use crate::remediation::signal_priority;
 use crate::signal_detector::SignalDetector;
@@ -7,6 +8,7 @@ use harness_core::{
     Project, RemediationType, Signal, SignalType,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcReport {
@@ -19,6 +21,8 @@ pub struct GcAgent {
     config: GcConfig,
     signal_detector: SignalDetector,
     draft_store: DraftStore,
+    /// Path to the checkpoint file; `None` disables checkpoint-based scanning.
+    checkpoint_path: Option<PathBuf>,
 }
 
 impl GcAgent {
@@ -27,10 +31,21 @@ impl GcAgent {
             config,
             signal_detector,
             draft_store,
+            checkpoint_path: None,
         }
     }
 
-    /// Run a full GC cycle: detect signals → generate fix drafts.
+    /// Configure the checkpoint file path used for incremental scanning.
+    pub fn with_checkpoint(mut self, path: PathBuf) -> Self {
+        self.checkpoint_path = Some(path);
+        self
+    }
+
+    /// Run a GC cycle using incremental scanning when a checkpoint is configured.
+    ///
+    /// If a valid checkpoint exists only events since `last_scan_at` are analysed.
+    /// Falls back to a full scan when the checkpoint is missing or corrupt.
+    /// On success the checkpoint is updated to the current timestamp.
     pub async fn run(
         &self,
         project: &Project,
@@ -38,8 +53,17 @@ impl GcAgent {
         violations: &[harness_core::Violation],
         agent: &dyn CodeAgent,
     ) -> anyhow::Result<GcReport> {
+        // Determine incremental cutoff from checkpoint (None → full scan).
+        let since = self
+            .checkpoint_path
+            .as_deref()
+            .and_then(GcCheckpoint::load)
+            .map(|cp| cp.last_scan_at);
+
+        let scanned_events = filter_events_since(events, since);
+
         // 1. Detect signals from events (including persisted `rule_check` violations)
-        let mut signals = self.signal_detector.detect(events);
+        let mut signals = self.signal_detector.detect(scanned_events);
         // Back-compat: if the caller provided live violations but they haven't been
         // persisted into `events` yet, fall back to the old detector.
         if !violations.is_empty() && !events.iter().any(|e| e.hook == "rule_check") {
@@ -96,11 +120,21 @@ impl GcAgent {
             }
         }
 
-        Ok(GcReport {
+        let report = GcReport {
             signals,
             drafts_generated,
             errors,
-        })
+        };
+
+        // Update checkpoint so the next run only processes new events.
+        if let Some(path) = &self.checkpoint_path {
+            let cp = GcCheckpoint::new(Utc::now());
+            if let Err(e) = cp.save(path) {
+                tracing::warn!("failed to save gc checkpoint: {e}");
+            }
+        }
+
+        Ok(report)
     }
 
     /// Adopt a draft: write artifacts to disk.
