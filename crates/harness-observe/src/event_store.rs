@@ -1,5 +1,5 @@
 use harness_core::{
-    Decision, Event, EventFilters, EventId, OtelConfig, SessionId, Severity, Violation,
+    Decision, Event, EventFilters, EventId, Grade, OtelConfig, SessionId, Severity, Violation,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -173,6 +173,23 @@ impl EventStore {
             if let Err(e) = self.log(&event) {
                 tracing::warn!("failed to log rule violation event: {e}");
             }
+        }
+    }
+
+    /// Log a quality grade event for trend tracking.
+    ///
+    /// Uses the "quality_grade" hook with decision mapped from grade:
+    /// A/B → Pass, C → Warn, D → Block.
+    pub fn log_quality_grade(&self, grade: Grade, score: f64) {
+        let decision = match grade {
+            Grade::A | Grade::B => Decision::Pass,
+            Grade::C => Decision::Warn,
+            Grade::D => Decision::Block,
+        };
+        let mut event = Event::new(SessionId::new(), "quality_grade", "QualityGrader", decision);
+        event.detail = Some(format!("grade={grade:?} score={score:.1}"));
+        if let Err(e) = self.log(&event) {
+            tracing::warn!("failed to log quality_grade event: {e}");
         }
     }
 

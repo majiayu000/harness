@@ -293,10 +293,23 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             )) as Arc<dyn crate::intake::IntakeSource>
         });
 
+    let quality_trigger = {
+        let gc_cfg = &server.config.gc;
+        Arc::new(crate::quality_trigger::QualityTrigger::new(
+            events.clone(),
+            gc_agent.clone(),
+            server.agent_registry.clone(),
+            project_root.clone(),
+            gc_cfg.auto_gc_grades.clone(),
+            gc_cfg.auto_gc_cooldown_secs,
+        ))
+    };
+
     let completion_callback = build_completion_callback(
         &feishu_intake,
         &github_intake,
         server.config.agents.review.clone(),
+        Some(quality_trigger),
     );
 
     Ok(AppState {
@@ -353,6 +366,7 @@ fn build_completion_callback(
     feishu_intake: &Option<Arc<crate::intake::feishu::FeishuIntake>>,
     github_intake: &Option<Arc<dyn crate::intake::IntakeSource>>,
     review_config: harness_core::AgentReviewConfig,
+    quality_trigger: Option<Arc<crate::quality_trigger::QualityTrigger>>,
 ) -> Option<task_runner::CompletionCallback> {
     let mut sources: std::collections::HashMap<String, Arc<dyn crate::intake::IntakeSource>> =
         std::collections::HashMap::new();
@@ -363,14 +377,20 @@ fn build_completion_callback(
         let fi_source: Arc<dyn crate::intake::IntakeSource> = fi.clone();
         sources.insert(fi_source.name().to_string(), fi_source);
     }
-    if sources.is_empty() && !review_config.review_bot_auto_trigger {
+    if sources.is_empty() && !review_config.review_bot_auto_trigger && quality_trigger.is_none() {
         return None;
     }
     let sources = Arc::new(sources);
     Some(Arc::new(move |task: task_runner::TaskState| {
         let sources = sources.clone();
         let review_config = review_config.clone();
+        let quality_trigger = quality_trigger.clone();
         Box::pin(async move {
+            // Grade recent events and auto-trigger GC if quality is poor.
+            if let Some(qt) = quality_trigger {
+                qt.check_and_maybe_trigger().await;
+            }
+
             // Auto-trigger review bot comment when task completes with a PR URL.
             if review_config.review_bot_auto_trigger {
                 if let task_runner::TaskStatus::Done = &task.status {
