@@ -64,3 +64,19 @@ pub async fn skill_delete(
     let deleted = skills.delete(&skill_id);
     RpcResponse::success(id, serde_json::json!({ "deleted": deleted }))
 }
+
+pub async fn skill_stats(state: &AppState, id: Option<serde_json::Value>) -> RpcResponse {
+    let skills = state.engines.skills.read().await;
+    let stats: Vec<serde_json::Value> = skills
+        .list()
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "usage_count": s.usage_count,
+                "last_used": s.last_used,
+            })
+        })
+        .collect();
+    RpcResponse::success(id, serde_json::json!(stats))
+}

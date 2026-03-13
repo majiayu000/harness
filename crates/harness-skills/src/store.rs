@@ -1,6 +1,10 @@
+use chrono::{DateTime, Utc};
 use harness_core::{SkillId, SkillLocation};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+const STATS_FILE: &str = "stats.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
@@ -12,6 +16,15 @@ pub struct Skill {
     pub version: String,
     pub author: String,
     pub location: SkillLocation,
+    pub usage_count: u64,
+    pub last_used: Option<DateTime<Utc>>,
+}
+
+/// Persisted usage entry for a single skill (keyed by skill name in stats.json).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SkillUsageEntry {
+    usage_count: u64,
+    last_used: Option<DateTime<Utc>>,
 }
 
 pub struct SkillStore {
@@ -65,7 +78,78 @@ impl SkillStore {
             }
         }
         self.deduplicate();
+        if let Some(dir) = self.persist_dir.clone() {
+            self.load_stats(&dir);
+        }
         Ok(())
+    }
+
+    /// Increment usage counter and update last_used timestamp for a skill.
+    /// Persists updated stats to disk if a persist_dir is configured.
+    pub fn record_usage(&mut self, id: &SkillId) {
+        if let Some(skill) = self.skills.iter_mut().find(|s| s.id == *id) {
+            skill.usage_count += 1;
+            skill.last_used = Some(Utc::now());
+        }
+        if let Some(dir) = self.persist_dir.clone() {
+            self.save_stats(&dir);
+        }
+    }
+
+    fn save_stats(&self, dir: &Path) {
+        let stats: HashMap<String, SkillUsageEntry> = self
+            .skills
+            .iter()
+            .filter(|s| s.usage_count > 0)
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    SkillUsageEntry {
+                        usage_count: s.usage_count,
+                        last_used: s.last_used,
+                    },
+                )
+            })
+            .collect();
+        let path = dir.join(STATS_FILE);
+        match serde_json::to_string(&stats) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!("failed to save skill stats to {}: {e}", path.display());
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to serialize skill stats: {e}");
+            }
+        }
+    }
+
+    fn load_stats(&mut self, dir: &Path) {
+        let path = dir.join(STATS_FILE);
+        if !path.exists() {
+            return;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(json) => match serde_json::from_str::<HashMap<String, SkillUsageEntry>>(&json) {
+                Ok(stats) => {
+                    for skill in &mut self.skills {
+                        if let Some(entry) = stats.get(&skill.name) {
+                            skill.usage_count = entry.usage_count;
+                            skill.last_used = entry.last_used;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to deserialize skill stats from {}: {e}",
+                        path.display()
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!("failed to read skill stats from {}: {e}", path.display());
+            }
+        }
     }
 
     fn load_from_dir(&mut self, dir: &Path) -> anyhow::Result<()> {
@@ -111,6 +195,8 @@ impl SkillStore {
                         content,
                         version: "1.0.0".to_string(),
                         author: "system".to_string(),
+                        usage_count: 0,
+                        last_used: None,
                         location,
                     });
                 }
@@ -196,6 +282,8 @@ impl SkillStore {
             version: "1.0.0".to_string(),
             author: "user".to_string(),
             location: SkillLocation::User,
+            usage_count: 0,
+            last_used: None,
         };
         self.skills.push(skill);
         let skill_ref = match self.skills.last() {
@@ -295,6 +383,8 @@ impl SkillStore {
                     version: "1.0".to_string(),
                     author: "system".to_string(),
                     location: SkillLocation::System,
+                    usage_count: 0,
+                    last_used: None,
                 });
             }
         }
@@ -353,6 +443,8 @@ mod tests {
             version: "1.0.0".to_string(),
             author: "test".to_string(),
             location,
+            usage_count: 0,
+            last_used: None,
         }
     }
 
@@ -549,6 +641,8 @@ mod tests {
             version: "1.0.0".to_string(),
             author: "system".to_string(),
             location: SkillLocation::System,
+            usage_count: 0,
+            last_used: None,
         });
         let matches = store.match_prompt("please do a code review of this PR");
         assert_eq!(matches.len(), 1);
@@ -567,6 +661,8 @@ mod tests {
             version: "1.0.0".to_string(),
             author: "system".to_string(),
             location: SkillLocation::System,
+            usage_count: 0,
+            last_used: None,
         });
         let matches = store.match_prompt("I have a BUILD ERROR in my project");
         assert_eq!(matches.len(), 1);
@@ -586,6 +682,93 @@ mod tests {
     }
 
     #[test]
+    fn record_usage_increments_counter() {
+        let mut store = SkillStore::new();
+        store.create("my-skill".to_string(), "# My Skill\nContent.".to_string());
+        let id = store.list()[0].id.clone();
+        assert_eq!(store.list()[0].usage_count, 0);
+        store.record_usage(&id);
+        assert_eq!(store.list()[0].usage_count, 1);
+        store.record_usage(&id);
+        assert_eq!(store.list()[0].usage_count, 2);
+    }
+
+    #[test]
+    fn record_usage_sets_last_used() {
+        let mut store = SkillStore::new();
+        store.create("my-skill".to_string(), "# My Skill\nContent.".to_string());
+        let id = store.list()[0].id.clone();
+        assert!(store.list()[0].last_used.is_none());
+        store.record_usage(&id);
+        assert!(store.list()[0].last_used.is_some());
+    }
+
+    #[test]
+    fn record_usage_persists_to_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist_path = dir.path().to_path_buf();
+        let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
+        store.create("my-skill".to_string(), "# My Skill\nContent.".to_string());
+        let id = store.list()[0].id.clone();
+        store.record_usage(&id);
+
+        let stats_file = persist_path.join(STATS_FILE);
+        assert!(
+            stats_file.exists(),
+            "stats.json should be written after record_usage"
+        );
+        let contents = std::fs::read_to_string(&stats_file).expect("read stats.json");
+        assert!(
+            contents.contains("my-skill"),
+            "stats should contain skill name"
+        );
+        assert!(
+            contents.contains("\"usage_count\":1"),
+            "stats should contain usage_count"
+        );
+    }
+
+    #[test]
+    fn load_stats_restores_usage_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist_path = dir.path().to_path_buf();
+
+        // Write initial stats to disk
+        {
+            let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
+            store.create(
+                "counter-skill".to_string(),
+                "# Counter\nContent.".to_string(),
+            );
+            let id = store.list()[0].id.clone();
+            store.record_usage(&id);
+            store.record_usage(&id);
+            store.record_usage(&id);
+        }
+
+        // A new store loading from the same directory should restore counts
+        let mut store2 = SkillStore::new().with_persist_dir(persist_path.clone());
+        store2.create(
+            "counter-skill".to_string(),
+            "# Counter\nContent.".to_string(),
+        );
+        store2.load_stats(&persist_path);
+        assert_eq!(
+            store2.list()[0].usage_count,
+            3,
+            "usage_count should be restored from stats.json"
+        );
+    }
+
+    #[test]
+    fn record_usage_ignores_unknown_id() {
+        let mut store = SkillStore::new();
+        let unknown_id = SkillId::new();
+        // Should not panic
+        store.record_usage(&unknown_id);
+    }
+
+    #[test]
     fn match_prompt_returns_empty_when_no_match() {
         let mut store = SkillStore::new();
         store.skills.push(Skill {
@@ -597,6 +780,8 @@ mod tests {
             version: "1.0.0".to_string(),
             author: "system".to_string(),
             location: SkillLocation::System,
+            usage_count: 0,
+            last_used: None,
         });
         let matches = store.match_prompt("implement feature X");
         assert!(matches.is_empty());

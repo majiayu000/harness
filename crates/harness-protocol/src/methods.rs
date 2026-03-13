@@ -79,6 +79,7 @@ pub enum Method {
     SkillDelete {
         skill_id: SkillId,
     },
+    SkillStats,
 
     // === Rule engine ===
     RuleLoad {
@@ -285,6 +286,7 @@ impl Method {
             Self::SkillList { .. } => "skill/list",
             Self::SkillGet { .. } => "skill/get",
             Self::SkillDelete { .. } => "skill/delete",
+            Self::SkillStats => "skill/stats",
             Self::RuleLoad { .. } => "rule/load",
             Self::RuleCheck { .. } => "rule/check",
             Self::ExecPlanInit { .. } => "exec_plan/init",

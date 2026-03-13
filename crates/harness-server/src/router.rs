@@ -89,6 +89,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         Method::SkillDelete { skill_id } => {
             Some(handlers::skills::skill_delete(state, id, skill_id).await)
         }
+        Method::SkillStats => Some(handlers::skills::skill_stats(state, id).await),
 
         // === Events / Metrics ===
         Method::EventLog { event } => Some(handlers::observe::event_log(state, id, event).await),
