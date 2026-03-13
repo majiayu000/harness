@@ -169,6 +169,18 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             tracing::warn!("failed to auto-register builtin guards: {e}");
         }
     }
+    match rule_engine.auto_register_project_guards(&project_root.join(".harness/guards")) {
+        Ok(registered) => {
+            tracing::info!(
+                registered_guard_count = registered,
+                total_guard_count = rule_engine.guards().len(),
+                "rules: project guard auto-registration completed"
+            );
+        }
+        Err(e) => {
+            tracing::warn!("failed to auto-register project guards: {e}");
+        }
+    }
     rule_engine
         .load_exec_policy_files(&server.config.rules.exec_policy_paths)
         .context("failed to load rules.exec_policy_paths")?;

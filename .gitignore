@@ -1,5 +1,6 @@
 /target/
 exec-plan-*.md
-.harness/
+.harness/*
+!.harness/guards
 crates/*/.harness/
 **/.harness/drafts/

@@ -192,6 +192,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rule_check_with_guard_returns_violations() -> anyhow::Result<()> {
+        let dir = tempdir_in_home("rule-check-violations-")?;
+        let state = make_test_state(dir.path()).await?;
+
+        // Write a guard script that always reports one violation.
+        let guard_script = dir.path().join("violation-guard.sh");
+        let violation_line = format!(
+            "#!/usr/bin/env bash\necho '{}:1:RS-03:unwrap in production code'\n",
+            dir.path().join("src/main.rs").display()
+        );
+        std::fs::write(&guard_script, violation_line)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&guard_script)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&guard_script, perms)?;
+        }
+
+        {
+            let mut rules = state.engines.rules.write().await;
+            rules.register_guard(Guard {
+                id: GuardId::from_str("RS-03-TEST"),
+                script_path: guard_script,
+                language: Language::Common,
+                rules: vec![],
+            });
+        }
+
+        let response = rule_check(
+            &state,
+            Some(serde_json::json!(1)),
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+
+        assert!(
+            response.error.is_none(),
+            "rule/check with guard should succeed: {:?}",
+            response.error
+        );
+        let violations: Vec<serde_json::Value> =
+            serde_json::from_value(response.result.expect("expected violations result"))?;
+        assert_eq!(violations.len(), 1, "expected exactly one violation");
+        let rule_id = violations[0]["rule_id"].as_str().unwrap_or("");
+        assert_eq!(rule_id, "RS-03", "expected RS-03 violation");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rule_check_returns_warning_for_empty_scan_input() -> anyhow::Result<()> {
         let dir = tempdir_in_home("rule-check-empty-input-")?;
         let state = make_test_state(dir.path()).await?;
