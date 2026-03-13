@@ -36,3 +36,4 @@ reqwest = { workspace = true }
 tempfile = "3"
 http-body-util = "0.1"
 tokio-tungstenite = "0.26"
+toml = { workspace = true }

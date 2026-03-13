@@ -1,5 +1,5 @@
 use crate::http::AppState;
-use harness_core::{EventFilters, Grade};
+use harness_core::{EventFilters, Grade, ReviewConfig};
 use harness_observe::health::generate_health_report;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,13 +8,15 @@ use tokio::time::sleep;
 pub struct Scheduler {
     pub gc_interval: Duration,
     pub health_interval: Duration,
+    pub review: ReviewConfig,
 }
 
 impl Scheduler {
-    pub fn from_grade(grade: Grade) -> Self {
+    pub fn from_grade(grade: Grade, review: ReviewConfig) -> Self {
         Self {
             gc_interval: grade.recommended_gc_interval(),
             health_interval: Duration::from_secs(24 * 3600),
+            review,
         }
     }
 
@@ -29,7 +31,7 @@ impl Scheduler {
             }
         });
 
-        let health_state = state;
+        let health_state = state.clone();
         let health_interval = self.health_interval;
         tokio::spawn(async move {
             loop {
@@ -39,6 +41,14 @@ impl Scheduler {
                 }
             }
         });
+
+        if self.review.enabled {
+            let review_state = state;
+            let review_config = self.review;
+            tokio::spawn(async move {
+                crate::periodic_reviewer::review_loop(review_config, review_state).await;
+            });
+        }
     }
 
     async fn run_health_tick(state: &AppState) -> anyhow::Result<()> {
@@ -148,27 +158,27 @@ mod tests {
 
     #[test]
     fn from_grade_d_returns_1h_gc_interval() {
-        let s = Scheduler::from_grade(Grade::D);
+        let s = Scheduler::from_grade(Grade::D, ReviewConfig::default());
         assert_eq!(s.gc_interval, Duration::from_secs(3600));
         assert_eq!(s.health_interval, Duration::from_secs(24 * 3600));
     }
 
     #[test]
     fn from_grade_a_returns_7d_gc_interval() {
-        let s = Scheduler::from_grade(Grade::A);
+        let s = Scheduler::from_grade(Grade::A, ReviewConfig::default());
         assert_eq!(s.gc_interval, Duration::from_secs(7 * 24 * 3600));
         assert_eq!(s.health_interval, Duration::from_secs(24 * 3600));
     }
 
     #[test]
     fn from_grade_b_returns_3d_gc_interval() {
-        let s = Scheduler::from_grade(Grade::B);
+        let s = Scheduler::from_grade(Grade::B, ReviewConfig::default());
         assert_eq!(s.gc_interval, Duration::from_secs(3 * 24 * 3600));
     }
 
     #[test]
     fn from_grade_c_returns_1d_gc_interval() {
-        let s = Scheduler::from_grade(Grade::C);
+        let s = Scheduler::from_grade(Grade::C, ReviewConfig::default());
         assert_eq!(s.gc_interval, Duration::from_secs(24 * 3600));
     }
 

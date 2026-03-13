@@ -221,6 +221,85 @@ pub fn agent_review_fix_prompt(pr: u64, issues: &[String], round: u32) -> String
     )
 }
 
+/// Build the periodic codebase review prompt with 11-item checklist.
+///
+/// `recent_commits` is the output of `git log --oneline` since the last review.
+/// The agent reviews the entire codebase and outputs findings sorted by severity,
+/// ending with a summary table.
+pub fn periodic_review_prompt(recent_commits: &str) -> String {
+    format!(
+        "You are performing a periodic codebase health review.\n\n\
+         Recent commits since last review:\n{recent_commits}\n\n\
+         Review the entire codebase for the following 11 categories of issues.\n\
+         For each finding, format your output as:\n\n\
+         ## [SEVERITY] Category: Short Title\n\n\
+         **File:** path/to/file.rs:LINE\n\
+         **Details:** What the issue is and why it matters\n\
+         **Action:** Specific fix recommendation\n\n\
+         ---\n\n\
+         ## Review Checklist\n\n\
+         ### CRITICAL\n\n\
+         **1. Duplicate Type Definitions**\n\
+         Structs or enums with the same name defined in multiple crates. \
+         Types that should be shared from a single source (e.g., `harness-core`). \
+         Config structs duplicated across crate boundaries.\n\n\
+         **7. Declaration-Execution Gap**\n\
+         Components built but never wired into the actual execution path. \
+         Modules registered in `lib.rs` but never imported or called. \
+         Functions or traits implemented but never invoked from startup/runtime code. \
+         Check `build_app_state()`, `main()`, and startup code to verify all \
+         declared components are actually connected. \
+         Note: Config structs using `Default::default()` instead of loaded values belong \
+         to item 11 (Config-Default Divergence), not here.\n\n\
+         ### HIGH\n\n\
+         **2. Oversized Files**\n\
+         Any `.rs` file exceeding 400 lines. Report exact line count and suggest split points.\n\n\
+         **3. God Objects**\n\
+         Structs with more than 10 public fields. Modules that mix unrelated concerns.\n\n\
+         **8. Dead Code**\n\
+         `pub` functions with zero call sites outside their own module. \
+         Structs or enums defined but never instantiated. \
+         Entire modules exported via `pub mod` but never imported by any other crate. \
+         Helper functions written speculatively but never used. \
+         Note: `#[cfg(test)]` code is excluded from this check.\n\n\
+         **10. Project Rule Violations**\n\
+         Verify that `CLAUDE.md` rules are respected throughout the codebase:\n\
+         - ZERO `Command::new(\"gh\")` or `Command::new(\"git\")` calls inside harness \
+         crates — all GitHub/git interaction must be in agent prompts only\n\
+         - All user-facing strings, comments, and docs in English\n\
+         - No hardcoded ports, URLs, or credentials\n\
+         - `cargo fmt` compliance\n\n\
+         ### MEDIUM\n\n\
+         **4. Public API Leakage**\n\
+         `lib.rs` files that export more than 5 `pub mod`. \
+         Internal implementation details exposed as public.\n\n\
+         **5. Repeated Patterns**\n\
+         Same function signature pattern appearing 3+ times across files. \
+         Boilerplate that should be abstracted (e.g., error wrapping, validation, CRUD).\n\n\
+         **9. Error Handling Inconsistency**\n\
+         Mixing `anyhow::Result` and custom error types without clear boundary rules. \
+         `let _ = result` or `.ok()` silently discarding meaningful errors. \
+         `.unwrap()` in non-test async code where `?` should be used.\n\n\
+         **11. Config-Default Divergence**\n\
+         Config struct has fields with serde defaults, but consuming code constructs via \
+         `Default::default()` instead of loading from file. \
+         For each Config struct, trace whether `load_config()` result is \
+         actually propagated to the code that uses it.\n\n\
+         ### LOW\n\n\
+         **6. Dependency Issues**\n\
+         Crates depending on more than 5 workspace siblings. \
+         Circular or unnecessary dependencies.\n\n\
+         ---\n\n\
+         After listing all findings, end with a summary table:\n\n\
+         | Severity | Count |\n\
+         |----------|-------|\n\
+         | CRITICAL | N     |\n\
+         | HIGH     | N     |\n\
+         | MEDIUM   | N     |\n\
+         | LOW      | N     |"
+    )
+}
+
 /// Check if agent output indicates approval (last non-empty line is "APPROVED").
 pub fn is_approved(output: &str) -> bool {
     last_non_empty_line(output) == Some("APPROVED")

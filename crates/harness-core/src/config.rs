@@ -11,8 +11,8 @@ pub use agents::{
 };
 pub use intake::{FeishuIntakeConfig, GitHubIntakeConfig, IntakeConfig};
 pub use misc::{
-    ConcurrencyConfig, GcConfig, ObserveConfig, OtelConfig, OtelExporter, RulesConfig,
-    SignalThresholdsConfig, ValidationConfig, WorkspaceConfig,
+    ConcurrencyConfig, GcConfig, ObserveConfig, OtelConfig, OtelExporter, ReviewConfig,
+    RulesConfig, SignalThresholdsConfig, ValidationConfig, WorkspaceConfig,
 };
 pub use project::{load_project_config, GitConfig, ProjectConfig};
 pub use server::{ServerConfig, Transport};
@@ -35,6 +35,8 @@ pub struct HarnessConfig {
     pub concurrency: ConcurrencyConfig,
     #[serde(default)]
     pub intake: IntakeConfig,
+    #[serde(default)]
+    pub review: ReviewConfig,
 }
 
 #[cfg(test)]
