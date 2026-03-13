@@ -82,6 +82,13 @@ pub struct TaskState {
     /// Source-specific identifier for the originating issue/message.
     /// Used by `CompletionCallback` to call `IntakeSource::on_task_complete`.
     pub external_id: Option<String>,
+    /// Parent task ID when this task is a subtask spawned via parallel dispatch.
+    /// Persisted so parent-child relationships survive server restart.
+    pub parent_id: Option<TaskId>,
+    /// IDs of subtasks spawned by this task during parallel dispatch.
+    /// Populated at runtime; not persisted (use `TaskStore::list_children` after restart).
+    #[serde(default)]
+    pub subtask_ids: Vec<TaskId>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -94,6 +101,8 @@ pub struct TaskSummary {
     pub error: Option<String>,
     /// Intake source name (e.g. "github", "feishu", "dashboard"). None for manual tasks.
     pub source: Option<String>,
+    /// Parent task ID when this is a subtask.
+    pub parent_id: Option<TaskId>,
 }
 
 impl TaskState {
@@ -107,6 +116,8 @@ impl TaskState {
             error: None,
             source: None,
             external_id: None,
+            parent_id: None,
+            subtask_ids: Vec::new(),
         }
     }
 
@@ -118,6 +129,7 @@ impl TaskState {
             pr_url: self.pr_url.clone(),
             error: self.error.clone(),
             source: self.source.clone(),
+            parent_id: self.parent_id.clone(),
         }
     }
 }
@@ -313,6 +325,17 @@ impl TaskStore {
         self.cache.iter().map(|e| e.value().clone()).collect()
     }
 
+    /// Return all cached tasks whose `parent_id` matches the given ID.
+    /// Reconstructs the child list from in-memory state; does not require
+    /// `subtask_ids` to be persisted on the parent.
+    pub fn list_children(&self, parent_id: &TaskId) -> Vec<TaskState> {
+        self.cache
+            .iter()
+            .filter(|e| e.value().parent_id.as_ref() == Some(parent_id))
+            .map(|e| e.value().clone())
+            .collect()
+    }
+
     pub(crate) async fn insert(&self, state: &TaskState) {
         self.persist_locks
             .entry(state.id.clone())
@@ -428,6 +451,15 @@ where
                     let project_config = harness_core::config::load_project_config(&project_root);
                     let remote = project_config.git.remote.clone();
                     let base_branch = project_config.git.base_branch.clone();
+
+                    // Register subtask IDs in the parent before dispatch.
+                    let sub_ids: Vec<TaskId> = (0..subtask_prompts.len())
+                        .map(|i| TaskId(format!("{}-p{i}", id.0)))
+                        .collect();
+                    mutate_and_persist(&store, &id, |s| {
+                        s.subtask_ids = sub_ids.clone();
+                    })
+                    .await;
 
                     let context_items = crate::task_executor::collect_context_items(
                         &skills,
@@ -594,6 +626,39 @@ mod tests {
         AgentRequest, AgentResponse, Capability, ContextItem, EventFilters, StreamItem, TokenUsage,
     };
     use tokio::time::Duration;
+
+    #[tokio::test]
+    async fn list_children_returns_subtasks_for_parent() -> anyhow::Result<()> {
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let parent_id = TaskId("parent-task".to_string());
+        let parent = TaskState::new(parent_id.clone());
+        store.insert(&parent).await;
+
+        let mut child1 = TaskState::new(TaskId("child-1".to_string()));
+        child1.parent_id = Some(parent_id.clone());
+        store.insert(&child1).await;
+
+        let mut child2 = TaskState::new(TaskId("child-2".to_string()));
+        child2.parent_id = Some(parent_id.clone());
+        store.insert(&child2).await;
+
+        // Unrelated task.
+        store
+            .insert(&TaskState::new(TaskId("other".to_string())))
+            .await;
+
+        let children = store.list_children(&parent_id);
+        assert_eq!(children.len(), 2);
+        assert!(children
+            .iter()
+            .all(|c| c.parent_id.as_ref() == Some(&parent_id)));
+
+        let no_children = store.list_children(&TaskId("nonexistent".to_string()));
+        assert!(no_children.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn test_task_state_new() {
