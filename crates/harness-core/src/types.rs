@@ -349,6 +349,30 @@ pub struct Violation {
     pub severity: Severity,
 }
 
+// === Auto-fix ===
+
+/// Outcome of a single auto-fix attempt for one violation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoFixAttempt {
+    pub rule_id: RuleId,
+    pub file: PathBuf,
+    pub line: Option<usize>,
+    /// Whether the fix_pattern was successfully applied to the file.
+    pub applied: bool,
+    /// Whether the violation is absent after the post-fix re-scan.
+    pub resolved: bool,
+}
+
+/// Summary returned by `RuleEngine::scan_and_fix`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoFixReport {
+    pub attempts: Vec<AutoFixAttempt>,
+    /// Number of violations where the fix_pattern was applied to the file.
+    pub fixed_count: usize,
+    /// Violations remaining after the auto-fix re-scan.
+    pub residual_violations: Vec<Violation>,
+}
+
 // === Skill ===
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

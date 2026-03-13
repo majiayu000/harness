@@ -2,7 +2,9 @@ use crate::exec_policy::{
     ExecPolicy, ExecPolicyCheckOutput, ExecPolicyParser, MatchOptions, RequirementsToml,
 };
 use anyhow::Context;
-use harness_core::{Category, GuardId, Language, RuleId, Severity, Violation};
+use harness_core::{
+    AutoFixAttempt, AutoFixReport, Category, GuardId, Language, RuleId, Severity, Violation,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -387,6 +389,116 @@ impl RuleEngine {
             }
         }
         Ok(fixed)
+    }
+
+    /// Scan for violations and, when `auto_fix` is true, attempt to apply each violation's
+    /// `fix_pattern`. Re-scans after all fixes to verify which violations were resolved.
+    ///
+    /// Returns an [`AutoFixReport`] containing per-attempt outcomes and the residual
+    /// violations that remain after the fix loop. When `auto_fix` is false the report
+    /// is empty and `residual_violations` holds the initial scan results.
+    pub async fn scan_and_fix(
+        &self,
+        project_root: &Path,
+        auto_fix: bool,
+    ) -> anyhow::Result<AutoFixReport> {
+        let initial_violations = self.scan(project_root).await?;
+
+        if !auto_fix {
+            return Ok(AutoFixReport {
+                attempts: vec![],
+                fixed_count: 0,
+                residual_violations: initial_violations,
+            });
+        }
+
+        let fixable: Vec<&Violation> = initial_violations
+            .iter()
+            .filter(|v| {
+                self.rules
+                    .iter()
+                    .any(|r| r.id == v.rule_id && r.fix_pattern.is_some())
+            })
+            .collect();
+
+        if fixable.is_empty() {
+            tracing::debug!(
+                violations = initial_violations.len(),
+                "auto-fix enabled but no violations have a fix_pattern"
+            );
+            return Ok(AutoFixReport {
+                attempts: vec![],
+                fixed_count: 0,
+                residual_violations: initial_violations,
+            });
+        }
+
+        let mut attempts: Vec<AutoFixAttempt> = Vec::new();
+        let mut fixed_count = 0usize;
+
+        for violation in &fixable {
+            let applied = match self.apply_fix(violation, project_root) {
+                Ok(true) => {
+                    fixed_count += 1;
+                    tracing::info!(
+                        rule = %violation.rule_id,
+                        file = %violation.file.display(),
+                        "auto-fix applied"
+                    );
+                    true
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        rule = %violation.rule_id,
+                        file = %violation.file.display(),
+                        "auto-fix pattern did not match"
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        rule = %violation.rule_id,
+                        file = %violation.file.display(),
+                        "auto-fix failed: {e}"
+                    );
+                    false
+                }
+            };
+            attempts.push(AutoFixAttempt {
+                rule_id: violation.rule_id.clone(),
+                file: violation.file.clone(),
+                line: violation.line,
+                applied,
+                resolved: false, // updated after re-scan below
+            });
+        }
+
+        // Re-scan to verify which violations were actually resolved.
+        let residual_violations = self.scan(project_root).await?;
+
+        let residual_keys: HashSet<(&RuleId, &PathBuf)> = residual_violations
+            .iter()
+            .map(|v| (&v.rule_id, &v.file))
+            .collect();
+
+        for attempt in &mut attempts {
+            if attempt.applied {
+                attempt.resolved = !residual_keys.contains(&(&attempt.rule_id, &attempt.file));
+            }
+        }
+
+        tracing::info!(
+            applied = fixed_count,
+            residual = residual_violations.len(),
+            project_root = %project_root.display(),
+            "auto-fix loop complete"
+        );
+
+        Ok(AutoFixReport {
+            attempts,
+            fixed_count,
+            residual_violations,
+        })
     }
 
     pub fn register_guard(&mut self, guard: Guard) {
@@ -1126,5 +1238,153 @@ host_executable(name = "git", paths = ["/opt/homebrew/bin/git"])
             .load_configured_requirements()
             .expect_err("missing configured requirements path must error");
         assert!(error.to_string().contains("rules.requirements_path"));
+    }
+
+    #[tokio::test]
+    async fn scan_and_fix_with_auto_fix_disabled_returns_empty_report() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project)?;
+
+        // Guard that always emits no violations.
+        let script = dir.path().join("noop.sh");
+        std::fs::write(&script, "#!/usr/bin/env bash\nexit 0\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms)?;
+        }
+
+        let mut engine = RuleEngine::new();
+        engine.register_guard(Guard {
+            id: GuardId::from_str("NOOP"),
+            script_path: script,
+            language: Language::Common,
+            rules: vec![],
+        });
+
+        let report = engine.scan_and_fix(&project, false).await?;
+        assert!(
+            report.attempts.is_empty(),
+            "auto_fix=false must not attempt any fix"
+        );
+        assert_eq!(report.fixed_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_and_fix_with_no_fixable_rules_returns_empty_attempts() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project)?;
+
+        // Guard that emits one violation for a rule with no fix_pattern.
+        let script = dir.path().join("guard.sh");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\necho \"src/lib.rs:1:FIX-NO-PATTERN:some issue\"\n",
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms)?;
+        }
+
+        let mut engine = RuleEngine::new();
+        engine.register_guard(Guard {
+            id: GuardId::from_str("TEST"),
+            script_path: script,
+            language: Language::Common,
+            rules: vec![],
+        });
+        engine.add_rule(Rule {
+            id: RuleId::from_str("FIX-NO-PATTERN"),
+            title: "No pattern rule".to_string(),
+            severity: Severity::Low,
+            category: Category::Style,
+            paths: vec![],
+            description: String::new(),
+            fix_pattern: None,
+        });
+
+        let report = engine.scan_and_fix(&project, true).await?;
+        assert!(
+            report.attempts.is_empty(),
+            "no fix_pattern rules should produce no attempts"
+        );
+        assert_eq!(report.fixed_count, 0);
+        // The residual violations still include the unfixable one.
+        assert_eq!(report.residual_violations.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_and_fix_resolves_violation_when_auto_fix_enabled() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project)?;
+
+        // File that triggers a violation when it contains "foo()".
+        let src_file = project.join("sample.rs");
+        std::fs::write(&src_file, "let x = foo();\n")?;
+
+        // Guard: emit a violation for sample.rs when "foo()" is present.
+        let script = dir.path().join("detect-foo.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\n\
+                 file=\"$1/sample.rs\"\n\
+                 if grep -q 'foo()' \"$file\" 2>/dev/null; then\n\
+                   echo \"$file:1:FIX-AUTO:use bar instead of foo\"\n\
+                 fi\n"
+            ),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms)?;
+        }
+
+        let mut engine = RuleEngine::new();
+        engine.register_guard(Guard {
+            id: GuardId::from_str("FOO-GUARD"),
+            script_path: script,
+            language: Language::Common,
+            rules: vec![],
+        });
+        engine.add_rule(Rule {
+            id: RuleId::from_str("FIX-AUTO"),
+            title: "Replace foo".to_string(),
+            severity: Severity::Low,
+            category: Category::Style,
+            paths: vec![],
+            description: String::new(),
+            fix_pattern: Some("s/foo/bar/".to_string()),
+        });
+
+        let report = engine.scan_and_fix(&project, true).await?;
+
+        assert_eq!(report.fixed_count, 1, "one file should be fixed");
+        assert_eq!(report.attempts.len(), 1);
+        assert!(report.attempts[0].applied, "fix should be applied");
+        assert!(
+            report.attempts[0].resolved,
+            "violation should be resolved after re-scan"
+        );
+        assert!(
+            report.residual_violations.is_empty(),
+            "no violations should remain after fix"
+        );
+
+        let content = std::fs::read_to_string(&src_file)?;
+        assert_eq!(content, "let x = bar();\n");
+        Ok(())
     }
 }
