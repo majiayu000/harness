@@ -62,6 +62,9 @@ pub struct ConcurrencyConfig {
     /// Maximum number of tasks waiting for a slot. Excess tasks are rejected. Default: 32.
     #[serde(default = "default_max_queue_size")]
     pub max_queue_size: usize,
+    /// Seconds of silence from the agent stream before declaring a stall. Default: 300.
+    #[serde(default = "default_stall_timeout_secs")]
+    pub stall_timeout_secs: u64,
 }
 
 fn default_max_concurrent_tasks() -> usize {
@@ -72,11 +75,16 @@ fn default_max_queue_size() -> usize {
     32
 }
 
+fn default_stall_timeout_secs() -> u64 {
+    300
+}
+
 impl Default for ConcurrencyConfig {
     fn default() -> Self {
         Self {
             max_concurrent_tasks: default_max_concurrent_tasks(),
             max_queue_size: default_max_queue_size(),
+            stall_timeout_secs: default_stall_timeout_secs(),
         }
     }
 }

@@ -151,6 +151,10 @@ pub struct CreateTaskRequest {
     /// Maximum backoff cap in milliseconds for validation retries. Default: 300 000 ms (5 min).
     #[serde(default = "default_retry_max_backoff_ms")]
     pub retry_max_backoff_ms: u64,
+    /// Seconds of silence from the agent stream before declaring a stall; defaults to 300.
+    /// Overrides the global `concurrency.stall_timeout_secs` for this task.
+    #[serde(default = "default_stall_timeout")]
+    pub stall_timeout_secs: u64,
 }
 
 impl Default for CreateTaskRequest {
@@ -167,6 +171,7 @@ impl Default for CreateTaskRequest {
             max_budget_usd: None,
             retry_base_backoff_ms: default_retry_base_backoff_ms(),
             retry_max_backoff_ms: default_retry_max_backoff_ms(),
+            stall_timeout_secs: default_stall_timeout(),
         }
     }
 }
@@ -210,6 +215,9 @@ fn default_turn_timeout() -> u64 {
     // regularly exceed the previous 10-minute default when running CI checks,
     // building dependencies from source, or iterating on review feedback.
     3600
+}
+fn default_stall_timeout() -> u64 {
+    300
 }
 
 fn describe_detect_main_worktree_join_error(join_err: &tokio::task::JoinError) -> String {
