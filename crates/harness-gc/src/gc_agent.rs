@@ -1,10 +1,10 @@
+use crate::artifact_parser::parse_artifacts;
 use crate::draft_store::DraftStore;
 use crate::remediation::signal_priority;
 use crate::signal_detector::SignalDetector;
 use chrono::Utc;
 use harness_core::{
-    AgentRequest, Artifact, ArtifactType, CodeAgent, Draft, DraftId, DraftStatus, GcConfig,
-    Project, RemediationType, Signal, SignalType,
+    AgentRequest, CodeAgent, Draft, DraftId, DraftStatus, GcConfig, Project, Signal, SignalType,
 };
 use serde::{Deserialize, Serialize};
 
@@ -197,22 +197,6 @@ fn build_prompt(signal: &Signal, project: &Project) -> String {
             signal.details
         ),
     }
-}
-
-fn parse_artifacts(output: &str, signal: &Signal) -> Vec<Artifact> {
-    let artifact_type = match signal.remediation {
-        RemediationType::Guard => ArtifactType::Guard,
-        RemediationType::Rule => ArtifactType::Rule,
-        RemediationType::Hook => ArtifactType::Hook,
-        RemediationType::Skill => ArtifactType::Skill,
-    };
-
-    // For now, treat the entire output as a single artifact
-    vec![Artifact {
-        artifact_type,
-        target_path: std::path::PathBuf::from(format!(".harness/drafts/{}.md", signal.id)),
-        content: output.to_string(),
-    }]
 }
 
 #[cfg(test)]

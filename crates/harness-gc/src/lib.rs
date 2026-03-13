@@ -1,3 +1,4 @@
+pub mod artifact_parser;
 pub mod draft_store;
 pub mod gc_agent;
 pub mod remediation;
