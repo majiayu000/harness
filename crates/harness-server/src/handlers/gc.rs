@@ -9,9 +9,6 @@ fn gc_adopt_task_request(
 ) -> crate::task_runner::CreateTaskRequest {
     crate::task_runner::CreateTaskRequest {
         prompt: Some(prompt),
-        issue: None,
-        pr: None,
-        agent: None,
         project: Some(project_root),
         wait_secs: gc_config.adopt_wait_secs,
         max_rounds: gc_config.adopt_max_rounds,

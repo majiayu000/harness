@@ -78,6 +78,7 @@ impl TaskQueue {
         Self::new(&ConcurrencyConfig {
             max_concurrent_tasks: 1024,
             max_queue_size: 1024,
+            stall_timeout_secs: 300,
         })
     }
 }
@@ -92,6 +93,7 @@ mod tests {
         ConcurrencyConfig {
             max_concurrent_tasks: max_concurrent,
             max_queue_size: max_queue,
+            stall_timeout_secs: 300,
         }
     }
 

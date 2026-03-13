@@ -12,7 +12,7 @@ use harness_protocol::{Notification, RpcNotification};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
 
 pub(crate) use helpers::{
     collect_context_items, emit_runtime_notification, mark_turn_failed, persist_runtime_thread,
@@ -69,12 +69,14 @@ pub(crate) async fn run_turn_lifecycle(
         ..Default::default()
     };
 
+    let stall_timeout = Duration::from_secs(server.config.concurrency.stall_timeout_secs);
     let (stream_tx, mut stream_rx) = mpsc::channel(128);
     let mut execution = std::pin::pin!(agent.execute_stream(req, stream_tx));
     let mut stream_closed = false;
     let mut execution_result: Option<harness_core::Result<()>> = None;
+    let mut last_activity = Instant::now();
 
-    while execution_result.is_none() || !stream_closed {
+    'outer: while execution_result.is_none() || !stream_closed {
         tokio::select! {
             result = &mut execution, if execution_result.is_none() => {
                 execution_result = Some(result);
@@ -82,6 +84,7 @@ pub(crate) async fn run_turn_lifecycle(
             incoming = stream_rx.recv(), if !stream_closed => {
                 match incoming {
                     Some(item) => {
+                        last_activity = Instant::now();
                         process_stream_item(
                             &server,
                             &thread_db,
@@ -96,6 +99,30 @@ pub(crate) async fn run_turn_lifecycle(
                         stream_closed = true;
                     }
                 }
+            }
+            _ = tokio::time::sleep_until(last_activity + stall_timeout) => {
+                let elapsed = last_activity.elapsed();
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    turn_id = %turn_id,
+                    elapsed_secs = elapsed.as_secs(),
+                    "agent stream stall detected; no output for {}s",
+                    stall_timeout.as_secs()
+                );
+                mark_turn_failed(
+                    &server,
+                    &thread_db,
+                    &notify_tx,
+                    &notification_tx,
+                    &thread_id,
+                    &turn_id,
+                    format!(
+                        "Agent stream stalled: no output for {}s",
+                        stall_timeout.as_secs()
+                    ),
+                )
+                .await;
+                break 'outer;
             }
         }
     }
