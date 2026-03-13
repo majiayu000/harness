@@ -150,6 +150,10 @@ pub struct GcConfig {
     /// Minimum seconds between auto-triggered GC runs (cooldown). Default: 300.
     #[serde(default = "default_auto_gc_cooldown_secs")]
     pub auto_gc_cooldown_secs: u64,
+    /// When true, `gc adopt` automatically creates a branch, commits the fix, pushes,
+    /// and opens a PR via the agent prompt flow. Default: true.
+    #[serde(default = "default_gc_auto_pr")]
+    pub auto_pr: bool,
 }
 
 impl Default for GcConfig {
@@ -165,6 +169,7 @@ impl Default for GcConfig {
             signal_thresholds: SignalThresholdsConfig::default(),
             auto_gc_grades: default_auto_gc_grades(),
             auto_gc_cooldown_secs: default_auto_gc_cooldown_secs(),
+            auto_pr: default_gc_auto_pr(),
         }
     }
 }
@@ -191,6 +196,10 @@ fn default_auto_gc_grades() -> Vec<Grade> {
 
 fn default_auto_gc_cooldown_secs() -> u64 {
     300
+}
+
+fn default_gc_auto_pr() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

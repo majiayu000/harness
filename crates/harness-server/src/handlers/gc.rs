@@ -123,7 +123,7 @@ pub async fn gc_adopt(
 
     match state.engines.gc_agent.adopt(&draft_id) {
         Ok(()) => {
-            if artifact_paths.is_empty() {
+            if artifact_paths.is_empty() || !state.core.server.config.gc.auto_pr {
                 return RpcResponse::success(
                     id,
                     serde_json::json!({ "adopted": true, "task_id": null }),
