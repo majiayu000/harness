@@ -18,6 +18,7 @@ pub mod http;
 pub mod intake;
 pub mod notify;
 pub mod parallel_dispatch;
+pub mod periodic_reviewer;
 pub mod plan_db;
 pub mod post_validator;
 pub mod router;

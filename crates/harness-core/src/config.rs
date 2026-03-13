@@ -11,8 +11,8 @@ pub use agents::{
 };
 pub use intake::{FeishuIntakeConfig, GitHubIntakeConfig, IntakeConfig};
 pub use misc::{
-    ConcurrencyConfig, GcConfig, ObserveConfig, OtelConfig, OtelExporter, RulesConfig,
-    SignalThresholdsConfig, ValidationConfig, WorkspaceConfig,
+    ConcurrencyConfig, GcConfig, ObserveConfig, OtelConfig, OtelExporter, ReviewConfig,
+    RulesConfig, SignalThresholdsConfig, ValidationConfig, WorkspaceConfig,
 };
 pub use project::{load_project_config, GitConfig, ProjectConfig};
 pub use server::{ServerConfig, Transport};
@@ -35,6 +35,8 @@ pub struct HarnessConfig {
     pub concurrency: ConcurrencyConfig,
     #[serde(default)]
     pub intake: IntakeConfig,
+    #[serde(default)]
+    pub review: ReviewConfig,
 }
 
 #[cfg(test)]
@@ -381,6 +383,49 @@ mod tests {
         assert!(!config.agents.review.enabled);
         assert_eq!(config.otel.exporter, OtelExporter::Disabled);
         assert_eq!(config.gc.max_drafts_per_run, 5);
+        assert!(!config.review.enabled);
+        assert_eq!(config.review.interval_hours, 24);
+        assert_eq!(config.review.timeout_secs, 900);
+        assert!(config.review.agent.is_none());
+    }
+
+    #[test]
+    fn review_config_defaults() {
+        let config = ReviewConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.interval_hours, 24);
+        assert_eq!(config.timeout_secs, 900);
+        assert!(config.agent.is_none());
+    }
+
+    #[test]
+    fn review_config_deserializes_from_toml() {
+        let toml_str = r#"
+            enabled = true
+            interval_hours = 48
+            agent = "claude"
+            timeout_secs = 1200
+        "#;
+        let config: ReviewConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.interval_hours, 48);
+        assert_eq!(config.agent.as_deref(), Some("claude"));
+        assert_eq!(config.timeout_secs, 1200);
+    }
+
+    #[test]
+    fn review_config_deserializes_with_defaults() {
+        let config: ReviewConfig = toml::from_str("enabled = true").unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.interval_hours, 24);
+        assert!(config.agent.is_none());
+        assert_eq!(config.timeout_secs, 900);
+    }
+
+    #[test]
+    fn harness_config_includes_review() {
+        let config = HarnessConfig::default();
+        assert!(!config.review.enabled);
     }
 
     #[test]
