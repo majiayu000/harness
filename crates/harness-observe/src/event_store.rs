@@ -71,6 +71,13 @@ impl EventStore {
         Ok(store)
     }
 
+    /// Close the SQLite connection pool.
+    ///
+    /// This is useful in tests to ensure clean shutdown before tempdir cleanup.
+    pub async fn close(self) {
+        self.pool.close().await;
+    }
+
     pub async fn with_policies_and_otel(
         data_dir: &Path,
         session_renewal_secs: u64,
@@ -496,6 +503,7 @@ mod tests {
         let store = EventStore::new(dir.path()).await?;
         let results = store.query(&EventFilters::default()).await?;
         assert!(results.is_empty());
+        store.close().await;
         Ok(())
     }
 
@@ -508,6 +516,7 @@ mod tests {
         let results = store.query(&EventFilters::default()).await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, event.id);
+        store.close().await;
         Ok(())
     }
 
@@ -529,6 +538,7 @@ mod tests {
             .await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].hook, "pre_tool_use");
+        store.close().await;
         Ok(())
     }
 
@@ -546,6 +556,7 @@ mod tests {
             .await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].decision, Decision::Block);
+        store.close().await;
         Ok(())
     }
 
@@ -568,6 +579,7 @@ mod tests {
             .await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].tool, "tool_a");
+        store.close().await;
         Ok(())
     }
 
@@ -591,6 +603,7 @@ mod tests {
             .await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session_id, sid1);
+        store.close().await;
         Ok(())
     }
 
@@ -608,6 +621,7 @@ mod tests {
             })
             .await?;
         assert_eq!(results.len(), 3);
+        store.close().await;
         Ok(())
     }
 
@@ -643,6 +657,7 @@ mod tests {
         assert!(check_events
             .iter()
             .all(|event| event.session_id == session_id));
+        store.close().await;
         Ok(())
     }
 
@@ -669,6 +684,7 @@ mod tests {
             })
             .await?;
         assert!(violation_events.is_empty());
+        store.close().await;
         Ok(())
     }
 
@@ -724,6 +740,7 @@ mod tests {
         assert_eq!(by_tool["R-HIGH"], Decision::Block);
         assert_eq!(by_tool["R-MED"], Decision::Warn);
         assert_eq!(by_tool["R-LOW"], Decision::Pass);
+        store.close().await;
         Ok(())
     }
 
@@ -741,6 +758,7 @@ mod tests {
             .await?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].detail.as_deref(), Some("/tmp/my-project"));
+        store.close().await;
         Ok(())
     }
 
@@ -806,6 +824,7 @@ mod tests {
             .find(|e| e.tool == "FIX-02")
             .ok_or_else(|| anyhow::anyhow!("FIX-02 attempt event not found"))?;
         assert_eq!(unresolved_evt.decision, Decision::Block);
+        store.close().await;
         Ok(())
     }
 
@@ -840,6 +859,7 @@ mod tests {
             .await?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].decision, Decision::Warn);
+        store.close().await;
         Ok(())
     }
 
@@ -857,6 +877,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, signal.id);
         assert_eq!(results[0].source, "github");
+        store.close().await;
         Ok(())
     }
 
@@ -877,6 +898,7 @@ mod tests {
         let results = store.query_external_signals(Some(cutoff))?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, new_signal.id);
+        store.close().await;
         Ok(())
     }
 
@@ -886,6 +908,7 @@ mod tests {
         let store = EventStore::new(dir.path()).await?;
         let results = store.query_external_signals(None)?;
         assert!(results.is_empty());
+        store.close().await;
         Ok(())
     }
 
@@ -918,6 +941,7 @@ mod tests {
             .await?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, event.id);
+        store.close().await;
         Ok(())
     }
 
@@ -934,6 +958,7 @@ mod tests {
         let results = store.query(&EventFilters::default()).await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, event.id);
+        store.close().await;
         Ok(())
     }
 }
