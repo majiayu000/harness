@@ -16,11 +16,19 @@ pub trait DbEntity: Serialize + for<'de> Deserialize<'de> + Send + Unpin + 'stat
 ///
 /// All three DB files (task, thread, plan) share the same pool configuration.
 pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {
+    // busy_timeout prevents SQLITE_BUSY on concurrent writers (waits up to 5s).
     let url = format!("sqlite:{}?mode=rwc", path.display());
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
         .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(&url)
+        .await?;
+    // Enable WAL mode for concurrent read/write and set busy timeout.
+    sqlx::query("PRAGMA journal_mode=WAL")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA busy_timeout=5000")
+        .execute(&pool)
         .await?;
     Ok(pool)
 }
