@@ -1,3 +1,4 @@
+use crate::types::ReasoningBudget;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -178,6 +179,10 @@ fn default_max_agent_review_rounds() -> u32 {
 pub struct ClaudeAgentConfig {
     pub cli_path: PathBuf,
     pub default_model: String,
+    /// Optional per-phase model selection. When set, the agent switches models
+    /// based on the `execution_phase` field of each `AgentRequest`.
+    #[serde(default)]
+    pub reasoning_budget: Option<ReasoningBudget>,
 }
 
 impl Default for ClaudeAgentConfig {
@@ -185,6 +190,7 @@ impl Default for ClaudeAgentConfig {
         Self {
             cli_path: PathBuf::from("claude"),
             default_model: "sonnet".to_string(),
+            reasoning_budget: None,
         }
     }
 }

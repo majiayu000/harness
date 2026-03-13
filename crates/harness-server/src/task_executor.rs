@@ -6,7 +6,7 @@ use crate::task_runner::{
 };
 use harness_core::{
     config::load_project_config, prompts, AgentRequest, AgentResponse, CodeAgent, ContextItem,
-    Event, SessionId, ThreadId, TurnId, TurnStatus,
+    Event, ExecutionPhase, SessionId, ThreadId, TurnId, TurnStatus,
 };
 use harness_protocol::{Notification, RpcNotification};
 use std::path::{Path, PathBuf};
@@ -233,6 +233,7 @@ pub(crate) async fn run_task(
         project_root: project.clone(),
         context: context_items.clone(),
         max_budget_usd: req.max_budget_usd,
+        execution_phase: Some(ExecutionPhase::Planning),
         ..Default::default()
     };
 
@@ -390,6 +391,7 @@ pub(crate) async fn run_task(
             prompt: prompts::check_existing_pr(pr_num, &review_config.review_bot_command),
             project_root: project.clone(),
             context: context_items.clone(),
+            execution_phase: Some(ExecutionPhase::Validation),
             ..Default::default()
         };
         let check_req = run_pre_execute(&interceptors, check_req).await?;
@@ -510,6 +512,7 @@ async fn run_agent_review(
             prompt: prompts::agent_review_prompt(pr_num, agent_round),
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
+            execution_phase: Some(ExecutionPhase::Validation),
             ..Default::default()
         };
         let review_req = run_pre_execute(interceptors, review_req).await?;
@@ -602,6 +605,7 @@ async fn run_agent_review(
             prompt: prompts::agent_review_fix_prompt(pr_num, &issues, agent_round),
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
+            execution_phase: Some(ExecutionPhase::Execution),
             ..Default::default()
         };
         let fix_req = run_pre_execute(interceptors, fix_req).await?;

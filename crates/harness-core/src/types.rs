@@ -523,6 +523,94 @@ pub enum BudgetTier {
     Medium,
 }
 
+/// Phase of task execution used to select the appropriate model via ReasoningBudget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPhase {
+    /// Initial planning and analysis (uses high-reasoning model).
+    Planning,
+    /// Core implementation work (uses balanced model).
+    Execution,
+    /// Validation and review (uses high-reasoning model).
+    Validation,
+}
+
+/// Per-phase model selection configuration.
+///
+/// Maps each `ExecutionPhase` to a `BudgetTier`, then maps tiers to model identifiers.
+/// When configured on `ClaudeCodeAgent`, the model is selected by phase rather than
+/// the flat `default_model`. Falls back to `req.model` or `default_model` when no
+/// `execution_phase` is set on the `AgentRequest`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningBudget {
+    /// Tier used for the Planning phase (default: XHigh).
+    #[serde(default = "default_planning_tier")]
+    pub planning_tier: BudgetTier,
+    /// Tier used for the Execution phase (default: High).
+    #[serde(default = "default_execution_tier")]
+    pub execution_tier: BudgetTier,
+    /// Tier used for the Validation phase (default: XHigh).
+    #[serde(default = "default_validation_tier")]
+    pub validation_tier: BudgetTier,
+    /// Model identifier for XHigh tier (default: opus).
+    #[serde(default = "default_xhigh_model")]
+    pub xhigh_model: String,
+    /// Model identifier for High tier (default: sonnet).
+    #[serde(default = "default_high_model")]
+    pub high_model: String,
+    /// Model identifier for Medium tier (default: haiku).
+    #[serde(default = "default_medium_model")]
+    pub medium_model: String,
+}
+
+fn default_planning_tier() -> BudgetTier {
+    BudgetTier::XHigh
+}
+fn default_execution_tier() -> BudgetTier {
+    BudgetTier::High
+}
+fn default_validation_tier() -> BudgetTier {
+    BudgetTier::XHigh
+}
+fn default_xhigh_model() -> String {
+    "claude-opus-4-20250514".to_string()
+}
+fn default_high_model() -> String {
+    "claude-sonnet-4-20250514".to_string()
+}
+fn default_medium_model() -> String {
+    "claude-haiku-4-20250514".to_string()
+}
+
+impl Default for ReasoningBudget {
+    fn default() -> Self {
+        Self {
+            planning_tier: default_planning_tier(),
+            execution_tier: default_execution_tier(),
+            validation_tier: default_validation_tier(),
+            xhigh_model: default_xhigh_model(),
+            high_model: default_high_model(),
+            medium_model: default_medium_model(),
+        }
+    }
+}
+
+impl ReasoningBudget {
+    /// Returns the model identifier for the given execution phase.
+    pub fn model_for_phase(&self, phase: ExecutionPhase) -> &str {
+        let tier = match phase {
+            ExecutionPhase::Planning => self.planning_tier,
+            ExecutionPhase::Execution => self.execution_tier,
+            ExecutionPhase::Validation => self.validation_tier,
+        };
+        match tier {
+            BudgetTier::XHigh => &self.xhigh_model,
+            BudgetTier::High => &self.high_model,
+            BudgetTier::Medium => &self.medium_model,
+        }
+    }
+}
+
 // === Event Filters ===
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -625,6 +713,84 @@ mod tests {
             Item::UserMessage { content } => assert_eq!(content, "hello world"),
             _ => anyhow::bail!("wrong variant"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn reasoning_budget_default_phase_mapping() {
+        let budget = ReasoningBudget::default();
+        // Planning and Validation use XHigh → opus
+        assert_eq!(
+            budget.model_for_phase(ExecutionPhase::Planning),
+            "claude-opus-4-20250514"
+        );
+        assert_eq!(
+            budget.model_for_phase(ExecutionPhase::Validation),
+            "claude-opus-4-20250514"
+        );
+        // Execution uses High → sonnet
+        assert_eq!(
+            budget.model_for_phase(ExecutionPhase::Execution),
+            "claude-sonnet-4-20250514"
+        );
+    }
+
+    #[test]
+    fn reasoning_budget_custom_models() {
+        let budget = ReasoningBudget {
+            planning_tier: BudgetTier::High,
+            execution_tier: BudgetTier::Medium,
+            validation_tier: BudgetTier::XHigh,
+            xhigh_model: "opus-custom".to_string(),
+            high_model: "sonnet-custom".to_string(),
+            medium_model: "haiku-custom".to_string(),
+        };
+        assert_eq!(
+            budget.model_for_phase(ExecutionPhase::Planning),
+            "sonnet-custom"
+        );
+        assert_eq!(
+            budget.model_for_phase(ExecutionPhase::Execution),
+            "haiku-custom"
+        );
+        assert_eq!(
+            budget.model_for_phase(ExecutionPhase::Validation),
+            "opus-custom"
+        );
+    }
+
+    #[test]
+    fn reasoning_budget_serde_roundtrip() -> anyhow::Result<()> {
+        let budget = ReasoningBudget::default();
+        let json = serde_json::to_string(&budget)?;
+        let back: ReasoningBudget = serde_json::from_str(&json)?;
+        assert_eq!(
+            budget.model_for_phase(ExecutionPhase::Planning),
+            back.model_for_phase(ExecutionPhase::Planning)
+        );
+        assert_eq!(
+            budget.model_for_phase(ExecutionPhase::Execution),
+            back.model_for_phase(ExecutionPhase::Execution)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_phase_serde_snake_case() -> anyhow::Result<()> {
+        assert_eq!(
+            serde_json::to_string(&ExecutionPhase::Planning)?,
+            "\"planning\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionPhase::Execution)?,
+            "\"execution\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionPhase::Validation)?,
+            "\"validation\""
+        );
+        let back: ExecutionPhase = serde_json::from_str("\"validation\"")?;
+        assert_eq!(back, ExecutionPhase::Validation);
         Ok(())
     }
 }
