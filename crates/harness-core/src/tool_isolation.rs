@@ -103,9 +103,11 @@ mod tests {
     #[test]
     fn explicit_allowed_tools_overrides_profile() {
         use crate::config::AgentsConfig;
-        let mut cfg = AgentsConfig::default();
-        cfg.capability_profile = CapabilityProfile::ReadOnly;
-        cfg.allowed_tools = Some(vec!["Bash".to_string()]);
+        let cfg = AgentsConfig {
+            capability_profile: CapabilityProfile::ReadOnly,
+            allowed_tools: Some(vec!["Bash".to_string()]),
+            ..Default::default()
+        };
 
         let resolved = cfg.resolve_allowed_tools().unwrap();
         assert_eq!(resolved, vec!["Bash"]);
@@ -114,9 +116,10 @@ mod tests {
     #[test]
     fn profile_used_when_no_explicit_tools() {
         use crate::config::AgentsConfig;
-        let mut cfg = AgentsConfig::default();
-        cfg.capability_profile = CapabilityProfile::Standard;
-        cfg.allowed_tools = None;
+        let cfg = AgentsConfig {
+            capability_profile: CapabilityProfile::Standard,
+            ..Default::default()
+        };
 
         let resolved = cfg.resolve_allowed_tools().unwrap();
         assert_eq!(resolved, vec!["Read", "Write", "Edit", "Bash"]);
