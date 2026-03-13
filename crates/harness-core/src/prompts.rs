@@ -265,6 +265,24 @@ pub fn extract_pr_number(url: &str) -> Option<u64> {
     None
 }
 
+/// Parse a GitHub PR URL into `(owner, repo, pr_number)`.
+///
+/// Accepts URLs of the form `https://github.com/{owner}/{repo}/pull/{number}[/...]`.
+pub fn parse_github_pr_url(url: &str) -> Option<(String, String, u64)> {
+    let path = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))?;
+    let parts: Vec<&str> = path.splitn(5, '/').collect();
+    if parts.len() >= 4 && parts[2] == "pull" {
+        let owner = parts[0].to_string();
+        let repo = parts[1].to_string();
+        let number_str = parts[3].split('#').next()?;
+        let number = number_str.parse::<u64>().ok()?;
+        return Some((owner, repo, number));
+    }
+    None
+}
+
 /// Check if agent output's last non-empty line is exactly "LGTM".
 pub fn is_lgtm(output: &str) -> bool {
     last_non_empty_line(output) == Some("LGTM")
@@ -530,5 +548,50 @@ mod tests {
     fn test_extract_review_issues_empty() {
         assert!(extract_review_issues("APPROVED").is_empty());
         assert!(extract_review_issues("ISSUE: ").is_empty());
+    }
+
+    #[test]
+    fn test_parse_github_pr_url_basic() {
+        assert_eq!(
+            parse_github_pr_url("https://github.com/owner/repo/pull/42"),
+            Some(("owner".to_string(), "repo".to_string(), 42))
+        );
+    }
+
+    #[test]
+    fn test_parse_github_pr_url_with_path_suffix() {
+        assert_eq!(
+            parse_github_pr_url("https://github.com/owner/repo/pull/42/files"),
+            Some(("owner".to_string(), "repo".to_string(), 42))
+        );
+    }
+
+    #[test]
+    fn test_parse_github_pr_url_with_fragment() {
+        assert_eq!(
+            parse_github_pr_url("https://github.com/owner/repo/pull/42#discussion_r123"),
+            Some(("owner".to_string(), "repo".to_string(), 42))
+        );
+    }
+
+    #[test]
+    fn test_parse_github_pr_url_not_a_pr() {
+        assert_eq!(
+            parse_github_pr_url("https://github.com/owner/repo/issues/42"),
+            None
+        );
+        assert_eq!(
+            parse_github_pr_url("https://example.com/owner/repo/pull/42"),
+            None
+        );
+        assert_eq!(parse_github_pr_url("not a url"), None);
+    }
+
+    #[test]
+    fn test_parse_github_pr_url_invalid_number() {
+        assert_eq!(
+            parse_github_pr_url("https://github.com/owner/repo/pull/abc"),
+            None
+        );
     }
 }

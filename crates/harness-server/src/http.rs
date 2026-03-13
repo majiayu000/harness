@@ -281,7 +281,11 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             )) as Arc<dyn crate::intake::IntakeSource>
         });
 
-    let completion_callback = build_completion_callback(&feishu_intake, &github_intake);
+    let completion_callback = build_completion_callback(
+        &feishu_intake,
+        &github_intake,
+        server.config.agents.review.clone(),
+    );
 
     Ok(AppState {
         core: CoreServices {
@@ -336,6 +340,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 fn build_completion_callback(
     feishu_intake: &Option<Arc<crate::intake::feishu::FeishuIntake>>,
     github_intake: &Option<Arc<dyn crate::intake::IntakeSource>>,
+    review_config: harness_core::AgentReviewConfig,
 ) -> Option<task_runner::CompletionCallback> {
     let mut sources: std::collections::HashMap<String, Arc<dyn crate::intake::IntakeSource>> =
         std::collections::HashMap::new();
@@ -346,13 +351,57 @@ fn build_completion_callback(
         let fi_source: Arc<dyn crate::intake::IntakeSource> = fi.clone();
         sources.insert(fi_source.name().to_string(), fi_source);
     }
-    if sources.is_empty() {
+    if sources.is_empty() && !review_config.review_bot_auto_trigger {
         return None;
     }
     let sources = Arc::new(sources);
     Some(Arc::new(move |task: task_runner::TaskState| {
         let sources = sources.clone();
+        let review_config = review_config.clone();
         Box::pin(async move {
+            // Auto-trigger review bot comment when task completes with a PR URL.
+            if review_config.review_bot_auto_trigger {
+                if let task_runner::TaskStatus::Done = &task.status {
+                    if let Some(pr_url) = task.pr_url.as_deref() {
+                        if let Some((owner, repo, pr_num)) =
+                            harness_core::prompts::parse_github_pr_url(pr_url)
+                        {
+                            match std::env::var("GITHUB_TOKEN") {
+                                Ok(token) if !token.is_empty() => {
+                                    if let Err(e) = post_review_bot_comment(
+                                        &owner,
+                                        &repo,
+                                        pr_num,
+                                        &review_config.review_bot_command,
+                                        &token,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            pr_url,
+                                            "review_bot_auto_trigger: failed to post comment: {e}"
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            pr_url,
+                                            comment = review_config.review_bot_command,
+                                            "review bot comment posted"
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    tracing::warn!(
+                                        pr_url,
+                                        "review_bot_auto_trigger: GITHUB_TOKEN not set or empty; skipping"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Intake source notification.
             let Some(source_name) = task.source.as_deref() else {
                 return;
             };
@@ -405,6 +454,33 @@ fn build_completion_callback(
             }
         })
     }))
+}
+
+/// Post a comment to a GitHub PR via the Issues API.
+async fn post_review_bot_comment(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    body: &str,
+    github_token: &str,
+) -> anyhow::Result<()> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments");
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {github_token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "harness-bot")
+        .json(&serde_json::json!({ "body": body }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("GitHub API returned {status}: {text}");
+    }
+    Ok(())
 }
 
 /// Resolve the reviewer agent for independent agent review.
