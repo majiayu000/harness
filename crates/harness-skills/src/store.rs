@@ -1,5 +1,7 @@
+use chrono::{DateTime, Utc};
 use harness_core::{SkillId, SkillLocation};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,12 +16,24 @@ pub struct Skill {
     pub location: SkillLocation,
     /// SHA-style hex digest of `content` used for change detection.
     pub content_hash: String,
+    pub usage_count: u64,
+    pub last_used: Option<DateTime<Utc>>,
+}
+
+/// Sidecar data persisted alongside skill files.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SkillUsage {
+    usage_count: u64,
+    last_used: Option<DateTime<Utc>>,
 }
 
 pub struct SkillStore {
     skills: Vec<Skill>,
     discovery_paths: Vec<PathBuf>,
     persist_dir: Option<PathBuf>,
+    /// Maps skill name to the directory where its source file lives,
+    /// used to write usage sidecar files alongside the skill.
+    skill_dirs: HashMap<String, PathBuf>,
 }
 
 impl SkillStore {
@@ -28,6 +42,35 @@ impl SkillStore {
             skills: Vec::new(),
             discovery_paths: Vec::new(),
             persist_dir: None,
+            skill_dirs: HashMap::new(),
+        }
+    }
+
+    /// Record that a skill was used: increments its counter, updates `last_used`,
+    /// and persists a sidecar `.usage.json` alongside the skill file when possible.
+    pub fn record_use(&mut self, id: &SkillId) {
+        let (name, count, last_used) = {
+            let Some(skill) = self.skills.iter_mut().find(|s| s.id == *id) else {
+                return;
+            };
+            skill.usage_count += 1;
+            skill.last_used = Some(Utc::now());
+            (skill.name.clone(), skill.usage_count, skill.last_used)
+        };
+        if let Some(dir) = self.skill_dirs.get(&name) {
+            let path = dir.join(format!("{}.usage.json", name));
+            let usage = SkillUsage {
+                usage_count: count,
+                last_used,
+            };
+            match serde_json::to_string(&usage) {
+                Ok(json) => {
+                    if let Err(e) = std::fs::write(&path, json) {
+                        tracing::warn!("failed to persist usage for skill \'{}\': {e}", name);
+                    }
+                }
+                Err(e) => tracing::warn!("failed to serialize usage for skill \'{}\': {e}", name),
+            }
         }
     }
 
@@ -74,7 +117,6 @@ impl SkillStore {
         let location = if dir.to_string_lossy().contains("/etc/") {
             SkillLocation::Admin
         } else if dir.to_string_lossy().contains("/.harness/skills") {
-            // Check if it's a project-level path (not under home)
             if let Ok(home) = std::env::var("HOME") {
                 if dir.starts_with(&home) && !dir.starts_with(PathBuf::from(&home).join(".harness"))
                 {
@@ -101,6 +143,8 @@ impl SkillStore {
 
                     let version = parse_version_from_frontmatter(&content);
                     let hash = compute_content_hash(&content);
+                    let usage = load_usage_sidecar(dir, &name);
+                    self.skill_dirs.insert(name.clone(), dir.to_path_buf());
                     self.skills.push(Skill {
                         id: SkillId::new(),
                         name: name.clone(),
@@ -117,6 +161,8 @@ impl SkillStore {
                         author: "system".to_string(),
                         location,
                         content_hash: hash,
+                        usage_count: usage.usage_count,
+                        last_used: usage.last_used,
                     });
                 }
             }
@@ -124,8 +170,6 @@ impl SkillStore {
         Ok(())
     }
 
-    /// Match skills whose trigger patterns appear in the given prompt text.
-    /// Skills with no trigger patterns are not returned.
     pub fn match_prompt(&self, prompt: &str) -> Vec<&Skill> {
         let prompt_lower = prompt.to_lowercase();
         self.skills
@@ -140,7 +184,6 @@ impl SkillStore {
             .collect()
     }
 
-    /// Match skills to current context (file patterns, language, etc.).
     pub fn match_context(&self, file_path: Option<&Path>, language: Option<&str>) -> Vec<&Skill> {
         self.skills
             .iter()
@@ -164,7 +207,6 @@ impl SkillStore {
             .collect()
     }
 
-    /// Deduplicate: same-name skills are resolved by location priority (repo > user > admin > system).
     pub fn deduplicate(&mut self) {
         let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut to_remove = Vec::new();
@@ -196,7 +238,7 @@ impl SkillStore {
         let content_hash = compute_content_hash(&content);
         let skill = Skill {
             id: SkillId::new(),
-            name,
+            name: name.clone(),
             description: content.lines().next().unwrap_or("").to_string(),
             content,
             trigger_patterns,
@@ -204,13 +246,15 @@ impl SkillStore {
             author: "user".to_string(),
             location: SkillLocation::User,
             content_hash,
+            usage_count: 0,
+            last_used: None,
         };
         self.skills.push(skill);
         let skill_ref = match self.skills.last() {
             Some(s) => s,
             None => unreachable!("skill was just pushed, so it must exist"),
         };
-        if let Some(dir) = &self.persist_dir {
+        if let Some(dir) = &self.persist_dir.clone() {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 tracing::warn!("failed to create skills dir {}: {e}", dir.display());
             } else {
@@ -218,6 +262,7 @@ impl SkillStore {
                 if let Err(e) = std::fs::write(&path, &skill_ref.content) {
                     tracing::warn!("failed to persist skill {}: {e}", path.display());
                 }
+                self.skill_dirs.insert(name, dir.clone());
             }
         }
         skill_ref
@@ -263,10 +308,6 @@ impl SkillStore {
             .collect()
     }
 
-    /// Update a skill's content. If the content hash differs from the stored
-    /// hash the patch version is auto-incremented, the new hash is stored, and
-    /// the file on disk is rewritten (if a persist dir is configured).
-    /// Returns the updated skill, or `None` if `id` is not found.
     pub fn update(&mut self, id: &SkillId, new_content: String) -> Option<&Skill> {
         let idx = self.skills.iter().position(|s| s.id == *id)?;
         let new_hash = compute_content_hash(&new_content);
@@ -298,13 +339,10 @@ impl SkillStore {
         Some(&self.skills[idx])
     }
 
-    /// Look up a skill by exact name.
     pub fn get_by_name(&self, name: &str) -> Option<&Skill> {
         self.skills.iter().find(|s| s.name == name)
     }
 
-    /// Load built-in system skills embedded at compile time.
-    /// Skips any skill whose name already exists in the store (user/repo skills take priority).
     pub fn load_builtin(&mut self) {
         let builtins = [
             ("interview", include_str!("../../../skills/interview.md")),
@@ -339,6 +377,8 @@ impl SkillStore {
                     author: "system".to_string(),
                     location: SkillLocation::System,
                     content_hash: compute_content_hash(content),
+                    usage_count: 0,
+                    last_used: None,
                 });
             }
         }
@@ -351,11 +391,6 @@ impl Default for SkillStore {
     }
 }
 
-/// Parse version from YAML-style frontmatter at the start of skill content.
-///
-/// Expects the file to begin with `---`, followed by a `version: x.y.z` line,
-/// then a closing `---`. Returns `"1.0.0"` when the block is absent or the
-/// field is missing.
 fn parse_version_from_frontmatter(content: &str) -> String {
     let mut lines = content.lines();
     if lines.next().map(|l| l.trim()) != Some("---") {
@@ -376,9 +411,6 @@ fn parse_version_from_frontmatter(content: &str) -> String {
     "1.0.0".to_string()
 }
 
-/// Compute a stable hex digest of `content` for change detection.
-///
-/// Uses `DefaultHasher` (stdlib) to avoid adding new dependencies.
 fn compute_content_hash(content: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -387,9 +419,6 @@ fn compute_content_hash(content: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Increment the patch component of a `"major.minor.patch"` version string.
-/// Returns `"1.0.1"` for `"1.0.0"`. Falls back to appending `.1` on parse
-/// failure so callers always receive a non-empty string.
 pub fn increment_patch(version: &str) -> String {
     let parts: Vec<&str> = version.splitn(3, '.').collect();
     if parts.len() == 3 {
@@ -404,12 +433,6 @@ pub fn increment_patch(version: &str) -> String {
     format!("{}.1", version)
 }
 
-/// Parse trigger patterns from a skill's markdown content.
-///
-/// Looks for an HTML comment of the form:
-/// `<!-- trigger-patterns: pattern one, pattern two -->`
-///
-/// Patterns are comma-separated, trimmed, and lowercased at match time.
 fn parse_trigger_patterns(content: &str) -> Vec<String> {
     for line in content.lines() {
         let trimmed = line.trim();
@@ -425,6 +448,17 @@ fn parse_trigger_patterns(content: &str) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+fn load_usage_sidecar(dir: &Path, skill_name: &str) -> SkillUsage {
+    let path = dir.join(format!("{}.usage.json", skill_name));
+    if !path.exists() {
+        return SkillUsage::default();
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 fn location_priority(loc: SkillLocation) -> u8 {
@@ -451,6 +485,8 @@ mod tests {
             author: "test".to_string(),
             location,
             content_hash: compute_content_hash("content"),
+            usage_count: 0,
+            last_used: None,
         }
     }
 
@@ -558,7 +594,7 @@ mod tests {
             assert_eq!(
                 skill.location,
                 SkillLocation::System,
-                "builtin skill '{}' should have System location",
+                "builtin skill \'{}\' should have System location",
                 skill.name
             );
         }
@@ -567,12 +603,9 @@ mod tests {
     #[test]
     fn load_builtin_user_skill_overrides_builtin() {
         let mut store = SkillStore::new();
-        // Add a user skill with the same name as a builtin before loading builtins
         store.skills.push(make_skill("review", SkillLocation::User));
         store.load_builtin();
-        // Should still have 10 skills total (9 builtins + 1 user, no duplicate)
         assert_eq!(store.list().len(), 10);
-        // The 'review' skill should retain User location (not overwritten by System)
         let Some(review) = store.get_by_name("review") else {
             panic!("review skill must exist");
         };
@@ -648,6 +681,8 @@ mod tests {
             author: "system".to_string(),
             location: SkillLocation::System,
             content_hash: compute_content_hash(""),
+            usage_count: 0,
+            last_used: None,
         });
         let matches = store.match_prompt("please do a code review of this PR");
         assert_eq!(matches.len(), 1);
@@ -667,6 +702,8 @@ mod tests {
             author: "system".to_string(),
             location: SkillLocation::System,
             content_hash: compute_content_hash(""),
+            usage_count: 0,
+            last_used: None,
         });
         let matches = store.match_prompt("I have a BUILD ERROR in my project");
         assert_eq!(matches.len(), 1);
@@ -698,12 +735,12 @@ mod tests {
             author: "system".to_string(),
             location: SkillLocation::System,
             content_hash: compute_content_hash(""),
+            usage_count: 0,
+            last_used: None,
         });
         let matches = store.match_prompt("implement feature X");
         assert!(matches.is_empty());
     }
-
-    // ── Version parsing ───────────────────────────────────────────────────────
 
     #[test]
     fn parse_version_from_frontmatter_returns_version_field() {
@@ -729,8 +766,6 @@ mod tests {
         assert_eq!(parse_version_from_frontmatter(content), "1.2.3");
     }
 
-    // ── increment_patch ───────────────────────────────────────────────────────
-
     #[test]
     fn increment_patch_bumps_last_component() {
         assert_eq!(increment_patch("1.0.0"), "1.0.1");
@@ -741,8 +776,6 @@ mod tests {
     fn increment_patch_does_not_touch_major_or_minor() {
         assert_eq!(increment_patch("3.7.2"), "3.7.3");
     }
-
-    // ── update auto-increments version on content change ─────────────────────
 
     #[test]
     fn update_increments_patch_when_content_changes() {
@@ -788,5 +821,70 @@ mod tests {
             "# Plain skill\nNo frontmatter.".to_string(),
         );
         assert_eq!(store.list()[0].version, "1.0.0");
+    }
+
+    #[test]
+    fn record_use_increments_counter() {
+        let mut store = SkillStore::new();
+        let skill = make_skill("deploy", SkillLocation::System);
+        let id = skill.id.clone();
+        store.skills.push(skill);
+        store.record_use(&id);
+        store.record_use(&id);
+        let s = store.get(&id).unwrap();
+        assert_eq!(s.usage_count, 2);
+        assert!(s.last_used.is_some());
+    }
+
+    #[test]
+    fn record_use_unknown_id_is_noop() {
+        let mut store = SkillStore::new();
+        store
+            .skills
+            .push(make_skill("deploy", SkillLocation::System));
+        let unknown = SkillId::new();
+        store.record_use(&unknown);
+        assert_eq!(store.list()[0].usage_count, 0);
+    }
+
+    #[test]
+    fn record_use_persists_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = SkillStore::new();
+        let skill = make_skill("deploy", SkillLocation::User);
+        let id = skill.id.clone();
+        store.skills.push(skill);
+        store
+            .skill_dirs
+            .insert("deploy".to_string(), tmp.path().to_path_buf());
+        store.record_use(&id);
+        let sidecar = tmp.path().join("deploy.usage.json");
+        assert!(sidecar.exists(), "sidecar file should be created");
+        let data: SkillUsage =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert_eq!(data.usage_count, 1);
+        assert!(data.last_used.is_some());
+    }
+
+    #[test]
+    fn load_usage_sidecar_returns_defaults_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let usage = load_usage_sidecar(tmp.path(), "nonexistent");
+        assert_eq!(usage.usage_count, 0);
+        assert!(usage.last_used.is_none());
+    }
+
+    #[test]
+    fn load_usage_sidecar_restores_persisted_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sidecar = tmp.path().join("myskill.usage.json");
+        let stored = SkillUsage {
+            usage_count: 42,
+            last_used: Some(chrono::Utc::now()),
+        };
+        std::fs::write(&sidecar, serde_json::to_string(&stored).unwrap()).unwrap();
+        let loaded = load_usage_sidecar(tmp.path(), "myskill");
+        assert_eq!(loaded.usage_count, 42);
+        assert!(loaded.last_used.is_some());
     }
 }
