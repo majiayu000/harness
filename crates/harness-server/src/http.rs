@@ -249,6 +249,16 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let thread_db_path = dir.join("threads.db");
     let thread_db = crate::thread_db::ThreadDb::open(&thread_db_path).await?;
     let plan_db = crate::plan_db::PlanDb::open(&dir.join("plans.db")).await?;
+    let plans_md_dir = dir.join("plans");
+    match plan_db.migrate_from_markdown_dir(&plans_md_dir).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            count = n,
+            "plan migration: imported {} plan(s) from markdown",
+            n
+        ),
+        Err(e) => tracing::warn!("plan migration: failed: {e}"),
+    }
     let configured_capacity = server.config.server.notification_broadcast_capacity;
     let notification_broadcast_capacity = configured_capacity.max(1);
     let notification_lag_log_every = server.config.server.notification_lag_log_every;
