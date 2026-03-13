@@ -358,6 +358,61 @@ impl RuleEngine {
         Ok(1)
     }
 
+    /// Register guard scripts found in `guards_dir` (all `*.sh` files).
+    ///
+    /// The guard ID is derived from the filename stem (uppercased, hyphens preserved).
+    /// Already-registered guards are skipped. Returns the count of newly registered guards.
+    pub fn auto_register_project_guards(&mut self, guards_dir: &Path) -> anyhow::Result<usize> {
+        if !guards_dir.is_dir() {
+            return Ok(0);
+        }
+
+        let mut registered = 0;
+        for entry in std::fs::read_dir(guards_dir)
+            .with_context(|| format!("failed to read guards directory: {}", guards_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.extension().map(|e| e == "sh").unwrap_or(false) {
+                continue;
+            }
+
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_uppercase(),
+                None => continue,
+            };
+            let guard_id = GuardId::from_str(&stem);
+
+            if self.guards.iter().any(|g| g.id == guard_id) {
+                continue;
+            }
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o755);
+                    if let Err(e) = std::fs::set_permissions(&path, perms) {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "failed to set executable bit on guard script: {e}"
+                        );
+                    }
+                }
+            }
+
+            self.register_guard(Guard {
+                id: guard_id,
+                script_path: path,
+                language: Language::Common,
+                rules: Vec::new(),
+            });
+            registered += 1;
+        }
+        Ok(registered)
+    }
+
     pub fn validate_scan_request(&self, files: Option<&[PathBuf]>) -> anyhow::Result<()> {
         if let Some(files) = files {
             if files.is_empty() {
