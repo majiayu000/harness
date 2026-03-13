@@ -354,10 +354,7 @@ mod tests {
 
     #[test]
     fn detect_severity_parses_all_valid_levels() {
-        assert_eq!(
-            detect_severity("severity: critical"),
-            Severity::Critical
-        );
+        assert_eq!(detect_severity("severity: critical"), Severity::Critical);
         assert_eq!(detect_severity("severity: high"), Severity::High);
         assert_eq!(detect_severity("severity: medium"), Severity::Medium);
         assert_eq!(detect_severity("severity: low"), Severity::Low);
@@ -378,10 +375,7 @@ mod tests {
 
     #[test]
     fn detect_severity_handles_severity_with_extra_text() {
-        assert_eq!(
-            detect_severity("severity: high (blocker)"),
-            Severity::High
-        );
+        assert_eq!(detect_severity("severity: high (blocker)"), Severity::High);
         assert_eq!(
             detect_severity("severity: critical - must fix"),
             Severity::Critical
