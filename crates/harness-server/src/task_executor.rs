@@ -149,6 +149,17 @@ pub(crate) async fn run_turn_lifecycle(
     }
 }
 
+/// Compute exponential backoff: `min(base_ms * 2^(attempt-1), max_ms)`.
+///
+/// - Attempt 1: `base_ms`
+/// - Attempt 2: `base_ms * 2`
+/// - Attempt 3: `base_ms * 4`
+/// - …capped at `max_ms`
+fn compute_backoff_ms(base_ms: u64, max_ms: u64, attempt: u32) -> u64 {
+    let shift = attempt.saturating_sub(1).min(63);
+    base_ms.saturating_mul(1u64 << shift).min(max_ms)
+}
+
 pub(crate) async fn run_task(
     store: &TaskStore,
     task_id: &TaskId,
@@ -219,17 +230,24 @@ pub(crate) async fn run_task(
                 if let Some(err) = run_post_execute(&interceptors, &impl_req, &r).await {
                     if validation_attempt < max_validation_retries {
                         validation_attempt += 1;
+                        let backoff_ms = compute_backoff_ms(
+                            req.retry_base_backoff_ms,
+                            req.retry_max_backoff_ms,
+                            validation_attempt,
+                        );
                         tracing::warn!(
                             attempt = validation_attempt,
                             max = max_validation_retries,
+                            backoff_ms,
                             error = %err,
-                            "post-execution validation failed; retrying with error context"
+                            "post-execution validation failed; backing off before retry"
                         );
                         let truncated = truncate_validation_error(&err, 2000);
                         impl_req.prompt = format!(
                             "{}\n\nPost-execution validation failed (attempt {}/{}):\n{}",
                             first_req.prompt, validation_attempt, max_validation_retries, truncated
                         );
+                        sleep(Duration::from_millis(backoff_ms)).await;
                         continue;
                     } else {
                         tracing::error!(
@@ -603,6 +621,28 @@ async fn run_agent_review(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exponential_backoff_three_consecutive_retries() {
+        let base_ms: u64 = 10_000;
+        let max_ms: u64 = 300_000;
+
+        // Attempt 1: base_ms * 2^0 = 10_000 ms (10 s)
+        assert_eq!(compute_backoff_ms(base_ms, max_ms, 1), 10_000);
+        // Attempt 2: base_ms * 2^1 = 20_000 ms (20 s)
+        assert_eq!(compute_backoff_ms(base_ms, max_ms, 2), 20_000);
+        // Attempt 3: base_ms * 2^2 = 40_000 ms (40 s)
+        assert_eq!(compute_backoff_ms(base_ms, max_ms, 3), 40_000);
+    }
+
+    #[test]
+    fn exponential_backoff_capped_at_max() {
+        let base_ms: u64 = 10_000;
+        let max_ms: u64 = 300_000;
+
+        // Attempt 6: 10_000 * 2^5 = 320_000 — should be capped at 300_000
+        assert_eq!(compute_backoff_ms(base_ms, max_ms, 6), 300_000);
+    }
 
     #[test]
     fn parse_harness_review_command() {
