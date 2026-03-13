@@ -109,6 +109,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_log_returns_logged_true_and_event_id() -> anyhow::Result<()> {
+        let project_root = tempdir_in_home("observe-event-log-root-")?;
+        let data_dir = tempfile::tempdir()?;
+        let state = make_test_state(project_root.path(), data_dir.path()).await?;
+
+        let session_id = harness_core::SessionId::new();
+        let event = harness_core::Event::new(
+            session_id.clone(),
+            "pre_tool_use",
+            "Bash",
+            harness_core::Decision::Pass,
+        );
+
+        let response = event_log(&state, Some(serde_json::json!(1)), event.clone()).await;
+
+        assert!(
+            response.error.is_none(),
+            "event_log should succeed: {:?}",
+            response.error
+        );
+        let result = response
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        assert_eq!(result["logged"], serde_json::json!(true));
+        let returned_id = result["event_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing event_id"))?;
+        assert_eq!(returned_id, event.id.as_str());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_query_returns_previously_logged_events() -> anyhow::Result<()> {
+        let project_root = tempdir_in_home("observe-event-query-root-")?;
+        let data_dir = tempfile::tempdir()?;
+        let state = make_test_state(project_root.path(), data_dir.path()).await?;
+
+        let session_id = harness_core::SessionId::new();
+        let event = harness_core::Event::new(
+            session_id.clone(),
+            "post_tool_use",
+            "Read",
+            harness_core::Decision::Pass,
+        );
+        state.observability.events.log(&event)?;
+
+        let filters = harness_core::EventFilters {
+            session_id: Some(session_id),
+            ..Default::default()
+        };
+        let response = event_query(&state, Some(serde_json::json!(2)), filters).await;
+
+        assert!(
+            response.error.is_none(),
+            "event_query should succeed: {:?}",
+            response.error
+        );
+        let events_val = response
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+        let events_arr = events_val
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("expected JSON array"))?;
+        assert_eq!(events_arr.len(), 1);
+        assert_eq!(
+            events_arr[0]["id"],
+            serde_json::json!(event.id.as_str()),
+            "returned event id should match logged event"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn metrics_collect_returns_internal_error_when_scan_fails() -> anyhow::Result<()> {
         let project_root = tempdir_in_home("metrics-scan-fail-root-")?;
         let data_dir = tempfile::tempdir()?;
