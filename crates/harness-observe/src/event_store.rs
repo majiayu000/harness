@@ -85,22 +85,26 @@ impl EventStore {
             return Ok(Vec::new());
         }
 
-        let content = std::fs::read_to_string(&path)?;
+        let file = std::fs::File::open(&path)?;
+        let reader = std::io::BufReader::new(file);
         let mut events: Vec<Event> = Vec::new();
 
-        for line in content.lines() {
+        use std::io::BufRead;
+        for line in reader.lines() {
+            let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(event) = serde_json::from_str::<Event>(line) {
+            if let Ok(event) = serde_json::from_str::<Event>(&line) {
                 if Self::matches_filters(&event, filters) {
                     events.push(event);
+                    if let Some(limit) = filters.limit {
+                        if events.len() >= limit {
+                            break;
+                        }
+                    }
                 }
             }
-        }
-
-        if let Some(limit) = filters.limit {
-            events.truncate(limit);
         }
 
         Ok(events)
