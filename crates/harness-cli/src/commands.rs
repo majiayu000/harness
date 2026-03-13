@@ -482,13 +482,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let content = std::fs::read_to_string(&cargo_toml_path)?;
             let parsed: toml::Value = toml::from_str(&content)?;
 
-            if let Some(version) = parsed.get("workspace")
+            if let Some(version) = parsed
+                .get("workspace")
                 .and_then(|w| w.get("package"))
                 .and_then(|p| p.get("version"))
                 .and_then(|v| v.as_str())
             {
                 println!("Current version: {}", version);
-            } else if let Some(version) = parsed.get("package")
+            } else if let Some(version) = parsed
+                .get("package")
                 .and_then(|p| p.get("version"))
                 .and_then(|v| v.as_str())
             {
