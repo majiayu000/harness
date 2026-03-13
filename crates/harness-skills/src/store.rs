@@ -12,6 +12,8 @@ pub struct Skill {
     pub version: String,
     pub author: String,
     pub location: SkillLocation,
+    /// SHA-style hex digest of `content` used for change detection.
+    pub content_hash: String,
 }
 
 pub struct SkillStore {
@@ -97,6 +99,8 @@ impl SkillStore {
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_default();
 
+                    let version = parse_version_from_frontmatter(&content);
+                    let hash = compute_content_hash(&content);
                     self.skills.push(Skill {
                         id: SkillId::new(),
                         name: name.clone(),
@@ -109,9 +113,10 @@ impl SkillStore {
                             .to_string(),
                         trigger_patterns: parse_trigger_patterns(&content),
                         content,
-                        version: "1.0.0".to_string(),
+                        version,
                         author: "system".to_string(),
                         location,
+                        content_hash: hash,
                     });
                 }
             }
@@ -187,15 +192,18 @@ impl SkillStore {
 
     pub fn create(&mut self, name: String, content: String) -> &Skill {
         let trigger_patterns = parse_trigger_patterns(&content);
+        let version = parse_version_from_frontmatter(&content);
+        let content_hash = compute_content_hash(&content);
         let skill = Skill {
             id: SkillId::new(),
             name,
             description: content.lines().next().unwrap_or("").to_string(),
             content,
             trigger_patterns,
-            version: "1.0.0".to_string(),
+            version,
             author: "user".to_string(),
             location: SkillLocation::User,
+            content_hash,
         };
         self.skills.push(skill);
         let skill_ref = match self.skills.last() {
@@ -255,6 +263,41 @@ impl SkillStore {
             .collect()
     }
 
+    /// Update a skill's content. If the content hash differs from the stored
+    /// hash the patch version is auto-incremented, the new hash is stored, and
+    /// the file on disk is rewritten (if a persist dir is configured).
+    /// Returns the updated skill, or `None` if `id` is not found.
+    pub fn update(&mut self, id: &SkillId, new_content: String) -> Option<&Skill> {
+        let idx = self.skills.iter().position(|s| s.id == *id)?;
+        let new_hash = compute_content_hash(&new_content);
+        let version = if new_hash != self.skills[idx].content_hash {
+            increment_patch(&self.skills[idx].version)
+        } else {
+            self.skills[idx].version.clone()
+        };
+        let trigger_patterns = parse_trigger_patterns(&new_content);
+        let description = new_content
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('#')
+            .trim()
+            .to_string();
+        let name = self.skills[idx].name.clone();
+        self.skills[idx].content = new_content.clone();
+        self.skills[idx].trigger_patterns = trigger_patterns;
+        self.skills[idx].description = description;
+        self.skills[idx].version = version;
+        self.skills[idx].content_hash = new_hash;
+        if let Some(dir) = &self.persist_dir {
+            let path = dir.join(format!("{}.md", name));
+            if let Err(e) = std::fs::write(&path, &new_content) {
+                tracing::warn!("failed to persist skill {}: {e}", path.display());
+            }
+        }
+        Some(&self.skills[idx])
+    }
+
     /// Look up a skill by exact name.
     pub fn get_by_name(&self, name: &str) -> Option<&Skill> {
         self.skills.iter().find(|s| s.name == name)
@@ -292,9 +335,10 @@ impl SkillStore {
                         .to_string(),
                     content: content.to_string(),
                     trigger_patterns: parse_trigger_patterns(content),
-                    version: "1.0".to_string(),
+                    version: parse_version_from_frontmatter(content),
                     author: "system".to_string(),
                     location: SkillLocation::System,
+                    content_hash: compute_content_hash(content),
                 });
             }
         }
@@ -305,6 +349,59 @@ impl Default for SkillStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Parse version from YAML-style frontmatter at the start of skill content.
+///
+/// Expects the file to begin with `---`, followed by a `version: x.y.z` line,
+/// then a closing `---`. Returns `"1.0.0"` when the block is absent or the
+/// field is missing.
+fn parse_version_from_frontmatter(content: &str) -> String {
+    let mut lines = content.lines();
+    if lines.next().map(|l| l.trim()) != Some("---") {
+        return "1.0.0".to_string();
+    }
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix("version:") {
+            let ver = rest.trim().to_string();
+            if !ver.is_empty() {
+                return ver;
+            }
+        }
+    }
+    "1.0.0".to_string()
+}
+
+/// Compute a stable hex digest of `content` for change detection.
+///
+/// Uses `DefaultHasher` (stdlib) to avoid adding new dependencies.
+fn compute_content_hash(content: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Increment the patch component of a `"major.minor.patch"` version string.
+/// Returns `"1.0.1"` for `"1.0.0"`. Falls back to appending `.1` on parse
+/// failure so callers always receive a non-empty string.
+pub fn increment_patch(version: &str) -> String {
+    let parts: Vec<&str> = version.splitn(3, '.').collect();
+    if parts.len() == 3 {
+        if let (Ok(major), Ok(minor), Ok(patch)) = (
+            parts[0].parse::<u32>(),
+            parts[1].parse::<u32>(),
+            parts[2].parse::<u32>(),
+        ) {
+            return format!("{}.{}.{}", major, minor, patch + 1);
+        }
+    }
+    format!("{}.1", version)
 }
 
 /// Parse trigger patterns from a skill's markdown content.
@@ -353,6 +450,7 @@ mod tests {
             version: "1.0.0".to_string(),
             author: "test".to_string(),
             location,
+            content_hash: compute_content_hash("content"),
         }
     }
 
@@ -549,6 +647,7 @@ mod tests {
             version: "1.0.0".to_string(),
             author: "system".to_string(),
             location: SkillLocation::System,
+            content_hash: compute_content_hash(""),
         });
         let matches = store.match_prompt("please do a code review of this PR");
         assert_eq!(matches.len(), 1);
@@ -567,6 +666,7 @@ mod tests {
             version: "1.0.0".to_string(),
             author: "system".to_string(),
             location: SkillLocation::System,
+            content_hash: compute_content_hash(""),
         });
         let matches = store.match_prompt("I have a BUILD ERROR in my project");
         assert_eq!(matches.len(), 1);
@@ -597,8 +697,96 @@ mod tests {
             version: "1.0.0".to_string(),
             author: "system".to_string(),
             location: SkillLocation::System,
+            content_hash: compute_content_hash(""),
         });
         let matches = store.match_prompt("implement feature X");
         assert!(matches.is_empty());
+    }
+
+    // ── Version parsing ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_version_from_frontmatter_returns_version_field() {
+        let content = "---\nversion: 2.3.4\n---\n# Title\n";
+        assert_eq!(parse_version_from_frontmatter(content), "2.3.4");
+    }
+
+    #[test]
+    fn parse_version_from_frontmatter_defaults_when_absent() {
+        let content = "# Title\nNo frontmatter here.";
+        assert_eq!(parse_version_from_frontmatter(content), "1.0.0");
+    }
+
+    #[test]
+    fn parse_version_from_frontmatter_defaults_when_field_missing() {
+        let content = "---\nauthor: alice\n---\n# Title\n";
+        assert_eq!(parse_version_from_frontmatter(content), "1.0.0");
+    }
+
+    #[test]
+    fn parse_version_from_frontmatter_ignores_trailing_whitespace() {
+        let content = "---\nversion:  1.2.3  \n---\n";
+        assert_eq!(parse_version_from_frontmatter(content), "1.2.3");
+    }
+
+    // ── increment_patch ───────────────────────────────────────────────────────
+
+    #[test]
+    fn increment_patch_bumps_last_component() {
+        assert_eq!(increment_patch("1.0.0"), "1.0.1");
+        assert_eq!(increment_patch("2.5.9"), "2.5.10");
+    }
+
+    #[test]
+    fn increment_patch_does_not_touch_major_or_minor() {
+        assert_eq!(increment_patch("3.7.2"), "3.7.3");
+    }
+
+    // ── update auto-increments version on content change ─────────────────────
+
+    #[test]
+    fn update_increments_patch_when_content_changes() {
+        let mut store = SkillStore::new();
+        store.create("skill-a".to_string(), "original content".to_string());
+        let id = store.list()[0].id.clone();
+        assert_eq!(store.list()[0].version, "1.0.0");
+        store.update(&id, "changed content".to_string());
+        assert_eq!(store.list()[0].version, "1.0.1");
+    }
+
+    #[test]
+    fn update_does_not_increment_when_content_unchanged() {
+        let mut store = SkillStore::new();
+        store.create("skill-b".to_string(), "same content".to_string());
+        let id = store.list()[0].id.clone();
+        store.update(&id, "same content".to_string());
+        assert_eq!(store.list()[0].version, "1.0.0");
+    }
+
+    #[test]
+    fn update_returns_none_for_unknown_id() {
+        let mut store = SkillStore::new();
+        let unknown = SkillId::new();
+        assert!(store.update(&unknown, "content".to_string()).is_none());
+    }
+
+    #[test]
+    fn create_parses_version_from_frontmatter() {
+        let mut store = SkillStore::new();
+        store.create(
+            "versioned".to_string(),
+            "---\nversion: 3.1.4\n---\n# Title\n".to_string(),
+        );
+        assert_eq!(store.list()[0].version, "3.1.4");
+    }
+
+    #[test]
+    fn create_defaults_version_when_no_frontmatter() {
+        let mut store = SkillStore::new();
+        store.create(
+            "plain".to_string(),
+            "# Plain skill\nNo frontmatter.".to_string(),
+        );
+        assert_eq!(store.list()[0].version, "1.0.0");
     }
 }
