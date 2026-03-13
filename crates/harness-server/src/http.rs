@@ -359,6 +359,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         Some(quality_trigger),
     );
 
+    let hook_enforcement = server.config.rules.hook_enforcement;
+    let events_for_hooks = events.clone();
+
     Ok(AppState {
         core: CoreServices {
             server,
@@ -402,7 +405,12 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         },
         interceptors: vec![
             Arc::new(crate::contract_validator::ContractValidator::new()),
-            Arc::new(crate::rule_enforcer::RuleEnforcer::new(rules)),
+            Arc::new(crate::rule_enforcer::RuleEnforcer::new(rules.clone())),
+            Arc::new(crate::hook_enforcer::HookEnforcer::new(
+                rules,
+                events_for_hooks,
+                hook_enforcement,
+            )),
             Arc::new(crate::post_validator::PostExecutionValidator::new(
                 validation_config,
             )),

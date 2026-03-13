@@ -1,7 +1,7 @@
 use crate::task_runner::{TaskId, TaskStatus, TaskStore};
 use harness_core::{
-    interceptor::TurnInterceptor, AgentRequest, AgentResponse, ContextItem, Decision, StreamItem,
-    ThreadId, TurnId, TurnStatus,
+    interceptor::{ToolUseEvent, TurnInterceptor},
+    AgentRequest, AgentResponse, ContextItem, Decision, StreamItem, ThreadId, TurnId, TurnStatus,
 };
 use harness_protocol::{Notification, RpcNotification};
 use std::path::Path;
@@ -74,6 +74,60 @@ pub(crate) async fn run_on_error(
 ) {
     for interceptor in interceptors {
         interceptor.on_error(req, error).await;
+    }
+}
+
+/// Call `post_tool_use` on all interceptors for the given tool-use event.
+///
+/// This is the hook injection point for file-write events in the agent pipeline.
+/// Returns the first non-empty violation feedback found, or `None` when all
+/// interceptors pass cleanly.
+pub(crate) async fn run_post_tool_use(
+    interceptors: &[Arc<dyn TurnInterceptor>],
+    event: &ToolUseEvent,
+    project_root: &Path,
+) -> Option<String> {
+    for interceptor in interceptors {
+        let result = interceptor.post_tool_use(event, project_root).await;
+        if let Some(feedback) = result.violation_feedback {
+            return Some(format!("[{}] {}", interceptor.name(), feedback));
+        }
+    }
+    None
+}
+
+/// Detect files added or modified in `project_root` via `git status --porcelain`.
+///
+/// Deleted entries are excluded. Returns an empty list when git is unavailable
+/// or `project_root` is not inside a git repository.
+pub(crate) async fn detect_modified_files(project_root: &Path) -> Vec<std::path::PathBuf> {
+    let output = tokio::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(project_root)
+        .output()
+        .await;
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.len() < 4 {
+                    return None;
+                }
+                if line[..2].contains('D') {
+                    return None;
+                }
+                Some(std::path::PathBuf::from(line[3..].trim()))
+            })
+            .collect(),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                project_root = %project_root.display(),
+                "detect_modified_files: git status unavailable"
+            );
+            Vec::new()
+        }
     }
 }
 

@@ -240,6 +240,10 @@ pub struct RulesConfig {
     /// Apply fix_pattern automatically when a violation has one. Default: false (opt-in).
     #[serde(default)]
     pub auto_fix: bool,
+    /// Enable real-time hook enforcement: scan modified files after each agent turn
+    /// and inject any violations into the next turn prompt. Default: false.
+    #[serde(default)]
+    pub hook_enforcement: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

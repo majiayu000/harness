@@ -5,8 +5,8 @@ use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
 use harness_core::{
-    config::load_project_config, prompts, AgentRequest, AgentResponse, CodeAgent, ContextItem,
-    Event, ExecutionPhase, SessionId, ThreadId, TurnId, TurnStatus,
+    config::load_project_config, interceptor::ToolUseEvent, prompts, AgentRequest, AgentResponse,
+    CodeAgent, ContextItem, Event, ExecutionPhase, SessionId, ThreadId, TurnId, TurnStatus,
 };
 use harness_protocol::{Notification, RpcNotification};
 use std::path::{Path, PathBuf};
@@ -15,9 +15,9 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 
 pub(crate) use helpers::{
-    collect_context_items, emit_runtime_notification, mark_turn_failed, persist_runtime_thread,
-    process_stream_item, run_on_error, run_post_execute, run_pre_execute,
-    truncate_validation_error, update_status,
+    collect_context_items, detect_modified_files, emit_runtime_notification, mark_turn_failed,
+    persist_runtime_thread, process_stream_item, run_on_error, run_post_execute, run_post_tool_use,
+    run_pre_execute, truncate_validation_error, update_status,
 };
 pub(crate) use pr_detection::{
     build_fix_ci_prompt, build_pr_approved_prompt, build_pr_rework_prompt,
@@ -255,7 +255,23 @@ pub(crate) async fn run_task(
         let raw = tokio::time::timeout(turn_timeout, agent.execute(impl_req.clone())).await;
         match raw {
             Ok(Ok(r)) => {
-                if let Some(err) = run_post_execute(&interceptors, &impl_req, &r).await {
+                // PreToolUse / PostToolUse hook injection point:
+                // detect files written during this turn and fire post_tool_use hooks.
+                let hook_err = {
+                    let modified = detect_modified_files(&project).await;
+                    if modified.is_empty() {
+                        None
+                    } else {
+                        let hook_event = ToolUseEvent {
+                            tool_name: "file_write".to_string(),
+                            affected_files: modified,
+                        };
+                        run_post_tool_use(&interceptors, &hook_event, &project).await
+                    }
+                };
+                let post_err = run_post_execute(&interceptors, &impl_req, &r).await;
+                let combined_err = hook_err.or(post_err);
+                if let Some(err) = combined_err {
                     if validation_attempt < max_validation_retries {
                         validation_attempt += 1;
                         let backoff_ms = compute_backoff_ms(
