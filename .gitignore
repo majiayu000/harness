@@ -4,3 +4,4 @@ exec-plan-*.md
 !.harness/guards
 crates/*/.harness/
 **/.harness/drafts/
+.claude/
