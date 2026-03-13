@@ -107,8 +107,8 @@ impl SkillStore {
                             .trim_start_matches('#')
                             .trim()
                             .to_string(),
+                        trigger_patterns: parse_trigger_patterns(&content),
                         content,
-                        trigger_patterns: Vec::new(),
                         version: "1.0.0".to_string(),
                         author: "system".to_string(),
                         location,
@@ -117,6 +117,22 @@ impl SkillStore {
             }
         }
         Ok(())
+    }
+
+    /// Match skills whose trigger patterns appear in the given prompt text.
+    /// Skills with no trigger patterns are not returned.
+    pub fn match_prompt(&self, prompt: &str) -> Vec<&Skill> {
+        let prompt_lower = prompt.to_lowercase();
+        self.skills
+            .iter()
+            .filter(|skill| {
+                !skill.trigger_patterns.is_empty()
+                    && skill
+                        .trigger_patterns
+                        .iter()
+                        .any(|p| prompt_lower.contains(&p.to_lowercase()))
+            })
+            .collect()
     }
 
     /// Match skills to current context (file patterns, language, etc.).
@@ -170,12 +186,13 @@ impl SkillStore {
     }
 
     pub fn create(&mut self, name: String, content: String) -> &Skill {
+        let trigger_patterns = parse_trigger_patterns(&content);
         let skill = Skill {
             id: SkillId::new(),
             name,
             description: content.lines().next().unwrap_or("").to_string(),
             content,
-            trigger_patterns: Vec::new(),
+            trigger_patterns,
             version: "1.0.0".to_string(),
             author: "user".to_string(),
             location: SkillLocation::User,
@@ -274,7 +291,7 @@ impl SkillStore {
                         .trim()
                         .to_string(),
                     content: content.to_string(),
-                    trigger_patterns: vec![],
+                    trigger_patterns: parse_trigger_patterns(content),
                     version: "1.0".to_string(),
                     author: "system".to_string(),
                     location: SkillLocation::System,
@@ -288,6 +305,29 @@ impl Default for SkillStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Parse trigger patterns from a skill's markdown content.
+///
+/// Looks for an HTML comment of the form:
+/// `<!-- trigger-patterns: pattern one, pattern two -->`
+///
+/// Patterns are comma-separated, trimmed, and lowercased at match time.
+fn parse_trigger_patterns(content: &str) -> Vec<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(inner) = trimmed
+            .strip_prefix("<!-- trigger-patterns:")
+            .and_then(|s| s.strip_suffix("-->"))
+        {
+            return inner
+                .split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 fn location_priority(loc: SkillLocation) -> u8 {
@@ -468,5 +508,97 @@ mod tests {
     fn get_by_name_returns_none_for_missing() {
         let store = SkillStore::new();
         assert!(store.get_by_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn load_builtin_skills_have_trigger_patterns() {
+        let mut store = SkillStore::new();
+        store.load_builtin();
+        for skill in store.list() {
+            assert!(
+                !skill.trigger_patterns.is_empty(),
+                "builtin skill \'{}\' should have trigger patterns parsed from content",
+                skill.name
+            );
+        }
+    }
+
+    #[test]
+    fn create_parses_trigger_patterns_from_content() {
+        let mut store = SkillStore::new();
+        store.create(
+            "my-skill".to_string(),
+            "# My Skill\n<!-- trigger-patterns: my keyword, another pattern -->\nContent."
+                .to_string(),
+        );
+        assert_eq!(
+            store.list()[0].trigger_patterns,
+            vec!["my keyword", "another pattern"]
+        );
+    }
+
+    #[test]
+    fn match_prompt_returns_matching_skills() {
+        let mut store = SkillStore::new();
+        store.skills.push(Skill {
+            id: SkillId::new(),
+            name: "review".to_string(),
+            description: "review code".to_string(),
+            content: String::new(),
+            trigger_patterns: vec!["code review".to_string(), "review pr".to_string()],
+            version: "1.0.0".to_string(),
+            author: "system".to_string(),
+            location: SkillLocation::System,
+        });
+        let matches = store.match_prompt("please do a code review of this PR");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "review");
+    }
+
+    #[test]
+    fn match_prompt_is_case_insensitive() {
+        let mut store = SkillStore::new();
+        store.skills.push(Skill {
+            id: SkillId::new(),
+            name: "build-fix".to_string(),
+            description: "fix builds".to_string(),
+            content: String::new(),
+            trigger_patterns: vec!["build error".to_string()],
+            version: "1.0.0".to_string(),
+            author: "system".to_string(),
+            location: SkillLocation::System,
+        });
+        let matches = store.match_prompt("I have a BUILD ERROR in my project");
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn match_prompt_skips_skills_without_patterns() {
+        let mut store = SkillStore::new();
+        store
+            .skills
+            .push(make_skill("no-patterns", SkillLocation::System));
+        let matches = store.match_prompt("any prompt with no-patterns keywords");
+        assert!(
+            matches.is_empty(),
+            "skills without patterns should not be returned"
+        );
+    }
+
+    #[test]
+    fn match_prompt_returns_empty_when_no_match() {
+        let mut store = SkillStore::new();
+        store.skills.push(Skill {
+            id: SkillId::new(),
+            name: "review".to_string(),
+            description: "review code".to_string(),
+            content: String::new(),
+            trigger_patterns: vec!["code review".to_string()],
+            version: "1.0.0".to_string(),
+            author: "system".to_string(),
+            location: SkillLocation::System,
+        });
+        let matches = store.match_prompt("implement feature X");
+        assert!(matches.is_empty());
     }
 }

@@ -400,8 +400,12 @@ where
                     let project_config = harness_core::config::load_project_config(&project_root);
                     let base_branch = project_config.git.base_branch.clone();
 
-                    let context_items =
-                        crate::task_executor::collect_context_items(&skills, &project_root).await;
+                    let context_items = crate::task_executor::collect_context_items(
+                        &skills,
+                        &project_root,
+                        req.prompt.as_deref().unwrap_or_default(),
+                    )
+                    .await;
 
                     let turn_timeout = tokio::time::Duration::from_secs(req.turn_timeout_secs);
                     let results = crate::parallel_dispatch::run_parallel_subtasks(
@@ -622,7 +626,10 @@ mod tests {
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
 
         let mut skill_store = harness_skills::SkillStore::new();
-        skill_store.create("test-skill".to_string(), "do something useful".to_string());
+        skill_store.create(
+            "test-skill".to_string(),
+            "<!-- trigger-patterns: test task -->\ndo something useful".to_string(),
+        );
         let skills = Arc::new(RwLock::new(skill_store));
 
         let agent = CapturingAgent::new();

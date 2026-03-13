@@ -1,5 +1,7 @@
 # Interview
 
+<!-- trigger-patterns: interview, requirements, large feature, 6+ files, deeply understand -->
+
 ## Trigger
 Use before starting large features (6+ files) to deeply understand requirements, constraints, and risks.
 
