@@ -1,5 +1,6 @@
 use harness_core::{
-    Decision, Event, EventFilters, EventId, Grade, OtelConfig, SessionId, Severity, Violation,
+    AutoFixReport, Decision, Event, EventFilters, EventId, Grade, OtelConfig, SessionId, Severity,
+    Violation,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -193,6 +194,62 @@ impl EventStore {
         }
     }
 
+    /// Log all auto-fix attempts and the overall outcome from a `scan_and_fix` run.
+    ///
+    /// Emits one `auto_fix` summary event followed by one `auto_fix_attempt` event per
+    /// violation that had a fix_pattern. Uses `Decision::Pass` when all violations were
+    /// resolved, `Decision::Warn` when some residual violations remain.
+    pub fn log_auto_fix_report(
+        &self,
+        session_id: &SessionId,
+        report: &AutoFixReport,
+        project_root: &std::path::Path,
+    ) {
+        let decision = if report.residual_violations.is_empty() {
+            Decision::Pass
+        } else {
+            Decision::Warn
+        };
+        let mut summary = Event::new(session_id.clone(), "auto_fix", "RuleEngine", decision);
+        summary.reason = Some(format!(
+            "applied={} residual={}",
+            report.fixed_count,
+            report.residual_violations.len()
+        ));
+        summary.detail = Some(project_root.display().to_string());
+        if let Err(e) = self.log(&summary) {
+            tracing::warn!("failed to log auto_fix event: {e}");
+        }
+
+        for attempt in &report.attempts {
+            let attempt_decision = if attempt.resolved {
+                Decision::Pass
+            } else if attempt.applied {
+                Decision::Warn
+            } else {
+                Decision::Block
+            };
+            let mut evt = Event::new(
+                session_id.clone(),
+                "auto_fix_attempt",
+                attempt.rule_id.as_str(),
+                attempt_decision,
+            );
+            evt.reason = Some(format!(
+                "applied={} resolved={}",
+                attempt.applied, attempt.resolved
+            ));
+            evt.detail = Some(if let Some(line) = attempt.line {
+                format!("{}:{line}", attempt.file.display())
+            } else {
+                attempt.file.display().to_string()
+            });
+            if let Err(e) = self.log(&evt) {
+                tracing::warn!("failed to log auto_fix_attempt event: {e}");
+            }
+        }
+    }
+
     pub fn query_recent(&self, duration: std::time::Duration) -> anyhow::Result<Vec<Event>> {
         let since = chrono::Utc::now() - chrono::Duration::from_std(duration)?;
         self.query(&EventFilters {
@@ -239,7 +296,10 @@ impl EventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Decision, Event, EventFilters, OtelExporter, RuleId, SessionId};
+    use harness_core::{
+        AutoFixAttempt, AutoFixReport, Decision, Event, EventFilters, OtelExporter, RuleId,
+        SessionId,
+    };
     use std::path::Path;
 
     fn make_event(hook: &str, decision: Decision) -> Event {
@@ -443,6 +503,96 @@ mod tests {
         })?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].detail.as_deref(), Some("/tmp/my-project"));
+        Ok(())
+    }
+
+    #[test]
+    fn log_auto_fix_report_emits_summary_and_attempt_events() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        let session_id = SessionId::new();
+
+        let report = AutoFixReport {
+            attempts: vec![
+                AutoFixAttempt {
+                    rule_id: RuleId::from_str("FIX-01"),
+                    file: std::path::PathBuf::from("src/main.rs"),
+                    line: Some(5),
+                    applied: true,
+                    resolved: true,
+                },
+                AutoFixAttempt {
+                    rule_id: RuleId::from_str("FIX-02"),
+                    file: std::path::PathBuf::from("src/lib.rs"),
+                    line: None,
+                    applied: false,
+                    resolved: false,
+                },
+            ],
+            fixed_count: 1,
+            residual_violations: vec![],
+        };
+
+        store.log_auto_fix_report(&session_id, &report, Path::new("/tmp/project"));
+
+        let all_events = store.query(&EventFilters {
+            session_id: Some(session_id.clone()),
+            ..Default::default()
+        })?;
+        // 1 summary + 2 attempts = 3 events
+        assert_eq!(all_events.len(), 3);
+
+        let summary: Vec<_> = all_events.iter().filter(|e| e.hook == "auto_fix").collect();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].decision, Decision::Pass, "no residual = Pass");
+        assert_eq!(summary[0].detail.as_deref(), Some("/tmp/project"));
+
+        let attempts: Vec<_> = all_events
+            .iter()
+            .filter(|e| e.hook == "auto_fix_attempt")
+            .collect();
+        assert_eq!(attempts.len(), 2);
+
+        let resolved_evt = attempts
+            .iter()
+            .find(|e| e.tool == "FIX-01")
+            .ok_or_else(|| anyhow::anyhow!("FIX-01 attempt event not found"))?;
+        assert_eq!(resolved_evt.decision, Decision::Pass);
+
+        let unresolved_evt = attempts
+            .iter()
+            .find(|e| e.tool == "FIX-02")
+            .ok_or_else(|| anyhow::anyhow!("FIX-02 attempt event not found"))?;
+        assert_eq!(unresolved_evt.decision, Decision::Block);
+        Ok(())
+    }
+
+    #[test]
+    fn log_auto_fix_report_summary_warns_when_residual_violations_remain() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path())?;
+        let session_id = SessionId::new();
+
+        let report = AutoFixReport {
+            attempts: vec![],
+            fixed_count: 0,
+            residual_violations: vec![Violation {
+                rule_id: RuleId::from_str("R-01"),
+                file: std::path::PathBuf::from("src/main.rs"),
+                line: None,
+                message: "still broken".to_string(),
+                severity: Severity::High,
+            }],
+        };
+
+        store.log_auto_fix_report(&session_id, &report, Path::new("/tmp/project"));
+
+        let events = store.query(&EventFilters {
+            hook: Some("auto_fix".to_string()),
+            ..Default::default()
+        })?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].decision, Decision::Warn);
         Ok(())
     }
 

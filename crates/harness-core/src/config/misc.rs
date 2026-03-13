@@ -228,6 +228,9 @@ pub struct RulesConfig {
     pub exec_policy_paths: Vec<PathBuf>,
     #[serde(default)]
     pub requirements_path: Option<PathBuf>,
+    /// Apply fix_pattern automatically when a violation has one. Default: false (opt-in).
+    #[serde(default)]
+    pub auto_fix: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
