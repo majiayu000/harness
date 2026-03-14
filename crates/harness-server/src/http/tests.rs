@@ -89,6 +89,7 @@ async fn make_test_state_with(
             thread_db: Some(thread_db),
             plan_db: None,
             plans: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            project_registry: None,
         },
         engines: crate::http::EngineServices {
             skills: Arc::new(tokio::sync::RwLock::new(harness_skills::SkillStore::new())),

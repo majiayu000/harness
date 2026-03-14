@@ -66,6 +66,7 @@ pub struct CoreServices {
     pub plan_db: Option<crate::plan_db::PlanDb>,
     pub plans:
         Arc<RwLock<std::collections::HashMap<harness_core::ExecPlanId, harness_exec::ExecPlan>>>,
+    pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
 }
 
 /// Engine services: skills, rules, and garbage collection.
@@ -252,6 +253,26 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let thread_db_path = dir.join("threads.db");
     let thread_db = crate::thread_db::ThreadDb::open(&thread_db_path).await?;
     let plan_db = crate::plan_db::PlanDb::open(&dir.join("plans.db")).await?;
+
+    let project_registry =
+        crate::project_registry::ProjectRegistry::open(&dir.join("projects.db")).await?;
+    // Auto-register the default project from --project-root on startup.
+    let default_project = crate::project_registry::Project {
+        id: "default".to_string(),
+        root: project_root.clone(),
+        max_concurrent: None,
+        default_agent: None,
+        active: true,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Err(e) = project_registry.register(default_project).await {
+        tracing::warn!("failed to auto-register default project: {e}");
+    } else {
+        tracing::info!(
+            project_root = %project_root.display(),
+            "project registry: default project registered"
+        );
+    }
     let plans_md_dir = dir.join("plans");
     match plan_db.migrate_from_markdown_dir(&plans_md_dir).await {
         Ok(0) => {}
@@ -384,6 +405,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                 Arc::new(RwLock::new(map))
             },
             plan_db: Some(plan_db),
+            project_registry: Some(project_registry),
         },
         engines: EngineServices {
             skills: Arc::new(RwLock::new(skill_store)),
@@ -670,6 +692,16 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .route("/tasks", get(list_tasks))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/stream", get(stream_task_sse))
+        .route(
+            "/projects",
+            post(crate::handlers::projects::register_project)
+                .get(crate::handlers::projects::list_projects),
+        )
+        .route(
+            "/projects/{id}",
+            get(crate::handlers::projects::get_project)
+                .delete(crate::handlers::projects::delete_project),
+        )
         .route("/api/intake", get(intake_status))
         .route(
             "/webhook",
