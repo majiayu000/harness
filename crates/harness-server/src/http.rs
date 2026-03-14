@@ -256,22 +256,34 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     let project_registry =
         crate::project_registry::ProjectRegistry::open(&dir.join("projects.db")).await?;
-    // Auto-register the default project from --project-root on startup.
-    let default_project = crate::project_registry::Project {
-        id: "default".to_string(),
-        root: project_root.clone(),
-        max_concurrent: None,
-        default_agent: None,
-        active: true,
-        created_at: chrono::Utc::now().to_rfc3339(),
-    };
-    if let Err(e) = project_registry.register(default_project).await {
-        tracing::warn!("failed to auto-register default project: {e}");
-    } else {
-        tracing::info!(
-            project_root = %project_root.display(),
-            "project registry: default project registered"
-        );
+    // Auto-register the default project from --project-root on startup, but only if it has not
+    // been registered before. Skipping the upsert preserves any user-updated settings
+    // (max_concurrent, default_agent) that were persisted from a previous run.
+    match project_registry.get("default").await {
+        Ok(Some(_)) => {
+            tracing::debug!("project registry: default project already registered, skipping");
+        }
+        Ok(None) => {
+            let default_project = crate::project_registry::Project {
+                id: "default".to_string(),
+                root: project_root.clone(),
+                max_concurrent: None,
+                default_agent: None,
+                active: true,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(e) = project_registry.register(default_project).await {
+                tracing::warn!("failed to auto-register default project: {e}");
+            } else {
+                tracing::info!(
+                    project_root = %project_root.display(),
+                    "project registry: default project registered"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!("failed to check default project registration: {e}");
+        }
     }
     let plans_md_dir = dir.join("plans");
     match plan_db.migrate_from_markdown_dir(&plans_md_dir).await {

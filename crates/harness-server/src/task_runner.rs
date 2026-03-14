@@ -93,6 +93,9 @@ pub struct TaskState {
     /// Populated at runtime; not persisted (use `TaskStore::list_children` after restart).
     #[serde(default)]
     pub subtask_ids: Vec<TaskId>,
+    /// Registry project ID this task belongs to; used for per-project concurrency enforcement.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -122,6 +125,7 @@ impl TaskState {
             external_id: None,
             parent_id: None,
             subtask_ids: Vec::new(),
+            project_id: None,
         }
     }
 
@@ -174,6 +178,9 @@ pub struct CreateTaskRequest {
     /// Intake source name (e.g. "github", "feishu", "periodic_review"). None for manual tasks.
     #[serde(default)]
     pub source: Option<String>,
+    /// Registry project ID resolved at enqueue time; propagated to TaskState for concurrency tracking.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 impl Default for CreateTaskRequest {
@@ -192,6 +199,7 @@ impl Default for CreateTaskRequest {
             retry_max_backoff_ms: default_retry_max_backoff_ms(),
             stall_timeout_secs: default_stall_timeout(),
             source: None,
+            project_id: None,
         }
     }
 }

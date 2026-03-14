@@ -29,23 +29,30 @@ pub(crate) async fn enqueue_task(
         ));
     }
 
-    // Resolve project: if the supplied path does not exist as a directory,
-    // treat it as a project ID and look it up in the registry.
+    // Resolve project: if project_id is provided, look it up in the registry and use its path.
+    // `project` is strictly a filesystem path; `project_id` is the registry lookup key.
+    // These two fields are mutually exclusive — providing both is a client error.
     let mut req = req;
-    if let (Some(registry), Some(project_path)) =
-        (state.core.project_registry.as_ref(), req.project.clone())
-    {
-        if !project_path.is_dir() {
-            let id = project_path.to_string_lossy();
-            match registry.resolve_path(&id).await {
-                Ok(Some(root)) => req.project = Some(root),
-                Ok(None) => {
-                    return Err(EnqueueTaskError::BadRequest(format!(
-                        "project '{id}' not found in registry and is not a valid directory"
-                    )))
-                }
-                Err(e) => return Err(EnqueueTaskError::Internal(e.to_string())),
+    if req.project.is_some() && req.project_id.is_some() {
+        return Err(EnqueueTaskError::BadRequest(
+            "only one of `project` (filesystem path) or `project_id` (registry ID) may be set"
+                .to_string(),
+        ));
+    }
+    if let Some(id) = req.project_id.as_deref() {
+        let Some(registry) = state.core.project_registry.as_ref() else {
+            return Err(EnqueueTaskError::BadRequest(
+                "project_id provided but project registry is not initialized".to_string(),
+            ));
+        };
+        match registry.resolve_path(id).await {
+            Ok(Some(root)) => req.project = Some(root),
+            Ok(None) => {
+                return Err(EnqueueTaskError::BadRequest(format!(
+                    "project '{id}' not found in registry"
+                )))
             }
+            Err(e) => return Err(EnqueueTaskError::Internal(e.to_string())),
         }
     }
 

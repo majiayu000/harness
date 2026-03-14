@@ -1,5 +1,5 @@
 use crate::http::AppState;
-use crate::project_registry::{validate_project_root, Project};
+use crate::project_registry::Project;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -30,18 +30,20 @@ pub async fn register_project(
         );
     };
 
-    let root = match req.root.canonicalize() {
+    // Use the same strict validator as task execution: checks existence, is_dir, and within $HOME.
+    let root = match crate::handlers::validate_project_root(&req.root) {
         Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid root path: {e}")})),
-            )
-        }
+        Err(msg) => return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))),
     };
 
-    if let Err(msg) = validate_project_root(&root) {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
+    // Also require a .git entry (directory or file for worktrees).
+    if !root.join(".git").exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({"error": format!("root is not a git repository (no .git found): {}", root.display())}),
+            ),
+        );
     }
 
     let project = Project {
