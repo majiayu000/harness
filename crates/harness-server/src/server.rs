@@ -8,6 +8,8 @@ pub struct HarnessServer {
     pub config: HarnessConfig,
     pub thread_manager: ThreadManager,
     pub agent_registry: Arc<AgentRegistry>,
+    /// Extra projects to register in the project registry at startup (from --project CLI flags).
+    pub startup_projects: Vec<(String, std::path::PathBuf)>,
 }
 
 impl HarnessServer {
@@ -20,6 +22,7 @@ impl HarnessServer {
             config,
             thread_manager,
             agent_registry: Arc::new(agent_registry),
+            startup_projects: Vec::new(),
         }
     }
 

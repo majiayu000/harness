@@ -1,13 +1,27 @@
 use anyhow::Result;
 use harness_core::HarnessConfig;
+use harness_server::project_registry::validate_project_root;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Parse a `name=path` string into `(name, PathBuf)`.
+fn parse_project_entry(s: &str) -> Result<(String, PathBuf)> {
+    let (name, path) = s
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--project must be in NAME=PATH format, got: {s:?}"))?;
+    if name.is_empty() {
+        anyhow::bail!("--project name cannot be empty in: {s:?}");
+    }
+    Ok((name.to_string(), PathBuf::from(path)))
+}
 
 pub async fn run(
     config: HarnessConfig,
     transport: String,
     port: Option<u16>,
     project_root: Option<PathBuf>,
+    projects: Vec<String>,
+    default_project: Option<String>,
 ) -> Result<()> {
     // On macOS, sandbox-exec (Seatbelt) with deny-default policy causes SIGTRAP
     // in Claude Code CLI. Require danger-full-access until Seatbelt policy is
@@ -23,10 +37,45 @@ pub async fn run(
         );
     }
 
+    // Parse and validate --project name=path entries.
+    let mut parsed_projects: Vec<(String, PathBuf)> = Vec::new();
+    for raw in &projects {
+        let (name, path) = parse_project_entry(raw)?;
+        let canonical = path.canonicalize().map_err(|e| {
+            anyhow::anyhow!(
+                "--project {name}: path '{}' is not accessible: {e}",
+                path.display()
+            )
+        })?;
+        if let Err(reason) = validate_project_root(&canonical) {
+            anyhow::bail!("--project {name}: {reason}");
+        }
+        parsed_projects.push((name, canonical));
+    }
+
+    // Determine the default project id.
+    let default_project_id: Option<String> = if !parsed_projects.is_empty() {
+        Some(
+            default_project
+                .clone()
+                .unwrap_or_else(|| parsed_projects[0].0.clone()),
+        )
+    } else {
+        None
+    };
+
     let mut serve_config = config.clone();
+    // When --project entries are provided, set project_root to the default project's path
+    // so existing single-project behaviour is preserved.
+    if let Some(ref id) = default_project_id {
+        if let Some((_, path)) = parsed_projects.iter().find(|(n, _)| n == id) {
+            serve_config.server.project_root = path.clone();
+        }
+    }
     if let Some(project_root) = project_root {
         serve_config.server.project_root = project_root;
     }
+
     let thread_manager = harness_server::thread_manager::ThreadManager::new();
     let mut agent_registry = harness_agents::AgentRegistry::new(&serve_config.agents.default_agent);
     let mut claude_agent = harness_agents::claude::ClaudeCodeAgent::new(
@@ -56,11 +105,12 @@ pub async fn run(
             ),
         );
     }
-    let server = harness_server::server::HarnessServer::new(
+    let mut server = harness_server::server::HarnessServer::new(
         serve_config.clone(),
         thread_manager,
         agent_registry,
     );
+    server.startup_projects = parsed_projects;
 
     match transport.as_str() {
         "stdio" => server.serve_stdio().await?,
