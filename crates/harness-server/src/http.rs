@@ -703,6 +703,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             get(crate::handlers::projects::get_project)
                 .delete(crate::handlers::projects::delete_project),
         )
+        .route("/projects/queue-stats", get(project_queue_stats))
         .route("/api/intake", get(intake_status))
         .route(
             "/webhook",
@@ -761,6 +762,33 @@ async fn shutdown_signal() {
 async fn health_check(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let count = state.core.tasks.count();
     Json(json!({"status": "ok", "tasks": count}))
+}
+
+/// GET /projects — per-project queue stats alongside the global queue summary.
+async fn project_queue_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let tq = &state.concurrency.task_queue;
+    let projects: serde_json::Map<String, serde_json::Value> = tq
+        .all_project_stats()
+        .into_iter()
+        .map(|(id, s)| {
+            (
+                id,
+                json!({
+                    "running": s.running,
+                    "queued": s.queued,
+                    "limit": s.limit,
+                }),
+            )
+        })
+        .collect();
+    Json(json!({
+        "global": {
+            "running": tq.running_count(),
+            "queued": tq.queued_count(),
+            "limit": tq.global_limit(),
+        },
+        "projects": projects,
+    }))
 }
 
 async fn handle_rpc(State(state): State<Arc<AppState>>, Json(req): Json<RpcRequest>) -> Response {

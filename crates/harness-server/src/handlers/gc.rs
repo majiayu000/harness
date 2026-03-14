@@ -142,7 +142,8 @@ pub async fn gc_adopt(
                     &state.core.server.config.gc,
                     state.core.project_root.clone(),
                 );
-                let permit = match state.concurrency.task_queue.acquire().await {
+                let project_id = state.core.project_root.to_string_lossy().into_owned();
+                let permit = match state.concurrency.task_queue.acquire(&project_id).await {
                     Ok(p) => p,
                     Err(e) => {
                         return RpcResponse::error(

@@ -22,7 +22,7 @@ impl std::fmt::Display for EnqueueTaskError {
 
 pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
-    req: task_runner::CreateTaskRequest,
+    mut req: task_runner::CreateTaskRequest,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
     if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
         return Err(EnqueueTaskError::BadRequest(
@@ -32,7 +32,6 @@ pub(crate) async fn enqueue_task(
 
     // Resolve project: if the supplied path does not exist as a directory,
     // treat it as a project ID and look it up in the registry.
-    let mut req = req;
     if let (Some(registry), Some(project_path)) =
         (state.core.project_registry.as_ref(), req.project.clone())
     {
@@ -50,12 +49,26 @@ pub(crate) async fn enqueue_task(
         }
     }
 
+    // Resolve and canonicalize the project root BEFORE acquiring the
+    // concurrency permit so that:
+    //   (a) None is mapped to the real worktree path rather than the literal
+    //       "default" key, so per_project config for that path is respected.
+    //   (b) Symlinked / relative / differently-spelled paths are normalised
+    //       to the same canonical bucket, preventing limit bypass.
+    // Overwrite req.project with the resolved path so spawn_task does not
+    // re-detect the worktree inside the spawned future.
+    let canonical_project = task_runner::resolve_canonical_project(req.project.clone())
+        .await
+        .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+    let project_id = canonical_project.to_string_lossy().into_owned();
+    req.project = Some(canonical_project);
+
     // Acquire concurrency permit before spawning. Blocks if all slots are
     // occupied; rejects immediately if the waiting queue is full.
     let permit = state
         .concurrency
         .task_queue
-        .acquire()
+        .acquire(&project_id)
         .await
         .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
 
