@@ -55,11 +55,17 @@ pub async fn run(
 
     // Determine the default project id.
     let default_project_id: Option<String> = if !parsed_projects.is_empty() {
-        Some(
-            default_project
-                .clone()
-                .unwrap_or_else(|| parsed_projects[0].0.clone()),
-        )
+        let id = default_project
+            .clone()
+            .unwrap_or_else(|| parsed_projects[0].0.clone());
+        // Fail fast if the requested default name doesn't exist in --project entries.
+        if !parsed_projects.iter().any(|(n, _)| n == &id) {
+            let known: Vec<&str> = parsed_projects.iter().map(|(n, _)| n.as_str()).collect();
+            anyhow::bail!(
+                "--default-project {id:?} does not match any --project name; known names: {known:?}"
+            );
+        }
+        Some(id)
     } else {
         None
     };

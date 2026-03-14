@@ -273,6 +273,22 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             "project registry: default project registered"
         );
     }
+    // Register any extra named projects supplied via --project CLI flags.
+    for (name, path) in &server.startup_projects {
+        let proj = crate::project_registry::Project {
+            id: name.clone(),
+            root: path.clone(),
+            max_concurrent: None,
+            default_agent: None,
+            active: true,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Err(e) = project_registry.register(proj).await {
+            tracing::warn!(project = %name, "failed to register startup project: {e}");
+        } else {
+            tracing::info!(project = %name, root = %path.display(), "project registry: startup project registered");
+        }
+    }
     let plans_md_dir = dir.join("plans");
     match plan_db.migrate_from_markdown_dir(&plans_md_dir).await {
         Ok(0) => {}
