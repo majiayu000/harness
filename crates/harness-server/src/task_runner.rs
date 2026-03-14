@@ -869,7 +869,7 @@ mod tests {
 
         let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
         let queue = crate::task_queue::TaskQueue::unbounded();
-        let permit = queue.acquire().await.unwrap();
+        let permit = queue.acquire("test").await.unwrap();
         spawn_task(
             store,
             agent_clone,
@@ -942,7 +942,7 @@ mod tests {
         };
 
         let queue = crate::task_queue::TaskQueue::unbounded();
-        let permit = queue.acquire().await.unwrap();
+        let permit = queue.acquire("test").await.unwrap();
         let task_id = spawn_task(
             store.clone(),
             agent,
@@ -1065,7 +1065,7 @@ mod tests {
         };
 
         let queue = crate::task_queue::TaskQueue::unbounded();
-        let permit = queue.acquire().await.unwrap();
+        let permit = queue.acquire("test").await.unwrap();
         let task_id = spawn_task_with_worktree_detector(
             store.clone(),
             agent,

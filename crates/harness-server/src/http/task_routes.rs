@@ -52,10 +52,15 @@ pub(crate) async fn enqueue_task(
 
     // Acquire concurrency permit before spawning. Blocks if all slots are
     // occupied; rejects immediately if the waiting queue is full.
+    let project_id = req
+        .project
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "default".to_string());
     let permit = state
         .concurrency
         .task_queue
-        .acquire()
+        .acquire(&project_id)
         .await
         .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
 

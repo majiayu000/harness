@@ -1,5 +1,6 @@
 use crate::Grade;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::dirs::dirs_data_dir;
@@ -57,7 +58,7 @@ impl Default for WorkspaceConfig {
 /// in the queue before new submissions are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConcurrencyConfig {
-    /// Maximum number of tasks executing concurrently. Default: 4.
+    /// Maximum number of tasks executing concurrently across all projects. Default: 4.
     #[serde(default = "default_max_concurrent_tasks")]
     pub max_concurrent_tasks: usize,
     /// Maximum number of tasks waiting for a slot. Excess tasks are rejected. Default: 32.
@@ -66,6 +67,10 @@ pub struct ConcurrencyConfig {
     /// Seconds of silence from the agent stream before declaring a stall. Default: 300.
     #[serde(default = "default_stall_timeout_secs")]
     pub stall_timeout_secs: u64,
+    /// Per-project concurrency limits. Maps project path string → max concurrent tasks.
+    /// Projects not listed here use the global `max_concurrent_tasks` limit.
+    #[serde(default)]
+    pub per_project: HashMap<String, usize>,
 }
 
 fn default_max_concurrent_tasks() -> usize {
@@ -86,6 +91,7 @@ impl Default for ConcurrencyConfig {
             max_concurrent_tasks: default_max_concurrent_tasks(),
             max_queue_size: default_max_queue_size(),
             stall_timeout_secs: default_stall_timeout_secs(),
+            per_project: HashMap::new(),
         }
     }
 }
