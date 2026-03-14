@@ -1,4 +1,12 @@
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64},
+    Arc,
+};
+
+use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
+use harness_agents::AgentRegistry;
+use harness_core::HarnessConfig;
 
 /// Create a temp directory under a writable base path without mutating
 /// global state (`HOME` env var).  Tries `$HOME` first; falls back to
@@ -17,15 +25,6 @@ pub fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
         .tempdir_in(&fallback)
         .map_err(Into::into)
 }
-
-use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
-use harness_agents::AgentRegistry;
-use harness_core::HarnessConfig;
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64},
-    Arc,
-};
-use tokio::sync::RwLock;
 
 pub async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
     make_test_state_with_registry(dir, AgentRegistry::new("test")).await
@@ -61,12 +60,12 @@ pub async fn make_test_state_with_registry(
             tasks,
             thread_db: Some(thread_db),
             plan_db: None,
-            plans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            plans: Default::default(),
             project_registry: None,
         },
         engines: crate::http::EngineServices {
-            skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
-            rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
+            skills: Default::default(),
+            rules: Default::default(),
             gc_agent,
         },
         observability: crate::http::ObservabilityServices {
