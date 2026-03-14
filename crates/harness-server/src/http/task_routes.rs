@@ -30,8 +30,6 @@ pub(crate) async fn enqueue_task(
         ));
     }
 
-    // Resolve project: if the supplied path does not exist as a directory,
-    // treat it as a project ID and look it up in the registry.
     if let (Some(registry), Some(project_path)) =
         (state.core.project_registry.as_ref(), req.project.clone())
     {
@@ -49,19 +47,19 @@ pub(crate) async fn enqueue_task(
         }
     }
 
-    // Resolve and canonicalize the project root BEFORE acquiring the
-    // concurrency permit so that:
-    //   (a) None is mapped to the real worktree path rather than the literal
-    //       "default" key, so per_project config for that path is respected.
-    //   (b) Symlinked / relative / differently-spelled paths are normalised
-    //       to the same canonical bucket, preventing limit bypass.
-    // Overwrite req.project with the resolved path so spawn_task does not
-    // re-detect the worktree inside the spawned future.
     let canonical_project = task_runner::resolve_canonical_project(req.project.clone())
         .await
         .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
     let project_id = canonical_project.to_string_lossy().into_owned();
-    req.project = Some(canonical_project);
+    req.project = Some(canonical_project.clone());
+
+    // Validate project root BEFORE acquiring a queue slot to prevent unbounded
+    // DashMap growth from invalid, nonexistent, or out-of-HOME project paths.
+    // Without this check, an attacker could exhaust memory by submitting tasks
+    // with unique random project paths that each create a DashMap entry but
+    // fail validation only after the slot is acquired.
+    crate::handlers::validate_project_root(&canonical_project)
+        .map_err(|e| EnqueueTaskError::BadRequest(e.to_string()))?;
 
     // Acquire concurrency permit before spawning. Blocks if all slots are
     // occupied; rejects immediately if the waiting queue is full.
@@ -157,7 +155,6 @@ pub(super) async fn create_tasks_batch(
         );
     }
 
-    // Build the list of per-task CreateTaskRequests.
     let mut task_requests: Vec<task_runner::CreateTaskRequest> = Vec::new();
 
     if let Some(issues) = req.issues {
@@ -191,7 +188,6 @@ pub(super) async fn create_tasks_batch(
         }
     }
 
-    // Enqueue each task; collect results (task_id or error per entry).
     let mut results = Vec::with_capacity(task_requests.len());
     for task_req in task_requests {
         let entry = match enqueue_task(&state, task_req).await {
