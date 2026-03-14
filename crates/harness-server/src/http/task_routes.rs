@@ -143,6 +143,93 @@ pub struct BatchCreateTaskRequest {
     pub turn_timeout_secs: Option<u64>,
 }
 
+/// Enqueues a task for background execution, returning its ID immediately.
+///
+/// Unlike `enqueue_task`, this function never blocks on concurrency permit
+/// acquisition. The task is registered with Pending status right away, and a
+/// background tokio task waits for a slot and then begins execution. This
+/// keeps the `/tasks/batch` HTTP handler responsive even when all concurrency
+/// slots are occupied.
+async fn enqueue_task_background(
+    state: Arc<AppState>,
+    req: task_runner::CreateTaskRequest,
+) -> Result<task_runner::TaskId, EnqueueTaskError> {
+    if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
+        return Err(EnqueueTaskError::BadRequest(
+            "at least one of prompt, issue, or pr must be provided".to_string(),
+        ));
+    }
+
+    // Resolve agent up-front (fast, no I/O) so we can return an error immediately
+    // if the agent name is invalid, before registering the task.
+    let agent =
+        if let Some(name) = &req.agent {
+            state.core.server.agent_registry.get(name).ok_or_else(|| {
+                EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
+            })?
+        } else {
+            let classification = crate::complexity_router::classify(
+                req.prompt.as_deref().unwrap_or_default(),
+                req.issue,
+                req.pr,
+            );
+            state
+                .core
+                .server
+                .agent_registry
+                .dispatch(&classification)
+                .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?
+        };
+
+    let (reviewer, review_config) = resolve_reviewer(
+        &state.core.server.agent_registry,
+        &state.core.server.config.agents.review,
+        agent.name(),
+    );
+
+    // Register the task immediately so the caller gets an ID without blocking.
+    let task_id =
+        task_runner::register_pending_task(state.core.tasks.clone(), req.source.clone()).await;
+
+    // Spawn a background tokio task that waits for a concurrency slot then executes.
+    // The HTTP handler returns the task_id before this future completes.
+    {
+        let task_id2 = task_id.clone();
+        tokio::spawn(async move {
+            match state.concurrency.task_queue.acquire().await {
+                Ok(permit) => {
+                    task_runner::spawn_preregistered_task(
+                        task_id2,
+                        state.core.tasks.clone(),
+                        agent,
+                        reviewer,
+                        review_config,
+                        state.engines.skills.clone(),
+                        state.observability.events.clone(),
+                        state.interceptors.clone(),
+                        req,
+                        state.concurrency.workspace_mgr.clone(),
+                        permit,
+                        state.completion_callback.clone(),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    // Queue is full; mark the pre-registered task as failed.
+                    task_runner::mutate_and_persist(&state.core.tasks, &task_id2, |s| {
+                        s.status = task_runner::TaskStatus::Failed;
+                        s.error = Some(format!("task queue full: {e}"));
+                    })
+                    .await;
+                    state.core.tasks.close_task_stream(&task_id2);
+                }
+            }
+        });
+    }
+
+    Ok(task_id)
+}
+
 pub(super) async fn create_tasks_batch(
     State(state): State<Arc<AppState>>,
     Json(req): Json<BatchCreateTaskRequest>,
@@ -191,11 +278,13 @@ pub(super) async fn create_tasks_batch(
         }
     }
 
-    // Enqueue each task; collect results (task_id or error per entry).
+    // Register each task without blocking on concurrency permit acquisition.
+    // Each task gets an ID immediately; a background tokio task handles permit
+    // waiting and execution. The HTTP handler returns as soon as all tasks are registered.
     let mut results = Vec::with_capacity(task_requests.len());
     for task_req in task_requests {
-        let entry = match enqueue_task(&state, task_req).await {
-            Ok(task_id) => json!({ "task_id": task_id.0, "status": "running" }),
+        let entry = match enqueue_task_background(state.clone(), task_req).await {
+            Ok(task_id) => json!({ "task_id": task_id.0, "status": "queued" }),
             Err(EnqueueTaskError::BadRequest(error)) => json!({ "error": error }),
             Err(EnqueueTaskError::Internal(error)) => json!({ "error": error }),
         };

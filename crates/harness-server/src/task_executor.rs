@@ -280,7 +280,7 @@ pub(crate) async fn run_task(
     let git = Some(&project_config.git);
 
     let first_prompt = if let Some(issue) = req.issue {
-        match find_existing_pr_for_issue(&project, issue).await {
+        let base = match find_existing_pr_for_issue(&project, issue).await {
             Ok(Some((pr_num, branch))) => {
                 tracing::info!(
                     "reusing existing PR #{pr_num} on branch `{branch}` for issue #{issue}"
@@ -292,6 +292,17 @@ pub(crate) async fn run_task(
                 tracing::warn!("failed to check for existing PR for issue #{issue}: {e}");
                 prompts::implement_from_issue(issue, git)
             }
+        };
+        // If the caller also supplied a description alongside the issue number, include it
+        // as additional context. Without this, batch tasks that set both `description` and
+        // `issue` would silently discard the description.
+        if let Some(hint) = req.prompt.as_deref().filter(|s| !s.is_empty()) {
+            format!(
+                "{base}\n\nAdditional context from caller:\n{}",
+                prompts::wrap_external_data(hint)
+            )
+        } else {
+            base
         }
     } else if let Some(pr) = req.pr {
         prompts::check_existing_pr(pr, &review_config.review_bot_command)
