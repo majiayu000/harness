@@ -29,6 +29,26 @@ pub(crate) async fn enqueue_task(
         ));
     }
 
+    // Resolve project: if the supplied path does not exist as a directory,
+    // treat it as a project ID and look it up in the registry.
+    let mut req = req;
+    if let (Some(registry), Some(project_path)) =
+        (state.core.project_registry.as_ref(), req.project.clone())
+    {
+        if !project_path.is_dir() {
+            let id = project_path.to_string_lossy();
+            match registry.resolve_path(&id).await {
+                Ok(Some(root)) => req.project = Some(root),
+                Ok(None) => {
+                    return Err(EnqueueTaskError::BadRequest(format!(
+                        "project '{id}' not found in registry and is not a valid directory"
+                    )))
+                }
+                Err(e) => return Err(EnqueueTaskError::Internal(e.to_string())),
+            }
+        }
+    }
+
     // Acquire concurrency permit before spawning. Blocks if all slots are
     // occupied; rejects immediately if the waiting queue is full.
     let permit = state
