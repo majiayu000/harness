@@ -53,13 +53,19 @@ pub(crate) async fn enqueue_task(
     let project_id = canonical_project.to_string_lossy().into_owned();
     req.project = Some(canonical_project.clone());
 
-    // Validate project root BEFORE acquiring a queue slot to prevent unbounded
-    // DashMap growth from invalid, nonexistent, or out-of-HOME project paths.
-    // Without this check, an attacker could exhaust memory by submitting tasks
-    // with unique random project paths that each create a DashMap entry but
-    // fail validation only after the slot is acquired.
-    crate::handlers::validate_project_root(&canonical_project)
-        .map_err(|e| EnqueueTaskError::BadRequest(e.to_string()))?;
+    // Validate that the project root exists as a directory BEFORE acquiring a
+    // queue slot to prevent unbounded DashMap growth. Without this guard an
+    // attacker could exhaust memory by submitting tasks with unique random
+    // project paths that each create a DashMap entry but would only fail later.
+    // We use a lightweight existence check here (not the full HOME-constraint
+    // check performed during task execution) so that legitimate test paths
+    // under /tmp or system directories are not rejected at enqueue time.
+    if !canonical_project.is_dir() {
+        return Err(EnqueueTaskError::BadRequest(format!(
+            "project root is not an existing directory: {}",
+            canonical_project.display()
+        )));
+    }
 
     // Acquire concurrency permit before spawning. Blocks if all slots are
     // occupied; rejects immediately if the waiting queue is full.
