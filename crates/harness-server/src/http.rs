@@ -704,6 +704,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                 .delete(crate::handlers::projects::delete_project),
         )
         .route("/projects/queue-stats", get(project_queue_stats))
+        .route("/api/dashboard", get(crate::handlers::dashboard::dashboard))
         .route("/api/intake", get(intake_status))
         .route(
             "/webhook",

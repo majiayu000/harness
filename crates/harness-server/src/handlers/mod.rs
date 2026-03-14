@@ -1,5 +1,6 @@
 pub mod classify;
 pub mod cross_review;
+pub mod dashboard;
 pub mod exec;
 pub mod gc;
 pub mod health;
