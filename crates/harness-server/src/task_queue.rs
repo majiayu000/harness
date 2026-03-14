@@ -44,6 +44,10 @@ pub struct TaskQueue {
     project_limits: DashMap<String, usize>,
     /// Per-project count of tasks waiting for a project-level slot.
     project_queued: DashMap<String, Arc<AtomicUsize>>,
+    /// Per-project count of tasks that hold the project slot but are still
+    /// waiting for the global slot. These are "queued" not "running" from an
+    /// observability standpoint — they haven't started executing yet.
+    project_awaiting_global: DashMap<String, Arc<AtomicUsize>>,
 }
 
 impl TaskQueue {
@@ -61,6 +65,7 @@ impl TaskQueue {
             project_semaphores: DashMap::new(),
             project_limits,
             project_queued: DashMap::new(),
+            project_awaiting_global: DashMap::new(),
         }
     }
 
@@ -83,6 +88,13 @@ impl TaskQueue {
 
     fn get_or_create_project_queued(&self, project_id: &str) -> Arc<AtomicUsize> {
         self.project_queued
+            .entry(project_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone()
+    }
+
+    fn get_or_create_project_awaiting_global(&self, project_id: &str) -> Arc<AtomicUsize> {
+        self.project_awaiting_global
             .entry(project_id.to_string())
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone()
@@ -122,16 +134,23 @@ impl TaskQueue {
                 return Err(anyhow::anyhow!("project task queue closed"));
             }
         };
+        // Project slot acquired; transition from "waiting for project" to
+        // "waiting for global". Keep this task counted as queued (not running)
+        // until it also holds the global slot.
         project_queued_counter.fetch_sub(1, Ordering::SeqCst);
+        let project_awaiting_counter = self.get_or_create_project_awaiting_global(project_id);
+        project_awaiting_counter.fetch_add(1, Ordering::SeqCst);
 
         // Then acquire the global slot.
         let global_permit = match self.global_semaphore.clone().acquire_owned().await {
             Ok(p) => p,
             Err(_) => {
                 self.queued_count.fetch_sub(1, Ordering::SeqCst);
+                project_awaiting_counter.fetch_sub(1, Ordering::SeqCst);
                 return Err(anyhow::anyhow!("task queue closed"));
             }
         };
+        project_awaiting_counter.fetch_sub(1, Ordering::SeqCst);
         self.queued_count.fetch_sub(1, Ordering::SeqCst);
 
         Ok(TaskPermit {
@@ -160,12 +179,23 @@ impl TaskQueue {
     pub fn project_stats(&self, project_id: &str) -> QueueStats {
         let limit = self.project_limit(project_id);
         if let Some(sem) = self.project_semaphores.get(project_id) {
-            let running = limit.saturating_sub(sem.available_permits());
+            // Tasks that hold the project semaphore but haven't yet acquired
+            // the global semaphore are still waiting — count them as queued,
+            // not running. "running" means the task holds BOTH permits and is
+            // actively executing.
+            let awaiting_global = self
+                .project_awaiting_global
+                .get(project_id)
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let holding_project = limit.saturating_sub(sem.available_permits());
+            let running = holding_project.saturating_sub(awaiting_global);
             let queued = self
                 .project_queued
                 .get(project_id)
                 .map(|c| c.load(Ordering::Relaxed))
-                .unwrap_or(0);
+                .unwrap_or(0)
+                + awaiting_global;
             QueueStats {
                 running,
                 queued,
