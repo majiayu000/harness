@@ -428,8 +428,56 @@ pub async fn spawn_task(
         workspace_mgr,
         permit,
         completion_callback,
+        None,
     )
     .await
+}
+
+/// Register a task with Pending status and return its ID immediately, without waiting
+/// for a concurrency permit. Pair with `spawn_preregistered_task` (called from a
+/// background tokio task after `task_queue.acquire()`) to begin execution.
+pub async fn register_pending_task(store: Arc<TaskStore>, source: Option<String>) -> TaskId {
+    let task_id = TaskId::new();
+    let mut state = TaskState::new(task_id.clone());
+    state.source = source;
+    store.insert(&state).await;
+    // Register stream channel now so SSE clients can subscribe before execution begins.
+    store.register_task_stream(&task_id);
+    task_id
+}
+
+/// Begin execution for a task pre-registered via `register_pending_task`.
+/// The caller must have already acquired a concurrency permit; it is held for the task's lifetime.
+pub async fn spawn_preregistered_task(
+    task_id: TaskId,
+    store: Arc<TaskStore>,
+    agent: Arc<dyn CodeAgent>,
+    reviewer: Option<Arc<dyn CodeAgent>>,
+    review_config: harness_core::AgentReviewConfig,
+    skills: Arc<RwLock<harness_skills::SkillStore>>,
+    events: Arc<harness_observe::EventStore>,
+    interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
+    req: CreateTaskRequest,
+    workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
+    permit: crate::task_queue::TaskPermit,
+    completion_callback: Option<CompletionCallback>,
+) {
+    spawn_task_with_worktree_detector(
+        store,
+        agent,
+        reviewer,
+        review_config,
+        skills,
+        events,
+        interceptors,
+        req,
+        detect_main_worktree,
+        workspace_mgr,
+        permit,
+        completion_callback,
+        Some(task_id),
+    )
+    .await;
 }
 
 async fn spawn_task_with_worktree_detector<F>(
@@ -445,16 +493,24 @@ async fn spawn_task_with_worktree_detector<F>(
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
+    preregistered_id: Option<TaskId>,
 ) -> TaskId
 where
     F: Fn() -> PathBuf + Send + Sync + 'static,
 {
-    let task_id = TaskId::new();
-    let mut state = TaskState::new(task_id.clone());
-    state.source = req.source.clone();
-    store.insert(&state).await;
-    // Register stream channel before spawning so SSE clients can subscribe immediately.
-    store.register_task_stream(&task_id);
+    let task_id = if let Some(id) = preregistered_id {
+        // Task was pre-registered (e.g. by register_pending_task for batch submission);
+        // store.insert and register_task_stream were already called.
+        id
+    } else {
+        let task_id = TaskId::new();
+        let mut state = TaskState::new(task_id.clone());
+        state.source = req.source.clone();
+        store.insert(&state).await;
+        // Register stream channel before spawning so SSE clients can subscribe immediately.
+        store.register_task_stream(&task_id);
+        task_id
+    };
 
     let id = task_id.clone();
     let store_watcher = store.clone();
@@ -1080,6 +1136,7 @@ mod tests {
             },
             None,
             permit,
+            None,
             None,
         )
         .await;
