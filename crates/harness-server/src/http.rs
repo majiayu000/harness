@@ -690,6 +690,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .route("/ws", get(crate::websocket::ws_handler))
         .route("/tasks", post(task_routes::create_task))
         .route("/tasks", get(list_tasks))
+        .route("/tasks/batch", post(task_routes::create_tasks_batch))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/stream", get(stream_task_sse))
         .route(
