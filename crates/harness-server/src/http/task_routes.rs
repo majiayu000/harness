@@ -114,8 +114,8 @@ pub(super) async fn create_tasks_batch(
     State(state): State<Arc<AppState>>,
     Json(req): Json<BatchCreateTaskRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let has_issues = req.issues.as_ref().map_or(false, |v| !v.is_empty());
-    let has_tasks = req.tasks.as_ref().map_or(false, |v| !v.is_empty());
+    let has_issues = req.issues.as_ref().is_some_and(|v| !v.is_empty());
+    let has_tasks = req.tasks.as_ref().is_some_and(|v| !v.is_empty());
 
     if !has_issues && !has_tasks {
         return (
@@ -235,7 +235,7 @@ mod tests {
     fn batch_request_empty_issues_list() {
         let json = r#"{"issues": []}"#;
         let req: BatchCreateTaskRequest = serde_json::from_str(json).unwrap();
-        let has_issues = req.issues.as_ref().map_or(false, |v| !v.is_empty());
+        let has_issues = req.issues.as_ref().is_some_and(|v| !v.is_empty());
         assert!(!has_issues);
     }
 
@@ -243,8 +243,8 @@ mod tests {
     fn batch_request_neither_issues_nor_tasks() {
         let json = r#"{"agent": "claude"}"#;
         let req: BatchCreateTaskRequest = serde_json::from_str(json).unwrap();
-        let has_issues = req.issues.as_ref().map_or(false, |v| !v.is_empty());
-        let has_tasks = req.tasks.as_ref().map_or(false, |v| !v.is_empty());
+        let has_issues = req.issues.as_ref().is_some_and(|v| !v.is_empty());
+        let has_tasks = req.tasks.as_ref().is_some_and(|v| !v.is_empty());
         assert!(!has_issues && !has_tasks);
     }
 }
