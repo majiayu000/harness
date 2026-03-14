@@ -111,6 +111,17 @@ impl TaskDb {
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 
+    /// Return the `pr_url` of the most recently created Done task that has one, or `None`.
+    pub async fn latest_done_pr_url(&self) -> anyhow::Result<Option<String>> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT pr_url FROM tasks WHERE status = 'done' AND pr_url IS NOT NULL \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(pr_url,)| pr_url))
+    }
+
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(

@@ -10,33 +10,31 @@ static SERVER_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLo
 
 /// GET /api/dashboard — JSON summary of all registered projects and global concurrency.
 ///
-/// Returns per-project task counts (running/queued from the live task queue;
-/// done/failed from the task store), the latest PR URL and quality grade for
-/// each project, plus global queue stats and server uptime.
+/// Per-project entries include only live queue stats (running/queued) because
+/// `TaskState` carries no `project_root` field, making per-project historical
+/// counts (done/failed) and per-project PR/grade unavailable without a schema
+/// change. Global metrics (done, failed, latest_pr, grade, uptime) are reported
+/// in the top-level `global` object where they accurately reflect all tasks.
 pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
     let start = SERVER_START.get_or_init(std::time::Instant::now);
     let uptime_secs = start.elapsed().as_secs();
 
     let tq = &state.concurrency.task_queue;
 
-    // Snapshot all tasks once for done/failed counts and latest PR.
+    // Global done/failed counts from the in-memory cache (all projects combined).
     let all_tasks = state.core.tasks.list_all();
-
     let global_done: u64 = all_tasks
         .iter()
         .filter(|t| matches!(t.status, TaskStatus::Done))
         .count() as u64;
-
     let global_failed: u64 = all_tasks
         .iter()
         .filter(|t| matches!(t.status, TaskStatus::Failed))
         .count() as u64;
 
-    // Most recent completed task with a PR URL (list_all returns newest-first from DB).
-    let latest_pr_global: Option<String> = all_tasks
-        .iter()
-        .filter(|t| matches!(t.status, TaskStatus::Done))
-        .find_map(|t| t.pr_url.clone());
+    // Most recent completed task with a PR URL, queried from the DB which is
+    // ordered by created_at DESC — deterministic and newest-first.
+    let latest_pr: Option<String> = state.core.tasks.latest_done_pr_url().await;
 
     // Grade from the global quality event store.
     let grade: Option<Value> = match state
@@ -56,6 +54,8 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     };
 
     // Build per-project entries from the registry.
+    // Only live queue stats are included; done/failed/latest_pr/grade are not
+    // available per-project (TaskState has no project_root field).
     let projects: Vec<Value> = match state.core.project_registry.as_ref() {
         None => vec![],
         Some(registry) => match registry.list().await {
@@ -75,11 +75,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                         "tasks": {
                             "running": qs.running,
                             "queued": qs.queued,
-                            "done": global_done,
-                            "failed": global_failed,
                         },
-                        "latest_pr": latest_pr_global,
-                        "grade": grade,
                     })
                 })
                 .collect(),
@@ -93,6 +89,10 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
             "queued": tq.queued_count(),
             "max_concurrent": tq.global_limit(),
             "uptime_secs": uptime_secs,
+            "done": global_done,
+            "failed": global_failed,
+            "latest_pr": latest_pr,
+            "grade": grade,
         }
     });
 
@@ -147,6 +147,8 @@ mod tests {
         assert!(global.get("queued").is_some());
         assert!(global.get("max_concurrent").is_some());
         assert!(global.get("uptime_secs").is_some());
+        assert!(global.get("done").is_some());
+        assert!(global.get("failed").is_some());
 
         Ok(())
     }

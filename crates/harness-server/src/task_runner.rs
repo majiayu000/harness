@@ -355,6 +355,18 @@ impl TaskStore {
         self.cache.iter().map(|e| e.value().clone()).collect()
     }
 
+    /// Return the `pr_url` of the most recently created Done task, ordered by `created_at DESC`
+    /// from the database (stable ordering, unlike the in-memory DashMap cache).
+    pub async fn latest_done_pr_url(&self) -> Option<String> {
+        match self.db.latest_done_pr_url().await {
+            Ok(url) => url,
+            Err(e) => {
+                tracing::warn!("failed to query latest done PR URL: {e}");
+                None
+            }
+        }
+    }
+
     /// Return all cached tasks whose `parent_id` matches the given ID.
     /// Reconstructs the child list from in-memory state; does not require
     /// `subtask_ids` to be persisted on the parent.
