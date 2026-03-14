@@ -222,6 +222,23 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             tracing::warn!("failed to auto-register project guards: {e}");
         }
     }
+    // Load guards from each named startup project so non-default projects are
+    // not silently unprotected.
+    for (name, path) in &server.startup_projects {
+        match rule_engine.auto_register_project_guards(&path.join(".harness/guards")) {
+            Ok(registered) => {
+                tracing::info!(
+                    project = %name,
+                    registered_guard_count = registered,
+                    total_guard_count = rule_engine.guards().len(),
+                    "rules: startup project guard auto-registration completed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(project = %name, "failed to auto-register startup project guards: {e}");
+            }
+        }
+    }
     rule_engine
         .load_exec_policy_files(&server.config.rules.exec_policy_paths)
         .context("failed to load rules.exec_policy_paths")?;

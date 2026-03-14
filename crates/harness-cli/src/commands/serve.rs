@@ -12,6 +12,12 @@ fn parse_project_entry(s: &str) -> Result<(String, PathBuf)> {
     if name.is_empty() {
         anyhow::bail!("--project name cannot be empty in: {s:?}");
     }
+    if name == "default" {
+        anyhow::bail!("--project name 'default' is reserved; choose a different name in: {s:?}");
+    }
+    if path.is_empty() {
+        anyhow::bail!("--project path cannot be empty in: {s:?}");
+    }
     Ok((name.to_string(), PathBuf::from(path)))
 }
 
@@ -41,6 +47,11 @@ pub async fn run(
     let mut parsed_projects: Vec<(String, PathBuf)> = Vec::new();
     for raw in &projects {
         let (name, path) = parse_project_entry(raw)?;
+        if parsed_projects.iter().any(|(n, _)| n == &name) {
+            anyhow::bail!(
+                "--project name '{name}' is duplicated; each project name must be unique"
+            );
+        }
         let canonical = path.canonicalize().map_err(|e| {
             anyhow::anyhow!(
                 "--project {name}: path '{}' is not accessible: {e}",
