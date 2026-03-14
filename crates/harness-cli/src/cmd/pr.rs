@@ -88,7 +88,14 @@ async fn run_review_loop(
         println!("[harness] Review round {round}/{max_rounds}, PR #{pr}");
 
         let req = AgentRequest {
-            prompt: prompts::review_prompt(issue, pr, round, prev_fixed, "/gemini review"),
+            prompt: prompts::review_prompt(
+                issue,
+                pr,
+                round,
+                prev_fixed,
+                "/gemini review",
+                "gemini-code-assist[bot]",
+            ),
             project_root: project.clone(),
             ..Default::default()
         };
