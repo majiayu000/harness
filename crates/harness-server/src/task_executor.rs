@@ -265,16 +265,18 @@ pub(crate) async fn run_task(
     task_id: &TaskId,
     agent: &dyn CodeAgent,
     reviewer: Option<&dyn CodeAgent>,
-    review_config: &harness_core::AgentReviewConfig,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
     interceptors: Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
     req: &CreateTaskRequest,
     project: PathBuf,
+    server_config: &harness_core::HarnessConfig,
 ) -> anyhow::Result<()> {
     update_status(store, task_id, TaskStatus::Implementing, 1).await;
 
     let project_config = load_project_config(&project);
+    let resolved = harness_core::config::resolve_config(server_config, &project_config);
+    let review_config = &resolved.review;
     let git = Some(&project_config.git);
 
     let first_prompt = if let Some(issue) = req.issue {

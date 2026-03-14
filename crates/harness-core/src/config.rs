@@ -3,6 +3,7 @@ mod dirs;
 mod intake;
 mod misc;
 mod project;
+mod resolve;
 mod server;
 
 pub use agents::{
@@ -14,7 +15,11 @@ pub use misc::{
     ConcurrencyConfig, GcConfig, ObserveConfig, OtelConfig, OtelExporter, ReviewConfig,
     RulesConfig, SignalThresholdsConfig, ValidationConfig, WorkspaceConfig,
 };
-pub use project::{load_project_config, GitConfig, ProjectConfig};
+pub use project::{
+    load_project_config, GitConfig, ProjectAgentConfig, ProjectConcurrencyConfig, ProjectConfig,
+    ProjectGcConfig, ProjectReviewConfig,
+};
+pub use resolve::{resolve_config, ResolvedConfig};
 pub use server::{ServerConfig, Transport};
 
 use serde::{Deserialize, Serialize};
