@@ -28,6 +28,12 @@ pub enum Command {
         /// Project root used by server-side scans (GC/health)
         #[arg(long)]
         project_root: Option<PathBuf>,
+        /// Register a named project at startup (repeatable, format: name=path)
+        #[arg(long = "project", value_name = "NAME=PATH")]
+        projects: Vec<String>,
+        /// Default project name when --project flags are used
+        #[arg(long)]
+        default_project: Option<String>,
     },
 
     /// Start MCP Server mode (JSON-RPC over stdio)
@@ -260,8 +266,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             transport,
             port,
             project_root,
+            projects,
+            default_project,
         } => {
-            serve::run(config, transport, port, project_root).await?;
+            serve::run(
+                config,
+                transport,
+                port,
+                project_root,
+                projects,
+                default_project,
+            )
+            .await?;
         }
 
         Command::McpServer => {
@@ -684,6 +700,7 @@ mod tests {
                 transport,
                 port,
                 project_root,
+                ..
             } => {
                 assert_eq!(transport, "stdio");
                 assert!(port.is_none());
@@ -902,6 +919,79 @@ mod tests {
                 }
             },
             _ => panic!("unexpected command variant parsed"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_serve_with_single_project_flag() {
+        let cli =
+            Cli::try_parse_from(["harness", "serve", "--project", "harness=/path/to/harness"])
+                .expect("serve with --project should parse");
+        match cli.command {
+            Command::Serve { projects, .. } => {
+                assert_eq!(projects, vec!["harness=/path/to/harness"]);
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_serve_with_multiple_project_flags() {
+        let cli = Cli::try_parse_from([
+            "harness",
+            "serve",
+            "--project",
+            "harness=/path/to/harness",
+            "--project",
+            "litellm=/path/to/litellm-rs",
+        ])
+        .expect("serve with multiple --project flags should parse");
+        match cli.command {
+            Command::Serve { projects, .. } => {
+                assert_eq!(
+                    projects,
+                    vec!["harness=/path/to/harness", "litellm=/path/to/litellm-rs"]
+                );
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_serve_with_default_project_flag() {
+        let cli = Cli::try_parse_from([
+            "harness",
+            "serve",
+            "--project",
+            "harness=/path/to/harness",
+            "--project",
+            "litellm=/path/to/litellm-rs",
+            "--default-project",
+            "litellm",
+        ])
+        .expect("serve with --default-project should parse");
+        match cli.command {
+            Command::Serve {
+                projects,
+                default_project,
+                ..
+            } => {
+                assert_eq!(projects.len(), 2);
+                assert_eq!(default_project.as_deref(), Some("litellm"));
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_serve_project_root_still_works() {
+        let cli = Cli::try_parse_from(["harness", "serve", "--project-root", "/tmp/repo"])
+            .expect("--project-root backward compat should parse");
+        match cli.command {
+            Command::Serve { project_root, .. } => {
+                assert_eq!(project_root, Some(PathBuf::from("/tmp/repo")));
+            }
+            _ => panic!("expected Serve command"),
         }
     }
 }
