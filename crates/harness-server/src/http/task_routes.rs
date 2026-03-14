@@ -181,11 +181,19 @@ async fn enqueue_task_background(
                 .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?
         };
 
-    let (reviewer, review_config) = resolve_reviewer(
+    let (reviewer, _review_config) = resolve_reviewer(
         &state.core.server.agent_registry,
         &state.core.server.config.agents.review,
         agent.name(),
     );
+
+    // Resolve canonical project for per-project concurrency limits.
+    let canonical_project = task_runner::resolve_canonical_project(req.project.clone())
+        .await
+        .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+    let project_id = canonical_project.to_string_lossy().into_owned();
+
+    let server_config = std::sync::Arc::new(state.core.server.config.clone());
 
     // Register the task immediately so the caller gets an ID without blocking.
     let task_id =
@@ -196,14 +204,14 @@ async fn enqueue_task_background(
     {
         let task_id2 = task_id.clone();
         tokio::spawn(async move {
-            match state.concurrency.task_queue.acquire().await {
+            match state.concurrency.task_queue.acquire(&project_id).await {
                 Ok(permit) => {
                     task_runner::spawn_preregistered_task(
                         task_id2,
                         state.core.tasks.clone(),
                         agent,
                         reviewer,
-                        review_config,
+                        server_config,
                         state.engines.skills.clone(),
                         state.observability.events.clone(),
                         state.interceptors.clone(),

@@ -355,6 +355,18 @@ impl TaskStore {
         self.cache.iter().map(|e| e.value().clone()).collect()
     }
 
+    /// Return the `pr_url` of the most recently created Done task, ordered by `created_at DESC`
+    /// from the database (stable ordering, unlike the in-memory DashMap cache).
+    pub async fn latest_done_pr_url(&self) -> Option<String> {
+        match self.db.latest_done_pr_url().await {
+            Ok(url) => url,
+            Err(e) => {
+                tracing::warn!("failed to query latest done PR URL: {e}");
+                None
+            }
+        }
+    }
+
     /// Return all cached tasks whose `parent_id` matches the given ID.
     /// Reconstructs the child list from in-memory state; does not require
     /// `subtask_ids` to be persisted on the parent.
@@ -472,7 +484,7 @@ pub async fn spawn_preregistered_task(
     store: Arc<TaskStore>,
     agent: Arc<dyn CodeAgent>,
     reviewer: Option<Arc<dyn CodeAgent>>,
-    review_config: harness_core::AgentReviewConfig,
+    server_config: std::sync::Arc<harness_core::HarnessConfig>,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
     interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
@@ -485,7 +497,7 @@ pub async fn spawn_preregistered_task(
         store,
         agent,
         reviewer,
-        review_config,
+        server_config,
         skills,
         events,
         interceptors,
