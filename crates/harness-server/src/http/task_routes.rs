@@ -57,7 +57,7 @@ pub(crate) async fn enqueue_task(
                 .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?
         };
 
-    let (reviewer, review_config) = resolve_reviewer(
+    let (reviewer, _review_config) = resolve_reviewer(
         &state.core.server.agent_registry,
         &state.core.server.config.agents.review,
         agent.name(),
@@ -67,7 +67,7 @@ pub(crate) async fn enqueue_task(
         state.core.tasks.clone(),
         agent,
         reviewer,
-        review_config,
+        Arc::new(state.core.server.config.clone()),
         state.engines.skills.clone(),
         state.observability.events.clone(),
         state.interceptors.clone(),

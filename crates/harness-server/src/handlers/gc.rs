@@ -156,7 +156,7 @@ pub async fn gc_adopt(
                     state.core.tasks.clone(),
                     agent,
                     None,
-                    harness_core::AgentReviewConfig::default(),
+                    std::sync::Arc::new(state.core.server.config.clone()),
                     state.engines.skills.clone(),
                     state.observability.events.clone(),
                     state.interceptors.clone(),

@@ -1,6 +1,41 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Per-project agent configuration overrides.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectAgentConfig {
+    /// Override the default agent name for this project.
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+/// Per-project review configuration overrides.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectReviewConfig {
+    /// Whether agent review is enabled for this project.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Review bot command override (e.g. "/gemini review").
+    #[serde(default)]
+    pub bot_command: Option<String>,
+}
+
+/// Per-project concurrency configuration overrides.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectConcurrencyConfig {
+    /// Maximum number of concurrent tasks for this project.
+    #[serde(default)]
+    pub max_concurrent_tasks: Option<usize>,
+}
+
+/// Per-project GC configuration overrides.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectGcConfig {
+    /// Maximum number of drafts per GC run for this project.
+    #[serde(default)]
+    pub max_drafts_per_run: Option<usize>,
+}
+
 /// Git configuration for a project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitConfig {
@@ -50,6 +85,18 @@ pub struct ProjectConfig {
     /// triggers language detection (cargo fmt/check for Rust, etc.).
     #[serde(default)]
     pub validation: super::misc::ValidationConfig,
+    /// Per-project agent overrides. `None` inherits from server defaults.
+    #[serde(default)]
+    pub agent: Option<ProjectAgentConfig>,
+    /// Per-project review overrides. `None` inherits from server defaults.
+    #[serde(default)]
+    pub review: Option<ProjectReviewConfig>,
+    /// Per-project concurrency overrides. `None` inherits from server defaults.
+    #[serde(default)]
+    pub concurrency: Option<ProjectConcurrencyConfig>,
+    /// Per-project GC overrides. `None` inherits from server defaults.
+    #[serde(default)]
+    pub gc: Option<ProjectGcConfig>,
 }
 
 /// Load project config from `{project_root}/.harness/config.toml`.
