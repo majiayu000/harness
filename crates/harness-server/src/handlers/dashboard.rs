@@ -5,8 +5,10 @@ use harness_observe::QualityGrader;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-/// Lazily initialized server start time. Set on the first dashboard request.
-static SERVER_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// Server start time. Initialized once in `serve()` before accepting connections,
+/// so `uptime_secs` reflects true server uptime rather than time since first dashboard hit.
+pub(crate) static SERVER_START: std::sync::OnceLock<std::time::Instant> =
+    std::sync::OnceLock::new();
 
 /// GET /api/dashboard — JSON summary of all registered projects and global concurrency.
 ///
@@ -33,10 +35,12 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         .count() as u64;
 
     // Most recent completed task with a PR URL, queried from the DB which is
-    // ordered by created_at DESC — deterministic and newest-first.
+    // ordered by updated_at DESC — reflects completion time, not creation time.
     let latest_pr: Option<String> = state.core.tasks.latest_done_pr_url().await;
 
     // Grade from the global quality event store.
+    // Derive violation_count from the most recent rule_scan session so we don't
+    // permanently depress the grade with historical violations from old scans.
     let grade: Option<Value> = match state
         .observability
         .events
@@ -44,7 +48,18 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         .await
     {
         Ok(events) => {
-            let report = QualityGrader::grade(&events, 0);
+            let violation_count = events
+                .iter()
+                .rev()
+                .find(|e| e.hook == "rule_scan")
+                .map(|scan| {
+                    events
+                        .iter()
+                        .filter(|e| e.hook == "rule_check" && e.session_id == scan.session_id)
+                        .count()
+                })
+                .unwrap_or(0);
+            let report = QualityGrader::grade(&events, violation_count);
             serde_json::to_value(report.grade).ok()
         }
         Err(e) => {

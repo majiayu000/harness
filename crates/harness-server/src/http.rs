@@ -649,6 +649,8 @@ fn resolve_reviewer(
 
 pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Result<()> {
     tracing::info!("harness: HTTP server listening on {addr}");
+    // Record true server start time before accepting any connections.
+    crate::handlers::dashboard::SERVER_START.get_or_init(std::time::Instant::now);
 
     let state = Arc::new(build_app_state(server).await?);
 
