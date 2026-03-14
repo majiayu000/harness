@@ -82,10 +82,13 @@ pub struct ObservabilityServices {
     pub signal_rate_limiter: Arc<SignalRateLimiter>,
 }
 
-/// Concurrency services: task queue and workspace isolation.
+/// Concurrency services: task queue, workspace isolation, and per-project semaphores.
 pub struct ConcurrencyServices {
     pub task_queue: Arc<crate::task_queue::TaskQueue>,
     pub workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
+    /// Per-project concurrency semaphores. Created lazily when a project config
+    /// specifies a `max_concurrent_tasks` lower than the global limit.
+    pub project_semaphores: Arc<dashmap::DashMap<std::path::PathBuf, Arc<tokio::sync::Semaphore>>>,
 }
 
 /// Notification services: broadcast channels and lag tracking.
@@ -245,7 +248,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     );
     let draft_store = harness_gc::DraftStore::new(&dir)?;
     let gc_agent = Arc::new(harness_gc::GcAgent::new(
-        harness_core::GcConfig::default(),
+        server.config.gc.clone(),
         signal_detector,
         draft_store,
     ));
@@ -419,6 +422,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         concurrency: ConcurrencyServices {
             task_queue,
             workspace_mgr,
+            project_semaphores: Arc::new(dashmap::DashMap::new()),
         },
         notifications: NotificationServices {
             notification_tx: broadcast::channel(notification_broadcast_capacity).0,
@@ -484,14 +488,15 @@ fn build_completion_callback(
                         {
                             match std::env::var("GITHUB_TOKEN") {
                                 Ok(token) if !token.is_empty() => {
-                                    if let Err(e) = post_review_bot_comment(
-                                        &owner,
-                                        &repo,
-                                        pr_num,
-                                        &review_config.review_bot_command,
-                                        &token,
-                                    )
-                                    .await
+                                    // Use the task's effective (project-resolved) bot command if
+                                    // available; fall back to the global server-level command.
+                                    let cmd = task
+                                        .review_bot_command
+                                        .as_deref()
+                                        .unwrap_or(&review_config.review_bot_command);
+                                    if let Err(e) =
+                                        post_review_bot_comment(&owner, &repo, pr_num, cmd, &token)
+                                            .await
                                     {
                                         tracing::warn!(
                                             pr_url,
@@ -500,7 +505,7 @@ fn build_completion_callback(
                                     } else {
                                         tracing::info!(
                                             pr_url,
-                                            comment = review_config.review_bot_command,
+                                            comment = cmd,
                                             "review bot comment posted"
                                         );
                                     }
@@ -597,54 +602,6 @@ async fn post_review_bot_comment(
         anyhow::bail!("GitHub API returned {status}: {text}");
     }
     Ok(())
-}
-
-/// Resolve the reviewer agent for independent agent review.
-///
-/// 1. If `config.reviewer_agent` is set and differs from implementor, use it.
-/// 2. Otherwise, auto-select the first registered agent that isn't the implementor.
-/// 3. If none found, return None (agent review will be skipped).
-fn resolve_reviewer(
-    registry: &harness_agents::AgentRegistry,
-    config: &harness_core::AgentReviewConfig,
-    implementor_name: &str,
-) -> (
-    Option<Arc<dyn harness_core::CodeAgent>>,
-    harness_core::AgentReviewConfig,
-) {
-    if !config.enabled {
-        return (None, config.clone());
-    }
-
-    // Explicit reviewer
-    if !config.reviewer_agent.is_empty() {
-        if config.reviewer_agent == implementor_name {
-            tracing::warn!(
-                "agents.review.reviewer_agent == implementor '{}', skipping agent review",
-                implementor_name
-            );
-            return (None, config.clone());
-        }
-        if let Some(agent) = registry.get(&config.reviewer_agent) {
-            return (Some(agent), config.clone());
-        }
-        tracing::warn!(
-            "agents.review.reviewer_agent '{}' not registered, skipping agent review",
-            config.reviewer_agent
-        );
-        return (None, config.clone());
-    }
-
-    // Auto-select: first agent != implementor
-    for name in registry.list() {
-        if name != implementor_name {
-            if let Some(agent) = registry.get(name) {
-                return (Some(agent), config.clone());
-            }
-        }
-    }
-
-    (None, config.clone())
 }
 
 pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Result<()> {

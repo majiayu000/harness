@@ -260,11 +260,55 @@ async fn run_agent_streaming(
     }
 }
 
+/// Resolve the reviewer agent using the effective (post-project-override) review config.
+///
+/// Called after `resolve_config` so that project-level `[review] enabled = true`
+/// can activate review even when the server default is disabled.
+pub(crate) fn resolve_reviewer(
+    registry: &harness_agents::AgentRegistry,
+    config: &harness_core::AgentReviewConfig,
+    implementor_name: &str,
+) -> Option<std::sync::Arc<dyn CodeAgent>> {
+    if !config.enabled {
+        return None;
+    }
+
+    // Explicit reviewer
+    if !config.reviewer_agent.is_empty() {
+        if config.reviewer_agent == implementor_name {
+            tracing::warn!(
+                "agents.review.reviewer_agent == implementor '{}', skipping agent review",
+                implementor_name
+            );
+            return None;
+        }
+        if let Some(agent) = registry.get(&config.reviewer_agent) {
+            return Some(agent);
+        }
+        tracing::warn!(
+            "agents.review.reviewer_agent '{}' not registered, skipping agent review",
+            config.reviewer_agent
+        );
+        return None;
+    }
+
+    // Auto-select: first registered agent that isn't the implementor
+    for name in registry.list() {
+        if name != implementor_name {
+            if let Some(agent) = registry.get(name) {
+                return Some(agent);
+            }
+        }
+    }
+
+    None
+}
+
 pub(crate) async fn run_task(
     store: &TaskStore,
     task_id: &TaskId,
     agent: &dyn CodeAgent,
-    reviewer: Option<&dyn CodeAgent>,
+    registry: &harness_agents::AgentRegistry,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
     interceptors: Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
@@ -278,6 +322,18 @@ pub(crate) async fn run_task(
     let resolved = harness_core::config::resolve_config(server_config, &project_config);
     let review_config = &resolved.review;
     let git = Some(&project_config.git);
+
+    // Fix 1: resolve reviewer after project config is loaded, so project-level
+    // `[review] enabled = true` can override a globally-disabled review.
+    let reviewer_arc = resolve_reviewer(registry, review_config, agent.name());
+    let reviewer = reviewer_arc.as_deref();
+
+    // Fix 2: store the effective bot command in TaskState so the completion
+    // callback uses the project-specific command, not the global one.
+    mutate_and_persist(store, task_id, |s| {
+        s.review_bot_command = Some(review_config.review_bot_command.clone());
+    })
+    .await;
 
     let first_prompt = if let Some(issue) = req.issue {
         let base = match find_existing_pr_for_issue(&project, issue).await {

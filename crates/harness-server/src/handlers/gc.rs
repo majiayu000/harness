@@ -75,7 +75,7 @@ pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcRespo
     match state
         .engines
         .gc_agent
-        .run(&project, &events, &violations, agent.as_ref())
+        .run(&project, &events, &violations, agent.as_ref(), None)
         .await
     {
         Ok(report) => match serde_json::to_value(&report) {
@@ -156,7 +156,7 @@ pub async fn gc_adopt(
                 let tid = crate::task_runner::spawn_task(
                     state.core.tasks.clone(),
                     agent,
-                    None,
+                    state.core.server.agent_registry.clone(),
                     std::sync::Arc::new(state.core.server.config.clone()),
                     state.engines.skills.clone(),
                     state.observability.events.clone(),
@@ -165,6 +165,7 @@ pub async fn gc_adopt(
                     state.concurrency.workspace_mgr.clone(),
                     permit,
                     None,
+                    state.concurrency.project_semaphores.clone(),
                 )
                 .await;
                 Some(tid.0)

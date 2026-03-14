@@ -38,7 +38,7 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
                 config.agents.sandbox_mode,
             );
 
-            let report = gc_agent.run(&project, &events, &[], &claude).await?;
+            let report = gc_agent.run(&project, &events, &[], &claude, None).await?;
             println!("Signals detected: {}", report.signals.len());
             println!("Drafts generated: {}", report.drafts_generated);
             for e in &report.errors {

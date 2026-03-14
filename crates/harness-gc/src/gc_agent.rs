@@ -52,6 +52,7 @@ impl GcAgent {
         events: &[harness_core::Event],
         violations: &[harness_core::Violation],
         agent: &dyn CodeAgent,
+        max_drafts_override: Option<usize>,
     ) -> anyhow::Result<GcReport> {
         // 0. Expire stale drafts before generating new ones
         self.draft_store
@@ -81,7 +82,8 @@ impl GcAgent {
         let mut drafts_generated = 0;
         let mut errors = Vec::new();
 
-        for signal in signals.iter().take(self.config.max_drafts_per_run) {
+        let max_drafts = max_drafts_override.unwrap_or(self.config.max_drafts_per_run);
+        for signal in signals.iter().take(max_drafts) {
             let prompt = build_prompt(signal, project);
 
             let result = agent

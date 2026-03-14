@@ -100,9 +100,12 @@ impl QualityTrigger {
             return;
         };
         let project = Project::from_path(self.project_root.clone());
+        let max_drafts_override = harness_core::config::load_project_config(&self.project_root)
+            .gc
+            .and_then(|g| g.max_drafts_per_run);
         if let Err(e) = self
             .gc_agent
-            .run(&project, &events, &[], agent.as_ref())
+            .run(&project, &events, &[], agent.as_ref(), max_drafts_override)
             .await
         {
             tracing::warn!("quality_trigger: gc_agent.run failed: {e}");

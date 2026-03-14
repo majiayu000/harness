@@ -1,4 +1,4 @@
-use super::{resolve_reviewer, AppState};
+use super::AppState;
 use crate::task_runner;
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
@@ -91,16 +91,10 @@ pub(crate) async fn enqueue_task(
                 .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?
         };
 
-    let (reviewer, _review_config) = resolve_reviewer(
-        &state.core.server.agent_registry,
-        &state.core.server.config.agents.review,
-        agent.name(),
-    );
-
     let task_id = task_runner::spawn_task(
         state.core.tasks.clone(),
         agent,
-        reviewer,
+        state.core.server.agent_registry.clone(),
         Arc::new(state.core.server.config.clone()),
         state.engines.skills.clone(),
         state.observability.events.clone(),
@@ -109,6 +103,7 @@ pub(crate) async fn enqueue_task(
         state.concurrency.workspace_mgr.clone(),
         permit,
         state.completion_callback.clone(),
+        state.concurrency.project_semaphores.clone(),
     )
     .await;
 
@@ -152,7 +147,7 @@ pub struct BatchCreateTaskRequest {
 /// slots are occupied.
 async fn enqueue_task_background(
     state: Arc<AppState>,
-    req: task_runner::CreateTaskRequest,
+    mut req: task_runner::CreateTaskRequest,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
     if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
         return Err(EnqueueTaskError::BadRequest(
@@ -181,11 +176,11 @@ async fn enqueue_task_background(
                 .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?
         };
 
-    let (reviewer, review_config) = resolve_reviewer(
-        &state.core.server.agent_registry,
-        &state.core.server.config.agents.review,
-        agent.name(),
-    );
+    let canonical_project = task_runner::resolve_canonical_project(req.project.clone())
+        .await
+        .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+    let project_id = canonical_project.to_string_lossy().into_owned();
+    req.project = Some(canonical_project);
 
     // Register the task immediately so the caller gets an ID without blocking.
     let task_id =
@@ -196,14 +191,14 @@ async fn enqueue_task_background(
     {
         let task_id2 = task_id.clone();
         tokio::spawn(async move {
-            match state.concurrency.task_queue.acquire().await {
+            match state.concurrency.task_queue.acquire(&project_id).await {
                 Ok(permit) => {
                     task_runner::spawn_preregistered_task(
                         task_id2,
                         state.core.tasks.clone(),
                         agent,
-                        reviewer,
-                        review_config,
+                        state.core.server.agent_registry.clone(),
+                        Arc::new(state.core.server.config.clone()),
                         state.engines.skills.clone(),
                         state.observability.events.clone(),
                         state.interceptors.clone(),
@@ -211,6 +206,7 @@ async fn enqueue_task_background(
                         state.concurrency.workspace_mgr.clone(),
                         permit,
                         state.completion_callback.clone(),
+                        state.concurrency.project_semaphores.clone(),
                     )
                     .await;
                 }

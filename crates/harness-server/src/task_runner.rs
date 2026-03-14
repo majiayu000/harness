@@ -93,6 +93,10 @@ pub struct TaskState {
     /// Populated at runtime; not persisted (use `TaskStore::list_children` after restart).
     #[serde(default)]
     pub subtask_ids: Vec<TaskId>,
+    /// Effective review-bot command for this task (resolved from project + server config).
+    /// Used by the completion callback to post the correct trigger comment per project.
+    #[serde(default)]
+    pub review_bot_command: Option<String>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -122,6 +126,7 @@ impl TaskState {
             external_id: None,
             parent_id: None,
             subtask_ids: Vec::new(),
+            review_bot_command: None,
         }
     }
 
@@ -421,10 +426,13 @@ impl TaskStore {
     }
 }
 
+/// Shared map of per-project concurrency semaphores, keyed by canonical project root.
+pub type ProjectSemaphores = Arc<DashMap<PathBuf, Arc<tokio::sync::Semaphore>>>;
+
 pub async fn spawn_task(
     store: Arc<TaskStore>,
     agent: Arc<dyn CodeAgent>,
-    reviewer: Option<Arc<dyn CodeAgent>>,
+    registry: Arc<harness_agents::AgentRegistry>,
     server_config: std::sync::Arc<harness_core::HarnessConfig>,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
@@ -433,11 +441,12 @@ pub async fn spawn_task(
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
+    project_semaphores: ProjectSemaphores,
 ) -> TaskId {
     spawn_task_with_worktree_detector(
         store,
         agent,
-        reviewer,
+        registry,
         server_config,
         skills,
         events,
@@ -448,6 +457,7 @@ pub async fn spawn_task(
         permit,
         completion_callback,
         None,
+        project_semaphores,
     )
     .await
 }
@@ -471,8 +481,8 @@ pub async fn spawn_preregistered_task(
     task_id: TaskId,
     store: Arc<TaskStore>,
     agent: Arc<dyn CodeAgent>,
-    reviewer: Option<Arc<dyn CodeAgent>>,
-    review_config: harness_core::AgentReviewConfig,
+    registry: Arc<harness_agents::AgentRegistry>,
+    server_config: std::sync::Arc<harness_core::HarnessConfig>,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
     interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
@@ -480,12 +490,13 @@ pub async fn spawn_preregistered_task(
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
+    project_semaphores: ProjectSemaphores,
 ) {
     spawn_task_with_worktree_detector(
         store,
         agent,
-        reviewer,
-        review_config,
+        registry,
+        server_config,
         skills,
         events,
         interceptors,
@@ -495,6 +506,7 @@ pub async fn spawn_preregistered_task(
         permit,
         completion_callback,
         Some(task_id),
+        project_semaphores,
     )
     .await;
 }
@@ -502,7 +514,7 @@ pub async fn spawn_preregistered_task(
 async fn spawn_task_with_worktree_detector<F>(
     store: Arc<TaskStore>,
     agent: Arc<dyn CodeAgent>,
-    reviewer: Option<Arc<dyn CodeAgent>>,
+    registry: Arc<harness_agents::AgentRegistry>,
     server_config: std::sync::Arc<harness_core::HarnessConfig>,
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
@@ -513,6 +525,7 @@ async fn spawn_task_with_worktree_detector<F>(
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
     preregistered_id: Option<TaskId>,
+    project_semaphores: ProjectSemaphores,
 ) -> TaskId
 where
     F: Fn() -> PathBuf + Send + Sync + 'static,
@@ -625,6 +638,44 @@ where
             }
         }
 
+        // Fix 3 + Fix 4: load project config once here to apply overrides before
+        // workspace creation consumes `project_root`.
+        let proj_cfg = harness_core::config::load_project_config(&project_root);
+        let resolved_early = harness_core::config::resolve_config(&server_config, &proj_cfg);
+
+        // Fix 3: apply project-level default-agent override when no explicit agent requested.
+        let agent = if req.agent.is_none()
+            && resolved_early.default_agent != server_config.agents.default_agent
+        {
+            registry.get(&resolved_early.default_agent).unwrap_or(agent)
+        } else {
+            agent
+        };
+
+        // Fix 4: enforce per-project concurrency limit when it is stricter than the global one.
+        // A per-project semaphore is created lazily on first use.
+        let _project_permit: Option<tokio::sync::OwnedSemaphorePermit> =
+            if resolved_early.concurrency.max_concurrent_tasks
+                < server_config.concurrency.max_concurrent_tasks
+            {
+                use dashmap::mapref::entry::Entry;
+                let sem = match project_semaphores.entry(project_root.clone()) {
+                    Entry::Occupied(e) => e.get().clone(),
+                    Entry::Vacant(e) => e
+                        .insert(std::sync::Arc::new(tokio::sync::Semaphore::new(
+                            resolved_early.concurrency.max_concurrent_tasks,
+                        )))
+                        .clone(),
+                };
+                Some(
+                    sem.acquire_owned()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("project semaphore closed: {e}"))?,
+                )
+            } else {
+                None
+            };
+
         // If workspace isolation is configured, create a per-task git worktree.
         let run_project = if let Some(ref wmgr) = workspace_mgr {
             let project_config = harness_core::config::load_project_config(&project_root);
@@ -643,7 +694,7 @@ where
             &store,
             &id,
             agent.as_ref(),
-            reviewer.as_deref(),
+            &*registry,
             skills,
             events,
             interceptors,
@@ -948,7 +999,7 @@ mod tests {
         spawn_task(
             store,
             agent_clone,
-            None,
+            Arc::new(harness_agents::AgentRegistry::new("test")),
             Default::default(),
             skills,
             events,
@@ -957,6 +1008,7 @@ mod tests {
             None,
             permit,
             None,
+            Arc::new(DashMap::new()),
         )
         .await;
 
@@ -1021,7 +1073,7 @@ mod tests {
         let task_id = spawn_task(
             store.clone(),
             agent,
-            None,
+            Arc::new(harness_agents::AgentRegistry::new("test")),
             Default::default(),
             skills,
             events,
@@ -1030,6 +1082,7 @@ mod tests {
             None,
             permit,
             None,
+            Arc::new(DashMap::new()),
         )
         .await;
 
@@ -1144,7 +1197,7 @@ mod tests {
         let task_id = spawn_task_with_worktree_detector(
             store.clone(),
             agent,
-            None,
+            Arc::new(harness_agents::AgentRegistry::new("test")),
             Default::default(),
             skills,
             events.clone(),
@@ -1157,6 +1210,7 @@ mod tests {
             permit,
             None,
             None,
+            Arc::new(DashMap::new()),
         )
         .await;
 

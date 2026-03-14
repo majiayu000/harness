@@ -280,6 +280,7 @@ mod tests {
             concurrency: crate::http::ConcurrencyServices {
                 task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
                 workspace_mgr: None,
+                project_semaphores: std::sync::Arc::new(dashmap::DashMap::new()),
             },
             notifications: crate::http::NotificationServices {
                 notification_tx,
