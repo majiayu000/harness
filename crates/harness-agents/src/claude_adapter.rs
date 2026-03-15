@@ -136,16 +136,15 @@ impl AgentAdapter for ClaudeAdapter {
                 } else {
                     let exit_status = child.wait().await.ok();
                     if let Some(status) = exit_status {
-                        if !status.success() {
-                            if tx
+                        if !status.success()
+                            && tx
                                 .send(AgentEvent::Error {
                                     message: format!("claude exited with {status}"),
                                 })
                                 .await
                                 .is_err()
-                            {
-                                tracing::debug!("claude: receiver dropped before error event");
-                            }
+                        {
+                            tracing::debug!("claude: receiver dropped before error event");
                         }
                     }
                 }
@@ -153,14 +152,13 @@ impl AgentAdapter for ClaudeAdapter {
             *guard = None;
         }
 
-        if !send_failed {
-            if tx
+        if !send_failed
+            && tx
                 .send(AgentEvent::TurnCompleted { output: output_buf })
                 .await
                 .is_err()
-            {
-                tracing::debug!("claude: receiver dropped before TurnCompleted");
-            }
+        {
+            tracing::debug!("claude: receiver dropped before TurnCompleted");
         }
 
         Ok(())
