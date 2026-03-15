@@ -137,10 +137,11 @@ impl QualityTrigger {
             return;
         };
         let project = Project::from_path(self.project_root.clone());
-        let all_events = match self.events.query(&EventFilters::default()).await {
-            Ok(e) => e,
-            Err(_) => vec![],
-        };
+        let all_events: Vec<harness_core::Event> = self
+            .events
+            .query(&EventFilters::default())
+            .await
+            .unwrap_or_default();
         if let Err(e) = self
             .gc_agent
             .run(&project, &all_events, &[], agent.as_ref())
