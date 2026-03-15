@@ -143,10 +143,21 @@ pub(crate) async fn run_setup_phase(
         }
 
         let mut cmd = Command::new("sh");
-        cmd.arg("-lc").arg(setup_command).current_dir(project_root);
+        cmd.arg("-lc")
+            .arg(setup_command)
+            .current_dir(project_root)
+            .kill_on_drop(true);
         apply_setup_environment(&mut cmd, cloud);
+        crate::process_group::apply_process_group_management(&mut cmd);
 
-        let output = cmd.output().await.map_err(|err| {
+        let child = cmd.spawn().map_err(|err| {
+            HarnessError::AgentExecution(format!(
+                "failed to run cloud setup command `{setup_command}`: {err}"
+            ))
+        })?;
+        let _pg_guard = crate::process_group::ProcessGroupGuard::new(child.id());
+
+        let output = child.wait_with_output().await.map_err(|err| {
             HarnessError::AgentExecution(format!(
                 "failed to run cloud setup command `{setup_command}`: {err}"
             ))

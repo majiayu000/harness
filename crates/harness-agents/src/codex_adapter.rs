@@ -125,16 +125,32 @@ impl AgentAdapter for CodexAdapter {
                 .current_dir(&req.project_root)
                 .kill_on_drop(true);
             crate::strip_claude_env(&mut cmd);
+            crate::process_group::apply_process_group_management(&mut cmd);
 
             let mut child = cmd.spawn().map_err(|e| {
                 harness_core::HarnessError::AgentExecution(format!("failed to spawn codex: {e}"))
             })?;
+
+            let child_pid = child.id();
+
+            // Drain stderr in a background task so the pipe buffer never fills
+            // up — a full buffer causes the child to block and stall indefinitely.
+            if let Some(stderr) = child.stderr.take() {
+                tokio::spawn(async move {
+                    crate::streaming::filter_agent_stderr(stderr, "codex").await;
+                });
+            }
 
             state.stdin = child.stdin.take();
             let stdout = child.stdout.take().ok_or_else(|| {
                 harness_core::HarnessError::AgentExecution("no stdout from codex".into())
             })?;
             state.child = Some(child);
+
+            // ProcessGroupGuard kills the entire process group on drop so that
+            // grandchild processes (node, cargo, etc.) are cleaned up even when
+            // this future is cancelled by an external timeout.
+            let _pg_guard = crate::process_group::ProcessGroupGuard::new(child_pid);
 
             // Initialize handshake
             Self::send_request(&mut state, "initialize", json!({})).await?;

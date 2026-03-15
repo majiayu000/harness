@@ -4,6 +4,7 @@ pub mod claude_adapter;
 mod cloud_setup;
 pub mod codex;
 pub mod codex_adapter;
+mod process_group;
 pub mod registry;
 mod streaming;
 
