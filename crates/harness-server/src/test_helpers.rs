@@ -42,7 +42,7 @@ pub async fn make_test_state_with_registry(
     let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
     let events = Arc::new(harness_observe::EventStore::new(dir).await?);
     let signal_detector = harness_gc::SignalDetector::new(
-        harness_gc::signal_detector::SignalThresholds::default(),
+        server.config.gc.signal_thresholds.clone().into(),
         harness_core::ProjectId::new(),
     );
     let draft_store = harness_gc::DraftStore::new(dir)?;
