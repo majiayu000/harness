@@ -26,17 +26,37 @@ impl DbEntity for ExecPlan {
 
 pub struct PlanDb {
     inner: Db<ExecPlan>,
+    /// Serializes read-modify-write cycles to prevent lost-update races.
+    update_lock: tokio::sync::Mutex<()>,
 }
 
 impl PlanDb {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         Ok(Self {
             inner: Db::open(path).await?,
+            update_lock: tokio::sync::Mutex::new(()),
         })
     }
 
     pub async fn upsert(&self, plan: &ExecPlan) -> anyhow::Result<()> {
         self.inner.upsert(plan).await
+    }
+
+    /// Load a plan, apply `f`, persist the result, and return the updated plan.
+    ///
+    /// Holds an exclusive lock for the duration of the read-modify-write so
+    /// that concurrent callers cannot overwrite each other's changes.
+    pub async fn update_in_txn<F>(&self, id: &ExecPlanId, f: F) -> anyhow::Result<Option<ExecPlan>>
+    where
+        F: FnOnce(&mut ExecPlan),
+    {
+        let _guard = self.update_lock.lock().await;
+        let Some(mut plan) = self.inner.get(id.as_str()).await? else {
+            return Ok(None);
+        };
+        f(&mut plan);
+        self.inner.upsert(&plan).await?;
+        Ok(Some(plan))
     }
 
     pub async fn get(&self, id: &ExecPlanId) -> anyhow::Result<Option<ExecPlan>> {
