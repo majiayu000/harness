@@ -8,8 +8,15 @@ use tokio::task::JoinHandle;
 ///
 /// `ThreadManager` is a pure in-memory cache. It owns no persistence layer.
 /// Thread persistence is handled exclusively by `CoreServices.thread_db`
-/// (`AppState.core.thread_db`). Handlers load persisted threads into this
-/// cache at startup and write back to `thread_db` after mutations.
+/// (`AppState.core.thread_db`).
+///
+/// Lifecycle ownership:
+/// - **Startup hydration**: performed in `http.rs` during app initialisation,
+///   which loads persisted threads from `thread_db` into this cache via
+///   `threads_cache()`.
+/// - **Mutation persistence**: performed by `task_executor/helpers.rs`
+///   (`persist_runtime_thread`) after each stream item is applied to the
+///   cache, writing the updated thread back to `thread_db`.
 pub struct ThreadManager {
     threads: DashMap<String, Thread>,
     running_turn_tasks: DashMap<String, JoinHandle<()>>,
