@@ -120,6 +120,30 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn semantic_error_codes_are_negative_and_distinct() {
+        assert!(crate::NOT_FOUND < 0);
+        assert!(crate::CONFLICT < 0);
+        assert!(crate::NOT_INITIALIZED < 0);
+        assert!(crate::STORAGE_ERROR < 0);
+        assert!(crate::AGENT_ERROR < 0);
+        assert!(crate::VALIDATION_ERROR < 0);
+
+        // All semantic codes must be distinct from each other and from INTERNAL_ERROR
+        let codes = [
+            crate::NOT_FOUND,
+            crate::CONFLICT,
+            crate::NOT_INITIALIZED,
+            crate::STORAGE_ERROR,
+            crate::AGENT_ERROR,
+            crate::VALIDATION_ERROR,
+            crate::INTERNAL_ERROR,
+        ];
+        let unique: std::collections::HashSet<i32> = codes.iter().copied().collect();
+        assert_eq!(unique.len(), codes.len(), "error codes must be unique");
+    }
+
+    #[test]
     fn slash_style_thread_start() -> anyhow::Result<()> {
         let json = r#"{"jsonrpc":"2.0","id":1,"method":"thread/start","params":{"cwd":"/tmp"}}"#;
         let req: RpcRequest = decode_request(json)?;

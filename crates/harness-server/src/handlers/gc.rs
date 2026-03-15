@@ -1,6 +1,8 @@
 use crate::http::AppState;
 use harness_core::DraftId;
-use harness_protocol::{RpcResponse, INTERNAL_ERROR, NOT_FOUND};
+use harness_protocol::{
+    RpcResponse, AGENT_ERROR, CONFLICT, INTERNAL_ERROR, NOT_FOUND, STORAGE_ERROR, VALIDATION_ERROR,
+};
 
 fn gc_adopt_task_request(
     prompt: String,
@@ -29,7 +31,7 @@ pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcRespo
                 error = %err,
                 "gc/run rejected before scan"
             );
-            return RpcResponse::error(id, INTERNAL_ERROR, err.to_string());
+            return RpcResponse::error(id, VALIDATION_ERROR, err.to_string());
         }
         let guard_count = rules.guards().len();
         let violations = match rules.scan(&project_root).await {
@@ -65,12 +67,12 @@ pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcRespo
         .await
     {
         Ok(e) => e,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => return RpcResponse::error(id, STORAGE_ERROR, e.to_string()),
     };
     let project = harness_core::Project::from_path(project_root);
     let agent = match state.core.server.agent_registry.default_agent() {
         Some(a) => a,
-        None => return RpcResponse::error(id, INTERNAL_ERROR, "no agent registered"),
+        None => return RpcResponse::error(id, AGENT_ERROR, "no agent registered"),
     };
     match state
         .engines
@@ -82,14 +84,14 @@ pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcRespo
             Ok(v) => RpcResponse::success(id, v),
             Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
         },
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => RpcResponse::error(id, AGENT_ERROR, e.to_string()),
     }
 }
 
 pub async fn gc_status(state: &AppState, id: Option<serde_json::Value>) -> RpcResponse {
     match state.engines.gc_agent.drafts() {
         Ok(drafts) => RpcResponse::success(id, serde_json::json!({ "draft_count": drafts.len() })),
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => RpcResponse::error(id, STORAGE_ERROR, e.to_string()),
     }
 }
 
@@ -99,7 +101,7 @@ pub async fn gc_drafts(state: &AppState, id: Option<serde_json::Value>) -> RpcRe
             Ok(v) => RpcResponse::success(id, v),
             Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
         },
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => RpcResponse::error(id, STORAGE_ERROR, e.to_string()),
     }
 }
 
@@ -113,7 +115,7 @@ pub async fn gc_adopt(
         Ok(None) => {
             return RpcResponse::error(id, NOT_FOUND, format!("draft {} not found", draft_id));
         }
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => return RpcResponse::error(id, STORAGE_ERROR, e.to_string()),
     };
     let artifact_paths: Vec<String> = draft
         .artifacts
@@ -146,11 +148,7 @@ pub async fn gc_adopt(
                 let permit = match state.concurrency.task_queue.acquire(&project_id).await {
                     Ok(p) => p,
                     Err(e) => {
-                        return RpcResponse::error(
-                            id,
-                            INTERNAL_ERROR,
-                            format!("task queue full: {e}"),
-                        );
+                        return RpcResponse::error(id, CONFLICT, format!("task queue full: {e}"));
                     }
                 };
                 let tid = crate::task_runner::spawn_task(
@@ -176,7 +174,7 @@ pub async fn gc_adopt(
                 serde_json::json!({ "adopted": true, "task_id": task_id }),
             )
         }
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => RpcResponse::error(id, STORAGE_ERROR, e.to_string()),
     }
 }
 
@@ -251,6 +249,6 @@ pub async fn gc_reject(
 ) -> RpcResponse {
     match state.engines.gc_agent.reject(&draft_id, reason.as_deref()) {
         Ok(()) => RpcResponse::success(id, serde_json::json!({ "rejected": true })),
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => RpcResponse::error(id, STORAGE_ERROR, e.to_string()),
     }
 }

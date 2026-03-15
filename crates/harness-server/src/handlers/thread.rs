@@ -1,4 +1,4 @@
-use crate::{http::AppState, validate_root};
+use crate::{handlers::harness_error_code, http::AppState, validate_root};
 use harness_core::{ThreadId, ThreadStatus, TurnStatus};
 use harness_protocol::{Notification, RpcResponse, INTERNAL_ERROR, NOT_FOUND};
 use std::path::PathBuf;
@@ -163,7 +163,7 @@ pub async fn turn_start(
 
             RpcResponse::success(id, serde_json::json!({ "turn_id": turn_id }))
         }
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => RpcResponse::error(id, harness_error_code(&e), e.to_string()),
     }
 }
 
@@ -200,7 +200,7 @@ pub async fn turn_cancel(
                     }
                     RpcResponse::success(id, serde_json::json!({ "cancelled": cancelled }))
                 }
-                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                Err(e) => RpcResponse::error(id, harness_error_code(&e), e.to_string()),
             }
         }
         None => RpcResponse::error(id, NOT_FOUND, "turn not found in any thread"),
@@ -260,7 +260,7 @@ pub async fn turn_steer(
                     persist_thread(state, &thread_id).await;
                     RpcResponse::success(id, serde_json::json!({ "steered": true }))
                 }
-                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                Err(e) => RpcResponse::error(id, harness_error_code(&e), e.to_string()),
             }
         }
         None => RpcResponse::error(id, NOT_FOUND, "turn not found in any thread"),
@@ -277,7 +277,7 @@ pub async fn thread_resume(
             persist_thread(state, &thread_id).await;
             RpcResponse::success(id, serde_json::json!({ "resumed": true }))
         }
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => RpcResponse::error(id, harness_error_code(&e), e.to_string()),
     }
 }
 
@@ -297,7 +297,7 @@ pub async fn thread_fork(
             persist_thread_insert(state, &new_id).await;
             RpcResponse::success(id, serde_json::json!({ "thread_id": new_id }))
         }
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => RpcResponse::error(id, harness_error_code(&e), e.to_string()),
     }
 }
 
@@ -311,7 +311,7 @@ pub async fn thread_compact(
             persist_thread(state, &thread_id).await;
             RpcResponse::success(id, serde_json::json!({ "compacted": true }))
         }
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => RpcResponse::error(id, harness_error_code(&e), e.to_string()),
     }
 }
 

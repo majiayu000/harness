@@ -1,6 +1,6 @@
 use crate::{http::AppState, validate_root};
 use harness_core::{AgentRequest, CodeAgent};
-use harness_protocol::{RpcResponse, INTERNAL_ERROR};
+use harness_protocol::{RpcResponse, AGENT_ERROR, INTERNAL_ERROR};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ pub async fn cross_review(
 
     let primary = match state.core.server.agent_registry.default_agent() {
         Some(a) => a,
-        None => return RpcResponse::error(id, INTERNAL_ERROR, "no agent registered"),
+        None => return RpcResponse::error(id, AGENT_ERROR, "no agent registered"),
     };
 
     let challenger = state.core.server.agent_registry.get("codex");

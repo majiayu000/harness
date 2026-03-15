@@ -1,6 +1,6 @@
 use crate::http::AppState;
 use harness_core::SkillId;
-use harness_protocol::{RpcResponse, INTERNAL_ERROR, NOT_FOUND};
+use harness_protocol::{RpcResponse, INTERNAL_ERROR, NOT_FOUND, VALIDATION_ERROR};
 
 pub async fn skill_create(
     state: &AppState,
@@ -12,7 +12,7 @@ pub async fn skill_create(
     if name.contains('/') || name.contains('\\') || name.contains("..") || name.is_empty() {
         return RpcResponse::error(
             id,
-            INTERNAL_ERROR,
+            VALIDATION_ERROR,
             "skill name must not contain path separators or '..'",
         );
     }

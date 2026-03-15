@@ -12,7 +12,7 @@ pub mod rules;
 pub mod skills;
 pub mod thread;
 
-/// Validate a project root path, returning early with an `INTERNAL_ERROR`
+/// Validate a project root path, returning early with a `VALIDATION_ERROR`
 /// response on failure.
 ///
 /// # Example
@@ -27,12 +27,28 @@ macro_rules! validate_root {
             Err(e) => {
                 return harness_protocol::RpcResponse::error(
                     $id,
-                    harness_protocol::INTERNAL_ERROR,
+                    harness_protocol::VALIDATION_ERROR,
                     e,
                 )
             }
         }
     };
+}
+
+/// Map a [`harness_core::HarnessError`] to the most specific JSON-RPC error code.
+///
+/// Use this instead of hardcoding `INTERNAL_ERROR` when propagating errors from
+/// the core library, so that clients receive actionable semantic codes.
+pub(crate) fn harness_error_code(err: &harness_core::HarnessError) -> i32 {
+    use harness_core::HarnessError::*;
+    match err {
+        ThreadNotFound(_) | TurnNotFound(_) | AgentNotFound(_) | DraftNotFound(_)
+        | SkillNotFound(_) | ExecPlanNotFound(_) | RuleNotFound(_) => harness_protocol::NOT_FOUND,
+        InvalidState(_) => harness_protocol::CONFLICT,
+        Persistence(_) => harness_protocol::STORAGE_ERROR,
+        AgentExecution(_) => harness_protocol::AGENT_ERROR,
+        _ => harness_protocol::INTERNAL_ERROR,
+    }
 }
 
 /// Validate that `file` is an existing path within `project_root` (already canonicalized).
@@ -76,4 +92,75 @@ pub(crate) fn validate_project_root(path: &std::path::Path) -> Result<std::path:
         ));
     }
     Ok(canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::harness_error_code;
+    use harness_core::HarnessError;
+    use harness_protocol::{AGENT_ERROR, CONFLICT, INTERNAL_ERROR, NOT_FOUND, STORAGE_ERROR};
+
+    #[test]
+    fn harness_error_code_maps_not_found_variants() {
+        assert_eq!(
+            harness_error_code(&HarnessError::ThreadNotFound("t".into())),
+            NOT_FOUND
+        );
+        assert_eq!(
+            harness_error_code(&HarnessError::TurnNotFound("t".into())),
+            NOT_FOUND
+        );
+        assert_eq!(
+            harness_error_code(&HarnessError::AgentNotFound("a".into())),
+            NOT_FOUND
+        );
+        assert_eq!(
+            harness_error_code(&HarnessError::DraftNotFound("d".into())),
+            NOT_FOUND
+        );
+        assert_eq!(
+            harness_error_code(&HarnessError::SkillNotFound("s".into())),
+            NOT_FOUND
+        );
+        assert_eq!(
+            harness_error_code(&HarnessError::ExecPlanNotFound("e".into())),
+            NOT_FOUND
+        );
+        assert_eq!(
+            harness_error_code(&HarnessError::RuleNotFound("r".into())),
+            NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn harness_error_code_maps_state_errors() {
+        assert_eq!(
+            harness_error_code(&HarnessError::InvalidState("bad".into())),
+            CONFLICT
+        );
+    }
+
+    #[test]
+    fn harness_error_code_maps_persistence_errors() {
+        assert_eq!(
+            harness_error_code(&HarnessError::Persistence("db".into())),
+            STORAGE_ERROR
+        );
+    }
+
+    #[test]
+    fn harness_error_code_maps_agent_errors() {
+        assert_eq!(
+            harness_error_code(&HarnessError::AgentExecution("fail".into())),
+            AGENT_ERROR
+        );
+    }
+
+    #[test]
+    fn harness_error_code_falls_back_to_internal_error() {
+        assert_eq!(
+            harness_error_code(&HarnessError::Other("misc".into())),
+            INTERNAL_ERROR
+        );
+    }
 }
