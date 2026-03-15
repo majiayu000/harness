@@ -519,6 +519,51 @@ mod tests {
         Ok(())
     }
 
+    /// After forking, the same TurnId exists in both the original and the fork.
+    /// `find_thread_for_turn` must return one of the two valid thread IDs — not
+    /// None and not an unrelated thread — demonstrating that the lookup is
+    /// ambiguous but bounded.
+    #[test]
+    fn find_thread_for_turn_after_fork_returns_one_of_the_two_threads() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        tm.complete_turn(&thread_id, &turn_id)?;
+        let fork_id = tm.fork_thread(&thread_id, None)?;
+
+        let found = tm.find_thread_for_turn(&turn_id);
+        assert!(
+            found == Some(thread_id.clone()) || found == Some(fork_id.clone()),
+            "expected turn to resolve to either the original or forked thread, got {:?}",
+            found
+        );
+        Ok(())
+    }
+
+    /// A turn created exclusively on the forked branch must always resolve to
+    /// the fork — there is no ambiguity for turns that do not appear in the
+    /// original thread.
+    #[test]
+    fn find_thread_and_turn_fork_only_turn_routes_to_fork() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        tm.complete_turn(&thread_id, &turn_id)?;
+        let fork_id = tm.fork_thread(&thread_id, None)?;
+
+        // This turn exists only in the fork — lookup must be unambiguous.
+        let fork_turn_id = tm.start_turn(&fork_id, "fork-task".to_string(), AgentId::new())?;
+        let (found_thread_id, found_turn) = tm
+            .find_thread_and_turn(&fork_turn_id)
+            .ok_or_else(|| anyhow::anyhow!("find_thread_and_turn returned None for fork turn"))?;
+        assert_eq!(
+            found_thread_id, fork_id,
+            "fork-only turn must resolve to the fork, not the original"
+        );
+        assert_eq!(found_turn.id, fork_turn_id);
+        Ok(())
+    }
+
     #[test]
     fn steer_turn_appends_instruction() -> anyhow::Result<()> {
         let tm = ThreadManager::new();
@@ -536,12 +581,27 @@ mod tests {
     fn resume_thread_sets_status_to_idle() -> anyhow::Result<()> {
         let tm = ThreadManager::new();
         let thread_id = tm.start_thread(PathBuf::from("/tmp"));
-        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
-        tm.complete_turn(&thread_id, &turn_id)?;
+
+        // Manually archive the thread so we can validate the Archived → Idle
+        // transition. Without this the thread is already Idle after start_thread
+        // and resume_thread() would be a no-op with respect to status.
+        tm.threads_cache()
+            .get_mut(thread_id.as_str())
+            .ok_or_else(|| anyhow::anyhow!("thread missing before archive"))?
+            .status = harness_core::ThreadStatus::Archived;
+
+        {
+            let pre = tm
+                .get_thread(&thread_id)
+                .ok_or_else(|| anyhow::anyhow!("thread missing"))?;
+            assert_eq!(pre.status, harness_core::ThreadStatus::Archived);
+        }
+
         tm.resume_thread(&thread_id)?;
+
         let thread = tm
             .get_thread(&thread_id)
-            .ok_or_else(|| anyhow::anyhow!("thread missing"))?;
+            .ok_or_else(|| anyhow::anyhow!("thread missing after resume"))?;
         assert_eq!(thread.status, harness_core::ThreadStatus::Idle);
         Ok(())
     }
