@@ -753,7 +753,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use harness_core::{
-        AgentRequest, AgentResponse, Capability, ContextItem, EventFilters, StreamItem, TokenUsage,
+        AgentRequest, AgentResponse, Capability, ContextItem, EventFilters, ExecutionPhase,
+        StreamItem, TokenUsage,
     };
     use tokio::time::Duration;
 
@@ -956,7 +957,7 @@ mod tests {
 
         let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
         let queue = crate::task_queue::TaskQueue::unbounded();
-        let permit = queue.acquire("test").await.unwrap();
+        let permit = queue.acquire("test").await?;
         spawn_task(
             store,
             agent_clone,
@@ -1029,7 +1030,7 @@ mod tests {
         };
 
         let queue = crate::task_queue::TaskQueue::unbounded();
-        let permit = queue.acquire("test").await.unwrap();
+        let permit = queue.acquire("test").await?;
         let task_id = spawn_task(
             store.clone(),
             agent,
@@ -1152,7 +1153,7 @@ mod tests {
         };
 
         let queue = crate::task_queue::TaskQueue::unbounded();
-        let permit = queue.acquire("test").await.unwrap();
+        let permit = queue.acquire("test").await?;
         let task_id = spawn_task_with_worktree_detector(
             store.clone(),
             agent,
@@ -1208,6 +1209,191 @@ mod tests {
             }),
             "expected task_failure event containing panic payload, got: {:?}",
             failure_events
+        );
+        Ok(())
+    }
+
+    /// Mock agent that records the `execution_phase` from every call and
+    /// returns pre-configured responses in order.
+    struct PhaseCapturingAgent {
+        phases: tokio::sync::Mutex<Vec<Option<ExecutionPhase>>>,
+        responses: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl PhaseCapturingAgent {
+        fn new(responses: Vec<String>) -> Arc<Self> {
+            Arc::new(Self {
+                phases: tokio::sync::Mutex::new(Vec::new()),
+                responses: tokio::sync::Mutex::new(responses),
+            })
+        }
+
+        async fn captured_phases(&self) -> Vec<Option<ExecutionPhase>> {
+            self.phases.lock().await.clone()
+        }
+
+        async fn next_response(&self) -> String {
+            let mut guard = self.responses.lock().await;
+            if guard.is_empty() {
+                String::new()
+            } else {
+                guard.remove(0)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl harness_core::CodeAgent for PhaseCapturingAgent {
+        fn name(&self) -> &str {
+            "phase-capturing-mock"
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+
+        async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+            self.phases.lock().await.push(req.execution_phase);
+            let output = self.next_response().await;
+            Ok(AgentResponse {
+                output,
+                stderr: String::new(),
+                items: vec![],
+                token_usage: TokenUsage::default(),
+                model: "mock".into(),
+                exit_code: Some(0),
+            })
+        }
+
+        async fn execute_stream(
+            &self,
+            req: AgentRequest,
+            tx: tokio::sync::mpsc::Sender<StreamItem>,
+        ) -> harness_core::Result<()> {
+            self.phases.lock().await.push(req.execution_phase);
+            let output = self.next_response().await;
+            if !output.is_empty() {
+                if let Err(e) = tx.send(StreamItem::MessageDelta { text: output }).await {
+                    tracing::warn!("PhaseCapturingAgent: failed to send MessageDelta: {e}");
+                }
+            }
+            if let Err(e) = tx.send(StreamItem::Done).await {
+                tracing::warn!("PhaseCapturingAgent: failed to send Done: {e}");
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn planning_phase_is_set_on_initial_implementation_turn() -> anyhow::Result<()> {
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
+        let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
+
+        // Agent returns empty output (no PR URL) → task completes after implementation.
+        let agent = PhaseCapturingAgent::new(vec![String::new()]);
+        let agent_clone = agent.clone();
+
+        let req = CreateTaskRequest {
+            prompt: Some("implement something".into()),
+            project: Some(dir.path().to_path_buf()),
+            wait_secs: 0,
+            max_rounds: 0,
+            turn_timeout_secs: 30,
+            ..Default::default()
+        };
+
+        let queue = crate::task_queue::TaskQueue::unbounded();
+        let permit = queue.acquire("test").await?;
+        spawn_task(
+            store,
+            agent_clone,
+            None,
+            Default::default(),
+            skills,
+            events,
+            vec![],
+            req,
+            None,
+            permit,
+            None,
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let phases = agent.captured_phases().await;
+        assert!(
+            !phases.is_empty(),
+            "expected at least one agent call, got none"
+        );
+        assert_eq!(
+            phases[0],
+            Some(ExecutionPhase::Planning),
+            "initial implementation turn must use Planning phase"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validation_phase_is_set_on_review_loop_turns() -> anyhow::Result<()> {
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
+        let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
+
+        // Call 1 (execute_stream): return a PR URL to trigger the review loop.
+        // Call 2 (execute): return LGTM to complete the review loop.
+        let agent = PhaseCapturingAgent::new(vec![
+            "PR_URL=https://github.com/owner/repo/pull/1".into(),
+            "LGTM".into(),
+        ]);
+        let agent_clone = agent.clone();
+
+        let req = CreateTaskRequest {
+            prompt: Some("implement something".into()),
+            project: Some(dir.path().to_path_buf()),
+            wait_secs: 0,
+            max_rounds: 1,
+            turn_timeout_secs: 30,
+            ..Default::default()
+        };
+
+        let queue = crate::task_queue::TaskQueue::unbounded();
+        let permit = queue.acquire("test").await?;
+        spawn_task(
+            store,
+            agent_clone,
+            None,
+            Default::default(),
+            skills,
+            events,
+            vec![],
+            req,
+            None,
+            permit,
+            None,
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let phases = agent.captured_phases().await;
+        assert!(
+            phases.len() >= 2,
+            "expected at least 2 agent calls (implementation + review check), got {}",
+            phases.len()
+        );
+        assert_eq!(
+            phases[0],
+            Some(ExecutionPhase::Planning),
+            "implementation turn must use Planning phase"
+        );
+        assert_eq!(
+            phases[1],
+            Some(ExecutionPhase::Validation),
+            "review check turn must use Validation phase"
         );
         Ok(())
     }
