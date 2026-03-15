@@ -1229,7 +1229,7 @@ mod startup_tests {
     use super::build_app_state;
     use crate::{server::HarnessServer, thread_manager::ThreadManager};
     use harness_agents::AgentRegistry;
-    use harness_core::HarnessConfig;
+    use harness_core::{HarnessConfig, SkillLocation};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -1239,40 +1239,83 @@ mod startup_tests {
         std::fs::create_dir_all(&project_root)?;
         let data_dir = sandbox.path().join("data");
 
-        // First startup: create a skill so it gets persisted to disk.
-        {
-            let mut config = HarnessConfig::default();
-            config.server.project_root = project_root.clone();
-            config.server.data_dir = data_dir.clone();
-            let server = Arc::new(HarnessServer::new(
-                config,
-                ThreadManager::new(),
-                AgentRegistry::new("test"),
-            ));
-            let state = build_app_state(server).await?;
-            let mut skills = state.engines.skills.write().await;
-            skills.create("my-test-skill".to_string(), "# My test skill".to_string());
-        }
+        // Redirect HOME to an empty sandbox directory so that
+        // $HOME/.harness/skills/ cannot shadow the persisted skill under
+        // data_dir, keeping the test isolated from machine state.
+        let fake_home = sandbox.path().join("home");
+        std::fs::create_dir_all(&fake_home)?;
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: test-only single-process env override; no concurrent thread
+        // modifies HOME during this test.  Restored unconditionally before return.
+        unsafe { std::env::set_var("HOME", &fake_home) };
 
-        // Second startup: verify the persisted skill is reloaded via discover().
-        {
-            let mut config = HarnessConfig::default();
-            config.server.project_root = project_root.clone();
-            config.server.data_dir = data_dir.clone();
-            let server = Arc::new(HarnessServer::new(
-                config,
-                ThreadManager::new(),
-                AgentRegistry::new("test"),
-            ));
-            let state = build_app_state(server).await?;
-            let skills = state.engines.skills.read().await;
+        let outcome: anyhow::Result<()> = async {
+            // First startup: create a skill so it gets persisted to disk.
+            {
+                let mut config = HarnessConfig::default();
+                config.server.project_root = project_root.clone();
+                config.server.data_dir = data_dir.clone();
+                let server = Arc::new(HarnessServer::new(
+                    config,
+                    ThreadManager::new(),
+                    AgentRegistry::new("test"),
+                ));
+                let state = build_app_state(server).await?;
+                let mut skills = state.engines.skills.write().await;
+                skills.create("my-test-skill".to_string(), "# My test skill".to_string());
+            }
+
+            // Assert the skill file was physically written to data_dir/skills/
+            // before the second startup, catching a broken persist_dir path early.
+            let persisted_path = data_dir.join("skills").join("my-test-skill.md");
             assert!(
-                skills.list().iter().any(|s| s.name == "my-test-skill"),
-                "expected persisted skill to be reloaded after restart"
+                persisted_path.exists(),
+                "expected skill file to be written to {}",
+                persisted_path.display()
             );
+
+            // Second startup: verify the persisted skill is reloaded via discover().
+            {
+                let mut config = HarnessConfig::default();
+                config.server.project_root = project_root.clone();
+                config.server.data_dir = data_dir.clone();
+                let server = Arc::new(HarnessServer::new(
+                    config,
+                    ThreadManager::new(),
+                    AgentRegistry::new("test"),
+                ));
+                let state = build_app_state(server).await?;
+                let skills = state.engines.skills.read().await;
+                let reloaded = skills
+                    .list()
+                    .iter()
+                    .find(|s| s.name == "my-test-skill")
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("expected persisted skill to be reloaded after restart")
+                    })?;
+                // Confirm the skill came from data_dir/skills/ (System location),
+                // not from $HOME/.harness/skills/ or /etc/harness/skills/.
+                assert_eq!(
+                    reloaded.location,
+                    SkillLocation::System,
+                    "reloaded skill has location {:?}; expected System (data_dir/skills/)",
+                    reloaded.location
+                );
+            }
+
+            Ok(())
+        }
+        .await;
+
+        // Restore HOME regardless of outcome so parallel tests are not affected.
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
         }
 
-        Ok(())
+        outcome
     }
 
     #[tokio::test]
