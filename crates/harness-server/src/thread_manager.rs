@@ -297,9 +297,16 @@ impl ThreadManager {
             }
         }
 
-        // Rewrite each cloned turn's thread_id to point at the new thread.
+        // Rewrite each cloned turn: assign a fresh TurnId (so source and fork
+        // never share turn identifiers) and update thread_id to the new thread.
+        // Any Running turn has no corresponding task handle in the fork, so
+        // finalize it as Completed to keep the snapshot internally consistent.
         for turn in &mut new_thread.turns {
+            turn.id = TurnId::new();
             turn.thread_id = new_thread.id.clone();
+            if matches!(turn.status, TurnStatus::Running) {
+                turn.complete();
+            }
         }
 
         let new_id = new_thread.id.clone();
@@ -565,7 +572,7 @@ mod tests {
     fn fork_thread_creates_independent_copy() -> anyhow::Result<()> {
         let tm = ThreadManager::new();
         let orig_id = tm.start_thread(PathBuf::from("/src"));
-        tm.start_turn(&orig_id, "t1".to_string(), AgentId::new())?;
+        let orig_turn_id = tm.start_turn(&orig_id, "t1".to_string(), AgentId::new())?;
 
         let fork_id = tm.fork_thread(&orig_id, None)?;
         assert_ne!(fork_id, orig_id);
@@ -575,13 +582,57 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("fork missing"))?;
         assert_eq!(fork.project_root, PathBuf::from("/src"));
         assert_eq!(fork.turns.len(), 1);
-        // Every cloned turn must reference the fork's ID, not the original's.
+
         for turn in &fork.turns {
+            // thread_id must point at the fork, not the source.
             assert_eq!(
                 turn.thread_id, fork_id,
                 "turn thread_id not updated after fork"
             );
+            // Each cloned turn must have a fresh TurnId so source and fork
+            // never share identifiers (prevents cross-thread RPC collisions).
+            assert_ne!(turn.id, orig_turn_id, "cloned turn must have a new TurnId");
+            // A Running turn has no task handle in the fork; it must be finalized.
+            assert_eq!(
+                turn.status,
+                TurnStatus::Completed,
+                "running turn must be finalized as Completed in the fork"
+            );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn fork_thread_running_turn_has_no_duplicate_turn_id() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let orig_id = tm.start_thread(PathBuf::from("/src"));
+        let orig_turn_id = tm.start_turn(&orig_id, "work".to_string(), AgentId::new())?;
+
+        let fork_id = tm.fork_thread(&orig_id, None)?;
+
+        // find_thread_for_turn must resolve each ID unambiguously.
+        let resolved_orig = tm.find_thread_for_turn(&orig_turn_id);
+        assert_eq!(
+            resolved_orig,
+            Some(orig_id),
+            "source turn must stay in source thread"
+        );
+
+        let fork = tm
+            .get_thread(&fork_id)
+            .ok_or_else(|| anyhow::anyhow!("fork missing"))?;
+        let fork_turn_id = fork
+            .turns
+            .first()
+            .map(|t| t.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("fork has no turns"))?;
+
+        let resolved_fork = tm.find_thread_for_turn(&fork_turn_id);
+        assert_eq!(
+            resolved_fork,
+            Some(fork_id),
+            "fork turn must resolve to fork thread"
+        );
         Ok(())
     }
 
