@@ -179,29 +179,17 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
+    use crate::{
+        http::AppState,
+        server::HarnessServer,
+        test_helpers::{make_test_state, make_test_state_with_registry},
+        thread_manager::ThreadManager,
+    };
     use harness_agents::AgentRegistry;
     use harness_core::HarnessConfig;
     use harness_protocol::{Method, RpcRequest, INTERNAL_ERROR};
     use std::sync::Arc;
     use tokio::sync::RwLock;
-
-    async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
-        make_test_state_with_config_and_registry(
-            dir,
-            HarnessConfig::default(),
-            AgentRegistry::new("test"),
-        )
-        .await
-    }
-
-    async fn make_test_state_with_registry(
-        dir: &std::path::Path,
-        agent_registry: AgentRegistry,
-    ) -> anyhow::Result<AppState> {
-        make_test_state_with_config_and_registry(dir, HarnessConfig::default(), agent_registry)
-            .await
-    }
 
     async fn make_test_state_with_config_and_registry(
         dir: &std::path::Path,
