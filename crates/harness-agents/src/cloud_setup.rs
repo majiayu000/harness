@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
@@ -146,7 +147,9 @@ pub(crate) async fn run_setup_phase(
         cmd.arg("-lc")
             .arg(setup_command)
             .current_dir(project_root)
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         apply_setup_environment(&mut cmd, cloud);
         crate::process_group::apply_process_group_management(&mut cmd);
 
