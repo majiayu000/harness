@@ -876,7 +876,7 @@ async fn api_auth_middleware(
     let query_token: Option<String> = if path == "/ws" || path == "/" {
         req.uri().query().and_then(|q| {
             q.split('&')
-                .find_map(|kv| kv.strip_prefix("token=").map(|v| percent_decode(v)))
+                .find_map(|kv| kv.strip_prefix("token=").map(percent_decode))
         })
     } else {
         None
