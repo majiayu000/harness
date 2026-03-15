@@ -720,3 +720,105 @@ async fn intake_status_recent_dispatches_empty_initially() -> anyhow::Result<()>
     assert!(json["recent_dispatches"].as_array().unwrap().is_empty());
     Ok(())
 }
+
+/// Build a minimal router that includes the auth middleware, mirroring how the
+/// real server wires up the dashboard and tasks endpoints.
+fn authed_app(state: Arc<AppState>) -> Router {
+    use axum::middleware;
+    Router::new()
+        .route("/", get(crate::dashboard::index))
+        .route("/health", get(health_check))
+        .route("/tasks", get(list_tasks))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            api_auth_middleware,
+        ))
+        .with_state(state)
+}
+
+#[tokio::test]
+async fn dashboard_requires_auth_when_token_configured() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::HarnessConfig::default();
+    config.server.api_token = Some("secret123".to_string());
+    let state = make_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = authed_app(state);
+
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dashboard_accessible_via_query_param_token() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::HarnessConfig::default();
+    config.server.api_token = Some("secret123".to_string());
+    let state = make_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = authed_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/?token=secret123")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dashboard_query_param_token_percent_decoded() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::HarnessConfig::default();
+    // Token contains characters that encodeURIComponent would encode.
+    config.server.api_token = Some("tok/en=val+end".to_string());
+    let state = make_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = authed_app(state);
+
+    // Simulate the encodeURIComponent output: / → %2F, = → %3D, + → %2B
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/?token=tok%2Fen%3Dval%2Bend")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dashboard_no_auth_configured_remains_public() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = authed_app(state);
+
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
