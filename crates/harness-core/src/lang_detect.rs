@@ -109,12 +109,40 @@ fn has_spec_dir(project_root: &Path) -> bool {
     project_root.join("spec").is_dir()
 }
 
+// ── Prompt instruction builder ───────────────────────────────────────────────
+
+/// Generate validation instructions to inject into agent prompts.
+///
+/// Instead of running validation externally, these instructions tell the agent
+/// what commands to run before committing. The agent discovers available tools
+/// and adapts to the project environment.
+pub fn validation_prompt_instructions(lang: Language, project_root: &Path) -> String {
+    let pre_commit = default_pre_commit_commands(lang, project_root);
+    let pre_push = default_pre_push_commands(lang, project_root);
+
+    if pre_commit.is_empty() && pre_push.is_empty() {
+        return String::new();
+    }
+
+    let mut parts = Vec::new();
+    parts.push("Before committing, run these validation commands and fix any errors:".to_string());
+
+    for cmd in &pre_commit {
+        parts.push(format!("- `{cmd}`"));
+    }
+    for cmd in &pre_push {
+        parts.push(format!("- `{cmd}`"));
+    }
+
+    parts.join("\n")
+}
+
 // ── Command builders ──────────────────────────────────────────────────────────
 
 /// Default pre-commit validation commands for the detected language.
 ///
-/// These commands run after agent output to verify formatting, compilation,
-/// and linting before continuing to the review loop.
+/// Used by `validation_prompt_instructions` to generate agent prompt text.
+/// Also used by `PostExecutionValidator` when explicit config commands are set.
 pub fn default_pre_commit_commands(lang: Language, project_root: &Path) -> Vec<String> {
     match lang {
         Language::Rust => {
@@ -143,10 +171,7 @@ pub fn default_pre_commit_commands(lang: Language, project_root: &Path) -> Vec<S
             }
             cmds
         }
-        Language::Python => vec![
-            "ruff format .".to_string(),
-            "ruff check .".to_string(),
-        ],
+        Language::Python => vec!["ruff format .".to_string(), "ruff check .".to_string()],
         Language::Java => {
             if is_gradle_project(project_root) {
                 vec!["./gradlew check".to_string()]
@@ -154,10 +179,7 @@ pub fn default_pre_commit_commands(lang: Language, project_root: &Path) -> Vec<S
                 vec!["mvn compile -B".to_string()]
             }
         }
-        Language::CSharp => vec![
-            "dotnet format".to_string(),
-            "dotnet build".to_string(),
-        ],
+        Language::CSharp => vec!["dotnet format".to_string(), "dotnet build".to_string()],
         Language::Ruby => {
             if has_rubocop_config(project_root) {
                 vec!["bundle exec rubocop".to_string()]
@@ -544,5 +566,25 @@ mod tests {
         let dir = tmpdir();
         assert!(default_pre_commit_commands(Language::Common, dir.path()).is_empty());
         assert!(default_pre_push_commands(Language::Common, dir.path()).is_empty());
+    }
+
+    // ── validation_prompt_instructions ────────────────────────────────────────
+
+    #[test]
+    fn rust_prompt_instructions_include_all_commands() {
+        let dir = tmpdir();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"foo\"").unwrap();
+        let instructions = validation_prompt_instructions(Language::Rust, dir.path());
+        assert!(instructions.contains("cargo fmt"));
+        assert!(instructions.contains("cargo check"));
+        assert!(instructions.contains("cargo clippy"));
+        assert!(instructions.contains("cargo test"));
+    }
+
+    #[test]
+    fn common_language_returns_empty_instructions() {
+        let dir = tmpdir();
+        let instructions = validation_prompt_instructions(Language::Common, dir.path());
+        assert!(instructions.is_empty());
     }
 }

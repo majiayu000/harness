@@ -5,9 +5,9 @@ use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
 use harness_core::{
-    config::load_project_config, interceptor::ToolUseEvent, prompts, AgentRequest, AgentResponse,
-    CodeAgent, ContextItem, Event, ExecutionPhase, HarnessError, Item, SessionId, StreamItem,
-    ThreadId, TokenUsage, TurnId, TurnStatus,
+    config::load_project_config, interceptor::ToolUseEvent, lang_detect, prompts, AgentRequest,
+    AgentResponse, CodeAgent, ContextItem, Event, ExecutionPhase, HarnessError, Item, SessionId,
+    StreamItem, ThreadId, TokenUsage, TurnId, TurnStatus,
 };
 use harness_protocol::{Notification, RpcNotification};
 use std::path::{Path, PathBuf};
@@ -308,6 +308,23 @@ pub(crate) async fn run_task(
         prompts::check_existing_pr(pr, &review_config.review_bot_command)
     } else {
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default(), git)
+    };
+
+    // Inject language-detected validation instructions into the prompt when no
+    // explicit validation config is set. This delegates validation to the agent
+    // instead of running external commands that may not be installed.
+    let first_prompt = if project_config.validation.pre_commit.is_empty()
+        && project_config.validation.pre_push.is_empty()
+    {
+        let lang = lang_detect::detect_language(&project);
+        let instructions = lang_detect::validation_prompt_instructions(lang, &project);
+        if instructions.is_empty() {
+            first_prompt
+        } else {
+            format!("{first_prompt}\n\n{instructions}")
+        }
+    } else {
+        first_prompt
     };
 
     let context_items = collect_context_items(&skills, &project, &first_prompt).await;
