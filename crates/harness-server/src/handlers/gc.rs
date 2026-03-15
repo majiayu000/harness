@@ -31,7 +31,9 @@ pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcRespo
                 error = %err,
                 "gc/run rejected before scan"
             );
-            return RpcResponse::error(id, VALIDATION_ERROR, err.to_string());
+            // validate_scan_request(None) only fails when no guards are registered,
+            // which is a server-side misconfiguration, not a client input error.
+            return RpcResponse::error(id, INTERNAL_ERROR, err.to_string());
         }
         let guard_count = rules.guards().len();
         let violations = match rules.scan(&project_root).await {
@@ -84,7 +86,9 @@ pub async fn gc_run(state: &AppState, id: Option<serde_json::Value>) -> RpcRespo
             Ok(v) => RpcResponse::success(id, v),
             Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
         },
-        Err(e) => RpcResponse::error(id, AGENT_ERROR, e.to_string()),
+        // run() propagates storage errors via ? (e.g. expire_stale_drafts);
+        // agent execution failures are collected into report.errors, not returned as Err.
+        Err(e) => RpcResponse::error(id, STORAGE_ERROR, e.to_string()),
     }
 }
 
@@ -174,7 +178,16 @@ pub async fn gc_adopt(
                 serde_json::json!({ "adopted": true, "task_id": task_id }),
             )
         }
-        Err(e) => RpcResponse::error(id, STORAGE_ERROR, e.to_string()),
+        Err(e) => {
+            let msg = e.to_string();
+            // Path safety checks in adopt() fire before any I/O and produce
+            // validation errors, not storage errors.
+            if msg.contains("target_path must") {
+                RpcResponse::error(id, VALIDATION_ERROR, msg)
+            } else {
+                RpcResponse::error(id, STORAGE_ERROR, msg)
+            }
+        }
     }
 }
 
@@ -249,6 +262,15 @@ pub async fn gc_reject(
 ) -> RpcResponse {
     match state.engines.gc_agent.reject(&draft_id, reason.as_deref()) {
         Ok(()) => RpcResponse::success(id, serde_json::json!({ "rejected": true })),
-        Err(e) => RpcResponse::error(id, STORAGE_ERROR, e.to_string()),
+        Err(e) => {
+            let msg = e.to_string();
+            // reject() returns "draft not found" for an unknown ID, which is a
+            // missing-resource error, not a storage fault.
+            if msg.contains("draft not found") {
+                RpcResponse::error(id, NOT_FOUND, msg)
+            } else {
+                RpcResponse::error(id, STORAGE_ERROR, msg)
+            }
+        }
     }
 }
