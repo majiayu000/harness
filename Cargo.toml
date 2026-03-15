@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.3"
+version = "0.6.5"
 edition = "2021"
 license = "MIT"
 rust-version = "1.75"
@@ -91,6 +91,7 @@ futures = "0.3"
 tokio-stream = "0.1"
 hmac = "0.12"
 sha2 = "0.10"
+nix = { version = "0.29", features = ["process", "signal"], default-features = false }
 
 # HTTP client (for Anthropic API)
 reqwest = { version = "0.12", features = ["json", "stream"] }

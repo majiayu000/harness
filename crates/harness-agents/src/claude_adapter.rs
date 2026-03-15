@@ -51,6 +51,7 @@ impl AgentAdapter for ClaudeAdapter {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         crate::strip_claude_env(&mut cmd);
+        crate::process_group::apply_process_group_management(&mut cmd);
 
         if !req.allowed_tools.is_empty() {
             cmd.arg("--allowedTools").arg(req.allowed_tools.join(","));
@@ -62,9 +63,24 @@ impl AgentAdapter for ClaudeAdapter {
             harness_core::HarnessError::AgentExecution(format!("failed to spawn claude: {e}"))
         })?;
 
+        let child_pid = child.id();
+        // ProcessGroupGuard kills the entire process group on drop (including
+        // grandchildren that kill_on_drop(true) misses). Fires even if this
+        // future is cancelled mid-execution due to an external timeout.
+        let _pg_guard = crate::process_group::ProcessGroupGuard::new(child_pid);
+
         let stdout = child.stdout.take().ok_or_else(|| {
             harness_core::HarnessError::AgentExecution("no stdout from claude process".into())
         })?;
+
+        // Drain stderr in a background task so the pipe buffer never fills up.
+        // A full stderr pipe causes the child to block, triggering stall timeout
+        // and leaving orphan processes.
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                crate::streaming::filter_agent_stderr(stderr, "claude").await;
+            });
+        }
 
         // Store child handle for interrupt()
         {
@@ -73,12 +89,20 @@ impl AgentAdapter for ClaudeAdapter {
         }
 
         if tx.send(AgentEvent::TurnStarted).await.is_err() {
+            let mut guard = self.child.lock().await;
+            if let Some(ref mut child) = *guard {
+                if let Err(e) = child.kill().await {
+                    tracing::debug!("claude kill on early send failure: {e}");
+                }
+            }
+            *guard = None;
             return Ok(());
         }
 
         let reader = tokio::io::BufReader::new(stdout);
         let mut lines = reader.lines();
         let mut output_buf = String::new();
+        let mut send_failed = false;
 
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
@@ -96,37 +120,46 @@ impl AgentAdapter for ClaudeAdapter {
             }
 
             if tx.send(event).await.is_err() {
+                send_failed = true;
                 break;
             }
         }
 
-        // Wait for process to finish and get exit status
-        let exit_status = {
+        // Kill immediately on send failure (receiver dropped); wait otherwise.
+        {
             let mut guard = self.child.lock().await;
             if let Some(ref mut child) = *guard {
-                child.wait().await.ok()
-            } else {
-                None
+                if send_failed {
+                    if let Err(e) = child.kill().await {
+                        tracing::debug!("claude kill on send failure: {e}");
+                    }
+                } else {
+                    let exit_status = child.wait().await.ok();
+                    if let Some(status) = exit_status {
+                        if !status.success()
+                            && tx
+                                .send(AgentEvent::Error {
+                                    message: format!("claude exited with {status}"),
+                                })
+                                .await
+                                .is_err()
+                        {
+                            tracing::debug!("claude: receiver dropped before error event");
+                        }
+                    }
+                }
             }
-        };
-
-        if let Some(status) = exit_status {
-            if !status.success() {
-                let _ = tx
-                    .send(AgentEvent::Error {
-                        message: format!("claude exited with {status}"),
-                    })
-                    .await;
-            }
+            *guard = None;
         }
 
-        let _ = tx
-            .send(AgentEvent::TurnCompleted { output: output_buf })
-            .await;
-
-        // Clean up child handle
-        let mut guard = self.child.lock().await;
-        *guard = None;
+        if !send_failed
+            && tx
+                .send(AgentEvent::TurnCompleted { output: output_buf })
+                .await
+                .is_err()
+        {
+            tracing::debug!("claude: receiver dropped before TurnCompleted");
+        }
 
         Ok(())
     }

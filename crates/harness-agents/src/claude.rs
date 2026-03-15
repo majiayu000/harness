@@ -95,10 +95,19 @@ impl CodeAgent for ClaudeCodeAgent {
 
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
-            .current_dir(&req.project_root);
+            .current_dir(&req.project_root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
         crate::strip_claude_env(&mut cmd);
+        crate::process_group::apply_process_group_management(&mut cmd);
 
-        let output = cmd.output().await.map_err(|e| {
+        let child = cmd.spawn().map_err(|e| {
+            harness_core::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
+        })?;
+        let _pg_guard = crate::process_group::ProcessGroupGuard::new(child.id());
+
+        let output = child.wait_with_output().await.map_err(|e| {
             harness_core::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
         })?;
 
@@ -144,10 +153,12 @@ impl CodeAgent for ClaudeCodeAgent {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         crate::strip_claude_env(&mut cmd);
+        crate::process_group::apply_process_group_management(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|error| {
             harness_core::HarnessError::AgentExecution(format!("failed to run claude: {error}"))
         })?;
+        let _pg_guard = crate::process_group::ProcessGroupGuard::new(child.id());
 
         if let Some(stderr) = child.stderr.take() {
             let agent = self.name().to_string();
