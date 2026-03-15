@@ -2,7 +2,9 @@ use super::*;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Request;
-use harness_core::{AgentRequest, AgentResponse, Capability, CodeAgent, StreamItem, TokenUsage};
+use harness_core::{
+    AgentRequest, AgentResponse, Capability, CodeAgent, StreamItem, TaskComplexity, TokenUsage,
+};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::sync::Arc;
@@ -11,12 +13,14 @@ use tower::ServiceExt;
 
 struct CapturingAgent {
     prompts: Mutex<Vec<String>>,
+    executed: tokio::sync::Notify,
 }
 
 impl CapturingAgent {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             prompts: Mutex::new(Vec::new()),
+            executed: tokio::sync::Notify::new(),
         })
     }
 }
@@ -33,6 +37,7 @@ impl CodeAgent for CapturingAgent {
 
     async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
         self.prompts.lock().await.push(req.prompt);
+        self.executed.notify_one();
         Ok(AgentResponse {
             output: String::new(),
             stderr: String::new(),
@@ -50,9 +55,11 @@ impl CodeAgent for CapturingAgent {
 
     async fn execute_stream(
         &self,
-        _req: AgentRequest,
+        req: AgentRequest,
         _tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::Result<()> {
+        self.prompts.lock().await.push(req.prompt);
+        self.executed.notify_one();
         Ok(())
     }
 }
@@ -753,10 +760,22 @@ async fn create_task_with_unregistered_agent_name_returns_bad_request() -> anyho
 #[tokio::test]
 async fn create_task_with_registered_agent_name_returns_accepted() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+
+    // Register two agents: "test" as default and "alt-agent" as a second option.
+    // The request names "alt-agent" explicitly — only that agent must execute.
+    let default_agent = CapturingAgent::new();
+    let alt_agent = CapturingAgent::new();
+    let mut registry = harness_agents::AgentRegistry::new("test");
+    registry.register("test", default_agent.clone());
+    registry.register("alt-agent", alt_agent.clone());
+    let state =
+        make_test_state_with(dir.path(), harness_core::HarnessConfig::default(), registry).await?;
     let app = task_app(state.clone());
 
-    let body = serde_json::json!({ "prompt": "fix the login bug", "agent": "test" });
+    // Set up notification futures before the HTTP call so we don't miss early fires.
+    let alt_executed = alt_agent.executed.notified();
+
+    let body = serde_json::json!({ "prompt": "fix the login bug", "agent": "alt-agent" });
     let response = app
         .oneshot(
             Request::builder()
@@ -768,18 +787,37 @@ async fn create_task_with_registered_agent_name_returns_accepted() -> anyhow::Re
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    // Wait for the background task to run the named agent.
+    tokio::time::timeout(std::time::Duration::from_secs(5), alt_executed)
+        .await
+        .map_err(|_| anyhow::anyhow!("alt-agent did not execute within 5 s"))?;
+
+    // The named agent must have received exactly the one prompt.
+    assert_eq!(alt_agent.prompts.lock().await.len(), 1);
+    // The default agent must not have been invoked at all.
+    assert_eq!(default_agent.prompts.lock().await.len(), 0);
+
     Ok(())
 }
 
 #[tokio::test]
 async fn create_task_complex_prompt_dispatches_via_registry() -> anyhow::Result<()> {
-    // A prompt with 6+ file references is classified as Complex.
-    // dispatch() tries "claude" then "anthropic-api" then falls back to default.
-    // With only the default agent registered, dispatch must still succeed.
+    // A prompt with 6+ file references must be classified Complex and routed to
+    // the "claude" agent.  dispatch() prefers "claude" over "anthropic-api" over
+    // the default agent for Complex/Critical tasks.
     let dir = tempfile::tempdir()?;
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
-    let before_count = state.core.tasks.count();
+
+    let default_agent = CapturingAgent::new();
+    let claude_agent = CapturingAgent::new();
+    let mut registry = harness_agents::AgentRegistry::new("test");
+    registry.register("test", default_agent.clone());
+    registry.register("claude", claude_agent.clone());
+    let state =
+        make_test_state_with(dir.path(), harness_core::HarnessConfig::default(), registry).await?;
     let app = task_app(state.clone());
+
+    let claude_executed = claude_agent.executed.notified();
 
     let body = serde_json::json!({
         "prompt": "Refactor src/a.rs src/b.rs src/c.rs src/d.rs src/e.rs src/f.rs to reduce duplication"
@@ -795,18 +833,35 @@ async fn create_task_complex_prompt_dispatches_via_registry() -> anyhow::Result<
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(state.core.tasks.count(), before_count + 1);
+
+    // dispatch() must have routed to "claude" because the prompt has 6 file refs → Complex.
+    tokio::time::timeout(std::time::Duration::from_secs(5), claude_executed)
+        .await
+        .map_err(|_| anyhow::anyhow!("claude agent did not execute within 5 s"))?;
+
+    assert_eq!(claude_agent.prompts.lock().await.len(), 1);
+    assert_eq!(default_agent.prompts.lock().await.len(), 0);
+
     Ok(())
 }
 
 #[tokio::test]
 async fn create_task_with_issue_number_bumps_complexity_and_dispatches() -> anyhow::Result<()> {
-    // A simple prompt with an issue number is bumped to Medium complexity.
-    // dispatch() should still succeed, falling back to the default agent.
+    // An issue-only request has no file references → would be Simple, but
+    // complexity_router::classify() bumps it to Medium when issue is present.
+    // Medium tasks use the default agent, NOT "claude" (which is reserved for Complex+).
     let dir = tempfile::tempdir()?;
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
-    let before_count = state.core.tasks.count();
+
+    let default_agent = CapturingAgent::new();
+    let claude_agent = CapturingAgent::new();
+    let mut registry = harness_agents::AgentRegistry::new("test");
+    registry.register("test", default_agent.clone());
+    registry.register("claude", claude_agent.clone());
+    let state =
+        make_test_state_with(dir.path(), harness_core::HarnessConfig::default(), registry).await?;
     let app = task_app(state.clone());
+
+    let default_executed = default_agent.executed.notified();
 
     let body = serde_json::json!({ "issue": 93 });
     let response = app
@@ -820,6 +875,23 @@ async fn create_task_with_issue_number_bumps_complexity_and_dispatches() -> anyh
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(state.core.tasks.count(), before_count + 1);
+
+    // Wait for the dispatch path to complete.
+    tokio::time::timeout(std::time::Duration::from_secs(5), default_executed)
+        .await
+        .map_err(|_| anyhow::anyhow!("default agent did not execute within 5 s"))?;
+
+    // classify() must bump issue-only from Simple to Medium.
+    let classification = crate::complexity_router::classify("", Some(93), None);
+    assert_eq!(
+        classification.complexity,
+        TaskComplexity::Medium,
+        "issue-only request must be bumped from Simple to Medium"
+    );
+
+    // Medium → default agent (not "claude", which handles Complex+).
+    assert_eq!(default_agent.prompts.lock().await.len(), 1);
+    assert_eq!(claude_agent.prompts.lock().await.len(), 0);
+
     Ok(())
 }
