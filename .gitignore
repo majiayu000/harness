@@ -1,5 +1,5 @@
 /target/
-config/*.toml
+config/default.toml
 exec-plan-*.md
 .harness/*
 !.harness/guards
