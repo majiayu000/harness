@@ -60,7 +60,6 @@ pub async fn make_test_state_with_registry(
             tasks,
             thread_db: Some(thread_db),
             plan_db: None,
-            plans: Default::default(),
             project_registry: None,
         },
         engines: crate::http::EngineServices {

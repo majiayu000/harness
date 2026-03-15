@@ -64,8 +64,6 @@ pub struct CoreServices {
     pub tasks: Arc<task_runner::TaskStore>,
     pub thread_db: Option<crate::thread_db::ThreadDb>,
     pub plan_db: Option<crate::plan_db::PlanDb>,
-    pub plans:
-        Arc<RwLock<std::collections::HashMap<harness_core::ExecPlanId, harness_exec::ExecPlan>>>,
     pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
 }
 
@@ -425,18 +423,6 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             project_root,
             tasks,
             thread_db: Some(thread_db),
-            plans: {
-                let mut map = std::collections::HashMap::new();
-                match plan_db.list().await {
-                    Ok(persisted) => {
-                        for plan in persisted {
-                            map.insert(plan.id.clone(), plan);
-                        }
-                    }
-                    Err(e) => tracing::warn!("failed to load persisted plans on startup: {e}"),
-                }
-                Arc::new(RwLock::new(map))
-            },
             plan_db: Some(plan_db),
             project_registry: Some(project_registry),
         },
