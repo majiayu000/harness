@@ -66,6 +66,12 @@ db_path = "~/.local/share/harness/harness.db"
 session_renewal_secs = 1800
 log_retention_days = 90
 
+[concurrency]
+max_concurrent_tasks = 4
+max_queue_size = 32
+# Seconds of silence from the agent stream before declaring a stall.
+stall_timeout_secs = 300
+
 [otel]
 environment = "development"
 exporter = "disabled"

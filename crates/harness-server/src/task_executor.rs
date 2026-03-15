@@ -191,11 +191,16 @@ fn compute_backoff_ms(base_ms: u64, max_ms: u64, attempt: u32) -> u64 {
 /// Execute an agent request via [`CodeAgent::execute_stream`], broadcasting
 /// each [`StreamItem`] to the per-task channel in real time, and reconstruct
 /// an [`AgentResponse`] from the collected stream events.
+///
+/// `stall_timeout` caps the maximum duration of silence from the agent stream;
+/// if no [`StreamItem`] arrives within this window the function returns
+/// [`HarnessError::AgentExecution`] with a stall description.
 async fn run_agent_streaming(
     agent: &dyn CodeAgent,
     req: AgentRequest,
     task_id: &TaskId,
     store: &TaskStore,
+    stall_timeout: Duration,
 ) -> harness_core::Result<AgentResponse> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamItem>(128);
     let mut exec = std::pin::pin!(agent.execute_stream(req, tx));
@@ -203,6 +208,7 @@ async fn run_agent_streaming(
     let mut channel_closed = false;
     let mut output = String::new();
     let mut token_usage = TokenUsage::default();
+    let mut last_activity = Instant::now();
 
     loop {
         tokio::select! {
@@ -212,6 +218,7 @@ async fn run_agent_streaming(
             item = rx.recv(), if !channel_closed => {
                 match item {
                     Some(item) => {
+                        last_activity = Instant::now();
                         store.publish_stream_item(task_id, item.clone());
                         match &item {
                             StreamItem::MessageDelta { text } => {
@@ -236,6 +243,18 @@ async fn run_agent_streaming(
                         channel_closed = true;
                     }
                 }
+            }
+            _ = tokio::time::sleep_until(last_activity + stall_timeout) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    elapsed_secs = last_activity.elapsed().as_secs(),
+                    "agent stream stalled: no output for {}s",
+                    stall_timeout.as_secs()
+                );
+                return Err(HarnessError::AgentExecution(format!(
+                    "agent stalled: no output for {}s",
+                    stall_timeout.as_secs()
+                )));
             }
         }
         if exec_result.is_some() && channel_closed {
@@ -313,6 +332,7 @@ pub(crate) async fn run_task(
     let context_items = collect_context_items(&skills, &project, &first_prompt).await;
 
     let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
+    let stall_timeout = Duration::from_secs(req.stall_timeout_secs);
 
     let initial_req = AgentRequest {
         prompt: first_prompt,
@@ -340,7 +360,7 @@ pub(crate) async fn run_task(
     let resp = loop {
         let raw = tokio::time::timeout(
             turn_timeout,
-            run_agent_streaming(agent, impl_req.clone(), task_id, store),
+            run_agent_streaming(agent, impl_req.clone(), task_id, store, stall_timeout),
         )
         .await;
         match raw {
@@ -899,5 +919,79 @@ mod tests {
                                                           // Should back up to byte 2 (1 full "é").
         assert!(result.starts_with("é"));
         assert!(result.contains("(output truncated,"));
+    }
+
+    /// A mock agent that never sends any stream items and never resolves, simulating
+    /// a hung agent that produces no output.
+    struct HangingAgent;
+
+    #[async_trait::async_trait]
+    impl harness_core::CodeAgent for HangingAgent {
+        fn name(&self) -> &str {
+            "hanging"
+        }
+
+        fn capabilities(&self) -> Vec<harness_core::Capability> {
+            vec![]
+        }
+
+        async fn execute(
+            &self,
+            _req: harness_core::AgentRequest,
+        ) -> harness_core::Result<harness_core::AgentResponse> {
+            std::future::pending().await
+        }
+
+        async fn execute_stream(
+            &self,
+            _req: harness_core::AgentRequest,
+            _tx: tokio::sync::mpsc::Sender<harness_core::StreamItem>,
+        ) -> harness_core::Result<()> {
+            // Hang forever — no output, no completion.
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn stall_detection_fires_when_agent_produces_no_output() {
+        let dir = crate::test_helpers::tempdir_in_home("harness-stall-test-").unwrap();
+        // Open the store with real time so the SQLite pool can initialise.
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await.unwrap();
+        let task_id = TaskId::new();
+
+        let req = harness_core::AgentRequest {
+            prompt: "test".into(),
+            project_root: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let stall_timeout = Duration::from_millis(50);
+
+        // Pause time after the store is open so sleep_until is fully controlled.
+        tokio::time::pause();
+
+        let store_clone = store.clone();
+        let task_id_clone = task_id.clone();
+        let handle = tokio::spawn(async move {
+            run_agent_streaming(
+                &HangingAgent,
+                req,
+                &task_id_clone,
+                &store_clone,
+                stall_timeout,
+            )
+            .await
+        });
+
+        // Advance past the stall window so the sleep_until branch fires.
+        tokio::time::advance(Duration::from_millis(100)).await;
+
+        let result = handle.await.unwrap();
+        assert!(result.is_err(), "expected stall error but got Ok");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("stalled"),
+            "expected 'stalled' in error message, got: {err}"
+        );
     }
 }
