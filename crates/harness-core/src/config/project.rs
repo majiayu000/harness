@@ -19,9 +19,9 @@ pub struct ProjectReviewConfig {
     #[serde(default)]
     pub bot_command: Option<String>,
     /// GitHub login of the review bot user override (e.g. "gemini-code-assist[bot]").
-    /// When `bot_command` is overridden but this is absent, the resolved
-    /// reviewer_name is cleared so the freshness check is not locked to the
-    /// wrong default bot login.
+    /// When absent, the server default reviewer_name is inherited unchanged.
+    /// If `bot_command` is changed to a bot with a different GitHub login,
+    /// this field must also be set explicitly.
     #[serde(default)]
     pub reviewer_name: Option<String>,
 }

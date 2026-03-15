@@ -33,21 +33,17 @@ pub fn resolve_config(server: &HarnessConfig, project: &ProjectConfig) -> Resolv
         if let Some(enabled) = proj_review.enabled {
             review.enabled = enabled;
         }
-        let bot_command_overridden = if let Some(cmd) = &proj_review.bot_command {
+        if let Some(cmd) = &proj_review.bot_command {
             review.review_bot_command = cmd.clone();
-            true
-        } else {
-            false
-        };
+        }
         if let Some(name) = &proj_review.reviewer_name {
             review.reviewer_name = name.clone();
-        } else if bot_command_overridden {
-            // bot_command was overridden but reviewer_name was not explicitly set.
-            // Clear the inherited default so the freshness check does not watch
-            // the wrong reviewer (e.g. gemini-code-assist[bot] when a different
-            // bot command was configured).
-            review.reviewer_name = String::new();
         }
+        // When bot_command is overridden without an explicit reviewer_name, the
+        // server default reviewer_name is inherited unchanged. This preserves the
+        // strongest freshness gate (filter by the configured bot login). If the
+        // new bot has a different GitHub login, the operator must set reviewer_name
+        // explicitly alongside bot_command.
     }
 
     let mut concurrency = server.concurrency.clone();
@@ -148,9 +144,13 @@ mod tests {
         let resolved = resolve_config(&server, &project);
         assert!(resolved.review.enabled);
         assert_eq!(resolved.review.review_bot_command, "/custom review");
-        // reviewer_name must be cleared when bot_command is overridden without
-        // an explicit reviewer_name — prevents watching the wrong default bot.
-        assert!(resolved.review.reviewer_name.is_empty());
+        // reviewer_name inherits the server default when not explicitly set,
+        // even when bot_command is overridden. This preserves the strongest
+        // freshness gate (filter by configured bot login).
+        assert_eq!(
+            resolved.review.reviewer_name,
+            server.agents.review.reviewer_name
+        );
     }
 
     #[test]
