@@ -40,13 +40,14 @@ pub fn implement_from_issue(issue: u64, git: Option<&GitConfig>) -> String {
 
 /// Build prompt: check an existing PR's CI and review status.
 pub fn check_existing_pr(pr: u64, review_bot_command: &str) -> String {
+    let body = shell_single_quote(review_bot_command);
     format!(
         "Check PR #{pr}:\n\
          1. `gh pr checks {pr}` — check CI status\n\
          2. `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/comments` — read inline review comments\n\
          3. If CI passes and there are no unresolved review comments, print LGTM on the last line\n\
          4. Otherwise fix each comment, commit, push, \
-         then run `gh pr comment {pr} --body '{review_bot_command}'` to trigger re-review, \
+         then run `gh pr comment {pr} --body {body}` to trigger re-review, \
          and print FIXED on the last line\n\n\
          Always print PR_URL=https://github.com/{{owner}}/{{repo}}/pull/{pr} on a separate line of your output."
     )
@@ -130,6 +131,7 @@ pub fn review_prompt(
     round: u32,
     prev_fixed: bool,
     review_bot_command: &str,
+    reviewer_name: &str,
 ) -> String {
     let context = match issue {
         Some(n) => format!("You previously created PR #{pr} for issue #{n}.\n"),
@@ -143,24 +145,32 @@ pub fn review_prompt(
          Skip medium severity style/design suggestions — they are acceptable for now."
     };
 
+    let body = shell_single_quote(review_bot_command);
     let push_action = format!(
-        "commit, push, then run `gh pr comment {pr} --body '{review_bot_command}'` \
+        "commit, push, then run `gh pr comment {pr} --body {body}` \
          to trigger re-review on the new code"
     );
 
     let freshness_check = if prev_fixed {
+        // Filter to reviews authored by the configured bot login so that a human
+        // reviewer submitting after the latest commit cannot be mistaken for the
+        // bot's re-review.
+        let login_filter =
+            format!("[.[] | select(.user.login == \"{reviewer_name}\")] | last | .submitted_at");
         format!(
             "\n\nIMPORTANT — New review verification:\n\
              The previous round pushed a fix commit. Before evaluating review status, \
-             you MUST verify that Gemini has submitted a NEW review covering the latest commit:\n\
-             1. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews --jq '.[-1].submitted_at'` \
-             to get the timestamp of the most recent review\n\
+             you MUST verify that {reviewer_name} has submitted a NEW review covering the latest commit:\n\
+             1. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews \
+             --jq '{login_filter}'` \
+             to get the timestamp of {reviewer_name}'s most recent review\n\
              2. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/commits --jq '.[-1].commit.committer.date'` \
              to get the timestamp of the latest commit\n\
-             3. If the latest review was submitted BEFORE the latest commit, \
-             Gemini has not yet re-reviewed the new code. \
+             3. If {reviewer_name}'s latest review was submitted BEFORE the latest commit \
+             (or no review from {reviewer_name} exists), \
+             {reviewer_name} has not yet re-reviewed the new code. \
              In this case, print WAITING on the last line and stop.\n\
-             4. Only proceed with the review evaluation below if the latest review \
+             4. Only proceed with the review evaluation below if {reviewer_name}'s latest review \
              was submitted AFTER the latest commit."
         )
     } else {
@@ -370,6 +380,14 @@ pub fn is_waiting(output: &str) -> bool {
     last_non_empty_line(output) == Some("WAITING")
 }
 
+/// Wrap `s` in POSIX single quotes, escaping any embedded single quotes via `'\''`.
+///
+/// This ensures the value is treated as literal data by the shell and cannot
+/// break out of the quoting context or inject shell metacharacters.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 fn last_non_empty_line(output: &str) -> Option<&str> {
     output
         .lines()
@@ -452,7 +470,14 @@ mod tests {
 
     #[test]
     fn test_review_prompt_with_issue() {
-        let p = review_prompt(Some(5), 10, 2, false, "/gemini review");
+        let p = review_prompt(
+            Some(5),
+            10,
+            2,
+            false,
+            "/gemini review",
+            "gemini-code-assist[bot]",
+        );
         assert!(p.contains("issue #5"));
         assert!(p.contains("PR #10"));
         assert!(p.contains("medium")); // round 2 includes medium
@@ -460,48 +485,141 @@ mod tests {
 
     #[test]
     fn test_review_prompt_without_issue() {
-        let p = review_prompt(None, 10, 2, false, "/gemini review");
+        let p = review_prompt(
+            None,
+            10,
+            2,
+            false,
+            "/gemini review",
+            "gemini-code-assist[bot]",
+        );
         assert!(p.contains("PR #10"));
         assert!(!p.contains("issue #")); // no issue reference when None
     }
 
     #[test]
     fn test_review_prompt_late_round_skips_medium() {
-        let p = review_prompt(None, 10, 3, false, "/gemini review");
+        let p = review_prompt(
+            None,
+            10,
+            3,
+            false,
+            "/gemini review",
+            "gemini-code-assist[bot]",
+        );
         assert!(p.contains("Skip medium"));
     }
 
     #[test]
     fn test_review_prompt_uses_configured_review_bot_command() {
-        let p = review_prompt(None, 10, 2, false, "/gemini review");
+        let p = review_prompt(
+            None,
+            10,
+            2,
+            false,
+            "/gemini review",
+            "gemini-code-assist[bot]",
+        );
         assert!(p.contains("/gemini review"));
-        let p = review_prompt(None, 10, 2, false, "/reviewbot run");
+        let p = review_prompt(None, 10, 2, false, "/reviewbot run", "reviewbot[bot]");
         assert!(p.contains("/reviewbot run"));
         assert!(!p.contains("/gemini"));
     }
 
     #[test]
     fn test_review_prompt_always_triggers_gemini_review() {
-        let p = review_prompt(None, 10, 2, false, "/gemini review");
+        let p = review_prompt(
+            None,
+            10,
+            2,
+            false,
+            "/gemini review",
+            "gemini-code-assist[bot]",
+        );
         assert!(p.contains("/gemini review"));
-        let p = review_prompt(None, 10, 4, true, "/gemini review");
+        let p = review_prompt(
+            None,
+            10,
+            4,
+            true,
+            "/gemini review",
+            "gemini-code-assist[bot]",
+        );
         assert!(p.contains("/gemini review"));
     }
 
     #[test]
     fn test_review_prompt_prev_fixed_requires_freshness_check() {
-        let p = review_prompt(None, 10, 3, true, "/gemini review");
+        let p = review_prompt(
+            None,
+            10,
+            3,
+            true,
+            "/gemini review",
+            "gemini-code-assist[bot]",
+        );
         assert!(p.contains("WAITING"));
         assert!(p.contains("latest review was submitted BEFORE the latest commit"));
         // Without prev_fixed, no freshness check
-        let p = review_prompt(None, 10, 3, false, "/gemini review");
+        let p = review_prompt(
+            None,
+            10,
+            3,
+            false,
+            "/gemini review",
+            "gemini-code-assist[bot]",
+        );
         assert!(!p.contains("WAITING"));
     }
 
     #[test]
     fn test_review_prompt_constraints() {
-        let p = review_prompt(None, 10, 2, false, "/gemini review");
+        let p = review_prompt(
+            None,
+            10,
+            2,
+            false,
+            "/gemini review",
+            "gemini-code-assist[bot]",
+        );
         assert!(p.contains("NEVER downgrade dependency"));
+    }
+
+    #[test]
+    fn test_review_prompt_freshness_check_filters_by_reviewer_login() {
+        let p = review_prompt(
+            None,
+            10,
+            2,
+            true,
+            "/gemini review",
+            "gemini-code-assist[bot]",
+        );
+        assert!(p.contains("gemini-code-assist[bot]"));
+        assert!(p.contains(".user.login"));
+        // A different reviewer's login must appear in its own prompt
+        let p2 = review_prompt(None, 10, 2, true, "/reviewbot run", "acme-bot[bot]");
+        assert!(p2.contains("acme-bot[bot]"));
+        assert!(!p2.contains("gemini-code-assist[bot]"));
+    }
+
+    #[test]
+    fn test_check_existing_pr_shell_quoting() {
+        // A command containing a single quote must not break single-quoting
+        let p = check_existing_pr(5, "it's a test");
+        assert!(
+            p.contains(r"'it'\''s a test'"),
+            "single quote must be escaped"
+        );
+    }
+
+    #[test]
+    fn test_review_prompt_shell_quoting() {
+        let p = review_prompt(None, 5, 2, false, "it's a test", "bot[bot]");
+        assert!(
+            p.contains(r"'it'\''s a test'"),
+            "single quote must be escaped"
+        );
     }
 
     #[test]
