@@ -127,6 +127,10 @@ impl SkillStore {
             } else {
                 SkillLocation::Repo
             }
+        } else if self.persist_dir.as_deref() == Some(dir) {
+            // Skills loaded from the persist directory were created by the user
+            // and must be treated as User-priority so they can override builtins.
+            SkillLocation::User
         } else {
             SkillLocation::System
         };
@@ -914,6 +918,43 @@ mod tests {
         assert!(
             restarted.get_by_name("custom-workflow").is_some(),
             "persisted skill must survive simulated server restart"
+        );
+    }
+
+    #[test]
+    fn persisted_skill_shadowing_builtin_survives_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist_path = dir.path().to_path_buf();
+
+        // First "session": create a user skill whose name matches a builtin.
+        let user_content = "# review\nMy custom review skill.".to_string();
+        let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
+        store.create("review".to_string(), user_content.clone());
+        assert!(
+            persist_path.join("review.md").exists(),
+            "skill file must be written to disk before restart"
+        );
+
+        // Simulate server restart: load builtins first (as http.rs does),
+        // then discover persisted skills.
+        let mut restarted = SkillStore::new().with_persist_dir(persist_path.clone());
+        restarted.load_builtin();
+        restarted
+            .discover()
+            .expect("discover must not fail on restart");
+
+        // The user's override must win over the same-named builtin.
+        let skill = restarted
+            .get_by_name("review")
+            .expect("shadowed builtin must survive restart");
+        assert_eq!(
+            skill.location,
+            SkillLocation::User,
+            "persisted skill must have User location, not System"
+        );
+        assert_eq!(
+            skill.content, user_content,
+            "persisted skill content must be the user version, not the builtin"
         );
     }
 }
