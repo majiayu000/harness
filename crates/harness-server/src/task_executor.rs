@@ -500,8 +500,12 @@ pub(crate) async fn run_task(
         }
     }
 
-    // Wait for external review bot
-    update_status(store, task_id, TaskStatus::Waiting, 1).await;
+    // Wait for external review bot.
+    // Use a local counter instead of querying the store to derive waiting_count —
+    // task execution is sequential within a single tokio task, so a plain u32 suffices.
+    let mut waiting_count: u32 = 0;
+    waiting_count += 1;
+    update_status(store, task_id, TaskStatus::Waiting, waiting_count).await;
 
     let wait_secs = req.wait_secs;
     tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
@@ -597,6 +601,8 @@ pub(crate) async fn run_task(
 
         tracing::info!("PR #{pr_num} not yet approved at round {round}; waiting");
         if round < req.max_rounds {
+            waiting_count += 1;
+            update_status(store, task_id, TaskStatus::Waiting, waiting_count).await;
             sleep(Duration::from_secs(wait_secs)).await;
         }
     }
