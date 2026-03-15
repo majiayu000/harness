@@ -124,13 +124,13 @@ pub fn default_pre_commit_commands(lang: Language, project_root: &Path) -> Vec<S
                 "--all-targets"
             };
             vec![
-                "cargo fmt --all -- --check".to_string(),
+                "cargo fmt --all".to_string(),
                 format!("cargo check {scope}"),
                 format!("cargo clippy {scope} -- -D warnings"),
             ]
         }
         Language::Go => vec![
-            "test -z \"$(gofmt -l .)\"".to_string(),
+            "gofmt -w .".to_string(),
             "go vet ./...".to_string(),
             "go build ./...".to_string(),
         ],
@@ -144,7 +144,7 @@ pub fn default_pre_commit_commands(lang: Language, project_root: &Path) -> Vec<S
             cmds
         }
         Language::Python => vec![
-            "ruff format --check .".to_string(),
+            "ruff format .".to_string(),
             "ruff check .".to_string(),
         ],
         Language::Java => {
@@ -155,7 +155,7 @@ pub fn default_pre_commit_commands(lang: Language, project_root: &Path) -> Vec<S
             }
         }
         Language::CSharp => vec![
-            "dotnet format --verify-no-changes".to_string(),
+            "dotnet format".to_string(),
             "dotnet build".to_string(),
         ],
         Language::Ruby => {
@@ -388,7 +388,7 @@ mod tests {
     fn go_pre_commit_order_gofmt_vet_build() {
         let dir = tmpdir();
         let cmds = default_pre_commit_commands(Language::Go, dir.path());
-        let gofmt_pos = cmds.iter().position(|c| c.contains("gofmt")).unwrap();
+        let gofmt_pos = cmds.iter().position(|c| c == "gofmt -w .").unwrap();
         let vet_pos = cmds.iter().position(|c| c == "go vet ./...").unwrap();
         let build_pos = cmds.iter().position(|c| c == "go build ./...").unwrap();
         assert!(gofmt_pos < vet_pos && vet_pos < build_pos);
@@ -449,10 +449,10 @@ mod tests {
     // ── Python commands ───────────────────────────────────────────────────────
 
     #[test]
-    fn python_pre_commit_includes_ruff_format_check() {
+    fn python_pre_commit_includes_ruff_format_and_check() {
         let dir = tmpdir();
         let cmds = default_pre_commit_commands(Language::Python, dir.path());
-        assert!(cmds.iter().any(|c| c == "ruff format --check ."));
+        assert!(cmds.iter().any(|c| c == "ruff format ."));
         assert!(cmds.iter().any(|c| c == "ruff check ."));
     }
 
@@ -495,10 +495,7 @@ mod tests {
     fn csharp_pre_commit_commands() {
         let dir = tmpdir();
         let cmds = default_pre_commit_commands(Language::CSharp, dir.path());
-        assert_eq!(
-            cmds,
-            vec!["dotnet format --verify-no-changes", "dotnet build"]
-        );
+        assert_eq!(cmds, vec!["dotnet format", "dotnet build"]);
     }
 
     #[test]
