@@ -14,15 +14,16 @@ use harness_agents::AgentRegistry;
 use harness_core::{
     AgentRequest, AgentResponse, Artifact, ArtifactType, Capability, CodeAgent, Draft, DraftId,
     DraftStatus, HarnessConfig, HarnessError, ProjectId, RemediationType, Signal, SignalType,
-    StreamItem, TokenUsage,
+    StreamItem, TaskId, TokenUsage,
 };
 use harness_server::{
-    handlers::gc::gc_adopt, http::build_app_state, server::HarnessServer,
+    handlers::gc::gc_adopt, http::build_app_state, server::HarnessServer, task_runner::TaskStatus,
     thread_manager::ThreadManager,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // Mock agent — immediately completes with a fake PR_URL output.
@@ -61,6 +62,49 @@ impl CodeAgent for MockPrAgent {
         tx.send(StreamItem::MessageDelta { text: resp.output })
             .await
             .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+        tx.send(StreamItem::Done)
+            .await
+            .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capturing agent — records the project_root from each AgentRequest.
+// ---------------------------------------------------------------------------
+
+struct ProjectRootCapturingAgent {
+    captured: Arc<Mutex<Option<PathBuf>>>,
+}
+
+#[async_trait]
+impl CodeAgent for ProjectRootCapturingAgent {
+    fn name(&self) -> &str {
+        "capture-root"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![Capability::Read, Capability::Write]
+    }
+
+    async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+        *self.captured.lock().await = Some(req.project_root.clone());
+        Ok(AgentResponse {
+            output: String::new(),
+            stderr: String::new(),
+            items: vec![],
+            token_usage: TokenUsage::default(),
+            model: "capture-root".to_string(),
+            exit_code: Some(0),
+        })
+    }
+
+    async fn execute_stream(
+        &self,
+        req: AgentRequest,
+        tx: Sender<StreamItem>,
+    ) -> harness_core::Result<()> {
+        *self.captured.lock().await = Some(req.project_root.clone());
         tx.send(StreamItem::Done)
             .await
             .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
@@ -251,6 +295,84 @@ async fn gc_adopt_auto_pr_true_dispatches_task() -> anyhow::Result<()> {
     assert!(
         !result["task_id"].is_null(),
         "task_id should be set when auto_pr=true and agent is registered"
+    );
+
+    Ok(())
+}
+
+/// gc_adopt dispatches a task whose project_root matches state.core.project_root.
+///
+/// Regression test for the fix introduced in issue #78: gc_adopt_task_request
+/// must pass the server's configured project_root to the spawned task instead
+/// of None (which would fall back to worktree detection).
+#[tokio::test]
+async fn gc_adopt_task_uses_state_project_root() -> anyhow::Result<()> {
+    let sandbox = common::tempdir_in_home("gc-adopt-project-root-")?;
+    let project_root = sandbox.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+
+    let captured: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+    let agent = Arc::new(ProjectRootCapturingAgent {
+        captured: captured.clone(),
+    });
+
+    let mut config = HarnessConfig::default();
+    config.server.data_dir = sandbox.path().join("server-data");
+    config.server.project_root = project_root.clone();
+    config.agents.default_agent = "capture-root".to_string();
+    config.gc.auto_pr = true;
+    // Point workspace root to a path that cannot be created so
+    // WorkspaceManager::new fails and workspace_mgr stays None.
+    // This lets the task run directly against project_root without
+    // requiring a git repository.
+    config.workspace.root = std::path::PathBuf::from("/dev/null/harness-no-workspace");
+
+    let mut registry = AgentRegistry::new("capture-root");
+    registry.register("capture-root", agent);
+    let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+    let state = build_app_state(server).await?;
+
+    let artifact_rel = std::path::PathBuf::from(".harness/drafts/test-guard.sh");
+    let draft = make_draft(&artifact_rel, "#!/usr/bin/env bash\necho 'guard'");
+    state.engines.gc_agent.draft_store().save(&draft)?;
+
+    let draft_id = draft.id.clone();
+    let resp = gc_adopt(&state, Some(serde_json::json!(1)), draft_id).await;
+    assert!(resp.error.is_none(), "gc_adopt failed: {:?}", resp.error);
+
+    let result = resp.result.expect("missing result");
+    let task_id_str = result["task_id"]
+        .as_str()
+        .expect("task_id should be a string");
+    let task_id = TaskId::from_str(task_id_str);
+
+    // Wait up to 5 seconds for the task to reach Done or Failed.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        if let Some(task) = state.core.tasks.get(&task_id) {
+            if matches!(task.status, TaskStatus::Done | TaskStatus::Failed) {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("timeout waiting for task to complete");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+
+    let final_task = state.core.tasks.get(&task_id).expect("task should exist");
+    assert!(
+        matches!(final_task.status, TaskStatus::Done),
+        "task should be Done, got {:?}: {:?}",
+        final_task.status,
+        final_task.error
+    );
+
+    let captured_root = captured.lock().await.clone().expect("agent was not called");
+    assert_eq!(
+        captured_root,
+        project_root.canonicalize()?,
+        "gc_adopt should dispatch task with state.core.project_root"
     );
 
     Ok(())
