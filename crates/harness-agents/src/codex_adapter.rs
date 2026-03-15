@@ -19,6 +19,9 @@ pub struct CodexAdapter {
 struct AdapterState {
     child: Option<tokio::process::Child>,
     stdin: Option<tokio::process::ChildStdin>,
+    /// Keeps the process group alive for the lifetime of the child.
+    /// Dropped (and SIGKILL sent to the process group) when the child is cleared.
+    pg_guard: Option<crate::process_group::ProcessGroupGuard>,
     next_id: u64,
 }
 
@@ -27,6 +30,7 @@ impl AdapterState {
         Self {
             child: None,
             stdin: None,
+            pg_guard: None,
             next_id: 1,
         }
     }
@@ -145,12 +149,12 @@ impl AgentAdapter for CodexAdapter {
             let stdout = child.stdout.take().ok_or_else(|| {
                 harness_core::HarnessError::AgentExecution("no stdout from codex".into())
             })?;
-            state.child = Some(child);
-
             // ProcessGroupGuard kills the entire process group on drop so that
             // grandchild processes (node, cargo, etc.) are cleaned up even when
-            // this future is cancelled by an external timeout.
-            let _pg_guard = crate::process_group::ProcessGroupGuard::new(child_pid);
+            // this future is cancelled by an external timeout.  Stored in state
+            // so it lives as long as the child — not just for this call.
+            state.pg_guard = Some(crate::process_group::ProcessGroupGuard::new(child_pid));
+            state.child = Some(child);
 
             // Initialize handshake
             Self::send_request(&mut state, "initialize", json!({})).await?;
@@ -221,6 +225,10 @@ impl AgentAdapter for CodexAdapter {
                 if let Some(ref mut child) = state.child {
                     let _ = child.kill().await;
                 }
+                // Clear all child state so the next start_turn() re-spawns cleanly.
+                state.child = None;
+                state.stdin = None;
+                state.pg_guard = None;
             }
         }
         Ok(())
