@@ -1,5 +1,5 @@
 use crate::http::{resolve_reviewer, AppState};
-use harness_core::DraftId;
+use harness_core::{config::resolve_config, DraftId};
 use harness_protocol::{RpcResponse, INTERNAL_ERROR, NOT_FOUND};
 
 fn gc_adopt_task_request(
@@ -142,9 +142,12 @@ pub async fn gc_adopt(
                     &state.core.server.config.gc,
                     state.core.project_root.clone(),
                 );
+                let project_config =
+                    harness_core::config::load_project_config(&state.core.project_root);
+                let resolved = resolve_config(&state.core.server.config, &project_config);
                 let (reviewer, _review_config) = resolve_reviewer(
                     &state.core.server.agent_registry,
-                    &state.core.server.config.agents.review,
+                    &resolved.review,
                     agent.name(),
                 );
                 let project_id = state.core.project_root.to_string_lossy().into_owned();
