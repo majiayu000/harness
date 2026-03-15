@@ -558,7 +558,7 @@ where
         let raw_project =
             resolve_project_root_with(req.project.clone(), move || detect_worktree()).await?;
         let project_root = crate::handlers::validate_project_root(&raw_project)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(|(_, e)| anyhow::anyhow!("{e}"))?;
 
         // Parallel dispatch for Complex+ prompt-only tasks when workspace isolation is active.
         // Issue and PR tasks have their own structured prompt flow and are not decomposed.

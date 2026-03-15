@@ -12,8 +12,10 @@ pub mod rules;
 pub mod skills;
 pub mod thread;
 
-/// Validate a project root path, returning early with a `VALIDATION_ERROR`
-/// response on failure.
+/// Validate a project root path, returning early with the appropriate error
+/// response on failure (`INTERNAL_ERROR` for server-side misconfigurations such
+/// as a missing `HOME` variable; `VALIDATION_ERROR` for bad client-supplied
+/// paths).
 ///
 /// # Example
 /// ```ignore
@@ -24,13 +26,7 @@ macro_rules! validate_root {
     ($path:expr, $id:expr) => {
         match $crate::handlers::validate_project_root($path) {
             Ok(p) => p,
-            Err(e) => {
-                return harness_protocol::RpcResponse::error(
-                    $id,
-                    harness_protocol::VALIDATION_ERROR,
-                    e,
-                )
-            }
+            Err((code, e)) => return harness_protocol::RpcResponse::error($id, code, e),
         }
     };
 }
@@ -71,24 +67,36 @@ pub(crate) fn validate_file_in_root(
 }
 
 /// Validate that a project root is an existing directory within `$HOME`.
-/// Returns the canonicalized path on success.
-pub(crate) fn validate_project_root(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+/// Returns the canonicalized path on success, or `(error_code, message)` on
+/// failure.  Missing `HOME` is a server-side misconfiguration (`INTERNAL_ERROR`);
+/// all other failures are client input errors (`VALIDATION_ERROR`).
+pub(crate) fn validate_project_root(
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, (i32, String)> {
     let home = std::env::var("HOME")
         .map(std::path::PathBuf::from)
-        .map_err(|_| "HOME environment variable not set".to_string())?;
-    let canonical = path
-        .canonicalize()
-        .map_err(|e| format!("invalid project root '{}': {e}", path.display()))?;
+        .map_err(|_| {
+            (
+                harness_protocol::INTERNAL_ERROR,
+                "HOME environment variable not set".to_string(),
+            )
+        })?;
+    let canonical = path.canonicalize().map_err(|e| {
+        (
+            harness_protocol::VALIDATION_ERROR,
+            format!("invalid project root '{}': {e}", path.display()),
+        )
+    })?;
     if !canonical.is_dir() {
-        return Err(format!(
-            "project root is not a directory: {}",
-            canonical.display()
+        return Err((
+            harness_protocol::VALIDATION_ERROR,
+            format!("project root is not a directory: {}", canonical.display()),
         ));
     }
     if !canonical.starts_with(&home) {
-        return Err(format!(
-            "project root must be within HOME: {}",
-            canonical.display()
+        return Err((
+            harness_protocol::VALIDATION_ERROR,
+            format!("project root must be within HOME: {}", canonical.display()),
         ));
     }
     Ok(canonical)

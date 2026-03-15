@@ -180,9 +180,12 @@ pub async fn gc_adopt(
         }
         Err(e) => {
             let msg = e.to_string();
-            // Path safety checks in adopt() fire before any I/O and produce
-            // validation errors, not storage errors.
-            if msg.contains("target_path must") {
+            if msg.contains("draft not found") {
+                // Draft disappeared between the initial read and adopt() call
+                // (TOCTOU race). Report as NOT_FOUND, not a storage fault.
+                RpcResponse::error(id, NOT_FOUND, msg)
+            } else if msg.contains("target_path must") {
+                // Path safety checks fire before any I/O — client validation failure.
                 RpcResponse::error(id, VALIDATION_ERROR, msg)
             } else {
                 RpcResponse::error(id, STORAGE_ERROR, msg)
