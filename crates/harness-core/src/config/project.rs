@@ -18,6 +18,12 @@ pub struct ProjectReviewConfig {
     /// Review bot command override (e.g. "/gemini review").
     #[serde(default)]
     pub bot_command: Option<String>,
+    /// GitHub login of the review bot user override (e.g. "gemini-code-assist[bot]").
+    /// When `bot_command` is overridden but this is absent, the resolved
+    /// reviewer_name is cleared so the freshness check is not locked to the
+    /// wrong default bot login.
+    #[serde(default)]
+    pub reviewer_name: Option<String>,
 }
 
 /// Per-project concurrency configuration overrides.

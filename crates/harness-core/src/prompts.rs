@@ -152,27 +152,48 @@ pub fn review_prompt(
     );
 
     let freshness_check = if prev_fixed {
-        // Filter to reviews authored by the configured bot login so that a human
-        // reviewer submitting after the latest commit cannot be mistaken for the
-        // bot's re-review.
-        let login_filter =
-            format!("[.[] | select(.user.login == \"{reviewer_name}\")] | last | .submitted_at");
-        format!(
-            "\n\nIMPORTANT — New review verification:\n\
-             The previous round pushed a fix commit. Before evaluating review status, \
-             you MUST verify that {reviewer_name} has submitted a NEW review covering the latest commit:\n\
-             1. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews \
-             --jq '{login_filter}'` \
-             to get the timestamp of {reviewer_name}'s most recent review\n\
-             2. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/commits --jq '.[-1].commit.committer.date'` \
-             to get the timestamp of the latest commit\n\
-             3. If {reviewer_name}'s latest review was submitted BEFORE the latest commit \
-             (or no review from {reviewer_name} exists), \
-             {reviewer_name} has not yet re-reviewed the new code. \
-             In this case, print WAITING on the last line and stop.\n\
-             4. Only proceed with the review evaluation below if {reviewer_name}'s latest review \
-             was submitted AFTER the latest commit."
-        )
+        if reviewer_name.is_empty() {
+            // No specific reviewer configured: check that *any* review was
+            // submitted after the latest commit rather than filtering by login.
+            format!(
+                "\n\nIMPORTANT — New review verification:\n\
+                 The previous round pushed a fix commit. Before evaluating review status, \
+                 you MUST verify that a new review covering the latest commit exists:\n\
+                 1. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews \
+                 --jq 'last | .submitted_at'` \
+                 to get the timestamp of the most recent review\n\
+                 2. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/commits --jq '.[-1].commit.committer.date'` \
+                 to get the timestamp of the latest commit\n\
+                 3. If the most recent review was submitted BEFORE the latest commit \
+                 (or no review exists), the reviewer has not yet re-reviewed the new code. \
+                 In this case, print WAITING on the last line and stop.\n\
+                 4. Only proceed with the review evaluation below if the most recent review \
+                 was submitted AFTER the latest commit."
+            )
+        } else {
+            // Filter to reviews authored by the configured bot login so that a human
+            // reviewer submitting after the latest commit cannot be mistaken for the
+            // bot's re-review.
+            let login_filter = format!(
+                "[.[] | select(.user.login == \"{reviewer_name}\")] | last | .submitted_at"
+            );
+            format!(
+                "\n\nIMPORTANT — New review verification:\n\
+                 The previous round pushed a fix commit. Before evaluating review status, \
+                 you MUST verify that {reviewer_name} has submitted a NEW review covering the latest commit:\n\
+                 1. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews \
+                 --jq '{login_filter}'` \
+                 to get the timestamp of {reviewer_name}'s most recent review\n\
+                 2. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/commits --jq '.[-1].commit.committer.date'` \
+                 to get the timestamp of the latest commit\n\
+                 3. If {reviewer_name}'s latest review was submitted BEFORE the latest commit \
+                 (or no review from {reviewer_name} exists), \
+                 {reviewer_name} has not yet re-reviewed the new code. \
+                 In this case, print WAITING on the last line and stop.\n\
+                 4. Only proceed with the review evaluation below if {reviewer_name}'s latest review \
+                 was submitted AFTER the latest commit."
+            )
+        }
     } else {
         String::new()
     };

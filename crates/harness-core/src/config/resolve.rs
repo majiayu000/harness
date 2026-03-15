@@ -33,8 +33,20 @@ pub fn resolve_config(server: &HarnessConfig, project: &ProjectConfig) -> Resolv
         if let Some(enabled) = proj_review.enabled {
             review.enabled = enabled;
         }
-        if let Some(cmd) = &proj_review.bot_command {
+        let bot_command_overridden = if let Some(cmd) = &proj_review.bot_command {
             review.review_bot_command = cmd.clone();
+            true
+        } else {
+            false
+        };
+        if let Some(name) = &proj_review.reviewer_name {
+            review.reviewer_name = name.clone();
+        } else if bot_command_overridden {
+            // bot_command was overridden but reviewer_name was not explicitly set.
+            // Clear the inherited default so the freshness check does not watch
+            // the wrong reviewer (e.g. gemini-code-assist[bot] when a different
+            // bot command was configured).
+            review.reviewer_name = String::new();
         }
     }
 
@@ -107,6 +119,7 @@ mod tests {
             review: Some(ProjectReviewConfig {
                 enabled: Some(true),
                 bot_command: None, // not overriding bot_command
+                reviewer_name: None,
             }),
             ..Default::default()
         };
@@ -127,6 +140,7 @@ mod tests {
             review: Some(ProjectReviewConfig {
                 enabled: Some(true),
                 bot_command: Some("/custom review".to_string()),
+                reviewer_name: None,
             }),
             ..Default::default()
         };
@@ -134,6 +148,47 @@ mod tests {
         let resolved = resolve_config(&server, &project);
         assert!(resolved.review.enabled);
         assert_eq!(resolved.review.review_bot_command, "/custom review");
+        // reviewer_name must be cleared when bot_command is overridden without
+        // an explicit reviewer_name — prevents watching the wrong default bot.
+        assert!(resolved.review.reviewer_name.is_empty());
+    }
+
+    #[test]
+    fn resolve_config_reviewer_name_explicit_override() {
+        let server = HarnessConfig::default();
+        let project = ProjectConfig {
+            review: Some(ProjectReviewConfig {
+                enabled: None,
+                bot_command: Some("/mybot review".to_string()),
+                reviewer_name: Some("mybot[bot]".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let resolved = resolve_config(&server, &project);
+        assert_eq!(resolved.review.review_bot_command, "/mybot review");
+        assert_eq!(resolved.review.reviewer_name, "mybot[bot]");
+    }
+
+    #[test]
+    fn resolve_config_reviewer_name_only_no_bot_command_change() {
+        let server = HarnessConfig::default();
+        let project = ProjectConfig {
+            review: Some(ProjectReviewConfig {
+                enabled: None,
+                bot_command: None,
+                reviewer_name: Some("other-bot[bot]".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let resolved = resolve_config(&server, &project);
+        // bot_command inherits server default
+        assert_eq!(
+            resolved.review.review_bot_command,
+            server.agents.review.review_bot_command
+        );
+        assert_eq!(resolved.review.reviewer_name, "other-bot[bot]");
     }
 
     #[test]

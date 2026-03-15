@@ -1,5 +1,7 @@
 use harness_agents::claude::ClaudeCodeAgent;
-use harness_core::{prompts, AgentRequest, CodeAgent, HarnessConfig};
+use harness_core::{
+    load_project_config, prompts, resolve_config, AgentRequest, CodeAgent, HarnessConfig,
+};
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
 
@@ -26,6 +28,8 @@ pub async fn fix(
     project: PathBuf,
 ) -> anyhow::Result<()> {
     let agent = create_agent(config);
+    let project_cfg = load_project_config(&project);
+    let resolved = resolve_config(config, &project_cfg);
 
     println!("[harness] Round 1 — Implementing issue #{issue} and creating PR");
 
@@ -54,8 +58,8 @@ pub async fn fix(
         ReviewLoopOpts {
             wait,
             max_rounds,
-            review_bot_command: &config.agents.review.review_bot_command,
-            reviewer_name: &config.agents.review.reviewer_name,
+            review_bot_command: &resolved.review.review_bot_command,
+            reviewer_name: &resolved.review.reviewer_name,
         },
     )
     .await
@@ -69,6 +73,8 @@ pub async fn loop_pr(
     project: PathBuf,
 ) -> anyhow::Result<()> {
     let agent = create_agent(config);
+    let project_cfg = load_project_config(&project);
+    let resolved = resolve_config(config, &project_cfg);
 
     println!("[harness] Starting review loop for PR #{pr}");
 
@@ -81,8 +87,8 @@ pub async fn loop_pr(
         ReviewLoopOpts {
             wait,
             max_rounds,
-            review_bot_command: &config.agents.review.review_bot_command,
-            reviewer_name: &config.agents.review.reviewer_name,
+            review_bot_command: &resolved.review.review_bot_command,
+            reviewer_name: &resolved.review.reviewer_name,
         },
     )
     .await
