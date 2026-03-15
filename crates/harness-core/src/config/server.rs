@@ -20,6 +20,10 @@ pub struct ServerConfig {
     /// Interval in seconds between WebSocket heartbeat pings. Must be >= 1.
     #[serde(default = "default_ws_heartbeat_interval_secs")]
     pub ws_heartbeat_interval_secs: u64,
+    /// List of trusted proxy IP addresses. X-Forwarded-For is only used when the
+    /// request originates from one of these IPs.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -33,6 +37,7 @@ impl Default for ServerConfig {
             notification_broadcast_capacity: default_notification_broadcast_capacity(),
             notification_lag_log_every: default_notification_lag_log_every(),
             ws_heartbeat_interval_secs: default_ws_heartbeat_interval_secs(),
+            trusted_proxies: Vec::new(),
         }
     }
 }

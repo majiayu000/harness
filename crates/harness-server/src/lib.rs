@@ -35,6 +35,7 @@ pub mod task_queue;
 pub mod task_runner;
 pub mod thread_db;
 pub mod thread_manager;
+pub mod trusted_proxy;
 pub mod webhook;
 pub mod websocket;
 pub mod workspace;
