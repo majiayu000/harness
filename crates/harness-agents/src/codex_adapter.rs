@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
+use tracing;
 
 /// Codex App Server adapter (L3-L4).
 ///
@@ -98,7 +99,9 @@ impl CodexAdapter {
         stdin.write_all(line.as_bytes()).await.map_err(|e| {
             harness_core::HarnessError::AgentExecution(format!("failed to write to codex: {e}"))
         })?;
-        stdin.flush().await.ok();
+        stdin.flush().await.map_err(|e| {
+            harness_core::HarnessError::AgentExecution(format!("failed to flush codex stdin: {e}"))
+        })?;
         Ok(())
     }
 }
@@ -248,7 +251,9 @@ impl AgentAdapter for CodexAdapter {
         stdin.write_all(line.as_bytes()).await.map_err(|e| {
             harness_core::HarnessError::AgentExecution(format!("failed to write to codex: {e}"))
         })?;
-        stdin.flush().await.ok();
+        stdin.flush().await.map_err(|e| {
+            harness_core::HarnessError::AgentExecution(format!("failed to flush codex stdin: {e}"))
+        })?;
         Ok(())
     }
 }

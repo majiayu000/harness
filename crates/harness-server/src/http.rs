@@ -988,7 +988,13 @@ async fn stream_task_sse(State(state): State<Arc<AppState>>, Path(id): Path<Stri
     let stream = futures::stream::unfold(rx, |mut rx| async move {
         match rx.recv().await {
             Ok(item) => {
-                let data = serde_json::to_string(&item).unwrap_or_default();
+                let data = match serde_json::to_string(&item) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("sse: failed to serialize event: {e}");
+                        String::new()
+                    }
+                };
                 Some((
                     Ok::<Event, std::convert::Infallible>(Event::default().data(data)),
                     rx,
