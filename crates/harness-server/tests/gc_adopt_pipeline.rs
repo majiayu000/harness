@@ -20,8 +20,8 @@ use harness_server::{
     handlers::gc::gc_adopt, http::build_app_state, server::HarnessServer,
     thread_manager::ThreadManager,
 };
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
 
 // ---------------------------------------------------------------------------
@@ -251,6 +251,153 @@ async fn gc_adopt_auto_pr_true_dispatches_task() -> anyhow::Result<()> {
     assert!(
         !result["task_id"].is_null(),
         "task_id should be set when auto_pr=true and agent is registered"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Capturing agent — records project_root from AgentRequest (issue #78 regression guard).
+// ---------------------------------------------------------------------------
+
+struct CapturingAgent {
+    captured_root: Arc<Mutex<Option<PathBuf>>>,
+}
+
+#[async_trait]
+impl CodeAgent for CapturingAgent {
+    fn name(&self) -> &str {
+        "capturing"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![Capability::Read, Capability::Write]
+    }
+
+    async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+        *self.captured_root.lock().unwrap() = Some(req.project_root.clone());
+        Ok(AgentResponse {
+            output: String::new(),
+            stderr: String::new(),
+            items: vec![],
+            token_usage: TokenUsage::default(),
+            model: "capturing".to_string(),
+            exit_code: Some(0),
+        })
+    }
+
+    async fn execute_stream(
+        &self,
+        req: AgentRequest,
+        tx: Sender<StreamItem>,
+    ) -> harness_core::Result<()> {
+        *self.captured_root.lock().unwrap() = Some(req.project_root.clone());
+        tx.send(StreamItem::MessageDelta {
+            text: String::new(),
+        })
+        .await
+        .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+        tx.send(StreamItem::Done)
+            .await
+            .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+        Ok(())
+    }
+}
+
+/// gc_adopt dispatches a task whose project_root matches the AppState project_root (issue #78).
+///
+/// Before the fix, `gc_adopt_task_request` set `project: None`, causing the task executor to
+/// fall back to worktree detection instead of using the server's configured project root.
+///
+/// Setup: workspace isolation is disabled by blocking the workspace root dir so the task
+/// runs directly against the project_root (no git worktree indirection).
+#[tokio::test]
+async fn gc_adopt_task_uses_appstate_project_root() -> anyhow::Result<()> {
+    let sandbox = common::tempdir_in_home("gc-adopt-project-root-")?;
+    let project_root = sandbox.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+
+    // Block workspace isolation: write a file where the workspace root dir would be,
+    // so WorkspaceManager::new fails and build_app_state falls back to workspace_mgr = None.
+    // With no workspace manager the task runs directly against project_root.
+    let ws_blocker = sandbox.path().join("ws-blocker");
+    std::fs::write(&ws_blocker, "blocker")?;
+
+    let captured_root: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+    let agent = Arc::new(CapturingAgent {
+        captured_root: captured_root.clone(),
+    });
+
+    let mut config = HarnessConfig::default();
+    config.server.data_dir = sandbox.path().join("server-data");
+    config.server.project_root = project_root.clone();
+    config.agents.default_agent = "capturing".to_string();
+    config.gc.auto_pr = true;
+    // Point workspace root at a path under the blocker file so create_dir_all fails.
+    config.workspace.root = ws_blocker.join("workspaces");
+
+    let mut registry = AgentRegistry::new("capturing");
+    registry.register("capturing", agent);
+
+    let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+    let state = build_app_state(server).await?;
+
+    let artifact_rel = PathBuf::from(".harness/drafts/test-guard.sh");
+    let draft = make_draft(&artifact_rel, "#!/usr/bin/env bash\necho 'guard'");
+    state.engines.gc_agent.draft_store().save(&draft)?;
+
+    let draft_id = draft.id.clone();
+    let resp = gc_adopt(&state, Some(serde_json::json!(1)), draft_id).await;
+    assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
+
+    let task_id_val = resp
+        .result
+        .as_ref()
+        .and_then(|r| r.get("task_id"))
+        .expect("result must have task_id field");
+    assert!(!task_id_val.is_null(), "task_id should be set");
+    let task_id = harness_server::task_runner::TaskId(
+        task_id_val
+            .as_str()
+            .expect("task_id should be a string")
+            .to_string(),
+    );
+
+    // Poll until task reaches a terminal state, with a 10-second limit.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let final_state = loop {
+        if let Some(ts) = state.core.tasks.get(&task_id) {
+            match ts.status {
+                harness_server::task_runner::TaskStatus::Done
+                | harness_server::task_runner::TaskStatus::Failed => break ts,
+                _ => {}
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("task did not reach terminal state within 10 seconds");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    assert!(
+        matches!(
+            final_state.status,
+            harness_server::task_runner::TaskStatus::Done
+        ),
+        "task should be Done but was {:?}: {:?}",
+        final_state.status,
+        final_state.error
+    );
+
+    let actual = captured_root
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("capturing agent must have recorded project_root");
+    assert_eq!(
+        actual,
+        project_root.canonicalize()?,
+        "gc_adopt must pass AppState project_root to the spawned task, not None/CWD"
     );
 
     Ok(())
