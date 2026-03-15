@@ -60,6 +60,21 @@ pub(crate) async fn enqueue_task(
     let canonical_project = task_runner::resolve_canonical_project(req.project.clone())
         .await
         .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+
+    // Enforce allowed_project_roots allowlist on the resolved canonical path so
+    // callers cannot bypass it by supplying a real directory path directly
+    // instead of registering the project first.
+    let allowed = &state.core.server.config.server.allowed_project_roots;
+    if !allowed.is_empty()
+        && !allowed
+            .iter()
+            .any(|base| canonical_project.starts_with(base))
+    {
+        return Err(EnqueueTaskError::BadRequest(
+            "project root is not under an allowed base directory".to_string(),
+        ));
+    }
+
     let project_id = canonical_project.to_string_lossy().into_owned();
     req.project = Some(canonical_project);
 
@@ -191,6 +206,19 @@ async fn enqueue_task_background(
     let canonical_project = task_runner::resolve_canonical_project(req.project.clone())
         .await
         .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+
+    // Enforce allowed_project_roots allowlist (same guard as enqueue_task).
+    let allowed = &state.core.server.config.server.allowed_project_roots;
+    if !allowed.is_empty()
+        && !allowed
+            .iter()
+            .any(|base| canonical_project.starts_with(base))
+    {
+        return Err(EnqueueTaskError::BadRequest(
+            "project root is not under an allowed base directory".to_string(),
+        ));
+    }
+
     let project_id = canonical_project.to_string_lossy().into_owned();
 
     let server_config = std::sync::Arc::new(state.core.server.config.clone());

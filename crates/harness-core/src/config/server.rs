@@ -24,6 +24,21 @@ pub struct ServerConfig {
     /// request originates from one of these IPs.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Static bearer token for API authentication.
+    ///
+    /// When set (via this field or the `HARNESS_API_TOKEN` environment variable),
+    /// all non-webhook and non-health HTTP endpoints require an
+    /// `Authorization: Bearer <token>` header. When not configured, authentication
+    /// is skipped for backward-compatible local development.
+    #[serde(default)]
+    pub api_token: Option<String>,
+    /// Allowlist of base directories under which project roots may be registered.
+    ///
+    /// When non-empty, `POST /projects` rejects any root that is not a descendant
+    /// of one of these directories. When empty, any valid git repository path is
+    /// accepted (legacy behaviour).
+    #[serde(default)]
+    pub allowed_project_roots: Vec<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -38,6 +53,8 @@ impl Default for ServerConfig {
             notification_lag_log_every: default_notification_lag_log_every(),
             ws_heartbeat_interval_secs: default_ws_heartbeat_interval_secs(),
             trusted_proxies: Vec::new(),
+            api_token: None,
+            allowed_project_roots: Vec::new(),
         }
     }
 }
