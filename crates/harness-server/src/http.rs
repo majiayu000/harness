@@ -1290,17 +1290,25 @@ mod startup_tests {
         // unconditionally, even when an assertion below panics.
         let _env_guard = unsafe { HomeGuard::set(&fake_home) };
 
+        let startup = |project_root: &std::path::Path, data_dir: &std::path::Path| {
+            let project_root = project_root.to_path_buf();
+            let data_dir = data_dir.to_path_buf();
+            async move {
+                let mut config = HarnessConfig::default();
+                config.server.project_root = project_root;
+                config.server.data_dir = data_dir;
+                let server = Arc::new(HarnessServer::new(
+                    config,
+                    ThreadManager::new(),
+                    AgentRegistry::new("test"),
+                ));
+                build_app_state(server).await
+            }
+        };
+
         // First startup: create a skill so it gets persisted to disk.
         {
-            let mut config = HarnessConfig::default();
-            config.server.project_root = project_root.clone();
-            config.server.data_dir = data_dir.clone();
-            let server = Arc::new(HarnessServer::new(
-                config,
-                ThreadManager::new(),
-                AgentRegistry::new("test"),
-            ));
-            let state = build_app_state(server).await?;
+            let state = startup(&project_root, &data_dir).await?;
             let mut skills = state.engines.skills.write().await;
             skills.create("my-test-skill".to_string(), "# My test skill".to_string());
         }
@@ -1316,15 +1324,7 @@ mod startup_tests {
 
         // Second startup: verify the persisted skill is reloaded via discover().
         {
-            let mut config = HarnessConfig::default();
-            config.server.project_root = project_root.clone();
-            config.server.data_dir = data_dir.clone();
-            let server = Arc::new(HarnessServer::new(
-                config,
-                ThreadManager::new(),
-                AgentRegistry::new("test"),
-            ));
-            let state = build_app_state(server).await?;
+            let state = startup(&project_root, &data_dir).await?;
             let skills = state.engines.skills.read().await;
             let reloaded = skills
                 .list()
