@@ -717,6 +717,18 @@ async fn run_agent_review(
             break;
         }
 
+        // Malformed reviewer output: neither APPROVED nor any ISSUE: lines.
+        // Sending an empty fix prompt would produce arbitrary or no-op commits,
+        // so treat this as a reviewer protocol failure and abort the review loop.
+        if issues.is_empty() {
+            tracing::warn!(
+                agent_round,
+                "agent reviewer output contained neither APPROVED nor ISSUE: lines; \
+                 treating as protocol failure and skipping fix round"
+            );
+            break;
+        }
+
         if agent_round == max_rounds {
             tracing::info!(
                 "agent review exhausted {max_rounds} rounds, proceeding to GitHub review"
