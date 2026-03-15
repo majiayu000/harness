@@ -70,7 +70,7 @@ pub async fn metrics_collect(
 
     let violation_count = violations.len();
     let report = harness_observe::QualityGrader::grade(&harness_observe::quality::QualityInput {
-        events: evts.clone(),
+        events: evts,
         violation_count,
         ..Default::default()
     });
@@ -253,7 +253,7 @@ pub async fn metrics_query(
                 .unwrap_or(0);
             let report =
                 harness_observe::QualityGrader::grade(&harness_observe::quality::QualityInput {
-                    events: evts.clone(),
+                    events: evts,
                     violation_count,
                     ..Default::default()
                 });

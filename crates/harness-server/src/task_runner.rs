@@ -78,6 +78,10 @@ pub struct TaskState {
     pub status: TaskStatus,
     pub turn: u32,
     pub pr_url: Option<String>,
+    /// Non-empty body of the PR description; None when unknown or not yet set.
+    /// Used by QualityTrigger to determine whether the PR has a real description.
+    #[serde(default)]
+    pub pr_description: Option<String>,
     pub rounds: Vec<RoundResult>,
     pub error: Option<String>,
     /// Intake source name that created this task (e.g. "github", "feishu").
@@ -93,6 +97,11 @@ pub struct TaskState {
     /// Populated at runtime; not persisted (use `TaskStore::list_children` after restart).
     #[serde(default)]
     pub subtask_ids: Vec<TaskId>,
+    /// Effective project root used during task execution (worktree path when workspace
+    /// isolation is active). Set before worktree cleanup so QualityTrigger can scan
+    /// the correct checkout. Not persisted to DB or serialised in HTTP responses.
+    #[serde(skip)]
+    pub task_project_root: Option<std::path::PathBuf>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -116,9 +125,11 @@ impl TaskState {
             status: TaskStatus::Pending,
             turn: 0,
             pr_url: None,
+            pr_description: None,
             rounds: Vec::new(),
             error: None,
             source: None,
+            task_project_root: None,
             external_id: None,
             parent_id: None,
             subtask_ids: Vec::new(),

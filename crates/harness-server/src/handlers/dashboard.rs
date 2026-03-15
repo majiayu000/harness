@@ -60,7 +60,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                 })
                 .unwrap_or(0);
             let report = QualityGrader::grade(&QualityInput {
-                events: events.clone(),
+                events,
                 violation_count,
                 ..Default::default()
             });

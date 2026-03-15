@@ -709,7 +709,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             })
             .unwrap_or(0);
         harness_observe::quality::QualityGrader::grade(&harness_observe::quality::QualityInput {
-            events: events.clone(),
+            events,
             violation_count,
             ..Default::default()
         })

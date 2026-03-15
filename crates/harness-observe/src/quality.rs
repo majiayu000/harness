@@ -63,9 +63,27 @@ pub struct QualityDimensions {
     pub diff_complexity: f64,
     /// PR metadata completeness: description and linked-issue presence.
     pub pr_completeness: f64,
-    /// Security event health: low ratio of security-related blocks.
+    /// Event stability: low ratio of blocked or escalated decisions across all hooks.
     pub security: f64,
 }
+
+/// Maximum number of clippy warnings before the score hits zero.
+const CLIPPY_WARNINGS_CAP: f64 = 10.0;
+/// Maximum number of review-fix rounds before the score hits zero.
+const REVIEW_ROUNDS_CAP: f64 = 5.0;
+/// Maximum number of violations before the score hits zero.
+const VIOLATION_COUNT_CAP: f64 = 100.0;
+/// Divisor for the diff-complexity index (changed_files * avg_diff_lines / N).
+const DIFF_COMPLEXITY_DIVISOR: f64 = 500.0;
+
+/// Scoring weights — must sum to 1.0.
+const WEIGHT_TEST_PASS_RATE: f64 = 0.25;
+const WEIGHT_CLIPPY: f64 = 0.15;
+const WEIGHT_REVIEW: f64 = 0.15;
+const WEIGHT_VIOLATION: f64 = 0.15;
+const WEIGHT_DIFF_COMPLEXITY: f64 = 0.10;
+const WEIGHT_PR_COMPLETENESS: f64 = 0.10;
+const WEIGHT_SECURITY: f64 = 0.10;
 
 pub struct QualityGrader;
 
@@ -75,33 +93,36 @@ impl QualityGrader {
         let events = &input.events;
         let total = events.len().max(1) as f64;
 
-        // Security (0.10): ratio of security-related blocks to total events.
+        // Stability (0.10): ratio of blocked or escalated events to total events.
+        // Counts ALL Block/Escalate decisions, not only security-labelled ones, so that
+        // a history full of blocked pre_tool_use events correctly reduces quality.
         let security_issues = events
             .iter()
-            .filter(|e| matches!(e.decision, Decision::Block) && e.hook.contains("security"))
+            .filter(|e| matches!(e.decision, Decision::Block | Decision::Escalate))
             .count() as f64;
         let security = (1.0 - security_issues / total) * 100.0;
 
         // Test pass rate (0.25): binary pass/fail from post-validation.
         let test_pass_rate = if input.test_passed { 100.0 } else { 0.0 };
 
-        // Clippy warnings (0.15): penalise each warning up to a cap of 10.
-        let clippy = (1.0 - (input.clippy_warnings as f64 / 10.0).min(1.0)) * 100.0;
+        // Clippy warnings (0.15): penalise each warning up to a cap.
+        let clippy = (1.0 - (input.clippy_warnings as f64 / CLIPPY_WARNINGS_CAP).min(1.0)) * 100.0;
 
-        // Review rounds (0.15): each extra fix cycle lowers the score (cap at 5).
-        let review = (1.0 - (input.review_rounds as f64 / 5.0).min(1.0)) * 100.0;
+        // Review rounds (0.15): each extra fix cycle lowers the score (cap at cap).
+        let review = (1.0 - (input.review_rounds as f64 / REVIEW_ROUNDS_CAP).min(1.0)) * 100.0;
 
-        // Violation count (0.15): inverse of violation density (cap at 100).
+        // Violation count (0.15): inverse of violation density.
         let violation = if input.violation_count == 0 {
             100.0
         } else {
-            (1.0 - (input.violation_count as f64 / 100.0).min(1.0)) * 100.0
+            (1.0 - (input.violation_count as f64 / VIOLATION_COUNT_CAP).min(1.0)) * 100.0
         };
 
         // Diff complexity (0.10): penalise large, sprawling diffs.
-        // Complexity index = changed_files * avg_diff_lines / 500, capped at 1.
-        let complexity_index =
-            (input.changed_files as f64 * input.avg_diff_lines as f64 / 500.0).min(1.0);
+        // Complexity index = changed_files * avg_diff_lines / DIVISOR, capped at 1.
+        let complexity_index = (input.changed_files as f64 * input.avg_diff_lines as f64
+            / DIFF_COMPLEXITY_DIVISOR)
+            .min(1.0);
         let diff_complexity = (1.0 - complexity_index) * 100.0;
 
         // PR completeness (0.10): one point each for description and linked issue.
@@ -109,13 +130,13 @@ impl QualityGrader {
         let pr_completeness = (completeness_points as f64 / 2.0) * 100.0;
 
         // Weighted score.
-        let score = test_pass_rate * 0.25
-            + clippy * 0.15
-            + review * 0.15
-            + violation * 0.15
-            + diff_complexity * 0.10
-            + pr_completeness * 0.10
-            + security * 0.10;
+        let score = test_pass_rate * WEIGHT_TEST_PASS_RATE
+            + clippy * WEIGHT_CLIPPY
+            + review * WEIGHT_REVIEW
+            + violation * WEIGHT_VIOLATION
+            + diff_complexity * WEIGHT_DIFF_COMPLEXITY
+            + pr_completeness * WEIGHT_PR_COMPLETENESS
+            + security * WEIGHT_SECURITY;
 
         let grade = Grade::from_score(score);
 
@@ -191,6 +212,34 @@ mod tests {
         };
         let report = QualityGrader::grade(&input);
         assert!(report.dimensions.security < 100.0);
+    }
+
+    #[test]
+    fn grade_degrades_with_non_security_blocks() {
+        // pre_tool_use blocks have no "security" in hook name; must still lower quality.
+        let input = QualityInput {
+            events: (0..10).map(|_| block_event("pre_tool_use")).collect(),
+            ..Default::default()
+        };
+        let report = QualityGrader::grade(&input);
+        assert!(
+            report.dimensions.security < 100.0,
+            "non-security Block events must reduce the stability dimension"
+        );
+    }
+
+    #[test]
+    fn grade_degrades_with_escalations() {
+        let escalate = |_| Event::new(SessionId::new(), "pre_tool_use", "Edit", Decision::Escalate);
+        let input = QualityInput {
+            events: (0..10).map(escalate).collect(),
+            ..Default::default()
+        };
+        let report = QualityGrader::grade(&input);
+        assert!(
+            report.dimensions.security < 100.0,
+            "Escalate events must reduce the stability dimension"
+        );
     }
 
     #[test]

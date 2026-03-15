@@ -176,6 +176,8 @@ impl TaskRow {
             status: status.parse::<TaskStatus>()?,
             turn: turn as u32,
             pr_url,
+            pr_description: None,
+            task_project_root: None,
             rounds: decoded_rounds,
             error,
             source,
@@ -250,12 +252,14 @@ mod tests {
             status,
             turn: 0,
             pr_url: None,
+            pr_description: None,
             rounds: vec![],
             error: None,
             source: None,
             external_id: None,
             parent_id: None,
             subtask_ids: vec![],
+            task_project_root: None,
         }
     }
 

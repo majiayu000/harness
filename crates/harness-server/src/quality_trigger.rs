@@ -62,14 +62,14 @@ impl QualityTrigger {
         unix_now().saturating_sub(last) >= self.cooldown_secs
     }
 
-    /// Scan the project root for rule violations. Returns 0 on error or when no
+    /// Scan `path` for rule violations. Returns 0 on error or when no
     /// guards are registered (same behaviour as the former hardcoded `0`).
-    async fn scan_violation_count(&self) -> usize {
+    async fn scan_violation_count(&self, path: &std::path::Path) -> usize {
         let engine = self.rules.read().await;
         if engine.guards().is_empty() {
             return 0;
         }
-        match engine.scan(&self.project_root).await {
+        match engine.scan(path).await {
             Ok(v) => v.len(),
             Err(e) => {
                 tracing::warn!("quality_trigger: rule scan failed: {e}");
@@ -88,9 +88,19 @@ impl QualityTrigger {
             }
         };
 
-        let violation_count = self.scan_violation_count().await;
-        let review_rounds = task.rounds.len() as u32;
-        let has_pr_description = task.pr_url.is_some();
+        let scan_path = task
+            .task_project_root
+            .as_deref()
+            .filter(|p| p.exists())
+            .unwrap_or(&self.project_root);
+        let violation_count = self.scan_violation_count(scan_path).await;
+        // Count only fix cycles produced by agent review, not implement/poll/subtask rounds.
+        let review_rounds = task
+            .rounds
+            .iter()
+            .filter(|r| r.action == "agent_review_fix")
+            .count() as u32;
+        let has_pr_description = task.pr_description.is_some() || task.pr_url.is_some();
 
         let input = QualityInput {
             events,
@@ -137,14 +147,9 @@ impl QualityTrigger {
             return;
         };
         let project = Project::from_path(self.project_root.clone());
-        let all_events: Vec<harness_core::Event> = self
-            .events
-            .query(&EventFilters::default())
-            .await
-            .unwrap_or_default();
         if let Err(e) = self
             .gc_agent
-            .run(&project, &all_events, &[], agent.as_ref())
+            .run(&project, &input.events, &[], agent.as_ref())
             .await
         {
             tracing::warn!("quality_trigger: gc_agent.run failed: {e}");
@@ -195,12 +200,14 @@ mod tests {
             status: TaskStatus::Done,
             turn: 0,
             pr_url: None,
+            pr_description: None,
             rounds: Vec::new(),
             error: None,
             source: None,
             external_id: None,
             parent_id: None,
             subtask_ids: Vec::new(),
+            task_project_root: None,
         }
     }
 
