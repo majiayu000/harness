@@ -223,9 +223,10 @@ pub fn agent_review_fix_prompt(pr: u64, issues: &[String], round: u32) -> String
         .map(|(i, issue)| format!("{}. {issue}", i + 1))
         .collect::<Vec<_>>()
         .join("\n");
+    let safe_issue_list = wrap_external_data(&issue_list);
     format!(
         "The independent reviewer found the following issues in PR #{pr} \
-         (agent review round {round}):\n\n{issue_list}\n\n\
+         (agent review round {round}):\n\n{safe_issue_list}\n\n\
          Fix each issue, run cargo check and cargo test, then commit and push.\n\
          On the last line of your output, print PR_URL=<PR URL>"
     )

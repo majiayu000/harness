@@ -1,4 +1,4 @@
-use crate::http::AppState;
+use crate::http::{resolve_reviewer, AppState};
 use harness_core::DraftId;
 use harness_protocol::{RpcResponse, INTERNAL_ERROR, NOT_FOUND};
 
@@ -142,6 +142,11 @@ pub async fn gc_adopt(
                     &state.core.server.config.gc,
                     state.core.project_root.clone(),
                 );
+                let (reviewer, _review_config) = resolve_reviewer(
+                    &state.core.server.agent_registry,
+                    &state.core.server.config.agents.review,
+                    agent.name(),
+                );
                 let project_id = state.core.project_root.to_string_lossy().into_owned();
                 let permit = match state.concurrency.task_queue.acquire(&project_id).await {
                     Ok(p) => p,
@@ -156,7 +161,7 @@ pub async fn gc_adopt(
                 let tid = crate::task_runner::spawn_task(
                     state.core.tasks.clone(),
                     agent,
-                    None,
+                    reviewer,
                     std::sync::Arc::new(state.core.server.config.clone()),
                     state.engines.skills.clone(),
                     state.observability.events.clone(),
