@@ -121,7 +121,11 @@ pub async fn gc_adopt(
         .map(|a| a.target_path.display().to_string())
         .collect();
 
-    match state.engines.gc_agent.adopt(&draft_id) {
+    match state
+        .engines
+        .gc_agent
+        .adopt(&draft_id, &state.core.project_root)
+    {
         Ok(()) => {
             if artifact_paths.is_empty() || !state.core.server.config.gc.auto_pr {
                 return RpcResponse::success(

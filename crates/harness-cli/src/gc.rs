@@ -80,7 +80,8 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
         GcCommand::Adopt { draft_id } => {
             let id = DraftId::from_str(&draft_id);
             let gc_agent = make_agent_for_draft_ops(data_dir)?;
-            gc_agent.adopt(&id)?;
+            let project_root = std::env::current_dir()?;
+            gc_agent.adopt(&id, &project_root)?;
             println!("Adopted draft: {draft_id}");
         }
 

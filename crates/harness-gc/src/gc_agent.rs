@@ -141,17 +141,28 @@ impl GcAgent {
         Ok(report)
     }
 
-    /// Adopt a draft: write artifacts to disk.
+    /// Adopt a draft: write artifacts to disk under `project_root`.
     ///
-    /// All artifact target_paths are validated to be relative (no absolute
-    /// paths or `..` traversal) before any writes occur.
-    pub fn adopt(&self, draft_id: &DraftId) -> anyhow::Result<()> {
+    /// All artifact target_paths are validated before any writes occur:
+    /// 1. Must be relative (no absolute paths).
+    /// 2. Must not contain `..` traversal components.
+    /// 3. After joining with `project_root` and canonicalizing the parent
+    ///    directory, the resolved path must still start with the canonical
+    ///    project root (guards against symlink-based escapes).
+    pub fn adopt(&self, draft_id: &DraftId, project_root: &std::path::Path) -> anyhow::Result<()> {
         let mut draft = self
             .draft_store
             .get(draft_id)?
             .ok_or_else(|| anyhow::anyhow!("draft not found"))?;
 
-        // Validate all paths before writing any files
+        let canonical_root = project_root.canonicalize().map_err(|e| {
+            anyhow::anyhow!(
+                "cannot canonicalize project root '{}': {e}",
+                project_root.display()
+            )
+        })?;
+
+        // Validate all paths before writing any files.
         for artifact in &draft.artifacts {
             let path = &artifact.target_path;
             if path.is_absolute() {
@@ -168,13 +179,36 @@ impl GcAgent {
                     );
                 }
             }
+            // Canonicalize the parent directory (creating it if needed) and
+            // verify the resolved path stays within the project root.
+            let abs_path = canonical_root.join(path);
+            let parent = abs_path.parent().ok_or_else(|| {
+                anyhow::anyhow!("artifact path has no parent: {}", path.display())
+            })?;
+            std::fs::create_dir_all(parent)?;
+            let filename = abs_path.file_name().ok_or_else(|| {
+                anyhow::anyhow!("artifact path has no filename: {}", path.display())
+            })?;
+            let canonical_path = parent
+                .canonicalize()
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "cannot canonicalize parent of '{}': {e}",
+                        abs_path.display()
+                    )
+                })?
+                .join(filename);
+            if !canonical_path.starts_with(&canonical_root) {
+                anyhow::bail!(
+                    "artifact target_path escapes project root: {}",
+                    path.display()
+                );
+            }
         }
 
         for artifact in &draft.artifacts {
-            if let Some(parent) = artifact.target_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&artifact.target_path, &artifact.content)?;
+            let abs_path = canonical_root.join(&artifact.target_path);
+            std::fs::write(&abs_path, &artifact.content)?;
         }
 
         draft.status = DraftStatus::Adopted;
@@ -412,7 +446,7 @@ mod tests {
         }]);
         gc.draft_store.save(&draft).unwrap();
 
-        let err = gc.adopt(&draft.id).unwrap_err();
+        let err = gc.adopt(&draft.id, dir.path()).unwrap_err();
         assert!(
             err.to_string().contains("must be relative"),
             "unexpected error: {err}"
@@ -431,7 +465,7 @@ mod tests {
         }]);
         gc.draft_store.save(&draft).unwrap();
 
-        let err = gc.adopt(&draft.id).unwrap_err();
+        let err = gc.adopt(&draft.id, dir.path()).unwrap_err();
         assert!(
             err.to_string().contains("must not contain '..'"),
             "unexpected error: {err}"
@@ -450,7 +484,35 @@ mod tests {
         }]);
         gc.draft_store.save(&draft).unwrap();
 
-        gc.adopt(&draft.id).unwrap();
+        gc.adopt(&draft.id, dir.path()).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adopt_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        // Create a symlink inside root pointing outside
+        let link_path = root.path().join("escape_link");
+        symlink(outside.path(), &link_path).unwrap();
+
+        let gc = make_test_gc_agent(root.path());
+
+        let draft = test_draft(vec![Artifact {
+            artifact_type: ArtifactType::Guard,
+            target_path: std::path::PathBuf::from("escape_link/malicious.md"),
+            content: "escaped".into(),
+        }]);
+        gc.draft_store.save(&draft).unwrap();
+
+        let err = gc.adopt(&draft.id, root.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes project root"),
+            "unexpected error: {err}"
+        );
     }
 
     // --- parse_artifacts tests ---
