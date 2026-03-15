@@ -887,4 +887,33 @@ mod tests {
         assert_eq!(loaded.usage_count, 42);
         assert!(loaded.last_used.is_some());
     }
+
+    #[test]
+    fn discover_reloads_persisted_skills_across_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist_path = dir.path().to_path_buf();
+
+        // First "session": create and persist a skill to disk.
+        let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
+        store.create(
+            "custom-workflow".to_string(),
+            "# Custom Workflow\nDoes custom things.".to_string(),
+        );
+        assert!(
+            persist_path.join("custom-workflow.md").exists(),
+            "skill file must be written to disk before restart"
+        );
+
+        // Simulate server restart: new store, same persist_dir.
+        let mut restarted = SkillStore::new().with_persist_dir(persist_path.clone());
+        restarted.load_builtin();
+        restarted
+            .discover()
+            .expect("discover must not fail on restart");
+
+        assert!(
+            restarted.get_by_name("custom-workflow").is_some(),
+            "persisted skill must survive simulated server restart"
+        );
+    }
 }
