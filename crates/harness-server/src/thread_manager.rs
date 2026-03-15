@@ -14,14 +14,19 @@ use tokio::task::JoinHandle;
 /// - **Startup hydration**: performed in `http.rs` during app initialisation,
 ///   which loads persisted threads from `thread_db` into this cache via
 ///   `threads_cache()`.
-/// - **Mutation persistence**: every mutation to this cache is followed by a
-///   write-through to `thread_db`. There are two call sites responsible:
+/// - **Mutation persistence**: when `thread_db` is configured, mutations to
+///   this cache are followed by a write-through. All persistence helpers
+///   short-circuit when `thread_db` is `None`, so durability is optional.
+///   There are three call sites responsible:
 ///   1. `handlers/thread.rs` — `persist_thread` / `persist_thread_insert`
 ///      are called after each direct handler mutation: thread create/fork
 ///      (`thread_start`, `thread_fork`), turn start (`turn_start`), turn
 ///      cancel (`turn_cancel`), turn steer (`turn_steer`), thread resume
 ///      (`thread_resume`), and thread compact (`thread_compact`).
-///   2. `task_executor` — `persist_runtime_thread` is called (a) after each
+///   2. `handlers/thread.rs` — `thread_delete` removes the entry from this
+///      cache and, when `thread_db` is present, calls `db.delete(...)` to
+///      remove it from the backing store as well.
+///   3. `task_executor` — `persist_runtime_thread` is called (a) after each
 ///      stream item is applied to the cache (`task_executor/helpers.rs`
 ///      `process_stream_item`), and (b) at turn completion or failure
 ///      (`task_executor.rs` and `task_executor/helpers.rs`
