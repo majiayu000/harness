@@ -100,7 +100,10 @@ impl QualityTrigger {
             .iter()
             .filter(|r| r.action == "agent_review_fix")
             .count() as u32;
-        let has_pr_description = task.pr_description.is_some() || task.pr_url.is_some();
+        let has_pr_description = task
+            .pr_description
+            .as_deref()
+            .map_or(false, |d| !d.trim().is_empty());
         // Derive has_linked_issue from the runtime flag or by scanning the PR description.
         let has_linked_issue = task.has_linked_issue
             || task
@@ -108,7 +111,14 @@ impl QualityTrigger {
                 .as_deref()
                 .map(|d| {
                     let d = d.to_lowercase();
-                    let keywords = ["fixes #", "closes #", "resolves #", "fix #", "close #", "resolve #"];
+                    let keywords = [
+                        "fixes #",
+                        "closes #",
+                        "resolves #",
+                        "fix #",
+                        "close #",
+                        "resolve #",
+                    ];
                     keywords.iter().any(|&kw| d.contains(kw))
                 })
                 .unwrap_or(false);

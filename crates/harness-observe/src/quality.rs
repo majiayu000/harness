@@ -112,11 +112,8 @@ impl QualityGrader {
         let review = (1.0 - (input.review_rounds as f64 / REVIEW_ROUNDS_CAP).min(1.0)) * 100.0;
 
         // Violation count (0.15): inverse of violation density.
-        let violation = if input.violation_count == 0 {
-            100.0
-        } else {
-            (1.0 - (input.violation_count as f64 / VIOLATION_COUNT_CAP).min(1.0)) * 100.0
-        };
+        let violation =
+            (1.0 - (input.violation_count as f64 / VIOLATION_COUNT_CAP).min(1.0)) * 100.0;
 
         // Diff complexity (0.10): penalise large, sprawling diffs.
         // Complexity index = changed_files * avg_diff_lines / DIVISOR, capped at 1.
