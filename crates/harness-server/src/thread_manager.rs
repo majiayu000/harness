@@ -297,6 +297,11 @@ impl ThreadManager {
             }
         }
 
+        // Rewrite each cloned turn's thread_id to point at the new thread.
+        for turn in &mut new_thread.turns {
+            turn.thread_id = new_thread.id.clone();
+        }
+
         let new_id = new_thread.id.clone();
         self.threads.insert(new_id.as_str().to_string(), new_thread);
         Ok(new_id)
@@ -486,5 +491,167 @@ mod tests {
         assert!(tm
             .start_turn(&bad_id, "x".to_string(), AgentId::new())
             .is_err());
+    }
+
+    #[test]
+    fn find_thread_and_turn_locates_existing_turn() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+
+        let (found_thread_id, found_turn) = tm
+            .find_thread_and_turn(&turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn not found"))?;
+        assert_eq!(found_thread_id, thread_id);
+        assert_eq!(found_turn.id, turn_id);
+        Ok(())
+    }
+
+    #[test]
+    fn find_thread_and_turn_returns_none_for_missing() {
+        let tm = ThreadManager::new();
+        let fake_turn = TurnId::from_str("does-not-exist");
+        assert!(tm.find_thread_and_turn(&fake_turn).is_none());
+    }
+
+    #[test]
+    fn find_thread_for_turn_returns_correct_thread() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+
+        let found = tm.find_thread_for_turn(&turn_id);
+        assert_eq!(found, Some(thread_id));
+        Ok(())
+    }
+
+    #[test]
+    fn steer_turn_appends_instruction() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "initial".to_string(), AgentId::new())?;
+
+        tm.steer_turn(&thread_id, &turn_id, "steer me".to_string())?;
+
+        let turn = tm
+            .get_turn(&thread_id, &turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn missing"))?;
+        assert_eq!(turn.items.len(), 2); // UserMessage + steer UserMessage
+        Ok(())
+    }
+
+    #[test]
+    fn resume_thread_sets_status_to_idle() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        // start_turn transitions the thread to Active; verify that first.
+        tm.start_turn(&thread_id, "work".to_string(), AgentId::new())?;
+        let thread = tm
+            .get_thread(&thread_id)
+            .ok_or_else(|| anyhow::anyhow!("thread missing"))?;
+        assert_eq!(thread.status, harness_core::ThreadStatus::Active);
+        drop(thread);
+
+        tm.resume_thread(&thread_id)?;
+
+        let thread = tm
+            .get_thread(&thread_id)
+            .ok_or_else(|| anyhow::anyhow!("thread missing"))?;
+        assert_eq!(thread.status, harness_core::ThreadStatus::Idle);
+        Ok(())
+    }
+
+    #[test]
+    fn fork_thread_creates_independent_copy() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let orig_id = tm.start_thread(PathBuf::from("/src"));
+        tm.start_turn(&orig_id, "t1".to_string(), AgentId::new())?;
+
+        let fork_id = tm.fork_thread(&orig_id, None)?;
+        assert_ne!(fork_id, orig_id);
+
+        let fork = tm
+            .get_thread(&fork_id)
+            .ok_or_else(|| anyhow::anyhow!("fork missing"))?;
+        assert_eq!(fork.project_root, PathBuf::from("/src"));
+        assert_eq!(fork.turns.len(), 1);
+        // Every cloned turn must reference the fork's ID, not the original's.
+        for turn in &fork.turns {
+            assert_eq!(
+                turn.thread_id, fork_id,
+                "turn thread_id not updated after fork"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fork_thread_truncates_at_turn() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let orig_id = tm.start_thread(PathBuf::from("/src"));
+        let t1 = tm.start_turn(&orig_id, "t1".to_string(), AgentId::new())?;
+        tm.start_turn(&orig_id, "t2".to_string(), AgentId::new())?;
+
+        let fork_id = tm.fork_thread(&orig_id, Some(&t1))?;
+        let fork = tm
+            .get_thread(&fork_id)
+            .ok_or_else(|| anyhow::anyhow!("fork missing"))?;
+        assert_eq!(fork.turns.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_thread_clears_completed_turn_items() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        tm.add_item(
+            &thread_id,
+            &turn_id,
+            Item::AgentReasoning {
+                content: "thinking".to_string(),
+            },
+        )?;
+        tm.complete_turn(&thread_id, &turn_id)?;
+
+        tm.compact_thread(&thread_id)?;
+
+        let turn = tm
+            .get_turn(&thread_id, &turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn missing"))?;
+        assert!(turn.items.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn mark_turn_failed_with_error_adds_error_item() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+
+        tm.mark_turn_failed_with_error(&thread_id, &turn_id, "something went wrong".to_string())?;
+
+        let turn = tm
+            .get_turn(&thread_id, &turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn missing"))?;
+        assert_eq!(turn.status, TurnStatus::Failed);
+        let has_error = turn
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Error { .. }));
+        assert!(has_error);
+        Ok(())
+    }
+
+    #[test]
+    fn is_turn_running_returns_true_while_running() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+
+        assert!(tm.is_turn_running(&thread_id, &turn_id));
+        tm.complete_turn(&thread_id, &turn_id)?;
+        assert!(!tm.is_turn_running(&thread_id, &turn_id));
+        Ok(())
     }
 }
