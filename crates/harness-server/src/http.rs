@@ -5,6 +5,7 @@ use axum::{
     extract::DefaultBodyLimit,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
@@ -19,6 +20,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, RwLock};
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 512 * 1024;
@@ -754,6 +756,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             "/signals",
             post(ingest_signal).layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES)),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            api_auth_middleware,
+        ))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -792,6 +798,63 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!("received Ctrl+C"),
         _ = terminate => tracing::info!("received SIGTERM"),
+    }
+}
+
+/// Resolve the effective API token from server config or `HARNESS_API_TOKEN` env var.
+fn resolve_api_token(config: &harness_core::ServerConfig) -> Option<String> {
+    config
+        .api_token
+        .clone()
+        .or_else(|| std::env::var("HARNESS_API_TOKEN").ok())
+        .filter(|t| !t.is_empty())
+}
+
+/// Bearer token authentication middleware.
+///
+/// Exempts `/health`, `/webhook`, `/webhook/feishu`, and `/signals` (which
+/// have their own HMAC-based protection).  All other endpoints require an
+/// `Authorization: Bearer <token>` header when `api_token` is configured.
+/// When no token is configured the middleware is a no-op (backward compat).
+async fn api_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    // Exempt paths that carry their own authentication or must stay public.
+    if matches!(
+        path,
+        "/health" | "/webhook" | "/webhook/feishu" | "/signals"
+    ) {
+        return next.run(req).await;
+    }
+
+    let Some(expected) = resolve_api_token(&state.core.server.config.server) else {
+        // No token configured — skip auth for backward compatibility.
+        return next.run(req).await;
+    };
+
+    let provided = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::to_string);
+
+    let authorized = provided
+        .as_deref()
+        .map(|tok| tok.as_bytes().ct_eq(expected.as_bytes()).into())
+        .unwrap_or(false);
+
+    if authorized {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        )
+            .into_response()
     }
 }
 

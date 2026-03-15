@@ -227,6 +227,7 @@ fn sanitize_task_id(id: &str) -> String {
 }
 
 async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {
+    crate::post_validator::validate_command_safety(script).map_err(|e| anyhow::anyhow!("{e}"))?;
     let output = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(script)

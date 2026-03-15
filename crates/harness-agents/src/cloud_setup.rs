@@ -11,6 +11,85 @@ pub(crate) const SETUP_ENV_ALLOWLIST: [&str; 10] = [
     "PATH", "HOME", "USER", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE",
 ];
 
+/// Reject setup commands that contain shell operators enabling injection.
+///
+/// `setup_commands` must only come from server-level config, never from
+/// per-project `.harness/config.toml`, and must invoke a single binary
+/// without piping or chaining (e.g. `npm ci`, `cargo fetch`).
+fn validate_setup_command(cmd: &str) -> Result<(), String> {
+    if cmd.contains('\n') || cmd.contains('\r') {
+        return Err(format!(
+            "setup command `{}` rejected: must be single-line",
+            cmd.lines().next().unwrap_or(cmd)
+        ));
+    }
+    let chars: Vec<char> = cmd.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < len {
+        let c = chars[i];
+        if c == '\\' && !in_single && i + 1 < len {
+            i += 2;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if c == '"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if in_single {
+            i += 1;
+            continue;
+        }
+        if c == '`' || (c == '$' && i + 1 < len && chars[i + 1] == '(') {
+            return Err(format!(
+                "setup command `{cmd}` rejected: contains command substitution"
+            ));
+        }
+        // Block chaining/backgrounding operators; allow redirections (>, <, >>)
+        // which are needed for setup tasks like `npm ci > /dev/null`.
+        if !in_double {
+            match c {
+                '|' if i + 1 < len && chars[i + 1] == '|' => {
+                    return Err(format!(
+                        "setup command `{cmd}` rejected: contains shell operator `||`"
+                    ));
+                }
+                '|' => {
+                    return Err(format!(
+                        "setup command `{cmd}` rejected: contains shell operator `|`"
+                    ));
+                }
+                '&' if i + 1 < len && chars[i + 1] == '&' => {
+                    return Err(format!(
+                        "setup command `{cmd}` rejected: contains shell operator `&&`"
+                    ));
+                }
+                '&' => {
+                    return Err(format!(
+                        "setup command `{cmd}` rejected: contains shell operator `&`"
+                    ));
+                }
+                ';' => {
+                    return Err(format!(
+                        "setup command `{cmd}` rejected: contains shell operator `;`"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 fn setup_cache_ttl(cloud: &CodexCloudConfig) -> Duration {
     Duration::from_secs(cloud.cache_ttl_hours.saturating_mul(3600))
 }
@@ -140,6 +219,10 @@ pub(crate) async fn run_setup_phase(
     for setup_command in &cloud.setup_commands {
         if setup_command.trim().is_empty() {
             continue;
+        }
+
+        if let Err(msg) = validate_setup_command(setup_command) {
+            return Err(HarnessError::AgentExecution(msg));
         }
 
         let mut cmd = Command::new("sh");

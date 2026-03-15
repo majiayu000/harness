@@ -44,6 +44,17 @@ pub async fn register_project(
         return (StatusCode::BAD_REQUEST, Json(json!({"error": msg})));
     }
 
+    let allowed = &state.core.server.config.server.allowed_project_roots;
+    if !allowed.is_empty() {
+        let permitted = allowed.iter().any(|base| root.starts_with(base));
+        if !permitted {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "project root is not under an allowed base directory"})),
+            );
+        }
+    }
+
     let project = Project {
         id: req.id,
         root,
