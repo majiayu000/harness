@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use harness_core::{
     interceptor::{InterceptResult, PostExecuteResult, TurnInterceptor},
-    lang_detect, AgentRequest, AgentResponse, ValidationConfig,
+    AgentRequest, AgentResponse, ValidationConfig,
 };
 use std::path::Path;
 use tokio::process::Command;
@@ -174,13 +174,13 @@ impl TurnInterceptor for PostExecutionValidator {
 
     async fn post_execute(&self, req: &AgentRequest, _resp: &AgentResponse) -> PostExecuteResult {
         let project = &req.project_root;
-        let lang = lang_detect::detect_language(project);
 
-        // Resolve pre_commit commands: config takes precedence over language detection.
-        // Config-provided commands are validated for shell operator safety; hardcoded
-        // defaults from lang_detect are trusted at compile time and bypass this check.
+        // Only run explicitly configured commands from .harness/config.toml.
+        // When config is empty, validation instructions are injected into the
+        // agent prompt instead (see task_executor.rs). This avoids hardcoded
+        // tool assumptions and lets the agent adapt to the project environment.
         let pre_commit = if self.config.pre_commit.is_empty() {
-            lang_detect::default_pre_commit_commands(lang, project)
+            vec![]
         } else {
             for cmd in &self.config.pre_commit {
                 if let Err(e) = Self::validate_command_safety(cmd) {
@@ -190,9 +190,8 @@ impl TurnInterceptor for PostExecutionValidator {
             self.config.pre_commit.clone()
         };
 
-        // Resolve pre_push commands: config takes precedence over language detection.
         let pre_push = if self.config.pre_push.is_empty() {
-            lang_detect::default_pre_push_commands(lang, project)
+            vec![]
         } else {
             for cmd in &self.config.pre_push {
                 if let Err(e) = Self::validate_command_safety(cmd) {
