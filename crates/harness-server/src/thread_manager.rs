@@ -297,9 +297,20 @@ impl ThreadManager {
             }
         }
 
-        let new_id = new_thread.id.clone();
-        self.threads.insert(new_id.as_str().to_string(), new_thread);
-        Ok(new_id)
+        // Rebind every inherited turn: assign a fresh unique TurnId and update
+        // thread_id to point at the fork.  Without this, the same TurnId would
+        // exist in both the source and the fork, making find_thread_for_turn()
+        // nondeterministic (DashMap iteration order) and causing turn-control
+        // RPCs (cancel / status / steer) to silently route to the wrong branch.
+        let fork_id = new_thread.id.clone();
+        for turn in &mut new_thread.turns {
+            turn.id = TurnId::new();
+            turn.thread_id = fork_id.clone();
+        }
+
+        self.threads
+            .insert(fork_id.as_str().to_string(), new_thread);
+        Ok(fork_id)
     }
 
     /// Compact a thread by clearing items from all completed turns.
@@ -519,23 +530,23 @@ mod tests {
         Ok(())
     }
 
-    /// After forking, the same TurnId exists in both the original and the fork.
-    /// `find_thread_for_turn` must return one of the two valid thread IDs — not
-    /// None and not an unrelated thread — demonstrating that the lookup is
-    /// ambiguous but bounded.
+    /// After forking, inherited turns are rebound with new unique IDs so that
+    /// `find_thread_for_turn` is deterministic.  The original TurnId must
+    /// resolve exclusively to the source thread — not to the fork and not to
+    /// None — because the fork's copy carries a fresh TurnId.
     #[test]
-    fn find_thread_for_turn_after_fork_returns_one_of_the_two_threads() -> anyhow::Result<()> {
+    fn find_thread_for_turn_after_fork_returns_source_thread() -> anyhow::Result<()> {
         let tm = ThreadManager::new();
         let thread_id = tm.start_thread(PathBuf::from("/tmp"));
         let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
         tm.complete_turn(&thread_id, &turn_id)?;
-        let fork_id = tm.fork_thread(&thread_id, None)?;
+        let _fork_id = tm.fork_thread(&thread_id, None)?;
 
         let found = tm.find_thread_for_turn(&turn_id);
-        assert!(
-            found == Some(thread_id.clone()) || found == Some(fork_id.clone()),
-            "expected turn to resolve to either the original or forked thread, got {:?}",
-            found
+        assert_eq!(
+            found,
+            Some(thread_id.clone()),
+            "original turn ID must resolve deterministically to the source thread after fork"
         );
         Ok(())
     }
@@ -618,6 +629,10 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("fork missing"))?;
         assert_eq!(fork.turns.len(), 1);
         assert_eq!(fork.status, harness_core::ThreadStatus::Idle);
+        assert!(
+            fork.turns.iter().all(|t| t.thread_id == fork_id),
+            "all inherited turns must reference the fork's thread_id"
+        );
         Ok(())
     }
 
@@ -633,7 +648,16 @@ mod tests {
             .get_thread(&fork_id)
             .ok_or_else(|| anyhow::anyhow!("fork missing"))?;
         assert_eq!(fork.turns.len(), 1);
-        assert_eq!(fork.turns[0].id, turn1);
+        // Inherited turns are rebound with fresh IDs — the fork's turn must not
+        // share the source's TurnId (which would cause nondeterministic routing).
+        assert_ne!(
+            fork.turns[0].id, turn1,
+            "fork turn must have a new unique ID, not the source turn ID"
+        );
+        assert!(
+            fork.turns.iter().all(|t| t.thread_id == fork_id),
+            "all inherited turns must reference the fork's thread_id"
+        );
         Ok(())
     }
 
