@@ -146,9 +146,12 @@ impl GcAgent {
     /// All artifact target_paths are validated before any writes occur:
     /// 1. Must be relative (no absolute paths).
     /// 2. Must not contain `..` traversal components.
-    /// 3. After joining with `project_root` and canonicalizing the parent
-    ///    directory, the resolved path must still start with the canonical
-    ///    project root (guards against symlink-based escapes).
+    /// 3. Every existing path component (including the final filename if it
+    ///    already exists as a symlink) is canonicalized and verified to remain
+    ///    within the canonical project root — guards against both intermediate-
+    ///    component and final-component symlink escapes.
+    /// 4. No directories are created during validation; `create_dir_all` is
+    ///    deferred to the write phase to prevent side-effects on invalid paths.
     pub fn adopt(&self, draft_id: &DraftId, project_root: &std::path::Path) -> anyhow::Result<()> {
         let mut draft = self
             .draft_store
@@ -162,7 +165,9 @@ impl GcAgent {
             )
         })?;
 
-        // Validate all paths before writing any files.
+        // Validate all paths and collect resolved write targets before touching
+        // the filesystem.
+        let mut write_targets: Vec<std::path::PathBuf> = Vec::with_capacity(draft.artifacts.len());
         for artifact in &draft.artifacts {
             let path = &artifact.target_path;
             if path.is_absolute() {
@@ -179,36 +184,16 @@ impl GcAgent {
                     );
                 }
             }
-            // Canonicalize the parent directory (creating it if needed) and
-            // verify the resolved path stays within the project root.
             let abs_path = canonical_root.join(path);
-            let parent = abs_path.parent().ok_or_else(|| {
-                anyhow::anyhow!("artifact path has no parent: {}", path.display())
-            })?;
-            std::fs::create_dir_all(parent)?;
-            let filename = abs_path.file_name().ok_or_else(|| {
-                anyhow::anyhow!("artifact path has no filename: {}", path.display())
-            })?;
-            let canonical_path = parent
-                .canonicalize()
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "cannot canonicalize parent of '{}': {e}",
-                        abs_path.display()
-                    )
-                })?
-                .join(filename);
-            if !canonical_path.starts_with(&canonical_root) {
-                anyhow::bail!(
-                    "artifact target_path escapes project root: {}",
-                    path.display()
-                );
-            }
+            let safe_path = resolve_safe_write_path(&abs_path, &canonical_root)?;
+            write_targets.push(safe_path);
         }
 
-        for artifact in &draft.artifacts {
-            let abs_path = canonical_root.join(&artifact.target_path);
-            std::fs::write(&abs_path, &artifact.content)?;
+        for (artifact, target) in draft.artifacts.iter().zip(write_targets.iter()) {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(target, &artifact.content)?;
         }
 
         draft.status = DraftStatus::Adopted;
@@ -233,6 +218,52 @@ impl GcAgent {
 
     pub fn draft_store(&self) -> &DraftStore {
         &self.draft_store
+    }
+}
+
+/// Resolve `abs_path` to a safe write target within `root` without creating
+/// any directories.
+///
+/// Walks up the path until an existing filesystem component is found, then
+/// canonicalizes it (resolving all symlinks) and verifies it stays within
+/// `root`.  This catches both intermediate-component symlinks (issue #2) and
+/// final-component symlinks that point outside the project (issue #1).
+fn resolve_safe_write_path(
+    abs_path: &std::path::Path,
+    root: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let mut existing = abs_path.to_path_buf();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+
+    loop {
+        match existing.symlink_metadata() {
+            Ok(_) => {
+                // This component exists on disk (may be a symlink).
+                // Canonicalize to resolve every symlink in the chain.
+                let canonical = existing.canonicalize().map_err(|e| {
+                    anyhow::anyhow!("cannot canonicalize '{}': {e}", existing.display())
+                })?;
+                if !canonical.starts_with(root) {
+                    anyhow::bail!(
+                        "artifact target_path escapes project root: {}",
+                        abs_path.display()
+                    );
+                }
+                // Append the non-existent suffix components and return.
+                let resolved = missing.iter().rev().fold(canonical, |p, c| p.join(c));
+                return Ok(resolved);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match existing.file_name() {
+                Some(name) => {
+                    missing.push(name.to_owned());
+                    existing.pop();
+                }
+                None => {
+                    anyhow::bail!("cannot resolve path: {}", abs_path.display());
+                }
+            },
+            Err(e) => return Err(e.into()),
+        }
     }
 }
 
@@ -513,6 +544,37 @@ mod tests {
             err.to_string().contains("escapes project root"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adopt_rejects_symlink_final_component() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        // Create a real file outside the project, then symlink to it from inside
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "sensitive").unwrap();
+        let link_path = root.path().join("linkfile");
+        symlink(&outside_file, &link_path).unwrap();
+
+        let gc = make_test_gc_agent(root.path());
+        let draft = test_draft(vec![Artifact {
+            artifact_type: ArtifactType::Guard,
+            target_path: std::path::PathBuf::from("linkfile"),
+            content: "escaped".into(),
+        }]);
+        gc.draft_store.save(&draft).unwrap();
+
+        let err = gc.adopt(&draft.id, root.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes project root"),
+            "unexpected error: {err}"
+        );
+        // Verify the outside file was NOT overwritten
+        assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "sensitive");
     }
 
     // --- parse_artifacts tests ---
