@@ -802,12 +802,20 @@ async fn shutdown_signal() {
 }
 
 /// Resolve the effective API token from server config or `HARNESS_API_TOKEN` env var.
-fn resolve_api_token(config: &harness_core::ServerConfig) -> Option<String> {
+///
+/// Filters empty strings *before* the env-var fallback so that an explicit
+/// `api_token = ""` in server.toml does not shadow `HARNESS_API_TOKEN`.
+pub(crate) fn resolve_api_token(config: &harness_core::ServerConfig) -> Option<String> {
     config
         .api_token
-        .clone()
-        .or_else(|| std::env::var("HARNESS_API_TOKEN").ok())
+        .as_deref()
         .filter(|t| !t.is_empty())
+        .map(|t| t.to_owned())
+        .or_else(|| {
+            std::env::var("HARNESS_API_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        })
 }
 
 /// Bearer token authentication middleware.
@@ -823,24 +831,41 @@ async fn api_auth_middleware(
 ) -> Response {
     let path = req.uri().path();
     // Exempt paths that carry their own authentication or must stay public.
+    // The dashboard HTML and favicon are static UI assets — the API calls they
+    // make are individually protected.  /ws accepts a ?token= query param
+    // because browsers cannot set Authorization headers on WebSocket upgrades.
     if matches!(
         path,
-        "/health" | "/webhook" | "/webhook/feishu" | "/signals"
+        "/health" | "/webhook" | "/webhook/feishu" | "/signals" | "/" | "/favicon.ico"
     ) {
         return next.run(req).await;
     }
+
+    // WebSocket upgrades: accept token from ?token= query param as an
+    // alternative to the Authorization header (browser WS cannot set headers).
+    let query_token: Option<String> = if path == "/ws" {
+        req.uri().query().and_then(|q| {
+            q.split('&')
+                .find_map(|kv| kv.strip_prefix("token=").map(|v| v.to_owned()))
+        })
+    } else {
+        None
+    };
 
     let Some(expected) = resolve_api_token(&state.core.server.config.server) else {
         // No token configured — skip auth for backward compatibility.
         return next.run(req).await;
     };
 
-    let provided = req
+    let header_token = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(str::to_string);
+
+    // Accept either the Authorization header token or the query-param token.
+    let provided = header_token.or(query_token);
 
     let authorized = provided
         .as_deref()
