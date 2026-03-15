@@ -1,4 +1,4 @@
-use crate::quality::{QualityGrader, QualityReport};
+use crate::quality::{QualityGrader, QualityInput, QualityReport};
 use harness_core::{Decision, Event, Grade, RuleId, Severity, Violation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,7 +39,11 @@ pub fn generate_health_report(events: &[Event], violations: &[Violation]) -> Hea
     let violation_summary = aggregate_violations(violations);
     let signal_summary = derive_signals(events);
     let event_summary = count_events(events);
-    let quality = QualityGrader::grade(events, violations.len());
+    let quality = QualityGrader::grade(&QualityInput {
+        events: events.to_vec(),
+        violation_count: violations.len(),
+        ..Default::default()
+    });
     let recommendations = build_recommendations(&quality, &violation_summary, &event_summary);
 
     HealthReport {
@@ -133,8 +137,8 @@ fn build_recommendations(
             "Review and fix security-related violations to improve security score.".to_string(),
         );
     }
-    if quality.dimensions.stability < 80.0 {
-        recs.push("Reduce block rate to improve stability score.".to_string());
+    if quality.dimensions.review_rounds < 80.0 {
+        recs.push("Reduce review fix cycles to improve quality score.".to_string());
     }
     if summary.escalate_count > 0 {
         recs.push(format!(
@@ -255,6 +259,6 @@ mod tests {
             .map(|_| make_violation("SEC-01", Severity::High))
             .collect();
         let report = generate_health_report(&[], &violations);
-        assert!(report.quality.dimensions.coverage < 100.0);
+        assert!(report.quality.dimensions.violation_count < 100.0);
     }
 }

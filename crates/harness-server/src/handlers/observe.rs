@@ -69,7 +69,11 @@ pub async fn metrics_collect(
     };
 
     let violation_count = violations.len();
-    let report = harness_observe::QualityGrader::grade(&evts, violation_count);
+    let report = harness_observe::QualityGrader::grade(&harness_observe::quality::QualityInput {
+        events: evts.clone(),
+        violation_count,
+        ..Default::default()
+    });
     match serde_json::to_value(&report) {
         Ok(v) => RpcResponse::success(id, v),
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -247,7 +251,12 @@ pub async fn metrics_query(
                         .count()
                 })
                 .unwrap_or(0);
-            let report = harness_observe::QualityGrader::grade(&evts, violation_count);
+            let report =
+                harness_observe::QualityGrader::grade(&harness_observe::quality::QualityInput {
+                    events: evts.clone(),
+                    violation_count,
+                    ..Default::default()
+                });
             match serde_json::to_value(&report) {
                 Ok(v) => RpcResponse::success(id, v),
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),

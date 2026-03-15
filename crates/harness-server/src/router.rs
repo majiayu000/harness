@@ -751,12 +751,12 @@ mod tests {
         let result = resp
             .result
             .ok_or_else(|| anyhow::anyhow!("missing result"))?;
-        let coverage = result["dimensions"]["coverage"]
+        let coverage = result["dimensions"]["violation_count"]
             .as_f64()
-            .ok_or_else(|| anyhow::anyhow!("missing coverage"))?;
+            .ok_or_else(|| anyhow::anyhow!("missing violation_count"))?;
         assert!(
             coverage < 100.0,
-            "coverage should degrade with violations, got {coverage}"
+            "violation_count should degrade with violations, got {coverage}"
         );
         Ok(())
     }
@@ -804,9 +804,9 @@ mod tests {
         let result = resp
             .result
             .ok_or_else(|| anyhow::anyhow!("missing result"))?;
-        let coverage = result["dimensions"]["coverage"]
+        let coverage = result["dimensions"]["violation_count"]
             .as_f64()
-            .ok_or_else(|| anyhow::anyhow!("missing coverage"))?;
+            .ok_or_else(|| anyhow::anyhow!("missing violation_count"))?;
         assert!(
             coverage < 100.0,
             "coverage should degrade with persisted violations, got {coverage}"

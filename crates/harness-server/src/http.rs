@@ -406,6 +406,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             project_root.clone(),
             gc_cfg.auto_gc_grades.clone(),
             gc_cfg.auto_gc_cooldown_secs,
+            rules.clone(),
         ))
     };
 
@@ -505,7 +506,7 @@ fn build_completion_callback(
         Box::pin(async move {
             // Grade recent events and auto-trigger GC if quality is poor.
             if let Some(qt) = quality_trigger {
-                qt.check_and_maybe_trigger().await;
+                qt.check_and_maybe_trigger(&task).await;
             }
 
             // Auto-trigger review bot comment when task completes with a PR URL.
@@ -707,7 +708,12 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     .count()
             })
             .unwrap_or(0);
-        harness_observe::quality::QualityGrader::grade(&events, violation_count).grade
+        harness_observe::quality::QualityGrader::grade(&harness_observe::quality::QualityInput {
+            events: events.clone(),
+            violation_count,
+            ..Default::default()
+        })
+        .grade
     };
     crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
     crate::intake::build_orchestrator(
