@@ -78,6 +78,10 @@ pub struct TaskState {
     pub status: TaskStatus,
     pub turn: u32,
     pub pr_url: Option<String>,
+    /// Non-empty body of the PR description; None when unknown or not yet set.
+    /// Used by QualityTrigger to determine whether the PR has a real description.
+    #[serde(default)]
+    pub pr_description: Option<String>,
     pub rounds: Vec<RoundResult>,
     pub error: Option<String>,
     /// Intake source name that created this task (e.g. "github", "feishu").
@@ -93,6 +97,31 @@ pub struct TaskState {
     /// Populated at runtime; not persisted (use `TaskStore::list_children` after restart).
     #[serde(default)]
     pub subtask_ids: Vec<TaskId>,
+    /// Effective project root used during task execution (worktree path when workspace
+    /// isolation is active). Set before worktree cleanup so QualityTrigger can scan
+    /// the correct checkout. Not persisted to DB or serialised in HTTP responses.
+    #[serde(skip)]
+    pub task_project_root: Option<std::path::PathBuf>,
+    /// Whether the post-task test run passed. Populated by the task runner after
+    /// validation; used by QualityTrigger to score the test_pass_rate dimension.
+    #[serde(skip)]
+    pub test_passed: Option<bool>,
+    /// Number of linter (clippy/equivalent) warnings from the validation run.
+    /// Populated by the task runner; used by QualityTrigger for the clippy dimension.
+    #[serde(skip)]
+    pub clippy_warnings: Option<usize>,
+    /// Number of files changed in the task diff.
+    /// Populated by the task runner; used by QualityTrigger for diff_complexity.
+    #[serde(skip)]
+    pub changed_files: Option<usize>,
+    /// Average number of diff lines per changed file.
+    /// Populated by the task runner; used by QualityTrigger for diff_complexity.
+    #[serde(skip)]
+    pub avg_diff_lines: Option<usize>,
+    /// Whether the PR body contains a linked issue reference (e.g. "fixes #123").
+    /// Populated by the task runner when pr_description is set.
+    #[serde(skip)]
+    pub has_linked_issue: bool,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -116,12 +145,19 @@ impl TaskState {
             status: TaskStatus::Pending,
             turn: 0,
             pr_url: None,
+            pr_description: None,
             rounds: Vec::new(),
             error: None,
             source: None,
+            task_project_root: None,
             external_id: None,
             parent_id: None,
             subtask_ids: Vec::new(),
+            test_passed: None,
+            clippy_warnings: None,
+            changed_files: None,
+            avg_diff_lines: None,
+            has_linked_issue: false,
         }
     }
 

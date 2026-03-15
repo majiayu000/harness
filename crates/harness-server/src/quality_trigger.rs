@@ -1,9 +1,13 @@
 use harness_core::{EventFilters, Grade, Project};
 use harness_gc::GcAgent;
+use harness_observe::quality::QualityInput;
 use harness_observe::{EventStore, QualityGrader};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use crate::task_runner::TaskState;
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -22,6 +26,7 @@ pub struct QualityTrigger {
     auto_gc_grades: Vec<Grade>,
     cooldown_secs: u64,
     last_triggered: Arc<AtomicU64>,
+    rules: Arc<RwLock<harness_rules::engine::RuleEngine>>,
 }
 
 impl QualityTrigger {
@@ -32,6 +37,7 @@ impl QualityTrigger {
         project_root: PathBuf,
         auto_gc_grades: Vec<Grade>,
         cooldown_secs: u64,
+        rules: Arc<RwLock<harness_rules::engine::RuleEngine>>,
     ) -> Self {
         Self {
             events,
@@ -41,6 +47,7 @@ impl QualityTrigger {
             auto_gc_grades,
             cooldown_secs,
             last_triggered: Arc::new(AtomicU64::new(0)),
+            rules,
         }
     }
 
@@ -55,8 +62,24 @@ impl QualityTrigger {
         unix_now().saturating_sub(last) >= self.cooldown_secs
     }
 
+    /// Scan `path` for rule violations. Returns 0 on error or when no
+    /// guards are registered (same behaviour as the former hardcoded `0`).
+    async fn scan_violation_count(&self, path: &std::path::Path) -> usize {
+        let engine = self.rules.read().await;
+        if engine.guards().is_empty() {
+            return 0;
+        }
+        match engine.scan(path).await {
+            Ok(v) => v.len(),
+            Err(e) => {
+                tracing::warn!("quality_trigger: rule scan failed: {e}");
+                0
+            }
+        }
+    }
+
     /// Grade recent events, log the result, and auto-trigger GC if warranted.
-    pub async fn check_and_maybe_trigger(&self) {
+    pub async fn check_and_maybe_trigger(&self, task: &TaskState) {
         let events = match self.events.query(&EventFilters::default()).await {
             Ok(e) => e,
             Err(e) => {
@@ -65,7 +88,54 @@ impl QualityTrigger {
             }
         };
 
-        let report = QualityGrader::grade(&events, 0);
+        let scan_path = task
+            .task_project_root
+            .as_deref()
+            .filter(|p| p.exists())
+            .unwrap_or(&self.project_root);
+        let violation_count = self.scan_violation_count(scan_path).await;
+        // Count only fix cycles produced by agent review, not implement/poll/subtask rounds.
+        let review_rounds = task
+            .rounds
+            .iter()
+            .filter(|r| r.action == "agent_review_fix")
+            .count() as u32;
+        let has_pr_description = task
+            .pr_description
+            .as_deref()
+            .map_or(false, |d| !d.trim().is_empty());
+        // Derive has_linked_issue from the runtime flag or by scanning the PR description.
+        let has_linked_issue = task.has_linked_issue
+            || task
+                .pr_description
+                .as_deref()
+                .map(|d| {
+                    let d = d.to_lowercase();
+                    let keywords = [
+                        "fixes #",
+                        "closes #",
+                        "resolves #",
+                        "fix #",
+                        "close #",
+                        "resolve #",
+                    ];
+                    keywords.iter().any(|&kw| d.contains(kw))
+                })
+                .unwrap_or(false);
+
+        let input = QualityInput {
+            events,
+            violation_count,
+            review_rounds,
+            has_pr_description,
+            has_linked_issue,
+            test_passed: task.test_passed.unwrap_or(true),
+            clippy_warnings: task.clippy_warnings.unwrap_or(0),
+            changed_files: task.changed_files.unwrap_or(0),
+            avg_diff_lines: task.avg_diff_lines.unwrap_or(0),
+        };
+
+        let report = QualityGrader::grade(&input);
         self.events
             .log_quality_grade(report.grade, report.score)
             .await;
@@ -73,6 +143,8 @@ impl QualityTrigger {
         tracing::info!(
             grade = ?report.grade,
             score = report.score,
+            violation_count,
+            review_rounds,
             "quality_trigger: post-task quality check"
         );
 
@@ -102,7 +174,7 @@ impl QualityTrigger {
         let project = Project::from_path(self.project_root.clone());
         if let Err(e) = self
             .gc_agent
-            .run(&project, &events, &[], agent.as_ref())
+            .run(&project, &input.events, &[], agent.as_ref())
             .await
         {
             tracing::warn!("quality_trigger: gc_agent.run failed: {e}");
@@ -134,6 +206,7 @@ mod tests {
             draft_store,
         ));
         let agent_registry = Arc::new(harness_agents::AgentRegistry::new("test"));
+        let rules = Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new()));
         QualityTrigger::new(
             events,
             gc_agent,
@@ -141,7 +214,31 @@ mod tests {
             dir.to_path_buf(),
             auto_gc_grades,
             cooldown_secs,
+            rules,
         )
+    }
+
+    fn empty_task() -> TaskState {
+        use crate::task_runner::{TaskId, TaskStatus};
+        TaskState {
+            id: TaskId::new(),
+            status: TaskStatus::Done,
+            turn: 0,
+            pr_url: None,
+            pr_description: None,
+            rounds: Vec::new(),
+            error: None,
+            source: None,
+            external_id: None,
+            parent_id: None,
+            subtask_ids: Vec::new(),
+            task_project_root: None,
+            test_passed: None,
+            clippy_warnings: None,
+            changed_files: None,
+            avg_diff_lines: None,
+            has_linked_issue: false,
+        }
     }
 
     // --- grade_triggers_gc mapping tests ---
@@ -238,7 +335,7 @@ mod tests {
             .await
             .unwrap();
 
-        trigger.check_and_maybe_trigger().await;
+        trigger.check_and_maybe_trigger(&empty_task()).await;
 
         let events = trigger
             .events

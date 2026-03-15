@@ -1,7 +1,7 @@
 use crate::{http::AppState, task_runner::TaskStatus};
 use axum::{extract::State, http::StatusCode, Json};
 use harness_core::EventFilters;
-use harness_observe::QualityGrader;
+use harness_observe::{quality::QualityInput, QualityGrader};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -59,7 +59,11 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                         .count()
                 })
                 .unwrap_or(0);
-            let report = QualityGrader::grade(&events, violation_count);
+            let report = QualityGrader::grade(&QualityInput {
+                events,
+                violation_count,
+                ..Default::default()
+            });
             serde_json::to_value(report.grade).ok()
         }
         Err(e) => {
