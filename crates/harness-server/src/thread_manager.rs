@@ -4,6 +4,12 @@ use harness_core::{
 };
 use tokio::task::JoinHandle;
 
+/// In-memory thread registry and turn lifecycle manager.
+///
+/// `ThreadManager` is a pure in-memory cache. It owns no persistence layer.
+/// Thread persistence is handled exclusively by `CoreServices.thread_db`
+/// (`AppState.core.thread_db`). Handlers load persisted threads into this
+/// cache at startup and write back to `thread_db` after mutations.
 pub struct ThreadManager {
     threads: DashMap<String, Thread>,
     running_turn_tasks: DashMap<String, JoinHandle<()>>,
