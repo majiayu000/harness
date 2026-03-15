@@ -64,7 +64,7 @@ pub struct QualityDimensions {
     /// PR metadata completeness: description and linked-issue presence.
     pub pr_completeness: f64,
     /// Event stability: low ratio of blocked or escalated decisions across all hooks.
-    pub security: f64,
+    pub stability: f64,
 }
 
 /// Maximum number of clippy warnings before the score hits zero.
@@ -83,7 +83,7 @@ const WEIGHT_REVIEW: f64 = 0.15;
 const WEIGHT_VIOLATION: f64 = 0.15;
 const WEIGHT_DIFF_COMPLEXITY: f64 = 0.10;
 const WEIGHT_PR_COMPLETENESS: f64 = 0.10;
-const WEIGHT_SECURITY: f64 = 0.10;
+const WEIGHT_STABILITY: f64 = 0.10;
 
 pub struct QualityGrader;
 
@@ -96,11 +96,11 @@ impl QualityGrader {
         // Stability (0.10): ratio of blocked or escalated events to total events.
         // Counts ALL Block/Escalate decisions, not only security-labelled ones, so that
         // a history full of blocked pre_tool_use events correctly reduces quality.
-        let security_issues = events
+        let stability_issues = events
             .iter()
             .filter(|e| matches!(e.decision, Decision::Block | Decision::Escalate))
             .count() as f64;
-        let security = (1.0 - security_issues / total) * 100.0;
+        let stability = (1.0 - stability_issues / total) * 100.0;
 
         // Test pass rate (0.25): binary pass/fail from post-validation.
         let test_pass_rate = if input.test_passed { 100.0 } else { 0.0 };
@@ -136,7 +136,7 @@ impl QualityGrader {
             + violation * WEIGHT_VIOLATION
             + diff_complexity * WEIGHT_DIFF_COMPLEXITY
             + pr_completeness * WEIGHT_PR_COMPLETENESS
-            + security * WEIGHT_SECURITY;
+            + stability * WEIGHT_STABILITY;
 
         let grade = Grade::from_score(score);
 
@@ -150,7 +150,7 @@ impl QualityGrader {
                 violation_count: violation,
                 diff_complexity,
                 pr_completeness,
-                security,
+                stability,
             },
             recommended_gc_interval: grade.recommended_gc_interval(),
         }
@@ -211,7 +211,7 @@ mod tests {
             ..Default::default()
         };
         let report = QualityGrader::grade(&input);
-        assert!(report.dimensions.security < 100.0);
+        assert!(report.dimensions.stability < 100.0);
     }
 
     #[test]
@@ -223,7 +223,7 @@ mod tests {
         };
         let report = QualityGrader::grade(&input);
         assert!(
-            report.dimensions.security < 100.0,
+            report.dimensions.stability < 100.0,
             "non-security Block events must reduce the stability dimension"
         );
     }
@@ -237,7 +237,7 @@ mod tests {
         };
         let report = QualityGrader::grade(&input);
         assert!(
-            report.dimensions.security < 100.0,
+            report.dimensions.stability < 100.0,
             "Escalate events must reduce the stability dimension"
         );
     }

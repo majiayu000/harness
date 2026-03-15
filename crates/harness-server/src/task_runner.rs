@@ -102,6 +102,26 @@ pub struct TaskState {
     /// the correct checkout. Not persisted to DB or serialised in HTTP responses.
     #[serde(skip)]
     pub task_project_root: Option<std::path::PathBuf>,
+    /// Whether the post-task test run passed. Populated by the task runner after
+    /// validation; used by QualityTrigger to score the test_pass_rate dimension.
+    #[serde(skip)]
+    pub test_passed: Option<bool>,
+    /// Number of linter (clippy/equivalent) warnings from the validation run.
+    /// Populated by the task runner; used by QualityTrigger for the clippy dimension.
+    #[serde(skip)]
+    pub clippy_warnings: Option<usize>,
+    /// Number of files changed in the task diff.
+    /// Populated by the task runner; used by QualityTrigger for diff_complexity.
+    #[serde(skip)]
+    pub changed_files: Option<usize>,
+    /// Average number of diff lines per changed file.
+    /// Populated by the task runner; used by QualityTrigger for diff_complexity.
+    #[serde(skip)]
+    pub avg_diff_lines: Option<usize>,
+    /// Whether the PR body contains a linked issue reference (e.g. "fixes #123").
+    /// Populated by the task runner when pr_description is set.
+    #[serde(skip)]
+    pub has_linked_issue: bool,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -133,6 +153,11 @@ impl TaskState {
             external_id: None,
             parent_id: None,
             subtask_ids: Vec::new(),
+            test_passed: None,
+            clippy_warnings: None,
+            changed_files: None,
+            avg_diff_lines: None,
+            has_linked_issue: false,
         }
     }
 

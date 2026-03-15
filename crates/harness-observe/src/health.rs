@@ -132,10 +132,8 @@ fn build_recommendations(
 ) -> Vec<String> {
     let mut recs = Vec::new();
 
-    if quality.dimensions.security < 90.0 {
-        recs.push(
-            "Review and fix security-related violations to improve security score.".to_string(),
-        );
+    if quality.dimensions.stability < 90.0 {
+        recs.push("Reduce blocked/escalated events to improve event stability score.".to_string());
     }
     if quality.dimensions.review_rounds < 80.0 {
         recs.push("Reduce review fix cycles to improve quality score.".to_string());

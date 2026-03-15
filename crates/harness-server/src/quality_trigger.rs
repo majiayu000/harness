@@ -101,13 +101,32 @@ impl QualityTrigger {
             .filter(|r| r.action == "agent_review_fix")
             .count() as u32;
         let has_pr_description = task.pr_description.is_some() || task.pr_url.is_some();
+        // Derive has_linked_issue from the runtime flag or by scanning the PR description.
+        let has_linked_issue = task.has_linked_issue
+            || task
+                .pr_description
+                .as_deref()
+                .map(|d| {
+                    let d = d.to_lowercase();
+                    d.contains("fixes #")
+                        || d.contains("closes #")
+                        || d.contains("resolves #")
+                        || d.contains("fix #")
+                        || d.contains("close #")
+                        || d.contains("resolve #")
+                })
+                .unwrap_or(false);
 
         let input = QualityInput {
             events,
             violation_count,
             review_rounds,
             has_pr_description,
-            ..Default::default()
+            has_linked_issue,
+            test_passed: task.test_passed.unwrap_or(true),
+            clippy_warnings: task.clippy_warnings.unwrap_or(0),
+            changed_files: task.changed_files.unwrap_or(0),
+            avg_diff_lines: task.avg_diff_lines.unwrap_or(0),
         };
 
         let report = QualityGrader::grade(&input);
@@ -208,6 +227,11 @@ mod tests {
             parent_id: None,
             subtask_ids: Vec::new(),
             task_project_root: None,
+            test_passed: None,
+            clippy_warnings: None,
+            changed_files: None,
+            avg_diff_lines: None,
+            has_linked_issue: false,
         }
     }
 

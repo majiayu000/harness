@@ -184,6 +184,11 @@ impl TaskRow {
             external_id,
             parent_id: parent_id.map(TaskId),
             subtask_ids: Vec::new(),
+            test_passed: None,
+            clippy_warnings: None,
+            changed_files: None,
+            avg_diff_lines: None,
+            has_linked_issue: false,
         })
     }
 }
@@ -260,6 +265,11 @@ mod tests {
             parent_id: None,
             subtask_ids: vec![],
             task_project_root: None,
+            test_passed: None,
+            clippy_warnings: None,
+            changed_files: None,
+            avg_diff_lines: None,
+            has_linked_issue: false,
         }
     }
 
