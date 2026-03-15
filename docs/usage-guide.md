@@ -56,7 +56,6 @@ total_budget_usd = 5.0
 draft_ttl_hours = 72
 
 [observe]
-db_path = "~/.local/share/harness/harness.db"
 log_retention_days = 90
 
 [otel]
@@ -352,7 +351,6 @@ curl -X DELETE http://127.0.0.1:9800/api/projects/new-project
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `db_path` | `"~/.local/share/harness/harness.db"` | SQLite database path for events |
 | `session_renewal_secs` | `1800` | Session renewal interval |
 | `log_retention_days` | `90` | Log retention period |
 
