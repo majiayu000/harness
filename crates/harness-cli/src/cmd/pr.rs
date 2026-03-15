@@ -11,6 +11,13 @@ fn create_agent(config: &HarnessConfig) -> ClaudeCodeAgent {
     )
 }
 
+struct ReviewLoopOpts<'a> {
+    wait: u64,
+    max_rounds: u32,
+    review_bot_command: &'a str,
+    reviewer_name: &'a str,
+}
+
 pub async fn fix(
     config: &HarnessConfig,
     issue: u64,
@@ -44,10 +51,12 @@ pub async fn fix(
         Some(issue),
         pr_number,
         Some(&pr_url),
-        wait,
-        max_rounds,
-        &config.agents.review.review_bot_command,
-        &config.agents.review.reviewer_name,
+        ReviewLoopOpts {
+            wait,
+            max_rounds,
+            review_bot_command: &config.agents.review.review_bot_command,
+            reviewer_name: &config.agents.review.reviewer_name,
+        },
     )
     .await
 }
@@ -69,10 +78,12 @@ pub async fn loop_pr(
         None,
         pr,
         None,
-        wait,
-        max_rounds,
-        &config.agents.review.review_bot_command,
-        &config.agents.review.reviewer_name,
+        ReviewLoopOpts {
+            wait,
+            max_rounds,
+            review_bot_command: &config.agents.review.review_bot_command,
+            reviewer_name: &config.agents.review.reviewer_name,
+        },
     )
     .await
 }
@@ -83,10 +94,7 @@ async fn run_review_loop(
     issue: Option<u64>,
     pr: u64,
     pr_url: Option<&str>,
-    wait: u64,
-    max_rounds: u32,
-    review_bot_command: &str,
-    reviewer_name: &str,
+    opts: ReviewLoopOpts<'_>,
 ) -> anyhow::Result<()> {
     let url_display: std::borrow::Cow<str> = match pr_url {
         Some(url) => std::borrow::Cow::Borrowed(url),
@@ -96,11 +104,14 @@ async fn run_review_loop(
     let mut prev_fixed = false;
     let mut round = 1u32;
 
-    while round <= max_rounds {
-        println!("[harness] Waiting {wait}s for CI and review bot...");
-        sleep(Duration::from_secs(wait)).await;
+    while round <= opts.max_rounds {
+        println!("[harness] Waiting {}s for CI and review bot...", opts.wait);
+        sleep(Duration::from_secs(opts.wait)).await;
 
-        println!("[harness] Review round {round}/{max_rounds}, PR #{pr}");
+        println!(
+            "[harness] Review round {round}/{}, PR #{pr}",
+            opts.max_rounds
+        );
 
         let req = AgentRequest {
             prompt: prompts::review_prompt(
@@ -108,8 +119,8 @@ async fn run_review_loop(
                 pr,
                 round,
                 prev_fixed,
-                review_bot_command,
-                reviewer_name,
+                opts.review_bot_command,
+                opts.reviewer_name,
             ),
             project_root: project.clone(),
             ..Default::default()
@@ -132,6 +143,9 @@ async fn run_review_loop(
         round += 1;
     }
 
-    println!("[harness] Reached max rounds ({max_rounds}), PR status: {url_display}");
+    println!(
+        "[harness] Reached max rounds ({}), PR status: {url_display}",
+        opts.max_rounds
+    );
     Ok(())
 }
