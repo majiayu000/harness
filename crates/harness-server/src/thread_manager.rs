@@ -487,4 +487,176 @@ mod tests {
             .start_turn(&bad_id, "x".to_string(), AgentId::new())
             .is_err());
     }
+
+    #[test]
+    fn find_thread_for_turn_returns_correct_thread() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        let found = tm.find_thread_for_turn(&turn_id);
+        assert_eq!(found, Some(thread_id));
+        Ok(())
+    }
+
+    #[test]
+    fn find_thread_for_turn_returns_none_for_missing_turn() {
+        let tm = ThreadManager::new();
+        let _thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let fake_turn = harness_core::TurnId::from_str("no-such-turn");
+        assert!(tm.find_thread_for_turn(&fake_turn).is_none());
+    }
+
+    #[test]
+    fn find_thread_and_turn_returns_thread_and_turn() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        let (found_thread_id, found_turn) = tm
+            .find_thread_and_turn(&turn_id)
+            .ok_or_else(|| anyhow::anyhow!("find_thread_and_turn returned None"))?;
+        assert_eq!(found_thread_id, thread_id);
+        assert_eq!(found_turn.id, turn_id);
+        Ok(())
+    }
+
+    #[test]
+    fn steer_turn_appends_instruction() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "initial".to_string(), AgentId::new())?;
+        tm.steer_turn(&thread_id, &turn_id, "steer me".to_string())?;
+        let turn = tm
+            .get_turn(&thread_id, &turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn missing"))?;
+        assert_eq!(turn.items.len(), 2); // UserMessage + steer UserMessage
+        Ok(())
+    }
+
+    #[test]
+    fn resume_thread_sets_status_to_idle() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        tm.complete_turn(&thread_id, &turn_id)?;
+        tm.resume_thread(&thread_id)?;
+        let thread = tm
+            .get_thread(&thread_id)
+            .ok_or_else(|| anyhow::anyhow!("thread missing"))?;
+        assert_eq!(thread.status, harness_core::ThreadStatus::Idle);
+        Ok(())
+    }
+
+    #[test]
+    fn fork_thread_creates_independent_copy() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let _turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        let fork_id = tm.fork_thread(&thread_id, None)?;
+        assert_ne!(fork_id, thread_id);
+        let fork = tm
+            .get_thread(&fork_id)
+            .ok_or_else(|| anyhow::anyhow!("fork missing"))?;
+        assert_eq!(fork.turns.len(), 1);
+        assert_eq!(fork.status, harness_core::ThreadStatus::Idle);
+        Ok(())
+    }
+
+    #[test]
+    fn fork_thread_truncates_at_turn() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn1 = tm.start_turn(&thread_id, "first".to_string(), AgentId::new())?;
+        tm.complete_turn(&thread_id, &turn1)?;
+        let _turn2 = tm.start_turn(&thread_id, "second".to_string(), AgentId::new())?;
+        let fork_id = tm.fork_thread(&thread_id, Some(&turn1))?;
+        let fork = tm
+            .get_thread(&fork_id)
+            .ok_or_else(|| anyhow::anyhow!("fork missing"))?;
+        assert_eq!(fork.turns.len(), 1);
+        assert_eq!(fork.turns[0].id, turn1);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_thread_clears_completed_turn_items() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        tm.add_item(
+            &thread_id,
+            &turn_id,
+            Item::AgentReasoning {
+                content: "thinking".to_string(),
+            },
+        )?;
+        tm.complete_turn(&thread_id, &turn_id)?;
+        tm.compact_thread(&thread_id)?;
+        let thread = tm
+            .get_thread(&thread_id)
+            .ok_or_else(|| anyhow::anyhow!("thread missing"))?;
+        let turn = thread
+            .turns
+            .iter()
+            .find(|t| t.id == turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn missing after compact"))?;
+        assert!(turn.items.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn mark_turn_failed_with_error_adds_error_item() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        tm.mark_turn_failed_with_error(&thread_id, &turn_id, "something broke".to_string())?;
+        let turn = tm
+            .get_turn(&thread_id, &turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn missing"))?;
+        assert_eq!(turn.status, TurnStatus::Failed);
+        let has_error = turn.items.iter().any(
+            |item| matches!(item, Item::Error { message, .. } if message == "something broke"),
+        );
+        assert!(has_error, "expected an Error item in the turn");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_turn_task_count_reflects_registered_handles() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        assert_eq!(tm.active_turn_task_count(), 0);
+        let handle =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(5)).await });
+        tm.register_turn_task(&turn_id, handle);
+        assert_eq!(tm.active_turn_task_count(), 1);
+        tm.clear_turn_task(&turn_id);
+        assert_eq!(tm.active_turn_task_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abort_turn_task_aborts_handle_directly() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        let handle =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(5)).await });
+        tm.register_turn_task(&turn_id, handle);
+        assert!(tm.abort_turn_task(&turn_id));
+        assert!(!tm.has_turn_task(&turn_id));
+        assert!(!tm.abort_turn_task(&turn_id)); // already gone
+        Ok(())
+    }
+
+    #[test]
+    fn is_turn_running_reflects_turn_status() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        assert!(tm.is_turn_running(&thread_id, &turn_id));
+        tm.complete_turn(&thread_id, &turn_id)?;
+        assert!(!tm.is_turn_running(&thread_id, &turn_id));
+        Ok(())
+    }
 }
