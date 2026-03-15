@@ -16,78 +16,16 @@ pub(crate) const SETUP_ENV_ALLOWLIST: [&str; 10] = [
 /// `setup_commands` must only come from server-level config, never from
 /// per-project `.harness/config.toml`, and must invoke a single binary
 /// without piping or chaining (e.g. `npm ci`, `cargo fetch`).
+///
+/// Redirections (`>`, `>>`, `<`) are permitted because setup tasks
+/// commonly suppress output (e.g. `npm ci > /dev/null`). Command
+/// chaining/backgrounding operators are always rejected.
+///
+/// Delegates to [`harness_core::shell_safety::validate_shell_safety`] with
+/// `allow_redirections = true`.
 fn validate_setup_command(cmd: &str) -> Result<(), String> {
-    if cmd.contains('\n') || cmd.contains('\r') {
-        return Err(format!(
-            "setup command `{}` rejected: must be single-line",
-            cmd.lines().next().unwrap_or(cmd)
-        ));
-    }
-    let chars: Vec<char> = cmd.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    while i < len {
-        let c = chars[i];
-        if c == '\\' && !in_single && i + 1 < len {
-            i += 2;
-            continue;
-        }
-        if c == '\'' && !in_double {
-            in_single = !in_single;
-            i += 1;
-            continue;
-        }
-        if c == '"' && !in_single {
-            in_double = !in_double;
-            i += 1;
-            continue;
-        }
-        if in_single {
-            i += 1;
-            continue;
-        }
-        if c == '`' || (c == '$' && i + 1 < len && chars[i + 1] == '(') {
-            return Err(format!(
-                "setup command `{cmd}` rejected: contains command substitution"
-            ));
-        }
-        // Block chaining/backgrounding operators; allow redirections (>, <, >>)
-        // which are needed for setup tasks like `npm ci > /dev/null`.
-        if !in_double {
-            match c {
-                '|' if i + 1 < len && chars[i + 1] == '|' => {
-                    return Err(format!(
-                        "setup command `{cmd}` rejected: contains shell operator `||`"
-                    ));
-                }
-                '|' => {
-                    return Err(format!(
-                        "setup command `{cmd}` rejected: contains shell operator `|`"
-                    ));
-                }
-                '&' if i + 1 < len && chars[i + 1] == '&' => {
-                    return Err(format!(
-                        "setup command `{cmd}` rejected: contains shell operator `&&`"
-                    ));
-                }
-                '&' => {
-                    return Err(format!(
-                        "setup command `{cmd}` rejected: contains shell operator `&`"
-                    ));
-                }
-                ';' => {
-                    return Err(format!(
-                        "setup command `{cmd}` rejected: contains shell operator `;`"
-                    ));
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    Ok(())
+    harness_core::shell_safety::validate_shell_safety(cmd, true)
+        .map_err(|e| e.replace("Command `", "setup command `"))
 }
 
 fn setup_cache_ttl(cloud: &CodexCloudConfig) -> Duration {

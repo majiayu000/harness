@@ -29,81 +29,12 @@ pub struct PostExecutionValidator {
 /// Used by both [`PostExecutionValidator`] (validation commands) and
 /// [`crate::workspace`] (workspace hooks) to reject config-supplied strings
 /// with shell injection potential before passing them to `sh -c`.
+///
+/// Delegates to [`harness_core::shell_safety::validate_shell_safety`] with
+/// strict mode (`allow_redirections = false`) — redirections are not needed
+/// for validator/hook commands and are rejected as a precaution.
 pub(crate) fn validate_command_safety(cmd_str: &str) -> Result<(), String> {
-    // Newlines and carriage returns are command separators in sh -c.
-    if cmd_str.contains('\n') || cmd_str.contains('\r') {
-        return Err(format!(
-            "Command `{}` rejected: contains newline character. \
-             Commands must be single-line.",
-            cmd_str.lines().next().unwrap_or(cmd_str)
-        ));
-    }
-
-    let chars: Vec<char> = cmd_str.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-
-    while i < len {
-        let c = chars[i];
-
-        if c == '\\' && !in_single && i + 1 < len {
-            i += 2;
-            continue;
-        }
-        if c == '\'' && !in_double {
-            in_single = !in_single;
-            i += 1;
-            continue;
-        }
-        if c == '"' && !in_single {
-            in_double = !in_double;
-            i += 1;
-            continue;
-        }
-        if in_single {
-            i += 1;
-            continue;
-        }
-
-        // Command substitution is active in both unquoted and double-quoted contexts.
-        if c == '`' {
-            return Err(shell_safety_error(cmd_str, "`"));
-        }
-        if c == '$' && i + 1 < len && chars[i + 1] == '(' {
-            return Err(shell_safety_error(cmd_str, "$("));
-        }
-
-        // Remaining shell operators are only active when fully unquoted.
-        if !in_double {
-            let op = match c {
-                '|' if i + 1 < len && chars[i + 1] == '|' => Some("||"),
-                '|' => Some("|"),
-                '&' if i + 1 < len && chars[i + 1] == '&' => Some("&&"),
-                '&' => Some("&"),
-                ';' => Some(";"),
-                '>' if i + 1 < len && chars[i + 1] == '>' => Some(">>"),
-                '>' => Some(">"),
-                '<' => Some("<"),
-                _ => None,
-            };
-            if let Some(op) = op {
-                return Err(shell_safety_error(cmd_str, op));
-            }
-        }
-
-        i += 1;
-    }
-
-    Ok(())
-}
-
-fn shell_safety_error(cmd_str: &str, op: &str) -> String {
-    format!(
-        "Command `{cmd_str}` rejected: contains shell operator `{op}`. \
-         Commands must invoke toolchain binaries directly without shell operators."
-    )
+    harness_core::shell_safety::validate_shell_safety(cmd_str, false)
 }
 
 impl PostExecutionValidator {
