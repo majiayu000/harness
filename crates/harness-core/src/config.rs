@@ -23,6 +23,25 @@ pub use resolve::{resolve_config, ResolvedConfig};
 pub use server::{ServerConfig, Transport};
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// A project entry declared in the config file under `[[projects]]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectEntry {
+    /// Unique project name used as identifier in APIs and logs.
+    pub name: String,
+    /// Absolute or relative path to the project root (must be a git repo).
+    pub root: PathBuf,
+    /// Mark this project as the default for single-project API calls.
+    #[serde(default)]
+    pub default: bool,
+    /// Override the default agent for this project.
+    #[serde(default)]
+    pub default_agent: Option<String>,
+    /// Maximum concurrent tasks for this project.
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HarnessConfig {
@@ -42,6 +61,9 @@ pub struct HarnessConfig {
     pub intake: IntakeConfig,
     #[serde(default)]
     pub review: ReviewConfig,
+    /// Projects declared in the config file. Registered on server startup.
+    #[serde(default)]
+    pub projects: Vec<ProjectEntry>,
 }
 
 #[cfg(test)]
@@ -431,6 +453,42 @@ mod tests {
     fn harness_config_includes_review() {
         let config = HarnessConfig::default();
         assert!(!config.review.enabled);
+    }
+
+    #[test]
+    fn projects_config_deserializes_from_toml() {
+        let toml_str = r#"
+            [[projects]]
+            name = "harness"
+            root = "/tmp/harness"
+            default = true
+
+            [[projects]]
+            name = "litellm"
+            root = "/tmp/litellm-rs"
+            max_concurrent = 2
+            default_agent = "claude"
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            projects: Vec<ProjectEntry>,
+        }
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(w.projects.len(), 2);
+        assert_eq!(w.projects[0].name, "harness");
+        assert!(w.projects[0].default);
+        assert!(w.projects[0].max_concurrent.is_none());
+        assert_eq!(w.projects[1].name, "litellm");
+        assert!(!w.projects[1].default);
+        assert_eq!(w.projects[1].max_concurrent, Some(2));
+        assert_eq!(w.projects[1].default_agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn harness_config_projects_defaults_to_empty() {
+        let config = HarnessConfig::default();
+        assert!(config.projects.is_empty());
     }
 
     #[test]

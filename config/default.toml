@@ -71,3 +71,24 @@ environment = "development"
 exporter = "disabled"
 # endpoint = "http://127.0.0.1:4318"
 log_user_prompt = false
+
+# Multi-project configuration. Each [[projects]] entry is auto-registered on
+# server startup. CLI --project flags merge with (and override) these entries.
+
+[[projects]]
+name = "harness"
+root = "/Users/apple/Desktop/code/AI/tool/harness"
+default = true
+max_concurrent = 2
+
+[[projects]]
+name = "litellm-rs"
+root = "/Users/apple/Desktop/code/AI/gateway/litellm-rs"
+max_concurrent = 2
+default_agent = "claude"
+
+[[projects]]
+name = "vibeguard"
+root = "/Users/apple/Desktop/code/AI/tool/vibeguard"
+max_concurrent = 1
+default_agent = "claude"

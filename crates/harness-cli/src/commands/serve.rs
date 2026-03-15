@@ -43,14 +43,43 @@ pub async fn run(
         );
     }
 
-    // Parse and validate --project name=path entries.
+    // Collect projects from config file `[[projects]]` entries.
     let mut parsed_projects: Vec<(String, PathBuf)> = Vec::new();
+    let mut config_default_name: Option<String> = None;
+    for entry in &config.projects {
+        if entry.name.is_empty() {
+            anyhow::bail!("[[projects]] entry has empty name");
+        }
+        if entry.name == "default" {
+            anyhow::bail!("[[projects]] name 'default' is reserved; choose a different name");
+        }
+        if parsed_projects.iter().any(|(n, _)| n == &entry.name) {
+            anyhow::bail!(
+                "[[projects]] name '{}' is duplicated; each project name must be unique",
+                entry.name
+            );
+        }
+        let canonical = entry.root.canonicalize().map_err(|e| {
+            anyhow::anyhow!(
+                "[[projects]] {}: path '{}' is not accessible: {e}",
+                entry.name,
+                entry.root.display()
+            )
+        })?;
+        if let Err(reason) = validate_project_root(&canonical) {
+            anyhow::bail!("[[projects]] {}: {reason}", entry.name);
+        }
+        if entry.default {
+            config_default_name = Some(entry.name.clone());
+        }
+        parsed_projects.push((entry.name.clone(), canonical));
+    }
+
+    // Merge CLI --project flags (override config entries with same name).
     for raw in &projects {
         let (name, path) = parse_project_entry(raw)?;
         if parsed_projects.iter().any(|(n, _)| n == &name) {
-            anyhow::bail!(
-                "--project name '{name}' is duplicated; each project name must be unique"
-            );
+            parsed_projects.retain(|(n, _)| n != &name);
         }
         let canonical = path.canonicalize().map_err(|e| {
             anyhow::anyhow!(
@@ -64,16 +93,16 @@ pub async fn run(
         parsed_projects.push((name, canonical));
     }
 
-    // Determine the default project id.
+    // Determine the default project id: CLI --default-project > config `default = true` > first entry.
     let default_project_id: Option<String> = if !parsed_projects.is_empty() {
         let id = default_project
             .clone()
+            .or(config_default_name)
             .unwrap_or_else(|| parsed_projects[0].0.clone());
-        // Fail fast if the requested default name doesn't exist in --project entries.
         if !parsed_projects.iter().any(|(n, _)| n == &id) {
             let known: Vec<&str> = parsed_projects.iter().map(|(n, _)| n.as_str()).collect();
             anyhow::bail!(
-                "--default-project {id:?} does not match any --project name; known names: {known:?}"
+                "default project {id:?} does not match any project name; known names: {known:?}"
             );
         }
         Some(id)

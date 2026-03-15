@@ -49,8 +49,8 @@ impl CodexAgent {
         let mut args = vec![
             OsString::from("exec"),
             OsString::from("--skip-git-repo-check"),
-            OsString::from("-a"),
-            OsString::from(codex_approval_mode(self.sandbox_mode)),
+            OsString::from("-s"),
+            OsString::from(codex_sandbox_mode(self.sandbox_mode)),
         ];
 
         if self.cloud.enabled {
@@ -169,11 +169,11 @@ impl CodeAgent for CodexAgent {
     }
 }
 
-fn codex_approval_mode(mode: SandboxMode) -> &'static str {
+fn codex_sandbox_mode(mode: SandboxMode) -> &'static str {
     match mode {
         SandboxMode::ReadOnly => "read-only",
-        SandboxMode::WorkspaceWrite => "read-write",
-        SandboxMode::DangerFullAccess => "full-access",
+        SandboxMode::WorkspaceWrite => "workspace-write",
+        SandboxMode::DangerFullAccess => "danger-full-access",
     }
 }
 #[cfg(test)]
@@ -436,7 +436,7 @@ printf 'third\n'
             .map(|value| value.to_string_lossy().to_string())
             .collect();
 
-        assert!(args.windows(2).any(|window| window == ["-a", "read-only"]));
+        assert!(args.windows(2).any(|window| window == ["-s", "read-only"]));
         assert!(!args.iter().any(|arg| arg == "--ephemeral"));
     }
 
@@ -462,7 +462,9 @@ printf 'third\n'
             .map(|value| value.to_string_lossy().to_string())
             .collect();
 
-        assert!(args.windows(2).any(|window| window == ["-a", "read-write"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["-s", "workspace-write"]));
         assert!(args.iter().any(|arg| arg == "--ephemeral"));
     }
 
@@ -604,15 +606,15 @@ printf 'third\n'
     }
 
     #[test]
-    fn codex_approval_mode_maps_to_codex_cli_values() {
-        assert_eq!(codex_approval_mode(SandboxMode::ReadOnly), "read-only");
+    fn codex_sandbox_mode_maps_to_codex_cli_values() {
+        assert_eq!(codex_sandbox_mode(SandboxMode::ReadOnly), "read-only");
         assert_eq!(
-            codex_approval_mode(SandboxMode::WorkspaceWrite),
-            "read-write"
+            codex_sandbox_mode(SandboxMode::WorkspaceWrite),
+            "workspace-write"
         );
         assert_eq!(
-            codex_approval_mode(SandboxMode::DangerFullAccess),
-            "full-access"
+            codex_sandbox_mode(SandboxMode::DangerFullAccess),
+            "danger-full-access"
         );
     }
 }
