@@ -1,8 +1,45 @@
-use crate::db::open_pool;
+use crate::db::{open_pool, Migration, Migrator};
 use crate::task_runner::{TaskId, TaskState, TaskStatus};
 use harness_core::TaskDbDecodeError;
 use sqlx::sqlite::SqlitePool;
 use std::path::Path;
+
+/// Versioned migrations for the tasks table.
+///
+/// v1 – baseline schema (all columns including those added in later iterations)
+/// v2/v3/v4 – additive ALTER TABLE for databases that predate v1 tracking;
+///   duplicate-column errors are silently ignored by the Migrator.
+static TASK_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "create tasks table",
+        sql: "CREATE TABLE IF NOT EXISTS tasks (
+            id          TEXT PRIMARY KEY,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            turn        INTEGER NOT NULL DEFAULT 0,
+            pr_url      TEXT,
+            rounds      TEXT NOT NULL DEFAULT '[]',
+            error       TEXT,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    },
+    Migration {
+        version: 2,
+        description: "add source column",
+        sql: "ALTER TABLE tasks ADD COLUMN source TEXT",
+    },
+    Migration {
+        version: 3,
+        description: "add external_id column",
+        sql: "ALTER TABLE tasks ADD COLUMN external_id TEXT",
+    },
+    Migration {
+        version: 4,
+        description: "add parent_id column",
+        sql: "ALTER TABLE tasks ADD COLUMN parent_id TEXT",
+    },
+];
 
 pub struct TaskDb {
     pool: SqlitePool,
@@ -12,44 +49,8 @@ impl TaskDb {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let pool = open_pool(path).await?;
         let db = Self { pool };
-        db.migrate().await?;
+        Migrator::new(&db.pool, TASK_MIGRATIONS).run().await?;
         Ok(db)
-    }
-
-    async fn migrate(&self) -> anyhow::Result<()> {
-        // Create table with all columns (including source/external_id added in Task 3.1).
-        // New databases get the full schema in one shot; existing databases are handled
-        // by the additive ALTER TABLE steps below.
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY,
-                status TEXT NOT NULL DEFAULT 'pending',
-                turn INTEGER NOT NULL DEFAULT 0,
-                pr_url TEXT,
-                rounds TEXT NOT NULL DEFAULT '[]',
-                error TEXT,
-                source TEXT,
-                external_id TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Additive migrations for existing DBs that predate Task 3.1.
-        // "duplicate column name" errors mean the column was already added — safe to ignore.
-        for col in &["source TEXT", "external_id TEXT", "parent_id TEXT"] {
-            let sql = format!("ALTER TABLE tasks ADD COLUMN {col}");
-            if let Err(e) = sqlx::query(&sql).execute(&self.pool).await {
-                let msg = e.to_string().to_lowercase();
-                if !msg.contains("duplicate column name") {
-                    return Err(anyhow::anyhow!("tasks migration failed ({col}): {e}"));
-                }
-            }
-        }
-
-        Ok(())
     }
 
     pub async fn insert(&self, state: &TaskState) -> anyhow::Result<()> {

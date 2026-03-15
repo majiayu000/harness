@@ -1,28 +1,7 @@
-use crate::db::{Db, DbEntity};
+use crate::db::Db;
 use harness_core::{ExecPlanId, ExecPlanStatus};
 use harness_exec::ExecPlan;
 use std::path::Path;
-
-const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS exec_plans (
-    id         TEXT PRIMARY KEY,
-    data       TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-)";
-
-impl DbEntity for ExecPlan {
-    fn table_name() -> &'static str {
-        "exec_plans"
-    }
-
-    fn id(&self) -> &str {
-        self.id.as_str()
-    }
-
-    fn create_table_sql() -> &'static str {
-        CREATE_TABLE_SQL
-    }
-}
 
 pub struct PlanDb {
     inner: Db<ExecPlan>,
@@ -61,7 +40,7 @@ impl PlanDb {
             "SELECT data FROM exec_plans WHERE json_extract(data, '$.status') = ? ORDER BY created_at DESC";
         let rows: Vec<(String,)> = sqlx::query_as(sql)
             .bind(&status_str)
-            .fetch_all(&self.inner.pool)
+            .fetch_all(self.inner.pool())
             .await?;
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
@@ -75,7 +54,7 @@ impl PlanDb {
             "SELECT data FROM exec_plans WHERE json_extract(data, '$.purpose') LIKE ? ORDER BY created_at DESC";
         let rows: Vec<(String,)> = sqlx::query_as(sql)
             .bind(&pattern)
-            .fetch_all(&self.inner.pool)
+            .fetch_all(self.inner.pool())
             .await?;
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))

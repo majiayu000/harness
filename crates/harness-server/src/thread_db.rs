@@ -1,8 +1,23 @@
-use crate::db::open_pool;
+use crate::db::{open_pool, Migration, Migrator};
 use anyhow::Context;
 use harness_core::{Thread, ThreadId, ThreadStatus};
 use sqlx::sqlite::SqlitePool;
 use std::path::Path;
+
+/// Versioned migrations for the threads table.
+static THREAD_MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    description: "create threads table",
+    sql: "CREATE TABLE IF NOT EXISTS threads (
+        id          TEXT PRIMARY KEY,
+        cwd         TEXT NOT NULL,
+        status      TEXT NOT NULL DEFAULT 'idle',
+        turns       TEXT NOT NULL DEFAULT '[]',
+        metadata    TEXT NOT NULL DEFAULT '{}',
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+    )",
+}];
 
 #[derive(Clone)]
 pub struct ThreadDb {
@@ -13,25 +28,8 @@ impl ThreadDb {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let pool = open_pool(path).await?;
         let db = Self { pool };
-        db.migrate().await?;
+        Migrator::new(&db.pool, THREAD_MIGRATIONS).run().await?;
         Ok(db)
-    }
-
-    async fn migrate(&self) -> anyhow::Result<()> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS threads (
-                id TEXT PRIMARY KEY,
-                cwd TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'idle',
-                turns TEXT NOT NULL DEFAULT '[]',
-                metadata TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )",
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     pub async fn insert(&self, thread: &Thread) -> anyhow::Result<()> {
