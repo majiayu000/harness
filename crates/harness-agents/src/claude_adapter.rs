@@ -104,7 +104,13 @@ impl AgentAdapter for ClaudeAdapter {
         let exit_status = {
             let mut guard = self.child.lock().await;
             if let Some(ref mut child) = *guard {
-                child.wait().await.ok()
+                match child.wait().await {
+                    Ok(status) => Some(status),
+                    Err(e) => {
+                        tracing::warn!("claude_adapter: failed to wait for child process: {e}");
+                        None
+                    }
+                }
             } else {
                 None
             }
@@ -112,17 +118,23 @@ impl AgentAdapter for ClaudeAdapter {
 
         if let Some(status) = exit_status {
             if !status.success() {
-                let _ = tx
+                if let Err(e) = tx
                     .send(AgentEvent::Error {
                         message: format!("claude exited with {status}"),
                     })
-                    .await;
+                    .await
+                {
+                    tracing::warn!("claude_adapter: failed to send Error event: {e}");
+                }
             }
         }
 
-        let _ = tx
+        if let Err(e) = tx
             .send(AgentEvent::TurnCompleted { output: output_buf })
-            .await;
+            .await
+        {
+            tracing::warn!("claude_adapter: failed to send TurnCompleted event: {e}");
+        }
 
         // Clean up child handle
         let mut guard = self.child.lock().await;

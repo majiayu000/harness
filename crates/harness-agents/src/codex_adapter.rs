@@ -98,7 +98,9 @@ impl CodexAdapter {
         stdin.write_all(line.as_bytes()).await.map_err(|e| {
             harness_core::HarnessError::AgentExecution(format!("failed to write to codex: {e}"))
         })?;
-        stdin.flush().await.ok();
+        if let Err(e) = stdin.flush().await {
+            tracing::warn!("codex_adapter: failed to flush stdin after notification: {e}");
+        }
         Ok(())
     }
 }
@@ -248,7 +250,9 @@ impl AgentAdapter for CodexAdapter {
         stdin.write_all(line.as_bytes()).await.map_err(|e| {
             harness_core::HarnessError::AgentExecution(format!("failed to write to codex: {e}"))
         })?;
-        stdin.flush().await.ok();
+        if let Err(e) = stdin.flush().await {
+            tracing::warn!("codex_adapter: failed to flush stdin after approval response: {e}");
+        }
         Ok(())
     }
 }

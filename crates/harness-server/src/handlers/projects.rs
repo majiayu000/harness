@@ -76,11 +76,18 @@ pub async fn list_projects(
         Ok(projects) => {
             let with_counts: Vec<serde_json::Value> = projects
                 .into_iter()
-                .map(|p| {
-                    let mut v = serde_json::to_value(&p).unwrap_or_default();
-                    // task_count is best-effort; tasks do not store project_id
-                    v["task_count"] = json!(0);
-                    v
+                .filter_map(|p| {
+                    match serde_json::to_value(&p) {
+                        Ok(mut v) => {
+                            // task_count is best-effort; tasks do not store project_id
+                            v["task_count"] = json!(0);
+                            Some(v)
+                        }
+                        Err(e) => {
+                            tracing::warn!("projects: failed to serialize project entry: {e}");
+                            None
+                        }
+                    }
                 })
                 .collect();
             (StatusCode::OK, Json(json!(with_counts)))

@@ -211,7 +211,9 @@ impl ThreadManager {
         turn_id: &TurnId,
         message: String,
     ) -> harness_core::Result<Option<TokenUsage>> {
-        let _ = self.add_item(thread_id, turn_id, Item::Error { code: -1, message });
+        if let Err(e) = self.add_item(thread_id, turn_id, Item::Error { code: -1, message }) {
+            tracing::warn!("thread_manager: failed to record error item for turn {turn_id}: {e}");
+        }
         self.fail_turn(thread_id, turn_id)
     }
 

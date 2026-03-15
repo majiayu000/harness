@@ -17,8 +17,24 @@ impl GcCheckpoint {
 
     /// Load checkpoint from `path`. Returns `None` if the file is missing or corrupt.
     pub fn load(path: &Path) -> Option<Self> {
-        let data = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&data).ok()
+        let data = match std::fs::read_to_string(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                tracing::warn!("gc: failed to read checkpoint at {}: {e}", path.display());
+                return None;
+            }
+        };
+        match serde_json::from_str(&data) {
+            Ok(cp) => Some(cp),
+            Err(e) => {
+                tracing::warn!(
+                    "gc: checkpoint at {} is corrupt, starting full scan: {e}",
+                    path.display()
+                );
+                None
+            }
+        }
     }
 
     /// Save checkpoint to `path`, creating parent directories as needed.
