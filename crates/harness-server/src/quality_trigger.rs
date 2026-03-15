@@ -108,12 +108,8 @@ impl QualityTrigger {
                 .as_deref()
                 .map(|d| {
                     let d = d.to_lowercase();
-                    d.contains("fixes #")
-                        || d.contains("closes #")
-                        || d.contains("resolves #")
-                        || d.contains("fix #")
-                        || d.contains("close #")
-                        || d.contains("resolve #")
+                    let keywords = ["fixes #", "closes #", "resolves #", "fix #", "close #", "resolve #"];
+                    keywords.iter().any(|&kw| d.contains(kw))
                 })
                 .unwrap_or(false);
 
