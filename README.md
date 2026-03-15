@@ -127,9 +127,18 @@ All settings are declarative TOML. Pass `--config <path>` or use the defaults in
 transport = "stdio"
 http_addr = "127.0.0.1:9800"
 data_dir = "~/.local/share/harness"
+project_root = "."
 
 [agents]
 default_agent = "claude"
+sandbox_mode = "danger-full-access"
+
+[agents.claude]
+cli_path = "claude"
+default_model = "sonnet"
+
+[agents.codex]
+cli_path = "codex"
 
 [agents.review]
 enabled = true
@@ -139,12 +148,189 @@ max_rounds = 3
 [gc]
 max_drafts_per_run = 5
 budget_per_signal_usd = 0.50
+total_budget_usd = 5.0
+draft_ttl_hours = 72
+
+[observe]
+db_path = "~/.local/share/harness/harness.db"
+log_retention_days = 90
 
 [otel]
 environment = "production"
 exporter = "otlp-http"
 # endpoint = "http://127.0.0.1:4318"
 ```
+
+### Multi-Project Configuration
+
+Register multiple projects in the config file. Each project gets its own worktree isolation, concurrency limits, and agent overrides.
+
+```toml
+[[projects]]
+name = "harness"
+root = "/path/to/harness"
+default = true              # default project for API calls without project field
+max_concurrent = 2          # max parallel tasks for this project
+
+[[projects]]
+name = "litellm-rs"
+root = "/path/to/litellm-rs"
+max_concurrent = 2
+default_agent = "claude"    # override default agent per project
+
+[[projects]]
+name = "vibeguard"
+root = "/path/to/vibeguard"
+max_concurrent = 1
+```
+
+CLI `--project name=path` flags merge with config entries (CLI overrides on conflict).
+
+### Per-Project Overrides
+
+Each project can have a `.harness/config.toml` in its root to override server defaults:
+
+```toml
+# /path/to/project/.harness/config.toml
+[git]
+base_branch = "develop"
+remote = "upstream"
+branch_prefix = "fix/"
+
+[validation]
+pre_commit = ["cargo fmt --all -- --check", "cargo check"]
+timeout_secs = 120
+
+[agent]
+default = "claude"
+
+[review]
+enabled = true
+
+[concurrency]
+max_concurrent_tasks = 3
+```
+
+## HTTP REST API
+
+### Task Management
+
+```bash
+# Submit a task by prompt
+curl -X POST http://127.0.0.1:9800/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Add input validation to the API handler",
+    "project": "/path/to/project"
+  }'
+
+# Submit a task by GitHub issue number
+curl -X POST http://127.0.0.1:9800/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project": "/path/to/project",
+    "issue": 42,
+    "description": "fix: handle edge case in parser"
+  }'
+
+# Submit a task by PR number (for review/fix)
+curl -X POST http://127.0.0.1:9800/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project": "/path/to/project",
+    "pr": 100
+  }'
+
+# Batch submit multiple tasks
+curl -X POST http://127.0.0.1:9800/tasks/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project": "/path/to/project",
+    "issues": [10, 11, 12]
+  }'
+
+# Get task status
+curl http://127.0.0.1:9800/tasks/{task_id}
+
+# List all tasks
+curl http://127.0.0.1:9800/tasks
+
+# Stream task output (SSE)
+curl http://127.0.0.1:9800/tasks/{task_id}/stream
+```
+
+### Project Management
+
+```bash
+# List registered projects
+curl http://127.0.0.1:9800/api/projects
+
+# Register a new project at runtime
+curl -X POST http://127.0.0.1:9800/api/projects \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "my-project",
+    "root": "/path/to/project",
+    "max_concurrent": 2
+  }'
+
+# Remove a project
+curl -X DELETE http://127.0.0.1:9800/api/projects/my-project
+```
+
+### Dashboard
+
+```bash
+# Get aggregated status across all projects
+curl http://127.0.0.1:9800/api/dashboard
+
+# Response:
+# {
+#   "global": { "running": 3, "queued": 1, "done": 42, "failed": 2, "grade": "A" },
+#   "projects": [
+#     { "id": "harness", "root": "...", "tasks": { "running": 1, "queued": 0 } },
+#     { "id": "litellm-rs", "root": "...", "tasks": { "running": 2, "queued": 1 } }
+#   ]
+# }
+```
+
+### Health
+
+```bash
+curl http://127.0.0.1:9800/health
+```
+
+## Server Startup
+
+**Important:** Always start the server from a standalone terminal, not from within Claude Code or other agent sessions. Agent environment variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`) propagate to spawned subprocesses and cause SIGTRAP.
+
+```bash
+# Single project (backward compatible)
+./target/release/harness serve --transport http --port 9800 --project-root /path/to/project
+
+# Multi-project via config file (recommended)
+./target/release/harness serve --transport http --port 9800 --config config/default.toml
+
+# Multi-project via CLI flags
+./target/release/harness serve --transport http --port 9800 \
+  --project harness=/path/to/harness \
+  --project litellm=/path/to/litellm
+
+# With GitHub token for auto-review
+GITHUB_TOKEN=ghp_xxx ./target/release/harness serve --transport http --port 9800 --config config/default.toml
+```
+
+## Task Execution Flow
+
+```
+POST /tasks → TaskQueue → acquire semaphore (project + global)
+    → create git worktree → agent executes in isolation
+    → post-validator runs (cargo fmt, cargo check)
+    → agent creates PR → Codex review (up to 3 rounds)
+    → quality score → cleanup worktree → done
+```
+
+Each task runs in an isolated git worktree, so multiple agents can work on the same repo in parallel without conflicts.
 
 ## Workspace Crates
 
