@@ -46,6 +46,8 @@ pub async fn fix(
         Some(&pr_url),
         wait,
         max_rounds,
+        &config.agents.review.review_bot_command,
+        &config.agents.review.reviewer_name,
     )
     .await
 }
@@ -61,7 +63,18 @@ pub async fn loop_pr(
 
     println!("[harness] Starting review loop for PR #{pr}");
 
-    run_review_loop(&agent, &project, None, pr, None, wait, max_rounds).await
+    run_review_loop(
+        &agent,
+        &project,
+        None,
+        pr,
+        None,
+        wait,
+        max_rounds,
+        &config.agents.review.review_bot_command,
+        &config.agents.review.reviewer_name,
+    )
+    .await
 }
 
 async fn run_review_loop(
@@ -72,6 +85,8 @@ async fn run_review_loop(
     pr_url: Option<&str>,
     wait: u64,
     max_rounds: u32,
+    review_bot_command: &str,
+    reviewer_name: &str,
 ) -> anyhow::Result<()> {
     let url_display: std::borrow::Cow<str> = match pr_url {
         Some(url) => std::borrow::Cow::Borrowed(url),
@@ -93,8 +108,8 @@ async fn run_review_loop(
                 pr,
                 round,
                 prev_fixed,
-                "/gemini review",
-                "gemini-code-assist[bot]",
+                review_bot_command,
+                reviewer_name,
             ),
             project_root: project.clone(),
             ..Default::default()
