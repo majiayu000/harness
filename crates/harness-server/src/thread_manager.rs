@@ -297,6 +297,11 @@ impl ThreadManager {
             }
         }
 
+        // Rewrite each cloned turn's thread_id to point at the new thread.
+        for turn in &mut new_thread.turns {
+            turn.thread_id = new_thread.id.clone();
+        }
+
         let new_id = new_thread.id.clone();
         self.threads.insert(new_id.as_str().to_string(), new_thread);
         Ok(new_id)
@@ -539,6 +544,13 @@ mod tests {
     fn resume_thread_sets_status_to_idle() -> anyhow::Result<()> {
         let tm = ThreadManager::new();
         let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        // start_turn transitions the thread to Active; verify that first.
+        tm.start_turn(&thread_id, "work".to_string(), AgentId::new())?;
+        let thread = tm
+            .get_thread(&thread_id)
+            .ok_or_else(|| anyhow::anyhow!("thread missing"))?;
+        assert_eq!(thread.status, harness_core::ThreadStatus::Active);
+        drop(thread);
 
         tm.resume_thread(&thread_id)?;
 
@@ -563,6 +575,13 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("fork missing"))?;
         assert_eq!(fork.project_root, PathBuf::from("/src"));
         assert_eq!(fork.turns.len(), 1);
+        // Every cloned turn must reference the fork's ID, not the original's.
+        for turn in &fork.turns {
+            assert_eq!(
+                turn.thread_id, fork_id,
+                "turn thread_id not updated after fork"
+            );
+        }
         Ok(())
     }
 
