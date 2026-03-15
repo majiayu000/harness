@@ -1233,6 +1233,49 @@ mod startup_tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn persisted_skills_survive_restart() -> anyhow::Result<()> {
+        let sandbox = tempfile::tempdir()?;
+        let project_root = sandbox.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+        let data_dir = sandbox.path().join("data");
+
+        // First startup: create a skill so it gets persisted to disk.
+        {
+            let mut config = HarnessConfig::default();
+            config.server.project_root = project_root.clone();
+            config.server.data_dir = data_dir.clone();
+            let server = Arc::new(HarnessServer::new(
+                config,
+                ThreadManager::new(),
+                AgentRegistry::new("test"),
+            ));
+            let state = build_app_state(server).await?;
+            let mut skills = state.engines.skills.write().await;
+            skills.create("my-test-skill".to_string(), "# My test skill".to_string());
+        }
+
+        // Second startup: verify the persisted skill is reloaded via discover().
+        {
+            let mut config = HarnessConfig::default();
+            config.server.project_root = project_root.clone();
+            config.server.data_dir = data_dir.clone();
+            let server = Arc::new(HarnessServer::new(
+                config,
+                ThreadManager::new(),
+                AgentRegistry::new("test"),
+            ));
+            let state = build_app_state(server).await?;
+            let skills = state.engines.skills.read().await;
+            assert!(
+                skills.list().iter().any(|s| s.name == "my-test-skill"),
+                "expected persisted skill to be reloaded after restart"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn build_app_state_auto_registers_builtin_guard() -> anyhow::Result<()> {
         let sandbox = tempfile::tempdir()?;
         let project_root = sandbox.path().join("project");
