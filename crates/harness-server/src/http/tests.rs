@@ -720,3 +720,106 @@ async fn intake_status_recent_dispatches_empty_initially() -> anyhow::Result<()>
     assert!(json["recent_dispatches"].as_array().unwrap().is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn create_task_with_unregistered_agent_name_returns_bad_request() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+    let app = task_app(state);
+
+    let body = serde_json::json!({ "prompt": "fix the login bug", "agent": "nonexistent-agent" });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    use http_body_util::BodyExt;
+    let resp_body = response.into_body().collect().await?.to_bytes();
+    let resp: serde_json::Value = serde_json::from_slice(&resp_body)?;
+    let error_msg = resp["error"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("error field missing or not a string"))?;
+    assert!(error_msg.contains("nonexistent-agent"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_task_with_registered_agent_name_returns_accepted() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+    let app = task_app(state.clone());
+
+    let body = serde_json::json!({ "prompt": "fix the login bug", "agent": "test" });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_task_complex_prompt_dispatches_via_registry() -> anyhow::Result<()> {
+    // A prompt with 6+ file references is classified as Complex.
+    // dispatch() tries "claude" then "anthropic-api" then falls back to default.
+    // With only the default agent registered, dispatch must still succeed.
+    let dir = tempfile::tempdir()?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+    let before_count = state.core.tasks.count();
+    let app = task_app(state.clone());
+
+    let body = serde_json::json!({
+        "prompt": "Refactor src/a.rs src/b.rs src/c.rs src/d.rs src/e.rs src/f.rs to reduce duplication"
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(state.core.tasks.count(), before_count + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_task_with_issue_number_bumps_complexity_and_dispatches() -> anyhow::Result<()> {
+    // A simple prompt with an issue number is bumped to Medium complexity.
+    // dispatch() should still succeed, falling back to the default agent.
+    let dir = tempfile::tempdir()?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+    let before_count = state.core.tasks.count();
+    let app = task_app(state.clone());
+
+    let body = serde_json::json!({ "issue": 93 });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(state.core.tasks.count(), before_count + 1);
+    Ok(())
+}
