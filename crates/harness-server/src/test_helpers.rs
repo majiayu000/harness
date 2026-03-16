@@ -4,24 +4,20 @@ use std::sync::{
     Arc,
 };
 
-use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
-use harness_agents::AgentRegistry;
-use harness_core::HarnessConfig;
-
-/// Serialises every test that reads or mutates the process-global `HOME` env var.
-/// Tests that create tempdirs under HOME *and* tests that mutate HOME must both
-/// hold this lock to prevent races where one test mutates HOME while another
-/// test's `validate_project_root` reads it.
+/// Serialises every test that reads or mutates the process-global `HOME` env
+/// var.  `tokio::test` runs tests concurrently in the same process; without
+/// this lock, a test that temporarily changes `HOME` races with any other test
+/// that calls `validate_project_root` (which reads `HOME`), leading to
+/// spurious "project root must be within HOME" failures.
 pub static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// RAII guard that restores `HOME` on drop, including on panic.
+/// RAII guard that restores `HOME` on drop, **including on panic**.
 pub struct HomeGuard {
     original: Option<String>,
 }
 
 impl HomeGuard {
-    /// Overwrite `HOME` with `path` and return a guard that will undo the
-    /// change when dropped.
+    /// Overwrite `HOME` with `path` and return a guard that restores it.
     ///
     /// # Safety
     /// The caller must hold `HOME_LOCK` for the lifetime of this guard.
@@ -42,6 +38,10 @@ impl Drop for HomeGuard {
         }
     }
 }
+
+use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
+use harness_agents::AgentRegistry;
+use harness_core::HarnessConfig;
 
 /// Create a temp directory under a writable base path without mutating
 /// global state (`HOME` env var).  Tries `$HOME` first; falls back to
