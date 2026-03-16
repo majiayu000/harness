@@ -1293,7 +1293,7 @@ mod startup_tests {
             message: "critical issue".to_string(),
             severity: Severity::Critical,
         };
-        state
+        let old_session_id = state
             .observability
             .events
             .persist_rule_scan(&project_root, &[old_violation])
@@ -1312,7 +1312,30 @@ mod startup_tests {
             .events
             .query(&EventFilters::default())
             .await
-            .unwrap_or_default();
+            .expect("event store query must succeed");
+
+        // Guard: verify both scan sessions were actually persisted before
+        // testing the counting logic.  Without this, a silent write failure
+        // would leave `events` empty and the final assert_eq!(…, 0) would pass
+        // vacuously, giving a false green.
+        //
+        // Expected layout:
+        //   - 2 × rule_scan  (one per persist_rule_scan call)
+        //   - 1 × rule_check (the single violation in the first scan)
+        assert_eq!(
+            events.len(),
+            3,
+            "expected 2 rule_scan anchor events and 1 rule_check violation event, got {}",
+            events.len()
+        );
+        let old_check_count = events
+            .iter()
+            .filter(|e| e.hook == "rule_check" && e.session_id == old_session_id)
+            .count();
+        assert_eq!(
+            old_check_count, 1,
+            "first scan must have persisted exactly 1 violation event"
+        );
 
         let violation_count = events
             .iter()
