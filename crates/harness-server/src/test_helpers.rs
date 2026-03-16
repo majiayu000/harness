@@ -8,6 +8,12 @@ use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager
 use harness_agents::AgentRegistry;
 use harness_core::HarnessConfig;
 
+/// Serialises every test that reads or mutates the process-global `HOME` env var.
+/// `tokio::test` runs tests concurrently in the same process; tests that call
+/// `tempdir_in_home` and then `validate_project_root` must hold this lock for
+/// the full duration to prevent a sibling test from mutating HOME in between.
+pub static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Create a temp directory under a writable base path without mutating
 /// global state (`HOME` env var).  Tries `$HOME` first; falls back to
 /// `$CWD/.harness-test-home` if `$HOME` is not writable.
