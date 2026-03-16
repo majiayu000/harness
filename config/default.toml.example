@@ -1,0 +1,66 @@
+# Harness example configuration — copy to config/default.toml and edit as needed.
+# Start the server with: harness serve --config config/default.toml
+
+[server]
+transport = "stdio"
+http_addr = "127.0.0.1:9800"
+# Absolute path required — the server does not expand `~`.
+# Default on Linux:  ~/.local/share/harness
+# Default on macOS:  ~/Library/Application Support/harness
+data_dir = "/home/yourname/.local/share/harness"
+project_root = "."
+
+[agents]
+default_agent = "claude"
+sandbox_mode = "danger-full-access"
+
+[agents.claude]
+cli_path = "claude"
+default_model = "sonnet"
+
+[agents.codex]
+cli_path = "codex"
+
+[agents.anthropic_api]
+base_url = "https://api.anthropic.com"
+default_model = "claude-sonnet-4-20250514"
+# Maximum tokens the Anthropic API may return per request. Default: 4096.
+max_tokens = 4096
+
+[agents.review]
+enabled = false
+reviewer_agent = "codex"
+max_rounds = 3
+
+[gc]
+max_drafts_per_run = 5
+budget_per_signal_usd = 0.50
+total_budget_usd = 5.0
+
+[gc.signal_thresholds]
+repeated_warn_min = 10
+chronic_block_min = 5
+hot_file_edits_min = 20
+slow_op_threshold_ms = 5000
+slow_op_count_min = 10
+escalation_ratio = 1.5
+violation_min = 5
+
+[rules]
+discovery_paths = []
+
+[observe]
+session_renewal_secs = 1800
+log_retention_days = 90
+
+[otel]
+environment = "development"
+exporter = "disabled"
+# endpoint = "http://127.0.0.1:4318"
+
+# Register projects below (can also pass --project-root / --project on CLI).
+# [[projects]]
+# name = "my-project"
+# root = "/path/to/my-project"
+# default = true
+# max_concurrent = 2

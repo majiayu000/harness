@@ -155,9 +155,26 @@ fn resolve_project_root(configured_root: &std::path::Path) -> anyhow::Result<std
     Ok(project_root)
 }
 
+/// Expand a leading `~/` or standalone `~` to the value of `$HOME`.
+/// Returns the path unchanged when `~` is not present or `HOME` is unset.
+fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
+    if let Some(s) = path.to_str() {
+        if let Some(rest) = s.strip_prefix("~/") {
+            if let Ok(home) = std::env::var("HOME") {
+                return std::path::PathBuf::from(home).join(rest);
+            }
+        } else if s == "~" {
+            if let Ok(home) = std::env::var("HOME") {
+                return std::path::PathBuf::from(home);
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Build an AppState with all stores. Used by both HTTP and stdio transports.
 pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppState> {
-    let dir = server.config.server.data_dir.clone();
+    let dir = expand_tilde(&server.config.server.data_dir);
     let project_root = resolve_project_root(&server.config.server.project_root)?;
     std::fs::create_dir_all(&dir)?;
     tracing::info!(
@@ -700,7 +717,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
     crate::intake::build_orchestrator(
         &state.core.server.config.intake,
-        Some(&state.core.server.config.server.data_dir),
+        Some(&expand_tilde(&state.core.server.config.server.data_dir)),
         state.feishu_intake.clone(),
     )
     .start(state.clone());
