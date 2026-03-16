@@ -201,6 +201,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_start_emits_notification() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = tempfile::tempdir()?;
         let mut state = make_test_state(dir.path()).await?;
 
@@ -240,6 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn turn_start_emits_notification() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = tempfile::tempdir()?;
         let mut state = make_test_state(dir.path()).await?;
 

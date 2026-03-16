@@ -60,7 +60,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use crate::test_helpers::tempdir_in_home;
+    use crate::test_helpers::{tempdir_in_home, HOME_LOCK};
 
     async fn make_test_state(project_root: &Path, data_dir: &Path) -> anyhow::Result<AppState> {
         let mut config = HarnessConfig::default();
@@ -86,6 +86,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_check_returns_internal_error_when_scan_fails() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         let project_root = tempdir_in_home("health-scan-fail-root-")?;
         let data_dir = tempfile::tempdir()?;
         let state = make_test_state(project_root.path(), data_dir.path()).await?;
@@ -126,6 +127,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_check_emits_rule_scan_anchor_event() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         // Regression test for issue #82: the handler path must write a
         // `rule_scan` anchor event so that session-scoped violation counting
         // in metrics_query works correctly.
