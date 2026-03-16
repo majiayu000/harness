@@ -725,27 +725,10 @@ pub(crate) async fn mutate_and_persist(
     id: &TaskId,
     f: impl FnOnce(&mut TaskState),
 ) {
-    let _ = mutate_and_persist_with(store, id, |state| {
-        f(state);
-    })
-    .await;
-}
-
-/// Mutate a task, compute a return value from the same in-lock snapshot, then persist.
-pub(crate) async fn mutate_and_persist_with<R>(
-    store: &TaskStore,
-    id: &TaskId,
-    f: impl FnOnce(&mut TaskState) -> R,
-) -> Option<R> {
-    let result = if let Some(mut entry) = store.cache.get_mut(id) {
-        let result = f(entry.value_mut());
-        Some(result)
-    } else {
-        None
-    };
-
+    if let Some(mut entry) = store.cache.get_mut(id) {
+        f(entry.value_mut());
+    }
     store.persist(id).await;
-    result
 }
 
 #[cfg(test)]
@@ -1070,8 +1053,7 @@ mod tests {
     }
 
     /// Verify that a local u32 counter correctly tracks waiting rounds without any store query.
-    /// This replaces the old mutate_and_persist_with counting pattern: task execution is
-    /// sequential within a single tokio task, so a plain local counter suffices.
+    /// Task execution is sequential within a single tokio task, so a plain local counter suffices.
     #[test]
     fn local_waiting_counter_increments_on_each_waiting_response() {
         let max_rounds = 5u32;
