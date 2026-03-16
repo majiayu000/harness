@@ -1443,12 +1443,13 @@ mod startup_tests {
                 .ok_or_else(|| {
                     anyhow::anyhow!("expected persisted skill to be reloaded after restart")
                 })?;
-            // Confirm the skill came from data_dir/skills/ (System location),
+            // Confirm the skill came from data_dir/skills/ (User location),
             // not from $HOME/.harness/skills/ or /etc/harness/skills/.
+            // Persist-dir skills use User tier so they shadow same-named builtins.
             assert_eq!(
                 reloaded.location,
-                SkillLocation::System,
-                "reloaded skill has location {:?}; expected System (data_dir/skills/)",
+                SkillLocation::User,
+                "reloaded skill has location {:?}; expected User (data_dir/skills/)",
                 reloaded.location
             );
         }

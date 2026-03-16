@@ -128,9 +128,10 @@ impl SkillStore {
                 SkillLocation::Repo
             }
         } else if self.persist_dir.as_deref() == Some(dir) {
-            // Skills loaded from the persist directory are server-managed
-            // and belong to the System location tier.
-            SkillLocation::System
+            // Skills loaded from the persist directory are user-created and
+            // must shadow same-named builtins (System tier). Use User tier so
+            // the dedup priority (User=3 > System=1) keeps user skills.
+            SkillLocation::User
         } else {
             SkillLocation::System
         };
