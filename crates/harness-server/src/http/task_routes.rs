@@ -240,8 +240,14 @@ async fn enqueue_task_background(
     }
 
     let project_id = canonical_project.to_string_lossy().into_owned();
+    req.project = Some(canonical_project);
 
     let server_config = std::sync::Arc::new(state.core.server.config.clone());
+
+    tracing::info!(
+        project = %req.project.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "None".to_string()),
+        "enqueue_task_background: resolved project for batch task"
+    );
 
     // Register the task immediately so the caller gets an ID without blocking.
     let task_id =
