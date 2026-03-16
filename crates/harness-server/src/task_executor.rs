@@ -712,8 +712,20 @@ async fn run_agent_review(
             tracing::warn!("failed to log agent_review event: {e}");
         }
 
-        if approved || issues.is_empty() {
+        if approved {
             tracing::info!("agent review approved at round {agent_round}");
+            break;
+        }
+
+        // Malformed reviewer output: neither APPROVED nor any ISSUE: lines.
+        // Sending an empty fix prompt would produce arbitrary or no-op commits,
+        // so treat this as a reviewer protocol failure and abort the review loop.
+        if issues.is_empty() {
+            tracing::warn!(
+                agent_round,
+                "agent reviewer output contained neither APPROVED nor ISSUE: lines; \
+                 treating as protocol failure and skipping fix round"
+            );
             break;
         }
 
