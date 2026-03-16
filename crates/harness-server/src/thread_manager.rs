@@ -311,12 +311,15 @@ impl ThreadManager {
         id: &ThreadId,
         from_turn: Option<&TurnId>,
     ) -> harness_core::Result<ThreadId> {
-        let source = self
+        // Clone eagerly and drop the read guard before any subsequent write to
+        // `self.threads`.  DashMap shards reads with a RwLock: holding a read
+        // Ref while calling `insert` on a key that hashes to the same shard
+        // will deadlock because `insert` requests an exclusive write lock.
+        let mut new_thread = self
             .threads
             .get(id.as_str())
-            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(id.to_string()))?;
-
-        let mut new_thread = source.clone();
+            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(id.to_string()))?
+            .clone();
         new_thread.id = ThreadId::new();
         new_thread.status = ThreadStatus::Idle;
         new_thread.updated_at = chrono::Utc::now();
@@ -772,5 +775,72 @@ mod tests {
         tm.complete_turn(&thread_id, &turn_id)?;
         assert!(!tm.is_turn_running(&thread_id, &turn_id));
         Ok(())
+    }
+
+    /// `cancel_turn` on an already-completed turn must be a no-op: it returns
+    /// `None` (no usage snapshot) and leaves the turn status unchanged.
+    #[test]
+    fn cancel_turn_on_completed_turn_is_noop() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        tm.complete_turn(&thread_id, &turn_id)?;
+
+        let usage = tm.cancel_turn(&thread_id, &turn_id)?;
+        assert!(
+            usage.is_none(),
+            "cancelling a completed turn must return None"
+        );
+
+        let turn = tm
+            .get_turn(&thread_id, &turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn missing"))?;
+        assert_eq!(
+            turn.status,
+            TurnStatus::Completed,
+            "status must remain Completed after noop cancel"
+        );
+        Ok(())
+    }
+
+    /// `complete_turn` on an already-failed turn must return `None` and leave
+    /// the status as Failed — `transition_turn` only acts on Running turns.
+    #[test]
+    fn complete_turn_on_failed_turn_is_noop() -> anyhow::Result<()> {
+        let tm = ThreadManager::new();
+        let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+        let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+        tm.fail_turn(&thread_id, &turn_id)?;
+
+        let usage = tm.complete_turn(&thread_id, &turn_id)?;
+        assert!(usage.is_none(), "completing a failed turn must return None");
+
+        let turn = tm
+            .get_turn(&thread_id, &turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn missing"))?;
+        assert_eq!(
+            turn.status,
+            TurnStatus::Failed,
+            "status must remain Failed after noop complete"
+        );
+        Ok(())
+    }
+
+    /// `get_turn` returns `None` when the thread itself does not exist.
+    #[test]
+    fn get_turn_returns_none_for_missing_thread() {
+        let tm = ThreadManager::new();
+        let missing_thread = ThreadId::from_str("no-such-thread");
+        let missing_turn = TurnId::from_str("no-such-turn");
+        assert!(tm.get_turn(&missing_thread, &missing_turn).is_none());
+    }
+
+    /// `steer_turn` propagates `ThreadNotFound` when the thread does not exist.
+    #[test]
+    fn steer_turn_on_missing_thread_returns_error() {
+        let tm = ThreadManager::new();
+        let missing = ThreadId::from_str("ghost");
+        let turn = TurnId::from_str("ghost-turn");
+        assert!(tm.steer_turn(&missing, &turn, "x".to_string()).is_err());
     }
 }
