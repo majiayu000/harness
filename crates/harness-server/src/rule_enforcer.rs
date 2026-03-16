@@ -37,6 +37,18 @@ impl TurnInterceptor for RuleEnforcer {
             return InterceptResult::pass();
         }
 
+        // Only enforce rules on projects that have opted in by providing their
+        // own `.harness/guards` directory.  Guards loaded at startup are scoped
+        // to the projects they belong to; scanning unrelated projects produces
+        // false positives (e.g. SEC-02 on test constants in external repos).
+        if !req.project_root.join(".harness").join("guards").is_dir() {
+            tracing::debug!(
+                project_root = %req.project_root.display(),
+                "rule_enforcer: project has no .harness/guards, skipping enforcement"
+            );
+            return InterceptResult::pass();
+        }
+
         let violations = match engine.scan(&req.project_root).await {
             Ok(v) => v,
             Err(e) => {
@@ -154,7 +166,7 @@ mod tests {
     async fn blocks_on_critical_violation() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let project = dir.path().join("project");
-        std::fs::create_dir_all(&project)?;
+        std::fs::create_dir_all(project.join(".harness").join("guards"))?;
 
         let rules = engine_with_guard(dir.path(), "SEC-01", "critical")?;
         {
@@ -191,7 +203,7 @@ mod tests {
     async fn warns_on_high_violation() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let project = dir.path().join("project");
-        std::fs::create_dir_all(&project)?;
+        std::fs::create_dir_all(project.join(".harness").join("guards"))?;
 
         let rules = engine_with_guard(dir.path(), "SEC-04", "high")?;
         {
