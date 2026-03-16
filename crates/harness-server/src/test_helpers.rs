@@ -8,6 +8,41 @@ use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager
 use harness_agents::AgentRegistry;
 use harness_core::HarnessConfig;
 
+/// Serialises every test that reads or mutates the process-global `HOME` env var.
+/// Tests that create tempdirs under HOME *and* tests that mutate HOME must both
+/// hold this lock to prevent races where one test mutates HOME while another
+/// test's `validate_project_root` reads it.
+pub static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// RAII guard that restores `HOME` on drop, including on panic.
+pub struct HomeGuard {
+    original: Option<String>,
+}
+
+impl HomeGuard {
+    /// Overwrite `HOME` with `path` and return a guard that will undo the
+    /// change when dropped.
+    ///
+    /// # Safety
+    /// The caller must hold `HOME_LOCK` for the lifetime of this guard.
+    pub unsafe fn set(path: &std::path::Path) -> Self {
+        let original = std::env::var("HOME").ok();
+        std::env::set_var("HOME", path);
+        HomeGuard { original }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.original.take() {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+}
+
 /// Create a temp directory under a writable base path without mutating
 /// global state (`HOME` env var).  Tries `$HOME` first; falls back to
 /// `$CWD/.harness-test-home` if `$HOME` is not writable.

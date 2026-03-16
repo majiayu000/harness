@@ -1337,49 +1337,14 @@ async fn ingest_signal(
 #[cfg(test)]
 mod startup_tests {
     use super::build_app_state;
-    use crate::{server::HarnessServer, thread_manager::ThreadManager};
+    use crate::{
+        server::HarnessServer,
+        test_helpers::{HomeGuard, HOME_LOCK},
+        thread_manager::ThreadManager,
+    };
     use harness_agents::AgentRegistry;
     use harness_core::{HarnessConfig, SkillLocation};
     use std::sync::Arc;
-
-    /// Serialises every test that mutates the process-global `HOME` env var.
-    /// `tokio::test` runs tests concurrently in the same process; without this
-    /// lock, two tests calling `set_var("HOME", …)` simultaneously trigger
-    /// undefined behaviour per the `set_var` safety contract.
-    static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// RAII guard that restores `HOME` on drop, **including on panic**.
-    /// Holding a `HomeGuard` while asserting means a failing assert unwinds
-    /// through `Drop`, so the original value is always restored before the
-    /// next test is allowed to run.
-    struct HomeGuard {
-        original: Option<String>,
-    }
-
-    impl HomeGuard {
-        /// Overwrite `HOME` with `path` and return a guard that will undo the
-        /// change when dropped.
-        ///
-        /// # Safety
-        /// The caller must hold `HOME_LOCK` for the lifetime of this guard.
-        /// That serialises all `HOME` mutations so no two guards can overlap.
-        unsafe fn set(path: &std::path::Path) -> Self {
-            let original = std::env::var("HOME").ok();
-            std::env::set_var("HOME", path);
-            HomeGuard { original }
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.original.take() {
-                    Some(h) => std::env::set_var("HOME", h),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
 
     #[tokio::test]
     async fn persisted_skills_survive_restart() -> anyhow::Result<()> {
@@ -1443,12 +1408,13 @@ mod startup_tests {
                 .ok_or_else(|| {
                     anyhow::anyhow!("expected persisted skill to be reloaded after restart")
                 })?;
-            // Confirm the skill came from data_dir/skills/ (System location),
-            // not from $HOME/.harness/skills/ or /etc/harness/skills/.
+            // Skills persisted via store.create() are stored in data_dir/skills/
+            // and loaded with SkillLocation::User so they can override same-named
+            // builtins after restart (User priority > System priority).
             assert_eq!(
                 reloaded.location,
-                SkillLocation::System,
-                "reloaded skill has location {:?}; expected System (data_dir/skills/)",
+                SkillLocation::User,
+                "reloaded skill has location {:?}; expected User (data_dir/skills/)",
                 reloaded.location
             );
         }
