@@ -543,4 +543,61 @@ mod tests {
             .iter()
             .any(|s| s.signal_type == SignalType::LinterViolations));
     }
+
+    #[test]
+    fn signal_thresholds_from_config_maps_all_fields() {
+        let config = harness_core::config::SignalThresholdsConfig {
+            repeated_warn_min: 3,
+            chronic_block_min: 2,
+            hot_file_edits_min: 7,
+            slow_op_threshold_ms: 1000,
+            slow_op_count_min: 4,
+            escalation_ratio: 2.5,
+            violation_min: 6,
+        };
+        let thresholds = SignalThresholds::from(config);
+        assert_eq!(thresholds.repeated_warn_min, 3);
+        assert_eq!(thresholds.chronic_block_min, 2);
+        assert_eq!(thresholds.hot_file_edits_min, 7);
+        assert_eq!(thresholds.slow_op_threshold_ms, 1000);
+        assert_eq!(thresholds.slow_op_count_min, 4);
+        assert_eq!(thresholds.escalation_ratio, 2.5);
+        assert_eq!(thresholds.violation_min, 6);
+    }
+
+    #[test]
+    fn detector_uses_custom_thresholds_from_config() {
+        // Build detector from a config with lower thresholds than default
+        let config = harness_core::config::SignalThresholdsConfig {
+            repeated_warn_min: 2,
+            chronic_block_min: 2,
+            hot_file_edits_min: 2,
+            slow_op_threshold_ms: 100,
+            slow_op_count_min: 2,
+            escalation_ratio: 1.5,
+            violation_min: 2,
+        };
+        let det = SignalDetector::new(config.into(), ProjectId::new());
+
+        // 2 warns should exceed the custom threshold of 2
+        let events: Vec<Event> = (0..2).map(|_| warn_event("test")).collect();
+        let signals = det.detect(&events);
+        assert!(
+            signals
+                .iter()
+                .any(|s| s.signal_type == SignalType::RepeatedWarn),
+            "expected RepeatedWarn signal with custom threshold of 2"
+        );
+
+        // With default thresholds (10), 2 warns would not trigger — confirming
+        // custom config is wired through, not the default.
+        let default_det = detector();
+        let signals_default = default_det.detect(&events);
+        assert!(
+            !signals_default
+                .iter()
+                .any(|s| s.signal_type == SignalType::RepeatedWarn),
+            "default detector should not fire RepeatedWarn for only 2 warns"
+        );
+    }
 }
