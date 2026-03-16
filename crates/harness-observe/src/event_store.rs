@@ -38,6 +38,9 @@ pub struct EventStore {
     pool: SqlitePool,
     data_dir: PathBuf,
     otel_pipeline: Mutex<Option<crate::otel_export::OtelPipeline>>,
+    /// Number of seconds of inactivity before a new session is considered started.
+    /// Exposed via `session_renewal_secs()` for callers that need to group events.
+    session_renewal_secs: u64,
 }
 
 impl EventStore {
@@ -51,6 +54,7 @@ impl EventStore {
             pool,
             data_dir: data_dir.to_path_buf(),
             otel_pipeline: Mutex::new(None),
+            session_renewal_secs: 1800,
         };
 
         store.migrate_from_jsonl().await;
@@ -64,18 +68,47 @@ impl EventStore {
         self.pool.close().await;
     }
 
+    /// Return the configured session-renewal window in seconds.
+    pub fn session_renewal_secs(&self) -> u64 {
+        self.session_renewal_secs
+    }
+
+    /// Delete all events whose timestamp is older than `days` days.
+    ///
+    /// Returns the number of rows deleted.  A `days` value of 0 is a no-op.
+    pub async fn purge_old_events(&self, days: u32) -> anyhow::Result<u64> {
+        if days == 0 {
+            return Ok(0);
+        }
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
+        let cutoff_str = cutoff.to_rfc3339();
+        let result = sqlx::query("DELETE FROM events WHERE ts < ?")
+            .bind(&cutoff_str)
+            .execute(&self.pool)
+            .await?;
+        let deleted = result.rows_affected();
+        if deleted > 0 {
+            tracing::info!(deleted, days, "event store: purged old events");
+        }
+        Ok(deleted)
+    }
+
     pub async fn with_policies_and_otel(
         data_dir: &Path,
         session_renewal_secs: u64,
         log_retention_days: u32,
         otel_config: &OtelConfig,
     ) -> anyhow::Result<Self> {
-        let store = Self::new(data_dir).await?;
+        let mut store = Self::new(data_dir).await?;
+        store.session_renewal_secs = session_renewal_secs;
         tracing::debug!(
             session_renewal_secs,
             log_retention_days,
-            "event store policy values accepted"
+            "event store: applying retention policies"
         );
+        if let Err(e) = store.purge_old_events(log_retention_days).await {
+            tracing::warn!("event store: failed to purge old events: {e}");
+        }
         let pipeline = match crate::otel_export::OtelPipeline::from_config(otel_config).await {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -947,6 +980,52 @@ mod tests {
         let results = store.query(&EventFilters::default()).await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, event.id);
+        store.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_renewal_secs_default_is_1800() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path()).await?;
+        assert_eq!(store.session_renewal_secs(), 1800);
+        store.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_old_events_zero_days_is_noop() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path()).await?;
+        store.log(&make_event("hook", Decision::Pass)).await?;
+        let deleted = store.purge_old_events(0).await?;
+        assert_eq!(deleted, 0);
+        let results = store.query(&EventFilters::default()).await?;
+        assert_eq!(results.len(), 1);
+        store.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_old_events_removes_stale_and_keeps_recent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path()).await?;
+
+        // Insert an old event (101 days ago)
+        let mut old_event = make_event("hook", Decision::Pass);
+        old_event.ts = chrono::Utc::now() - chrono::Duration::days(101);
+        store.log(&old_event).await?;
+
+        // Insert a recent event (1 day ago)
+        let recent_event = make_event("hook", Decision::Pass);
+        store.log(&recent_event).await?;
+
+        let deleted = store.purge_old_events(90).await?;
+        assert_eq!(deleted, 1, "only the old event should be purged");
+
+        let results = store.query(&EventFilters::default()).await?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, recent_event.id);
         store.close().await;
         Ok(())
     }
