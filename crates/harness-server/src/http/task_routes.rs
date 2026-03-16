@@ -20,6 +20,33 @@ impl std::fmt::Display for EnqueueTaskError {
     }
 }
 
+/// Resolve a project path-or-ID through the registry.
+///
+/// If `project` is `None` or already points to an existing directory it is
+/// returned unchanged.  If it is not a directory and a `registry` is
+/// available, the value is treated as a project ID and looked up; a missing
+/// ID is a `BadRequest` error.  When no registry is available the raw value
+/// is passed through so downstream canonicalization can handle it.
+async fn resolve_project_from_registry(
+    registry: Option<&crate::project_registry::ProjectRegistry>,
+    project: Option<std::path::PathBuf>,
+) -> Result<Option<std::path::PathBuf>, EnqueueTaskError> {
+    let (Some(registry), Some(project_path)) = (registry, project.clone()) else {
+        return Ok(project);
+    };
+    if project_path.is_dir() {
+        return Ok(Some(project_path));
+    }
+    let id = project_path.to_string_lossy();
+    match registry.resolve_path(&id).await {
+        Ok(Some(root)) => Ok(Some(root)),
+        Ok(None) => Err(EnqueueTaskError::BadRequest(format!(
+            "project '{id}' not found in registry and is not a valid directory"
+        ))),
+        Err(e) => Err(EnqueueTaskError::Internal(e.to_string())),
+    }
+}
+
 pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
     mut req: task_runner::CreateTaskRequest,
@@ -32,22 +59,8 @@ pub(crate) async fn enqueue_task(
 
     // Resolve project: if the supplied path does not exist as a directory,
     // treat it as a project ID and look it up in the registry.
-    if let (Some(registry), Some(project_path)) =
-        (state.core.project_registry.as_ref(), req.project.clone())
-    {
-        if !project_path.is_dir() {
-            let id = project_path.to_string_lossy();
-            match registry.resolve_path(&id).await {
-                Ok(Some(root)) => req.project = Some(root),
-                Ok(None) => {
-                    return Err(EnqueueTaskError::BadRequest(format!(
-                        "project '{id}' not found in registry and is not a valid directory"
-                    )))
-                }
-                Err(e) => return Err(EnqueueTaskError::Internal(e.to_string())),
-            }
-        }
-    }
+    req.project =
+        resolve_project_from_registry(state.core.project_registry.as_deref(), req.project).await?;
 
     // Resolve and canonicalize the project root BEFORE acquiring the
     // concurrency permit so that:
@@ -156,6 +169,8 @@ pub struct BatchCreateTaskRequest {
     pub max_rounds: Option<u32>,
     /// Per-turn timeout override in seconds applied to all tasks.
     pub turn_timeout_secs: Option<u64>,
+    /// Project root or registry ID applied to all tasks in this batch.
+    pub project: Option<std::path::PathBuf>,
 }
 
 /// Enqueues a task for background execution, returning its ID immediately.
@@ -167,13 +182,18 @@ pub struct BatchCreateTaskRequest {
 /// slots are occupied.
 async fn enqueue_task_background(
     state: Arc<AppState>,
-    req: task_runner::CreateTaskRequest,
+    mut req: task_runner::CreateTaskRequest,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
     if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
         return Err(EnqueueTaskError::BadRequest(
             "at least one of prompt, issue, or pr must be provided".to_string(),
         ));
     }
+
+    // Resolve project: if the supplied path does not exist as a directory,
+    // treat it as a project ID and look it up in the registry.
+    req.project =
+        resolve_project_from_registry(state.core.project_registry.as_deref(), req.project).await?;
 
     // Resolve agent up-front (fast, no I/O) so we can return an error immediately
     // if the agent name is invalid, before registering the task.
@@ -288,6 +308,7 @@ pub(super) async fn create_tasks_batch(
             let mut t = task_runner::CreateTaskRequest::default();
             t.issue = Some(issue);
             t.agent = req.agent.clone();
+            t.project = req.project.clone();
             if let Some(rounds) = req.max_rounds {
                 t.max_rounds = rounds;
             }
@@ -304,6 +325,7 @@ pub(super) async fn create_tasks_batch(
             t.prompt = item.description;
             t.issue = item.issue;
             t.agent = req.agent.clone();
+            t.project = req.project.clone();
             if let Some(rounds) = req.max_rounds {
                 t.max_rounds = rounds;
             }
@@ -404,5 +426,89 @@ mod tests {
         let has_issues = req.issues.as_ref().is_some_and(|v| !v.is_empty());
         let has_tasks = req.tasks.as_ref().is_some_and(|v| !v.is_empty());
         assert!(!has_issues && !has_tasks);
+    }
+
+    #[test]
+    fn batch_request_deserializes_project_field() {
+        let json = r#"{"issues": [1, 2], "project": "/home/user/my-repo"}"#;
+        let req: BatchCreateTaskRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.project,
+            Some(std::path::PathBuf::from("/home/user/my-repo"))
+        );
+    }
+
+    #[test]
+    fn batch_request_project_defaults_to_none() {
+        let json = r#"{"issues": [1]}"#;
+        let req: BatchCreateTaskRequest = serde_json::from_str(json).unwrap();
+        assert!(req.project.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_project_from_registry_passes_through_none() {
+        let result = resolve_project_from_registry(None, None).await;
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_project_from_registry_passes_through_existing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let result = resolve_project_from_registry(None, Some(path.clone())).await;
+        assert_eq!(result.unwrap(), Some(path));
+    }
+
+    #[tokio::test]
+    async fn resolve_project_from_registry_no_registry_passes_through_nondir() {
+        // When no registry is available, non-dir paths are returned as-is
+        // (downstream canonicalization handles them).
+        let path = std::path::PathBuf::from("/nonexistent/path");
+        let result = resolve_project_from_registry(None, Some(path.clone())).await;
+        assert_eq!(result.unwrap(), Some(path));
+    }
+
+    #[tokio::test]
+    async fn resolve_project_from_registry_resolves_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
+            .await
+            .unwrap();
+        registry
+            .register(crate::project_registry::Project {
+                id: "my-repo".to_string(),
+                root: std::path::PathBuf::from("/home/user/my-repo"),
+                max_concurrent: None,
+                default_agent: None,
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let result = resolve_project_from_registry(
+            Some(&registry),
+            Some(std::path::PathBuf::from("my-repo")),
+        )
+        .await;
+        assert_eq!(
+            result.unwrap(),
+            Some(std::path::PathBuf::from("/home/user/my-repo"))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_project_from_registry_unknown_id_returns_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
+            .await
+            .unwrap();
+
+        let result = resolve_project_from_registry(
+            Some(&registry),
+            Some(std::path::PathBuf::from("unknown-repo")),
+        )
+        .await;
+        assert!(matches!(result, Err(EnqueueTaskError::BadRequest(_))));
     }
 }

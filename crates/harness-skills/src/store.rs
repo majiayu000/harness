@@ -128,8 +128,9 @@ impl SkillStore {
                 SkillLocation::Repo
             }
         } else if self.persist_dir.as_deref() == Some(dir) {
-            // Skills loaded from the persist directory were created by the user
-            // and must be treated as User-priority so they can override builtins.
+            // Skills loaded from the persist directory are user-created and
+            // must shadow same-named builtins (System tier). Use User tier so
+            // the dedup priority (User=3 > System=1) keeps user skills.
             SkillLocation::User
         } else {
             SkillLocation::System
