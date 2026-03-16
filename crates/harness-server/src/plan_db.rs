@@ -252,4 +252,38 @@ mod tests {
         assert_eq!(count, 0);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn update_in_txn_persists_mutation() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = PlanDb::open(&dir.path().join("plans.db")).await?;
+
+        let plan = ExecPlan::from_spec("# Update test", &dir.path().to_path_buf())?;
+        db.upsert(&plan).await?;
+
+        let updated = db
+            .update_in_txn(&plan.id, |p| p.activate())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("plan should exist after upsert"))?;
+        assert_eq!(updated.status, ExecPlanStatus::Active);
+
+        // Reload from DB to confirm the change was persisted, not just returned in-memory.
+        let reloaded = db
+            .get(&plan.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("plan should still exist after update"))?;
+        assert_eq!(reloaded.status, ExecPlanStatus::Active);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_in_txn_returns_none_for_missing_plan() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = PlanDb::open(&dir.path().join("plans.db")).await?;
+        let result = db
+            .update_in_txn(&ExecPlanId::new(), |p| p.activate())
+            .await?;
+        assert!(result.is_none());
+        Ok(())
+    }
 }
