@@ -51,12 +51,15 @@ pub async fn run_preflight(
 ) -> anyhow::Result<PreflightResult> {
     let skill_content = {
         let store = skills.read().await;
-        store
-            .list()
-            .iter()
-            .find(|s| s.name == "preflight")
-            .map(|s| s.content.clone())
-            .unwrap_or_default()
+        match store.list().iter().find(|s| s.name == "preflight") {
+            Some(s) => s.content.clone(),
+            None => {
+                tracing::warn!(
+                    "preflight skill not found in store; proceeding with empty skill content"
+                );
+                String::new()
+            }
+        }
     };
 
     let rules_summary = {
