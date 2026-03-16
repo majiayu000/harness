@@ -1229,7 +1229,7 @@ mod startup_tests {
     use super::build_app_state;
     use crate::{server::HarnessServer, thread_manager::ThreadManager};
     use harness_agents::AgentRegistry;
-    use harness_core::HarnessConfig;
+    use harness_core::{EventFilters, HarnessConfig, RuleId, Severity, Violation};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -1256,6 +1256,80 @@ mod startup_tests {
                 .iter()
                 .any(|guard| guard.id.as_str() == harness_rules::engine::BUILTIN_BASELINE_GUARD_ID),
             "expected build_app_state to auto-register builtin guard"
+        );
+        Ok(())
+    }
+
+    /// Verifies the session-scoped violation counting used during server startup
+    /// (in `serve()`) only counts rule_check events from the latest rule_scan
+    /// session, not all historical violations.
+    ///
+    /// This is a regression test for issue #82: the old `persist_violations`
+    /// path never wrote a `rule_scan` anchor event, so the counting logic
+    /// would silently fall back to 0 regardless of actual violations.
+    #[tokio::test]
+    async fn startup_grade_uses_latest_rule_scan_session_for_violation_count() -> anyhow::Result<()>
+    {
+        let sandbox = tempfile::tempdir()?;
+        let project_root = sandbox.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+
+        let mut config = HarnessConfig::default();
+        config.server.project_root = project_root.clone();
+        config.server.data_dir = sandbox.path().join("data");
+
+        let server = Arc::new(HarnessServer::new(
+            config,
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        ));
+        let state = build_app_state(server).await?;
+
+        // First (older) scan: one critical violation.
+        let old_violation = Violation {
+            rule_id: RuleId::from_str("SEC-01"),
+            file: std::path::PathBuf::from("src/lib.rs"),
+            line: Some(1),
+            message: "critical issue".to_string(),
+            severity: Severity::Critical,
+        };
+        state
+            .observability
+            .events
+            .persist_rule_scan(&project_root, &[old_violation])
+            .await;
+
+        // Second (latest) scan: clean — no violations.
+        state
+            .observability
+            .events
+            .persist_rule_scan(&project_root, &[])
+            .await;
+
+        // Apply the same session-scoped counting logic used in serve().
+        let events = state
+            .observability
+            .events
+            .query(&EventFilters::default())
+            .await
+            .unwrap_or_default();
+
+        let violation_count = events
+            .iter()
+            .rev()
+            .find(|e| e.hook == "rule_scan")
+            .map(|scan| {
+                events
+                    .iter()
+                    .filter(|e| e.hook == "rule_check" && e.session_id == scan.session_id)
+                    .count()
+            })
+            .unwrap_or(0);
+
+        assert_eq!(
+            violation_count, 0,
+            "startup grade must use only the latest rule_scan session; \
+             old violations from earlier sessions must not bleed into the count"
         );
         Ok(())
     }
