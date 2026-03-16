@@ -1101,10 +1101,8 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_blocking_panic_surfaces_error_and_event() -> anyhow::Result<()> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let dir = tempfile::Builder::new()
-            .prefix("harness-test-")
-            .tempdir_in(&home)?;
+        let _lock = HOME_LOCK.lock().await;
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
         let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
         let agent = CapturingAgent::new();
