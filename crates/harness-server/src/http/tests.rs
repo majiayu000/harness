@@ -914,7 +914,7 @@ async fn wait_for_invocation(flag: &std::sync::atomic::AtomicBool, msg: &str) {
 
 #[tokio::test]
 async fn dispatch_complex_prompt_selects_claude_agent() -> anyhow::Result<()> {
-    let dir = crate::test_helpers::tempdir_in_home("harness-dispatch-test-")?;
+    let dir = tempfile::tempdir()?;
     let (state, default_invoked, claude_invoked) =
         make_test_state_with_dispatch_agents(dir.path()).await?;
     let app = task_app(state);
@@ -954,7 +954,7 @@ async fn dispatch_complex_prompt_selects_claude_agent() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn dispatch_simple_prompt_selects_default_agent() -> anyhow::Result<()> {
-    let dir = crate::test_helpers::tempdir_in_home("harness-dispatch-test-")?;
+    let dir = tempfile::tempdir()?;
     let (state, default_invoked, claude_invoked) =
         make_test_state_with_dispatch_agents(dir.path()).await?;
     let app = task_app(state);
