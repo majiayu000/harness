@@ -140,6 +140,11 @@ default_model = "sonnet"
 [agents.codex]
 cli_path = "codex"
 
+[agents.anthropic_api]
+base_url = "https://api.anthropic.com"
+default_model = "claude-sonnet-4-20250514"
+max_tokens = 4096
+
 [agents.review]
 enabled = true
 reviewer_agent = "codex"   # independent reviewer != implementor
