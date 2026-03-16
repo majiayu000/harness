@@ -249,6 +249,20 @@ mod tests {
 
         assert_eq!(req.project, Some(project_root));
     }
+
+    #[test]
+    fn gc_adopt_task_request_sets_prompt() {
+        let gc_config = harness_core::GcConfig::default();
+        let prompt = "fix the unwrap on line 42".to_string();
+
+        let req = gc_adopt_task_request(
+            prompt.clone(),
+            &gc_config,
+            std::path::PathBuf::from("/tmp/project"),
+        );
+
+        assert_eq!(req.prompt, Some(prompt));
+    }
 }
 
 pub async fn gc_reject(
