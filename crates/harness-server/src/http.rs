@@ -717,7 +717,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
     crate::intake::build_orchestrator(
         &state.core.server.config.intake,
-        Some(&state.core.server.config.server.data_dir),
+        Some(&expand_tilde(&state.core.server.config.server.data_dir)),
         state.feishu_intake.clone(),
     )
     .start(state.clone());

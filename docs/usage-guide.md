@@ -336,6 +336,25 @@ curl -X DELETE http://127.0.0.1:9800/api/projects/new-project
 | `reviewer_agent` | `"codex"` | Agent used for review (must differ from implementor) |
 | `max_rounds` | `3` | Maximum review-fix cycles |
 
+### `[review]`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Enable periodic whole-repo review |
+| `interval_hours` | `24` | Hours between review cycles |
+| `agent` | — | Agent for review tasks (defaults to `agents.default_agent`) |
+| `timeout_secs` | `900` | Per-turn timeout for review tasks |
+
+When enabled, the scheduler runs a background loop that:
+
+1. Checks for new commits since the last review (`git log --since=<last_review>`)
+2. If new commits exist, gathers repo structure, diff stats, and commit log
+3. Constructs a comprehensive review prompt and enqueues it as a task
+4. The agent reviews the entire codebase and may create a PR with fixes
+5. Logs a `periodic_review` event as checkpoint for the next cycle
+
+If no new commits have landed since the last review, the cycle is skipped.
+
 ### `[gc]`
 
 | Field | Default | Description |
@@ -405,6 +424,48 @@ curl -X DELETE http://127.0.0.1:9800/api/projects/new-project
 9. WorkspaceManager.cleanup()     → remove worktree
 10. Task status → done/failed
 ```
+
+## Scheduled Background Systems
+
+Harness runs three background schedulers automatically when the server starts:
+
+### 1. Periodic Review (`[review]`)
+
+Whole-repo code review on a timer. Disabled by default.
+
+```toml
+[review]
+enabled = true
+interval_hours = 24
+```
+
+**What happens when enabled:**
+- Every `interval_hours`, checks if new commits exist since the last review
+- If yes: gathers repo structure + diff stats + commit log → constructs review prompt → enqueues as a task
+- Agent reviews the entire codebase, may create a PR with fixes
+- If no new commits: cycle is skipped (no wasted resources)
+- Review events are logged to EventStore for audit trail
+
+### 2. Health Tick (always on)
+
+Every 24 hours, runs `RuleEngine::scan()` on the project root:
+- Checks all registered guard scripts against the codebase
+- Persists violations as `rule_check` events
+- Generates a health report with quality grade and violation summary
+- Logged as `scheduler: periodic health report`
+
+### 3. GC Runner (always on)
+
+Frequency adapts to code quality:
+
+| Grade | Interval | Meaning |
+|-------|----------|---------|
+| A (≥90) | 7 days | Code is healthy, rare scans |
+| B (≥75) | 3 days | Minor issues, moderate scanning |
+| C (≥60) | 1 day | Needs attention, daily scans |
+| D (<60) | 1 hour | Critical issues, aggressive scanning |
+
+Scans for violation signals → generates remediation drafts → optionally adopts fixes.
 
 ## CLI Commands
 
