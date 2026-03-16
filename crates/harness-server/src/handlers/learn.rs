@@ -235,6 +235,13 @@ fn parse_skills_from_output(output: &str) -> Vec<(String, String)> {
     skills
 }
 
+/// Detect the severity level for a rule section.
+///
+/// Only an explicit `severity: <level>` field is recognised — keywords that
+/// appear anywhere else in the text (title, description) are intentionally
+/// ignored to prevent false positives such as "critical path" being parsed
+/// as `Severity::Critical`.  When no explicit field is present the function
+/// returns `Severity::Low`.
 fn detect_severity(section: &str) -> Severity {
     section
         .lines()
@@ -242,6 +249,13 @@ fn detect_severity(section: &str) -> Severity {
         .unwrap_or(Severity::Low)
 }
 
+/// Parse a severity level from a single line that begins with `severity:`.
+///
+/// Leading whitespace and list markers (`-`, `*`, `>`) are stripped before
+/// matching so that markdown list items such as `- severity: high` are
+/// handled correctly.  Only the first alphabetic token after the colon is
+/// examined, which allows trailing annotations like `severity: high (blocker)`
+/// without misclassifying them.
 fn parse_severity_from_line(line: &str) -> Option<Severity> {
     let normalized = line
         .trim_start()
@@ -473,5 +487,17 @@ mod tests {
         let output = "=== skill:  ===\n# Empty name\nSome content.";
         let skills = parse_skills_from_output(output);
         assert!(skills.is_empty());
+    }
+
+    /// End-to-end regression test for issue #90: a rule whose title contains
+    /// "critical path" must not receive `Severity::Critical` when there is no
+    /// explicit `severity:` field.
+    #[test]
+    fn parse_rules_critical_path_in_title_no_explicit_field_defaults_to_low() {
+        let output = "## LEARN-200: Fix critical path bottleneck\n\
+                      The latency spike is caused by a critical path in the scheduler.";
+        let rules = parse_rules_from_output(output);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].severity, Severity::Low);
     }
 }
