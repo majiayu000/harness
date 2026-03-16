@@ -164,6 +164,8 @@ mod tests {
 
     #[tokio::test]
     async fn rule_check_returns_warning_when_no_guards_registered() -> anyhow::Result<()> {
+        // Hold HOME_LOCK so a concurrent persisted_skills_survive_restart cannot
+        // change HOME between tempdir_in_home() and validate_project_root().
         let _lock = HOME_LOCK.lock().await;
         let dir = tempdir_in_home("rule-check-no-guard-")?;
         let state = make_test_state(dir.path()).await?;
@@ -203,6 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn rule_check_with_guard_returns_violations() -> anyhow::Result<()> {
+        // Hold HOME_LOCK for the same reason as rule_check_returns_warning_when_no_guards_registered.
         let _lock = HOME_LOCK.lock().await;
         let dir = tempdir_in_home("rule-check-violations-")?;
         let state = make_test_state(dir.path()).await?;
