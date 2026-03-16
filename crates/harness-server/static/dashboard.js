@@ -18,9 +18,15 @@ let pollTimer = null;
 
 function $(sel) { return document.querySelector(sel); }
 
+/** Returns Authorization headers if a token is configured, otherwise {}. */
+function authHeaders() {
+  const tok = window.__HARNESS_TOKEN__;
+  return tok ? { "Authorization": "Bearer " + tok } : {};
+}
+
 async function fetchTasks() {
   try {
-    const resp = await fetch("/tasks");
+    const resp = await fetch("/tasks", { headers: authHeaders() });
     if (!resp.ok) return;
     const tasks = await resp.json();
     renderBoard(tasks);
@@ -34,7 +40,7 @@ async function fetchTasks() {
 
 async function fetchIntake() {
   try {
-    const resp = await fetch("/api/intake");
+    const resp = await fetch("/api/intake", { headers: authHeaders() });
     if (!resp.ok) return;
     const data = await resp.json();
     renderIntakeChannels(data.channels || []);
@@ -202,7 +208,10 @@ function escapeHtml(str) {
 
 function connectWebSocket() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const url = `${proto}//${location.host}/ws`;
+  const tok = window.__HARNESS_TOKEN__;
+  const url = tok
+    ? `${proto}//${location.host}/ws?token=${encodeURIComponent(tok)}`
+    : `${proto}//${location.host}/ws`;
 
   try {
     ws = new WebSocket(url);
@@ -263,7 +272,7 @@ function initForm() {
     try {
       const resp = await fetch("/tasks", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ prompt }),
       });
       if (!resp.ok) {

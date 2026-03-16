@@ -18,105 +18,28 @@ pub struct PostExecutionValidator {
     config: ValidationConfig,
 }
 
+/// Validate that a command string does not contain unquoted shell operators
+/// that could enable command chaining or execution escalation.
+///
+/// The check is quote-aware: operators inside single quotes (`'...'`) are
+/// ignored because the shell treats them as literal text. Inside double
+/// quotes (`"..."`), only command substitution (`` ` `` and `$(`) is
+/// blocked since `|`, `&`, `;`, `>`, `<` are inactive there.
+///
+/// Used by both [`PostExecutionValidator`] (validation commands) and
+/// [`crate::workspace`] (workspace hooks) to reject config-supplied strings
+/// with shell injection potential before passing them to `sh -c`.
+///
+/// Delegates to [`harness_core::shell_safety::validate_shell_safety`] with
+/// strict mode (`allow_redirections = false`) — redirections are not needed
+/// for validator/hook commands and are rejected as a precaution.
+pub(crate) fn validate_command_safety(cmd_str: &str) -> Result<(), String> {
+    harness_core::shell_safety::validate_shell_safety(cmd_str, false)
+}
+
 impl PostExecutionValidator {
     pub fn new(config: ValidationConfig) -> Self {
         Self { config }
-    }
-
-    /// Validate that a command string does not contain unquoted shell operators
-    /// that could enable command chaining or execution escalation.
-    ///
-    /// The check is quote-aware: operators inside single quotes (`'...'`) are
-    /// ignored because the shell treats them as literal text. Inside double
-    /// quotes (`"..."`), only command substitution (`` ` `` and `$(`) is
-    /// blocked since `|`, `&`, `;`, `>`, `<` are inactive there.
-    ///
-    /// Applied only to operator-configured commands (from `ValidationConfig`).
-    /// Hardcoded defaults from `lang_detect` are trusted at compile time and
-    /// bypass this check.
-    fn validate_command_safety(cmd_str: &str) -> Result<(), String> {
-        // Newlines and carriage returns are command separators in sh -c.
-        if cmd_str.contains('\n') || cmd_str.contains('\r') {
-            return Err(format!(
-                "Command `{}` rejected: contains newline character. \
-                 Validation commands must be single-line.",
-                cmd_str.lines().next().unwrap_or(cmd_str)
-            ));
-        }
-
-        let chars: Vec<char> = cmd_str.chars().collect();
-        let len = chars.len();
-        let mut i = 0;
-        let mut in_single = false;
-        let mut in_double = false;
-
-        while i < len {
-            let c = chars[i];
-
-            // Backslash escapes: outside single quotes, `\` makes the next
-            // character literal. Inside single quotes backslash has no special
-            // meaning (POSIX sh).
-            if c == '\\' && !in_single && i + 1 < len {
-                i += 2; // skip the escaped character entirely
-                continue;
-            }
-
-            // Track quote state.
-            if c == '\'' && !in_double {
-                in_single = !in_single;
-                i += 1;
-                continue;
-            }
-            if c == '"' && !in_single {
-                in_double = !in_double;
-                i += 1;
-                continue;
-            }
-
-            // Inside single quotes everything is literal — skip.
-            if in_single {
-                i += 1;
-                continue;
-            }
-
-            // Command substitution is active in both unquoted and double-quoted contexts.
-            if c == '`' {
-                return Err(Self::safety_error(cmd_str, "`"));
-            }
-            if c == '$' && i + 1 < len && chars[i + 1] == '(' {
-                return Err(Self::safety_error(cmd_str, "$("));
-            }
-
-            // Remaining shell operators are only active when fully unquoted.
-            if !in_double {
-                let op = match c {
-                    '|' if i + 1 < len && chars[i + 1] == '|' => Some("||"),
-                    '|' => Some("|"),
-                    '&' if i + 1 < len && chars[i + 1] == '&' => Some("&&"),
-                    '&' => Some("&"),
-                    ';' => Some(";"),
-                    '>' if i + 1 < len && chars[i + 1] == '>' => Some(">>"),
-                    '>' => Some(">"),
-                    '<' => Some("<"),
-                    _ => None,
-                };
-                if let Some(op) = op {
-                    return Err(Self::safety_error(cmd_str, op));
-                }
-            }
-
-            i += 1;
-        }
-
-        Ok(())
-    }
-
-    fn safety_error(cmd_str: &str, op: &str) -> String {
-        format!(
-            "Command `{cmd_str}` rejected: contains shell operator `{op}`. \
-             Validation commands must invoke toolchain binaries directly \
-             without shell operators."
-        )
     }
 
     /// Run a shell command via `sh -c` to support pipes, quotes, and complex expressions.
@@ -183,7 +106,7 @@ impl TurnInterceptor for PostExecutionValidator {
             vec![]
         } else {
             for cmd in &self.config.pre_commit {
-                if let Err(e) = Self::validate_command_safety(cmd) {
+                if let Err(e) = validate_command_safety(cmd) {
                     return PostExecuteResult::fail(e);
                 }
             }
@@ -194,7 +117,7 @@ impl TurnInterceptor for PostExecutionValidator {
             vec![]
         } else {
             for cmd in &self.config.pre_push {
-                if let Err(e) = Self::validate_command_safety(cmd) {
+                if let Err(e) = validate_command_safety(cmd) {
                     return PostExecuteResult::fail(e);
                 }
             }
@@ -408,7 +331,7 @@ mod tests {
         ];
         for cmd in safe {
             assert!(
-                PostExecutionValidator::validate_command_safety(cmd).is_ok(),
+                validate_command_safety(cmd).is_ok(),
                 "expected `{cmd}` to pass but it was rejected"
             );
         }
@@ -432,7 +355,7 @@ mod tests {
         ];
         for cmd in dangerous {
             assert!(
-                PostExecutionValidator::validate_command_safety(cmd).is_err(),
+                validate_command_safety(cmd).is_err(),
                 "expected `{cmd}` to be rejected but it passed"
             );
         }
@@ -441,11 +364,11 @@ mod tests {
     #[test]
     fn newline_bypasses_are_blocked() {
         assert!(
-            PostExecutionValidator::validate_command_safety("echo ok\nwhoami").is_err(),
+            validate_command_safety("echo ok\nwhoami").is_err(),
             "newline should be blocked"
         );
         assert!(
-            PostExecutionValidator::validate_command_safety("echo ok\r\nwhoami").is_err(),
+            validate_command_safety("echo ok\r\nwhoami").is_err(),
             "carriage return should be blocked"
         );
     }
@@ -455,12 +378,12 @@ mod tests {
         // echo \"foo | bash — the \" is an escaped quote, not a real one,
         // so | remains unquoted and must be rejected.
         assert!(
-            PostExecutionValidator::validate_command_safety("echo \\\"foo | bash").is_err(),
+            validate_command_safety("echo \\\"foo | bash").is_err(),
             "escaped double quote must not open quoted context"
         );
         // Same with single quote: echo \'foo && rm -rf /
         assert!(
-            PostExecutionValidator::validate_command_safety("echo \\'foo && rm").is_err(),
+            validate_command_safety("echo \\'foo && rm").is_err(),
             "escaped single quote must not open quoted context"
         );
     }
@@ -468,10 +391,8 @@ mod tests {
     #[test]
     fn command_substitution_blocked_even_inside_double_quotes() {
         // $( and ` are active inside double quotes in sh.
-        assert!(
-            PostExecutionValidator::validate_command_safety("test -z \"$(gofmt -l .)\"").is_err()
-        );
-        assert!(PostExecutionValidator::validate_command_safety("echo \"`whoami`\"").is_err());
+        assert!(validate_command_safety("test -z \"$(gofmt -l .)\"").is_err());
+        assert!(validate_command_safety("echo \"`whoami`\"").is_err());
     }
 
     #[tokio::test]

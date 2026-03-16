@@ -3,6 +3,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use dashmap::DashMap;
 use serde::Deserialize;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 use super::{IncomingIssue, IntakeSource, TaskCompletionResult};
 use crate::http::AppState;
@@ -191,7 +192,7 @@ fn verify_feishu_token(
         .as_str()
         .or_else(|| payload["header"]["token"].as_str())
         .unwrap_or("");
-    token == expected.as_str()
+    token.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 pub async fn feishu_webhook(

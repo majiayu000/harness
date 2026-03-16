@@ -11,6 +11,23 @@ pub(crate) const SETUP_ENV_ALLOWLIST: [&str; 10] = [
     "PATH", "HOME", "USER", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE",
 ];
 
+/// Reject setup commands that contain shell operators enabling injection.
+///
+/// `setup_commands` must only come from server-level config, never from
+/// per-project `.harness/config.toml`, and must invoke a single binary
+/// without piping or chaining (e.g. `npm ci`, `cargo fetch`).
+///
+/// Redirections (`>`, `>>`, `<`) are permitted because setup tasks
+/// commonly suppress output (e.g. `npm ci > /dev/null`). Command
+/// chaining/backgrounding operators are always rejected.
+///
+/// Delegates to [`harness_core::shell_safety::validate_shell_safety`] with
+/// `allow_redirections = true`.
+fn validate_setup_command(cmd: &str) -> Result<(), String> {
+    harness_core::shell_safety::validate_shell_safety(cmd, true)
+        .map_err(|e| e.replace("Command `", "setup command `"))
+}
+
 fn setup_cache_ttl(cloud: &CodexCloudConfig) -> Duration {
     Duration::from_secs(cloud.cache_ttl_hours.saturating_mul(3600))
 }
@@ -140,6 +157,10 @@ pub(crate) async fn run_setup_phase(
     for setup_command in &cloud.setup_commands {
         if setup_command.trim().is_empty() {
             continue;
+        }
+
+        if let Err(msg) = validate_setup_command(setup_command) {
+            return Err(HarnessError::AgentExecution(msg));
         }
 
         let mut cmd = Command::new("sh");

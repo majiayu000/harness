@@ -91,6 +91,7 @@ futures = "0.3"
 tokio-stream = "0.1"
 hmac = "0.12"
 sha2 = "0.10"
+subtle = "2"
 
 # HTTP client (for Anthropic API)
 reqwest = { version = "0.12", features = ["json", "stream"] }
