@@ -129,7 +129,12 @@ mod tests {
             harness_core::ProjectId::new(),
         );
         let draft_store = DraftStore::new(dir).expect("draft store");
-        let gc_agent = Arc::new(GcAgent::new(gc_config, signal_detector, draft_store));
+        let gc_agent = Arc::new(GcAgent::new(
+            gc_config,
+            signal_detector,
+            draft_store,
+            dir.to_path_buf(),
+        ));
         let agent_registry = Arc::new(harness_agents::AgentRegistry::new("test"));
         QualityTrigger::new(
             events,

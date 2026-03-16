@@ -30,7 +30,12 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
             let signal_detector = SignalDetector::new(thresholds, project.id.clone());
             let gc_config = map_gc_config(&config.gc);
             let draft_store = DraftStore::new(data_dir)?;
-            let gc_agent = GcAgent::new(gc_config, signal_detector, draft_store);
+            let gc_agent = GcAgent::new(
+                gc_config,
+                signal_detector,
+                draft_store,
+                project.root.clone(),
+            );
 
             let claude = harness_agents::claude::ClaudeCodeAgent::new(
                 config.agents.claude.cli_path.clone(),
@@ -79,14 +84,16 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
 
         GcCommand::Adopt { draft_id } => {
             let id = DraftId::from_str(&draft_id);
-            let gc_agent = make_agent_for_draft_ops(data_dir)?;
+            let project_root = config.server.project_root.clone();
+            let gc_agent = make_agent_for_draft_ops(data_dir, &project_root)?;
             gc_agent.adopt(&id)?;
             println!("Adopted draft: {draft_id}");
         }
 
         GcCommand::Reject { draft_id, reason } => {
             let id = DraftId::from_str(&draft_id);
-            let gc_agent = make_agent_for_draft_ops(data_dir)?;
+            let project_root = config.server.project_root.clone();
+            let gc_agent = make_agent_for_draft_ops(data_dir, &project_root)?;
             gc_agent.reject(&id, reason.as_deref())?;
             println!("Rejected draft: {draft_id}");
         }
@@ -95,12 +102,16 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
     Ok(())
 }
 
-fn make_agent_for_draft_ops(data_dir: &std::path::Path) -> anyhow::Result<GcAgent> {
+fn make_agent_for_draft_ops(
+    data_dir: &std::path::Path,
+    project_root: &std::path::Path,
+) -> anyhow::Result<GcAgent> {
     let draft_store = DraftStore::new(data_dir)?;
     Ok(GcAgent::new(
         GcConfig::default(),
         SignalDetector::new(GcThresholds::default(), ProjectId::new()),
         draft_store,
+        project_root.to_path_buf(),
     ))
 }
 

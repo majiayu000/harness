@@ -265,6 +265,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         server.config.gc.clone(),
         signal_detector,
         draft_store,
+        project_root.clone(),
     ));
 
     let thread_db_path = dir.join("threads.db");
