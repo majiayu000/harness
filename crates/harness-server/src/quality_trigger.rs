@@ -123,16 +123,13 @@ mod tests {
         cooldown_secs: u64,
     ) -> QualityTrigger {
         let events = Arc::new(EventStore::new(dir).await.expect("event store"));
+        let gc_config = harness_core::GcConfig::default();
         let signal_detector = SignalDetector::new(
-            harness_gc::signal_detector::SignalThresholds::default(),
+            gc_config.signal_thresholds.clone().into(),
             harness_core::ProjectId::new(),
         );
         let draft_store = DraftStore::new(dir).expect("draft store");
-        let gc_agent = Arc::new(GcAgent::new(
-            harness_core::GcConfig::default(),
-            signal_detector,
-            draft_store,
-        ));
+        let gc_agent = Arc::new(GcAgent::new(gc_config, signal_detector, draft_store));
         let agent_registry = Arc::new(harness_agents::AgentRegistry::new("test"));
         QualityTrigger::new(
             events,
