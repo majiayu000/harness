@@ -1,7 +1,7 @@
 use crate::http::AppState;
 use harness_core::DraftId;
 use harness_protocol::{
-    RpcResponse, AGENT_ERROR, CONFLICT, INTERNAL_ERROR, NOT_FOUND, STORAGE_ERROR, VALIDATION_ERROR,
+    RpcResponse, AGENT_ERROR, CONFLICT, INTERNAL_ERROR, NOT_FOUND, STORAGE_ERROR,
 };
 
 fn gc_adopt_task_request(
@@ -152,7 +152,13 @@ pub async fn gc_adopt(
                 let permit = match state.concurrency.task_queue.acquire(&project_id).await {
                     Ok(p) => p,
                     Err(e) => {
-                        return RpcResponse::error(id, CONFLICT, format!("task queue full: {e}"));
+                        let msg = e.to_string();
+                        if msg.contains("task queue is full") {
+                            return RpcResponse::error(id, CONFLICT, msg);
+                        } else {
+                            // Queue was closed — internal server error, not a client conflict.
+                            return RpcResponse::error(id, INTERNAL_ERROR, msg);
+                        }
                     }
                 };
                 let tid = crate::task_runner::spawn_task(
@@ -185,8 +191,9 @@ pub async fn gc_adopt(
                 // (TOCTOU race). Report as NOT_FOUND, not a storage fault.
                 RpcResponse::error(id, NOT_FOUND, msg)
             } else if msg.contains("target_path must") {
-                // Path safety checks fire before any I/O — client validation failure.
-                RpcResponse::error(id, VALIDATION_ERROR, msg)
+                // Artifact paths come from persisted server-side draft data, not
+                // from caller input — a malformed path is a server/agent data bug.
+                RpcResponse::error(id, INTERNAL_ERROR, msg)
             } else {
                 RpcResponse::error(id, STORAGE_ERROR, msg)
             }
