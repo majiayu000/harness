@@ -190,7 +190,87 @@ pub async fn gc_adopt(
 
 #[cfg(test)]
 mod tests {
-    use super::gc_adopt_task_request;
+    use super::{gc_adopt_task_request, gc_run};
+    use crate::{http::build_app_state, server::HarnessServer, thread_manager::ThreadManager};
+    use harness_agents::AgentRegistry;
+    use harness_core::{EventFilters, GuardId, HarnessConfig, Language};
+    use harness_protocol::INTERNAL_ERROR;
+    use harness_rules::engine::Guard;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use crate::test_helpers::tempdir_in_home;
+
+    async fn make_test_state(
+        project_root: &Path,
+        data_dir: &Path,
+    ) -> anyhow::Result<crate::http::AppState> {
+        let mut config = HarnessConfig::default();
+        config.server.project_root = project_root.to_path_buf();
+        config.server.data_dir = data_dir.to_path_buf();
+        let server = Arc::new(HarnessServer::new(
+            config,
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        ));
+        build_app_state(server).await
+    }
+
+    async fn register_failing_guard(state: &crate::http::AppState) {
+        let mut rules = state.engines.rules.write().await;
+        rules.register_guard(Guard {
+            id: GuardId::from_str("FAIL-SCAN-GUARD"),
+            script_path: std::path::PathBuf::from("fail\0scan.sh"),
+            language: Language::Common,
+            rules: vec![],
+        });
+    }
+
+    #[tokio::test]
+    async fn gc_run_returns_internal_error_when_scan_fails() -> anyhow::Result<()> {
+        let project_root = tempdir_in_home("gc-run-scan-fail-root-")?;
+        let data_dir = tempfile::tempdir()?;
+        let state = make_test_state(project_root.path(), data_dir.path()).await?;
+        register_failing_guard(&state).await;
+
+        let response = gc_run(&state, Some(serde_json::json!(1))).await;
+
+        let error = response
+            .error
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("expected gc/run to return an error"))?;
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(
+            !error.message.is_empty(),
+            "scan failure should provide a non-empty error message"
+        );
+        assert!(
+            response.result.is_none(),
+            "scan failure must not return a success payload"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gc_run_does_not_persist_rule_scan_when_scan_fails() -> anyhow::Result<()> {
+        let project_root = tempdir_in_home("gc-run-scan-fail-persist-")?;
+        let data_dir = tempfile::tempdir()?;
+        let state = make_test_state(project_root.path(), data_dir.path()).await?;
+        register_failing_guard(&state).await;
+
+        gc_run(&state, Some(serde_json::json!(1))).await;
+
+        let events = state
+            .observability
+            .events
+            .query(&EventFilters::default())
+            .await?;
+        assert!(
+            events.iter().all(|event| event.hook != "rule_scan"),
+            "scan failure should not persist a rule_scan event"
+        );
+        Ok(())
+    }
 
     #[test]
     fn gc_adopt_task_request_uses_gc_config_values() {
