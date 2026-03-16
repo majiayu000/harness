@@ -77,6 +77,13 @@ impl SkillStore {
     /// Enable disk persistence: created skills are written to `{dir}/{name}.md`,
     /// deleted skills are removed, and the dir is added to discovery_paths so
     /// skills survive restarts.
+    ///
+    /// # Startup sequence
+    ///
+    /// After calling `with_persist_dir`, call `load_builtin()` then `discover()`
+    /// so previously persisted skills are reloaded from disk.  User-tier skills
+    /// loaded from `persist_dir` take priority over same-named builtin (System)
+    /// skills during the `deduplicate()` step inside `discover()`.
     pub fn with_persist_dir(mut self, dir: PathBuf) -> Self {
         self.discovery_paths.push(dir.clone());
         self.persist_dir = Some(dir);
