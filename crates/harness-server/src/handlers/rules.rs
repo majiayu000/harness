@@ -259,6 +259,9 @@ mod tests {
 
     #[tokio::test]
     async fn rule_check_returns_warning_for_empty_scan_input() -> anyhow::Result<()> {
+        // Hold HOME_LOCK so that no concurrent test changes $HOME while
+        // tempdir_in_home reads it.
+        let _lock = HOME_LOCK.lock().await;
         let dir = tempdir_in_home("rule-check-empty-input-")?;
         let state = make_test_state(dir.path()).await?;
         {
