@@ -3,6 +3,7 @@ use harness_core::{
     AgentId, Item, Thread, ThreadId, ThreadStatus, TokenUsage, Turn, TurnId, TurnStatus,
 };
 use tokio::task::JoinHandle;
+use tracing;
 
 /// In-memory thread registry and turn lifecycle manager.
 ///
@@ -238,7 +239,9 @@ impl ThreadManager {
         turn_id: &TurnId,
         message: String,
     ) -> harness_core::Result<Option<TokenUsage>> {
-        let _ = self.add_item(thread_id, turn_id, Item::Error { code: -1, message });
+        if let Err(e) = self.add_item(thread_id, turn_id, Item::Error { code: -1, message }) {
+            tracing::warn!("thread manager: failed to add error item for turn {turn_id}: {e}");
+        }
         self.fail_turn(thread_id, turn_id)
     }
 

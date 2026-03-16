@@ -117,8 +117,11 @@ impl EventStore {
                 continue;
             }
             if let Ok(event) = serde_json::from_str::<Event>(line) {
-                let _ = self.insert_event(&event).await;
-                imported += 1;
+                if let Err(e) = self.insert_event(&event).await {
+                    tracing::warn!("event store: failed to insert migrated event: {e}");
+                } else {
+                    imported += 1;
+                }
             }
         }
         if imported > 0 {

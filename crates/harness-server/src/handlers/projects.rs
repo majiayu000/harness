@@ -8,6 +8,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
+use tracing;
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterProjectRequest {
@@ -91,7 +92,13 @@ pub async fn list_projects(
             let with_counts: Vec<serde_json::Value> = projects
                 .into_iter()
                 .map(|p| {
-                    let mut v = serde_json::to_value(&p).unwrap_or_default();
+                    let mut v = match serde_json::to_value(&p) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!("projects: failed to serialize project: {e}");
+                            serde_json::Value::default()
+                        }
+                    };
                     // task_count is best-effort; tasks do not store project_id
                     v["task_count"] = json!(0);
                     v

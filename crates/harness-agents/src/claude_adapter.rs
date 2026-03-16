@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
+use tracing;
 
 /// Streaming Claude Code adapter (L1-L2).
 ///
@@ -104,7 +105,13 @@ impl AgentAdapter for ClaudeAdapter {
         let exit_status = {
             let mut guard = self.child.lock().await;
             if let Some(ref mut child) = *guard {
-                child.wait().await.ok()
+                child
+                    .wait()
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!("claude: failed to wait for child process: {e}");
+                    })
+                    .ok()
             } else {
                 None
             }
@@ -112,17 +119,23 @@ impl AgentAdapter for ClaudeAdapter {
 
         if let Some(status) = exit_status {
             if !status.success() {
-                let _ = tx
+                if let Err(e) = tx
                     .send(AgentEvent::Error {
                         message: format!("claude exited with {status}"),
                     })
-                    .await;
+                    .await
+                {
+                    tracing::debug!("claude: event channel closed before error could be sent: {e}");
+                }
             }
         }
 
-        let _ = tx
+        if let Err(e) = tx
             .send(AgentEvent::TurnCompleted { output: output_buf })
-            .await;
+            .await
+        {
+            tracing::debug!("claude: event channel closed before turn completed: {e}");
+        }
 
         // Clean up child handle
         let mut guard = self.child.lock().await;

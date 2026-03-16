@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use harness_core::Event;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use tracing;
 
 /// Persisted state for incremental GC scanning.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -17,8 +18,19 @@ impl GcCheckpoint {
 
     /// Load checkpoint from `path`. Returns `None` if the file is missing or corrupt.
     pub fn load(path: &Path) -> Option<Self> {
-        let data = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&data).ok()
+        let data = match std::fs::read_to_string(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                tracing::warn!("gc: failed to read checkpoint at {}: {e}", path.display());
+                return None;
+            }
+        };
+        serde_json::from_str(&data)
+            .map_err(|e| {
+                tracing::warn!("gc: corrupt checkpoint at {}: {e}", path.display());
+            })
+            .ok()
     }
 
     /// Save checkpoint to `path`, creating parent directories as needed.
