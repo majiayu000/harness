@@ -638,6 +638,7 @@ mod tests {
 
     #[tokio::test]
     async fn gc_adopt_schedule_changes_with_gc_config() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let short_max_rounds = 1;
         let long_max_rounds = 3;
         let short_schedule_turn = run_gc_adopt_and_wait_for_failure_turn(short_max_rounds).await?;
@@ -662,6 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn rule_check_returns_warning_when_no_guards_loaded() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
         let proj_dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
@@ -834,6 +836,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_start_persists_to_db() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
         let proj_dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
@@ -1359,6 +1362,7 @@ mod tests {
 
     #[tokio::test]
     async fn learn_rules_returns_zero_when_no_adopted_drafts() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
         let proj_dir = crate::test_helpers::tempdir_in_home("harness-learn-rules-test-")?;
@@ -1394,6 +1398,7 @@ mod tests {
 
     #[tokio::test]
     async fn learn_skills_returns_zero_when_no_adopted_drafts() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = tempfile::tempdir()?;
         let state = make_test_state(dir.path()).await?;
         let proj_dir = crate::test_helpers::tempdir_in_home("harness-learn-skills-test-")?;
@@ -1489,6 +1494,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_plan_init_persists_to_db() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = tempfile::tempdir()?;
         let proj_dir = crate::test_helpers::tempdir_in_home("harness-exec-test-")?;
         let state = make_test_state_with_plan_db(dir.path()).await?;
@@ -1529,6 +1535,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_plan_status_reads_plan_from_memory() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = tempfile::tempdir()?;
         let proj_dir = crate::test_helpers::tempdir_in_home("harness-exec-test-")?;
         let state = make_test_state_with_plan_db(dir.path()).await?;
@@ -1581,6 +1588,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_plan_update_persists_status_change() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = tempfile::tempdir()?;
         let proj_dir = crate::test_helpers::tempdir_in_home("harness-exec-test-")?;
         let state = make_test_state_with_plan_db(dir.path()).await?;
@@ -1641,6 +1649,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_plan_survives_simulated_restart() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let data_dir = tempfile::tempdir()?;
         let proj_dir = crate::test_helpers::tempdir_in_home("harness-exec-test-")?;
         let plan_db_path = data_dir.path().join("exec_plans.db");
@@ -1711,6 +1720,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_plan_status_fallback_to_db_when_not_in_memory() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let data_dir = tempfile::tempdir()?;
         let proj_dir = crate::test_helpers::tempdir_in_home("harness-exec-test-")?;
         let plan_db_path = data_dir.path().join("exec_plans.db");

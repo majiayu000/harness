@@ -76,7 +76,7 @@ async fn make_test_state_with(
     );
     let draft_store = harness_gc::DraftStore::new(dir)?;
     let gc_agent = Arc::new(harness_gc::GcAgent::new(
-        harness_core::GcConfig::default(),
+        server.config.gc.clone(),
         signal_detector,
         draft_store,
     ));
