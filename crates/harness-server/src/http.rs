@@ -1343,7 +1343,7 @@ mod startup_tests {
         thread_manager::ThreadManager,
     };
     use harness_agents::AgentRegistry;
-    use harness_core::{HarnessConfig, SkillLocation};
+    use harness_core::{EventFilters, HarnessConfig, RuleId, Severity, SkillLocation, Violation};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -1451,6 +1451,103 @@ mod startup_tests {
             "expected build_app_state to auto-register builtin guard"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_grade_uses_latest_rule_scan_session_for_violation_count() -> anyhow::Result<()>
+    {
+        let _lock = HOME_LOCK.lock().await;
+        let sandbox = tempfile::tempdir()?;
+        let project_root = sandbox.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+        let data_dir = sandbox.path().join("data");
+
+        // Redirect HOME so build_app_state does not read from the real user home.
+        let fake_home = sandbox.path().join("home");
+        std::fs::create_dir_all(&fake_home)?;
+        // SAFETY: HOME_LOCK is held above; HomeGuard::drop restores HOME unconditionally.
+        let _env_guard = unsafe { HomeGuard::set(&fake_home) };
+
+        let mut config = HarnessConfig::default();
+        config.server.project_root = project_root.clone();
+        config.server.data_dir = data_dir;
+        let server = Arc::new(HarnessServer::new(
+            config,
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        ));
+        let state = build_app_state(server).await?;
+
+        // First scan: persist 5 violations (old session — must NOT count at startup).
+        let old_violations: Vec<Violation> = (0..5)
+            .map(|i| Violation {
+                rule_id: RuleId::from_str(&format!("U-{i:02}")),
+                file: std::path::PathBuf::from("src/old.rs"),
+                line: Some(i + 1),
+                message: format!("old violation {i}"),
+                severity: Severity::Low,
+            })
+            .collect();
+        state
+            .observability
+            .events
+            .persist_rule_scan(&project_root, &old_violations)
+            .await;
+
+        // Second scan: persist 2 violations (latest session — must be used for startup grade).
+        let new_violations = vec![
+            Violation {
+                rule_id: RuleId::from_str("SEC-01"),
+                file: std::path::PathBuf::from("src/lib.rs"),
+                line: Some(1),
+                message: "new critical violation".to_string(),
+                severity: Severity::Critical,
+            },
+            Violation {
+                rule_id: RuleId::from_str("SEC-02"),
+                file: std::path::PathBuf::from("src/main.rs"),
+                line: None,
+                message: "another new violation".to_string(),
+                severity: Severity::High,
+            },
+        ];
+        state
+            .observability
+            .events
+            .persist_rule_scan(&project_root, &new_violations)
+            .await;
+
+        // Replicate the exact startup grade logic from serve() (lines 687-697).
+        let events = state
+            .observability
+            .events
+            .query(&EventFilters::default())
+            .await
+            .unwrap_or_default();
+        let violation_count = events
+            .iter()
+            .rev()
+            .find(|e| e.hook == "rule_scan")
+            .map(|scan| {
+                events
+                    .iter()
+                    .filter(|e| e.hook == "rule_check" && e.session_id == scan.session_id)
+                    .count()
+            })
+            .unwrap_or(0);
+
+        // Must count only the latest scan session (2 violations), not historical total (7).
+        assert_eq!(
+            violation_count,
+            new_violations.len(),
+            "startup grade must use latest scan session ({} violations), not historical total ({})",
+            new_violations.len(),
+            old_violations.len() + new_violations.len(),
+        );
+
+        Ok(())
+        // _env_guard dropped here → HOME restored unconditionally
+        // _lock dropped here → next test may proceed
     }
 }
 
