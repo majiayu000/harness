@@ -222,6 +222,48 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn metrics_collect_emits_rule_scan_anchor_event() -> anyhow::Result<()> {
+        // Regression test for issue #82: the handler path must write a
+        // `rule_scan` anchor event so that session-scoped violation counting
+        // in metrics_query works correctly.
+        let project_root = tempdir_in_home("metrics-scan-anchor-root-")?;
+        let data_dir = tempfile::tempdir()?;
+        let state = make_test_state(project_root.path(), data_dir.path()).await?;
+
+        let response = metrics_collect(
+            &state,
+            Some(serde_json::json!(1)),
+            project_root.path().to_path_buf(),
+        )
+        .await;
+
+        assert!(
+            response.error.is_none(),
+            "metrics_collect should succeed: {:?}",
+            response.error
+        );
+
+        let events = state
+            .observability
+            .events
+            .query(&EventFilters {
+                hook: Some("rule_scan".to_string()),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(
+            events.len(),
+            1,
+            "metrics_collect must emit exactly one rule_scan anchor event"
+        );
+        assert_eq!(
+            events[0].hook, "rule_scan",
+            "anchor event hook must be 'rule_scan'"
+        );
+        Ok(())
+    }
 }
 
 pub async fn metrics_query(
