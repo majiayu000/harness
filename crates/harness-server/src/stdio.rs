@@ -86,6 +86,7 @@ pub async fn serve(mut state: AppState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::HOME_LOCK;
     use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
     use harness_agents::AgentRegistry;
     use harness_core::HarnessConfig;
@@ -201,6 +202,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_start_emits_notification() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         let dir = tempfile::tempdir()?;
         let mut state = make_test_state(dir.path()).await?;
 
@@ -240,6 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn turn_start_emits_notification() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         let dir = tempfile::tempdir()?;
         let mut state = make_test_state(dir.path()).await?;
 

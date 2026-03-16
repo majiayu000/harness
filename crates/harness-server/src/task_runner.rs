@@ -751,6 +751,7 @@ pub(crate) async fn mutate_and_persist_with<R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::HOME_LOCK;
     use async_trait::async_trait;
     use harness_core::{
         AgentRequest, AgentResponse, Capability, ContextItem, EventFilters, ExecutionPhase,
@@ -760,6 +761,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_stream_subscribe_and_publish() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
         let id = TaskId("stream-test".to_string());
@@ -799,6 +801,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_stream_backpressure_drops_oldest_on_lag() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
         let id = TaskId("backpressure-test".to_string());
@@ -830,6 +833,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_children_returns_subtasks_for_parent() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
 
@@ -929,6 +933,7 @@ mod tests {
 
     #[tokio::test]
     async fn skills_are_injected_into_agent_context() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
 
@@ -1007,6 +1012,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_interceptor_fails_task() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
         let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
@@ -1251,6 +1257,7 @@ mod tests {
 
     #[tokio::test]
     async fn planning_phase_is_set_on_initial_implementation_turn() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
         let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
@@ -1303,6 +1310,7 @@ mod tests {
 
     #[tokio::test]
     async fn validation_phase_is_set_on_review_loop_turns() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
         let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));

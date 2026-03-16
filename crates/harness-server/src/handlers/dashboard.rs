@@ -117,6 +117,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::HOME_LOCK;
     use crate::{http::build_app_state, server::HarnessServer, thread_manager::ThreadManager};
     use axum::{body::to_bytes, routing::get, Router};
     use harness_agents::AgentRegistry;
@@ -137,6 +138,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_returns_ok_with_expected_shape() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-dashboard-")?;
         let state = make_test_state(dir.path()).await?;
         let state = Arc::new(state);
@@ -170,6 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_global_fields_are_numeric() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-dashboard-")?;
         let state = Arc::new(make_test_state(dir.path()).await?);
 
