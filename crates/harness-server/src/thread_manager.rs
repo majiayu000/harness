@@ -7,7 +7,13 @@ use tracing;
 
 /// In-memory thread registry and turn lifecycle manager.
 ///
-/// `ThreadManager` is a pure in-memory cache. It owns no persistence layer.
+/// `ThreadManager` is a pure in-memory cache with no persistence layer.
+/// It owns only two DashMaps: one for thread state and one for running-turn
+/// task handles.  It intentionally has no `db` field and no async persistence
+/// methods (`open`, `persist`, `persist_insert`, `persist_delete`); those were
+/// removed in issue #97 because they duplicated the write-through logic that
+/// handlers and the task executor perform via `AppState.core.thread_db`.
+///
 /// Thread persistence is handled exclusively by `CoreServices.thread_db`
 /// (`AppState.core.thread_db`).
 ///
