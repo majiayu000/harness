@@ -287,7 +287,6 @@ mod tests {
             discovery_paths = []
 
             [observe]
-            db_path = "."
             session_renewal_secs = 1800
             log_retention_days = 90
 

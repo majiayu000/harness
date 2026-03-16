@@ -157,7 +157,6 @@ total_budget_usd = 5.0
 draft_ttl_hours = 72
 
 [observe]
-db_path = "~/.local/share/harness/harness.db"
 log_retention_days = 90
 
 [otel]

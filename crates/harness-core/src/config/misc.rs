@@ -254,7 +254,6 @@ pub struct RulesConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObserveConfig {
-    pub db_path: PathBuf,
     pub session_renewal_secs: u64,
     pub log_retention_days: u32,
 }
@@ -262,7 +261,6 @@ pub struct ObserveConfig {
 impl Default for ObserveConfig {
     fn default() -> Self {
         Self {
-            db_path: dirs_data_dir().join("harness").join("harness.db"),
             session_renewal_secs: 1800,
             log_retention_days: 90,
         }
