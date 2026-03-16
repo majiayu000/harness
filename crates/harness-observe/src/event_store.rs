@@ -1,14 +1,18 @@
 use chrono::{DateTime, Utc};
+use harness_core::db::{open_pool, Migration, Migrator};
 use harness_core::{
     AutoFixReport, Decision, Event, EventFilters, EventId, ExternalSignal, ExternalSignalId, Grade,
     OtelConfig, SessionId, Severity, Violation,
 };
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::SqlitePool;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-const CREATE_TABLE_SQL: &str = "
-    CREATE TABLE IF NOT EXISTS events (
+/// Versioned migrations for the events table.
+static EVENT_MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    description: "create events table with indexes",
+    sql: "CREATE TABLE IF NOT EXISTS events (
         id          TEXT PRIMARY KEY,
         ts          TEXT NOT NULL,
         session_id  TEXT NOT NULL,
@@ -22,8 +26,8 @@ const CREATE_TABLE_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_events_session_id ON events (session_id);
     CREATE INDEX IF NOT EXISTS idx_events_hook ON events (hook);
     CREATE INDEX IF NOT EXISTS idx_events_decision ON events (decision);
-    CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
-";
+    CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts)",
+}];
 
 /// Event store backed by SQLite (same database as other harness stores).
 ///
@@ -40,26 +44,8 @@ impl EventStore {
     pub async fn new(data_dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let db_path = data_dir.join("events.db");
-        let url = format!("sqlite:{}?mode=rwc", db_path.display());
-        let pool = SqlitePoolOptions::new()
-            .max_connections(8)
-            .acquire_timeout(std::time::Duration::from_secs(10))
-            .connect(&url)
-            .await?;
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA busy_timeout=5000")
-            .execute(&pool)
-            .await?;
-
-        // Run migrations — SQLite requires each statement separately.
-        for stmt in CREATE_TABLE_SQL.split(';') {
-            let stmt = stmt.trim();
-            if !stmt.is_empty() {
-                sqlx::query(stmt).execute(&pool).await?;
-            }
-        }
+        let pool = open_pool(&db_path).await?;
+        Migrator::new(&pool, EVENT_MIGRATIONS).run().await?;
 
         let store = Self {
             pool,
