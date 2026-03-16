@@ -506,6 +506,7 @@ mod tests {
     }
 
     async fn run_gc_adopt_and_wait_for_failure_turn(max_rounds: u32) -> anyhow::Result<u32> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-gc-test-")?;
         let mut config = HarnessConfig::default();
         config.gc.adopt_wait_secs = 0;

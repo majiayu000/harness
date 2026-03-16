@@ -232,6 +232,7 @@ mod tests {
         // Regression test for issue #82: the handler path must write a
         // `rule_scan` anchor event so that session-scoped violation counting
         // in metrics_query works correctly.
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let project_root = tempdir_in_home("metrics-scan-anchor-root-")?;
         let data_dir = tempfile::tempdir()?;
         let state = make_test_state(project_root.path(), data_dir.path()).await?;
