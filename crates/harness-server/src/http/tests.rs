@@ -79,6 +79,7 @@ async fn make_test_state_with(
         server.config.gc.clone(),
         signal_detector,
         draft_store,
+        dir.to_path_buf(),
     ));
     let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
     Ok(Arc::new(AppState {

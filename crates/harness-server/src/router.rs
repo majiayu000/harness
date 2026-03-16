@@ -212,6 +212,7 @@ mod tests {
             server.config.gc.clone(),
             signal_detector,
             draft_store,
+            dir.to_path_buf(),
         ));
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
         let (notification_tx, _) = tokio::sync::broadcast::channel(64);
@@ -1452,6 +1453,7 @@ mod tests {
             server.config.gc.clone(),
             signal_detector,
             draft_store,
+            dir.to_path_buf(),
         ));
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
         let plan_db = crate::plan_db::PlanDb::open(&dir.join("exec_plans.db")).await?;

@@ -2,13 +2,14 @@ use crate::checkpoint::{filter_events_since, GcCheckpoint};
 use crate::draft_store::DraftStore;
 use crate::remediation::signal_priority;
 use crate::signal_detector::SignalDetector;
+use anyhow::Context;
 use chrono::Utc;
 use harness_core::{
     AgentRequest, Artifact, ArtifactType, CodeAgent, Draft, DraftId, DraftStatus, GcConfig,
     Project, RemediationType, Signal, SignalType,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcReport {
@@ -21,16 +22,24 @@ pub struct GcAgent {
     config: GcConfig,
     signal_detector: SignalDetector,
     draft_store: DraftStore,
+    /// Canonical project root used to validate artifact target paths in `adopt`.
+    project_root: PathBuf,
     /// Path to the checkpoint file; `None` disables checkpoint-based scanning.
     checkpoint_path: Option<PathBuf>,
 }
 
 impl GcAgent {
-    pub fn new(config: GcConfig, signal_detector: SignalDetector, draft_store: DraftStore) -> Self {
+    pub fn new(
+        config: GcConfig,
+        signal_detector: SignalDetector,
+        draft_store: DraftStore,
+        project_root: PathBuf,
+    ) -> Self {
         Self {
             config,
             signal_detector,
             draft_store,
+            project_root,
             checkpoint_path: None,
         }
     }
@@ -143,38 +152,33 @@ impl GcAgent {
 
     /// Adopt a draft: write artifacts to disk.
     ///
-    /// All artifact target_paths are validated to be relative (no absolute
-    /// paths or `..` traversal) before any writes occur.
+    /// All artifact target_paths are canonicalized and validated to reside
+    /// within the project root before any writes occur.
     pub fn adopt(&self, draft_id: &DraftId) -> anyhow::Result<()> {
         let mut draft = self
             .draft_store
             .get(draft_id)?
             .ok_or_else(|| anyhow::anyhow!("draft not found"))?;
 
-        // Validate all paths before writing any files
-        for artifact in &draft.artifacts {
-            let path = &artifact.target_path;
-            if path.is_absolute() {
-                anyhow::bail!(
-                    "artifact target_path must be relative, got: {}",
-                    path.display()
-                );
-            }
-            for component in path.components() {
-                if matches!(component, std::path::Component::ParentDir) {
-                    anyhow::bail!(
-                        "artifact target_path must not contain '..': {}",
-                        path.display()
-                    );
-                }
-            }
-        }
+        let canonical_root = self.project_root.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize project root '{}'",
+                self.project_root.display()
+            )
+        })?;
 
-        for artifact in &draft.artifacts {
-            if let Some(parent) = artifact.target_path.parent() {
+        // Validate and resolve all paths before writing any files
+        let resolved: Vec<PathBuf> = draft
+            .artifacts
+            .iter()
+            .map(|a| validate_target_path(&canonical_root, &a.target_path))
+            .collect::<anyhow::Result<_>>()?;
+
+        for (artifact, target) in draft.artifacts.iter().zip(resolved.iter()) {
+            if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&artifact.target_path, &artifact.content)?;
+            std::fs::write(target, &artifact.content)?;
         }
 
         draft.status = DraftStatus::Adopted;
@@ -200,6 +204,69 @@ impl GcAgent {
     pub fn draft_store(&self) -> &DraftStore {
         &self.draft_store
     }
+}
+
+/// Validate and resolve an artifact target path to an absolute path within `project_root`.
+///
+/// Steps:
+/// 1. Make the path absolute by joining it with `project_root` (if relative).
+/// 2. Lexically normalize `.` and `..` components.
+/// 3. Resolve the nearest existing ancestor via `canonicalize` to detect symlink escapes.
+/// 4. Verify the resolved path starts with `project_root`.
+fn validate_target_path(project_root: &Path, target_path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = if target_path.is_absolute() {
+        target_path.to_path_buf()
+    } else {
+        project_root.join(target_path)
+    };
+    let normalized = normalize_path(&absolute);
+    let resolved = resolve_for_boundary_check(&normalized)?;
+
+    if resolved == project_root || resolved.starts_with(project_root) {
+        return Ok(normalized);
+    }
+
+    anyhow::bail!(
+        "resolved path '{}' is outside project root '{}'",
+        resolved.display(),
+        project_root.display()
+    );
+}
+
+/// Lexically normalize a path: collapse `.` and `..` without hitting the filesystem.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if out.file_name().is_some() {
+                    out.pop();
+                }
+            }
+            Component::Normal(seg) => out.push(seg),
+        }
+    }
+    out
+}
+
+/// Walk up from `path` to find the nearest existing ancestor, canonicalize it,
+/// then re-attach the remaining suffix. This allows boundary checks on paths
+/// that do not yet exist on disk.
+fn resolve_for_boundary_check(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut ancestor = path;
+    while !ancestor.exists() {
+        ancestor = ancestor.parent().ok_or_else(|| {
+            anyhow::anyhow!("no existing ancestor found for '{}'", path.display())
+        })?;
+    }
+    let canonical = ancestor.canonicalize()?;
+    let suffix = path
+        .strip_prefix(ancestor)
+        .map_err(|_| anyhow::anyhow!("failed to compute suffix for '{}'", path.display()))?;
+    Ok(canonical.join(suffix))
 }
 
 fn build_prompt(signal: &Signal, project: &Project) -> String {
@@ -375,7 +442,12 @@ mod tests {
             ProjectId::new(),
         );
         let draft_store = DraftStore::new(dir).unwrap();
-        GcAgent::new(GcConfig::default(), signal_detector, draft_store)
+        GcAgent::new(
+            GcConfig::default(),
+            signal_detector,
+            draft_store,
+            dir.to_path_buf(),
+        )
     }
 
     fn test_signal() -> Signal {
@@ -401,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn adopt_rejects_absolute_target_path() {
+    fn adopt_rejects_absolute_path_outside_project_root() {
         let dir = tempfile::tempdir().unwrap();
         let gc = make_test_gc_agent(dir.path());
 
@@ -414,15 +486,27 @@ mod tests {
 
         let err = gc.adopt(&draft.id).unwrap_err();
         assert!(
-            err.to_string().contains("must be relative"),
+            err.to_string().contains("outside project root"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
     fn adopt_rejects_parent_dir_traversal() {
-        let dir = tempfile::tempdir().unwrap();
-        let gc = make_test_gc_agent(dir.path());
+        let sandbox = tempfile::tempdir().unwrap();
+        let project_root = sandbox.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let signal_detector = SignalDetector::new(
+            crate::signal_detector::SignalThresholds::default(),
+            ProjectId::new(),
+        );
+        let draft_store = DraftStore::new(&project_root).unwrap();
+        let gc = GcAgent::new(
+            GcConfig::default(),
+            signal_detector,
+            draft_store,
+            project_root.clone(),
+        );
 
         let draft = test_draft(vec![Artifact {
             artifact_type: ArtifactType::Skill,
@@ -433,9 +517,12 @@ mod tests {
 
         let err = gc.adopt(&draft.id).unwrap_err();
         assert!(
-            err.to_string().contains("must not contain '..'"),
+            err.to_string().contains("outside project root"),
             "unexpected error: {err}"
         );
+        // Verify no file was written outside the project root
+        let escaped = sandbox.path().join("etc/shadow");
+        assert!(!escaped.exists());
     }
 
     #[test]
@@ -445,12 +532,13 @@ mod tests {
 
         let draft = test_draft(vec![Artifact {
             artifact_type: ArtifactType::Guard,
-            target_path: std::path::PathBuf::from(".harness/drafts/test.md"),
+            target_path: std::path::PathBuf::from("subdir/test.md"),
             content: "valid content".into(),
         }]);
         gc.draft_store.save(&draft).unwrap();
 
         gc.adopt(&draft.id).unwrap();
+        assert!(dir.path().join("subdir/test.md").exists());
     }
 
     // --- parse_artifacts tests ---

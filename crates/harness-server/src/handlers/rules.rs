@@ -120,6 +120,7 @@ mod tests {
             server.config.gc.clone(),
             signal_detector,
             draft_store,
+            dir.to_path_buf(),
         ));
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
         let (notification_tx, _) = broadcast::channel(64);
