@@ -1349,7 +1349,7 @@ mod startup_tests {
     #[tokio::test]
     async fn persisted_skills_survive_restart() -> anyhow::Result<()> {
         // Hold the shared HOME_LOCK so no sibling test races on HOME.
-        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let _lock = HOME_LOCK.lock().await;
 
         let sandbox = tempfile::tempdir()?;
         let project_root = sandbox.path().join("project");
@@ -1426,6 +1426,7 @@ mod startup_tests {
 
     #[tokio::test]
     async fn build_app_state_auto_registers_builtin_guard() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
         let sandbox = tempfile::tempdir()?;
         let project_root = sandbox.path().join("project");
         std::fs::create_dir_all(&project_root)?;
