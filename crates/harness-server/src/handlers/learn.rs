@@ -425,4 +425,53 @@ mod tests {
         let skills = parse_skills_from_output("");
         assert!(skills.is_empty());
     }
+
+    #[test]
+    fn detect_category_stability_prefixes() {
+        assert_eq!(detect_category("RS-01"), Category::Stability);
+        assert_eq!(detect_category("GO-02"), Category::Stability);
+        assert_eq!(detect_category("TS-03"), Category::Stability);
+        assert_eq!(detect_category("PY-04"), Category::Stability);
+    }
+
+    #[test]
+    fn detect_category_style_for_unknown_prefix() {
+        assert_eq!(detect_category("LEARN-001"), Category::Style);
+        assert_eq!(detect_category("CUSTOM-99"), Category::Style);
+    }
+
+    #[test]
+    fn validate_skill_name_accepts_valid_names() {
+        assert!(validate_skill_name("my-skill").is_ok());
+        assert!(validate_skill_name("skill_name").is_ok());
+        assert!(validate_skill_name("skill.v2").is_ok());
+        assert!(validate_skill_name("MySkill123").is_ok());
+    }
+
+    #[test]
+    fn validate_skill_name_rejects_empty() {
+        assert!(validate_skill_name("").is_err());
+    }
+
+    #[test]
+    fn validate_skill_name_rejects_path_traversal() {
+        assert!(validate_skill_name("../etc/passwd").is_err());
+        assert!(validate_skill_name("foo/bar").is_err());
+        assert!(validate_skill_name("foo\\bar").is_err());
+    }
+
+    #[test]
+    fn validate_skill_name_rejects_invalid_characters() {
+        assert!(validate_skill_name("skill name").is_err());
+        assert!(validate_skill_name("skill@v1").is_err());
+        assert!(validate_skill_name("skill!").is_err());
+    }
+
+    #[test]
+    fn parse_skills_skips_blocks_with_empty_name_or_content() {
+        // block with empty content after ===
+        let output = "=== skill:  ===\n# Empty name\nSome content.";
+        let skills = parse_skills_from_output(output);
+        assert!(skills.is_empty());
+    }
 }
