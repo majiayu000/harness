@@ -190,7 +190,9 @@ impl AgentAdapter for CodexAdapter {
             Self::send_request(&mut state, "turn/start", json!({ "text": req.prompt })).await?;
             drop(state);
 
-            let _ = tx.send(AgentEvent::TurnStarted).await;
+            if let Err(e) = tx.send(AgentEvent::TurnStarted).await {
+                tracing::debug!("stream channel closed: {e}");
+            }
         }
 
         Ok(())

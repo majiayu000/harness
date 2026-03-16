@@ -229,12 +229,17 @@ mod tests {
             _req: TurnRequest,
             tx: tokio::sync::mpsc::Sender<AgentEvent>,
         ) -> harness_core::Result<()> {
-            let _ = tx.send(AgentEvent::TurnStarted).await;
-            let _ = tx
+            if let Err(e) = tx.send(AgentEvent::TurnStarted).await {
+                tracing::debug!("stream channel closed: {e}");
+            }
+            if let Err(e) = tx
                 .send(AgentEvent::TurnCompleted {
                     output: "mock done".into(),
                 })
-                .await;
+                .await
+            {
+                tracing::debug!("stream channel closed: {e}");
+            }
             Ok(())
         }
 
