@@ -8,16 +8,8 @@ use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager
 use harness_agents::AgentRegistry;
 use harness_core::HarnessConfig;
 
-/// Serialises every test that reads or mutates the process-global `HOME` env
-/// var. Tests that temporarily redirect HOME must hold this lock for their
-/// entire duration so that concurrent tests calling `tempdir_in_home` (which
-/// reads HOME) or `validate_project_root` (which also reads HOME) see a
-/// consistent value.
-pub static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Create a temp directory under a writable base path without mutating
-/// global state (`HOME` env var).  Tries `$HOME` first; falls back to
-/// `$CWD/.harness-test-home` if `$HOME` is not writable.
+/// Create a temp directory under a writable base path.  Tries `$HOME` first;
+/// falls back to `$CWD/.harness-test-home` if `$HOME` is not writable.
 pub fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
     let home = std::env::var("HOME")
         .map(PathBuf::from)

@@ -1337,62 +1337,22 @@ async fn ingest_signal(
 #[cfg(test)]
 mod startup_tests {
     use super::build_app_state;
-    use crate::{server::HarnessServer, test_helpers::HOME_LOCK, thread_manager::ThreadManager};
+    use crate::{server::HarnessServer, thread_manager::ThreadManager};
     use harness_agents::AgentRegistry;
     use harness_core::{HarnessConfig, SkillLocation};
     use std::sync::Arc;
 
-    /// RAII guard that restores `HOME` on drop, **including on panic**.
-    /// Holding a `HomeGuard` while asserting means a failing assert unwinds
-    /// through `Drop`, so the original value is always restored before the
-    /// next test is allowed to run.
-    struct HomeGuard {
-        original: Option<String>,
-    }
-
-    impl HomeGuard {
-        /// Overwrite `HOME` with `path` and return a guard that will undo the
-        /// change when dropped.
-        ///
-        /// # Safety
-        /// The caller must hold `HOME_LOCK` for the lifetime of this guard.
-        /// That serialises all `HOME` mutations so no two guards can overlap.
-        unsafe fn set(path: &std::path::Path) -> Self {
-            let original = std::env::var("HOME").ok();
-            std::env::set_var("HOME", path);
-            HomeGuard { original }
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.original.take() {
-                    Some(h) => std::env::set_var("HOME", h),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-
     #[tokio::test]
     async fn persisted_skills_survive_restart() -> anyhow::Result<()> {
-        // Hold the shared mutex for the entire test so no sibling test races on HOME.
-        let _lock = HOME_LOCK.lock().await;
-
         let sandbox = tempfile::tempdir()?;
         let project_root = sandbox.path().join("project");
         std::fs::create_dir_all(&project_root)?;
         let data_dir = sandbox.path().join("data");
 
-        // Redirect HOME to an empty sandbox directory so that
-        // $HOME/.harness/skills/ cannot shadow the persisted skill under
-        // data_dir, keeping the test isolated from machine state.
-        let fake_home = sandbox.path().join("home");
-        std::fs::create_dir_all(&fake_home)?;
-        // SAFETY: HOME_LOCK is held above; HomeGuard::drop restores HOME
-        // unconditionally, even when an assertion below panics.
-        let _env_guard = unsafe { HomeGuard::set(&fake_home) };
+        // No HOME mutation needed: data_dir/skills is loaded before
+        // $HOME/.harness/skills in the discovery chain and wins deduplication
+        // when both have the same User priority, so the test skill is always
+        // found even on machines that have a real $HOME/.harness/skills/.
 
         let startup = |project_root: &std::path::Path, data_dir: &std::path::Path| {
             let project_root = project_root.to_path_buf();
@@ -1448,8 +1408,6 @@ mod startup_tests {
         }
 
         Ok(())
-        // _env_guard dropped here → HOME restored unconditionally
-        // _lock dropped here → next test may proceed
     }
 
     #[tokio::test]
