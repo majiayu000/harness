@@ -1337,16 +1337,10 @@ async fn ingest_signal(
 #[cfg(test)]
 mod startup_tests {
     use super::build_app_state;
-    use crate::{server::HarnessServer, thread_manager::ThreadManager};
+    use crate::{server::HarnessServer, test_helpers::HOME_LOCK, thread_manager::ThreadManager};
     use harness_agents::AgentRegistry;
     use harness_core::{HarnessConfig, SkillLocation};
     use std::sync::Arc;
-
-    /// Serialises every test that mutates the process-global `HOME` env var.
-    /// `tokio::test` runs tests concurrently in the same process; without this
-    /// lock, two tests calling `set_var("HOME", …)` simultaneously trigger
-    /// undefined behaviour per the `set_var` safety contract.
-    static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// RAII guard that restores `HOME` on drop, **including on panic**.
     /// Holding a `HomeGuard` while asserting means a failing assert unwinds
@@ -1383,7 +1377,7 @@ mod startup_tests {
 
     #[tokio::test]
     async fn persisted_skills_survive_restart() -> anyhow::Result<()> {
-        // Hold the mutex for the entire test so no sibling test races on HOME.
+        // Hold the shared mutex for the entire test so no sibling test races on HOME.
         let _lock = HOME_LOCK.lock().await;
 
         let sandbox = tempfile::tempdir()?;
@@ -1443,12 +1437,12 @@ mod startup_tests {
                 .ok_or_else(|| {
                     anyhow::anyhow!("expected persisted skill to be reloaded after restart")
                 })?;
-            // Confirm the skill came from data_dir/skills/ (System location),
-            // not from $HOME/.harness/skills/ or /etc/harness/skills/.
+            // Skills persisted via store.create() are stored in data_dir/skills/
+            // with SkillLocation::User so they override builtins on reload.
             assert_eq!(
                 reloaded.location,
-                SkillLocation::System,
-                "reloaded skill has location {:?}; expected System (data_dir/skills/)",
+                SkillLocation::User,
+                "reloaded skill has location {:?}; expected User (data_dir/skills/)",
                 reloaded.location
             );
         }

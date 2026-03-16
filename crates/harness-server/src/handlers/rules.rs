@@ -160,10 +160,13 @@ mod tests {
         })
     }
 
-    use crate::test_helpers::tempdir_in_home;
+    use crate::test_helpers::{tempdir_in_home, HOME_LOCK};
 
     #[tokio::test]
     async fn rule_check_returns_warning_when_no_guards_registered() -> anyhow::Result<()> {
+        // Hold HOME_LOCK so that no concurrent test changes $HOME while
+        // validate_project_root reads it.
+        let _lock = HOME_LOCK.lock().await;
         let dir = tempdir_in_home("rule-check-no-guard-")?;
         let state = make_test_state(dir.path()).await?;
         let project_root = dir.path().to_path_buf();
@@ -202,6 +205,9 @@ mod tests {
 
     #[tokio::test]
     async fn rule_check_with_guard_returns_violations() -> anyhow::Result<()> {
+        // Hold HOME_LOCK so that no concurrent test changes $HOME while
+        // validate_project_root reads it.
+        let _lock = HOME_LOCK.lock().await;
         let dir = tempdir_in_home("rule-check-violations-")?;
         let state = make_test_state(dir.path()).await?;
 
