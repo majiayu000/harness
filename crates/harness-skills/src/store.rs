@@ -887,4 +887,34 @@ mod tests {
         assert_eq!(loaded.usage_count, 42);
         assert!(loaded.last_used.is_some());
     }
+
+    #[test]
+    fn persisted_skills_survive_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist_path = dir.path().to_path_buf();
+
+        // Session 1: create a skill (writes to disk via persist_dir).
+        {
+            let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
+            store.create(
+                "my-skill".to_string(),
+                "# My Skill\nDoes stuff.".to_string(),
+            );
+            assert_eq!(store.list().len(), 1);
+        }
+
+        // Session 2: simulate restart — new SkillStore with same persist_dir.
+        // discover() must reload the skill written in session 1.
+        {
+            let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
+            store.load_builtin();
+            store.discover().expect("discover should succeed");
+            let skill = store.get_by_name("my-skill");
+            assert!(
+                skill.is_some(),
+                "persisted skill should survive server restart"
+            );
+            assert_eq!(skill.unwrap().name, "my-skill");
+        }
+    }
 }
