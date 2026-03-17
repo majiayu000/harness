@@ -129,7 +129,181 @@ pub(crate) async fn stream_child_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::{Item, StreamItem};
+    use std::time::Duration;
     use tokio::process::Command;
+    use tokio::time::timeout;
+
+    // ── stream_child_output ──────────────────────────────────────────────────
+
+    /// stream_child_output returns Ok and collects all lines when the child
+    /// exits successfully.
+    #[tokio::test]
+    async fn stream_child_output_collects_all_lines_and_returns_output() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("printf 'line1\\nline2\\nline3\\n'")
+            .stdout(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let result = stream_child_output(&mut child, &tx, "test-agent")
+            .await
+            .expect("stream_child_output should succeed");
+
+        assert!(
+            result.contains("line1") && result.contains("line2") && result.contains("line3"),
+            "returned output must contain all lines, got: {result:?}"
+        );
+
+        // Drain channel to collect all sent items.
+        drop(tx);
+        let mut items = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            items.push(item);
+        }
+
+        let delta_count = items
+            .iter()
+            .filter(|item| matches!(item, StreamItem::MessageDelta { .. }))
+            .count();
+        assert!(
+            delta_count >= 3,
+            "expected at least 3 deltas, got {delta_count}"
+        );
+    }
+
+    /// Every line from the child process becomes a MessageDelta before
+    /// ItemCompleted is emitted.
+    #[tokio::test]
+    async fn stream_child_output_emits_deltas_before_item_completed() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("printf 'alpha\\nbeta\\n'")
+            .stdout(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        stream_child_output(&mut child, &tx, "test-agent")
+            .await
+            .expect("stream_child_output should succeed");
+        drop(tx);
+
+        let mut items = Vec::new();
+        while let Some(item) = rx.recv().await {
+            items.push(item);
+        }
+
+        let first_delta_pos = items
+            .iter()
+            .position(|item| matches!(item, StreamItem::MessageDelta { .. }))
+            .expect("at least one MessageDelta expected");
+        let completed_pos = items
+            .iter()
+            .position(|item| matches!(item, StreamItem::ItemCompleted { .. }))
+            .expect("ItemCompleted expected");
+        assert!(
+            first_delta_pos < completed_pos,
+            "MessageDelta must precede ItemCompleted"
+        );
+    }
+
+    /// The ItemCompleted payload must carry the full accumulated output.
+    #[tokio::test]
+    async fn stream_child_output_item_completed_contains_full_output() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("printf 'hello\\nworld\\n'")
+            .stdout(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        stream_child_output(&mut child, &tx, "test-agent")
+            .await
+            .expect("stream_child_output should succeed");
+        drop(tx);
+
+        let mut items = Vec::new();
+        while let Some(item) = rx.recv().await {
+            items.push(item);
+        }
+
+        let completed = items
+            .iter()
+            .find(|item| matches!(item, StreamItem::ItemCompleted { .. }))
+            .expect("ItemCompleted expected");
+        match completed {
+            StreamItem::ItemCompleted {
+                item: Item::AgentReasoning { content },
+            } => {
+                assert!(
+                    content.contains("hello") && content.contains("world"),
+                    "ItemCompleted content must include all lines, got: {content:?}"
+                );
+            }
+            other => panic!("unexpected ItemCompleted payload: {other:?}"),
+        }
+    }
+
+    /// stream_child_output must return Err when the child exits with a non-zero
+    /// status code.
+    #[tokio::test]
+    async fn stream_child_output_fails_on_nonzero_exit() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 1")
+            .stdout(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = stream_child_output(&mut child, &tx, "test-agent").await;
+        assert!(result.is_err(), "expected Err on non-zero exit");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("test-agent"),
+            "error message must identify the agent, got: {msg}"
+        );
+    }
+
+    /// stream_child_output must propagate a send error when the receiver has
+    /// been dropped before any output arrives.
+    #[tokio::test]
+    async fn stream_child_output_fails_when_channel_closed_before_output() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("printf 'some output\\n'")
+            .stdout(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamItem>(1);
+        drop(rx);
+
+        let result = timeout(
+            Duration::from_secs(5),
+            stream_child_output(&mut child, &tx, "test-agent"),
+        )
+        .await
+        .expect("stream_child_output should not hang");
+
+        assert!(result.is_err(), "expected Err when receiver is dropped");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("stream send failed"),
+            "error must report send failure, got: {msg}"
+        );
+    }
+
+    // ── filter_agent_stderr ──────────────────────────────────────────────────
 
     /// Spawn a child whose stderr contains mixed lines, run filter_agent_stderr,
     /// and verify it completes without panicking (behavioral smoke test).
