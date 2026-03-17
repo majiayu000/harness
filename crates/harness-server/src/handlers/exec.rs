@@ -24,6 +24,10 @@ pub async fn exec_plan_init(
                     format!("failed to persist plan: {e}"),
                 );
             }
+            state
+                .core
+                .plan_cache
+                .insert(plan_id.as_str().to_string(), plan);
             RpcResponse::success(id, serde_json::json!({ "plan_id": plan_id }))
         }
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -35,17 +39,35 @@ pub async fn exec_plan_status(
     id: Option<serde_json::Value>,
     plan_id: ExecPlanId,
 ) -> RpcResponse {
+    // DB is the authoritative source of truth. Always read from it when
+    // available so that a concurrent exec_plan_update that has already
+    // committed to SQLite but has not yet refreshed the cache cannot cause
+    // this handler to return stale status or milestones.
     if let Some(db) = &state.core.plan_db {
         match db.get(&plan_id).await {
-            Ok(Some(plan)) => match serde_json::to_value(&plan) {
-                Ok(v) => RpcResponse::success(id, v),
-                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
-            },
+            Ok(Some(plan)) => {
+                // Keep cache warm for the write path.
+                state
+                    .core
+                    .plan_cache
+                    .insert(plan_id.as_str().to_string(), plan.clone());
+                match serde_json::to_value(&plan) {
+                    Ok(v) => RpcResponse::success(id, v),
+                    Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                }
+            }
             Ok(None) => RpcResponse::error(id, NOT_FOUND, "plan not found"),
             Err(e) => RpcResponse::error(id, INTERNAL_ERROR, format!("db error: {e}")),
         }
     } else {
-        RpcResponse::error(id, NOT_FOUND, "plan not found")
+        // No DB (in-memory-only mode): fall back to cache.
+        match state.core.plan_cache.get(plan_id.as_str()) {
+            Some(plan) => match serde_json::to_value(plan.value()) {
+                Ok(v) => RpcResponse::success(id, v),
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            },
+            None => RpcResponse::error(id, NOT_FOUND, "plan not found"),
+        }
     }
 }
 
@@ -72,6 +94,7 @@ pub async fn exec_plan_update(
         _ => return RpcResponse::error(id, INTERNAL_ERROR, format!("unknown action: {action}")),
     }
 
+    // DB fallback: if plan is not in cache, let update_in_txn load it from DB.
     let result = db
         .update_in_txn(&plan_id, |plan| match action.as_str() {
             "activate" => plan.activate(),
@@ -98,10 +121,17 @@ pub async fn exec_plan_update(
         .await;
 
     match result {
-        Ok(Some(plan)) => match serde_json::to_value(&plan) {
-            Ok(v) => RpcResponse::success(id, v),
-            Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
-        },
+        Ok(Some(plan)) => {
+            // Keep in-memory cache in sync with the persisted state.
+            state
+                .core
+                .plan_cache
+                .insert(plan_id.as_str().to_string(), plan.clone());
+            match serde_json::to_value(&plan) {
+                Ok(v) => RpcResponse::success(id, v),
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
         Ok(None) => RpcResponse::error(id, NOT_FOUND, "plan not found"),
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, format!("db error: {e}")),
     }
