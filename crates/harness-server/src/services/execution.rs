@@ -113,21 +113,21 @@ impl DefaultExecutionService {
         &self,
         project: Option<PathBuf>,
     ) -> Result<Option<PathBuf>, EnqueueTaskError> {
-        let (Some(registry), Some(project_path)) =
-            (self.project_registry.as_ref(), project.clone())
-        else {
-            return Ok(project);
-        };
-        if project_path.is_dir() {
-            return Ok(Some(project_path));
-        }
-        let id = project_path.to_string_lossy();
-        match registry.resolve_path(&id).await {
-            Ok(Some(root)) => Ok(Some(root)),
-            Ok(None) => Err(EnqueueTaskError::BadRequest(format!(
-                "project '{id}' not found in registry and is not a valid directory"
-            ))),
-            Err(e) => Err(EnqueueTaskError::Internal(e.to_string())),
+        match (self.project_registry.as_ref(), project) {
+            (Some(registry), Some(project_path)) => {
+                if project_path.is_dir() {
+                    return Ok(Some(project_path));
+                }
+                let id = project_path.to_string_lossy();
+                match registry.resolve_path(&id).await {
+                    Ok(Some(root)) => Ok(Some(root)),
+                    Ok(None) => Err(EnqueueTaskError::BadRequest(format!(
+                        "project '{id}' not found in registry and is not a valid directory"
+                    ))),
+                    Err(e) => Err(EnqueueTaskError::Internal(e.to_string())),
+                }
+            }
+            (_, project) => Ok(project),
         }
     }
 
