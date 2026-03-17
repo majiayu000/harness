@@ -79,11 +79,11 @@ async fn run_review_for_project(
     project_root: &Path,
     project_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    // Build the hook name scoped to this project so checkpoints are independent.
-    let hook_name = match project_id {
-        Some(id) => format!("periodic_review:{id}"),
-        None => "periodic_review".to_string(),
-    };
+    // Key the checkpoint by canonical repo root so that:
+    // - the same physical repo always maps to one checkpoint regardless of how
+    //   many project IDs point at it, and
+    // - repointing an ID to a new root does not inherit the old root's checkpoint.
+    let hook_name = format!("periodic_review:{}", project_root.to_string_lossy());
 
     // In incremental mode: skip the cycle when no new commits have landed.
     // In full mode: always run.
@@ -181,7 +181,7 @@ async fn build_prompt(
                 ..EventFilters::default()
             })
             .await
-            .unwrap_or_default();
+            .map_err(|e| anyhow::anyhow!("failed to query {hook_name} events: {e}"))?;
         let since_arg = events
             .iter()
             .map(|e| e.ts)
@@ -294,20 +294,21 @@ mod tests {
     }
 
     #[test]
-    fn hook_name_scoped_per_project() {
-        // Verify the hook naming logic used in run_review_for_project.
-        let with_id = match Some("my-project") {
-            Some(id) => format!("periodic_review:{id}"),
-            None => "periodic_review".to_string(),
-        };
-        assert_eq!(with_id, "periodic_review:my-project");
+    fn hook_name_keyed_by_root() {
+        // Verify the hook naming logic used in run_review_for_project:
+        // checkpoint key is derived from the canonical repo root, not the
+        // project ID, so the same physical repo always maps to one checkpoint
+        // regardless of how many IDs point at it.
+        let root_a = std::path::Path::new("/home/user/repo-a");
+        let root_b = std::path::Path::new("/home/user/repo-b");
+        let name_a = format!("periodic_review:{}", root_a.to_string_lossy());
+        let name_b = format!("periodic_review:{}", root_b.to_string_lossy());
+        assert_ne!(name_a, name_b);
+        assert_eq!(name_a, "periodic_review:/home/user/repo-a");
 
-        let without_id: Option<&str> = None;
-        let fallback = match without_id {
-            Some(id) => format!("periodic_review:{id}"),
-            None => "periodic_review".to_string(),
-        };
-        assert_eq!(fallback, "periodic_review");
+        // Same root with different hypothetical IDs must produce the same key.
+        let name_a2 = format!("periodic_review:{}", root_a.to_string_lossy());
+        assert_eq!(name_a, name_a2);
     }
 
     #[test]
