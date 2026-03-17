@@ -1,6 +1,5 @@
 use harness_core::{CodexCloudConfig, HarnessError};
 use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -44,11 +43,7 @@ pub(crate) fn setup_cache_key(cloud: &CodexCloudConfig, project_root: &Path) -> 
     hasher.update(fingerprint.as_bytes());
     let digest = hasher.finalize();
 
-    let mut key = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut key, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    key
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn setup_cache_stamp_path(cloud: &CodexCloudConfig, project_root: &Path) -> PathBuf {
@@ -248,7 +243,7 @@ mod tests {
             .arg("-lc")
             .arg("exit 0")
             .output()
-            .expect("status command should run")
+            .unwrap_or_else(|e| panic!("status command should run: {e}"))
             .status
     }
 
@@ -338,5 +333,115 @@ mod tests {
 
         let summary = command_output_summary(&output, &[]);
         assert_eq!(summary.len(), 512);
+    }
+
+    #[test]
+    fn validate_setup_command_accepts_simple_command() {
+        assert!(validate_setup_command("npm ci").is_ok());
+        assert!(validate_setup_command("cargo fetch").is_ok());
+        assert!(validate_setup_command("pip install -r requirements.txt").is_ok());
+    }
+
+    #[test]
+    fn validate_setup_command_accepts_output_redirection() {
+        assert!(validate_setup_command("npm ci > /dev/null").is_ok());
+        assert!(validate_setup_command("cargo fetch 2>/dev/null").is_ok());
+    }
+
+    #[test]
+    fn validate_setup_command_rejects_command_chaining() {
+        assert!(validate_setup_command("npm ci && rm -rf /").is_err());
+        assert!(validate_setup_command("npm ci; echo pwned").is_err());
+        assert!(validate_setup_command("npm ci || echo fallback").is_err());
+    }
+
+    #[test]
+    fn validate_setup_command_rejects_background_execution() {
+        assert!(validate_setup_command("npm ci &").is_err());
+    }
+
+    #[test]
+    fn setup_cache_key_changes_when_project_root_changes() {
+        let cloud = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: vec!["npm ci".to_string()],
+            setup_secret_env: vec!["NPM_TOKEN".to_string()],
+        };
+
+        let key_a = setup_cache_key(&cloud, Path::new("/tmp/project-a"));
+        let key_b = setup_cache_key(&cloud, Path::new("/tmp/project-b"));
+
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn setup_cache_key_changes_when_secret_env_changes() {
+        let project_root = Path::new("/tmp/project");
+        let with_token = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: vec!["npm ci".to_string()],
+            setup_secret_env: vec!["NPM_TOKEN".to_string()],
+        };
+        let without_token = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: vec!["npm ci".to_string()],
+            setup_secret_env: Vec::new(),
+        };
+
+        assert_ne!(
+            setup_cache_key(&with_token, project_root),
+            setup_cache_key(&without_token, project_root)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_setup_phase_noop_when_cloud_disabled() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("should-not-exist.txt");
+        let setup = format!("touch \"{}\"", marker.display());
+
+        let cloud = CodexCloudConfig {
+            enabled: false,
+            cache_ttl_hours: 12,
+            setup_commands: vec![setup],
+            setup_secret_env: Vec::new(),
+        };
+
+        run_setup_phase(&cloud, dir.path()).await?;
+
+        assert!(!marker.exists(), "setup command must not run when disabled");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_setup_phase_noop_when_no_commands() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cloud = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: Vec::new(),
+            setup_secret_env: Vec::new(),
+        };
+
+        run_setup_phase(&cloud, dir.path()).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_setup_phase_rejects_chaining_command() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cloud = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: vec!["npm ci && echo pwned".to_string()],
+            setup_secret_env: Vec::new(),
+        };
+
+        let result = run_setup_phase(&cloud, dir.path()).await;
+        assert!(result.is_err(), "chaining command must be rejected");
+        Ok(())
     }
 }
