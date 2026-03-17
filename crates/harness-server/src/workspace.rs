@@ -45,9 +45,23 @@ impl WorkspaceManager {
             anyhow::bail!("invalid remote: {remote:?}");
         }
 
-        // Idempotent: use entry API to avoid TOCTOU race between get and insert.
-        if let Some(entry) = self.active.get(task_id) {
-            return Ok(entry.workspace_path.clone());
+        let sanitized = sanitize_task_id(&task_id.0);
+        let workspace_path = self.config.root.join(&sanitized);
+
+        // Atomic check-and-insert: prevents TOCTOU where two concurrent calls for the
+        // same task_id would both attempt git worktree add on the same path.
+        // Insert a placeholder immediately so any concurrent caller returns early.
+        {
+            use dashmap::mapref::entry::Entry;
+            match self.active.entry(task_id.clone()) {
+                Entry::Occupied(e) => return Ok(e.get().workspace_path.clone()),
+                Entry::Vacant(e) => {
+                    e.insert(ActiveWorkspace {
+                        workspace_path: workspace_path.clone(),
+                        source_repo: source_repo.to_path_buf(),
+                    });
+                }
+            }
         }
 
         // Fetch latest base_branch from remote so the worktree starts from upstream HEAD.
@@ -69,9 +83,6 @@ impl WorkspaceManager {
                 stderr.trim()
             );
         }
-
-        let sanitized = sanitize_task_id(&task_id.0);
-        let workspace_path = self.config.root.join(&sanitized);
 
         // Create git worktree based on remote/base_branch (latest upstream).
         // Falls back to local base_branch if fetch failed above.
@@ -108,6 +119,7 @@ impl WorkspaceManager {
                 .await?;
 
             if !fallback.status.success() {
+                self.active.remove(task_id);
                 let stderr = String::from_utf8_lossy(&fallback.stderr);
                 anyhow::bail!(
                     "git worktree add failed for task {}: {}",
@@ -132,6 +144,7 @@ impl WorkspaceManager {
             };
 
             if let Some(err_msg) = hook_error {
+                self.active.remove(task_id);
                 if let Err(cleanup_err) = remove_worktree(source_repo, &workspace_path).await {
                     tracing::warn!(
                         "failed to cleanup partial worktree after hook failure: {cleanup_err}"
@@ -141,13 +154,6 @@ impl WorkspaceManager {
             }
         }
 
-        self.active.insert(
-            task_id.clone(),
-            ActiveWorkspace {
-                workspace_path: workspace_path.clone(),
-                source_repo: source_repo.to_path_buf(),
-            },
-        );
         Ok(workspace_path)
     }
 
@@ -201,6 +207,53 @@ impl WorkspaceManager {
             }
         }
         Ok(())
+    }
+
+    /// Scan `config.root` for worktree directories and remove any that correspond to
+    /// terminal (Done/Failed) task IDs and are not currently tracked as active.
+    /// This cleans up orphaned worktrees left behind by a previous server crash.
+    ///
+    /// Errors from individual removals are logged and do not abort the sweep.
+    pub async fn cleanup_orphan_worktrees(&self, source_repo: &Path, terminal_task_ids: &[TaskId]) {
+        let terminal_dirs: std::collections::HashSet<String> = terminal_task_ids
+            .iter()
+            .map(|id| sanitize_task_id(&id.0))
+            .collect();
+
+        let read_dir = match std::fs::read_dir(&self.config.root) {
+            Ok(rd) => rd,
+            Err(e) => {
+                tracing::warn!(
+                    "cleanup_orphan_worktrees: failed to read workspace root {:?}: {e}",
+                    self.config.root
+                );
+                return;
+            }
+        };
+
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if !terminal_dirs.contains(&dir_name) {
+                continue;
+            }
+            if self.active.iter().any(|e| e.workspace_path == path) {
+                continue;
+            }
+            tracing::info!(
+                "cleanup_orphan_worktrees: removing orphan worktree {:?}",
+                path
+            );
+            if let Err(e) = remove_worktree(source_repo, &path).await {
+                tracing::warn!("cleanup_orphan_worktrees: failed to remove {:?}: {e}", path);
+            }
+        }
     }
 }
 
