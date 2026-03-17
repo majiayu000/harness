@@ -406,7 +406,7 @@ pub fn sibling_task_context(siblings: &[SiblingTask]) -> String {
     let mut desc_lines: Vec<String> = Vec::with_capacity(siblings.len());
     for s in siblings {
         match s.issue {
-            Some(n) => desc_lines.push(format!("#{n}: {}", s.description)),
+            Some(n) => desc_lines.push(format!("- #{n}: {}", s.description)),
             None => desc_lines.push(format!("- {}", s.description)),
         }
     }

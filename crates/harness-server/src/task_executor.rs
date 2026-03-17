@@ -346,15 +346,16 @@ pub(crate) async fn run_task(
             let sibling_tasks: Vec<prompts::SiblingTask> = siblings
                 .into_iter()
                 .filter_map(|s| {
-                    let description = s.description.unwrap_or_else(|| "unknown task".to_string());
-                    if description.is_empty() {
-                        None
-                    } else {
-                        Some(prompts::SiblingTask {
-                            issue: s.issue,
-                            description,
-                        })
-                    }
+                    s.description.and_then(|description| {
+                        if description.is_empty() {
+                            None
+                        } else {
+                            Some(prompts::SiblingTask {
+                                issue: s.issue,
+                                description,
+                            })
+                        }
+                    })
                 })
                 .collect();
             let ctx = prompts::sibling_task_context(&sibling_tasks);

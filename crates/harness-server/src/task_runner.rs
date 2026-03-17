@@ -649,9 +649,17 @@ where
                     if !siblings.is_empty() {
                         let sibling_tasks: Vec<harness_core::prompts::SiblingTask> = siblings
                             .into_iter()
-                            .map(|s| harness_core::prompts::SiblingTask {
-                                issue: s.issue,
-                                description: s.description.unwrap_or_default(),
+                            .filter_map(|s| {
+                                s.description.and_then(|description| {
+                                    if description.is_empty() {
+                                        None
+                                    } else {
+                                        Some(harness_core::prompts::SiblingTask {
+                                            issue: s.issue,
+                                            description,
+                                        })
+                                    }
+                                })
                             })
                             .collect();
                         let ctx = harness_core::prompts::sibling_task_context(&sibling_tasks);
@@ -994,9 +1002,9 @@ mod tests {
             .iter()
             .all(|s| s.project_root.as_deref() == Some(project.as_path())));
 
-        // No siblings when no other active tasks share the project.
-        let no_siblings = store.list_siblings(&other_project, &current_id);
-        assert_eq!(no_siblings.len(), 1);
+        // One sibling on `other_project`.
+        let other_project_siblings = store.list_siblings(&other_project, &current_id);
+        assert_eq!(other_project_siblings.len(), 1);
 
         Ok(())
     }
