@@ -171,7 +171,10 @@ pub fn default_pre_commit_commands(lang: Language, project_root: &Path) -> Vec<S
             }
             cmds
         }
-        Language::Python => vec!["ruff format .".to_string(), "ruff check .".to_string()],
+        Language::Python => vec![
+            "ruff format --check .".to_string(),
+            "ruff check .".to_string(),
+        ],
         Language::Java => {
             if is_gradle_project(project_root) {
                 vec!["./gradlew check".to_string()]
@@ -179,7 +182,10 @@ pub fn default_pre_commit_commands(lang: Language, project_root: &Path) -> Vec<S
                 vec!["mvn compile -B".to_string()]
             }
         }
-        Language::CSharp => vec!["dotnet format".to_string(), "dotnet build".to_string()],
+        Language::CSharp => vec![
+            "dotnet format --verify-no-changes".to_string(),
+            "dotnet build".to_string(),
+        ],
         Language::Ruby => {
             if has_rubocop_config(project_root) {
                 vec!["bundle exec rubocop".to_string()]
@@ -474,7 +480,7 @@ mod tests {
     fn python_pre_commit_includes_ruff_format_and_check() {
         let dir = tmpdir();
         let cmds = default_pre_commit_commands(Language::Python, dir.path());
-        assert!(cmds.iter().any(|c| c == "ruff format ."));
+        assert!(cmds.iter().any(|c| c == "ruff format --check ."));
         assert!(cmds.iter().any(|c| c == "ruff check ."));
     }
 
@@ -517,7 +523,10 @@ mod tests {
     fn csharp_pre_commit_commands() {
         let dir = tmpdir();
         let cmds = default_pre_commit_commands(Language::CSharp, dir.path());
-        assert_eq!(cmds, vec!["dotnet format", "dotnet build"]);
+        assert_eq!(
+            cmds,
+            vec!["dotnet format --verify-no-changes", "dotnet build"]
+        );
     }
 
     #[test]
