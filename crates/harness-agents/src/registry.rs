@@ -195,6 +195,54 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_critical_task_prefers_claude() {
+        let mut registry = registry_with_default();
+        registry.register(
+            "claude",
+            Arc::new(StubAgent {
+                agent_name: "claude",
+            }),
+        );
+
+        let agent = registry
+            .dispatch(&classification(TaskComplexity::Critical))
+            .unwrap();
+        assert_eq!(agent.name(), "claude");
+    }
+
+    #[test]
+    fn dispatch_critical_task_falls_back_to_anthropic_api_when_no_claude() {
+        let mut registry = registry_with_default();
+        registry.register(
+            "anthropic-api",
+            Arc::new(StubAgent {
+                agent_name: "anthropic-api",
+            }),
+        );
+
+        let agent = registry
+            .dispatch(&classification(TaskComplexity::Critical))
+            .unwrap();
+        assert_eq!(agent.name(), "anthropic-api");
+    }
+
+    #[test]
+    fn dispatch_medium_task_uses_default_agent() {
+        let mut registry = registry_with_default();
+        registry.register(
+            "claude",
+            Arc::new(StubAgent {
+                agent_name: "claude",
+            }),
+        );
+
+        let agent = registry
+            .dispatch(&classification(TaskComplexity::Medium))
+            .unwrap();
+        assert_eq!(agent.name(), "default-agent");
+    }
+
+    #[test]
     fn dispatch_returns_error_when_no_agents_registered() {
         let registry = AgentRegistry::new("missing");
         let result = registry.dispatch(&classification(TaskComplexity::Simple));
