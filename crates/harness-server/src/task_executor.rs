@@ -318,10 +318,11 @@ pub(crate) async fn run_task(
             .and_then(|s| s.project_root.clone())
             .unwrap_or_else(|| project.clone());
         let siblings: Vec<prompts::SiblingTask> = store
-            .list_all()
-            .into_iter()
-            .filter(|t| {
-                t.id != *task_id
+            .cache
+            .iter()
+            .filter_map(|entry| {
+                let t = entry.value();
+                if t.id != *task_id
                     && matches!(
                         t.status,
                         TaskStatus::Implementing
@@ -331,8 +332,12 @@ pub(crate) async fn run_task(
                             | TaskStatus::Reviewing
                     )
                     && t.project_root.as_deref() == Some(canonical_project.as_path())
+                {
+                    Some(prompts::SiblingTask { issue: t.issue })
+                } else {
+                    None
+                }
             })
-            .map(|t| prompts::SiblingTask { issue: t.issue })
             .collect();
         let ctx = prompts::sibling_task_context(&siblings);
         if ctx.is_empty() {
@@ -784,10 +789,11 @@ async fn run_agent_review(
                 .and_then(|s| s.project_root.clone())
                 .unwrap_or_else(|| project.to_path_buf());
             let siblings: Vec<prompts::SiblingTask> = store
-                .list_all()
-                .into_iter()
-                .filter(|t| {
-                    t.id != *task_id
+                .cache
+                .iter()
+                .filter_map(|entry| {
+                    let t = entry.value();
+                    if t.id != *task_id
                         && matches!(
                             t.status,
                             TaskStatus::Implementing
@@ -797,8 +803,12 @@ async fn run_agent_review(
                                 | TaskStatus::Reviewing
                         )
                         && t.project_root.as_deref() == Some(canonical_project.as_path())
+                    {
+                        Some(prompts::SiblingTask { issue: t.issue })
+                    } else {
+                        None
+                    }
                 })
-                .map(|t| prompts::SiblingTask { issue: t.issue })
                 .collect();
             let ctx = prompts::sibling_task_context(&siblings);
             if ctx.is_empty() {
