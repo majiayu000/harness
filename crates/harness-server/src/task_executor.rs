@@ -327,6 +327,25 @@ pub(crate) async fn run_task(
         first_prompt
     };
 
+    // Inject sibling-awareness context when other agents are working on the same project.
+    // This prevents parallel agents from over-scoping their changes into each other's files.
+    let first_prompt = {
+        let siblings = store.list_siblings(&project, task_id);
+        if siblings.is_empty() {
+            first_prompt
+        } else {
+            let sibling_tasks: Vec<prompts::SiblingTask> = siblings
+                .into_iter()
+                .map(|s| prompts::SiblingTask {
+                    issue: s.issue,
+                    description: s.description.unwrap_or_else(|| "unknown task".to_string()),
+                })
+                .collect();
+            let ctx = prompts::sibling_task_context(&sibling_tasks);
+            format!("{first_prompt}\n\n{ctx}")
+        }
+    };
+
     let context_items = collect_context_items(&skills, &project, &first_prompt).await;
 
     let turn_timeout = Duration::from_secs(req.turn_timeout_secs);

@@ -381,6 +381,40 @@ pub fn is_waiting(output: &str) -> bool {
     last_non_empty_line(output) == Some("WAITING")
 }
 
+/// Describes a sibling task running in parallel on the same project.
+///
+/// Used by [`sibling_task_context`] to build a constraint block for the agent.
+pub struct SiblingTask {
+    /// GitHub issue number, if this is an issue-based task.
+    pub issue: Option<u64>,
+    /// Short description of what the sibling task is implementing.
+    pub description: String,
+}
+
+/// Build a warning block telling the agent which issues other parallel agents are handling.
+///
+/// When `siblings` is empty, returns an empty string so callers can skip appending it.
+/// The block instructs the agent to stay in its lane and avoid modifying files owned by
+/// siblings, which reduces cross-agent merge conflicts in parallel dispatch scenarios.
+pub fn sibling_task_context(siblings: &[SiblingTask]) -> String {
+    if siblings.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![
+        "\u{26a0}\u{fe0f}  The following issues are being handled by OTHER agents in parallel on this same project.".to_string(),
+        "Do NOT modify files related to these issues — another agent is responsible:".to_string(),
+    ];
+    for s in siblings {
+        match s.issue {
+            Some(n) => lines.push(format!("- #{n}: {}", s.description)),
+            None => lines.push(format!("- {}", s.description)),
+        }
+    }
+    lines.push(String::new());
+    lines.push("Only modify files directly needed for YOUR assigned task.".to_string());
+    lines.join("\n")
+}
+
 /// Wrap `s` in POSIX single quotes, escaping any embedded single quotes via `'\''`.
 ///
 /// This ensures the value is treated as literal data by the shell and cannot
@@ -874,5 +908,40 @@ PR_URL=https://github.com/owner/repo/pull/269";
             parse_github_pr_url("https://github.com/owner/repo/pull/abc"),
             None
         );
+    }
+
+    #[test]
+    fn test_sibling_task_context_empty() {
+        assert_eq!(sibling_task_context(&[]), String::new());
+    }
+
+    #[test]
+    fn test_sibling_task_context_with_issue_siblings() {
+        let siblings = vec![
+            SiblingTask {
+                issue: Some(77),
+                description: "fix Mistral transform_request unwrap".to_string(),
+            },
+            SiblingTask {
+                issue: Some(78),
+                description: "fix Vertex AI unwrap".to_string(),
+            },
+        ];
+        let ctx = sibling_task_context(&siblings);
+        assert!(ctx.contains("#77: fix Mistral transform_request unwrap"));
+        assert!(ctx.contains("#78: fix Vertex AI unwrap"));
+        assert!(ctx.contains("OTHER agents"));
+        assert!(ctx.contains("Only modify files directly needed for YOUR assigned task."));
+    }
+
+    #[test]
+    fn test_sibling_task_context_without_issue_number() {
+        let siblings = vec![SiblingTask {
+            issue: None,
+            description: "refactor auth middleware".to_string(),
+        }];
+        let ctx = sibling_task_context(&siblings);
+        assert!(ctx.contains("- refactor auth middleware"));
+        assert!(!ctx.contains('#'));
     }
 }
