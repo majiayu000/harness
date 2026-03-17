@@ -99,6 +99,9 @@ pub struct NotificationServices {
     pub notification_lag_log_every: u64,
     /// Channel for server-push JSON-RPC notifications (stdio transport only).
     pub notify_tx: Option<crate::notify::NotifySender>,
+    /// Whether `initialize` has been received (but `initialized` may not yet be set).
+    /// Used to enforce the `initialize` → `initialized` ordering.
+    pub initializing: Arc<AtomicBool>,
     /// Whether the client has completed the initialize/initialized handshake.
     pub initialized: Arc<AtomicBool>,
     /// Broadcast channel used to signal all active WebSocket connections to close gracefully.
@@ -481,6 +484,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             notification_lagged_total: Arc::new(AtomicU64::new(0)),
             notification_lag_log_every,
             notify_tx: None,
+            initializing: Arc::new(AtomicBool::new(false)),
             initialized: Arc::new(AtomicBool::new(false)),
             ws_shutdown_tx: broadcast::channel(1).0,
         },
