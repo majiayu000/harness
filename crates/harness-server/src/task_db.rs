@@ -112,6 +112,20 @@ impl TaskDb {
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 
+    /// Mark all in-progress (non-terminal) tasks as Failed with a restart-recovery error.
+    /// Returns the number of tasks recovered.
+    pub async fn recover_in_progress(&self) -> anyhow::Result<u32> {
+        let result = sqlx::query(
+            "UPDATE tasks SET status = 'failed', \
+             error = 'recovered after server restart', \
+             updated_at = datetime('now') \
+             WHERE status NOT IN ('done', 'failed')",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() as u32)
+    }
+
     /// Return the `pr_url` of the most recently completed Done task that has one, or `None`.
     /// Orders by `updated_at DESC` because `updated_at` is written when the task transitions
     /// to Done, which correctly reflects completion time rather than creation time.
@@ -433,6 +447,38 @@ mod tests {
 
         let no_children = db.list_children("nonexistent").await?;
         assert!(no_children.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_marks_non_terminal_tasks_failed() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("t-pending", TaskStatus::Pending))
+            .await?;
+        db.insert(&make_task("t-implementing", TaskStatus::Implementing))
+            .await?;
+        db.insert(&make_task("t-waiting", TaskStatus::Waiting))
+            .await?;
+        db.insert(&make_task("t-done", TaskStatus::Done)).await?;
+        db.insert(&make_task("t-failed", TaskStatus::Failed))
+            .await?;
+
+        let recovered = db.recover_in_progress().await?;
+        assert_eq!(recovered, 3, "should recover 3 in-progress tasks");
+
+        let pending = db.get("t-pending").await?.expect("should exist");
+        assert!(matches!(pending.status, TaskStatus::Failed));
+        assert_eq!(
+            pending.error.as_deref(),
+            Some("recovered after server restart")
+        );
+
+        let done = db.get("t-done").await?.expect("should exist");
+        assert!(matches!(done.status, TaskStatus::Done));
+        let failed = db.get("t-failed").await?.expect("should exist");
+        assert!(matches!(failed.status, TaskStatus::Failed));
         Ok(())
     }
 

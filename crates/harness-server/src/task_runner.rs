@@ -310,11 +310,14 @@ async fn record_task_failure(
     reason: String,
 ) {
     log_task_failure_event(events, task_id, &reason).await;
-    mutate_and_persist(store, task_id, |s| {
+    if let Err(e) = mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Failed;
         s.error = Some(reason);
     })
-    .await;
+    .await
+    {
+        tracing::error!("failed to persist task failure for {task_id:?}: {e}");
+    }
 }
 
 /// In-memory cache + SQLite persistence.
@@ -329,6 +332,14 @@ pub struct TaskStore {
 impl TaskStore {
     pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
         let db = TaskDb::open(db_path).await?;
+        let recovered = db.recover_in_progress().await?;
+        if recovered > 0 {
+            tracing::warn!(
+                recovered,
+                "startup recovery: marked {} in-progress task(s) as failed",
+                recovered
+            );
+        }
         let cache = DashMap::new();
         let persist_locks = DashMap::new();
         for task in db.list().await? {
@@ -416,7 +427,7 @@ impl TaskStore {
         }
     }
 
-    pub(crate) async fn persist(&self, id: &TaskId) {
+    pub(crate) async fn persist(&self, id: &TaskId) -> anyhow::Result<()> {
         let lock = self
             .persist_locks
             .entry(id.clone())
@@ -426,10 +437,9 @@ impl TaskStore {
 
         let snapshot = self.cache.get(id).map(|state| state.value().clone());
         if let Some(state) = snapshot {
-            if let Err(e) = self.db.update(&state).await {
-                tracing::error!("task_db update failed: {e}");
-            }
+            self.db.update(&state).await?;
         }
+        Ok(())
     }
 }
 
@@ -587,7 +597,7 @@ where
                     mutate_and_persist(&store, &id, |s| {
                         s.subtask_ids = sub_ids.clone();
                     })
-                    .await;
+                    .await?;
 
                     let context_items = crate::task_executor::collect_context_items(
                         &skills,
@@ -631,7 +641,7 @@ where
                             s.error = Some("all parallel subtasks failed".to_string());
                         }
                     })
-                    .await;
+                    .await?;
                     return Ok(());
                 }
             }
@@ -711,12 +721,12 @@ pub(crate) async fn update_status(
     task_id: &TaskId,
     status: TaskStatus,
     turn: u32,
-) {
+) -> anyhow::Result<()> {
     mutate_and_persist(store, task_id, |s| {
         s.status = status;
         s.turn = turn;
     })
-    .await;
+    .await
 }
 
 /// Mutate a task in the cache then persist to SQLite.
@@ -724,11 +734,11 @@ pub(crate) async fn mutate_and_persist(
     store: &TaskStore,
     id: &TaskId,
     f: impl FnOnce(&mut TaskState),
-) {
+) -> anyhow::Result<()> {
     if let Some(mut entry) = store.cache.get_mut(id) {
         f(entry.value_mut());
     }
-    store.persist(id).await;
+    store.persist(id).await
 }
 
 #[cfg(test)]

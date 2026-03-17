@@ -278,11 +278,18 @@ async fn enqueue_task_background(
                 }
                 Err(e) => {
                     // Queue is full; mark the pre-registered task as failed.
-                    task_runner::mutate_and_persist(&state.core.tasks, &task_id2, |s| {
-                        s.status = task_runner::TaskStatus::Failed;
-                        s.error = Some(format!("task queue full: {e}"));
-                    })
-                    .await;
+                    if let Err(persist_err) =
+                        task_runner::mutate_and_persist(&state.core.tasks, &task_id2, |s| {
+                            s.status = task_runner::TaskStatus::Failed;
+                            s.error = Some(format!("task queue full: {e}"));
+                        })
+                        .await
+                    {
+                        tracing::error!(
+                            task_id = %task_id2.0,
+                            "failed to persist task failure after queue full: {persist_err}"
+                        );
+                    }
                     state.core.tasks.close_task_stream(&task_id2);
                 }
             }
