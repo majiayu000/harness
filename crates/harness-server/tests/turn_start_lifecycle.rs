@@ -297,3 +297,80 @@ async fn running_to_cancelled_stops_turn() -> anyhow::Result<()> {
     assert_eq!(cancelled.status, TurnStatus::Cancelled);
     Ok(())
 }
+
+/// When the configured default agent is not registered in the registry,
+/// `run_turn_lifecycle` immediately marks the turn as Failed and records
+/// an Error item containing the missing agent name.
+#[tokio::test]
+async fn turn_fails_when_agent_not_registered() -> anyhow::Result<()> {
+    let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
+    let project_root = sandbox.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+
+    let mut config = HarnessConfig::default();
+    config.server.data_dir = sandbox.path().join("server-data");
+    config.server.project_root = project_root.clone();
+    // "ghost" is the configured default agent but is never registered.
+    config.agents.default_agent = "ghost".to_string();
+
+    let registry = AgentRegistry::new("ghost");
+    let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+    let state = build_app_state(server).await?;
+
+    let (_, turn_id) =
+        start_thread_and_turn(&state, project_root, "do work with ghost agent").await?;
+
+    let failed =
+        wait_for_status(&state, &turn_id, TurnStatus::Failed, Duration::from_secs(3)).await?;
+    // The agent-not-found path must append an Item::Error naming the missing agent.
+    assert!(
+        failed.items.iter().any(|item| matches!(
+            item,
+            Item::Error { message, .. } if message.contains("ghost")
+        )),
+        "failed turn should contain an Item::Error mentioning the missing agent name"
+    );
+    Ok(())
+}
+
+/// When the agent blocks indefinitely without emitting any stream items,
+/// the stall detection in `run_turn_lifecycle` fires after `stall_timeout_secs`
+/// and transitions the turn to Failed.
+#[tokio::test]
+async fn turn_fails_on_stall_timeout() -> anyhow::Result<()> {
+    let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
+    let project_root = sandbox.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+
+    let mut config = HarnessConfig::default();
+    config.server.data_dir = sandbox.path().join("server-data");
+    config.server.project_root = project_root.clone();
+    config.agents.default_agent = "mock".to_string();
+    // Use a very short stall timeout so the test completes quickly.
+    config.concurrency.stall_timeout_secs = 1;
+
+    let mut registry = AgentRegistry::new("mock");
+    registry.register("mock", MockAgent::block_forever());
+
+    let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+    let state = build_app_state(server).await?;
+
+    let (_, turn_id) = start_thread_and_turn(&state, project_root, "slow task that stalls").await?;
+
+    let running = fetch_turn(&state, &turn_id).await?;
+    assert_eq!(running.status, TurnStatus::Running);
+
+    // Allow 5s for the 1s stall to fire and persist the Failed state.
+    let failed =
+        wait_for_status(&state, &turn_id, TurnStatus::Failed, Duration::from_secs(5)).await?;
+    // The stall-detection path must append an Item::Error with the stall-specific reason,
+    // not merely a generic fallback message.
+    assert!(
+        failed.items.iter().any(|item| matches!(
+            item,
+            Item::Error { message, .. } if message.contains("stalled") || message.contains("no output for")
+        )),
+        "stall-timed-out turn should include an Item::Error from stall detection"
+    );
+    Ok(())
+}
