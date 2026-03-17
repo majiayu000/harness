@@ -199,20 +199,31 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// RAII guard that sets one or more env vars under the shared env lock and
+    /// restores them on drop (including on panic).  All keys are set atomically
+    /// while holding the lock, eliminating re-entrant lock attempts.
     struct ScopedEnvVar {
-        key: String,
-        original: Option<String>,
+        entries: Vec<(String, Option<String>)>,
         _guard: MutexGuard<'static, ()>,
     }
 
     impl ScopedEnvVar {
         fn set(key: &str, value: &str) -> Self {
+            Self::set_pairs(&[(key, value)])
+        }
+
+        fn set_pairs(pairs: &[(&str, &str)]) -> Self {
             let guard = env_lock().lock().expect("env lock should not be poisoned");
-            let original = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
+            let entries = pairs
+                .iter()
+                .map(|(key, value)| {
+                    let original = std::env::var(key).ok();
+                    unsafe { std::env::set_var(key, value) };
+                    (key.to_string(), original)
+                })
+                .collect();
             Self {
-                key: key.to_string(),
-                original,
+                entries,
                 _guard: guard,
             }
         }
@@ -220,10 +231,12 @@ mod tests {
 
     impl Drop for ScopedEnvVar {
         fn drop(&mut self) {
-            if let Some(value) = &self.original {
-                unsafe { std::env::set_var(&self.key, value) };
-            } else {
-                unsafe { std::env::remove_var(&self.key) };
+            for (key, original) in &self.entries {
+                if let Some(value) = original {
+                    unsafe { std::env::set_var(key, value) };
+                } else {
+                    unsafe { std::env::remove_var(key) };
+                }
             }
         }
     }
@@ -565,10 +578,10 @@ printf 'third\n'
 
     #[tokio::test]
     async fn execute_removes_claude_code_env_vars() -> anyhow::Result<()> {
-        // Use a single ScopedEnvVar to hold the env lock; set both vars while
-        // the lock is already held to avoid a re-entrant deadlock.
-        let _guard = ScopedEnvVar::set("CLAUDECODE", "1");
-        unsafe { std::env::set_var("CLAUDE_CODE_ENTRYPOINT", "claude-code") };
+        let _guard = ScopedEnvVar::set_pairs(&[
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_ENTRYPOINT", "claude-code"),
+        ]);
 
         let dir = tempdir()?;
         let agent_capture = dir.path().join("agent-env.txt");
@@ -594,8 +607,6 @@ printf 'third\n'
         };
 
         agent.execute(request).await?;
-
-        unsafe { std::env::remove_var("CLAUDE_CODE_ENTRYPOINT") };
 
         let agent_env = fs::read_to_string(agent_capture)?;
         assert!(
