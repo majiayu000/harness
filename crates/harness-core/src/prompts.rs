@@ -38,6 +38,39 @@ pub fn implement_from_issue(issue: u64, git: Option<&GitConfig>) -> String {
     )
 }
 
+/// Lightweight snapshot of a concurrently-running task used to build sibling-awareness
+/// context in agent prompts.
+pub struct SiblingTask {
+    /// GitHub issue number, if this task was created from an issue.
+    pub issue: Option<u64>,
+    /// Short description derived from the task prompt or issue number.
+    pub description: String,
+}
+
+/// Build a constraint block that tells an agent which issues are being handled
+/// concurrently by other agents on the same project.
+///
+/// Returns an empty string when `siblings` is empty so callers can append
+/// unconditionally without injecting noise into single-task prompts.
+pub fn sibling_task_context(siblings: &[SiblingTask]) -> String {
+    if siblings.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from(
+        "\n\n\
+         ⚠️  The following issues are being handled by OTHER agents in parallel on this project.\n\
+         Do NOT modify files related to these issues — another agent is responsible:\n",
+    );
+    for sibling in siblings {
+        match sibling.issue {
+            Some(n) => block.push_str(&format!("- #{n}: {}\n", sibling.description)),
+            None => block.push_str(&format!("- {}\n", sibling.description)),
+        }
+    }
+    block.push_str("\nOnly modify files directly needed for YOUR assigned task.");
+    block
+}
+
 /// Build prompt: check an existing PR's CI and review status.
 pub fn check_existing_pr(pr: u64, review_bot_command: &str) -> String {
     let body = shell_single_quote(review_bot_command);
@@ -729,6 +762,41 @@ PR_URL=https://github.com/owner/repo/pull/269";
         ));
         assert!(!is_lgtm("somethingLGTM"));
         assert!(!is_lgtm("notLGTM\n"));
+    }
+
+    #[test]
+    fn sibling_task_context_empty_returns_empty_string() {
+        assert_eq!(sibling_task_context(&[]), "");
+    }
+
+    #[test]
+    fn sibling_task_context_with_issue_numbers() {
+        let siblings = vec![
+            SiblingTask {
+                issue: Some(77),
+                description: "fix Mistral unwrap".to_string(),
+            },
+            SiblingTask {
+                issue: Some(78),
+                description: "fix Vertex AI unwrap".to_string(),
+            },
+        ];
+        let ctx = sibling_task_context(&siblings);
+        assert!(ctx.contains("#77: fix Mistral unwrap"));
+        assert!(ctx.contains("#78: fix Vertex AI unwrap"));
+        assert!(ctx.contains("OTHER agents"));
+        assert!(ctx.contains("Only modify files directly needed for YOUR assigned task."));
+    }
+
+    #[test]
+    fn sibling_task_context_without_issue_number_omits_hash() {
+        let siblings = vec![SiblingTask {
+            issue: None,
+            description: "refactor auth module".to_string(),
+        }];
+        let ctx = sibling_task_context(&siblings);
+        assert!(ctx.contains("- refactor auth module"));
+        assert!(!ctx.contains('#'));
     }
 
     #[test]

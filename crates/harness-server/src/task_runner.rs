@@ -93,6 +93,15 @@ pub struct TaskState {
     /// Populated at runtime; not persisted (use `TaskStore::list_children` after restart).
     #[serde(default)]
     pub subtask_ids: Vec<TaskId>,
+    /// Canonical project root for sibling-task awareness; runtime-only, not persisted.
+    #[serde(skip)]
+    pub project_root: Option<PathBuf>,
+    /// GitHub issue number for sibling-task context; runtime-only, not persisted.
+    #[serde(skip)]
+    pub issue_number: Option<u64>,
+    /// Brief description (first 80 chars of prompt) for sibling-task context; runtime-only.
+    #[serde(skip)]
+    pub brief_description: Option<String>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -122,6 +131,9 @@ impl TaskState {
             external_id: None,
             parent_id: None,
             subtask_ids: Vec::new(),
+            project_root: None,
+            issue_number: None,
+            brief_description: None,
         }
     }
 
@@ -365,6 +377,53 @@ impl TaskStore {
                 None
             }
         }
+    }
+
+    /// Wire runtime-only metadata for sibling-task awareness into the in-memory cache.
+    /// No-op when the task ID is not found (e.g. task was already removed).
+    pub(crate) fn set_runtime_metadata(
+        &self,
+        id: &TaskId,
+        project_root: PathBuf,
+        issue_number: Option<u64>,
+        brief_description: Option<String>,
+    ) {
+        if let Some(mut entry) = self.cache.get_mut(id) {
+            entry.project_root = Some(project_root);
+            entry.issue_number = issue_number;
+            entry.brief_description = brief_description;
+        }
+    }
+
+    /// Return sibling tasks that are actively running on the same project root,
+    /// excluding `exclude_id`. Active means `Pending` or `Implementing` status.
+    /// Used to inject sibling-task context into agent prompts so parallel agents
+    /// do not over-scope their changes.
+    pub fn list_active_in_project(
+        &self,
+        project: &std::path::Path,
+        exclude_id: &TaskId,
+    ) -> Vec<harness_core::prompts::SiblingTask> {
+        self.cache
+            .iter()
+            .filter(|e| {
+                let task = e.value();
+                &task.id != exclude_id
+                    && task.project_root.as_deref() == Some(project)
+                    && matches!(task.status, TaskStatus::Pending | TaskStatus::Implementing)
+            })
+            .map(|e| {
+                let task = e.value();
+                let description = task.brief_description.clone().unwrap_or_else(|| {
+                    task.issue_number
+                        .map_or_else(String::new, |n| format!("issue #{n}"))
+                });
+                harness_core::prompts::SiblingTask {
+                    issue: task.issue_number,
+                    description,
+                }
+            })
+            .collect()
     }
 
     /// Return all cached tasks whose `parent_id` matches the given ID.
@@ -636,6 +695,13 @@ where
                 }
             }
         }
+
+        // Wire runtime-only metadata before project_root is potentially moved.
+        let brief_description = req
+            .prompt
+            .as_deref()
+            .map(|p| p.chars().take(80).collect::<String>());
+        store.set_runtime_metadata(&id, project_root.clone(), req.issue, brief_description);
 
         // If workspace isolation is configured, create a per-task git worktree.
         let run_project = if let Some(ref wmgr) = workspace_mgr {
@@ -1363,6 +1429,84 @@ mod tests {
             phases[1],
             Some(ExecutionPhase::Validation),
             "review check turn must use Validation phase"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_active_in_project_excludes_self_and_terminal_tasks() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let project = std::path::PathBuf::from("/projects/myrepo");
+
+        let self_id = TaskId("self".to_string());
+        let sibling_id = TaskId("sibling".to_string());
+        let done_id = TaskId("done".to_string());
+        let other_project_id = TaskId("other-project".to_string());
+
+        // Insert all tasks as Pending first.
+        for id in [&self_id, &sibling_id, &done_id, &other_project_id] {
+            let mut state = TaskState::new(id.clone());
+            state.status = TaskStatus::Pending;
+            store.cache.insert(id.clone(), state);
+        }
+
+        // Wire metadata: self and sibling share the same project, done and other do not.
+        store.set_runtime_metadata(
+            &self_id,
+            project.clone(),
+            Some(10),
+            Some("self task".into()),
+        );
+        store.set_runtime_metadata(
+            &sibling_id,
+            project.clone(),
+            Some(11),
+            Some("sibling task".into()),
+        );
+        store.set_runtime_metadata(
+            &done_id,
+            project.clone(),
+            Some(12),
+            Some("done task".into()),
+        );
+        store.set_runtime_metadata(
+            &other_project_id,
+            std::path::PathBuf::from("/projects/other"),
+            Some(13),
+            Some("other project task".into()),
+        );
+
+        // Mark done task as Done.
+        if let Some(mut e) = store.cache.get_mut(&done_id) {
+            e.status = TaskStatus::Done;
+        }
+
+        let siblings = store.list_active_in_project(&project, &self_id);
+
+        // Only the sibling (Pending, same project, not self) should appear.
+        assert_eq!(siblings.len(), 1, "expected exactly one sibling");
+        assert_eq!(siblings[0].issue, Some(11));
+        assert_eq!(siblings[0].description, "sibling task");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_active_in_project_empty_when_no_siblings() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let project = std::path::PathBuf::from("/projects/solo");
+
+        let id = TaskId("solo".to_string());
+        let mut state = TaskState::new(id.clone());
+        state.status = TaskStatus::Implementing;
+        store.cache.insert(id.clone(), state);
+        store.set_runtime_metadata(&id, project.clone(), Some(99), Some("solo".into()));
+
+        let siblings = store.list_active_in_project(&project, &id);
+        assert!(
+            siblings.is_empty(),
+            "task with no siblings should return empty vec"
         );
         Ok(())
     }

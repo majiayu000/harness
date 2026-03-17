@@ -310,6 +310,15 @@ pub(crate) async fn run_task(
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default(), git)
     };
 
+    // Inject sibling-task awareness so the agent does not over-scope its changes
+    // when other agents are working on the same project concurrently.
+    let siblings = store.list_active_in_project(&project, task_id);
+    let first_prompt = if siblings.is_empty() {
+        first_prompt
+    } else {
+        format!("{first_prompt}{}", prompts::sibling_task_context(&siblings))
+    };
+
     // Inject language-detected validation instructions into the prompt when no
     // explicit validation config is set. This delegates validation to the agent
     // instead of running external commands that may not be installed.
