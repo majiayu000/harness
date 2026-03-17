@@ -308,6 +308,37 @@ pub fn periodic_review_prompt(
     )
 }
 
+/// Brief description of a task running in parallel on the same project.
+pub struct SiblingTask {
+    /// GitHub issue number being implemented, if any.
+    pub issue: Option<u64>,
+}
+
+/// Build a constraint block listing tasks running in parallel on the same project.
+///
+/// Informs the agent of sibling tasks so it avoids over-scoping its changes to
+/// files owned by those agents. Returns an empty string when `siblings` is empty.
+pub fn sibling_task_context(siblings: &[SiblingTask]) -> String {
+    if siblings.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = siblings
+        .iter()
+        .map(|s| match s.issue {
+            Some(n) => format!("- issue #{n}"),
+            None => "- (prompt task)".to_string(),
+        })
+        .collect();
+    format!(
+        "\u{26a0}\u{fe0f} The following tasks are being handled by OTHER agents in parallel on \
+         this same project.\n\
+         Do NOT modify files related to these issues \u{2014} another agent is responsible:\n\
+         {}\n\n\
+         Only modify files directly needed for YOUR assigned issue.",
+        lines.join("\n")
+    )
+}
+
 /// Check if agent output indicates approval (last non-empty line is "APPROVED").
 pub fn is_approved(output: &str) -> bool {
     last_non_empty_line(output) == Some("APPROVED")
@@ -400,6 +431,46 @@ fn last_non_empty_line(output: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sibling_task_context_empty_returns_empty_string() {
+        assert_eq!(sibling_task_context(&[]), "");
+    }
+
+    #[test]
+    fn sibling_task_context_with_issues_lists_them() {
+        let siblings = vec![
+            SiblingTask { issue: Some(77) },
+            SiblingTask { issue: Some(78) },
+        ];
+        let ctx = sibling_task_context(&siblings);
+        assert!(ctx.contains("#77"), "should list issue #77");
+        assert!(ctx.contains("#78"), "should list issue #78");
+        assert!(
+            ctx.contains("Do NOT modify files"),
+            "should contain constraint"
+        );
+        assert!(
+            ctx.contains("Only modify files directly needed"),
+            "should contain scope reminder"
+        );
+    }
+
+    #[test]
+    fn sibling_task_context_prompt_task_without_issue() {
+        let siblings = vec![SiblingTask { issue: None }];
+        let ctx = sibling_task_context(&siblings);
+        assert!(!ctx.is_empty(), "should produce output for prompt tasks");
+        assert!(ctx.contains("prompt task"), "should label prompt tasks");
+    }
+
+    #[test]
+    fn sibling_task_context_single_sibling() {
+        let siblings = vec![SiblingTask { issue: Some(42) }];
+        let ctx = sibling_task_context(&siblings);
+        assert!(ctx.contains("#42"));
+        assert!(ctx.contains("OTHER agents"));
+    }
 
     #[test]
     fn test_gc_adopt_prompt() {

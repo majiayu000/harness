@@ -197,6 +197,8 @@ impl TaskRow {
             external_id,
             parent_id: parent_id.map(TaskId),
             subtask_ids: Vec::new(),
+            project_root: None,
+            issue: None,
         })
     }
 }
@@ -271,6 +273,8 @@ mod tests {
             external_id: None,
             parent_id: None,
             subtask_ids: vec![],
+            project_root: None,
+            issue: None,
         }
     }
 

@@ -310,6 +310,38 @@ pub(crate) async fn run_task(
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default(), git)
     };
 
+    // Inject sibling task awareness so parallel agents know what other agents are
+    // implementing and avoid modifying the same files.
+    let first_prompt = {
+        let canonical_project = store
+            .get(task_id)
+            .and_then(|s| s.project_root.clone())
+            .unwrap_or_else(|| project.clone());
+        let siblings: Vec<prompts::SiblingTask> = store
+            .list_all()
+            .into_iter()
+            .filter(|t| {
+                t.id != *task_id
+                    && matches!(
+                        t.status,
+                        TaskStatus::Implementing
+                            | TaskStatus::Pending
+                            | TaskStatus::Waiting
+                            | TaskStatus::AgentReview
+                            | TaskStatus::Reviewing
+                    )
+                    && t.project_root.as_deref() == Some(canonical_project.as_path())
+            })
+            .map(|t| prompts::SiblingTask { issue: t.issue })
+            .collect();
+        let ctx = prompts::sibling_task_context(&siblings);
+        if ctx.is_empty() {
+            first_prompt
+        } else {
+            format!("{first_prompt}\n\n{ctx}")
+        }
+    };
+
     // Inject language-detected validation instructions into the prompt when no
     // explicit validation config is set. This delegates validation to the agent
     // instead of running external commands that may not be installed.

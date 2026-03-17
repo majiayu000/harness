@@ -93,6 +93,15 @@ pub struct TaskState {
     /// Populated at runtime; not persisted (use `TaskStore::list_children` after restart).
     #[serde(default)]
     pub subtask_ids: Vec<TaskId>,
+    /// Canonical project root this task operates on.
+    /// Set when the task starts executing; None for tasks created before this field was added.
+    /// Used to identify sibling tasks running in parallel on the same repository.
+    #[serde(default)]
+    pub project_root: Option<PathBuf>,
+    /// GitHub issue number, if this task was created from an issue.
+    /// Persisted so sibling tasks can identify what others are implementing.
+    #[serde(default)]
+    pub issue: Option<u64>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -122,6 +131,8 @@ impl TaskState {
             external_id: None,
             parent_id: None,
             subtask_ids: Vec::new(),
+            project_root: None,
+            issue: None,
         }
     }
 
@@ -569,6 +580,14 @@ where
             resolve_project_root_with(req.project.clone(), move || detect_worktree()).await?;
         let project_root = crate::handlers::validate_project_root(&raw_project)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Record project root and issue so sibling tasks running in parallel
+        // can identify each other and avoid modifying the same files.
+        mutate_and_persist(&store, &id, |s| {
+            s.project_root = Some(project_root.clone());
+            s.issue = req.issue;
+        })
+        .await?;
 
         // Parallel dispatch for Complex+ prompt-only tasks when workspace isolation is active.
         // Issue and PR tasks have their own structured prompt flow and are not decomposed.
