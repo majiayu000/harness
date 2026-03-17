@@ -16,6 +16,10 @@ use tokio::time::{timeout, Duration};
 /// turn prompt and retry up to `config.max_retries` times.
 pub struct PostExecutionValidator {
     config: ValidationConfig,
+    /// Path to the `gh` binary used for PR existence verification.
+    /// Defaults to `"gh"` (resolved via PATH). Override in tests to inject a
+    /// fake binary and keep tests hermetic.
+    gh_bin: String,
 }
 
 /// Validate that a command string does not contain unquoted shell operators
@@ -39,7 +43,52 @@ pub(crate) fn validate_command_safety(cmd_str: &str) -> Result<(), String> {
 
 impl PostExecutionValidator {
     pub fn new(config: ValidationConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            gh_bin: "gh".to_string(),
+        }
+    }
+
+    /// Verify that a PR URL exists by calling `gh pr view` with the URL as a
+    /// positional argument (not interpolated into a shell string) to prevent
+    /// command injection from agent-controlled output.
+    async fn verify_pr_exists(
+        gh_bin: &str,
+        pr_url: &str,
+        project: &Path,
+        timeout_secs: u64,
+    ) -> Result<(), String> {
+        let child = match Command::new(gh_bin)
+            .args(["pr", "view", pr_url, "--json", "state"])
+            .current_dir(project)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(format!(
+                    "Failed to spawn `{gh_bin}` to verify PR {pr_url}: {e}"
+                ))
+            }
+        };
+
+        let result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
+        match result {
+            Ok(Ok(output)) if output.status.success() => Ok(()),
+            Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let code = output.status.code().unwrap_or(-1);
+                Err(format!(
+                    "`gh pr view {pr_url}` failed (exit {code})\nstdout: {stdout}\nstderr: {stderr}"
+                ))
+            }
+            Ok(Err(e)) => Err(format!("`gh pr view {pr_url}` failed to wait: {e}")),
+            Err(_) => Err(format!(
+                "`gh pr view {pr_url}` timed out after {timeout_secs}s"
+            )),
+        }
     }
 
     /// Run a shell command via `sh -c` to support pipes, quotes, and complex expressions.
@@ -168,12 +217,18 @@ impl TurnInterceptor for PostExecutionValidator {
                     // This prevents false passes (same PR number in local repo)
                     // and false failures (PR opened against a fork or different
                     // repo).
-                    let verify_cmd = format!("gh pr view {pr_url} --json state");
                     tracing::info!(
                         pr_url = %pr_url,
                         "post_validator: verifying PR existence via GitHub API"
                     );
-                    match Self::run_command(&verify_cmd, project, self.config.timeout_secs).await {
+                    match Self::verify_pr_exists(
+                        &self.gh_bin,
+                        &pr_url,
+                        project,
+                        self.config.timeout_secs,
+                    )
+                    .await
+                    {
                         Ok(()) => tracing::debug!(pr_url = %pr_url, "post_validator: PR verified"),
                         Err(e) => {
                             tracing::warn!(
@@ -503,19 +558,29 @@ mod tests {
 
     #[tokio::test]
     async fn pr_verification_fails_when_gh_pr_view_fails() {
-        // In a temp directory with no git remote, `gh pr view` will fail
-        // because it cannot determine the repository. This test verifies that
-        // the validator captures and surfaces that failure.
+        // Hermetic: create a fake `gh` script that always exits 1, inject it
+        // via the gh_bin override so no real network call is made.
+        let bin_dir = tempfile::tempdir().unwrap();
+        let fake_gh = bin_dir.path().join("gh");
+        std::fs::write(&fake_gh, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let config = ValidationConfig::default();
-        let validator = PostExecutionValidator::new(config);
+        let validator = PostExecutionValidator {
+            config,
+            gh_bin: fake_gh.to_string_lossy().into_owned(),
+        };
         let req = make_req(dir.path().to_path_buf());
         let resp = make_resp("PR_URL=https://github.com/owner/repo/pull/99999");
         let result = validator.post_execute(&req, &resp).await;
-        // gh pr view should fail (no git remote in temp dir, or gh not installed)
         assert!(
             result.error.is_some(),
-            "expected PR verification error when gh pr view fails in a non-git directory"
+            "expected PR verification error when gh exits non-zero"
         );
         let err = result.error.unwrap();
         assert!(
