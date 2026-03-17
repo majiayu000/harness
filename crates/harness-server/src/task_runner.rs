@@ -987,7 +987,7 @@ mod tests {
             "expected 2 siblings, got: {sibling_ids:?}"
         );
         assert!(
-            siblings.iter().all(|s| &s.id != &current_id),
+            siblings.iter().all(|s| s.id != current_id),
             "current task must be excluded"
         );
         assert!(siblings
