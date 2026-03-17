@@ -51,6 +51,17 @@ pub(crate) async fn run_turn_lifecycle(
     };
 
     let Some(agent) = server.agent_registry.get(&agent_name) else {
+        let msg = format!("agent `{agent_name}` not found in registry");
+        if let Err(e) = server.thread_manager.add_item(
+            &thread_id,
+            &turn_id,
+            harness_core::Item::Error {
+                code: -1,
+                message: msg.clone(),
+            },
+        ) {
+            tracing::warn!("failed to add agent-not-found error item: {e}");
+        }
         mark_turn_failed(
             &server,
             &thread_db,
@@ -58,7 +69,7 @@ pub(crate) async fn run_turn_lifecycle(
             &notification_tx,
             &thread_id,
             &turn_id,
-            format!("agent `{agent_name}` not found in registry"),
+            msg,
         )
         .await;
         return;
@@ -110,19 +121,12 @@ pub(crate) async fn run_turn_lifecycle(
                     "agent stream stall detected; no output for {}s",
                     stall_timeout.as_secs()
                 );
-                mark_turn_failed(
-                    &server,
-                    &thread_db,
-                    &notify_tx,
-                    &notification_tx,
-                    &thread_id,
-                    &turn_id,
-                    format!(
-                        "Agent stream stalled: no output for {}s",
-                        stall_timeout.as_secs()
-                    ),
-                )
-                .await;
+                // Store the stall reason as the execution result so the Err branch
+                // below appends a stall-specific Item::Error before marking failed.
+                execution_result = Some(Err(HarnessError::AgentExecution(format!(
+                    "Agent stream stalled: no output for {}s",
+                    stall_timeout.as_secs()
+                ))));
                 break 'outer;
             }
         }

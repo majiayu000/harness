@@ -322,11 +322,13 @@ async fn turn_fails_when_agent_not_registered() -> anyhow::Result<()> {
 
     let failed =
         wait_for_status(&state, &turn_id, TurnStatus::Failed, Duration::from_secs(3)).await?;
-    // The agent-not-found path transitions the turn to Failed.
-    // Items are preserved (at minimum the initial UserMessage).
+    // The agent-not-found path must append an Item::Error naming the missing agent.
     assert!(
-        !failed.items.is_empty(),
-        "failed turn should still contain the user message item"
+        failed.items.iter().any(|item| matches!(
+            item,
+            Item::Error { message, .. } if message.contains("ghost")
+        )),
+        "failed turn should contain an Item::Error mentioning the missing agent name"
     );
     Ok(())
 }
@@ -361,12 +363,14 @@ async fn turn_fails_on_stall_timeout() -> anyhow::Result<()> {
     // Allow 5s for the 1s stall to fire and persist the Failed state.
     let failed =
         wait_for_status(&state, &turn_id, TurnStatus::Failed, Duration::from_secs(5)).await?;
+    // The stall-detection path must append an Item::Error with the stall-specific reason,
+    // not merely a generic fallback message.
     assert!(
-        failed
-            .items
-            .iter()
-            .any(|item| matches!(item, Item::Error { .. })),
-        "stall-timed-out turn should include an Error item"
+        failed.items.iter().any(|item| matches!(
+            item,
+            Item::Error { message, .. } if message.contains("stalled") || message.contains("no output for")
+        )),
+        "stall-timed-out turn should include an Item::Error from stall detection"
     );
     Ok(())
 }
