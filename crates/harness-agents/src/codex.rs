@@ -88,7 +88,11 @@ impl CodeAgent for CodexAgent {
 
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
-            .current_dir(&req.project_root);
+            .current_dir(&req.project_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         crate::strip_claude_env(&mut cmd);
 
         if self.cloud.enabled {
@@ -97,8 +101,11 @@ impl CodeAgent for CodexAgent {
             }
         }
 
-        let output = cmd.output().await.map_err(|err| {
+        let child = cmd.spawn().map_err(|err| {
             harness_core::HarnessError::AgentExecution(format!("failed to run codex: {err}"))
+        })?;
+        let output = child.wait_with_output().await.map_err(|err| {
+            harness_core::HarnessError::AgentExecution(format!("failed to wait for codex: {err}"))
         })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -141,6 +148,7 @@ impl CodeAgent for CodexAgent {
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);

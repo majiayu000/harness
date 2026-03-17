@@ -95,11 +95,18 @@ impl CodeAgent for ClaudeCodeAgent {
 
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
-            .current_dir(&req.project_root);
+            .current_dir(&req.project_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         crate::strip_claude_env(&mut cmd);
 
-        let output = cmd.output().await.map_err(|e| {
+        let child = cmd.spawn().map_err(|e| {
             harness_core::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
+        })?;
+        let output = child.wait_with_output().await.map_err(|e| {
+            harness_core::HarnessError::AgentExecution(format!("failed to wait for claude: {e}"))
         })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -140,6 +147,7 @@ impl CodeAgent for ClaudeCodeAgent {
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);

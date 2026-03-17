@@ -67,13 +67,25 @@ pub async fn serve(mut state: AppState) -> anyhow::Result<()> {
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
+    let mut shutdown = std::pin::pin!(shutdown_signal());
 
-        if let Some(out) = process_line(&state, &line).await? {
-            if out_tx.send(out).await.is_err() {
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                match line? {
+                    Some(line) if !line.trim().is_empty() => {
+                        if let Some(out) = process_line(&state, &line).await? {
+                            if out_tx.send(out).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(_) => continue,
+                    None => break,
+                }
+            }
+            _ = &mut shutdown => {
+                tracing::info!("stdio server received shutdown signal");
                 break;
             }
         }
@@ -81,6 +93,30 @@ pub async fn serve(mut state: AppState) -> anyhow::Result<()> {
 
     state.observability.events.shutdown().await;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("stdio: received Ctrl+C"),
+        _ = terminate => tracing::info!("stdio: received SIGTERM"),
+    }
 }
 
 #[cfg(test)]

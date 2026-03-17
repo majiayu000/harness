@@ -54,6 +54,7 @@ impl PostExecutionValidator {
         let child = match Command::new("sh")
             .args(["-c", cmd_str])
             .current_dir(project)
+            .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
         {
