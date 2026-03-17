@@ -407,7 +407,7 @@ pub fn sibling_task_context(siblings: &[SiblingTask]) -> String {
     for s in siblings {
         match s.issue {
             Some(n) => desc_lines.push(format!("#{n}: {}", s.description)),
-            None => desc_lines.push(s.description.clone()),
+            None => desc_lines.push(format!("- {}", s.description)),
         }
     }
     let safe_list = wrap_external_data(&desc_lines.join("\n"));

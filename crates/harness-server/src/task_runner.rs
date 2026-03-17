@@ -402,7 +402,13 @@ impl TaskStore {
             .filter(|e| {
                 let task = e.value();
                 &task.id != exclude_id
-                    && matches!(task.status, TaskStatus::Pending | TaskStatus::Implementing)
+                    && matches!(
+                        task.status,
+                        TaskStatus::Pending
+                            | TaskStatus::Implementing
+                            | TaskStatus::Reviewing
+                            | TaskStatus::AgentReview
+                    )
                     && task.project_root.as_deref() == Some(project)
             })
             .map(|e| e.value().clone())
@@ -634,9 +640,26 @@ where
         );
         if req.issue.is_none() && req.pr.is_none() && is_complex {
             if let Some(ref wmgr) = workspace_mgr {
-                let subtask_prompts =
+                let mut subtask_prompts =
                     crate::parallel_dispatch::decompose(req.prompt.as_deref().unwrap_or_default());
                 if subtask_prompts.len() > 1 {
+                    // Prepend sibling-awareness context to each subtask prompt so parallel
+                    // agents know what other top-level tasks are running on the same project.
+                    let siblings = store.list_siblings(&project_root, &id);
+                    if !siblings.is_empty() {
+                        let sibling_tasks: Vec<harness_core::prompts::SiblingTask> = siblings
+                            .into_iter()
+                            .map(|s| harness_core::prompts::SiblingTask {
+                                issue: s.issue,
+                                description: s.description.unwrap_or_default(),
+                            })
+                            .collect();
+                        let ctx = harness_core::prompts::sibling_task_context(&sibling_tasks);
+                        subtask_prompts = subtask_prompts
+                            .into_iter()
+                            .map(|p| format!("{ctx}\n\n{p}"))
+                            .collect();
+                    }
                     let project_config = harness_core::config::load_project_config(&project_root);
                     let remote = project_config.git.remote.clone();
                     let base_branch = project_config.git.base_branch.clone();
