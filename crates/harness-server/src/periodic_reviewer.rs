@@ -118,13 +118,14 @@ async fn run_review_for_project(
         }
     }
 
-    let prompt = build_prompt(state, config, project_root).await?;
+    let prompt = build_prompt(state, config, project_root, &hook_name).await?;
 
     let req = CreateTaskRequest {
         prompt: Some(prompt),
         agent: config.agent.clone(),
         turn_timeout_secs: config.timeout_secs,
         source: Some("periodic_review".to_string()),
+        project: Some(project_root.to_path_buf()),
         ..CreateTaskRequest::default()
     };
 
@@ -164,6 +165,7 @@ async fn build_prompt(
     state: &Arc<AppState>,
     config: &ReviewConfig,
     project_root: &Path,
+    hook_name: &str,
 ) -> anyhow::Result<String> {
     let repo_structure = gather_repo_structure(project_root).await;
 
@@ -175,7 +177,7 @@ async fn build_prompt(
             .observability
             .events
             .query(&EventFilters {
-                hook: Some("periodic_review".to_string()),
+                hook: Some(hook_name.to_string()),
                 ..EventFilters::default()
             })
             .await
