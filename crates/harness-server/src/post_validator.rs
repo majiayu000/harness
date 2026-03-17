@@ -160,22 +160,29 @@ impl TurnInterceptor for PostExecutionValidator {
         // to avoid noisy failures from incomplete code.
         if errors.is_empty() {
             if let Some(pr_url) = prompts::parse_pr_url(&resp.output) {
-                if let Some(pr_num) = prompts::extract_pr_number(&pr_url) {
-                    let verify_cmd = format!("gh pr view {pr_num} --json number");
+                // Guard: only verify URLs that look like a real GitHub PR
+                // (contain /pull/{number}).  Non-PR URLs are silently skipped.
+                if prompts::extract_pr_number(&pr_url).is_some() {
+                    // Use the full URL so `gh` resolves the exact repo the
+                    // agent targeted, not the repo of the current checkout.
+                    // This prevents false passes (same PR number in local repo)
+                    // and false failures (PR opened against a fork or different
+                    // repo).
+                    let verify_cmd = format!("gh pr view {pr_url} --json state");
                     tracing::info!(
-                        pr_num,
+                        pr_url = %pr_url,
                         "post_validator: verifying PR existence via GitHub API"
                     );
                     match Self::run_command(&verify_cmd, project, self.config.timeout_secs).await {
-                        Ok(()) => tracing::debug!(pr_num, "post_validator: PR #{pr_num} verified"),
+                        Ok(()) => tracing::debug!(pr_url = %pr_url, "post_validator: PR verified"),
                         Err(e) => {
                             tracing::warn!(
-                                pr_num,
+                                pr_url = %pr_url,
                                 error = %e,
                                 "post_validator: PR verification failed"
                             );
                             errors.push(format!(
-                                "PR #{pr_num} could not be verified via GitHub API: {e}"
+                                "PR {pr_url} could not be verified via GitHub API: {e}"
                             ));
                         }
                     }
@@ -489,7 +496,7 @@ mod tests {
             "expected pre_commit error, got: {err}"
         );
         assert!(
-            !err.contains("PR #42"),
+            !err.contains("github.com/owner/repo/pull/42"),
             "PR verification must not run when pre_commit fails"
         );
     }
@@ -512,8 +519,8 @@ mod tests {
         );
         let err = result.error.unwrap();
         assert!(
-            err.contains("PR #99999"),
-            "expected error mentioning PR number, got: {err}"
+            err.contains("https://github.com/owner/repo/pull/99999"),
+            "expected error mentioning PR URL, got: {err}"
         );
     }
 }
