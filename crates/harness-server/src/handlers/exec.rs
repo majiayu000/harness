@@ -39,17 +39,14 @@ pub async fn exec_plan_status(
     id: Option<serde_json::Value>,
     plan_id: ExecPlanId,
 ) -> RpcResponse {
-    // Check in-memory cache first.
-    if let Some(plan) = state.core.plan_cache.get(plan_id.as_str()) {
-        return match serde_json::to_value(plan.value()) {
-            Ok(v) => RpcResponse::success(id, v),
-            Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
-        };
-    }
-    // DB fallback: plan may have been created in a previous session.
+    // DB is the authoritative source of truth. Always read from it when
+    // available so that a concurrent exec_plan_update that has already
+    // committed to SQLite but has not yet refreshed the cache cannot cause
+    // this handler to return stale status or milestones.
     if let Some(db) = &state.core.plan_db {
         match db.get(&plan_id).await {
             Ok(Some(plan)) => {
+                // Keep cache warm for the write path.
                 state
                     .core
                     .plan_cache
@@ -63,7 +60,14 @@ pub async fn exec_plan_status(
             Err(e) => RpcResponse::error(id, INTERNAL_ERROR, format!("db error: {e}")),
         }
     } else {
-        RpcResponse::error(id, NOT_FOUND, "plan not found")
+        // No DB (in-memory-only mode): fall back to cache.
+        match state.core.plan_cache.get(plan_id.as_str()) {
+            Some(plan) => match serde_json::to_value(plan.value()) {
+                Ok(v) => RpcResponse::success(id, v),
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            },
+            None => RpcResponse::error(id, NOT_FOUND, "plan not found"),
+        }
     }
 }
 
