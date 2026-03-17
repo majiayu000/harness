@@ -364,6 +364,71 @@ mod tests {
     }
 
     #[test]
+    fn parse_issues_opened_with_harness_mention_creates_issue_task() {
+        let payload = serde_json::json!({
+            "action": "opened",
+            "issue": {
+                "number": 77,
+                "body": "@harness please implement this feature"
+            }
+        });
+
+        let (request, reason) =
+            parse_github_webhook_task_request("issues", payload.to_string().as_bytes()).unwrap();
+        let request = request.expect("request should exist");
+        assert_eq!(reason, "issue mention");
+        assert_eq!(request.issue, Some(77));
+        assert_eq!(request.pr, None);
+        assert_eq!(request.prompt, None);
+    }
+
+    #[test]
+    fn parse_issues_reopened_with_harness_mention_creates_issue_task() {
+        let payload = serde_json::json!({
+            "action": "reopened",
+            "issue": {
+                "number": 88,
+                "body": "This is still broken, @harness fix it"
+            }
+        });
+
+        let (request, reason) =
+            parse_github_webhook_task_request("issues", payload.to_string().as_bytes()).unwrap();
+        let request = request.expect("request should exist");
+        assert_eq!(reason, "issue mention");
+        assert_eq!(request.issue, Some(88));
+    }
+
+    #[test]
+    fn parse_issues_opened_without_harness_mention_is_ignored() {
+        let payload = serde_json::json!({
+            "action": "opened",
+            "issue": {
+                "number": 99,
+                "body": "This issue has no harness mention"
+            }
+        });
+
+        let (request, reason) =
+            parse_github_webhook_task_request("issues", payload.to_string().as_bytes()).unwrap();
+        assert!(request.is_none());
+        assert_eq!(reason, "no @harness command in issue body");
+    }
+
+    #[test]
+    fn parse_issues_opened_with_no_body_is_ignored() {
+        let payload = serde_json::json!({
+            "action": "opened",
+            "issue": { "number": 100 }
+        });
+
+        let (request, reason) =
+            parse_github_webhook_task_request("issues", payload.to_string().as_bytes()).unwrap();
+        assert!(request.is_none());
+        assert_eq!(reason, "no @harness command in issue body");
+    }
+
+    #[test]
     fn parse_issues_edited_action_is_ignored() {
         let payload = serde_json::json!({
             "action": "edited",
