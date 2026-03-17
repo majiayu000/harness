@@ -93,6 +93,16 @@ pub struct TaskState {
     /// Populated at runtime; not persisted (use `TaskStore::list_children` after restart).
     #[serde(default)]
     pub subtask_ids: Vec<TaskId>,
+    /// Resolved project root for this task. Set at spawn time; not persisted to the database.
+    /// Used by sibling-awareness lookups in `TaskStore::list_siblings`.
+    #[serde(skip)]
+    pub project_root: Option<PathBuf>,
+    /// GitHub issue number if this is an issue-based task. Set at spawn time; not persisted.
+    #[serde(skip)]
+    pub issue: Option<u64>,
+    /// Short description derived from the task prompt or issue number. Set at spawn time; not persisted.
+    #[serde(skip)]
+    pub description: Option<String>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -122,6 +132,9 @@ impl TaskState {
             external_id: None,
             parent_id: None,
             subtask_ids: Vec::new(),
+            project_root: None,
+            issue: None,
+            description: None,
         }
     }
 
@@ -378,6 +391,30 @@ impl TaskStore {
         }
     }
 
+    /// Return all active (Pending or Implementing) tasks on the same project, excluding `exclude_id`.
+    ///
+    /// Used by `run_task` to build sibling-awareness context before starting implementation,
+    /// so each agent knows what other agents are working on and avoids touching their files.
+    /// Only tasks that have `project_root` set (populated at spawn time) are considered.
+    pub fn list_siblings(&self, project: &std::path::Path, exclude_id: &TaskId) -> Vec<TaskState> {
+        self.cache
+            .iter()
+            .filter(|e| {
+                let task = e.value();
+                &task.id != exclude_id
+                    && matches!(
+                        task.status,
+                        TaskStatus::Pending
+                            | TaskStatus::Implementing
+                            | TaskStatus::Reviewing
+                            | TaskStatus::AgentReview
+                    )
+                    && task.project_root.as_deref() == Some(project)
+            })
+            .map(|e| e.value().clone())
+            .collect()
+    }
+
     /// Return all cached tasks whose `parent_id` matches the given ID.
     /// Reconstructs the child list from in-memory state; does not require
     /// `subtask_ids` to be persisted on the parent.
@@ -570,6 +607,26 @@ where
         let project_root = crate::handlers::validate_project_root(&raw_project)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+        // Populate transient sibling-awareness fields in the in-memory cache.
+        // These are not persisted; they enable list_siblings() lookups during run_task.
+        let description = req.issue.map(|n| format!("issue #{n}")).or_else(|| {
+            req.prompt.as_ref().map(|p| {
+                let s = p.trim();
+                // Use char_indices to find a safe UTF-8 boundary at or before 80 chars.
+                let cutoff = s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len());
+                if cutoff < s.len() {
+                    format!("{}...", &s[..cutoff])
+                } else {
+                    s.to_string()
+                }
+            })
+        });
+        if let Some(mut entry) = store.cache.get_mut(&id) {
+            entry.project_root = Some(project_root.clone());
+            entry.issue = req.issue;
+            entry.description = description;
+        }
+
         // Parallel dispatch for Complex+ prompt-only tasks when workspace isolation is active.
         // Issue and PR tasks have their own structured prompt flow and are not decomposed.
         let classification = crate::complexity_router::classify(
@@ -583,9 +640,34 @@ where
         );
         if req.issue.is_none() && req.pr.is_none() && is_complex {
             if let Some(ref wmgr) = workspace_mgr {
-                let subtask_prompts =
+                let mut subtask_prompts =
                     crate::parallel_dispatch::decompose(req.prompt.as_deref().unwrap_or_default());
                 if subtask_prompts.len() > 1 {
+                    // Prepend sibling-awareness context to each subtask prompt so parallel
+                    // agents know what other top-level tasks are running on the same project.
+                    let siblings = store.list_siblings(&project_root, &id);
+                    if !siblings.is_empty() {
+                        let sibling_tasks: Vec<harness_core::prompts::SiblingTask> = siblings
+                            .into_iter()
+                            .filter_map(|s| {
+                                s.description.and_then(|description| {
+                                    if description.is_empty() {
+                                        None
+                                    } else {
+                                        Some(harness_core::prompts::SiblingTask {
+                                            issue: s.issue,
+                                            description,
+                                        })
+                                    }
+                                })
+                            })
+                            .collect();
+                        let ctx = harness_core::prompts::sibling_task_context(&sibling_tasks);
+                        subtask_prompts = subtask_prompts
+                            .into_iter()
+                            .map(|p| format!("{ctx}\n\n{p}"))
+                            .collect();
+                    }
                     let project_config = harness_core::config::load_project_config(&project_root);
                     let remote = project_config.git.remote.clone();
                     let base_branch = project_config.git.base_branch.clone();
@@ -861,6 +943,70 @@ mod tests {
         assert!(matches!(state.status, TaskStatus::Pending));
         assert_eq!(state.turn, 0);
         assert!(state.pr_url.is_none());
+        assert!(state.project_root.is_none());
+        assert!(state.issue.is_none());
+        assert!(state.description.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_siblings_returns_active_tasks_for_same_project() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let project = PathBuf::from("/repo/project");
+        let other_project = PathBuf::from("/repo/other");
+
+        let current_id = TaskId("current".to_string());
+        let mut current = TaskState::new(current_id.clone());
+        current.project_root = Some(project.clone());
+        current.status = TaskStatus::Implementing;
+        store.insert(&current).await;
+
+        // Sibling on same project in Implementing status.
+        let mut sibling1 = TaskState::new(TaskId("sibling-1".to_string()));
+        sibling1.project_root = Some(project.clone());
+        sibling1.status = TaskStatus::Implementing;
+        sibling1.issue = Some(77);
+        sibling1.description = Some("fix unwrap in s3.rs".to_string());
+        store.insert(&sibling1).await;
+
+        // Sibling on same project in Pending status.
+        let mut sibling2 = TaskState::new(TaskId("sibling-2".to_string()));
+        sibling2.project_root = Some(project.clone());
+        sibling2.status = TaskStatus::Pending;
+        store.insert(&sibling2).await;
+
+        // Task on a different project — must not appear.
+        let mut other = TaskState::new(TaskId("other-project".to_string()));
+        other.project_root = Some(other_project.clone());
+        other.status = TaskStatus::Implementing;
+        store.insert(&other).await;
+
+        // Done task on same project — must not appear.
+        let mut done = TaskState::new(TaskId("done-task".to_string()));
+        done.project_root = Some(project.clone());
+        done.status = TaskStatus::Done;
+        store.insert(&done).await;
+
+        let siblings = store.list_siblings(&project, &current_id);
+        let sibling_ids: Vec<&str> = siblings.iter().map(|s| s.id.0.as_str()).collect();
+        assert_eq!(
+            siblings.len(),
+            2,
+            "expected 2 siblings, got: {sibling_ids:?}"
+        );
+        assert!(
+            siblings.iter().all(|s| s.id != current_id),
+            "current task must be excluded"
+        );
+        assert!(siblings
+            .iter()
+            .all(|s| s.project_root.as_deref() == Some(project.as_path())));
+
+        // One sibling on `other_project`.
+        let other_project_siblings = store.list_siblings(&other_project, &current_id);
+        assert_eq!(other_project_siblings.len(), 1);
+
+        Ok(())
     }
 
     struct CapturingAgent {

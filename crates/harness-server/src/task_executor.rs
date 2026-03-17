@@ -327,6 +327,42 @@ pub(crate) async fn run_task(
         first_prompt
     };
 
+    // Inject sibling-awareness context when other agents are working on the same project.
+    // This prevents parallel agents from over-scoping their changes into each other's files.
+    //
+    // `project` may be a per-task worktree path when workspace isolation is active, but the
+    // sibling cache stores the canonical source repo path (set at spawn time before the worktree
+    // is created). Look up the canonical root from the task's own cache entry so that
+    // list_siblings() path comparison works correctly in the isolated-worktree case.
+    let first_prompt = {
+        let canonical_project = store
+            .get(task_id)
+            .and_then(|s| s.project_root)
+            .unwrap_or_else(|| project.clone());
+        let siblings = store.list_siblings(&canonical_project, task_id);
+        if siblings.is_empty() {
+            first_prompt
+        } else {
+            let sibling_tasks: Vec<prompts::SiblingTask> = siblings
+                .into_iter()
+                .filter_map(|s| {
+                    s.description.and_then(|description| {
+                        if description.is_empty() {
+                            None
+                        } else {
+                            Some(prompts::SiblingTask {
+                                issue: s.issue,
+                                description,
+                            })
+                        }
+                    })
+                })
+                .collect();
+            let ctx = prompts::sibling_task_context(&sibling_tasks);
+            format!("{first_prompt}\n\n{ctx}")
+        }
+    };
+
     let context_items = collect_context_items(&skills, &project, &first_prompt).await;
 
     let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
