@@ -1,24 +1,9 @@
 use super::{resolve_reviewer, AppState};
-use crate::task_runner;
+use crate::{services::EnqueueTaskError, task_runner};
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
-
-#[derive(Debug)]
-pub(crate) enum EnqueueTaskError {
-    BadRequest(String),
-    Internal(String),
-}
-
-impl std::fmt::Display for EnqueueTaskError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BadRequest(msg) => write!(f, "bad request: {msg}"),
-            Self::Internal(msg) => write!(f, "internal error: {msg}"),
-        }
-    }
-}
 
 /// Resolve a project path-or-ID through the registry.
 ///

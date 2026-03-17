@@ -124,6 +124,24 @@ mod tests {
         ));
         let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
         let (notification_tx, _) = broadcast::channel(64);
+        let _project_svc_tmp =
+            crate::project_registry::ProjectRegistry::open(&dir.join("svc_projects.db")).await?;
+        let project_svc =
+            crate::services::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
+        let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
+        let execution_svc = crate::services::DefaultExecutionService::new(
+            tasks.clone(),
+            server.agent_registry.clone(),
+            Arc::new(server.config.clone()),
+            Default::default(),
+            events.clone(),
+            vec![],
+            None,
+            Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            None,
+            None,
+            vec![],
+        );
         Ok(AppState {
             core: crate::http::CoreServices {
                 server,
@@ -158,6 +176,9 @@ mod tests {
             feishu_intake: None,
             github_intake: None,
             completion_callback: None,
+            project_svc,
+            task_svc,
+            execution_svc,
         })
     }
 

@@ -28,6 +28,7 @@ pub mod router;
 pub mod rule_enforcer;
 pub mod scheduler;
 pub mod server;
+pub mod services;
 pub mod stdio;
 pub mod task_db;
 pub mod task_executor;
