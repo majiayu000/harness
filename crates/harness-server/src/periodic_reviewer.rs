@@ -22,7 +22,16 @@ pub fn start(state: Arc<AppState>, config: ReviewConfig) {
 }
 
 async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
-    let interval = Duration::from_secs(config.interval_hours * 3600);
+    let interval = config.effective_interval();
+
+    if config.run_on_startup {
+        // Brief delay to let the server fully initialize before the first tick.
+        sleep(Duration::from_secs(5)).await;
+        if let Err(err) = run_review_tick(&state, &config).await {
+            tracing::error!("scheduler: periodic review startup tick failed: {err}");
+        }
+    }
+
     loop {
         sleep(interval).await;
         if let Err(err) = run_review_tick(&state, &config).await {
@@ -184,7 +193,9 @@ mod tests {
     fn review_config_defaults_disabled() {
         let config = ReviewConfig::default();
         assert!(!config.enabled);
+        assert!(!config.run_on_startup);
         assert_eq!(config.interval_hours, 24);
+        assert!(config.interval_secs.is_none());
         assert_eq!(config.timeout_secs, 900);
         assert!(config.agent.is_none());
     }
@@ -193,14 +204,37 @@ mod tests {
     fn review_config_custom_values() {
         let config = ReviewConfig {
             enabled: true,
+            run_on_startup: true,
             interval_hours: 12,
+            interval_secs: None,
             agent: Some("claude".to_string()),
             timeout_secs: 600,
         };
         assert!(config.enabled);
+        assert!(config.run_on_startup);
         assert_eq!(config.interval_hours, 12);
         assert_eq!(config.agent.as_deref(), Some("claude"));
         assert_eq!(config.timeout_secs, 600);
+    }
+
+    #[test]
+    fn effective_interval_prefers_secs_over_hours() {
+        let config = ReviewConfig {
+            interval_hours: 24,
+            interval_secs: Some(300),
+            ..ReviewConfig::default()
+        };
+        assert_eq!(config.effective_interval(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn effective_interval_falls_back_to_hours() {
+        let config = ReviewConfig {
+            interval_hours: 2,
+            interval_secs: None,
+            ..ReviewConfig::default()
+        };
+        assert_eq!(config.effective_interval(), Duration::from_secs(7200));
     }
 
     #[test]

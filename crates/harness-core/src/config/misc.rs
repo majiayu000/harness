@@ -312,15 +312,35 @@ pub struct ReviewConfig {
     /// Whether periodic review is enabled. Default: false.
     #[serde(default)]
     pub enabled: bool,
+    /// Run a review immediately on server startup (after a brief init delay).
+    /// Default: false.
+    #[serde(default)]
+    pub run_on_startup: bool,
     /// Interval between review runs in hours. Default: 24.
+    /// Ignored when `interval_secs` is set.
     #[serde(default = "default_review_interval_hours")]
     pub interval_hours: u64,
+    /// Override interval in seconds for fine-grained control (e.g. testing).
+    /// Takes precedence over `interval_hours` when set.
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
     /// Agent to use for the review. Default: None (use the default agent).
     #[serde(default)]
     pub agent: Option<String>,
     /// Per-turn timeout in seconds for the review agent. Default: 900.
     #[serde(default = "default_review_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+impl ReviewConfig {
+    /// Effective interval as a Duration. `interval_secs` takes precedence
+    /// over `interval_hours`.
+    pub fn effective_interval(&self) -> std::time::Duration {
+        match self.interval_secs {
+            Some(secs) => std::time::Duration::from_secs(secs),
+            None => std::time::Duration::from_secs(self.interval_hours * 3600),
+        }
+    }
 }
 
 fn default_review_interval_hours() -> u64 {
@@ -335,7 +355,9 @@ impl Default for ReviewConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            run_on_startup: false,
             interval_hours: default_review_interval_hours(),
+            interval_secs: None,
             agent: None,
             timeout_secs: default_review_timeout_secs(),
         }

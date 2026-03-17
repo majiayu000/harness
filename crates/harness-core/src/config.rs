@@ -424,12 +424,14 @@ mod tests {
     fn harness_config_default_roundtrip() {
         let config = HarnessConfig::default();
         assert_eq!(config.agents.default_agent, "claude");
-        assert_eq!(config.server.transport, Transport::Stdio);
+        assert_eq!(config.server.transport, Transport::Http);
         assert!(!config.agents.review.enabled);
         assert_eq!(config.otel.exporter, OtelExporter::Disabled);
         assert_eq!(config.gc.max_drafts_per_run, 5);
         assert!(!config.review.enabled);
+        assert!(!config.review.run_on_startup);
         assert_eq!(config.review.interval_hours, 24);
+        assert!(config.review.interval_secs.is_none());
         assert_eq!(config.review.timeout_secs, 900);
         assert!(config.review.agent.is_none());
     }
@@ -438,7 +440,9 @@ mod tests {
     fn review_config_defaults() {
         let config = ReviewConfig::default();
         assert!(!config.enabled);
+        assert!(!config.run_on_startup);
         assert_eq!(config.interval_hours, 24);
+        assert!(config.interval_secs.is_none());
         assert_eq!(config.timeout_secs, 900);
         assert!(config.agent.is_none());
     }
@@ -447,13 +451,17 @@ mod tests {
     fn review_config_deserializes_from_toml() {
         let toml_str = r#"
             enabled = true
+            run_on_startup = true
             interval_hours = 48
+            interval_secs = 600
             agent = "claude"
             timeout_secs = 1200
         "#;
         let config: ReviewConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
+        assert!(config.run_on_startup);
         assert_eq!(config.interval_hours, 48);
+        assert_eq!(config.interval_secs, Some(600));
         assert_eq!(config.agent.as_deref(), Some("claude"));
         assert_eq!(config.timeout_secs, 1200);
     }
@@ -462,7 +470,9 @@ mod tests {
     fn review_config_deserializes_with_defaults() {
         let config: ReviewConfig = toml::from_str("enabled = true").unwrap();
         assert!(config.enabled);
+        assert!(!config.run_on_startup);
         assert_eq!(config.interval_hours, 24);
+        assert!(config.interval_secs.is_none());
         assert!(config.agent.is_none());
         assert_eq!(config.timeout_secs, 900);
     }
