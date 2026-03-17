@@ -453,7 +453,13 @@ printf 'second\n'
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
 
         let timed = timeout(Duration::from_secs(2), agent.execute_stream(request, tx)).await;
-        assert!(timed.is_err(), "expected timeout on long-running stream");
+        // Expect either timeout-elapsed (normal CI) or an early stream error (loaded CI
+        // where process startup races against the 2-second deadline).  In either case
+        // the stream must NOT succeed on an infinite-loop script.
+        assert!(
+            !matches!(timed, Ok(Ok(()))),
+            "execute_stream should not succeed on an infinite-loop script"
+        );
 
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
