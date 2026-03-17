@@ -89,6 +89,29 @@ pub async fn make_test_state_with_registry(
     ));
     let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
     let (notification_tx, _) = tokio::sync::broadcast::channel(64);
+    let task_queue = Arc::new(crate::task_queue::TaskQueue::new(&Default::default()));
+
+    // Service layer — use concrete defaults backed by the same infrastructure.
+    let project_svc = crate::services::DefaultProjectService::new(
+        // Tests that don't need a registry still get a lightweight one.
+        crate::project_registry::ProjectRegistry::open(&dir.join("projects.db")).await?,
+        dir.to_path_buf(),
+    );
+    let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
+    let execution_svc = crate::services::DefaultExecutionService::new(
+        tasks.clone(),
+        server.agent_registry.clone(),
+        Arc::new(server.config.clone()),
+        Default::default(),
+        events.clone(),
+        vec![],
+        None,
+        task_queue.clone(),
+        None,
+        None,
+        vec![],
+    );
+
     Ok(AppState {
         core: crate::http::CoreServices {
             server,
@@ -108,7 +131,7 @@ pub async fn make_test_state_with_registry(
             signal_rate_limiter: Arc::new(crate::http::SignalRateLimiter::new(100)),
         },
         concurrency: crate::http::ConcurrencyServices {
-            task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            task_queue,
             workspace_mgr: None,
         },
         notifications: crate::http::NotificationServices {
@@ -124,5 +147,8 @@ pub async fn make_test_state_with_registry(
         feishu_intake: None,
         github_intake: None,
         completion_callback: None,
+        project_svc,
+        task_svc,
+        execution_svc,
     })
 }

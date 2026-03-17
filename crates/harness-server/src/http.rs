@@ -121,6 +121,17 @@ pub struct AppState {
     pub github_intake: Option<Arc<dyn crate::intake::IntakeSource>>,
     /// Completion callback invoked when a task reaches a terminal state.
     pub completion_callback: Option<task_runner::CompletionCallback>,
+
+    // ── Service layer ────────────────────────────────────────────────────────
+    // Trait-based abstractions for independent testability. Each service owns
+    // its dependencies; the fields above are preserved for handlers that have
+    // not yet been migrated to the service interfaces.
+    /// Project registry operations and default-root lookup.
+    pub project_svc: Arc<dyn crate::services::ProjectService>,
+    /// Task lifecycle queries and stream subscriptions.
+    pub task_svc: Arc<dyn crate::services::TaskService>,
+    /// Task enqueue: project resolution, agent dispatch, concurrency, workspace.
+    pub execution_svc: Arc<dyn crate::services::ExecutionService>,
 }
 
 impl AppState {
@@ -457,6 +468,40 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let hook_enforcement = server.config.rules.hook_enforcement;
     let events_for_hooks = events.clone();
 
+    // ── Service layer construction ────────────────────────────────────────────
+    // Build the interceptor list once so it can be shared with ExecutionService
+    // without reconstructing it inside the AppState literal.
+    let skills_arc = Arc::new(RwLock::new(skill_store));
+    let interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>> = vec![
+        Arc::new(crate::contract_validator::ContractValidator::new()),
+        Arc::new(crate::rule_enforcer::RuleEnforcer::new(rules.clone())),
+        Arc::new(crate::hook_enforcer::HookEnforcer::new(
+            rules.clone(),
+            events_for_hooks,
+            hook_enforcement,
+        )),
+        Arc::new(crate::post_validator::PostExecutionValidator::new(
+            validation_config,
+        )),
+    ];
+
+    let project_svc =
+        crate::services::DefaultProjectService::new(project_registry.clone(), project_root.clone());
+    let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
+    let execution_svc = crate::services::DefaultExecutionService::new(
+        tasks.clone(),
+        server.agent_registry.clone(),
+        Arc::new(server.config.clone()),
+        skills_arc.clone(),
+        events.clone(),
+        interceptors.clone(),
+        workspace_mgr.clone(),
+        task_queue.clone(),
+        completion_callback.clone(),
+        Some(project_registry.clone()),
+        server.config.server.allowed_project_roots.clone(),
+    );
+
     Ok(AppState {
         core: CoreServices {
             server,
@@ -467,8 +512,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             project_registry: Some(project_registry),
         },
         engines: EngineServices {
-            skills: Arc::new(RwLock::new(skill_store)),
-            rules: rules.clone(),
+            skills: skills_arc,
+            rules,
             gc_agent,
         },
         observability: ObservabilityServices {
@@ -488,21 +533,13 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             initialized: Arc::new(AtomicBool::new(false)),
             ws_shutdown_tx: broadcast::channel(1).0,
         },
-        interceptors: vec![
-            Arc::new(crate::contract_validator::ContractValidator::new()),
-            Arc::new(crate::rule_enforcer::RuleEnforcer::new(rules.clone())),
-            Arc::new(crate::hook_enforcer::HookEnforcer::new(
-                rules,
-                events_for_hooks,
-                hook_enforcement,
-            )),
-            Arc::new(crate::post_validator::PostExecutionValidator::new(
-                validation_config,
-            )),
-        ],
+        interceptors,
         feishu_intake,
         github_intake,
         completion_callback,
+        project_svc,
+        task_svc,
+        execution_svc,
     })
 }
 
@@ -1071,10 +1108,10 @@ async fn github_webhook(
                 "task_id": task_id.0,
             })),
         ),
-        Err(task_routes::EnqueueTaskError::BadRequest(error)) => {
+        Err(crate::services::EnqueueTaskError::BadRequest(error)) => {
             (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
         }
-        Err(task_routes::EnqueueTaskError::Internal(error)) => (
+        Err(crate::services::EnqueueTaskError::Internal(error)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": error })),
         ),
