@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn make_engine_with_content(content: &str) -> anyhow::Result<RuleEngine> {
