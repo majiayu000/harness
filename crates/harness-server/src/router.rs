@@ -640,7 +640,6 @@ mod tests {
 
     #[tokio::test]
     async fn gc_adopt_schedule_changes_with_gc_config() -> anyhow::Result<()> {
-        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let short_max_rounds = 1;
         let long_max_rounds = 3;
         let short_schedule_turn = run_gc_adopt_and_wait_for_failure_turn(short_max_rounds).await?;
