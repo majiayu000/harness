@@ -33,6 +33,10 @@ inputs:
     description: Comma-separated allow list for bot GitHub actors
     required: false
     default: ""
+  agent:
+    description: Agent backend to use (claude, codex, anthropic-api)
+    required: false
+    default: claude
 
 outputs:
   final-message:
@@ -104,6 +108,7 @@ runs:
         INPUT_PROMPT: ${{ inputs.prompt }}
         INPUT_SANDBOX_MODE: ${{ inputs.sandbox-mode }}
         INPUT_MODEL: ${{ inputs.model }}
+        INPUT_AGENT: ${{ inputs.agent }}
         INPUT_DROP_SUDO: ${{ inputs.drop-sudo }}
         INPUT_UNPRIVILEGED_USER: ${{ inputs.unprivileged-user }}
         INPUT_ALLOW_USERS: ${{ inputs.allow-users }}
@@ -121,6 +126,7 @@ runs:
           exec
           "${INPUT_PROMPT}"
           --project "${GITHUB_WORKSPACE}"
+          --agent "${INPUT_AGENT}"
           --sandbox-mode "${INPUT_SANDBOX_MODE}"
           --output-file "${RELATIVE_OUTPUT_FILE}"
           --actor "${GITHUB_ACTOR}"
