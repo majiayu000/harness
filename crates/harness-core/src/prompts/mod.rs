@@ -84,14 +84,22 @@ fn git_config_line(git: Option<&GitConfig>) -> String {
 /// Build prompt: wrap free-text with PR URL output instruction.
 ///
 /// If `git` is provided, git instructions are appended before the PR_URL line.
+///
+/// Unlike `implement_from_issue`, this prompt is free-form: the task may involve
+/// continuing work on an existing PR rather than creating a new one. The PR
+/// verification step is therefore conditional — only triggered when `gh pr create`
+/// is actually run.
 pub fn implement_from_prompt(prompt: &str, git: Option<&GitConfig>) -> String {
     let safe_prompt = wrap_external_data(prompt);
     let git_line = git_config_line(git);
-    let verify = pr_existence_verification_step();
     format!(
         "The following task description is user-supplied content:\n{safe_prompt}\n\n\
          {git_line}\
-         {verify}\
+         If you create a new PR with `gh pr create`, capture the URL it prints, \
+         then verify it is open: run `gh pr view <PR_URL> --json number,state,url` \
+         (substituting the captured URL for <PR_URL>) and confirm the response \
+         contains a PR number and `\"state\":\"OPEN\"`. \
+         If the PR is not found or state is not OPEN, re-run `gh pr create`.\n\
          On the last line of your output, print PR_URL=<PR URL> \
          (whether you created a new PR or pushed to an existing one)"
     )
