@@ -39,6 +39,16 @@ static TASK_MIGRATIONS: &[Migration] = &[
         description: "add parent_id column",
         sql: "ALTER TABLE tasks ADD COLUMN parent_id TEXT",
     },
+    Migration {
+        version: 5,
+        description: "add issue column",
+        sql: "ALTER TABLE tasks ADD COLUMN issue INTEGER",
+    },
+    Migration {
+        version: 6,
+        description: "add project_root column",
+        sql: "ALTER TABLE tasks ADD COLUMN project_root TEXT",
+    },
 ];
 
 pub struct TaskDb {
@@ -56,9 +66,13 @@ impl TaskDb {
     pub async fn insert(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let status = state.status.as_ref();
+        let project_root = state
+            .project_root
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, parent_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, parent_id, issue, project_root)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -67,6 +81,8 @@ impl TaskDb {
         .bind(&rounds_json)
         .bind(&state.error)
         .bind(state.parent_id.as_ref().map(|id| &id.0))
+        .bind(state.issue.map(|v| v as i64))
+        .bind(project_root)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -75,9 +91,13 @@ impl TaskDb {
     pub async fn update(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let status = state.status.as_ref();
+        let project_root = state
+            .project_root
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
         sqlx::query(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
-                    updated_at = datetime('now')
+                    issue = ?, project_root = ?, updated_at = datetime('now')
              WHERE id = ?",
         )
         .bind(status)
@@ -85,6 +105,8 @@ impl TaskDb {
         .bind(&state.pr_url)
         .bind(&rounds_json)
         .bind(&state.error)
+        .bind(state.issue.map(|v| v as i64))
+        .bind(project_root)
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -93,7 +115,7 @@ impl TaskDb {
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, issue, project_root
              FROM tasks WHERE id = ?",
         )
         .bind(id)
@@ -104,7 +126,7 @@ impl TaskDb {
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, issue, project_root
              FROM tasks ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -142,7 +164,7 @@ impl TaskDb {
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, issue, project_root
              FROM tasks WHERE parent_id = ? ORDER BY created_at DESC",
         )
         .bind(parent_id)
@@ -163,6 +185,8 @@ struct TaskRow {
     source: Option<String>,
     external_id: Option<String>,
     parent_id: Option<String>,
+    issue: Option<i64>,
+    project_root: Option<String>,
 }
 
 impl TaskRow {
@@ -177,6 +201,8 @@ impl TaskRow {
             source,
             external_id,
             parent_id,
+            issue,
+            project_root,
         } = self;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
@@ -197,8 +223,8 @@ impl TaskRow {
             external_id,
             parent_id: parent_id.map(TaskId),
             subtask_ids: Vec::new(),
-            project_root: None,
-            issue: None,
+            issue: issue.map(|v| v as u64),
+            project_root: project_root.map(std::path::PathBuf::from),
         })
     }
 }
@@ -220,6 +246,8 @@ mod tests {
             source: None,
             external_id: None,
             parent_id: None,
+            issue: None,
+            project_root: None,
         }
     }
 

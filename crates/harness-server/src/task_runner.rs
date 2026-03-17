@@ -96,7 +96,8 @@ pub struct TaskState {
     /// Canonical project root this task operates on.
     /// Set when the task starts executing; None for tasks created before this field was added.
     /// Used to identify sibling tasks running in parallel on the same repository.
-    #[serde(default)]
+    /// Skipped during API serialization to avoid leaking server-local filesystem paths.
+    #[serde(skip)]
     pub project_root: Option<PathBuf>,
     /// GitHub issue number, if this task was created from an issue.
     /// Persisted so sibling tasks can identify what others are implementing.
