@@ -153,9 +153,9 @@ mod tests {
             .await
             .expect("stream_child_output should succeed");
 
-        assert!(
-            result.contains("line1") && result.contains("line2") && result.contains("line3"),
-            "returned output must contain all lines, got: {result:?}"
+        assert_eq!(
+            result, "line1\nline2\nline3\n",
+            "returned output must be exactly the three lines with newlines, got: {result:?}"
         );
 
         // Drain channel to collect all sent items.
@@ -169,9 +169,9 @@ mod tests {
             .iter()
             .filter(|item| matches!(item, StreamItem::MessageDelta { .. }))
             .count();
-        assert!(
-            delta_count >= 3,
-            "expected at least 3 deltas, got {delta_count}"
+        assert_eq!(
+            delta_count, 3,
+            "expected exactly 3 deltas (one per line), got {delta_count}"
         );
     }
 
@@ -198,17 +198,17 @@ mod tests {
             items.push(item);
         }
 
-        let first_delta_pos = items
+        let last_delta_pos = items
             .iter()
-            .position(|item| matches!(item, StreamItem::MessageDelta { .. }))
+            .rposition(|item| matches!(item, StreamItem::MessageDelta { .. }))
             .expect("at least one MessageDelta expected");
         let completed_pos = items
             .iter()
             .position(|item| matches!(item, StreamItem::ItemCompleted { .. }))
             .expect("ItemCompleted expected");
         assert!(
-            first_delta_pos < completed_pos,
-            "MessageDelta must precede ItemCompleted"
+            last_delta_pos < completed_pos,
+            "all MessageDeltas must precede ItemCompleted (last delta at {last_delta_pos}, completed at {completed_pos})"
         );
     }
 
@@ -242,9 +242,9 @@ mod tests {
             StreamItem::ItemCompleted {
                 item: Item::AgentReasoning { content },
             } => {
-                assert!(
-                    content.contains("hello") && content.contains("world"),
-                    "ItemCompleted content must include all lines, got: {content:?}"
+                assert_eq!(
+                    content, "hello\nworld\n",
+                    "ItemCompleted content must be exactly the full accumulated output, got: {content:?}"
                 );
             }
             other => panic!("unexpected ItemCompleted payload: {other:?}"),
