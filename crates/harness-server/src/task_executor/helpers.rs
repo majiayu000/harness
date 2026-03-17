@@ -316,7 +316,7 @@ mod tests {
         AgentRequest, AgentResponse, Decision, TokenUsage,
     };
     use std::sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     };
 
@@ -462,6 +462,45 @@ mod tests {
         }
     }
 
+    /// Interceptor that records whether `pre_execute` was invoked.
+    struct CallTrackedInterceptor {
+        called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl TurnInterceptor for CallTrackedInterceptor {
+        fn name(&self) -> &str {
+            "call_tracked"
+        }
+        async fn pre_execute(&self, _req: &AgentRequest) -> InterceptResult {
+            self.called.store(true, Ordering::SeqCst);
+            InterceptResult::pass()
+        }
+    }
+
+    /// Failing post interceptor with a configurable name and error message.
+    struct NamedFailingPostInterceptor {
+        name_str: &'static str,
+        error_msg: &'static str,
+    }
+
+    #[async_trait]
+    impl TurnInterceptor for NamedFailingPostInterceptor {
+        fn name(&self) -> &str {
+            self.name_str
+        }
+        async fn pre_execute(&self, _req: &AgentRequest) -> InterceptResult {
+            InterceptResult::pass()
+        }
+        async fn post_execute(
+            &self,
+            _req: &AgentRequest,
+            _resp: &AgentResponse,
+        ) -> PostExecuteResult {
+            PostExecuteResult::fail(self.error_msg)
+        }
+    }
+
     fn wrap<T: TurnInterceptor + 'static>(t: T) -> Arc<dyn TurnInterceptor> {
         Arc::new(t)
     }
@@ -513,14 +552,20 @@ mod tests {
 
     #[tokio::test]
     async fn run_pre_execute_stops_chain_at_first_block() {
-        // ModifyingInterceptor comes after Block — must never run.
+        // Prove the second interceptor is never invoked when the first blocks.
+        let second_called = Arc::new(AtomicBool::new(false));
         let interceptors: Vec<Arc<dyn TurnInterceptor>> = vec![
             Arc::new(BlockInterceptor::new("early block")),
-            Arc::new(ModifyingInterceptor),
+            Arc::new(CallTrackedInterceptor {
+                called: second_called.clone(),
+            }),
         ];
         let result = run_pre_execute(&interceptors, make_req()).await;
-        // Should fail due to block, not proceed to ModifyingInterceptor.
-        assert!(result.is_err());
+        assert!(result.is_err(), "should fail due to block");
+        assert!(
+            !second_called.load(Ordering::SeqCst),
+            "interceptor after block must not be called"
+        );
     }
 
     // ── run_post_execute ──────────────────────────────────────────────────────
@@ -547,13 +592,35 @@ mod tests {
 
     #[tokio::test]
     async fn run_post_execute_returns_first_failure_only() {
+        // Two interceptors with distinct names and messages — only the first must appear.
         let interceptors: Vec<Arc<dyn TurnInterceptor>> = vec![
-            Arc::new(FailingPostInterceptor),
-            Arc::new(FailingPostInterceptor),
+            Arc::new(NamedFailingPostInterceptor {
+                name_str: "first_fail",
+                error_msg: "first error",
+            }),
+            Arc::new(NamedFailingPostInterceptor {
+                name_str: "second_fail",
+                error_msg: "second error",
+            }),
         ];
         let result = run_post_execute(&interceptors, &make_req(), &make_resp()).await;
-        // Exactly one error string — the chain stops at the first failure.
-        assert!(result.is_some());
+        let error = result.expect("should have an error");
+        assert!(
+            error.contains("first_fail"),
+            "should name the first interceptor"
+        );
+        assert!(
+            error.contains("first error"),
+            "should contain the first error message"
+        );
+        assert!(
+            !error.contains("second_fail"),
+            "second interceptor must not run"
+        );
+        assert!(
+            !error.contains("second error"),
+            "second interceptor must not run"
+        );
     }
 
     #[tokio::test]
