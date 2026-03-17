@@ -4,7 +4,25 @@ use harness_core::{
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 
-/// All JSON-RPC 2.0 methods supported by the Harness App Server.
+/// All JSON-RPC 2.0 methods supported by the Harness agent-facing protocol.
+///
+/// # Transport contract
+///
+/// This enum covers the **agent / data-plane** surface only (JSON-RPC over stdio,
+/// WebSocket, or HTTP `/rpc`).  Task and project management (the *operator /
+/// control-plane* surface) is exclusively available over HTTP REST:
+///
+/// | Control-plane capability | HTTP endpoint |
+/// |--------------------------|---------------|
+/// | Enqueue a task           | `POST /tasks` |
+/// | List tasks               | `GET  /tasks` |
+/// | Batch-create tasks       | `POST /tasks/batch` |
+/// | Stream task output       | `GET  /tasks/{id}/stream` |
+/// | Register a project       | `POST /projects` |
+/// | List projects            | `GET  /projects` |
+/// | Dashboard API            | `GET  /api/dashboard` |
+///
+/// See `docs/api-contract.md` for the full transport role description.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Method {

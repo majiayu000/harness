@@ -1,3 +1,13 @@
+//! JSON-RPC request router — **agent-facing (data plane) only**.
+//!
+//! This module handles the JSON-RPC 2.0 surface used by agents running inside
+//! Harness threads (stdio, WebSocket, or HTTP `/rpc`).  It deliberately does
+//! **not** handle task submission or project registration; those operations are
+//! part of the operator-facing control plane and are exclusively served by the
+//! HTTP REST routes defined in `http.rs`.
+//!
+//! See `docs/api-contract.md` for the full transport role description.
+
 use crate::handlers;
 use crate::http::AppState;
 use harness_protocol::{Method, RpcRequest, RpcResponse};
