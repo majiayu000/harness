@@ -241,14 +241,26 @@ pub fn periodic_review_prompt(
     repo_structure: &str,
     diff_stat: &str,
     recent_commits: &str,
+    guard_violations: &str,
 ) -> String {
     let safe_structure = wrap_external_data(repo_structure);
     let safe_diff_stat = wrap_external_data(diff_stat);
     let safe_commits = wrap_external_data(recent_commits);
+    let violations_section = if guard_violations.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "## VibeGuard Scan Results\n\n\
+             The following violations were detected by automated guard scripts. \
+             Prioritize these in your review:\n{}\n\n",
+            wrap_external_data(guard_violations)
+        )
+    };
     format!(
         "You are conducting a periodic codebase health review. \
          Examine the entire codebase for the 11 categories of issues below. \
          Produce a structured markdown report with severity-ranked findings.\n\n\
+         {violations_section}\
          ## Context\n\n\
          Repository structure:\n{safe_structure}\n\n\
          Changes since last review (diff stat):\n{safe_diff_stat}\n\n\

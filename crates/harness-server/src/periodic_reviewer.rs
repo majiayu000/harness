@@ -85,8 +85,39 @@ async fn run_review_tick(state: &Arc<AppState>, config: &ReviewConfig) -> anyhow
     let diff_stat = gather_diff_stat(project_root, &since_arg).await;
     let recent_commits = gather_recent_commits(project_root, &since_arg).await;
 
-    let prompt =
-        harness_core::prompts::periodic_review_prompt(&repo_structure, &diff_stat, &recent_commits);
+    // Run VibeGuard guard scans and include violations in the review context.
+    let guard_violations = {
+        let rules = state.engines.rules.read().await;
+        match rules.scan(project_root).await {
+            Ok(violations) => {
+                if violations.is_empty() {
+                    String::new()
+                } else {
+                    let mut buf = String::from("Guard scan found the following violations:\n");
+                    for v in &violations {
+                        buf.push_str(&format!(
+                            "- [{}] {}: {}\n",
+                            v.rule_id,
+                            v.file.display(),
+                            v.message
+                        ));
+                    }
+                    buf
+                }
+            }
+            Err(e) => {
+                tracing::warn!("scheduler: guard scan failed, proceeding without: {e}");
+                String::new()
+            }
+        }
+    };
+
+    let prompt = harness_core::prompts::periodic_review_prompt(
+        &repo_structure,
+        &diff_stat,
+        &recent_commits,
+        &guard_violations,
+    );
 
     let req = CreateTaskRequest {
         prompt: Some(prompt),

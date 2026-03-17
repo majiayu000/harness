@@ -705,6 +705,15 @@ where
                     let any_success = results.iter().any(|r| r.response.is_some());
                     mutate_and_persist(&store, &id, |s| {
                         for r in &results {
+                            let detail = if let Some(ref resp) = r.response {
+                                if resp.output.is_empty() {
+                                    None
+                                } else {
+                                    Some(resp.output.clone())
+                                }
+                            } else {
+                                r.error.clone()
+                            };
                             s.rounds.push(RoundResult {
                                 turn: (r.index as u32).saturating_add(1),
                                 action: format!("parallel_subtask_{}", r.index),
@@ -713,7 +722,7 @@ where
                                 } else {
                                     "failed".into()
                                 },
-                                detail: r.error.clone(),
+                                detail,
                             });
                         }
                         if any_success {
