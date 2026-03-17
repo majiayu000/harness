@@ -774,9 +774,41 @@ async fn run_agent_review(
             break;
         }
 
-        // Implementor fixes the issues
+        // Implementor fixes the issues; include sibling context so the fix
+        // round cannot touch files owned by parallel tasks (same guard as
+        // the initial first_prompt injection).
+        let fix_prompt = {
+            let base = prompts::agent_review_fix_prompt(pr_num, &issues, agent_round);
+            let canonical_project = store
+                .get(task_id)
+                .and_then(|s| s.project_root.clone())
+                .unwrap_or_else(|| project.to_path_buf());
+            let siblings: Vec<prompts::SiblingTask> = store
+                .list_all()
+                .into_iter()
+                .filter(|t| {
+                    t.id != *task_id
+                        && matches!(
+                            t.status,
+                            TaskStatus::Implementing
+                                | TaskStatus::Pending
+                                | TaskStatus::Waiting
+                                | TaskStatus::AgentReview
+                                | TaskStatus::Reviewing
+                        )
+                        && t.project_root.as_deref() == Some(canonical_project.as_path())
+                })
+                .map(|t| prompts::SiblingTask { issue: t.issue })
+                .collect();
+            let ctx = prompts::sibling_task_context(&siblings);
+            if ctx.is_empty() {
+                base
+            } else {
+                format!("{base}\n\n{ctx}")
+            }
+        };
         let fix_req = AgentRequest {
-            prompt: prompts::agent_review_fix_prompt(pr_num, &issues, agent_round),
+            prompt: fix_prompt,
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Execution),

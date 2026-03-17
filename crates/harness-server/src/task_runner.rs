@@ -564,6 +564,20 @@ where
         task_id
     };
 
+    // Eagerly populate project_root and issue before spawning so sibling tasks
+    // that build their first prompt concurrently can detect this task's project
+    // affinity without waiting for async path resolution inside the spawned future.
+    // For the common case where req.project is provided this eliminates the race
+    // entirely; for the auto-detect (None) case issue is still pre-populated.
+    if let Err(e) = mutate_and_persist(&store, &task_id, |s| {
+        s.project_root = req.project.clone();
+        s.issue = req.issue;
+    })
+    .await
+    {
+        tracing::warn!("failed to pre-populate task metadata for sibling detection: {e}");
+    }
+
     let id = task_id.clone();
     let store_watcher = store.clone();
     let events_watcher = events.clone();
@@ -581,8 +595,8 @@ where
         let project_root = crate::handlers::validate_project_root(&raw_project)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        // Record project root and issue so sibling tasks running in parallel
-        // can identify each other and avoid modifying the same files.
+        // Update project root to the validated canonical path (may differ from
+        // the pre-populated req.project due to symlink resolution / validation).
         mutate_and_persist(&store, &id, |s| {
             s.project_root = Some(project_root.clone());
             s.issue = req.issue;
