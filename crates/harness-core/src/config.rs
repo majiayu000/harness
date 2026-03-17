@@ -76,6 +76,8 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.reviewer_agent.is_empty());
         assert_eq!(config.max_rounds, 3);
+        assert_eq!(config.review_bot_command, "/gemini review");
+        assert!(config.review_bot_auto_trigger);
     }
 
     #[test]
@@ -89,6 +91,8 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.reviewer_agent, "codex");
         assert_eq!(config.max_rounds, 5);
+        assert_eq!(config.review_bot_command, "/gemini review");
+        assert!(config.review_bot_auto_trigger);
     }
 
     #[test]
@@ -100,6 +104,21 @@ mod tests {
         assert!(config.enabled);
         assert!(config.reviewer_agent.is_empty());
         assert_eq!(config.max_rounds, 3);
+        assert_eq!(config.review_bot_command, "/gemini review");
+        assert!(config.review_bot_auto_trigger);
+    }
+
+    #[test]
+    fn agent_review_config_deserializes_bot_settings() {
+        let toml_str = r#"
+            enabled = true
+            review_bot_command = "/reviewbot run"
+            review_bot_auto_trigger = false
+        "#;
+        let config: AgentReviewConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.review_bot_command, "/reviewbot run");
+        assert!(!config.review_bot_auto_trigger);
     }
 
     #[test]
