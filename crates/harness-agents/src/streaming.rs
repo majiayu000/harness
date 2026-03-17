@@ -301,6 +301,15 @@ mod tests {
             msg.contains("stream send failed"),
             "error must report send failure, got: {msg}"
         );
+
+        // Reap the child to avoid zombie processes on Unix.
+        // kill() may fail if the process already exited naturally; log but don't fail.
+        if let Err(e) = child.kill().await {
+            eprintln!("child kill (may already have exited): {e}");
+        }
+        if let Err(e) = child.wait().await {
+            eprintln!("child wait: {e}");
+        }
     }
 
     // ── filter_agent_stderr ──────────────────────────────────────────────────
