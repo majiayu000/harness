@@ -116,6 +116,7 @@ pub async fn make_test_state_with_registry(
             notification_lagged_total: Arc::new(AtomicU64::new(0)),
             notification_lag_log_every: 1,
             notify_tx: None,
+            initializing: Arc::new(AtomicBool::new(true)),
             initialized: Arc::new(AtomicBool::new(true)),
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },

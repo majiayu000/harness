@@ -46,12 +46,15 @@ top-level navigation requests, `/ws` and `/` additionally accept a
 
 ### JSON-RPC 2.0 — agent-facing (data plane)
 
-JSON-RPC is the protocol used by agents running inside Harness threads. It is
-available over three transports simultaneously:
+JSON-RPC is the protocol used by agents running inside Harness threads. The
+transport is selected at server startup with `--transport <mode>`:
 
-* **stdio** — for agents launched as child processes
-* **WebSocket** (`GET /ws`) — for long-running agent connections
-* **HTTP POST** (`POST /rpc`) — for request/response without a persistent connection
+* **stdio** (`--transport stdio`) — for agents launched as child processes
+* **HTTP + WebSocket** (`--transport http`) — exposes both `GET /ws` (long-running
+  connections) and `POST /rpc` (request/response) over the same HTTP listener
+
+Only one transport mode is active per server instance. Clients must connect via
+the transport that matches how the server was started.
 
 All three transports share the same method set. The following capabilities are
 **only available via JSON-RPC**:

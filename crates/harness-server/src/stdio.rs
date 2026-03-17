@@ -177,6 +177,7 @@ mod tests {
                 notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 notification_lag_log_every: 1,
                 notify_tx: None,
+                initializing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
             },

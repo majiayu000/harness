@@ -41,9 +41,20 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
                     "Server already initialized.",
                 ));
             }
+            state
+                .notifications
+                .initializing
+                .store(true, Ordering::Relaxed);
             Some(handlers::thread::initialize(id).await)
         }
         Method::Initialized => {
+            if !state.notifications.initializing.load(Ordering::Relaxed) {
+                return Some(RpcResponse::error(
+                    id,
+                    harness_protocol::INVALID_REQUEST,
+                    "Send 'initialize' before 'initialized'.",
+                ));
+            }
             state
                 .notifications
                 .initialized
@@ -253,6 +264,7 @@ mod tests {
                 notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 notification_lag_log_every: 1,
                 notify_tx: None,
+                initializing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
             },
@@ -992,6 +1004,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialized_without_initialize_rejected() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut state = make_test_state(dir.path()).await?;
+        // Simulate a fresh server where the handshake has not started.
+        state.notifications.initializing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.notifications.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: Method::Initialized,
+        };
+        let resp = handle_request(&state, req)
+            .await
+            .expect("should return error response");
+        assert!(
+            resp.error.is_some(),
+            "initialized without initialize should be rejected"
+        );
+        assert_eq!(resp.error.unwrap().code, harness_protocol::INVALID_REQUEST);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn handshake_unlocks_methods() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut state = make_test_state(dir.path()).await?;
@@ -1494,6 +1530,7 @@ mod tests {
                 notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 notification_lag_log_every: 1,
                 notify_tx: None,
+                initializing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
             },
