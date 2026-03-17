@@ -379,6 +379,23 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             }
         };
 
+    // Cleanup orphan worktrees from any previous crash.
+    if let Some(ref wmgr) = workspace_mgr {
+        let terminal_ids: Vec<crate::task_runner::TaskId> = tasks
+            .list_all()
+            .into_iter()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    crate::task_runner::TaskStatus::Done | crate::task_runner::TaskStatus::Failed
+                )
+            })
+            .map(|t| t.id)
+            .collect();
+        wmgr.cleanup_orphan_worktrees(&project_root, &terminal_ids)
+            .await;
+    }
+
     let task_queue = Arc::new(crate::task_queue::TaskQueue::new(
         &server.config.concurrency,
     ));

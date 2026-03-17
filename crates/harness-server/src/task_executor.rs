@@ -272,7 +272,7 @@ pub(crate) async fn run_task(
     project: PathBuf,
     server_config: &harness_core::HarnessConfig,
 ) -> anyhow::Result<()> {
-    update_status(store, task_id, TaskStatus::Implementing, 1).await;
+    update_status(store, task_id, TaskStatus::Implementing, 1).await?;
 
     let project_config = load_project_config(&project);
     let resolved = harness_core::config::resolve_config(server_config, &project_config);
@@ -453,7 +453,7 @@ pub(crate) async fn run_task(
             detail: None,
         });
     })
-    .await;
+    .await?;
 
     // Log implementation event
     let mut ev = Event::new(
@@ -473,7 +473,7 @@ pub(crate) async fn run_task(
             s.status = TaskStatus::Done;
             s.turn = 2;
         })
-        .await;
+        .await?;
         return Ok(());
     };
 
@@ -505,7 +505,7 @@ pub(crate) async fn run_task(
     // task execution is sequential within a single tokio task, so a plain u32 suffices.
     let mut waiting_count: u32 = 0;
     waiting_count += 1;
-    update_status(store, task_id, TaskStatus::Waiting, waiting_count).await;
+    update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
 
     let wait_secs = req.wait_secs;
     tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
@@ -513,7 +513,7 @@ pub(crate) async fn run_task(
 
     // Review loop
     for round in 1..=req.max_rounds {
-        update_status(store, task_id, TaskStatus::Reviewing, round).await;
+        update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let check_req = AgentRequest {
             prompt: prompts::check_existing_pr(pr_num, &review_config.review_bot_command),
@@ -566,7 +566,7 @@ pub(crate) async fn run_task(
                 detail: None,
             });
         })
-        .await;
+        .await?;
 
         // Log pr_review event for observability and GC signal detection.
         let mut ev = Event::new(
@@ -595,14 +595,14 @@ pub(crate) async fn run_task(
                 s.status = TaskStatus::Done;
                 s.turn = round.saturating_add(1);
             })
-            .await;
+            .await?;
             return Ok(());
         }
 
         tracing::info!("PR #{pr_num} not yet approved at round {round}; waiting");
         if round < req.max_rounds {
             waiting_count += 1;
-            update_status(store, task_id, TaskStatus::Waiting, waiting_count).await;
+            update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
             sleep(Duration::from_secs(wait_secs)).await;
         }
     }
@@ -615,7 +615,7 @@ pub(crate) async fn run_task(
             req.max_rounds
         ));
     })
-    .await;
+    .await?;
     Ok(())
 }
 
@@ -635,7 +635,7 @@ async fn run_agent_review(
 ) -> anyhow::Result<()> {
     let max_rounds = review_config.max_rounds;
     for agent_round in 1..=max_rounds {
-        update_status(store, task_id, TaskStatus::AgentReview, agent_round).await;
+        update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
 
         // Reviewer evaluates the PR diff
         let review_req = AgentRequest {
@@ -695,7 +695,7 @@ async fn run_agent_review(
                 detail: Some(review_detail),
             });
         })
-        .await;
+        .await?;
 
         // Log agent_review event
         let mut ev = Event::new(
@@ -785,7 +785,7 @@ async fn run_agent_review(
                 detail: None,
             });
         })
-        .await;
+        .await?;
     }
 
     Ok(())

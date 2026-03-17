@@ -275,8 +275,8 @@ pub(crate) async fn update_status(
     task_id: &TaskId,
     status: TaskStatus,
     round: u32,
-) {
-    crate::task_runner::update_status(store, task_id, status, round).await;
+) -> anyhow::Result<()> {
+    crate::task_runner::update_status(store, task_id, status, round).await
 }
 
 /// Build the context item list for an agent request: skills matching the prompt
