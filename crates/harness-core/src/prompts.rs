@@ -396,23 +396,27 @@ pub struct SiblingTask {
 /// When `siblings` is empty, returns an empty string so callers can skip appending it.
 /// The block instructs the agent to stay in its lane and avoid modifying files owned by
 /// siblings, which reduces cross-agent merge conflicts in parallel dispatch scenarios.
+///
+/// Sibling descriptions are user-supplied text and are wrapped with [`wrap_external_data`]
+/// so the agent treats them as untrusted data rather than trusted instructions.
 pub fn sibling_task_context(siblings: &[SiblingTask]) -> String {
     if siblings.is_empty() {
         return String::new();
     }
-    let mut lines = vec![
-        "\u{26a0}\u{fe0f}  The following issues are being handled by OTHER agents in parallel on this same project.".to_string(),
-        "Do NOT modify files related to these issues — another agent is responsible:".to_string(),
-    ];
+    let mut desc_lines: Vec<String> = Vec::with_capacity(siblings.len());
     for s in siblings {
         match s.issue {
-            Some(n) => lines.push(format!("- #{n}: {}", s.description)),
-            None => lines.push(format!("- {}", s.description)),
+            Some(n) => desc_lines.push(format!("#{n}: {}", s.description)),
+            None => desc_lines.push(s.description.clone()),
         }
     }
-    lines.push(String::new());
-    lines.push("Only modify files directly needed for YOUR assigned task.".to_string());
-    lines.join("\n")
+    let safe_list = wrap_external_data(&desc_lines.join("\n"));
+    format!(
+        "\u{26a0}\u{fe0f}  The following issues are being handled by OTHER agents in parallel on this same project.\n\
+         Do NOT modify files related to these issues — another agent is responsible:\n\
+         {safe_list}\n\
+         \nOnly modify files directly needed for YOUR assigned task."
+    )
 }
 
 /// Wrap `s` in POSIX single quotes, escaping any embedded single quotes via `'\''`.

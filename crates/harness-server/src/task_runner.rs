@@ -606,8 +606,10 @@ where
         let description = req.issue.map(|n| format!("issue #{n}")).or_else(|| {
             req.prompt.as_ref().map(|p| {
                 let s = p.trim();
-                if s.len() > 80 {
-                    format!("{}...", &s[..80])
+                // Use char_indices to find a safe UTF-8 boundary at or before 80 chars.
+                let cutoff = s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len());
+                if cutoff < s.len() {
+                    format!("{}...", &s[..cutoff])
                 } else {
                     s.to_string()
                 }
@@ -956,9 +958,18 @@ mod tests {
 
         let siblings = store.list_siblings(&project, &current_id);
         let sibling_ids: Vec<&str> = siblings.iter().map(|s| s.id.0.as_str()).collect();
-        assert_eq!(siblings.len(), 2, "expected 2 siblings, got: {sibling_ids:?}");
-        assert!(siblings.iter().all(|s| &s.id != &current_id), "current task must be excluded");
-        assert!(siblings.iter().all(|s| s.project_root.as_deref() == Some(project.as_path())));
+        assert_eq!(
+            siblings.len(),
+            2,
+            "expected 2 siblings, got: {sibling_ids:?}"
+        );
+        assert!(
+            siblings.iter().all(|s| &s.id != &current_id),
+            "current task must be excluded"
+        );
+        assert!(siblings
+            .iter()
+            .all(|s| s.project_root.as_deref() == Some(project.as_path())));
 
         // No siblings when no other active tasks share the project.
         let no_siblings = store.list_siblings(&other_project, &current_id);

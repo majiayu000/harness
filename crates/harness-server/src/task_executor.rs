@@ -329,8 +329,17 @@ pub(crate) async fn run_task(
 
     // Inject sibling-awareness context when other agents are working on the same project.
     // This prevents parallel agents from over-scoping their changes into each other's files.
+    //
+    // `project` may be a per-task worktree path when workspace isolation is active, but the
+    // sibling cache stores the canonical source repo path (set at spawn time before the worktree
+    // is created). Look up the canonical root from the task's own cache entry so that
+    // list_siblings() path comparison works correctly in the isolated-worktree case.
     let first_prompt = {
-        let siblings = store.list_siblings(&project, task_id);
+        let canonical_project = store
+            .get(task_id)
+            .and_then(|s| s.project_root)
+            .unwrap_or_else(|| project.clone());
+        let siblings = store.list_siblings(&canonical_project, task_id);
         if siblings.is_empty() {
             first_prompt
         } else {
