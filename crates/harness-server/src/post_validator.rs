@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use harness_core::{
     interceptor::{InterceptResult, PostExecuteResult, TurnInterceptor},
-    AgentRequest, AgentResponse, ValidationConfig,
+    prompts, AgentRequest, AgentResponse, ValidationConfig,
 };
 use std::path::Path;
 use tokio::process::Command;
@@ -96,7 +96,7 @@ impl TurnInterceptor for PostExecutionValidator {
         Some(self.config.max_retries)
     }
 
-    async fn post_execute(&self, req: &AgentRequest, _resp: &AgentResponse) -> PostExecuteResult {
+    async fn post_execute(&self, req: &AgentRequest, resp: &AgentResponse) -> PostExecuteResult {
         let project = &req.project_root;
 
         // Only run explicitly configured commands from .harness/config.toml.
@@ -148,6 +148,36 @@ impl TurnInterceptor for PostExecutionValidator {
                     Err(e) => {
                         tracing::warn!(cmd = %cmd, error = %e, "post_validator: failed");
                         errors.push(e);
+                    }
+                }
+            }
+        }
+
+        // PR existence verification: if the agent output contains a PR_URL,
+        // verify via `gh pr view` that the PR actually exists on GitHub.
+        // This prevents silently succeeding when an agent claims to have created
+        // a PR that does not exist. Runs only when all other validations pass
+        // to avoid noisy failures from incomplete code.
+        if errors.is_empty() {
+            if let Some(pr_url) = prompts::parse_pr_url(&resp.output) {
+                if let Some(pr_num) = prompts::extract_pr_number(&pr_url) {
+                    let verify_cmd = format!("gh pr view {pr_num} --json number");
+                    tracing::info!(
+                        pr_num,
+                        "post_validator: verifying PR existence via GitHub API"
+                    );
+                    match Self::run_command(&verify_cmd, project, self.config.timeout_secs).await {
+                        Ok(()) => tracing::debug!(pr_num, "post_validator: PR #{pr_num} verified"),
+                        Err(e) => {
+                            tracing::warn!(
+                                pr_num,
+                                error = %e,
+                                "post_validator: PR verification failed"
+                            );
+                            errors.push(format!(
+                                "PR #{pr_num} could not be verified via GitHub API: {e}"
+                            ));
+                        }
                     }
                 }
             }
@@ -412,5 +442,78 @@ mod tests {
         let _result = validator.post_execute(&req, &resp).await;
         // pre_push should NOT have run because pre_commit failed
         assert!(!marker.exists());
+    }
+
+    // ── PR existence verification ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn pr_verification_skipped_when_output_has_no_pr_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ValidationConfig::default();
+        let validator = PostExecutionValidator::new(config);
+        let req = make_req(dir.path().to_path_buf());
+        let resp = make_resp("implementation done, no PR created");
+        let result = validator.post_execute(&req, &resp).await;
+        // No PR_URL in output → verification not attempted → pass
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn pr_verification_skipped_when_pr_url_has_no_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ValidationConfig::default();
+        let validator = PostExecutionValidator::new(config);
+        let req = make_req(dir.path().to_path_buf());
+        // URL does not contain a PR number
+        let resp = make_resp("done\nPR_URL=https://github.com/owner/repo/");
+        let result = validator.post_execute(&req, &resp).await;
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn pr_verification_skipped_when_pre_commit_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ValidationConfig {
+            pre_commit: vec!["false".to_string()],
+            ..Default::default()
+        };
+        let validator = PostExecutionValidator::new(config);
+        let req = make_req(dir.path().to_path_buf());
+        // PR_URL is present but pre_commit failed — verification must not run
+        let resp = make_resp("done\nPR_URL=https://github.com/owner/repo/pull/42");
+        let result = validator.post_execute(&req, &resp).await;
+        let err = result.error.unwrap();
+        // The error should be from pre_commit, not from PR verification
+        assert!(
+            err.contains("false"),
+            "expected pre_commit error, got: {err}"
+        );
+        assert!(
+            !err.contains("PR #42"),
+            "PR verification must not run when pre_commit fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_verification_fails_when_gh_pr_view_fails() {
+        // In a temp directory with no git remote, `gh pr view` will fail
+        // because it cannot determine the repository. This test verifies that
+        // the validator captures and surfaces that failure.
+        let dir = tempfile::tempdir().unwrap();
+        let config = ValidationConfig::default();
+        let validator = PostExecutionValidator::new(config);
+        let req = make_req(dir.path().to_path_buf());
+        let resp = make_resp("PR_URL=https://github.com/owner/repo/pull/99999");
+        let result = validator.post_execute(&req, &resp).await;
+        // gh pr view should fail (no git remote in temp dir, or gh not installed)
+        assert!(
+            result.error.is_some(),
+            "expected PR verification error when gh pr view fails in a non-git directory"
+        );
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("PR #99999"),
+            "expected error mentioning PR number, got: {err}"
+        );
     }
 }
