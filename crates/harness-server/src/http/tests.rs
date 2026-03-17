@@ -899,9 +899,9 @@ async fn make_test_state_with_dispatch_agents(
     Ok((state, default_invoked, claude_invoked))
 }
 
-/// Poll (with 500 ms deadline) until `flag` is set; panic with `msg` on timeout.
+/// Poll (with 5 s deadline) until `flag` is set; panic with `msg` on timeout.
 async fn wait_for_invocation(flag: &std::sync::atomic::AtomicBool, msg: &str) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if flag.load(std::sync::atomic::Ordering::SeqCst) {
             return;
@@ -915,7 +915,8 @@ async fn wait_for_invocation(flag: &std::sync::atomic::AtomicBool, msg: &str) {
 
 #[tokio::test]
 async fn dispatch_complex_prompt_selects_claude_agent() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = crate::test_helpers::tempdir_in_home("dispatch-complex-")?;
     let (state, default_invoked, claude_invoked) =
         make_test_state_with_dispatch_agents(dir.path()).await?;
     let app = task_app(state);
@@ -955,7 +956,8 @@ async fn dispatch_complex_prompt_selects_claude_agent() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn dispatch_simple_prompt_selects_default_agent() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = crate::test_helpers::tempdir_in_home("dispatch-simple-")?;
     let (state, default_invoked, claude_invoked) =
         make_test_state_with_dispatch_agents(dir.path()).await?;
     let app = task_app(state);
