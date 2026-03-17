@@ -34,8 +34,15 @@ observes results. The following capabilities are **only available over HTTP**:
 | `POST /signals` | ingest | Signal ingestion (rate-limited) |
 | `GET  /health` | health | Server health check |
 
-Authentication: all routes (except `/health`) require an `Authorization: Bearer
-<token>` header validated with constant-time comparison.
+Authentication: when `api_token` is configured, all routes require proof of the
+token; without a configured token the middleware is a no-op (backward
+compatibility).  Exempt routes that bypass auth entirely: `/health`,
+`/webhook`, `/webhook/feishu`, `/signals`, and `/favicon.ico` (these carry
+their own HMAC-based protection or are intentionally public).  For browser
+clients that cannot set `Authorization` headers on WebSocket upgrades or
+top-level navigation requests, `/ws` and `/` additionally accept a
+`?token=<value>` query parameter as a fallback; all other routes only accept
+`Authorization: Bearer <token>`.
 
 ### JSON-RPC 2.0 — agent-facing (data plane)
 
@@ -89,17 +96,23 @@ All three transports share the same method set. The following capabilities are
 | `preflight` | Pre-flight validation |
 | `cross_review` | Cross-agent code review |
 
-JSON-RPC requires a handshake (`initialize` → `initialized`) before any other
-method is accepted.
+JSON-RPC requires a server-wide handshake (`initialize` → `initialized`) before
+any method other than `initialize`/`initialized` is accepted.  This handshake
+is **server-wide, not per-connection**: the first client to complete it sets a
+shared flag; all subsequent connections (stdio, WebSocket, or HTTP `/rpc`) can
+send methods immediately without repeating the handshake.  Sending `initialize`
+again after the server is already initialized returns a `-32600 INVALID_REQUEST`
+error.
 
 ## Why the split?
 
 The design is intentional:
 
 1. **Security boundary** — Task submission and project registration are privileged
-   operations. Keeping them HTTP-only means they are always protected by the same
-   token-based authentication middleware. Agent processes communicating over stdio
-   cannot submit new tasks or register projects.
+   operations. Keeping them HTTP-only means they go through the same
+   token-based authentication middleware (when `api_token` is configured).
+   Agent processes communicating over stdio cannot submit new tasks or register
+   projects regardless of auth configuration.
 
 2. **Semantic clarity** — HTTP semantics (status codes, REST verbs, SSE) are a
    natural fit for long-running job management. JSON-RPC semantics (request/
