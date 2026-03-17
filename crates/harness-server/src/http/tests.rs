@@ -823,6 +823,111 @@ async fn dashboard_no_auth_configured_remains_public() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let secret = "secret";
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let before_count = state.core.tasks.count();
+    let app = webhook_app(state.clone());
+
+    let payload = serde_json::json!({
+        "action": "opened",
+        "issue": {
+            "number": 77,
+            "body": "@harness please implement this feature"
+        }
+    });
+    let payload_body = payload.to_string();
+    let signature = webhook_signature(secret, payload_body.as_bytes());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("x-github-event", "issues")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload_body))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(state.core.tasks.count(), before_count + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn webhook_pull_request_review_changes_requested_creates_task() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let secret = "secret";
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let before_count = state.core.tasks.count();
+    let app = webhook_app(state.clone());
+
+    let payload = serde_json::json!({
+        "action": "submitted",
+        "review": {
+            "state": "changes_requested",
+            "body": "Please fix the error handling.",
+            "html_url": "https://github.com/org/repo/pull/10#pullrequestreview-1"
+        },
+        "pull_request": {
+            "number": 10,
+            "html_url": "https://github.com/org/repo/pull/10"
+        },
+        "repository": { "full_name": "org/repo" }
+    });
+    let payload_body = payload.to_string();
+    let signature = webhook_signature(secret, payload_body.as_bytes());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("x-github-event", "pull_request_review")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload_body))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(state.core.tasks.count(), before_count + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn webhook_ping_event_returns_accepted_without_creating_task() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let secret = "secret";
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let before_count = state.core.tasks.count();
+    let app = webhook_app(state.clone());
+
+    let payload = serde_json::json!({ "zen": "Design for failure." });
+    let payload_body = payload.to_string();
+    let signature = webhook_signature(secret, payload_body.as_bytes());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("x-github-event", "ping")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload_body))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(state.core.tasks.count(), before_count);
+    Ok(())
+}
+
 /// Agent stub that records invocations via an atomic flag.
 /// Records in both `execute` and `execute_stream` since the task executor
 /// calls `execute_stream` (via `run_agent_streaming`).
