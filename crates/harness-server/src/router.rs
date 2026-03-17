@@ -223,6 +223,7 @@ mod tests {
                 tasks,
                 thread_db: Some(thread_db),
                 plan_db: None,
+                plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
                 project_registry: None,
             },
             engines: crate::http::EngineServices {
@@ -1464,6 +1465,7 @@ mod tests {
                 tasks,
                 thread_db: Some(thread_db),
                 plan_db: Some(plan_db),
+                plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
                 project_registry: None,
             },
             engines: crate::http::EngineServices {

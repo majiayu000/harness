@@ -13,6 +13,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use dashmap::DashMap;
 use harness_protocol::{RpcNotification, RpcRequest};
 use serde_json::json;
 use std::collections::HashMap;
@@ -66,6 +67,9 @@ pub struct CoreServices {
     pub tasks: Arc<task_runner::TaskStore>,
     pub thread_db: Option<crate::thread_db::ThreadDb>,
     pub plan_db: Option<crate::plan_db::PlanDb>,
+    /// In-memory plan cache hydrated from `plan_db` on startup.
+    /// Write-through: every mutation must also persist via `plan_db`.
+    pub plan_cache: Arc<DashMap<String, harness_exec::ExecPlan>>,
     pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
 }
 
@@ -350,6 +354,21 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             .insert(thread.id.as_str().to_string(), thread);
     }
 
+    // Load persisted plans into the in-memory plan cache
+    let plan_cache: Arc<DashMap<String, harness_exec::ExecPlan>> = Arc::new(DashMap::new());
+    match plan_db.list().await {
+        Ok(plans) => {
+            let count = plans.len();
+            for plan in plans {
+                plan_cache.insert(plan.id.as_str().to_string(), plan);
+            }
+            if count > 0 {
+                tracing::info!(count, "plan cache: loaded {} plan(s) from db", count);
+            }
+        }
+        Err(e) => tracing::warn!("plan cache: failed to load plans on startup: {e}"),
+    }
+
     let mut skill_store = harness_skills::SkillStore::new()
         .with_persist_dir(dir.join("skills"))
         .with_discovery(&project_root);
@@ -461,6 +480,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             tasks,
             thread_db: Some(thread_db),
             plan_db: Some(plan_db),
+            plan_cache,
             project_registry: Some(project_registry),
         },
         engines: EngineServices {
