@@ -12,7 +12,7 @@ pub use agents::{
 };
 pub use intake::{FeishuIntakeConfig, GitHubIntakeConfig, IntakeConfig};
 pub use misc::{
-    ConcurrencyConfig, GcConfig, ObserveConfig, OtelConfig, OtelExporter, ReviewConfig,
+    ConcurrencyConfig, GcConfig, ObserveConfig, OtelConfig, OtelExporter, ReviewConfig, ReviewMode,
     RulesConfig, SignalThresholdsConfig, ValidationConfig, WorkspaceConfig,
 };
 pub use project::{
@@ -441,6 +441,31 @@ mod tests {
         assert_eq!(config.interval_hours, 24);
         assert_eq!(config.timeout_secs, 900);
         assert!(config.agent.is_none());
+        assert_eq!(config.mode, ReviewMode::Incremental);
+    }
+
+    #[test]
+    fn review_mode_default_is_incremental() {
+        assert_eq!(ReviewMode::default(), ReviewMode::Incremental);
+    }
+
+    #[test]
+    fn review_mode_deserializes_full_from_toml() {
+        let config: ReviewConfig = toml::from_str("enabled = true\nmode = \"full\"").unwrap();
+        assert_eq!(config.mode, ReviewMode::Full);
+    }
+
+    #[test]
+    fn review_mode_deserializes_incremental_from_toml() {
+        let config: ReviewConfig =
+            toml::from_str("enabled = true\nmode = \"incremental\"").unwrap();
+        assert_eq!(config.mode, ReviewMode::Incremental);
+    }
+
+    #[test]
+    fn review_mode_defaults_to_incremental_when_omitted() {
+        let config: ReviewConfig = toml::from_str("enabled = true").unwrap();
+        assert_eq!(config.mode, ReviewMode::Incremental);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use crate::http::task_routes;
 use crate::http::AppState;
 use crate::task_runner::CreateTaskRequest;
-use harness_core::{Decision, Event, EventFilters, ReviewConfig, SessionId};
+use harness_core::{Decision, Event, EventFilters, ReviewConfig, ReviewMode, SessionId};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -32,52 +33,92 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
 }
 
 async fn run_review_tick(state: &Arc<AppState>, config: &ReviewConfig) -> anyhow::Result<()> {
-    let project_root = &state.core.project_root;
+    // Collect all active project roots to review. When the registry is available, iterate
+    // every active project; otherwise fall back to the single default project root.
+    let project_roots: Vec<(Option<String>, std::path::PathBuf)> =
+        match &state.core.project_registry {
+            Some(registry) => {
+                let projects = registry
+                    .list()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to list projects: {e}"))?;
+                projects
+                    .into_iter()
+                    .filter(|p| p.active)
+                    .map(|p| (Some(p.id), p.root))
+                    .collect()
+            }
+            None => vec![(None, state.core.project_root.clone())],
+        };
 
-    // Query EventStore for the most recent "periodic_review" event timestamp.
-    let events = state
-        .observability
-        .events
-        .query(&EventFilters {
-            hook: Some("periodic_review".to_string()),
-            ..EventFilters::default()
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to query periodic_review events: {e}"))?;
+    if project_roots.is_empty() {
+        tracing::debug!("scheduler: no active projects to review");
+        return Ok(());
+    }
 
-    let last_review_ts = events.iter().map(|e| e.ts).max();
-
-    // If there was a prior review, skip this cycle when no new commits have landed.
-    // On first boot (no prior event) we always run.
-    if let Some(ts) = last_review_ts {
-        let since = ts.to_rfc3339();
-        let output = tokio::process::Command::new("git")
-            .args(["log", "--oneline", &format!("--since={since}"), "-1"])
-            .current_dir(project_root)
-            .output()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to run git log: {e}"))?;
-
-        if String::from_utf8_lossy(&output.stdout).trim().is_empty() {
-            tracing::debug!(
-                since = %since,
-                "scheduler: periodic review skipped — no new commits"
+    for (project_id, root) in project_roots {
+        if let Err(err) = run_review_for_project(state, config, &root, project_id.as_deref()).await
+        {
+            tracing::error!(
+                project = ?project_id,
+                root = %root.display(),
+                "scheduler: review failed for project: {err}"
             );
-            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Run one review cycle for a single project root.
+///
+/// `project_id` is used to scope the event-store checkpoint so each project
+/// tracks its own last-review timestamp independently.
+async fn run_review_for_project(
+    state: &Arc<AppState>,
+    config: &ReviewConfig,
+    project_root: &Path,
+    project_id: Option<&str>,
+) -> anyhow::Result<()> {
+    // Build the hook name scoped to this project so checkpoints are independent.
+    let hook_name = match project_id {
+        Some(id) => format!("periodic_review:{id}"),
+        None => "periodic_review".to_string(),
+    };
+
+    // In incremental mode: skip the cycle when no new commits have landed.
+    // In full mode: always run.
+    if config.mode == ReviewMode::Incremental {
+        let events = state
+            .observability
+            .events
+            .query(&EventFilters {
+                hook: Some(hook_name.clone()),
+                ..EventFilters::default()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to query {hook_name} events: {e}"))?;
+
+        if let Some(ts) = events.iter().map(|e| e.ts).max() {
+            let since = ts.to_rfc3339();
+            let output = tokio::process::Command::new("git")
+                .args(["log", "--oneline", &format!("--since={since}"), "-1"])
+                .current_dir(project_root)
+                .output()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to run git log: {e}"))?;
+
+            if String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+                tracing::debug!(
+                    project = ?project_id,
+                    since = %since,
+                    "scheduler: periodic review skipped — no new commits"
+                );
+                return Ok(());
+            }
         }
     }
 
-    // Gather context strings for the review prompt.
-    let since_arg = last_review_ts
-        .map(|ts| ts.to_rfc3339())
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-
-    let repo_structure = gather_repo_structure(project_root).await;
-    let diff_stat = gather_diff_stat(project_root, &since_arg).await;
-    let recent_commits = gather_recent_commits(project_root, &since_arg).await;
-
-    let prompt =
-        harness_core::prompts::periodic_review_prompt(&repo_structure, &diff_stat, &recent_commits);
+    let prompt = build_prompt(state, config, project_root).await?;
 
     let req = CreateTaskRequest {
         prompt: Some(prompt),
@@ -91,6 +132,8 @@ async fn run_review_tick(state: &Arc<AppState>, config: &ReviewConfig) -> anyhow
         Ok(task_id) => {
             tracing::info!(
                 task_id = %task_id,
+                project = ?project_id,
+                mode = ?config.mode,
                 "scheduler: periodic review task enqueued"
             );
         }
@@ -101,21 +144,58 @@ async fn run_review_tick(state: &Arc<AppState>, config: &ReviewConfig) -> anyhow
         }
     }
 
-    // Log a "periodic_review" event so the next cycle can check the timestamp.
-    let event = Event::new(
-        SessionId::new(),
-        "periodic_review",
-        "scheduler",
-        Decision::Pass,
-    );
+    // Log a checkpoint event so the next cycle can check the timestamp.
+    let event = Event::new(SessionId::new(), &hook_name, "scheduler", Decision::Pass);
     if let Err(err) = state.observability.events.log(&event).await {
-        tracing::warn!("scheduler: failed to log periodic_review event: {err}");
+        tracing::warn!(
+            project = ?project_id,
+            "scheduler: failed to log {hook_name} event: {err}"
+        );
     }
 
     Ok(())
 }
 
-async fn gather_repo_structure(project_root: &std::path::Path) -> String {
+/// Build the review prompt based on the configured mode.
+///
+/// - `full`: only repo structure, no diff/commit noise.
+/// - `incremental`: repo structure + diff stat + recent commits.
+async fn build_prompt(
+    state: &Arc<AppState>,
+    config: &ReviewConfig,
+    project_root: &Path,
+) -> anyhow::Result<String> {
+    let repo_structure = gather_repo_structure(project_root).await;
+
+    let prompt = if config.mode == ReviewMode::Full {
+        harness_core::prompts::full_repo_review_prompt(&repo_structure)
+    } else {
+        // Incremental: compute the since timestamp from the last review event.
+        let events = state
+            .observability
+            .events
+            .query(&EventFilters {
+                hook: Some("periodic_review".to_string()),
+                ..EventFilters::default()
+            })
+            .await
+            .unwrap_or_default();
+        let since_arg = events
+            .iter()
+            .map(|e| e.ts)
+            .max()
+            .map(|ts| ts.to_rfc3339())
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+
+        let diff_stat = gather_diff_stat(project_root, &since_arg).await;
+        let recent_commits = gather_recent_commits(project_root, &since_arg).await;
+        harness_core::prompts::periodic_review_prompt(&repo_structure, &diff_stat, &recent_commits)
+    };
+
+    Ok(prompt)
+}
+
+async fn gather_repo_structure(project_root: &Path) -> String {
     let output = tokio::process::Command::new("git")
         .args(["ls-files", "--", "*.rs"])
         .current_dir(project_root)
@@ -127,7 +207,7 @@ async fn gather_repo_structure(project_root: &std::path::Path) -> String {
     }
 }
 
-async fn gather_diff_stat(project_root: &std::path::Path, since: &str) -> String {
+async fn gather_diff_stat(project_root: &Path, since: &str) -> String {
     // Find the first new commit after `since` to diff from its parent.
     let rev_output = tokio::process::Command::new("git")
         .args([
@@ -164,7 +244,7 @@ async fn gather_diff_stat(project_root: &std::path::Path, since: &str) -> String
     }
 }
 
-async fn gather_recent_commits(project_root: &std::path::Path, since: &str) -> String {
+async fn gather_recent_commits(project_root: &Path, since: &str) -> String {
     let output = tokio::process::Command::new("git")
         .args(["log", "--oneline", &format!("--since={since}")])
         .current_dir(project_root)
@@ -187,6 +267,7 @@ mod tests {
         assert_eq!(config.interval_hours, 24);
         assert_eq!(config.timeout_secs, 900);
         assert!(config.agent.is_none());
+        assert_eq!(config.mode, ReviewMode::Incremental);
     }
 
     #[test]
@@ -196,11 +277,35 @@ mod tests {
             interval_hours: 12,
             agent: Some("claude".to_string()),
             timeout_secs: 600,
+            mode: ReviewMode::Full,
         };
         assert!(config.enabled);
         assert_eq!(config.interval_hours, 12);
         assert_eq!(config.agent.as_deref(), Some("claude"));
         assert_eq!(config.timeout_secs, 600);
+        assert_eq!(config.mode, ReviewMode::Full);
+    }
+
+    #[test]
+    fn review_mode_default_is_incremental() {
+        assert_eq!(ReviewMode::default(), ReviewMode::Incremental);
+    }
+
+    #[test]
+    fn hook_name_scoped_per_project() {
+        // Verify the hook naming logic used in run_review_for_project.
+        let with_id = match Some("my-project") {
+            Some(id) => format!("periodic_review:{id}"),
+            None => "periodic_review".to_string(),
+        };
+        assert_eq!(with_id, "periodic_review:my-project");
+
+        let without_id: Option<&str> = None;
+        let fallback = match without_id {
+            Some(id) => format!("periodic_review:{id}"),
+            None => "periodic_review".to_string(),
+        };
+        assert_eq!(fallback, "periodic_review");
     }
 
     #[test]

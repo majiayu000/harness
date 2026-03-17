@@ -110,6 +110,9 @@ mod tests {
             external_id: None,
             parent_id: None,
             subtask_ids: vec![],
+            project_root: None,
+            issue: None,
+            description: None,
         };
         state.source = Some("github".to_string());
         store.insert(&state).await;
@@ -140,6 +143,9 @@ mod tests {
             external_id: None,
             parent_id: None,
             subtask_ids: vec![child_id.clone()],
+            project_root: None,
+            issue: None,
+            description: None,
         };
         store.insert(&parent_state).await;
 
@@ -154,6 +160,9 @@ mod tests {
             external_id: None,
             parent_id: Some(parent_id.clone()),
             subtask_ids: vec![],
+            project_root: None,
+            issue: None,
+            description: None,
         };
         store.insert(&child_state).await;
 
