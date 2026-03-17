@@ -103,9 +103,11 @@ pub fn implement_from_prompt(prompt: &str, git: Option<&GitConfig>) -> String {
 /// This delegates GitHub API verification to the agent, conforming to the
 /// "zero gh/git calls in harness crates" architecture rule in CLAUDE.md.
 fn pr_existence_verification_step() -> &'static str {
-    "After creating the PR, verify it exists: run `gh pr view --json number,state` \
-     and confirm it returns valid JSON with a PR number. \
-     If the PR is not found, re-run `gh pr create`.\n"
+    "After creating the PR, capture the URL printed by `gh pr create`, \
+     then verify it is open: run `gh pr view <PR_URL> --json number,state,url` \
+     (substituting the captured URL for <PR_URL>) and confirm the response \
+     contains a PR number and `\"state\":\"OPEN\"`. \
+     If the PR is not found or state is not OPEN, re-run `gh pr create`.\n"
 }
 
 /// Build prompt: adopt a GC draft — create branch, commit applied files, push, open PR.
@@ -133,7 +135,9 @@ pub fn gc_adopt_prompt(
          4. Commit with a descriptive message referencing the rationale\n\
          5. Push the branch\n\
          6. Open a PR targeting the default branch with `gh pr create`\n\
-         7. Verify the PR exists: run `gh pr view --json number,state` and confirm it returns valid JSON with a PR number.\n\n\
+         7. Capture the URL printed by `gh pr create` in step 6, then verify it is open: \
+         run `gh pr view <PR_URL> --json number,state,url` (substituting the captured URL) \
+         and confirm `\"state\":\"OPEN\"`. Re-run `gh pr create` if not found or not open.\n\n\
          On the last line of your output, print PR_URL=<full PR URL>"
     )
 }
@@ -368,8 +372,12 @@ mod tests {
     fn test_gc_adopt_prompt_pr_verification() {
         let p = gc_adopt_prompt("abc123", "rationale", "validate", &["file.md"]);
         assert!(
-            p.contains("gh pr view --json number,state"),
-            "gc_adopt_prompt must include PR existence verification step"
+            p.contains("gh pr view <PR_URL>"),
+            "gc_adopt_prompt must verify PR with explicit URL selector"
+        );
+        assert!(
+            p.contains("OPEN"),
+            "gc_adopt_prompt verification must enforce state == OPEN"
         );
     }
 
@@ -408,8 +416,12 @@ mod tests {
     fn implement_from_issue_includes_pr_verification() {
         let p = implement_from_issue(42, None);
         assert!(
-            p.contains("gh pr view --json number,state"),
-            "implement_from_issue must include PR existence verification step"
+            p.contains("gh pr view <PR_URL>"),
+            "implement_from_issue must verify PR with explicit URL selector"
+        );
+        assert!(
+            p.contains("OPEN"),
+            "implement_from_issue verification must enforce state == OPEN"
         );
     }
 
@@ -432,8 +444,12 @@ mod tests {
     fn implement_from_prompt_includes_pr_verification() {
         let p = implement_from_prompt("fix the bug", None);
         assert!(
-            p.contains("gh pr view --json number,state"),
-            "implement_from_prompt must include PR existence verification step"
+            p.contains("gh pr view <PR_URL>"),
+            "implement_from_prompt must verify PR with explicit URL selector"
+        );
+        assert!(
+            p.contains("OPEN"),
+            "implement_from_prompt verification must enforce state == OPEN"
         );
     }
 
