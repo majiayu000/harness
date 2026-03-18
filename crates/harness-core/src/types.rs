@@ -653,6 +653,10 @@ pub struct EventFilters {
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     pub limit: Option<usize>,
+    /// Whether to load the `content` column (large blobs; off by default).
+    /// Only enable on internal audit paths — never on public-facing queries.
+    #[serde(default)]
+    pub include_content: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

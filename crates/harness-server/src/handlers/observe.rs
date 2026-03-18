@@ -21,7 +21,13 @@ pub async fn event_query(
     id: Option<serde_json::Value>,
     filters: harness_core::EventFilters,
 ) -> RpcResponse {
-    match state.observability.events.query(&filters).await {
+    // Never expose raw content blobs through the public observability API;
+    // content may contain secrets echoed by agent reviewers.
+    let safe_filters = harness_core::EventFilters {
+        include_content: false,
+        ..filters
+    };
+    match state.observability.events.query(&safe_filters).await {
         Ok(events) => match serde_json::to_value(&events) {
             Ok(v) => RpcResponse::success(id, v),
             Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),

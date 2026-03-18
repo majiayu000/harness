@@ -217,8 +217,15 @@ impl EventStore {
 
     pub async fn query(&self, filters: &EventFilters) -> anyhow::Result<Vec<Event>> {
         let mut conditions: Vec<&str> = Vec::new();
-        let mut sql = String::from(
-            "SELECT id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, content
+        // Only load the `content` column when explicitly requested; it can be large and
+        // is not needed by hot paths (dashboard, health, gc, quality_trigger).
+        let content_col = if filters.include_content {
+            "content"
+        } else {
+            "NULL as content"
+        };
+        let mut sql = format!(
+            "SELECT id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, {content_col}
              FROM events WHERE 1=1",
         );
 
