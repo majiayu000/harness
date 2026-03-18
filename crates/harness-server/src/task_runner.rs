@@ -93,6 +93,11 @@ pub struct TaskState {
     /// Populated at runtime; not persisted (use `TaskStore::list_children` after restart).
     #[serde(default)]
     pub subtask_ids: Vec<TaskId>,
+    /// Canonical filesystem path of the project root that spawned this task.
+    /// Persisted so tasks can be associated back to their project after restart.
+    /// Matches the bucket key used by the concurrency queue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     /// Resolved project root for this task. Set at spawn time; not persisted to the database.
     /// Used by sibling-awareness lookups in `TaskStore::list_siblings`.
     #[serde(skip)]
@@ -132,6 +137,7 @@ impl TaskState {
             external_id: None,
             parent_id: None,
             subtask_ids: Vec::new(),
+            project_id: None,
             project_root: None,
             issue: None,
             description: None,
@@ -379,6 +385,19 @@ impl TaskStore {
         self.cache.iter().map(|e| e.value().clone()).collect()
     }
 
+    /// Count active (non-terminal) tasks associated with the given project ID.
+    ///
+    /// `project_id` is the canonical filesystem path used as the concurrency bucket key.
+    pub async fn count_active_by_project_id(&self, project_id: &str) -> u32 {
+        match self.db.count_active_by_project_id(project_id).await {
+            Ok(count) => count,
+            Err(e) => {
+                tracing::warn!("failed to count active tasks for project '{project_id}': {e}");
+                0
+            }
+        }
+    }
+
     /// Return the `pr_url` of the most recently created Done task, ordered by `created_at DESC`
     /// from the database (stable ordering, unlike the in-memory DashMap cache).
     pub async fn latest_done_pr_url(&self) -> Option<String> {
@@ -622,6 +641,7 @@ where
             })
         });
         if let Some(mut entry) = store.cache.get_mut(&id) {
+            entry.project_id = Some(project_root.to_string_lossy().into_owned());
             entry.project_root = Some(project_root.clone());
             entry.issue = req.issue;
             entry.description = description;

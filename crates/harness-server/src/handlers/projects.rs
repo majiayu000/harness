@@ -89,21 +89,29 @@ pub async fn list_projects(
 
     match registry.list().await {
         Ok(projects) => {
-            let with_counts: Vec<serde_json::Value> = projects
-                .into_iter()
-                .map(|p| {
-                    let mut v = match serde_json::to_value(&p) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!("projects: failed to serialize project: {e}");
-                            serde_json::Value::default()
-                        }
-                    };
-                    // task_count is best-effort; tasks do not store project_id
-                    v["task_count"] = json!(0);
-                    v
-                })
-                .collect();
+            let mut with_counts = Vec::with_capacity(projects.len());
+            for p in projects {
+                let mut v = match serde_json::to_value(&p) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("projects: failed to serialize project: {e}");
+                        serde_json::Value::default()
+                    }
+                };
+                let project_id = p
+                    .root
+                    .canonicalize()
+                    .unwrap_or(p.root)
+                    .to_string_lossy()
+                    .into_owned();
+                let task_count = state
+                    .core
+                    .tasks
+                    .count_active_by_project_id(&project_id)
+                    .await;
+                v["task_count"] = json!(task_count);
+                with_counts.push(v);
+            }
             (StatusCode::OK, Json(json!(with_counts)))
         }
         Err(e) => (
