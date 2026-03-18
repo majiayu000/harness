@@ -534,10 +534,15 @@ pub async fn spawn_task(
 /// Register a task with Pending status and return its ID immediately, without waiting
 /// for a concurrency permit. Pair with `spawn_preregistered_task` (called from a
 /// background tokio task after `task_queue.acquire()`) to begin execution.
-pub async fn register_pending_task(store: Arc<TaskStore>, source: Option<String>) -> TaskId {
+pub async fn register_pending_task(
+    store: Arc<TaskStore>,
+    source: Option<String>,
+    project_id: String,
+) -> TaskId {
     let task_id = TaskId::new();
     let mut state = TaskState::new(task_id.clone());
     state.source = source;
+    state.project_id = Some(project_id);
     store.insert(&state).await;
     // Register stream channel now so SSE clients can subscribe before execution begins.
     store.register_task_stream(&task_id);
