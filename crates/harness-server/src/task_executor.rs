@@ -519,19 +519,19 @@ pub(crate) async fn run_task(
     if review_config.enabled {
         if let Some(reviewer) = reviewer {
             tracing::info!("starting agent review for PR #{pr_num}");
-            agent_review::run_agent_review(
+            agent_review::run_agent_review(&agent_review::AgentReviewContext {
                 store,
                 task_id,
                 agent,
                 reviewer,
                 review_config,
-                &context_items,
-                &project,
-                &interceptors,
+                context_items: &context_items,
+                project: &project,
+                interceptors: &interceptors,
                 turn_timeout,
                 pr_num,
-                &events,
-            )
+                events: &events,
+            })
             .await?;
         } else {
             tracing::warn!("agent review enabled but no reviewer agent configured; skipping");

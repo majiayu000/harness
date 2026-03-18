@@ -9,22 +9,39 @@ use tokio::time::Duration;
 
 use super::helpers::{run_on_error, run_post_execute, run_pre_execute, update_status};
 
+/// Context bundle for the agent-review cycle.
+pub(super) struct AgentReviewContext<'a> {
+    pub store: &'a TaskStore,
+    pub task_id: &'a TaskId,
+    pub agent: &'a dyn CodeAgent,
+    pub reviewer: &'a dyn CodeAgent,
+    pub review_config: &'a harness_core::AgentReviewConfig,
+    pub context_items: &'a [ContextItem],
+    pub project: &'a Path,
+    pub interceptors: &'a [Arc<dyn harness_core::interceptor::TurnInterceptor>],
+    pub turn_timeout: Duration,
+    pub pr_num: u64,
+    pub events: &'a harness_observe::EventStore,
+}
+
 /// Run the agent-review cycle: reviewer evaluates the PR, implementor fixes
 /// issues, up to `review_config.max_rounds` iterations.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_agent_review(
-    store: &TaskStore,
-    task_id: &TaskId,
-    agent: &dyn CodeAgent,
-    reviewer: &dyn CodeAgent,
-    review_config: &harness_core::AgentReviewConfig,
-    context_items: &[ContextItem],
-    project: &Path,
-    interceptors: &[Arc<dyn harness_core::interceptor::TurnInterceptor>],
-    turn_timeout: Duration,
-    pr_num: u64,
-    events: &harness_observe::EventStore,
-) -> anyhow::Result<()> {
+pub(super) async fn run_agent_review(ctx: &AgentReviewContext<'_>) -> anyhow::Result<()> {
+    let AgentReviewContext {
+        store,
+        task_id,
+        agent,
+        reviewer,
+        review_config,
+        context_items,
+        project,
+        interceptors,
+        turn_timeout,
+        pr_num,
+        events,
+    } = ctx;
+    let turn_timeout = *turn_timeout;
+    let pr_num = *pr_num;
     let max_rounds = review_config.max_rounds;
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
