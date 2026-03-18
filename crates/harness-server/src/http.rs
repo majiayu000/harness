@@ -112,19 +112,24 @@ pub struct NotificationServices {
     pub ws_shutdown_tx: broadcast::Sender<()>,
 }
 
-pub struct AppState {
-    pub core: CoreServices,
-    pub engines: EngineServices,
-    pub observability: ObservabilityServices,
-    pub concurrency: ConcurrencyServices,
-    pub notifications: NotificationServices,
-    pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
+/// Intake services: external event sources and task completion handling.
+pub struct IntakeServices {
     /// Feishu Bot intake handler. None when feishu intake is disabled or not configured.
     pub feishu_intake: Option<Arc<crate::intake::feishu::FeishuIntake>>,
     /// Pre-built GitHub intake poller, shared between orchestrator and completion callback.
     pub github_intake: Option<Arc<dyn crate::intake::IntakeSource>>,
     /// Completion callback invoked when a task reaches a terminal state.
     pub completion_callback: Option<task_runner::CompletionCallback>,
+}
+
+pub struct AppState {
+    pub core: CoreServices,
+    pub engines: EngineServices,
+    pub observability: ObservabilityServices,
+    pub concurrency: ConcurrencyServices,
+    pub notifications: NotificationServices,
+    pub intake: IntakeServices,
+    pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
 
     // ── Service layer ────────────────────────────────────────────────────────
     // Trait-based abstractions for independent testability. Each service owns
@@ -554,9 +559,11 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             ws_shutdown_tx: broadcast::channel(1).0,
         },
         interceptors,
-        feishu_intake,
-        github_intake,
-        completion_callback,
+        intake: IntakeServices {
+            feishu_intake,
+            github_intake,
+            completion_callback,
+        },
         project_svc,
         task_svc,
         execution_svc,
@@ -797,7 +804,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     crate::intake::build_orchestrator(
         &state.core.server.config.intake,
         Some(&expand_tilde(&state.core.server.config.server.data_dir)),
-        state.feishu_intake.clone(),
+        state.intake.feishu_intake.clone(),
     )
     .start(state.clone());
 
