@@ -1,3 +1,4 @@
+use crate::db::DbSerializable;
 use crate::task_db::TaskDb;
 use dashmap::DashMap;
 pub use harness_core::TaskId;
@@ -31,8 +32,8 @@ pub enum TaskStatus {
     Failed,
 }
 
-impl AsRef<str> for TaskStatus {
-    fn as_ref(&self) -> &str {
+impl DbSerializable for TaskStatus {
+    fn to_db_str(&self) -> &'static str {
         match self {
             TaskStatus::Pending => "pending",
             TaskStatus::Implementing => "implementing",
@@ -43,12 +44,8 @@ impl AsRef<str> for TaskStatus {
             TaskStatus::Failed => "failed",
         }
     }
-}
 
-impl std::str::FromStr for TaskStatus {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_db_str(s: &str) -> anyhow::Result<Self> {
         match s {
             "pending" => Ok(TaskStatus::Pending),
             "implementing" => Ok(TaskStatus::Implementing),
@@ -59,6 +56,20 @@ impl std::str::FromStr for TaskStatus {
             "failed" => Ok(TaskStatus::Failed),
             _ => anyhow::bail!("unknown task status `{s}`"),
         }
+    }
+}
+
+impl AsRef<str> for TaskStatus {
+    fn as_ref(&self) -> &str {
+        self.to_db_str()
+    }
+}
+
+impl std::str::FromStr for TaskStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_db_str(s)
     }
 }
 

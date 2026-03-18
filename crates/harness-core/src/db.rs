@@ -123,6 +123,18 @@ impl<T: DbEntity> Db<T> {
     }
 }
 
+/// Trait for types that can be serialized to/from a SQLite status column.
+///
+/// Implementing this trait once per status type is sufficient — the blanket
+/// `AsRef<str>` and `FromStr` impls are provided by callers that delegate to
+/// these methods, eliminating duplicated match arms across DB modules.
+pub trait DbSerializable: Sized {
+    /// Return the canonical database string for this value.
+    fn to_db_str(&self) -> &'static str;
+    /// Parse a database string back into the value, or return an error.
+    fn from_db_str(s: &str) -> anyhow::Result<Self>;
+}
+
 /// A single versioned SQL migration.
 pub struct Migration {
     /// Monotonically increasing version number. Applied in ascending order.
