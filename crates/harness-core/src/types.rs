@@ -1,3 +1,4 @@
+use crate::db::DbSerializable;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -75,13 +76,28 @@ pub enum ThreadStatus {
     Archived,
 }
 
-impl AsRef<str> for ThreadStatus {
-    fn as_ref(&self) -> &str {
+impl DbSerializable for ThreadStatus {
+    fn to_db_str(&self) -> &'static str {
         match self {
             ThreadStatus::Idle => "idle",
             ThreadStatus::Active => "active",
             ThreadStatus::Archived => "archived",
         }
+    }
+
+    fn from_db_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "idle" => Ok(ThreadStatus::Idle),
+            "active" => Ok(ThreadStatus::Active),
+            "archived" => Ok(ThreadStatus::Archived),
+            _ => anyhow::bail!("unknown thread status `{s}`"),
+        }
+    }
+}
+
+impl AsRef<str> for ThreadStatus {
+    fn as_ref(&self) -> &str {
+        self.to_db_str()
     }
 }
 
@@ -89,12 +105,7 @@ impl std::str::FromStr for ThreadStatus {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "idle" => Ok(ThreadStatus::Idle),
-            "active" => Ok(ThreadStatus::Active),
-            "archived" => Ok(ThreadStatus::Archived),
-            _ => anyhow::bail!("unknown thread status `{s}`"),
-        }
+        Self::from_db_str(s)
     }
 }
 
