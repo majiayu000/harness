@@ -477,6 +477,31 @@ pub(crate) async fn run_task(
         tracing::warn!(stderr = %stderr, "agent stderr during implementation");
     }
 
+    // Review-only tasks (periodic_review) produce a report, not a PR.
+    // Persist the output and return immediately — no PR parsing or review loop.
+    let is_review_task = store
+        .get(task_id)
+        .map_or(false, |s| s.source.as_deref() == Some("periodic_review"));
+
+    if is_review_task {
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Done;
+            s.turn = 1;
+            s.rounds.push(RoundResult {
+                turn: 1,
+                action: "review".into(),
+                result: "completed".into(),
+                detail: if output.is_empty() {
+                    None
+                } else {
+                    Some(output.clone())
+                },
+            });
+        })
+        .await?;
+        return Ok(());
+    }
+
     let pr_url = prompts::parse_pr_url(&output);
     let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
 
