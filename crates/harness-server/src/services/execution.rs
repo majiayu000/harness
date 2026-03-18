@@ -251,8 +251,12 @@ impl ExecutionService for DefaultExecutionService {
         let server_config = self.server_config.clone();
 
         // Register the task immediately so the caller gets an ID without blocking.
-        let task_id =
-            task_runner::register_pending_task(self.tasks.clone(), req.source.clone()).await;
+        let task_id = task_runner::register_pending_task(
+            self.tasks.clone(),
+            req.source.clone(),
+            project_id.clone(),
+        )
+        .await;
 
         // Spawn a background tokio task that waits for a concurrency slot then executes.
         let tasks = self.tasks.clone();
