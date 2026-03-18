@@ -43,6 +43,7 @@ pub(super) async fn run_agent_review(ctx: &AgentReviewContext<'_>) -> anyhow::Re
     let turn_timeout = *turn_timeout;
     let pr_num = *pr_num;
     let max_rounds = review_config.max_rounds;
+    let context_vec = context_items.to_vec();
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
 
@@ -50,7 +51,7 @@ pub(super) async fn run_agent_review(ctx: &AgentReviewContext<'_>) -> anyhow::Re
         let review_req = AgentRequest {
             prompt: prompts::agent_review_prompt(pr_num, agent_round),
             project_root: project.to_path_buf(),
-            context: context_items.to_vec(),
+            context: context_vec.clone(),
             execution_phase: Some(ExecutionPhase::Validation),
             ..Default::default()
         };
@@ -155,7 +156,7 @@ pub(super) async fn run_agent_review(ctx: &AgentReviewContext<'_>) -> anyhow::Re
         let fix_req = AgentRequest {
             prompt: prompts::agent_review_fix_prompt(pr_num, &issues, agent_round),
             project_root: project.to_path_buf(),
-            context: context_items.to_vec(),
+            context: context_vec.clone(),
             execution_phase: Some(ExecutionPhase::Execution),
             ..Default::default()
         };
