@@ -62,11 +62,32 @@ pub fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
 }
 
 pub async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
-    make_test_state_with_registry(dir, AgentRegistry::new("test")).await
+    make_state_inner(dir, dir, AgentRegistry::new("test")).await
 }
 
 pub async fn make_test_state_with_registry(
     dir: &std::path::Path,
+    agent_registry: AgentRegistry,
+) -> anyhow::Result<AppState> {
+    make_state_inner(dir, dir, agent_registry).await
+}
+
+/// Build a test `AppState` wrapped in `Arc`, using separate data and project-root directories.
+///
+/// Use this when the test needs to assert that the server uses the configured
+/// `project_root` and not the process working directory.
+pub async fn make_test_state_with_project_root(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+) -> anyhow::Result<Arc<AppState>> {
+    Ok(Arc::new(
+        make_state_inner(dir, project_root, AgentRegistry::new("test")).await?,
+    ))
+}
+
+async fn make_state_inner(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
     agent_registry: AgentRegistry,
 ) -> anyhow::Result<AppState> {
     let server = Arc::new(HarnessServer::new(
@@ -85,7 +106,7 @@ pub async fn make_test_state_with_registry(
         server.config.gc.clone(),
         signal_detector,
         draft_store,
-        dir.to_path_buf(),
+        project_root.to_path_buf(),
     ));
     let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
     let (notification_tx, _) = tokio::sync::broadcast::channel(64);
@@ -95,7 +116,7 @@ pub async fn make_test_state_with_registry(
     let project_svc = crate::services::DefaultProjectService::new(
         // Tests that don't need a registry still get a lightweight one.
         crate::project_registry::ProjectRegistry::open(&dir.join("projects.db")).await?,
-        dir.to_path_buf(),
+        project_root.to_path_buf(),
     );
     let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
     let execution_svc = crate::services::DefaultExecutionService::new(
@@ -115,7 +136,7 @@ pub async fn make_test_state_with_registry(
     Ok(AppState {
         core: crate::http::CoreServices {
             server,
-            project_root: dir.to_path_buf(),
+            project_root: project_root.to_path_buf(),
             tasks,
             thread_db: Some(thread_db),
             plan_db: None,
