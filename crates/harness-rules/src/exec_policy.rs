@@ -165,19 +165,21 @@ impl ExecPolicy {
                 .extend(rules.iter().cloned());
         }
         for (name, overlay_paths) in &overlay.host_executables_by_name {
-            let mut merged_paths: Vec<PathBuf> = combined
-                .host_executables_by_name
-                .get(name)
-                .map(|existing| existing.iter().cloned().collect())
-                .unwrap_or_default();
-            for path in overlay_paths.iter() {
-                if !merged_paths.iter().any(|existing| existing == path) {
-                    merged_paths.push(path.clone());
+            match combined.host_executables_by_name.entry(name.clone()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(overlay_paths.clone());
+                }
+                Entry::Occupied(mut slot) => {
+                    let val = slot.get_mut();
+                    let mut merged: Vec<PathBuf> = val.iter().cloned().collect();
+                    for path in overlay_paths.iter() {
+                        if !merged.iter().any(|existing| existing == path) {
+                            merged.push(path.clone());
+                        }
+                    }
+                    *val = merged.into();
                 }
             }
-            combined
-                .host_executables_by_name
-                .insert(name.clone(), merged_paths.into());
         }
         combined
     }
@@ -195,13 +197,14 @@ impl ExecPolicy {
                 slot.insert(paths.into());
             }
             Entry::Occupied(mut slot) => {
-                let mut merged_paths = slot.get().to_vec();
+                let val = slot.get_mut();
+                let mut merged: Vec<PathBuf> = val.iter().cloned().collect();
                 for path in paths {
-                    if !merged_paths.iter().any(|existing| existing == &path) {
-                        merged_paths.push(path);
+                    if !merged.iter().any(|existing| existing == &path) {
+                        merged.push(path);
                     }
                 }
-                slot.insert(merged_paths.into());
+                *val = merged.into();
             }
         }
     }
