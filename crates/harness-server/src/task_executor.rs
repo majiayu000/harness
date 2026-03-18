@@ -481,7 +481,7 @@ pub(crate) async fn run_task(
     // Persist the output and return immediately — no PR parsing or review loop.
     let is_review_task = store
         .get(task_id)
-        .map_or(false, |s| s.source.as_deref() == Some("periodic_review"));
+        .is_some_and(|s| s.source.as_deref() == Some("periodic_review"));
 
     if is_review_task {
         mutate_and_persist(store, task_id, |s| {
