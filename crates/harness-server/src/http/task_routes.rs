@@ -235,12 +235,8 @@ async fn enqueue_task_background(
     );
 
     // Register the task immediately so the caller gets an ID without blocking.
-    let task_id = task_runner::register_pending_task(
-        state.core.tasks.clone(),
-        req.source.clone(),
-        project_id.clone(),
-    )
-    .await;
+    let task_id =
+        task_runner::register_pending_task(state.core.tasks.clone(), req.source.clone()).await;
 
     // Spawn a background tokio task that waits for a concurrency slot then executes.
     // The HTTP handler returns the task_id before this future completes.

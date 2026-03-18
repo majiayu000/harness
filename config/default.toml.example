@@ -2,7 +2,7 @@
 # Start the server with: harness serve --config config/default.toml
 
 [server]
-transport = "stdio"
+transport = "http"
 http_addr = "127.0.0.1:9800"
 # Absolute path required — the server does not expand `~`.
 # Default on Linux:  ~/.local/share/harness
@@ -57,6 +57,16 @@ log_retention_days = 90
 environment = "development"
 exporter = "disabled"
 # endpoint = "http://127.0.0.1:4318"
+
+[review]
+enabled = false
+# Run a review immediately on server startup. Default: false.
+# run_on_startup = true
+# Override interval in seconds (takes precedence over interval_hours).
+# interval_secs = 300
+# interval_hours = 24
+# agent = "claude"
+# timeout_secs = 900
 
 # Register projects below (can also pass --project-root / --project on CLI).
 # [[projects]]

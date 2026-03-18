@@ -1,4 +1,3 @@
-use crate::db::DbSerializable;
 use crate::task_db::TaskDb;
 use dashmap::DashMap;
 pub use harness_core::TaskId;
@@ -32,8 +31,8 @@ pub enum TaskStatus {
     Failed,
 }
 
-impl DbSerializable for TaskStatus {
-    fn to_db_str(&self) -> &'static str {
+impl AsRef<str> for TaskStatus {
+    fn as_ref(&self) -> &str {
         match self {
             TaskStatus::Pending => "pending",
             TaskStatus::Implementing => "implementing",
@@ -44,8 +43,12 @@ impl DbSerializable for TaskStatus {
             TaskStatus::Failed => "failed",
         }
     }
+}
 
-    fn from_db_str(s: &str) -> anyhow::Result<Self> {
+impl std::str::FromStr for TaskStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "pending" => Ok(TaskStatus::Pending),
             "implementing" => Ok(TaskStatus::Implementing),
@@ -56,20 +59,6 @@ impl DbSerializable for TaskStatus {
             "failed" => Ok(TaskStatus::Failed),
             _ => anyhow::bail!("unknown task status `{s}`"),
         }
-    }
-}
-
-impl AsRef<str> for TaskStatus {
-    fn as_ref(&self) -> &str {
-        self.to_db_str()
-    }
-}
-
-impl std::str::FromStr for TaskStatus {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::from_db_str(s)
     }
 }
 
@@ -104,12 +93,6 @@ pub struct TaskState {
     /// Populated at runtime; not persisted (use `TaskStore::list_children` after restart).
     #[serde(default)]
     pub subtask_ids: Vec<TaskId>,
-    /// Canonical filesystem path of the project root that spawned this task.
-    /// Persisted so tasks can be associated back to their project after restart.
-    /// Matches the bucket key used by the concurrency queue.
-    /// Not serialized in API responses to avoid leaking internal filesystem paths.
-    #[serde(skip)]
-    pub project_id: Option<String>,
     /// Resolved project root for this task. Set at spawn time; not persisted to the database.
     /// Used by sibling-awareness lookups in `TaskStore::list_siblings`.
     #[serde(skip)]
@@ -149,7 +132,6 @@ impl TaskState {
             external_id: None,
             parent_id: None,
             subtask_ids: Vec::new(),
-            project_id: None,
             project_root: None,
             issue: None,
             description: None,
@@ -397,19 +379,6 @@ impl TaskStore {
         self.cache.iter().map(|e| e.value().clone()).collect()
     }
 
-    /// Count active (non-terminal) tasks associated with the given project ID.
-    ///
-    /// `project_id` is the canonical filesystem path used as the concurrency bucket key.
-    pub async fn count_active_by_project_id(&self, project_id: &str) -> u32 {
-        match self.db.count_active_by_project_id(project_id).await {
-            Ok(count) => count,
-            Err(e) => {
-                tracing::warn!("failed to count active tasks for project '{project_id}': {e}");
-                0
-            }
-        }
-    }
-
     /// Return the `pr_url` of the most recently created Done task, ordered by `created_at DESC`
     /// from the database (stable ordering, unlike the in-memory DashMap cache).
     pub async fn latest_done_pr_url(&self) -> Option<String> {
@@ -545,15 +514,10 @@ pub async fn spawn_task(
 /// Register a task with Pending status and return its ID immediately, without waiting
 /// for a concurrency permit. Pair with `spawn_preregistered_task` (called from a
 /// background tokio task after `task_queue.acquire()`) to begin execution.
-pub async fn register_pending_task(
-    store: Arc<TaskStore>,
-    source: Option<String>,
-    project_id: String,
-) -> TaskId {
+pub async fn register_pending_task(store: Arc<TaskStore>, source: Option<String>) -> TaskId {
     let task_id = TaskId::new();
     let mut state = TaskState::new(task_id.clone());
     state.source = source;
-    state.project_id = Some(project_id);
     store.insert(&state).await;
     // Register stream channel now so SSE clients can subscribe before execution begins.
     store.register_task_stream(&task_id);
@@ -644,6 +608,7 @@ where
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // Populate transient sibling-awareness fields in the in-memory cache.
+        // These are not persisted; they enable list_siblings() lookups during run_task.
         let description = req.issue.map(|n| format!("issue #{n}")).or_else(|| {
             req.prompt.as_ref().map(|p| {
                 let s = p.trim();
@@ -657,15 +622,9 @@ where
             })
         });
         if let Some(mut entry) = store.cache.get_mut(&id) {
-            entry.project_id = Some(project_root.to_string_lossy().into_owned());
             entry.project_root = Some(project_root.clone());
             entry.issue = req.issue;
             entry.description = description;
-        }
-        // Persist project_id immediately so count_active_by_project_id() sees this
-        // task from the moment it transitions out of the pre-registered NULL state.
-        if let Err(e) = store.persist(&id).await {
-            tracing::warn!(task_id = %id.0, "failed to persist project_id: {e}");
         }
 
         // Parallel dispatch for Complex+ prompt-only tasks when workspace isolation is active.
@@ -679,7 +638,8 @@ where
             classification.complexity,
             harness_core::TaskComplexity::Complex | harness_core::TaskComplexity::Critical
         );
-        if req.issue.is_none() && req.pr.is_none() && is_complex {
+        let is_review = req.source.as_deref() == Some("periodic_review");
+        if req.issue.is_none() && req.pr.is_none() && is_complex && !is_review {
             if let Some(ref wmgr) = workspace_mgr {
                 let mut subtask_prompts =
                     crate::parallel_dispatch::decompose(req.prompt.as_deref().unwrap_or_default());
@@ -746,6 +706,15 @@ where
                     let any_success = results.iter().any(|r| r.response.is_some());
                     mutate_and_persist(&store, &id, |s| {
                         for r in &results {
+                            let detail = if let Some(ref resp) = r.response {
+                                if resp.output.is_empty() {
+                                    None
+                                } else {
+                                    Some(resp.output.clone())
+                                }
+                            } else {
+                                r.error.clone()
+                            };
                             s.rounds.push(RoundResult {
                                 turn: (r.index as u32).saturating_add(1),
                                 action: format!("parallel_subtask_{}", r.index),
@@ -754,7 +723,7 @@ where
                                 } else {
                                     "failed".into()
                                 },
-                                detail: r.error.clone(),
+                                detail,
                             });
                         }
                         if any_success {
@@ -1052,14 +1021,12 @@ mod tests {
 
     struct CapturingAgent {
         captured: tokio::sync::Mutex<Vec<ContextItem>>,
-        done: tokio::sync::Notify,
     }
 
     impl CapturingAgent {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 captured: tokio::sync::Mutex::new(Vec::new()),
-                done: tokio::sync::Notify::new(),
             })
         }
     }
@@ -1079,8 +1046,6 @@ mod tests {
             if guard.is_empty() {
                 *guard = req.context.clone();
             }
-            drop(guard);
-            self.done.notify_one();
             Ok(AgentResponse {
                 output: String::new(),
                 stderr: String::new(),
@@ -1107,8 +1072,6 @@ mod tests {
             if guard.is_empty() {
                 *guard = req.context.clone();
             }
-            drop(guard);
-            self.done.notify_one();
             Ok(())
         }
     }
@@ -1160,9 +1123,7 @@ mod tests {
         )
         .await;
 
-        tokio::time::timeout(Duration::from_secs(5), agent.done.notified())
-            .await
-            .map_err(|_| anyhow::anyhow!("agent did not execute within 5 seconds"))?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let captured = agent.captured.lock().await;
         assert!(

@@ -44,7 +44,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            transport: Transport::Stdio,
+            transport: Transport::Http,
             http_addr: SocketAddr::from(([127, 0, 0, 1], 9800)),
             data_dir: dirs_data_dir().join("harness"),
             project_root: default_project_root(),

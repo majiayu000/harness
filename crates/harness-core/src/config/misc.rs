@@ -303,44 +303,44 @@ fn default_otel_environment() -> String {
     "development".to_string()
 }
 
-/// Review mode controlling how each cycle is scoped.
-///
-/// - `incremental` (default): Skip the cycle when no new commits have landed since the last
-///   review. The prompt includes diff stats and recent commits for context.
-/// - `full`: Always run regardless of new commits. The prompt covers the entire codebase
-///   without diff/commit noise; the agent reads and analyzes all files each cycle.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ReviewMode {
-    /// Skip when no new commits; include diff context in the prompt.
-    #[default]
-    Incremental,
-    /// Always run; no diff context, full-codebase analysis.
-    Full,
-}
-
 /// Periodic codebase review configuration.
 ///
 /// When enabled, the scheduler spawns an agent review job at the configured interval.
-/// In `incremental` mode the review is skipped if no new commits have landed since the
-/// last review. In `full` mode the review always runs and covers the entire codebase.
+/// The review is skipped if no new commits have landed since the last review.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewConfig {
     /// Whether periodic review is enabled. Default: false.
     #[serde(default)]
     pub enabled: bool,
+    /// Run a review immediately on server startup (after a brief init delay).
+    /// Default: false.
+    #[serde(default)]
+    pub run_on_startup: bool,
     /// Interval between review runs in hours. Default: 24.
+    /// Ignored when `interval_secs` is set.
     #[serde(default = "default_review_interval_hours")]
     pub interval_hours: u64,
+    /// Override interval in seconds for fine-grained control (e.g. testing).
+    /// Takes precedence over `interval_hours` when set.
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
     /// Agent to use for the review. Default: None (use the default agent).
     #[serde(default)]
     pub agent: Option<String>,
     /// Per-turn timeout in seconds for the review agent. Default: 900.
     #[serde(default = "default_review_timeout_secs")]
     pub timeout_secs: u64,
-    /// Review scope mode. Default: `incremental`.
-    #[serde(default)]
-    pub mode: ReviewMode,
+}
+
+impl ReviewConfig {
+    /// Effective interval as a Duration. `interval_secs` takes precedence
+    /// over `interval_hours`.
+    pub fn effective_interval(&self) -> std::time::Duration {
+        match self.interval_secs {
+            Some(secs) => std::time::Duration::from_secs(secs),
+            None => std::time::Duration::from_secs(self.interval_hours * 3600),
+        }
+    }
 }
 
 fn default_review_interval_hours() -> u64 {
@@ -355,10 +355,11 @@ impl Default for ReviewConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            run_on_startup: false,
             interval_hours: default_review_interval_hours(),
+            interval_secs: None,
             agent: None,
             timeout_secs: default_review_timeout_secs(),
-            mode: ReviewMode::default(),
         }
     }
 }

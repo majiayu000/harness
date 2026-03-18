@@ -310,6 +310,9 @@ pub(crate) async fn run_task(
         }
     } else if let Some(pr) = req.pr {
         prompts::check_existing_pr(pr, &review_config.review_bot_command)
+    } else if req.source.as_deref() == Some("periodic_review") {
+        // Review tasks use their prompt as-is — no "create PR" wrapper.
+        req.prompt.clone().unwrap_or_default()
     } else {
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default(), git)
     };
@@ -475,6 +478,31 @@ pub(crate) async fn run_task(
 
     if !stderr.is_empty() {
         tracing::warn!(stderr = %stderr, "agent stderr during implementation");
+    }
+
+    // Review-only tasks produce a report, not a PR.
+    // Persist the output and return immediately — no PR parsing or review loop.
+    let is_review_task = store
+        .get(task_id)
+        .is_some_and(|s| s.source.as_deref() == Some("periodic_review"));
+
+    if is_review_task {
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Done;
+            s.turn = 1;
+            s.rounds.push(RoundResult {
+                turn: 1,
+                action: "review".into(),
+                result: "completed".into(),
+                detail: if output.is_empty() {
+                    None
+                } else {
+                    Some(output.clone())
+                },
+            });
+        })
+        .await?;
+        return Ok(());
     }
 
     let pr_url = prompts::parse_pr_url(&output);
@@ -722,7 +750,6 @@ async fn run_agent_review(
         let approved = prompts::is_approved(&output);
         let issues = prompts::extract_review_issues(&output);
         let review_detail = output;
-        let review_content = review_detail.clone();
 
         mutate_and_persist(store, task_id, |s| {
             s.rounds.push(RoundResult {
@@ -738,7 +765,7 @@ async fn run_agent_review(
         })
         .await?;
 
-        // Log agent_review event with full reviewer output for audit
+        // Log agent_review event
         let mut ev = Event::new(
             SessionId::new(),
             "agent_review",
@@ -755,7 +782,6 @@ async fn run_agent_review(
         } else {
             format!("round {agent_round}: {} issues", issues.len())
         });
-        ev.content = Some(review_content);
         if let Err(e) = events.log(&ev).await {
             tracing::warn!("failed to log agent_review event: {e}");
         }

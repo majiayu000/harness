@@ -23,7 +23,7 @@ fn parse_project_entry(s: &str) -> Result<(String, PathBuf)> {
 
 pub async fn run(
     config: HarnessConfig,
-    transport: String,
+    transport: Option<String>,
     port: Option<u16>,
     project_root: Option<PathBuf>,
     projects: Vec<String>,
@@ -158,9 +158,17 @@ pub async fn run(
     );
     server.startup_projects = parsed_projects;
 
-    match transport.as_str() {
-        "stdio" => server.serve_stdio().await?,
-        "http" => {
+    let effective_transport = match transport.as_deref() {
+        Some("stdio") => harness_core::Transport::Stdio,
+        Some("http") => harness_core::Transport::Http,
+        Some("web_socket") => harness_core::Transport::WebSocket,
+        Some(other) => anyhow::bail!("unknown transport: {other}"),
+        None => serve_config.server.transport,
+    };
+
+    match effective_transport {
+        harness_core::Transport::Stdio => server.serve_stdio().await?,
+        harness_core::Transport::Http | harness_core::Transport::WebSocket => {
             let addr = if let Some(p) = port {
                 format!("127.0.0.1:{p}").parse()?
             } else {
@@ -168,7 +176,6 @@ pub async fn run(
             };
             Arc::new(server).serve_http(addr).await?
         }
-        other => anyhow::bail!("unknown transport: {other}"),
     }
 
     Ok(())
