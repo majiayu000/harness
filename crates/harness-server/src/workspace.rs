@@ -54,9 +54,9 @@ impl WorkspaceManager {
         {
             use dashmap::mapref::entry::Entry;
             match self.active.entry(task_id.clone()) {
-                Entry::Occupied(e) => return Ok(e.get().workspace_path.clone()),
-                Entry::Vacant(e) => {
-                    e.insert(ActiveWorkspace {
+                Entry::Occupied(occ) => return Ok(occ.get().workspace_path.clone()),
+                Entry::Vacant(vac) => {
+                    vac.insert(ActiveWorkspace {
                         workspace_path: workspace_path.clone(),
                         source_repo: source_repo.to_path_buf(),
                     });

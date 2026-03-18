@@ -220,21 +220,25 @@ impl SkillStore {
     }
 
     pub fn deduplicate(&mut self) {
-        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
         let mut to_remove = Vec::new();
 
         for (idx, skill) in self.skills.iter().enumerate() {
-            if let Some(&existing_idx) = seen.get(&skill.name) {
-                let existing_priority = location_priority(self.skills[existing_idx].location);
-                let new_priority = location_priority(skill.location);
-                if new_priority > existing_priority {
-                    to_remove.push(existing_idx);
-                    seen.insert(skill.name.clone(), idx);
-                } else {
-                    to_remove.push(idx);
+            match seen.entry(skill.name.clone()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(idx);
                 }
-            } else {
-                seen.insert(skill.name.clone(), idx);
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let existing_idx = *slot.get();
+                    let existing_priority = location_priority(self.skills[existing_idx].location);
+                    let new_priority = location_priority(skill.location);
+                    if new_priority > existing_priority {
+                        to_remove.push(existing_idx);
+                        *slot.get_mut() = idx;
+                    } else {
+                        to_remove.push(idx);
+                    }
+                }
             }
         }
 
