@@ -303,10 +303,27 @@ fn default_otel_environment() -> String {
     "development".to_string()
 }
 
+/// Review mode controlling how each cycle is scoped.
+///
+/// - `incremental` (default): Skip the cycle when no new commits have landed since the last
+///   review. The prompt includes diff stats and recent commits for context.
+/// - `full`: Always run regardless of new commits. The prompt covers the entire codebase
+///   without diff/commit noise; the agent reads and analyzes all files each cycle.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewMode {
+    /// Skip when no new commits; include diff context in the prompt.
+    #[default]
+    Incremental,
+    /// Always run; no diff context, full-codebase analysis.
+    Full,
+}
+
 /// Periodic codebase review configuration.
 ///
 /// When enabled, the scheduler spawns an agent review job at the configured interval.
-/// The review is skipped if no new commits have landed since the last review.
+/// In `incremental` mode the review is skipped if no new commits have landed since the
+/// last review. In `full` mode the review always runs and covers the entire codebase.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewConfig {
     /// Whether periodic review is enabled. Default: false.
@@ -321,6 +338,9 @@ pub struct ReviewConfig {
     /// Per-turn timeout in seconds for the review agent. Default: 900.
     #[serde(default = "default_review_timeout_secs")]
     pub timeout_secs: u64,
+    /// Review scope mode. Default: `incremental`.
+    #[serde(default)]
+    pub mode: ReviewMode,
 }
 
 fn default_review_interval_hours() -> u64 {
@@ -338,6 +358,7 @@ impl Default for ReviewConfig {
             interval_hours: default_review_interval_hours(),
             agent: None,
             timeout_secs: default_review_timeout_secs(),
+            mode: ReviewMode::default(),
         }
     }
 }
