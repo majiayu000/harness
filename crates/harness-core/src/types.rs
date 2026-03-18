@@ -313,6 +313,9 @@ pub struct Event {
     pub decision: Decision,
     pub reason: Option<String>,
     pub detail: Option<String>,
+    /// Full content payload for auditing (e.g. raw reviewer output for agent_review events).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub content: Option<String>,
     pub duration_ms: Option<u64>,
 }
 
@@ -327,6 +330,7 @@ impl Event {
             decision,
             reason: None,
             detail: None,
+            content: None,
             duration_ms: None,
         }
     }
