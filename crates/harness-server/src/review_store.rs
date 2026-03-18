@@ -3,7 +3,19 @@ use sqlx::sqlite::SqlitePool;
 use std::path::Path;
 
 // id, rule_id, priority, impact, confidence, effort, file, line, title, description, action
-type FindingRow = (String, String, String, i32, i32, i32, String, i64, String, String, String);
+type FindingRow = (
+    String,
+    String,
+    String,
+    i32,
+    i32,
+    i32,
+    String,
+    i64,
+    String,
+    String,
+    String,
+);
 
 /// A single finding from a periodic review.
 #[derive(Debug, Clone, Serialize, Deserialize)]
