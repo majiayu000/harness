@@ -1052,12 +1052,14 @@ mod tests {
 
     struct CapturingAgent {
         captured: tokio::sync::Mutex<Vec<ContextItem>>,
+        done: tokio::sync::Notify,
     }
 
     impl CapturingAgent {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 captured: tokio::sync::Mutex::new(Vec::new()),
+                done: tokio::sync::Notify::new(),
             })
         }
     }
@@ -1077,6 +1079,8 @@ mod tests {
             if guard.is_empty() {
                 *guard = req.context.clone();
             }
+            drop(guard);
+            self.done.notify_one();
             Ok(AgentResponse {
                 output: String::new(),
                 stderr: String::new(),
@@ -1103,6 +1107,8 @@ mod tests {
             if guard.is_empty() {
                 *guard = req.context.clone();
             }
+            drop(guard);
+            self.done.notify_one();
             Ok(())
         }
     }
@@ -1154,7 +1160,9 @@ mod tests {
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::timeout(Duration::from_secs(5), agent.done.notified())
+            .await
+            .map_err(|_| anyhow::anyhow!("agent did not execute within 5 seconds"))?;
 
         let captured = agent.captured.lock().await;
         assert!(

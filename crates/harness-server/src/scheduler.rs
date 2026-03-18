@@ -82,93 +82,14 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{server::HarnessServer, thread_manager::ThreadManager};
-    use harness_agents::AgentRegistry;
-    use harness_core::{EventFilters, Grade, GuardId, HarnessConfig, Language};
+    use harness_core::{EventFilters, Grade, GuardId, Language};
     use harness_rules::engine::Guard;
-    use std::{path::Path, sync::Arc};
-    use tokio::sync::RwLock;
 
-    async fn make_test_state(dir: &Path, project_root: &Path) -> anyhow::Result<Arc<AppState>> {
-        let server = Arc::new(HarnessServer::new(
-            HarnessConfig::default(),
-            ThreadManager::new(),
-            AgentRegistry::new("test"),
-        ));
-        let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
-        let events = Arc::new(harness_observe::EventStore::new(dir).await?);
-        let signal_detector = harness_gc::SignalDetector::new(
-            server.config.gc.signal_thresholds.clone().into(),
-            harness_core::ProjectId::new(),
-        );
-        let draft_store = harness_gc::DraftStore::new(dir)?;
-        let gc_agent = Arc::new(harness_gc::GcAgent::new(
-            server.config.gc.clone(),
-            signal_detector,
-            draft_store,
-            project_root.to_path_buf(),
-        ));
-        let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
-        let _project_svc_tmp =
-            crate::project_registry::ProjectRegistry::open(&dir.join("svc_projects.db")).await?;
-        let project_svc = crate::services::DefaultProjectService::new(
-            _project_svc_tmp,
-            project_root.to_path_buf(),
-        );
-        let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
-        let execution_svc = crate::services::DefaultExecutionService::new(
-            tasks.clone(),
-            server.agent_registry.clone(),
-            Arc::new(server.config.clone()),
-            Default::default(),
-            events.clone(),
-            vec![],
-            None,
-            Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-            None,
-            None,
-            vec![],
-        );
-        Ok(Arc::new(AppState {
-            core: crate::http::CoreServices {
-                server,
-                project_root: project_root.to_path_buf(),
-                tasks,
-                thread_db: Some(thread_db),
-                plan_db: None,
-                plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
-                project_registry: None,
-            },
-            engines: crate::http::EngineServices {
-                skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
-                rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
-                gc_agent,
-            },
-            observability: crate::http::ObservabilityServices {
-                events,
-                signal_rate_limiter: std::sync::Arc::new(crate::http::SignalRateLimiter::new(100)),
-            },
-            concurrency: crate::http::ConcurrencyServices {
-                task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-                workspace_mgr: None,
-            },
-            notifications: crate::http::NotificationServices {
-                notification_tx: tokio::sync::broadcast::channel(32).0,
-                notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                notification_lag_log_every: 1,
-                notify_tx: None,
-                initializing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
-            },
-            interceptors: vec![],
-            feishu_intake: None,
-            github_intake: None,
-            completion_callback: None,
-            project_svc,
-            task_svc,
-            execution_svc,
-        }))
+    async fn make_test_state(
+        dir: &std::path::Path,
+        project_root: &std::path::Path,
+    ) -> anyhow::Result<Arc<AppState>> {
+        crate::test_helpers::make_test_state_with_project_root(dir, project_root).await
     }
 
     async fn register_failing_guard(state: &AppState) {

@@ -199,7 +199,7 @@ pub async fn feishu_webhook(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(feishu) = state.feishu_intake.as_ref() else {
+    let Some(feishu) = state.intake.feishu_intake.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "Feishu intake not configured"})),
