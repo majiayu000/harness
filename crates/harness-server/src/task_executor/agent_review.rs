@@ -10,6 +10,7 @@ use tokio::time::Duration;
 use super::helpers::{run_on_error, run_post_execute, run_pre_execute, update_status};
 
 /// Context bundle for the agent-review cycle.
+#[derive(Clone, Copy)]
 pub(super) struct AgentReviewContext<'a> {
     pub store: &'a TaskStore,
     pub task_id: &'a TaskId,
@@ -39,9 +40,7 @@ pub(super) async fn run_agent_review(ctx: &AgentReviewContext<'_>) -> anyhow::Re
         turn_timeout,
         pr_num,
         events,
-    } = ctx;
-    let turn_timeout = *turn_timeout;
-    let pr_num = *pr_num;
+    } = *ctx;
     let max_rounds = review_config.max_rounds;
     let context_vec = context_items.to_vec();
     for agent_round in 1..=max_rounds {
