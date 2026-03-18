@@ -624,6 +624,57 @@ printf 'third\n'
         Ok(())
     }
 
+    #[tokio::test]
+    async fn execute_stream_removes_claude_code_env_vars() -> anyhow::Result<()> {
+        let _guard = ScopedEnvVar::set_pairs(&[
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_ENTRYPOINT", "claude-code"),
+        ]);
+
+        let dir = tempdir()?;
+        let agent_capture = dir.path().join("agent-env.txt");
+        let cli_script = dir.path().join("capture-stream-env.sh");
+
+        fs::write(
+            &cli_script,
+            format!("#!/bin/sh\nenv > \"{}\"\nexit 0\n", agent_capture.display()),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&cli_script)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&cli_script, perms)?;
+        }
+
+        let agent = CodexAgent::new(cli_script, SandboxMode::DangerFullAccess);
+        let request = AgentRequest {
+            prompt: "ping".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..AgentRequest::default()
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        agent.execute_stream(request, tx).await?;
+        // Drain the channel so no items are left pending.
+        while rx.try_recv().is_ok() {}
+
+        let agent_env = fs::read_to_string(agent_capture)?;
+        assert!(
+            !agent_env
+                .lines()
+                .any(|line| line.starts_with("CLAUDECODE=")),
+            "CLAUDECODE must not be passed to codex agent in streaming mode"
+        );
+        assert!(
+            !agent_env
+                .lines()
+                .any(|line| line.starts_with("CLAUDE_CODE_ENTRYPOINT=")),
+            "CLAUDE_CODE_ENTRYPOINT must not be passed to codex agent in streaming mode"
+        );
+        Ok(())
+    }
+
     #[test]
     fn codex_sandbox_mode_maps_to_codex_cli_values() {
         assert_eq!(codex_sandbox_mode(SandboxMode::ReadOnly), "read-only");
