@@ -1,3 +1,4 @@
+mod agent_review;
 mod helpers;
 mod pr_detection;
 
@@ -6,11 +7,11 @@ use crate::task_runner::{
 };
 use harness_core::{
     config::load_project_config, interceptor::ToolUseEvent, lang_detect, prompts, AgentRequest,
-    AgentResponse, CodeAgent, ContextItem, Event, ExecutionPhase, HarnessError, Item, SessionId,
-    StreamItem, ThreadId, TokenUsage, TurnId, TurnStatus,
+    AgentResponse, CodeAgent, Event, ExecutionPhase, HarnessError, Item, SessionId, StreamItem,
+    ThreadId, TokenUsage, TurnId, TurnStatus,
 };
 use harness_protocol::{Notification, RpcNotification};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, Duration, Instant};
@@ -24,9 +25,6 @@ pub(crate) use pr_detection::{
     build_fix_ci_prompt, build_pr_approved_prompt, build_pr_rework_prompt,
     find_existing_pr_for_issue, parse_harness_mention_command, HarnessMentionCommand,
 };
-// PromptBuilder is used internally by pr_detection and re-exported for tests.
-#[cfg(test)]
-pub(crate) use pr_detection::PromptBuilder;
 
 pub(crate) async fn run_turn_lifecycle(
     server: Arc<crate::server::HarnessServer>,
@@ -521,7 +519,7 @@ pub(crate) async fn run_task(
     if review_config.enabled {
         if let Some(reviewer) = reviewer {
             tracing::info!("starting agent review for PR #{pr_num}");
-            run_agent_review(
+            agent_review::run_agent_review(
                 store,
                 task_id,
                 agent,
@@ -659,178 +657,6 @@ pub(crate) async fn run_task(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_agent_review(
-    store: &TaskStore,
-    task_id: &TaskId,
-    agent: &dyn CodeAgent,
-    reviewer: &dyn CodeAgent,
-    review_config: &harness_core::AgentReviewConfig,
-    context_items: &[ContextItem],
-    project: &Path,
-    interceptors: &[Arc<dyn harness_core::interceptor::TurnInterceptor>],
-    turn_timeout: Duration,
-    pr_num: u64,
-    events: &harness_observe::EventStore,
-) -> anyhow::Result<()> {
-    let max_rounds = review_config.max_rounds;
-    for agent_round in 1..=max_rounds {
-        update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
-
-        // Reviewer evaluates the PR diff
-        let review_req = AgentRequest {
-            prompt: prompts::agent_review_prompt(pr_num, agent_round),
-            project_root: project.to_path_buf(),
-            context: context_items.to_vec(),
-            execution_phase: Some(ExecutionPhase::Validation),
-            ..Default::default()
-        };
-        let review_req = run_pre_execute(interceptors, review_req).await?;
-
-        let resp = tokio::time::timeout(turn_timeout, reviewer.execute(review_req.clone())).await;
-        let resp = match resp {
-            Ok(Ok(r)) => {
-                if let Some(val_err) = run_post_execute(interceptors, &review_req, &r).await {
-                    tracing::warn!(
-                        agent_round,
-                        error = %val_err,
-                        "post-execute validation failed in agent review; continuing"
-                    );
-                }
-                r
-            }
-            Ok(Err(e)) => {
-                run_on_error(interceptors, &review_req, &e.to_string()).await;
-                return Err(e.into());
-            }
-            Err(_) => {
-                let msg = format!(
-                    "Agent review round {agent_round} timed out after {}s",
-                    turn_timeout.as_secs()
-                );
-                run_on_error(interceptors, &review_req, &msg).await;
-                return Err(anyhow::anyhow!("{msg}"));
-            }
-        };
-
-        let AgentResponse { output, stderr, .. } = resp;
-
-        if !stderr.is_empty() {
-            tracing::warn!(agent_round, stderr = %stderr, "agent reviewer stderr");
-        }
-
-        let approved = prompts::is_approved(&output);
-        let issues = prompts::extract_review_issues(&output);
-        let review_detail = output;
-
-        mutate_and_persist(store, task_id, |s| {
-            s.rounds.push(RoundResult {
-                turn: 0, // agent review rounds use turn 0
-                action: "agent_review".into(),
-                result: if approved {
-                    "approved".into()
-                } else {
-                    format!("{} issues", issues.len())
-                },
-                detail: Some(review_detail),
-            });
-        })
-        .await?;
-
-        // Log agent_review event
-        let mut ev = Event::new(
-            SessionId::new(),
-            "agent_review",
-            "task_runner",
-            if approved {
-                harness_core::Decision::Complete
-            } else {
-                harness_core::Decision::Warn
-            },
-        );
-        ev.detail = Some(format!("pr={pr_num}"));
-        ev.reason = Some(if approved {
-            format!("round {agent_round}: approved")
-        } else {
-            format!("round {agent_round}: {} issues", issues.len())
-        });
-        if let Err(e) = events.log(&ev).await {
-            tracing::warn!("failed to log agent_review event: {e}");
-        }
-
-        if approved {
-            tracing::info!("agent review approved at round {agent_round}");
-            break;
-        }
-
-        // Malformed reviewer output: neither APPROVED nor any ISSUE: lines.
-        // Sending an empty fix prompt would produce arbitrary or no-op commits,
-        // so treat this as a reviewer protocol failure and abort the review loop.
-        if issues.is_empty() {
-            tracing::warn!(
-                agent_round,
-                "agent reviewer output contained neither APPROVED nor ISSUE: lines; \
-                 treating as protocol failure and skipping fix round"
-            );
-            break;
-        }
-
-        if agent_round == max_rounds {
-            tracing::info!(
-                "agent review exhausted {max_rounds} rounds, proceeding to GitHub review"
-            );
-            break;
-        }
-
-        // Implementor fixes the issues
-        let fix_req = AgentRequest {
-            prompt: prompts::agent_review_fix_prompt(pr_num, &issues, agent_round),
-            project_root: project.to_path_buf(),
-            context: context_items.to_vec(),
-            execution_phase: Some(ExecutionPhase::Execution),
-            ..Default::default()
-        };
-        let fix_req = run_pre_execute(interceptors, fix_req).await?;
-
-        let fix_resp = tokio::time::timeout(turn_timeout, agent.execute(fix_req.clone())).await;
-        match fix_resp {
-            Ok(Ok(r)) => {
-                if let Some(val_err) = run_post_execute(interceptors, &fix_req, &r).await {
-                    tracing::warn!(
-                        agent_round,
-                        error = %val_err,
-                        "post-execute validation failed in agent review fix; continuing"
-                    );
-                }
-            }
-            Ok(Err(e)) => {
-                run_on_error(interceptors, &fix_req, &e.to_string()).await;
-                return Err(e.into());
-            }
-            Err(_) => {
-                let msg = format!(
-                    "Agent review fix round {agent_round} timed out after {}s",
-                    turn_timeout.as_secs()
-                );
-                run_on_error(interceptors, &fix_req, &msg).await;
-                return Err(anyhow::anyhow!("{msg}"));
-            }
-        }
-
-        mutate_and_persist(store, task_id, |s| {
-            s.rounds.push(RoundResult {
-                turn: 0,
-                action: "agent_review_fix".into(),
-                result: "fixed".into(),
-                detail: None,
-            });
-        })
-        .await?;
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,54 +711,6 @@ mod tests {
     fn parse_harness_first_mention_per_line_is_used() {
         let cmd = parse_harness_mention_command("@harness review then @harness fix ci");
         assert_eq!(cmd, Some(HarnessMentionCommand::Review));
-    }
-
-    #[test]
-    fn prompt_builder_no_sections_adds_trailing_newline() {
-        let result = PromptBuilder::new("Title line.").build();
-        assert_eq!(result, "Title line.\n");
-    }
-
-    #[test]
-    fn prompt_builder_optional_url_absent_is_skipped() {
-        let result = PromptBuilder::new("Title.")
-            .add_optional_url("Link", None)
-            .build();
-        assert_eq!(result, "Title.\n");
-    }
-
-    #[test]
-    fn prompt_builder_optional_url_present_appears_in_output() {
-        let result = PromptBuilder::new("Title.")
-            .add_optional_url("Link", Some("https://example.com"))
-            .build();
-        assert!(result.contains("- Link: "));
-        assert!(result.contains("https://example.com"));
-        assert!(result.ends_with('\n'));
-    }
-
-    #[test]
-    fn prompt_builder_add_section_wraps_external_data() {
-        let result = PromptBuilder::new("Title.")
-            .add_section("Payload", "content here")
-            .build();
-        assert!(result.contains("Payload:\n"));
-        assert!(result.contains("<external_data>"));
-        assert!(result.contains("content here"));
-    }
-
-    #[test]
-    fn prompt_builder_multiple_urls_all_appear() {
-        let result = PromptBuilder::new("Title.")
-            .add_optional_url("First", Some("url1"))
-            .add_optional_url("Second", None)
-            .add_optional_url("Third", Some("url3"))
-            .build();
-        assert!(result.contains("- First: "));
-        assert!(result.contains("url1"));
-        assert!(!result.contains("Second"));
-        assert!(result.contains("- Third: "));
-        assert!(result.contains("url3"));
     }
 
     #[test]

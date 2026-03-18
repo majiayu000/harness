@@ -44,12 +44,19 @@ pub(crate) fn parse_harness_mention_command(body: &str) -> Option<HarnessMention
     None
 }
 
+/// Fluent builder for constructing structured agent prompts.
+///
+/// Produces a prompt with a title line followed by zero or more named
+/// sections and optional URL metadata lines.  All external-data payloads are
+/// automatically wrapped in `<external_data>` tags to reduce prompt-injection
+/// risk.
 pub(crate) struct PromptBuilder {
     title: String,
     sections: Vec<(String, String)>,
 }
 
 impl PromptBuilder {
+    /// Create a new builder with the given title line.
     pub(crate) fn new(title: impl Into<String>) -> Self {
         Self {
             title: title.into(),
@@ -205,4 +212,57 @@ pub(crate) async fn find_existing_pr_for_issue(
         .into_iter()
         .next()
         .map(|item| (item.number, item.head_ref_name)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PromptBuilder;
+
+    #[test]
+    fn prompt_builder_no_sections_adds_trailing_newline() {
+        let result = PromptBuilder::new("Title line.").build();
+        assert_eq!(result, "Title line.\n");
+    }
+
+    #[test]
+    fn prompt_builder_optional_url_absent_is_skipped() {
+        let result = PromptBuilder::new("Title.")
+            .add_optional_url("Link", None)
+            .build();
+        assert_eq!(result, "Title.\n");
+    }
+
+    #[test]
+    fn prompt_builder_optional_url_present_appears_in_output() {
+        let result = PromptBuilder::new("Title.")
+            .add_optional_url("Link", Some("https://example.com"))
+            .build();
+        assert!(result.contains("- Link: "));
+        assert!(result.contains("https://example.com"));
+        assert!(result.ends_with('\n'));
+    }
+
+    #[test]
+    fn prompt_builder_add_section_wraps_external_data() {
+        let result = PromptBuilder::new("Title.")
+            .add_section("Payload", "content here")
+            .build();
+        assert!(result.contains("Payload:\n"));
+        assert!(result.contains("<external_data>"));
+        assert!(result.contains("content here"));
+    }
+
+    #[test]
+    fn prompt_builder_multiple_urls_all_appear() {
+        let result = PromptBuilder::new("Title.")
+            .add_optional_url("First", Some("url1"))
+            .add_optional_url("Second", None)
+            .add_optional_url("Third", Some("url3"))
+            .build();
+        assert!(result.contains("- First: "));
+        assert!(result.contains("url1"));
+        assert!(!result.contains("Second"));
+        assert!(result.contains("- Third: "));
+        assert!(result.contains("url3"));
+    }
 }
