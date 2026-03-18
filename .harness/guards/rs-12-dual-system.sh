@@ -17,6 +17,8 @@ has_task=$(grep -rl \
   --include="*.rs" \
   --exclude-dir=".git" \
   --exclude-dir="target" \
+  --exclude-dir="tests" \
+  --exclude-dir=".harness" \
   -E 'struct\s+Task[A-Z]|enum\s+Task[A-Z]' \
   "${project_root}" 2>/dev/null | head -1)
 
@@ -24,6 +26,8 @@ has_todo=$(grep -rl \
   --include="*.rs" \
   --exclude-dir=".git" \
   --exclude-dir="target" \
+  --exclude-dir="tests" \
+  --exclude-dir=".harness" \
   -E 'struct\s+Todo[A-Z]|enum\s+Todo[A-Z]' \
   "${project_root}" 2>/dev/null | head -1)
 
