@@ -19,9 +19,9 @@ pub struct Cli {
 pub enum Command {
     /// Start the App Server
     Serve {
-        /// Transport mode
-        #[arg(long, default_value = "stdio")]
-        transport: String,
+        /// Transport mode (overrides config file; defaults to config value or "http")
+        #[arg(long)]
+        transport: Option<String>,
         /// HTTP port (only for http/websocket transport)
         #[arg(long)]
         port: Option<u16>,
@@ -731,7 +731,7 @@ mod tests {
                 project_root,
                 ..
             } => {
-                assert_eq!(transport, "stdio");
+                assert!(transport.is_none());
                 assert!(port.is_none());
                 assert!(project_root.is_none());
             }
@@ -748,7 +748,7 @@ mod tests {
             Command::Serve {
                 transport, port, ..
             } => {
-                assert_eq!(transport, "http");
+                assert_eq!(transport.as_deref(), Some("http"));
                 assert_eq!(port, Some(8080));
             }
             _ => panic!("expected Serve command"),

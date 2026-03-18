@@ -72,6 +72,7 @@ async fn make_test_state_with_config_and_registry(
         observability: crate::http::ObservabilityServices {
             events,
             signal_rate_limiter: std::sync::Arc::new(crate::http::SignalRateLimiter::new(100)),
+            review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
@@ -1360,6 +1361,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         observability: crate::http::ObservabilityServices {
             events,
             signal_rate_limiter: std::sync::Arc::new(crate::http::SignalRateLimiter::new(100)),
+            review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),

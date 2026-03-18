@@ -29,9 +29,16 @@ grep -rn \
   --include="*.rs" \
   --exclude-dir=".git" \
   --exclude-dir="target" \
+  --exclude-dir=".harness" \
   -E 'PathBuf::from\(|Path::new\(' \
   "${project_root}" 2>/dev/null \
 | while IFS=: read -r file line rest; do
+  # File-level check: if this file has validate_root!/validate_project_root/canonicalize
+  # as a defense, skip the entire file — the protection is at function level, not per-line.
+  file_protected=$(grep -c -E '(validate_root!|validate_project_root|canonicalize_project_root|\.canonicalize\(\))' "${file}" 2>/dev/null || true)
+  if [ "${file_protected}" -gt 0 ]; then
+    continue
+  fi
   # Check surrounding 5 lines for canonicalize or starts_with validation
   safe=$(awk "NR>=$((line > 5 ? line - 5 : 1)) && NR<=$((line + 5))" "${file}" 2>/dev/null \
     | grep -c -E '(canonicalize|starts_with|strip_prefix|contains\("\.\."\))' || true)

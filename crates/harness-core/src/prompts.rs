@@ -1,11 +1,5 @@
 //! Prompt templates and output parsers shared across CLI and HTTP entries.
 
-pub mod review;
-pub use review::{
-    agent_review_fix_prompt, agent_review_prompt, extract_review_issues, full_repo_review_prompt,
-    is_approved, periodic_review_prompt, review_prompt,
-};
-
 use crate::config::GitConfig;
 
 /// Build prompt: continue work on an existing PR for a GitHub issue.
@@ -122,6 +116,240 @@ pub fn gc_adopt_prompt(
     )
 }
 
+/// Build review loop prompt for a given round.
+///
+/// `round` controls convergence behavior:
+/// - Round 2: fix all critical/high/medium comments
+/// - Round 3+: only fix critical/high; skip medium style/design suggestions
+///
+/// When `prev_fixed` is true (previous round pushed code), the agent must first
+/// verify that Gemini has submitted a **new** review covering the latest commit
+/// before declaring LGTM. If no new review exists yet, agent outputs WAITING.
+pub fn review_prompt(
+    issue: Option<u64>,
+    pr: u64,
+    round: u32,
+    prev_fixed: bool,
+    review_bot_command: &str,
+    reviewer_name: &str,
+) -> String {
+    let context = match issue {
+        Some(n) => format!("You previously created PR #{pr} for issue #{n}.\n"),
+        None => format!("Review PR #{pr}.\n"),
+    };
+
+    let severity_guidance = if round <= 2 {
+        "Fix all review comments marked critical, high, or medium severity."
+    } else {
+        "Fix only critical and high severity issues. \
+         Skip medium severity style/design suggestions — they are acceptable for now."
+    };
+
+    let body = shell_single_quote(review_bot_command);
+    let push_action = format!(
+        "commit, push, then run `gh pr comment {pr} --body {body}` \
+         to trigger re-review on the new code"
+    );
+
+    let freshness_check = if prev_fixed {
+        // Filter to reviews authored by the configured bot login so that a human
+        // reviewer submitting after the latest commit cannot be mistaken for the
+        // bot's re-review.
+        let login_filter =
+            format!("[.[] | select(.user.login == \"{reviewer_name}\")] | last | .submitted_at");
+        format!(
+            "\n\nIMPORTANT — New review verification:\n\
+             The previous round pushed a fix commit. Before evaluating review status, \
+             you MUST verify that {reviewer_name} has submitted a NEW review covering the latest commit:\n\
+             1. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews \
+             --jq '{login_filter}'` \
+             to get the timestamp of {reviewer_name}'s most recent review\n\
+             2. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/commits --jq '.[-1].commit.committer.date'` \
+             to get the timestamp of the latest commit\n\
+             3. If {reviewer_name}'s latest review was submitted BEFORE the latest commit \
+             (or no review from {reviewer_name} exists), \
+             {reviewer_name} has not yet re-reviewed the new code. \
+             In this case, print WAITING on the last line and stop.\n\
+             4. Only proceed with the review evaluation below if {reviewer_name}'s latest review \
+             was submitted AFTER the latest commit."
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "{context}\
+         Steps:\n\
+         1. Run `gh pr checks {pr}` to check CI status\n\
+         2. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews` to read review verdicts\n\
+         3. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/comments` to read inline review comments\n\
+         4. {severity_guidance}\n\
+         5. If all CI checks pass and there are no unresolved review comments \
+         that match the severity criteria above, print LGTM on the last line\n\
+         6. Otherwise fix the issues, {push_action}, \
+         and print FIXED on the last line\
+         {freshness_check}\n\n\
+         Constraints:\n\
+         - NEVER downgrade dependency versions\n\
+         - Do NOT refactor working code for style preferences\n\
+         - Focus on correctness and safety, not cosmetic improvements"
+    )
+}
+
+/// Build prompt: reviewer agent evaluates a PR diff.
+///
+/// The reviewer reads the diff and outputs either `APPROVED` on the last line
+/// or lists issues prefixed with `ISSUE:`.
+pub fn agent_review_prompt(pr: u64, round: u32) -> String {
+    format!(
+        "You are an independent code reviewer. Review PR #{pr} (agent review round {round}).\n\n\
+         Steps:\n\
+         1. Run `gh pr diff {pr}` to read the full diff\n\
+         2. Check for correctness, safety, and style issues\n\
+         3. If everything looks good, print APPROVED on the last line\n\
+         4. Otherwise, list each issue on its own line prefixed with \"ISSUE: \"\n\n\
+         Constraints:\n\
+         - Focus on correctness and safety, not cosmetic preferences\n\
+         - NEVER downgrade dependency versions\n\
+         - Be specific: reference file names and line numbers"
+    )
+}
+
+/// Build prompt: implementor fixes issues found by the reviewer agent.
+pub fn agent_review_fix_prompt(pr: u64, issues: &[String], round: u32) -> String {
+    let issue_list: String = issues
+        .iter()
+        .enumerate()
+        .map(|(i, issue)| format!("{}. {issue}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let safe_issue_list = wrap_external_data(&issue_list);
+    format!(
+        "The independent reviewer found the following issues in PR #{pr} \
+         (agent review round {round}):\n\n{safe_issue_list}\n\n\
+         Fix each issue, run cargo check and cargo test, then commit and push.\n\
+         On the last line of your output, print PR_URL=<PR URL>"
+    )
+}
+
+/// Build prompt: periodic codebase review with an 11-item checklist.
+///
+/// `repo_structure` is the output of a directory listing (e.g., `find . -type f -name '*.rs'`).
+/// `diff_stat` is the output of `git diff --stat` since the last review.
+/// `recent_commits` is the output of `git log --oneline` since the last review.
+pub fn periodic_review_prompt(
+    repo_structure: &str,
+    diff_stat: &str,
+    recent_commits: &str,
+    guard_violations: &str,
+    existing_issues: &str,
+) -> String {
+    let safe_structure = wrap_external_data(repo_structure);
+    let safe_diff_stat = wrap_external_data(diff_stat);
+    let safe_commits = wrap_external_data(recent_commits);
+    let existing_issues_section = if existing_issues.is_empty() {
+        "No existing review issues.\n\n".to_string()
+    } else {
+        format!(
+            "The following issues are ALREADY tracked. Skip any finding that matches:\n{}\n\n",
+            wrap_external_data(existing_issues)
+        )
+    };
+    let violations_section = if guard_violations.is_empty() {
+        "No guard violations detected.\n".to_string()
+    } else {
+        format!(
+            "The following violations were detected by automated guard scripts. \
+             These are machine-verified facts — do not re-verify them. \
+             Add context, prioritize, and suggest fixes:\n{}\n",
+            wrap_external_data(guard_violations)
+        )
+    };
+    format!(
+        "You are a code review agent conducting a periodic codebase health review.\n\n\
+         ## Instructions\n\n\
+         1. Review in priority order: P0 (security) → P1 (logic/correctness) → P2 (quality) → P3 (performance)\n\
+         2. Guard scan results below are confirmed violations — include them as findings with added context\n\
+         3. Also check for issues the guards cannot detect (architectural, cross-module, semantic)\n\
+         4. Score each finding: impact (1-5), confidence (1-5), effort to fix (1-5)\n\
+         5. Focus on changes since last review when available; flag pre-existing issues only if critical\n\n\
+         ## Guard Scan Results\n\n\
+         {violations_section}\n\
+         ## Repository Context\n\n\
+         Structure:\n{safe_structure}\n\n\
+         Changes since last review:\n{safe_diff_stat}\n\n\
+         Recent commits:\n{safe_commits}\n\n\
+         ## Review Categories\n\n\
+         P0 Security: injection, XSS, path traversal, hardcoded secrets, unauth endpoints\n\
+         P1 Logic: deadlocks, race conditions, declaration-execution gaps, data inconsistency\n\
+         P2 Quality: oversized files (>400 lines), god objects (>10 pub fields), dead code, \
+         error handling (unwrap in prod, silent discards), duplicate types, config divergence\n\
+         P3 Performance: unnecessary allocations, repeated patterns, dependency bloat\n\n\
+         ## Output Format\n\n\
+         You MUST output valid JSON and nothing else. No markdown, no explanation outside the JSON.\n\n\
+         ```json\n\
+         {{\n\
+           \"findings\": [\n\
+             {{\n\
+               \"id\": \"F001\",\n\
+               \"rule_id\": \"SEC-07\",\n\
+               \"priority\": \"P0\",\n\
+               \"impact\": 5,\n\
+               \"confidence\": 4,\n\
+               \"effort\": 2,\n\
+               \"file\": \"crates/example/src/lib.rs\",\n\
+               \"line\": 42,\n\
+               \"title\": \"Short descriptive title\",\n\
+               \"description\": \"What the issue is and why it matters\",\n\
+               \"action\": \"Specific fix recommendation\"\n\
+             }}\n\
+           ],\n\
+           \"summary\": {{\n\
+             \"p0_count\": 0,\n\
+             \"p1_count\": 0,\n\
+             \"p2_count\": 0,\n\
+             \"p3_count\": 0,\n\
+             \"health_score\": 75\n\
+           }}\n\
+         }}\n\
+         ```\n\n\
+         Rules:\n\
+         - health_score: 100 minus deductions (P0: -15 each, P1: -8, P2: -3, P3: -1), minimum 0\n\
+         - line: use 0 if unknown\n\
+         - rule_id: use guard rule_id if from scan (e.g. RS-03, SEC-07), or REVIEW-XX for new findings\n\
+         - id: sequential F001, F002, etc.\n\
+         - Output ONLY the JSON object. No text before or after it.\n\n\
+         ## Existing Issues (DO NOT DUPLICATE)\n\n\
+         {existing_issues_section}\
+         ## Post-Review Actions\n\n\
+         After outputting the JSON, create a GitHub issue for EACH P0 and P1 finding using `gh issue create`.\n\
+         CRITICAL: Do NOT create an issue if the same problem is already listed in Existing Issues above.\n\
+         Issue format:\n\
+         - Title: `[PRIORITY] RULE_ID: short title`\n\
+         - Body: description + recommended action + file:line reference\n\
+         - Labels: `review`, priority label (e.g. `p0`, `p1`)\n\n\
+         Do NOT create issues for P2 or P3 findings. Do NOT create PRs or edit any files."
+    )
+}
+
+/// Check if agent output indicates approval (last non-empty line is "APPROVED").
+pub fn is_approved(output: &str) -> bool {
+    last_non_empty_line(output) == Some("APPROVED")
+}
+
+/// Extract `ISSUE:` prefixed lines from agent review output.
+pub fn extract_review_issues(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|l| {
+            l.trim()
+                .strip_prefix("ISSUE:")
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Parse `PR_URL=<url>` from agent output (searches from last line).
 pub fn parse_pr_url(output: &str) -> Option<String> {
     for line in output.lines().rev() {
@@ -219,11 +447,11 @@ pub fn sibling_task_context(siblings: &[SiblingTask]) -> String {
 ///
 /// This ensures the value is treated as literal data by the shell and cannot
 /// break out of the quoting context or inject shell metacharacters.
-pub(super) fn shell_single_quote(s: &str) -> String {
+fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-pub(super) fn last_non_empty_line(output: &str) -> Option<&str> {
+fn last_non_empty_line(output: &str) -> Option<&str> {
     output
         .lines()
         .rev()

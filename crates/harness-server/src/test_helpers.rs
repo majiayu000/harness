@@ -151,6 +151,7 @@ async fn make_state_inner(
         observability: crate::http::ObservabilityServices {
             events,
             signal_rate_limiter: Arc::new(crate::http::SignalRateLimiter::new(100)),
+            review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue,
