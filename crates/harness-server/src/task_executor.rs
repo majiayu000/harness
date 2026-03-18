@@ -722,6 +722,7 @@ async fn run_agent_review(
         let approved = prompts::is_approved(&output);
         let issues = prompts::extract_review_issues(&output);
         let review_detail = output;
+        let review_content = review_detail.clone();
 
         mutate_and_persist(store, task_id, |s| {
             s.rounds.push(RoundResult {
@@ -737,7 +738,7 @@ async fn run_agent_review(
         })
         .await?;
 
-        // Log agent_review event
+        // Log agent_review event with full reviewer output for audit
         let mut ev = Event::new(
             SessionId::new(),
             "agent_review",
@@ -754,6 +755,7 @@ async fn run_agent_review(
         } else {
             format!("round {agent_round}: {} issues", issues.len())
         });
+        ev.content = Some(review_content);
         if let Err(e) = events.log(&ev).await {
             tracing::warn!("failed to log agent_review event: {e}");
         }

@@ -313,6 +313,9 @@ pub struct Event {
     pub decision: Decision,
     pub reason: Option<String>,
     pub detail: Option<String>,
+    /// Full content payload for auditing (e.g. raw reviewer output for agent_review events).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub content: Option<String>,
     pub duration_ms: Option<u64>,
 }
 
@@ -327,6 +330,7 @@ impl Event {
             decision,
             reason: None,
             detail: None,
+            content: None,
             duration_ms: None,
         }
     }
@@ -649,6 +653,10 @@ pub struct EventFilters {
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     pub limit: Option<usize>,
+    /// Whether to load the `content` column (large blobs; off by default).
+    /// Only enable on internal audit paths — never on public-facing queries.
+    #[serde(default)]
+    pub include_content: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

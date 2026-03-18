@@ -9,10 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Versioned migrations for the events table.
-static EVENT_MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description: "create events table with indexes",
-    sql: "CREATE TABLE IF NOT EXISTS events (
+static EVENT_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "create events table with indexes",
+        sql: "CREATE TABLE IF NOT EXISTS events (
         id          TEXT PRIMARY KEY,
         ts          TEXT NOT NULL,
         session_id  TEXT NOT NULL,
@@ -27,7 +28,13 @@ static EVENT_MIGRATIONS: &[Migration] = &[Migration {
     CREATE INDEX IF NOT EXISTS idx_events_hook ON events (hook);
     CREATE INDEX IF NOT EXISTS idx_events_decision ON events (decision);
     CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts)",
-}];
+    },
+    Migration {
+        version: 2,
+        description: "add content column to events table",
+        sql: "ALTER TABLE events ADD COLUMN content TEXT",
+    },
+];
 
 /// Event store backed by SQLite (same database as other harness stores).
 ///
@@ -171,8 +178,8 @@ impl EventStore {
         let ts = event.ts.to_rfc3339();
         sqlx::query(
             "INSERT OR IGNORE INTO events
-                (id, ts, session_id, hook, tool, decision, reason, detail, duration_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, content)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(event.id.as_str())
         .bind(&ts)
@@ -183,6 +190,7 @@ impl EventStore {
         .bind(&event.reason)
         .bind(&event.detail)
         .bind(event.duration_ms.map(|v| v as i64))
+        .bind(&event.content)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -209,8 +217,15 @@ impl EventStore {
 
     pub async fn query(&self, filters: &EventFilters) -> anyhow::Result<Vec<Event>> {
         let mut conditions: Vec<&str> = Vec::new();
-        let mut sql = String::from(
-            "SELECT id, ts, session_id, hook, tool, decision, reason, detail, duration_ms
+        // Only load the `content` column when explicitly requested; it can be large and
+        // is not needed by hot paths (dashboard, health, gc, quality_trigger).
+        let content_col = if filters.include_content {
+            "content"
+        } else {
+            "NULL as content"
+        };
+        let mut sql = format!(
+            "SELECT id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, {content_col}
              FROM events WHERE 1=1",
         );
 
@@ -284,6 +299,7 @@ impl EventStore {
         let decision_str: String = row.try_get("decision")?;
         let reason: Option<String> = row.try_get("reason")?;
         let detail: Option<String> = row.try_get("detail")?;
+        let content: Option<String> = row.try_get("content")?;
         let duration_ms: Option<i64> = row.try_get("duration_ms")?;
 
         let ts = chrono::DateTime::parse_from_rfc3339(&ts_str)
@@ -302,6 +318,7 @@ impl EventStore {
             decision,
             reason,
             detail,
+            content,
             duration_ms: duration_ms.map(|v| v as u64),
         })
     }
