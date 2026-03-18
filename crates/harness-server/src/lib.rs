@@ -24,6 +24,7 @@ pub mod plan_db;
 pub mod post_validator;
 pub mod project_registry;
 pub mod quality_trigger;
+pub mod review_store;
 pub mod router;
 pub mod rule_enforcer;
 pub mod scheduler;

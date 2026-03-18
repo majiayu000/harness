@@ -127,19 +127,17 @@ async fn run_review_tick(state: &Arc<AppState>, config: &ReviewConfig) -> anyhow
         ..CreateTaskRequest::default()
     };
 
-    match task_routes::enqueue_task(state, req).await {
-        Ok(task_id) => {
-            tracing::info!(
-                task_id = %task_id,
-                "scheduler: periodic review task enqueued"
-            );
+    let task_id = match task_routes::enqueue_task(state, req).await {
+        Ok(id) => {
+            tracing::info!(task_id = %id, "scheduler: periodic review task enqueued");
+            id
         }
         Err(err) => {
             return Err(anyhow::anyhow!(
                 "failed to enqueue periodic review task: {err}"
             ));
         }
-    }
+    };
 
     // Log a "periodic_review" event so the next cycle can check the timestamp.
     let event = Event::new(
@@ -151,6 +149,69 @@ async fn run_review_tick(state: &Arc<AppState>, config: &ReviewConfig) -> anyhow
     if let Err(err) = state.observability.events.log(&event).await {
         tracing::warn!("scheduler: failed to log periodic_review event: {err}");
     }
+
+    // Wait for the review task to complete, then persist structured findings.
+    let store = state.core.tasks.clone();
+    let review_store = state.observability.review_store.clone();
+    let timeout_secs = config.timeout_secs;
+    tokio::spawn(async move {
+        let poll_interval = Duration::from_secs(15);
+        let max_wait = Duration::from_secs(timeout_secs + 120);
+        let start = tokio::time::Instant::now();
+        loop {
+            sleep(poll_interval).await;
+            if start.elapsed() > max_wait {
+                tracing::warn!(task_id = %task_id, "scheduler: review task polling timed out");
+                break;
+            }
+            let Some(task) = store.get(&task_id) else {
+                continue;
+            };
+            if !matches!(
+                task.status,
+                crate::task_runner::TaskStatus::Done | crate::task_runner::TaskStatus::Failed
+            ) {
+                continue;
+            }
+            // Collect agent output from round details.
+            let output: String = task
+                .rounds
+                .iter()
+                .filter_map(|r| r.detail.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if output.is_empty() {
+                tracing::warn!(task_id = %task_id, "scheduler: review task completed but no output");
+                break;
+            }
+            match crate::review_store::parse_review_output(&output) {
+                Ok(review) => {
+                    tracing::info!(
+                        task_id = %task_id,
+                        findings = review.findings.len(),
+                        health_score = review.summary.health_score,
+                        "scheduler: periodic review parsed"
+                    );
+                    if let Some(ref rs) = review_store {
+                        match rs.persist_findings(&task_id.0, &review.findings).await {
+                            Ok(n) => tracing::info!(
+                                new_findings = n,
+                                "scheduler: review findings persisted"
+                            ),
+                            Err(e) => tracing::warn!("scheduler: failed to persist findings: {e}"),
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        "scheduler: failed to parse review output as JSON: {e}"
+                    );
+                }
+            }
+            break;
+        }
+    });
 
     Ok(())
 }

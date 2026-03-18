@@ -84,6 +84,7 @@ pub struct EngineServices {
 pub struct ObservabilityServices {
     pub events: Arc<harness_observe::EventStore>,
     pub signal_rate_limiter: Arc<SignalRateLimiter>,
+    pub review_store: Option<Arc<crate::review_store::ReviewStore>>,
 }
 
 /// Concurrency services: task queue and workspace isolation.
@@ -539,6 +540,18 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         observability: ObservabilityServices {
             events,
             signal_rate_limiter: Arc::new(SignalRateLimiter::new(SIGNAL_RATE_LIMIT_PER_MINUTE)),
+            review_store: {
+                let review_db_path = dir.join("reviews.db");
+                match crate::review_store::ReviewStore::open(&review_db_path).await {
+                    Ok(store) => Some(Arc::new(store)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "review store init failed, reviews will not be persisted: {e}"
+                        );
+                        None
+                    }
+                }
+            },
         },
         concurrency: ConcurrencyServices {
             task_queue,

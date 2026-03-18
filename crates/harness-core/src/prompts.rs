@@ -247,76 +247,69 @@ pub fn periodic_review_prompt(
     let safe_diff_stat = wrap_external_data(diff_stat);
     let safe_commits = wrap_external_data(recent_commits);
     let violations_section = if guard_violations.is_empty() {
-        String::new()
+        "No guard violations detected.\n".to_string()
     } else {
         format!(
-            "## VibeGuard Scan Results\n\n\
-             The following violations were detected by automated guard scripts. \
-             Prioritize these in your review:\n{}\n\n",
+            "The following violations were detected by automated guard scripts. \
+             These are machine-verified facts — do not re-verify them. \
+             Add context, prioritize, and suggest fixes:\n{}\n",
             wrap_external_data(guard_violations)
         )
     };
     format!(
-        "You are conducting a periodic codebase health review. \
-         Examine the entire codebase for the 11 categories of issues below. \
-         Produce a structured markdown report with severity-ranked findings.\n\n\
-         {violations_section}\
-         ## Context\n\n\
-         Repository structure:\n{safe_structure}\n\n\
-         Changes since last review (diff stat):\n{safe_diff_stat}\n\n\
+        "You are a code review agent conducting a periodic codebase health review.\n\n\
+         ## Instructions\n\n\
+         1. Review in priority order: P0 (security) → P1 (logic/correctness) → P2 (quality) → P3 (performance)\n\
+         2. Guard scan results below are confirmed violations — include them as findings with added context\n\
+         3. Also check for issues the guards cannot detect (architectural, cross-module, semantic)\n\
+         4. Score each finding: impact (1-5), confidence (1-5), effort to fix (1-5)\n\
+         5. Focus on changes since last review when available; flag pre-existing issues only if critical\n\n\
+         ## Guard Scan Results\n\n\
+         {violations_section}\n\
+         ## Repository Context\n\n\
+         Structure:\n{safe_structure}\n\n\
+         Changes since last review:\n{safe_diff_stat}\n\n\
          Recent commits:\n{safe_commits}\n\n\
-         ## Review Checklist\n\n\
-         Check for ALL of the following (mark each item even if no issues found):\n\n\
-         ### CRITICAL\n\
-         1. **Duplicate Type Definitions** — Structs or enums with the same name in multiple \
-         crates. Config structs duplicated across crate boundaries.\n\
-         7. **Declaration-Execution Gap** — Components built but never wired into the actual \
-         execution path. Modules registered in lib.rs but never called from startup/runtime code. \
-         (Note: config structs using Default::default() instead of loaded values belong to #11, \
-         not here.)\n\n\
-         ### HIGH\n\
-         2. **Oversized Files** — Any .rs file exceeding 400 lines. Report exact line count \
-         and suggest split points.\n\
-         3. **God Objects** — Structs with more than 10 public fields. Modules mixing unrelated concerns.\n\
-         8. **Dead Code** — pub functions with zero call sites outside their own module. \
-         Structs or enums defined but never instantiated. Entire modules exported via pub mod \
-         but never imported. (Exclude #[cfg(test)] code.)\n\
-         10. **Project Rule Violations** — Verify CLAUDE.md rules: ZERO Command::new(\"gh\") or \
-         Command::new(\"git\") calls (all git/GitHub interaction must be in agent prompts only); \
-         all user-facing strings and comments in English; no hardcoded ports/URLs/credentials; \
-         cargo fmt compliance.\n\n\
-         ### MEDIUM\n\
-         4. **Public API Leakage** — lib.rs files exporting more than 5 pub mod entries. \
-         Internal implementation details exposed as public.\n\
-         5. **Repeated Patterns** — Same function signature pattern appearing 3+ times across \
-         files. Boilerplate that should be abstracted.\n\
-         9. **Error Handling Inconsistency** — Mixing anyhow::Result and custom error types \
-         without clear boundary rules. Silently discarding meaningful errors with let _ or .ok(). \
-         .unwrap() in non-test async code.\n\
-         11. **Config-Default Divergence** — Config struct has fields with serde defaults, but \
-         consuming code constructs via Default::default() instead of loading from file.\n\n\
-         ### LOW\n\
-         6. **Dependency Issues** — Crates depending on more than 5 workspace siblings. \
-         Circular or unnecessary dependencies.\n\n\
+         ## Review Categories\n\n\
+         P0 Security: injection, XSS, path traversal, hardcoded secrets, unauth endpoints\n\
+         P1 Logic: deadlocks, race conditions, declaration-execution gaps, data inconsistency\n\
+         P2 Quality: oversized files (>400 lines), god objects (>10 pub fields), dead code, \
+         error handling (unwrap in prod, silent discards), duplicate types, config divergence\n\
+         P3 Performance: unnecessary allocations, repeated patterns, dependency bloat\n\n\
          ## Output Format\n\n\
-         For each finding:\n\
-         ```\n\
-         ## [SEVERITY] Category: Short Title\n\n\
-         **File:** path/to/file.rs:LINE\n\
-         **Details:** What the issue is and why it matters\n\
-         **Action:** Specific fix recommendation\n\
+         You MUST output valid JSON and nothing else. No markdown, no explanation outside the JSON.\n\n\
+         ```json\n\
+         {{\n\
+           \"findings\": [\n\
+             {{\n\
+               \"id\": \"F001\",\n\
+               \"rule_id\": \"SEC-07\",\n\
+               \"priority\": \"P0\",\n\
+               \"impact\": 5,\n\
+               \"confidence\": 4,\n\
+               \"effort\": 2,\n\
+               \"file\": \"crates/example/src/lib.rs\",\n\
+               \"line\": 42,\n\
+               \"title\": \"Short descriptive title\",\n\
+               \"description\": \"What the issue is and why it matters\",\n\
+               \"action\": \"Specific fix recommendation\"\n\
+             }}\n\
+           ],\n\
+           \"summary\": {{\n\
+             \"p0_count\": 0,\n\
+             \"p1_count\": 0,\n\
+             \"p2_count\": 0,\n\
+             \"p3_count\": 0,\n\
+             \"health_score\": 75\n\
+           }}\n\
+         }}\n\
          ```\n\n\
-         End with a summary table:\n\
-         ```\n\
-         | Severity | Count |\n\
-         |----------|-------|\n\
-         | CRITICAL | N     |\n\
-         | HIGH     | N     |\n\
-         | MEDIUM   | N     |\n\
-         | LOW      | N     |\n\
-         ```\n\n\
-         If a category has no findings, include a one-line note: \
-         `## [SEVERITY] Category: No issues found.`"
+         Rules:\n\
+         - health_score: 100 minus deductions (P0: -15 each, P1: -8, P2: -3, P3: -1), minimum 0\n\
+         - line: use 0 if unknown\n\
+         - rule_id: use guard rule_id if from scan (e.g. RS-03, SEC-07), or REVIEW-XX for new findings\n\
+         - id: sequential F001, F002, etc.\n\
+         - Output ONLY the JSON object. No text before or after it."
     )
 }
 

@@ -638,7 +638,8 @@ where
             classification.complexity,
             harness_core::TaskComplexity::Complex | harness_core::TaskComplexity::Critical
         );
-        if req.issue.is_none() && req.pr.is_none() && is_complex {
+        let is_review = req.source.as_deref() == Some("periodic_review");
+        if req.issue.is_none() && req.pr.is_none() && is_complex && !is_review {
             if let Some(ref wmgr) = workspace_mgr {
                 let mut subtask_prompts =
                     crate::parallel_dispatch::decompose(req.prompt.as_deref().unwrap_or_default());
