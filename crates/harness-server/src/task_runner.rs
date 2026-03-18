@@ -96,7 +96,8 @@ pub struct TaskState {
     /// Canonical filesystem path of the project root that spawned this task.
     /// Persisted so tasks can be associated back to their project after restart.
     /// Matches the bucket key used by the concurrency queue.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Not serialized in API responses to avoid leaking internal filesystem paths.
+    #[serde(skip)]
     pub project_id: Option<String>,
     /// Resolved project root for this task. Set at spawn time; not persisted to the database.
     /// Used by sibling-awareness lookups in `TaskStore::list_siblings`.
@@ -627,7 +628,6 @@ where
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // Populate transient sibling-awareness fields in the in-memory cache.
-        // These are not persisted; they enable list_siblings() lookups during run_task.
         let description = req.issue.map(|n| format!("issue #{n}")).or_else(|| {
             req.prompt.as_ref().map(|p| {
                 let s = p.trim();
@@ -645,6 +645,11 @@ where
             entry.project_root = Some(project_root.clone());
             entry.issue = req.issue;
             entry.description = description;
+        }
+        // Persist project_id immediately so count_active_by_project_id() sees this
+        // task from the moment it transitions out of the pre-registered NULL state.
+        if let Err(e) = store.persist(&id).await {
+            tracing::warn!(task_id = %id.0, "failed to persist project_id: {e}");
         }
 
         // Parallel dispatch for Complex+ prompt-only tasks when workspace isolation is active.
