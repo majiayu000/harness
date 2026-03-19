@@ -360,7 +360,9 @@ pub(crate) async fn run_task(
     project: PathBuf,
     server_config: &harness_core::HarnessConfig,
 ) -> anyhow::Result<()> {
+    let task_start = Instant::now();
     update_status(store, task_id, TaskStatus::Implementing, 1).await?;
+    let impl_phase_start = Instant::now();
 
     let project_config = load_project_config(&project);
     let resolved = harness_core::config::resolve_config(server_config, &project_config);
@@ -580,7 +582,30 @@ pub(crate) async fn run_task(
         }
     };
 
-    let AgentResponse { output, stderr, .. } = resp;
+    let AgentResponse {
+        output,
+        stderr,
+        token_usage: impl_token_usage,
+        ..
+    } = resp;
+
+    tracing::info!(
+        task_id = %task_id,
+        phase = "implementing",
+        elapsed_secs = impl_phase_start.elapsed().as_secs(),
+        "phase_completed"
+    );
+    {
+        let preview: String = output.chars().take(200).collect();
+        tracing::info!(
+            task_id = %task_id,
+            output_chars = output.len(),
+            preview = %preview,
+            input_tokens = impl_token_usage.input_tokens,
+            output_tokens = impl_token_usage.output_tokens,
+            "agent_output_summary"
+        );
+    }
 
     if !stderr.is_empty() {
         tracing::warn!(stderr = %stderr, "agent stderr during implementation");
@@ -608,6 +633,14 @@ pub(crate) async fn run_task(
             });
         })
         .await?;
+        tracing::info!(
+            task_id = %task_id,
+            status = "done",
+            turns = 1,
+            pr_url = tracing::field::Empty,
+            total_elapsed_secs = task_start.elapsed().as_secs(),
+            "task_completed"
+        );
         return Ok(());
     }
 
@@ -648,6 +681,14 @@ pub(crate) async fn run_task(
             s.turn = 2;
         })
         .await?;
+        tracing::info!(
+            task_id = %task_id,
+            status = "done",
+            turns = 2,
+            pr_url = tracing::field::Empty,
+            total_elapsed_secs = task_start.elapsed().as_secs(),
+            "task_completed"
+        );
         return Ok(());
     };
 
@@ -684,6 +725,8 @@ pub(crate) async fn run_task(
     let wait_secs = req.wait_secs;
     tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
     sleep(Duration::from_secs(wait_secs)).await;
+
+    let review_phase_start = Instant::now();
 
     // Review loop
     for round in 1..=req.max_rounds {
@@ -772,6 +815,20 @@ pub(crate) async fn run_task(
                 s.turn = round.saturating_add(1);
             })
             .await?;
+            tracing::info!(
+                task_id = %task_id,
+                phase = "reviewing",
+                elapsed_secs = review_phase_start.elapsed().as_secs(),
+                "phase_completed"
+            );
+            tracing::info!(
+                task_id = %task_id,
+                status = "done",
+                turns = round.saturating_add(1),
+                pr_url = pr_url.as_deref().unwrap_or(""),
+                total_elapsed_secs = task_start.elapsed().as_secs(),
+                "task_completed"
+            );
             return Ok(());
         }
 
@@ -792,6 +849,20 @@ pub(crate) async fn run_task(
         ));
     })
     .await?;
+    tracing::info!(
+        task_id = %task_id,
+        phase = "reviewing",
+        elapsed_secs = review_phase_start.elapsed().as_secs(),
+        "phase_completed"
+    );
+    tracing::info!(
+        task_id = %task_id,
+        status = "failed",
+        turns = req.max_rounds.saturating_add(1),
+        pr_url = pr_url.as_deref().unwrap_or(""),
+        total_elapsed_secs = task_start.elapsed().as_secs(),
+        "task_completed"
+    );
     Ok(())
 }
 
