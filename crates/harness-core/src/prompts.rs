@@ -2,6 +2,44 @@
 
 use crate::config::GitConfig;
 
+/// A prompt decomposed into its static, semi-static, and dynamic layers.
+///
+/// This structure prepares prompts for future API-level prompt caching by separating
+/// stable content (instructions, output format) from dynamic content (issue body, diff).
+///
+/// ## Layers
+/// - `static_instructions`: Role description, workflow steps, output format — identical
+///   across all tasks of the same type. Highest cache hit rate.
+/// - `context`: Project-level configuration (git config, rules, sibling tasks) — stable
+///   within a session but varies per project.
+/// - `dynamic_payload`: Issue body, PR diff, review comments — unique per invocation.
+///
+/// Call [`to_prompt_string`](PromptParts::to_prompt_string) to concatenate all parts into
+/// the final prompt string. The result is identical to what the previous `String`-returning
+/// functions produced.
+pub struct PromptParts {
+    /// Role description, workflow steps, and output format — same for all tasks of this type.
+    pub static_instructions: String,
+    /// Project conventions, git config, sibling task warnings, rules — semi-static per session.
+    pub context: String,
+    /// Issue body, labels, comments, PR diff — changes every invocation.
+    pub dynamic_payload: String,
+}
+
+impl PromptParts {
+    /// Concatenate all three layers into the final prompt string.
+    ///
+    /// The output is identical to the `String` that was previously returned directly by
+    /// the prompt-building function. Callers that previously stored the return value as a
+    /// `String` should call this method to obtain it.
+    pub fn to_prompt_string(&self) -> String {
+        format!(
+            "{}{}{}",
+            self.static_instructions, self.context, self.dynamic_payload
+        )
+    }
+}
+
 /// Build prompt: continue work on an existing PR for a GitHub issue.
 ///
 /// Used when a prior task already created a PR for this issue. Instead of
@@ -24,18 +62,29 @@ pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str) -> String 
     )
 }
 
-/// Build prompt: implement from a GitHub issue, create PR.
+/// Build prompt parts: implement from a GitHub issue, create PR.
 ///
-/// If `git` is provided, git instructions (base branch, remote, prefix) are
-/// appended so the agent targets the correct branch.
-pub fn implement_from_issue(issue: u64, git: Option<&GitConfig>) -> String {
+/// Returns a [`PromptParts`] with:
+/// - `static_instructions`: the workflow instruction (read issue, implement, test, create PR)
+///   and output format — identical for every issue-based task.
+/// - `context`: git config targeting instructions — semi-static per project session.
+/// - `dynamic_payload`: empty for now; future callers may populate this with the fetched
+///   issue body, labels, and comments to enable prompt caching of the static layers.
+///
+/// Call [`.to_prompt_string()`](PromptParts::to_prompt_string) to obtain the final prompt
+/// string, which is identical to what the previous `String`-returning version produced.
+pub fn implement_from_issue(issue: u64, git: Option<&GitConfig>) -> PromptParts {
     let git_line = git_config_line(git);
-    format!(
-        "Read GitHub issue #{issue}, understand the requirements, implement the code in this project, \
-         run cargo check and cargo test, create a feature branch, commit, push, \
-         and create a PR with gh pr create.{git_line}\
-         On the last line of your output, print PR_URL=<full PR URL>"
-    )
+    PromptParts {
+        static_instructions: format!(
+            "Read GitHub issue #{issue}, understand the requirements, implement the code in this project, \
+             run cargo check and cargo test, create a feature branch, commit, push, \
+             and create a PR with gh pr create."
+        ),
+        context: git_line,
+        dynamic_payload: "On the last line of your output, print PR_URL=<full PR URL>"
+            .to_string(),
+    }
 }
 
 /// Build prompt: check an existing PR's CI and review status.
@@ -556,9 +605,64 @@ mod tests {
 
     #[test]
     fn test_implement_from_issue() {
-        let p = implement_from_issue(42, None);
+        let p = implement_from_issue(42, None).to_prompt_string();
         assert!(p.contains("issue #42"));
         assert!(p.contains("PR_URL="));
+    }
+
+    #[test]
+    fn test_prompt_parts_to_prompt_string_no_git() {
+        let parts = implement_from_issue(42, None);
+        let s = parts.to_prompt_string();
+        // static_instructions contains the issue reference and workflow steps
+        assert!(s.contains("issue #42"));
+        // dynamic_payload contains the output format
+        assert!(s.contains("PR_URL=<full PR URL>"));
+        // context is empty when no git config provided
+        assert!(parts.context.is_empty());
+        // concatenation produces the same string as the old implementation
+        let expected = "Read GitHub issue #42, understand the requirements, implement the code in this project, \
+             run cargo check and cargo test, create a feature branch, commit, push, \
+             and create a PR with gh pr create.\
+             On the last line of your output, print PR_URL=<full PR URL>"
+            .to_string();
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn test_prompt_parts_to_prompt_string_with_git() {
+        use crate::config::GitConfig;
+        let git = GitConfig {
+            base_branch: "main".to_string(),
+            remote: "origin".to_string(),
+            branch_prefix: "feat/".to_string(),
+        };
+        let parts = implement_from_issue(7, Some(&git));
+        // context holds the git config line
+        assert!(parts.context.contains("main"));
+        assert!(parts.context.contains("origin"));
+        assert!(parts.context.contains("feat/"));
+        let s = parts.to_prompt_string();
+        // full string contains all three layers
+        assert!(s.contains("issue #7"));
+        assert!(s.contains("main"));
+        assert!(s.contains("PR_URL=<full PR URL>"));
+        // identical to old implementation
+        let expected = "Read GitHub issue #7, understand the requirements, implement the code in this project, \
+             run cargo check and cargo test, create a feature branch, commit, push, \
+             and create a PR with gh pr create. Create your PR targeting the main branch on the origin remote. \
+             Use branch prefix feat/.\n\
+             On the last line of your output, print PR_URL=<full PR URL>"
+            .to_string();
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn test_prompt_parts_fields_are_accessible() {
+        let parts = implement_from_issue(99, None);
+        assert!(parts.static_instructions.contains("issue #99"));
+        assert!(parts.dynamic_payload.contains("PR_URL="));
+        assert!(parts.context.is_empty());
     }
 
     #[test]
