@@ -6,10 +6,29 @@ use crate::task_runner::{
 };
 use harness_core::{
     config::load_project_config, interceptor::ToolUseEvent, lang_detect, prompts, AgentRequest,
-    AgentResponse, CodeAgent, ContextItem, Event, ExecutionPhase, HarnessError, Item, SessionId,
-    StreamItem, ThreadId, TokenUsage, TurnId, TurnStatus,
+    AgentResponse, CapabilityProfile, CodeAgent, ContextItem, Event, ExecutionPhase, HarnessError,
+    Item, SessionId, StreamItem, ThreadId, TokenUsage, TurnId, TurnStatus,
 };
 use harness_protocol::{Notification, RpcNotification};
+
+/// Extract tool list from a capability profile, falling back to ReadOnly if
+/// the profile unexpectedly returns `None` (which means Full/unrestricted).
+/// This prevents silent privilege escalation: a misconfigured restricted profile
+/// never degrades to Full access.
+fn restricted_tools(profile: CapabilityProfile) -> Vec<String> {
+    match profile.tools() {
+        Some(tools) => tools,
+        None => {
+            tracing::warn!(
+                ?profile,
+                "restricted profile returned None (Full); falling back to ReadOnly"
+            );
+            CapabilityProfile::ReadOnly
+                .tools()
+                .unwrap_or_else(|| vec!["Read".to_string(), "Grep".to_string(), "Glob".to_string()])
+        }
+    }
+}
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -386,12 +405,22 @@ pub(crate) async fn run_task(
 
     let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
 
+    // Periodic review tasks need Bash to run guard check commands but should
+    // not have unrestricted write access — use Standard profile. All other
+    // tasks (implementation) keep Full (no restriction, Vec::new()).
+    let initial_allowed_tools = if req.source.as_deref() == Some("periodic_review") {
+        restricted_tools(CapabilityProfile::Standard)
+    } else {
+        Vec::new()
+    };
+
     let initial_req = AgentRequest {
         prompt: first_prompt,
         project_root: project.clone(),
         context: context_items.clone(),
         max_budget_usd: req.max_budget_usd,
         execution_phase: Some(ExecutionPhase::Planning),
+        allowed_tools: initial_allowed_tools,
         ..Default::default()
     };
 
@@ -600,6 +629,8 @@ pub(crate) async fn run_task(
             project_root: project.clone(),
             context: context_items.clone(),
             execution_phase: Some(ExecutionPhase::Validation),
+            // Review-check agents only read PR state — restrict to ReadOnly.
+            allowed_tools: restricted_tools(CapabilityProfile::ReadOnly),
             ..Default::default()
         };
         let check_req = run_pre_execute(&interceptors, check_req).await?;
@@ -717,12 +748,13 @@ async fn run_agent_review(
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
 
-        // Reviewer evaluates the PR diff
+        // Reviewer evaluates the PR diff — read-only, no write access needed.
         let review_req = AgentRequest {
             prompt: prompts::agent_review_prompt(pr_num, agent_round),
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Validation),
+            allowed_tools: restricted_tools(CapabilityProfile::ReadOnly),
             ..Default::default()
         };
         let review_req = run_pre_execute(interceptors, review_req).await?;
@@ -1014,5 +1046,33 @@ mod tests {
                                                           // Should back up to byte 2 (1 full "é").
         assert!(result.starts_with("é"));
         assert!(result.contains("(output truncated,"));
+    }
+
+    #[test]
+    fn review_check_turn_uses_readonly_profile() {
+        let tools = restricted_tools(CapabilityProfile::ReadOnly);
+        assert!(tools.contains(&"Read".to_string()));
+        assert!(tools.contains(&"Grep".to_string()));
+        assert!(tools.contains(&"Glob".to_string()));
+        assert!(!tools.contains(&"Write".to_string()));
+        assert!(!tools.contains(&"Edit".to_string()));
+        assert!(!tools.contains(&"Bash".to_string()));
+    }
+
+    #[test]
+    fn periodic_review_turn_uses_standard_profile_with_bash() {
+        let tools = restricted_tools(CapabilityProfile::Standard);
+        assert!(tools.contains(&"Bash".to_string()));
+        assert!(tools.contains(&"Read".to_string()));
+        assert!(tools.contains(&"Write".to_string()));
+        assert!(tools.contains(&"Edit".to_string()));
+        // Standard does not include Grep/Glob — it's distinct from ReadOnly.
+        assert!(!tools.contains(&"Grep".to_string()));
+    }
+
+    #[test]
+    fn implementation_turn_uses_full_profile_no_restriction() {
+        // Full profile returns None — no --allowedTools flag is passed to the agent.
+        assert!(CapabilityProfile::Full.tools().is_none());
     }
 }
