@@ -158,6 +158,47 @@ pub struct BatchCreateTaskRequest {
     pub project: Option<std::path::PathBuf>,
 }
 
+/// Compute connected conflict groups from per-task file-reference sets.
+///
+/// Two tasks are in the same group when their file-reference sets overlap
+/// (directly or transitively). Tasks whose file-reference set is empty form
+/// singleton groups and are never serialised against other tasks.
+fn build_conflict_groups(file_refs: &[Vec<String>]) -> Vec<Vec<usize>> {
+    let n = file_refs.len();
+    let mut visited = vec![false; n];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+
+    for start in 0..n {
+        if visited[start] {
+            continue;
+        }
+        let mut group = vec![start];
+        visited[start] = true;
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(start);
+
+        while let Some(curr) = queue.pop_front() {
+            for other in 0..n {
+                if visited[other] {
+                    continue;
+                }
+                let has_overlap = !file_refs[curr].is_empty()
+                    && !file_refs[other].is_empty()
+                    && file_refs[curr].iter().any(|f| file_refs[other].contains(f));
+                if has_overlap {
+                    visited[other] = true;
+                    group.push(other);
+                    queue.push_back(other);
+                }
+            }
+        }
+
+        groups.push(group);
+    }
+
+    groups
+}
+
 /// Enqueues a task for background execution, returning its ID immediately.
 ///
 /// Unlike `enqueue_task`, this function never blocks on concurrency permit
@@ -165,9 +206,15 @@ pub struct BatchCreateTaskRequest {
 /// background tokio task waits for a slot and then begins execution. This
 /// keeps the `/tasks/batch` HTTP handler responsive even when all concurrency
 /// slots are occupied.
+///
+/// When `group_sem` is `Some`, the background task acquires a permit from that
+/// semaphore before competing for the per-project concurrency slot. Sharing the
+/// same `Semaphore(1)` across multiple tasks in a conflict group serialises their
+/// execution and prevents concurrent edits to the same files.
 async fn enqueue_task_background(
     state: Arc<AppState>,
     mut req: task_runner::CreateTaskRequest,
+    group_sem: Option<Arc<tokio::sync::Semaphore>>,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
     if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
         return Err(EnqueueTaskError::BadRequest(
@@ -243,6 +290,14 @@ async fn enqueue_task_background(
     {
         let task_id2 = task_id.clone();
         tokio::spawn(async move {
+            // Acquire the group serialisation permit before competing for the
+            // per-project concurrency slot, then pass it into spawn_preregistered_task
+            // so it is held inside the innermost future for the full task lifetime.
+            let group_permit = if let Some(sem) = group_sem {
+                sem.acquire_owned().await.ok()
+            } else {
+                None
+            };
             match state.concurrency.task_queue.acquire(&project_id).await {
                 Ok(permit) => {
                     task_runner::spawn_preregistered_task(
@@ -258,6 +313,7 @@ async fn enqueue_task_background(
                         state.concurrency.workspace_mgr.clone(),
                         permit,
                         state.intake.completion_callback.clone(),
+                        group_permit,
                     )
                     .await;
                 }
@@ -334,13 +390,80 @@ pub(super) async fn create_tasks_batch(
         }
     }
 
+    // Detect file-reference overlaps and build conflict groups.
+    // Tasks sharing at least one file reference (directly or transitively) are
+    // placed in the same group and assigned a shared Semaphore(1) so they execute
+    // sequentially instead of concurrently.
+    let task_file_refs: Vec<Vec<String>> = task_requests
+        .iter()
+        .map(|t| {
+            if let Some(p) = t.prompt.as_deref() {
+                crate::parallel_dispatch::extract_file_refs(p)
+            } else if t.issue.is_some() {
+                // Issue-only task: no prompt to extract file refs from.
+                // Use a sentinel so all such tasks in this batch are placed in
+                // the same conflict group and serialised (conservative: we
+                // cannot know which files they will touch without fetching the
+                // issue body).
+                vec!["__unresolved_issue__".to_string()]
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+
+    let conflict_groups = build_conflict_groups(&task_file_refs);
+
+    let n = task_requests.len();
+    let mut task_semaphores: Vec<Option<Arc<tokio::sync::Semaphore>>> = vec![None; n];
+    let mut task_conflict_files: Vec<Vec<String>> = vec![Vec::new(); n];
+
+    for group in &conflict_groups {
+        if group.len() < 2 {
+            continue;
+        }
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        for &idx in group {
+            task_semaphores[idx] = Some(Arc::clone(&sem));
+            // Collect files from this task that overlap with any other group member.
+            let mut shared: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for &other in group {
+                if other == idx {
+                    continue;
+                }
+                for f in &task_file_refs[idx] {
+                    if task_file_refs[other].contains(f) {
+                        shared.insert(f.clone());
+                    }
+                }
+            }
+            let mut files: Vec<String> = shared.into_iter().collect();
+            files.sort();
+            task_conflict_files[idx] = files;
+        }
+    }
+
     // Register each task without blocking on concurrency permit acquisition.
     // Each task gets an ID immediately; a background tokio task handles permit
     // waiting and execution. The HTTP handler returns as soon as all tasks are registered.
-    let mut results = Vec::with_capacity(task_requests.len());
-    for task_req in task_requests {
-        let entry = match enqueue_task_background(state.clone(), task_req).await {
-            Ok(task_id) => json!({ "task_id": task_id.0, "status": "queued" }),
+    let mut results = Vec::with_capacity(n);
+    for (i, task_req) in task_requests.into_iter().enumerate() {
+        let sem = task_semaphores[i].take();
+        let is_serialized = sem.is_some();
+        let conflict_files = std::mem::take(&mut task_conflict_files[i]);
+        let entry = match enqueue_task_background(state.clone(), task_req, sem).await {
+            Ok(task_id) => {
+                if is_serialized {
+                    json!({
+                        "task_id": task_id.0,
+                        "status": "queued",
+                        "serialized": true,
+                        "conflict_files": conflict_files,
+                    })
+                } else {
+                    json!({ "task_id": task_id.0, "status": "queued" })
+                }
+            }
             Err(EnqueueTaskError::BadRequest(error)) => json!({ "error": error }),
             Err(EnqueueTaskError::Internal(error)) => json!({ "error": error }),
         };
@@ -508,5 +631,70 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(EnqueueTaskError::BadRequest(_))));
+    }
+
+    #[test]
+    fn conflict_groups_empty_refs_are_singletons() {
+        let refs: Vec<Vec<String>> = vec![vec![], vec![], vec![]];
+        let groups = build_conflict_groups(&refs);
+        assert_eq!(groups.len(), 3);
+        for g in &groups {
+            assert_eq!(g.len(), 1);
+        }
+    }
+
+    #[test]
+    fn conflict_groups_two_tasks_share_file() {
+        let refs = vec![
+            vec!["src/auth.rs".to_string()],
+            vec!["src/auth.rs".to_string(), "src/db.rs".to_string()],
+            vec!["src/config.rs".to_string()],
+        ];
+        let groups = build_conflict_groups(&refs);
+        // Tasks 0 and 1 share auth.rs; task 2 is independent.
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups.iter().any(|g| g.contains(&0) && g.contains(&1)),
+            "tasks 0 and 1 must be in the same conflict group"
+        );
+        assert!(
+            groups.iter().any(|g| g.len() == 1 && g[0] == 2),
+            "task 2 must be a singleton group"
+        );
+    }
+
+    #[test]
+    fn conflict_groups_transitive_overlap() {
+        // A-B share a.rs, B-C share b.rs → all three in same group.
+        let refs = vec![
+            vec!["a.rs".to_string()],
+            vec!["a.rs".to_string(), "b.rs".to_string()],
+            vec!["b.rs".to_string()],
+        ];
+        let groups = build_conflict_groups(&refs);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 3);
+    }
+
+    #[test]
+    fn conflict_groups_no_overlap() {
+        let refs = vec![
+            vec!["a.rs".to_string()],
+            vec!["b.rs".to_string()],
+            vec!["c.rs".to_string()],
+        ];
+        let groups = build_conflict_groups(&refs);
+        assert_eq!(groups.len(), 3);
+        for g in &groups {
+            assert_eq!(g.len(), 1);
+        }
+    }
+
+    #[test]
+    fn conflict_groups_single_task() {
+        let refs = vec![vec!["src/main.rs".to_string()]];
+        let groups = build_conflict_groups(&refs);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0], vec![0]);
     }
 }
