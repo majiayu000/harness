@@ -1,4 +1,4 @@
-# Check
+# Use when: running all guard scripts to produce a project health report, before committing, or after significant changes. Triggers on: health report, project check, run guards, guard scripts, project health
 
 <!-- trigger-patterns: health report, project check, run guards, guard scripts, project health -->
 

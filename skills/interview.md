@@ -1,4 +1,4 @@
-# Interview
+# Use when: starting a large feature (6+ files) to deeply understand requirements, constraints, and risks before writing any code. Triggers on: interview, requirements, large feature, 6+ files, deeply understand
 
 <!-- trigger-patterns: interview, requirements, large feature, 6+ files, deeply understand -->
 

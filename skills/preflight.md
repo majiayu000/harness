@@ -1,4 +1,4 @@
-# Preflight
+# Use when: about to make medium-complexity changes (3-5 files) to identify constraints and risks before writing any code. Triggers on: preflight, before changes, 3-5 files, medium complexity, identify constraints
 
 <!-- trigger-patterns: preflight, before changes, 3-5 files, medium complexity, identify constraints -->
 

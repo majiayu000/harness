@@ -1,4 +1,4 @@
-# Cross Review
+# Use when: reviewing high-stakes changes such as security-sensitive code, public API changes, or data migrations that need adversarial dual-model scrutiny. Triggers on: cross review, adversarial review, dual model, high stakes, security sensitive
 
 <!-- trigger-patterns: cross review, adversarial review, dual model, high stakes, security sensitive -->
 

@@ -1,4 +1,4 @@
-# Stats
+# Use when: viewing aggregated hook statistics, compliance trends, or identifying the most violated rules. Triggers on: hook stats, hook statistics, compliance trends, violated rules, aggregated stats
 
 <!-- trigger-patterns: hook stats, hook statistics, compliance trends, violated rules, aggregated stats -->
 

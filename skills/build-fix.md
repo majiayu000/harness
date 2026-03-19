@@ -1,4 +1,4 @@
-# Build Fix
+# Use when: a build or compilation fails — locate root cause and apply the minimal fix to get it green. Triggers on: build error, build failed, compilation error, compile error, cargo error, fix build
 
 <!-- trigger-patterns: build error, build failed, compilation error, compile error, cargo error, fix build -->
 

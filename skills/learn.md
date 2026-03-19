@@ -1,4 +1,4 @@
-# Learn
+# Use when: after fixing a bug or completing a successful implementation to extract reusable rules or skills from the experience. Triggers on: extract rules, learn from, reusable rules, after fixing, after implementation
 
 <!-- trigger-patterns: extract rules, learn from, reusable rules, after fixing, after implementation -->
 
