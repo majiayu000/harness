@@ -117,12 +117,12 @@ impl TurnInterceptor for HookEnforcer {
             Decision::Warn
         };
 
-        let mut ev = Event::new(
-            SessionId::new(),
-            "hook_enforcement",
-            "post_tool_use",
-            decision,
-        );
+        let sid = if let Some(id) = event.session_id.clone() {
+            id
+        } else {
+            SessionId::new()
+        };
+        let mut ev = Event::new(sid, "hook_enforcement", "post_tool_use", decision);
         ev.detail = Some(format!(
             "tool={} files={} violations={}",
             event.tool_name,
@@ -202,6 +202,7 @@ mod tests {
         let event = ToolUseEvent {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
+            session_id: None,
         };
         let result = enforcer.post_tool_use(&event, &project).await;
         assert!(
@@ -228,6 +229,7 @@ mod tests {
         let event = ToolUseEvent {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
+            session_id: None,
         };
         let result = enforcer.post_tool_use(&event, &project).await;
         assert!(
@@ -247,6 +249,7 @@ mod tests {
         let event = ToolUseEvent {
             tool_name: "write_file".to_string(),
             affected_files: vec![],
+            session_id: None,
         };
         let result = enforcer.post_tool_use(&event, dir.path()).await;
         assert!(result.violation_feedback.is_none());
@@ -265,6 +268,7 @@ mod tests {
         let event = ToolUseEvent {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
+            session_id: None,
         };
         enforcer.post_tool_use(&event, &project).await;
 
@@ -292,6 +296,7 @@ mod tests {
         let event = ToolUseEvent {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
+            session_id: None,
         };
         let result = enforcer.post_tool_use(&event, dir.path()).await;
         assert!(

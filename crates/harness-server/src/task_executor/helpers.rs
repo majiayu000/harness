@@ -732,6 +732,7 @@ mod tests {
         let event = ToolUseEvent {
             tool_name: "write_file".to_string(),
             affected_files: vec![],
+            session_id: None,
         };
         let result = run_post_tool_use(&interceptors, &event, std::path::Path::new("/tmp")).await;
         assert!(result.is_none());
@@ -743,6 +744,7 @@ mod tests {
         let event = ToolUseEvent {
             tool_name: "write_file".to_string(),
             affected_files: vec![std::path::PathBuf::from("foo.rs")],
+            session_id: None,
         };
         let result = run_post_tool_use(&interceptors, &event, std::path::Path::new("/tmp")).await;
         assert!(result.is_some());
@@ -760,6 +762,7 @@ mod tests {
         let event = ToolUseEvent {
             tool_name: "read_file".to_string(),
             affected_files: vec![],
+            session_id: None,
         };
         let result = run_post_tool_use(&interceptors, &event, std::path::Path::new("/tmp")).await;
         assert!(result.is_none());

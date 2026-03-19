@@ -520,6 +520,7 @@ pub(crate) async fn run_task(
                         let hook_event = ToolUseEvent {
                             tool_name: "file_write".to_string(),
                             affected_files: modified,
+                            session_id: None,
                         };
                         run_post_tool_use(&interceptors, &hook_event, &project).await
                     }

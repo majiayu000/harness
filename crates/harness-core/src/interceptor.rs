@@ -1,4 +1,4 @@
-use crate::{AgentRequest, AgentResponse, Decision};
+use crate::{AgentRequest, AgentResponse, Decision, SessionId};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
@@ -70,6 +70,10 @@ pub struct ToolUseEvent {
     pub tool_name: String,
     /// Files created or modified by this tool use.
     pub affected_files: Vec<PathBuf>,
+    /// Session that produced this tool use. `None` when the session is not
+    /// known at construction time; interceptors fall back to a fresh anonymous
+    /// [`SessionId`] in that case.
+    pub session_id: Option<SessionId>,
 }
 
 /// Result returned by a [`TurnInterceptor::post_tool_use`] call.
