@@ -1,6 +1,7 @@
 use crate::types::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Core trait for all code agents (Claude Code, Codex, Anthropic API, etc.)
@@ -29,6 +30,11 @@ pub struct AgentRequest {
     /// determines which model is used. Defaults to None (uses req.model or default_model).
     #[serde(default)]
     pub execution_phase: Option<ExecutionPhase>,
+    /// Additional environment variables to set in the agent subprocess.
+    /// Used to pass per-task configuration such as `CARGO_TARGET_DIR` for
+    /// workspace-isolated builds to prevent cargo lock contention.
+    #[serde(default)]
+    pub env_vars: HashMap<String, String>,
 }
 
 impl Default for AgentRequest {
@@ -41,6 +47,7 @@ impl Default for AgentRequest {
             max_budget_usd: None,
             context: Vec::new(),
             execution_phase: None,
+            env_vars: HashMap::new(),
         }
     }
 }

@@ -10,6 +10,7 @@ use harness_core::{
     Item, SessionId, StreamItem, ThreadId, TokenUsage, TurnId, TurnStatus,
 };
 use harness_protocol::{Notification, RpcNotification};
+use std::collections::HashMap;
 
 /// Extract tool list from a capability profile, falling back to ReadOnly if
 /// the profile unexpectedly returns `None` (which means Full/unrestricted).
@@ -362,6 +363,15 @@ pub(crate) async fn run_task(
 ) -> anyhow::Result<()> {
     update_status(store, task_id, TaskStatus::Implementing, 1).await?;
 
+    // Set CARGO_TARGET_DIR to a per-workspace path so parallel agents using isolated
+    // git worktrees each build to their own target directory, eliminating cargo file
+    // lock contention when 4+ agents run cargo check/test simultaneously.
+    let cargo_env: HashMap<String, String> = [(
+        "CARGO_TARGET_DIR".to_string(),
+        format!("{}/target", project.display()),
+    )]
+    .into();
+
     let project_config = load_project_config(&project);
     let resolved = harness_core::config::resolve_config(server_config, &project_config);
     let review_config = &resolved.review;
@@ -485,6 +495,7 @@ pub(crate) async fn run_task(
         max_budget_usd: req.max_budget_usd,
         execution_phase: Some(ExecutionPhase::Planning),
         allowed_tools: initial_allowed_tools,
+        env_vars: cargo_env.clone(),
         ..Default::default()
     };
 
@@ -693,8 +704,8 @@ pub(crate) async fn run_task(
             project_root: project.clone(),
             context: context_items.clone(),
             execution_phase: Some(ExecutionPhase::Validation),
-            // Review-check agents only read PR state — restrict to ReadOnly.
             allowed_tools: restricted_tools(CapabilityProfile::ReadOnly),
+            env_vars: cargo_env.clone(),
             ..Default::default()
         };
         let check_req = run_pre_execute(&interceptors, check_req).await?;
@@ -808,6 +819,11 @@ async fn run_agent_review(
     pr_num: u64,
     events: &harness_observe::EventStore,
 ) -> anyhow::Result<()> {
+    let cargo_env: HashMap<String, String> = [(
+        "CARGO_TARGET_DIR".to_string(),
+        format!("{}/target", project.display()),
+    )]
+    .into();
     let max_rounds = review_config.max_rounds;
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
@@ -819,6 +835,7 @@ async fn run_agent_review(
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Validation),
             allowed_tools: restricted_tools(CapabilityProfile::ReadOnly),
+            env_vars: cargo_env.clone(),
             ..Default::default()
         };
         let review_req = run_pre_execute(interceptors, review_req).await?;
@@ -924,6 +941,7 @@ async fn run_agent_review(
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Execution),
+            env_vars: cargo_env.clone(),
             ..Default::default()
         };
         let fix_req = run_pre_execute(interceptors, fix_req).await?;

@@ -122,11 +122,7 @@ mod tests {
         AgentRequest {
             prompt: prompt.to_string(),
             project_root: PathBuf::from("."),
-            allowed_tools: vec![],
-            model: None,
-            max_budget_usd: None,
-            context: vec![],
-            execution_phase: None,
+            ..Default::default()
         }
     }
 

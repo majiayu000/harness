@@ -101,6 +101,9 @@ impl CodeAgent for ClaudeCodeAgent {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         crate::strip_claude_env(&mut cmd);
+        for (key, value) in &req.env_vars {
+            cmd.env(key, value);
+        }
 
         let child = cmd.spawn().map_err(|e| {
             harness_core::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
@@ -152,6 +155,9 @@ impl CodeAgent for ClaudeCodeAgent {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         crate::strip_claude_env(&mut cmd);
+        for (key, value) in &req.env_vars {
+            cmd.env(key, value);
+        }
 
         let mut child = cmd.spawn().map_err(|error| {
             harness_core::HarnessError::AgentExecution(format!("failed to run claude: {error}"))
