@@ -42,3 +42,11 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 - NEVER downgrade dependency versions unless explicitly requested
 - Prefer standard library over new dependencies
 - Run `cargo audit` before adding security-sensitive crates
+
+## VibeGuard Overrides (Harness-specific, from GC Learn 2026-03-19)
+
+- RS-03 exempt: `fn main()` scope, `Mutex::lock().unwrap()`, `RwLock::{read,write}().unwrap()`
+- RS-13: only flag functions returning `()` or `Result<()>` — typed returns are transformers, not action functions
+- U-16 exempt: `**/prompts.rs` → 1200-line limit, `**/dispatch.rs` → 1000-line limit
+- L1 exempt: new files matching `src/**/{mod,lib,main}.rs` (standard Rust module files)
+- gh/git guard: CLAUDE.md rule is semantic (agent prompts only); bash guard should not double-block `cargo test` subprocesses
