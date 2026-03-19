@@ -453,7 +453,11 @@ pub fn build_available_skills_listing(skills: &[(&str, &str)]) -> String {
     }
     let mut out = "\n\n## Available Skills\n".to_string();
     for (name, desc) in skills {
-        out.push_str(&format!("- **{}**: {}\n", name, desc));
+        out.push_str("- **");
+        out.push_str(name);
+        out.push_str("**: ");
+        out.push_str(desc);
+        out.push('\n');
     }
     out
 }
@@ -469,7 +473,11 @@ pub fn build_matched_skills_section(skills: &[(&str, &str)]) -> String {
     }
     let mut out = "\n\n## Relevant Skills\n".to_string();
     for (name, content) in skills {
-        out.push_str(&format!("### {}\n{}\n", name, content));
+        out.push_str("### ");
+        out.push_str(name);
+        out.push('\n');
+        out.push_str(content);
+        out.push('\n');
     }
     out
 }
