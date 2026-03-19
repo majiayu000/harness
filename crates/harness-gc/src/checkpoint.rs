@@ -9,11 +9,23 @@ use tracing;
 pub struct GcCheckpoint {
     /// Timestamp of the last successful GC scan.
     pub last_scan_at: DateTime<Utc>,
+    /// Git commit hash at the time of the last scan; used for git-diff-based incremental scanning.
+    #[serde(default)]
+    pub head_commit: Option<String>,
 }
 
 impl GcCheckpoint {
     pub fn new(last_scan_at: DateTime<Utc>) -> Self {
-        Self { last_scan_at }
+        Self {
+            last_scan_at,
+            head_commit: None,
+        }
+    }
+
+    /// Set the HEAD commit hash recorded at scan time.
+    pub fn with_head_commit(mut self, commit: String) -> Self {
+        self.head_commit = Some(commit);
+        self
     }
 
     /// Load checkpoint from `path`. Returns `None` if the file is missing or corrupt.
@@ -73,15 +85,30 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
+    fn save_and_load_roundtrip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let path = dir.path().join(".harness").join("gc-checkpoint.json");
         let ts = Utc::now();
-        let cp = GcCheckpoint::new(ts);
+        let cp = GcCheckpoint::new(ts).with_head_commit("abc1234".to_string());
 
-        cp.save(&path).unwrap();
-        let loaded = GcCheckpoint::load(&path).expect("checkpoint should load");
+        cp.save(&path)?;
+        let loaded = GcCheckpoint::load(&path)
+            .ok_or_else(|| anyhow::anyhow!("checkpoint should load"))?;
         assert_eq!(loaded.last_scan_at, ts);
+        assert_eq!(loaded.head_commit.as_deref(), Some("abc1234"));
+        Ok(())
+    }
+
+    #[test]
+    fn load_checkpoint_without_head_commit_defaults_to_none() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("old-checkpoint.json");
+        // Write a checkpoint that lacks the head_commit field (legacy format).
+        std::fs::write(&path, r#"{"last_scan_at":"2024-01-01T00:00:00Z"}"#)?;
+        let loaded = GcCheckpoint::load(&path)
+            .ok_or_else(|| anyhow::anyhow!("should load legacy checkpoint"))?;
+        assert!(loaded.head_commit.is_none());
+        Ok(())
     }
 
     #[test]

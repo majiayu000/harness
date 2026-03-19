@@ -304,12 +304,15 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         ),
     );
     let draft_store = harness_gc::DraftStore::new(&dir)?;
-    let gc_agent = Arc::new(harness_gc::GcAgent::new(
-        server.config.gc.clone(),
-        signal_detector,
-        draft_store,
-        project_root.clone(),
-    ));
+    let gc_agent = Arc::new(
+        harness_gc::GcAgent::new(
+            server.config.gc.clone(),
+            signal_detector,
+            draft_store,
+            project_root.clone(),
+        )
+        .with_checkpoint(dir.join("gc-checkpoint.json")),
+    );
 
     let thread_db_path = dir.join("threads.db");
     let thread_db = crate::thread_db::ThreadDb::open(&thread_db_path).await?;

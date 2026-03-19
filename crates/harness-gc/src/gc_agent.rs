@@ -11,6 +11,9 @@ use harness_core::{
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
+/// Default tools allowed during GC agent execution.
+const DEFAULT_GC_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcReport {
     pub signals: Vec<Signal>,
@@ -50,11 +53,71 @@ impl GcAgent {
         self
     }
 
+    /// Return the list of files changed since the last checkpoint commit.
+    ///
+    /// Reads the `head_commit` from the checkpoint, runs
+    /// `git diff --name-only <hash>..HEAD`, and returns the changed paths.
+    /// Returns an empty vec (triggering a full scan) when:
+    /// - no checkpoint is configured,
+    /// - the checkpoint has no `head_commit` recorded, or
+    /// - `git diff` fails.
+    ///
+    /// Also emits a tracing log line describing the scan mode.
+    pub async fn changed_files_since_checkpoint(&self) -> Vec<PathBuf> {
+        let Some(cp_path) = &self.checkpoint_path else {
+            tracing::info!("gc: full scan: no checkpoint found");
+            return vec![];
+        };
+        let Some(cp) = GcCheckpoint::load(cp_path) else {
+            tracing::info!("gc: full scan: no checkpoint found");
+            return vec![];
+        };
+        let Some(base_commit) = cp.head_commit else {
+            tracing::info!("gc: full scan: no checkpoint found");
+            return vec![];
+        };
+
+        let range = format!("{base_commit}..HEAD");
+        match tokio::process::Command::new("git")
+            .args(["diff", "--name-only", &range])
+            .current_dir(&self.project_root)
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                let files: Vec<PathBuf> = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(PathBuf::from)
+                    .collect();
+                tracing::info!(
+                    "gc: incremental scan: {} files changed since last checkpoint",
+                    files.len()
+                );
+                files
+            }
+            Ok(out) => {
+                tracing::warn!(
+                    "gc: git diff failed ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                tracing::info!("gc: full scan: falling back after git diff error");
+                vec![]
+            }
+            Err(e) => {
+                tracing::warn!("gc: git diff error: {e}");
+                tracing::info!("gc: full scan: falling back after git diff error");
+                vec![]
+            }
+        }
+    }
+
     /// Run a GC cycle using incremental scanning when a checkpoint is configured.
     ///
     /// If a valid checkpoint exists only events since `last_scan_at` are analysed.
     /// Falls back to a full scan when the checkpoint is missing or corrupt.
-    /// On success the checkpoint is updated to the current timestamp.
+    /// On success the checkpoint is updated with the current timestamp and HEAD commit.
     pub async fn run(
         &self,
         project: &Project,
@@ -62,7 +125,7 @@ impl GcAgent {
         violations: &[harness_core::Violation],
         agent: &dyn CodeAgent,
     ) -> anyhow::Result<GcReport> {
-        // 0. Expire stale drafts before generating new ones
+        // 0. Expire stale drafts before generating new ones.
         self.draft_store
             .expire_stale_drafts(self.config.draft_ttl_hours)?;
 
@@ -73,9 +136,12 @@ impl GcAgent {
             .and_then(GcCheckpoint::load)
             .map(|cp| cp.last_scan_at);
 
+        // Log scan mode via git-diff helper.
+        let _changed = self.changed_files_since_checkpoint().await;
+
         let scanned_events = filter_events_since(events, since);
 
-        // 1. Detect signals from events (including persisted `rule_check` violations)
+        // 1. Detect signals from events (including persisted `rule_check` violations).
         let mut signals = self.signal_detector.detect(scanned_events);
         // Back-compat: if the caller provided live violations but they haven't been
         // persisted into `events` yet, fall back to the old detector.
@@ -83,12 +149,17 @@ impl GcAgent {
             signals.extend(self.signal_detector.from_violations(violations));
         }
 
-        // 2. Prioritize
+        // 2. Prioritize.
         signals.sort_by_key(|s| signal_priority(s.signal_type));
 
-        // 3. Generate fix drafts (up to max_drafts_per_run)
+        // 3. Generate fix drafts (up to max_drafts_per_run).
         let mut drafts_generated = 0;
         let mut errors = Vec::new();
+        let allowed_tools: Vec<String> = self
+            .config
+            .allowed_tools
+            .clone()
+            .unwrap_or_else(|| DEFAULT_GC_TOOLS.iter().map(|s| s.to_string()).collect());
 
         for signal in signals.iter().take(self.config.max_drafts_per_run) {
             let prompt = build_prompt(signal, project);
@@ -97,7 +168,7 @@ impl GcAgent {
                 .execute(AgentRequest {
                     prompt,
                     project_root: project.root.clone(),
-                    allowed_tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
+                    allowed_tools: allowed_tools.clone(),
                     max_budget_usd: Some(self.config.budget_per_signal_usd),
                     ..Default::default()
                 })
@@ -139,9 +210,13 @@ impl GcAgent {
             errors,
         };
 
-        // Update checkpoint so the next run only processes new events.
+        // Update checkpoint with current timestamp and HEAD commit hash.
         if let Some(path) = &self.checkpoint_path {
-            let cp = GcCheckpoint::new(Utc::now());
+            let head = get_current_head(&self.project_root).await;
+            let mut cp = GcCheckpoint::new(Utc::now());
+            if let Some(h) = head {
+                cp = cp.with_head_commit(h);
+            }
             if let Err(e) = cp.save(path) {
                 tracing::warn!("failed to save gc checkpoint: {e}");
             }
@@ -167,7 +242,7 @@ impl GcAgent {
             )
         })?;
 
-        // Validate and resolve all paths before writing any files
+        // Validate and resolve all paths before writing any files.
         let resolved: Vec<PathBuf> = draft
             .artifacts
             .iter()
@@ -203,6 +278,21 @@ impl GcAgent {
 
     pub fn draft_store(&self) -> &DraftStore {
         &self.draft_store
+    }
+}
+
+/// Run `git rev-parse HEAD` in `project_root` and return the commit hash, or `None` on failure.
+async fn get_current_head(project_root: &Path) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .await
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        None
     }
 }
 
