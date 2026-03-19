@@ -1,4 +1,4 @@
-# Review
+# Use when: reviewing a pull request, checking code quality on a diff, or responding to review comments. Triggers on: code review, review pr, review the, review this, review diff
 
 <!-- trigger-patterns: code review, review pr, review the, review this, review diff -->
 

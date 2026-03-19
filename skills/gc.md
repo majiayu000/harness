@@ -1,4 +1,4 @@
-# GC
+# Use when: disk usage is high or on a weekly cadence to archive old logs, clean worktrees, and scan for code smells. Triggers on: garbage collect, disk usage, clean worktrees, archive logs, code smells
 
 <!-- trigger-patterns: garbage collect, disk usage, clean worktrees, archive logs, code smells -->
 

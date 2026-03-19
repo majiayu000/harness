@@ -1,4 +1,4 @@
-# Exec Plan
+# Use when: a SPEC is approved and you need a milestone-based execution plan for a long-running multi-session task. Triggers on: exec plan, execution plan, long running, multi-session, milestone plan
 
 <!-- trigger-patterns: exec plan, execution plan, long running, multi-session, milestone plan -->
 
