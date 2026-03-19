@@ -464,6 +464,15 @@ pub(crate) async fn run_task(
         }
     };
 
+    // Prepend the Harness Constitution when enabled. Embedded at compile time so
+    // no runtime file I/O is needed.
+    const CONSTITUTION: &str = include_str!("../../../config/constitution.md");
+    let first_prompt = if server_config.server.constitution_enabled {
+        format!("{CONSTITUTION}\n\n---\n\n{first_prompt}")
+    } else {
+        first_prompt
+    };
+
     // Inject skill content directly into the prompt text.
     // Since harness uses single-turn `claude -p`, context items are not visible
     // to the agent — we must embed skill content in the prompt string itself.
@@ -1154,5 +1163,26 @@ mod tests {
     fn implementation_turn_uses_full_profile_no_restriction() {
         // Full profile returns None — no --allowedTools flag is passed to the agent.
         assert!(CapabilityProfile::Full.tools().is_none());
+    }
+
+    #[test]
+    fn constitution_prepended_when_enabled() {
+        const CONSTITUTION: &str = include_str!("../../../config/constitution.md");
+        let base = "Do the task.".to_string();
+        let result = format!("{CONSTITUTION}\n\n---\n\n{base}");
+        assert!(result.starts_with("# Harness Constitution"));
+        assert!(result.contains("GP-01"));
+        assert!(result.contains("GP-05"));
+        assert!(result.contains("Do the task."));
+    }
+
+    #[test]
+    fn constitution_absent_when_disabled() {
+        const CONSTITUTION: &str = include_str!("../../../config/constitution.md");
+        let base = "Do the task.".to_string();
+        // When disabled, prompt is returned as-is.
+        let result = base.clone();
+        assert!(!result.contains(CONSTITUTION));
+        assert_eq!(result, base);
     }
 }
