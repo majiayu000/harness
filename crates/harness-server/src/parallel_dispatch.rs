@@ -10,7 +10,7 @@ const PARALLEL_EXTENSIONS: &[&str] = &[
     "yaml", "yml", "json", "sh", "md",
 ];
 
-fn extract_file_refs(prompt: &str) -> Vec<String> {
+pub(crate) fn extract_file_refs(prompt: &str) -> Vec<String> {
     let mut refs: Vec<String> = prompt
         .split_whitespace()
         .filter_map(|token| {
