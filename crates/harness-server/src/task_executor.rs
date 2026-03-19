@@ -10,6 +10,25 @@ use harness_core::{
     Item, SessionId, StreamItem, ThreadId, TokenUsage, TurnId, TurnStatus,
 };
 use harness_protocol::{Notification, RpcNotification};
+
+/// Extract tool list from a capability profile, falling back to ReadOnly if
+/// the profile unexpectedly returns `None` (which means Full/unrestricted).
+/// This prevents silent privilege escalation: a misconfigured restricted profile
+/// never degrades to Full access.
+fn restricted_tools(profile: CapabilityProfile) -> Vec<String> {
+    match profile.tools() {
+        Some(tools) => tools,
+        None => {
+            tracing::warn!(
+                ?profile,
+                "restricted profile returned None (Full); falling back to ReadOnly"
+            );
+            CapabilityProfile::ReadOnly
+                .tools()
+                .unwrap_or_else(|| vec!["Read".to_string(), "Grep".to_string(), "Glob".to_string()])
+        }
+    }
+}
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -378,7 +397,7 @@ pub(crate) async fn run_task(
     // not have unrestricted write access — use Standard profile. All other
     // tasks (implementation) keep Full (no restriction, Vec::new()).
     let initial_allowed_tools = if req.source.as_deref() == Some("periodic_review") {
-        CapabilityProfile::Standard.tools().unwrap_or_default()
+        restricted_tools(CapabilityProfile::Standard)
     } else {
         Vec::new()
     };
@@ -599,7 +618,7 @@ pub(crate) async fn run_task(
             context: context_items.clone(),
             execution_phase: Some(ExecutionPhase::Validation),
             // Review-check agents only read PR state — restrict to ReadOnly.
-            allowed_tools: CapabilityProfile::ReadOnly.tools().unwrap_or_default(),
+            allowed_tools: restricted_tools(CapabilityProfile::ReadOnly),
             ..Default::default()
         };
         let check_req = run_pre_execute(&interceptors, check_req).await?;
@@ -723,7 +742,7 @@ async fn run_agent_review(
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Validation),
-            allowed_tools: CapabilityProfile::ReadOnly.tools().unwrap_or_default(),
+            allowed_tools: restricted_tools(CapabilityProfile::ReadOnly),
             ..Default::default()
         };
         let review_req = run_pre_execute(interceptors, review_req).await?;
@@ -1019,7 +1038,7 @@ mod tests {
 
     #[test]
     fn review_check_turn_uses_readonly_profile() {
-        let tools = CapabilityProfile::ReadOnly.tools().unwrap_or_default();
+        let tools = restricted_tools(CapabilityProfile::ReadOnly);
         assert!(tools.contains(&"Read".to_string()));
         assert!(tools.contains(&"Grep".to_string()));
         assert!(tools.contains(&"Glob".to_string()));
@@ -1030,7 +1049,7 @@ mod tests {
 
     #[test]
     fn periodic_review_turn_uses_standard_profile_with_bash() {
-        let tools = CapabilityProfile::Standard.tools().unwrap_or_default();
+        let tools = restricted_tools(CapabilityProfile::Standard);
         assert!(tools.contains(&"Bash".to_string()));
         assert!(tools.contains(&"Read".to_string()));
         assert!(tools.contains(&"Write".to_string()));
