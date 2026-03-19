@@ -160,6 +160,9 @@ pub struct GcConfig {
     /// and opens a PR via the agent prompt flow. Default: true.
     #[serde(default = "default_gc_auto_pr")]
     pub auto_pr: bool,
+    /// Tools allowed during GC agent execution. Default: ["Read", "Grep", "Glob"].
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 impl Default for GcConfig {
@@ -176,6 +179,7 @@ impl Default for GcConfig {
             auto_gc_grades: default_auto_gc_grades(),
             auto_gc_cooldown_secs: default_auto_gc_cooldown_secs(),
             auto_pr: default_gc_auto_pr(),
+            allowed_tools: None,
         }
     }
 }
