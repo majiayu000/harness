@@ -397,10 +397,18 @@ pub(super) async fn create_tasks_batch(
     let task_file_refs: Vec<Vec<String>> = task_requests
         .iter()
         .map(|t| {
-            t.prompt
-                .as_deref()
-                .map(crate::parallel_dispatch::extract_file_refs)
-                .unwrap_or_default()
+            if let Some(p) = t.prompt.as_deref() {
+                crate::parallel_dispatch::extract_file_refs(p)
+            } else if t.issue.is_some() {
+                // Issue-only task: no prompt to extract file refs from.
+                // Use a sentinel so all such tasks in this batch are placed in
+                // the same conflict group and serialised (conservative: we
+                // cannot know which files they will touch without fetching the
+                // issue body).
+                vec!["__unresolved_issue__".to_string()]
+            } else {
+                Vec::new()
+            }
         })
         .collect();
 

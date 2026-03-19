@@ -10,6 +10,22 @@ const PARALLEL_EXTENSIONS: &[&str] = &[
     "yaml", "yml", "json", "sh", "md",
 ];
 
+/// Well-known filenames that have no extension but represent source files.
+const EXTENSIONLESS_FILENAMES: &[&str] = &[
+    "Dockerfile",
+    "Makefile",
+    "Jenkinsfile",
+    "Vagrantfile",
+    "Procfile",
+    "Rakefile",
+    "Gemfile",
+    "Brewfile",
+    ".gitignore",
+    ".gitattributes",
+    ".env",
+    ".editorconfig",
+];
+
 pub(crate) fn extract_file_refs(prompt: &str) -> Vec<String> {
     let mut refs: Vec<String> = prompt
         .split_whitespace()
@@ -17,12 +33,32 @@ pub(crate) fn extract_file_refs(prompt: &str) -> Vec<String> {
             let token = token.trim_matches(|c: char| {
                 !c.is_alphanumeric() && c != '.' && c != '_' && c != '-' && c != '/'
             });
-            token.rfind('.').and_then(|dot_pos| {
-                let ext = &token[dot_pos + 1..];
-                PARALLEL_EXTENSIONS
-                    .contains(&ext)
-                    .then_some(token.to_string())
-            })
+            // Normalize: strip leading "./" so "./src/auth.rs" == "src/auth.rs".
+            let token = token.strip_prefix("./").unwrap_or(token);
+            if token.is_empty() {
+                return None;
+            }
+            // Accept tokens with a recognised file extension.
+            let has_known_ext = token
+                .rfind('.')
+                .map(|dot_pos| {
+                    let ext = &token[dot_pos + 1..];
+                    PARALLEL_EXTENSIONS.contains(&ext)
+                })
+                .unwrap_or(false);
+            if has_known_ext {
+                return Some(token.to_string());
+            }
+            // Accept path-like tokens containing '/' regardless of extension
+            // (e.g. "docker/Dockerfile"). Exclude URL-like strings.
+            if token.contains('/') && !token.starts_with("http") {
+                return Some(token.to_string());
+            }
+            // Accept bare well-known extensionless filenames (e.g. "Dockerfile").
+            if EXTENSIONLESS_FILENAMES.contains(&token) {
+                return Some(token.to_string());
+            }
+            None
         })
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
@@ -236,6 +272,40 @@ mod tests {
     fn extract_file_refs_returns_sorted() {
         let files = extract_file_refs("src/b.rs src/a.rs src/c.rs");
         assert_eq!(files, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
+    }
+
+    #[test]
+    fn extract_file_refs_normalizes_dot_slash_prefix() {
+        let files = extract_file_refs("update ./src/auth.rs and src/auth.rs");
+        // Both should normalise to "src/auth.rs" and deduplicate.
+        assert_eq!(files, vec!["src/auth.rs"]);
+    }
+
+    #[test]
+    fn extract_file_refs_dot_slash_groups_with_plain_path() {
+        let a = extract_file_refs("./src/auth.rs");
+        let b = extract_file_refs("src/auth.rs");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn extract_file_refs_extensionless_in_path() {
+        // "docker/Dockerfile" has no recognised extension but contains '/'.
+        let files = extract_file_refs("update docker/Dockerfile");
+        assert_eq!(files, vec!["docker/Dockerfile"]);
+    }
+
+    #[test]
+    fn extract_file_refs_bare_dockerfile() {
+        let files = extract_file_refs("update Dockerfile and src/main.rs");
+        assert!(files.contains(&"Dockerfile".to_string()));
+        assert!(files.contains(&"src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn extract_file_refs_excludes_urls() {
+        let files = extract_file_refs("see https://example.com/path for details");
+        assert!(files.is_empty());
     }
 
     #[test]
