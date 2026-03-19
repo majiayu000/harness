@@ -311,10 +311,10 @@ pub(crate) async fn run_task(
                 );
                 prompts::continue_existing_pr(issue, pr_num, &branch)
             }
-            Ok(None) => prompts::implement_from_issue(issue, git),
+            Ok(None) => prompts::implement_from_issue(issue, git).to_prompt_string(),
             Err(e) => {
                 tracing::warn!("failed to check for existing PR for issue #{issue}: {e}");
-                prompts::implement_from_issue(issue, git)
+                prompts::implement_from_issue(issue, git).to_prompt_string()
             }
         };
         // If the caller also supplied a description alongside the issue number, include it
