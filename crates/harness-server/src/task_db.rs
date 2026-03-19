@@ -1,14 +1,19 @@
 use crate::db::{open_pool, Migration, Migrator};
 use crate::task_runner::{TaskId, TaskState, TaskStatus};
 use harness_core::TaskDbDecodeError;
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePool;
 use std::path::Path;
+
+/// Maximum artifact content size in bytes before truncation.
+const ARTIFACT_MAX_BYTES: usize = 65_536;
 
 /// Versioned migrations for the tasks table.
 ///
 /// v1 – baseline schema (all columns including those added in later iterations)
 /// v2/v3/v4 – additive ALTER TABLE for databases that predate v1 tracking;
 ///   duplicate-column errors are silently ignored by the Migrator.
+/// v5 – add task_artifacts table for persisting agent output per task turn.
 static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -39,7 +44,29 @@ static TASK_MIGRATIONS: &[Migration] = &[
         description: "add parent_id column",
         sql: "ALTER TABLE tasks ADD COLUMN parent_id TEXT",
     },
+    Migration {
+        version: 5,
+        description: "create task_artifacts table",
+        sql: "CREATE TABLE IF NOT EXISTS task_artifacts (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id       TEXT NOT NULL,
+            turn          INTEGER NOT NULL DEFAULT 0,
+            artifact_type TEXT NOT NULL,
+            content       TEXT NOT NULL,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    },
 ];
+
+/// A single persisted artifact captured from agent output during task execution.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TaskArtifact {
+    pub task_id: String,
+    pub turn: i64,
+    pub artifact_type: String,
+    pub content: String,
+    pub created_at: String,
+}
 
 pub struct TaskDb {
     pool: SqlitePool,
@@ -149,6 +176,57 @@ impl TaskDb {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
+    }
+
+    /// Persist a single artifact captured from agent output.
+    ///
+    /// Content larger than [`ARTIFACT_MAX_BYTES`] is truncated to avoid
+    /// unbounded database growth without requiring an external compression
+    /// dependency.
+    pub async fn insert_artifact(
+        &self,
+        task_id: &str,
+        turn: u32,
+        artifact_type: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        let stored = if content.len() > ARTIFACT_MAX_BYTES {
+            let mut boundary = ARTIFACT_MAX_BYTES;
+            while boundary > 0 && !content.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            format!(
+                "{}\n[truncated: {} bytes total]",
+                &content[..boundary],
+                content.len()
+            )
+        } else {
+            content.to_string()
+        };
+
+        sqlx::query(
+            "INSERT INTO task_artifacts (task_id, turn, artifact_type, content)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(task_id)
+        .bind(turn as i64)
+        .bind(artifact_type)
+        .bind(&stored)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return all artifacts for a task ordered by insertion time.
+    pub async fn list_artifacts(&self, task_id: &str) -> anyhow::Result<Vec<TaskArtifact>> {
+        let rows = sqlx::query_as::<_, TaskArtifact>(
+            "SELECT task_id, turn, artifact_type, content, created_at
+             FROM task_artifacts WHERE task_id = ? ORDER BY id ASC",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 }
 

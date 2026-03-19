@@ -454,6 +454,31 @@ impl TaskStore {
         self.stream_txs.remove(id);
     }
 
+    /// Persist an artifact captured from agent output during task execution.
+    pub(crate) async fn insert_artifact(
+        &self,
+        task_id: &TaskId,
+        turn: u32,
+        artifact_type: &str,
+        content: &str,
+    ) {
+        if let Err(e) = self
+            .db
+            .insert_artifact(&task_id.0, turn, artifact_type, content)
+            .await
+        {
+            tracing::warn!(task_id = %task_id.0, artifact_type, "failed to insert task artifact: {e}");
+        }
+    }
+
+    /// Return all artifacts for a task ordered by insertion time.
+    pub async fn list_artifacts(
+        &self,
+        task_id: &TaskId,
+    ) -> anyhow::Result<Vec<crate::task_db::TaskArtifact>> {
+        self.db.list_artifacts(&task_id.0).await
+    }
+
     pub(crate) async fn insert(&self, state: &TaskState) {
         self.persist_locks
             .entry(state.id.clone())
