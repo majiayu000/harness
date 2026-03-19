@@ -24,9 +24,6 @@ use std::time::Instant;
 use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, RwLock};
 
-const MAX_WEBHOOK_BODY_BYTES: usize = 512 * 1024;
-const SIGNAL_RATE_LIMIT_PER_MINUTE: u32 = 100;
-
 /// Per-source rate limiter for `POST /signals` ingestion.
 pub struct SignalRateLimiter {
     counts: Mutex<HashMap<String, (u32, Instant)>>,
@@ -299,7 +296,12 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     let signal_detector = harness_gc::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
-        harness_core::ProjectId::new(),
+        harness_core::ProjectId::from_str(
+            project_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("default"),
+        ),
     );
     let draft_store = harness_gc::DraftStore::new(&dir)?;
     let gc_agent = Arc::new(harness_gc::GcAgent::new(
@@ -527,6 +529,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         server.config.server.allowed_project_roots.clone(),
     );
 
+    let signal_rate_limit = server.config.server.signal_rate_limit_per_minute;
     Ok(AppState {
         core: CoreServices {
             server,
@@ -544,7 +547,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         },
         observability: ObservabilityServices {
             events,
-            signal_rate_limiter: Arc::new(SignalRateLimiter::new(SIGNAL_RATE_LIMIT_PER_MINUTE)),
+            signal_rate_limiter: Arc::new(SignalRateLimiter::new(signal_rate_limit)),
             review_store: {
                 let review_db_path = dir.join("reviews.db");
                 match crate::review_store::ReviewStore::open(&review_db_path).await {
@@ -848,16 +851,21 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .route("/api/intake", get(intake_status))
         .route(
             "/webhook",
-            post(github_webhook).layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES)),
+            post(github_webhook).layer(DefaultBodyLimit::max(
+                state.core.server.config.server.max_webhook_body_bytes,
+            )),
         )
         .route(
             "/webhook/feishu",
-            post(crate::intake::feishu::feishu_webhook)
-                .layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES)),
+            post(crate::intake::feishu::feishu_webhook).layer(DefaultBodyLimit::max(
+                state.core.server.config.server.max_webhook_body_bytes,
+            )),
         )
         .route(
             "/signals",
-            post(ingest_signal).layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES)),
+            post(ingest_signal).layer(DefaultBodyLimit::max(
+                state.core.server.config.server.max_webhook_body_bytes,
+            )),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

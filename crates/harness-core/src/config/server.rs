@@ -39,6 +39,14 @@ pub struct ServerConfig {
     /// accepted (legacy behaviour).
     #[serde(default)]
     pub allowed_project_roots: Vec<PathBuf>,
+    /// Maximum allowed body size in bytes for webhook and signal ingestion endpoints.
+    /// Default: 524288 (512 KiB).
+    #[serde(default = "default_max_webhook_body_bytes")]
+    pub max_webhook_body_bytes: usize,
+    /// Maximum number of signal ingestion requests per source per minute.
+    /// Default: 100.
+    #[serde(default = "default_signal_rate_limit_per_minute")]
+    pub signal_rate_limit_per_minute: u32,
 }
 
 impl Default for ServerConfig {
@@ -55,6 +63,8 @@ impl Default for ServerConfig {
             trusted_proxies: Vec::new(),
             api_token: None,
             allowed_project_roots: Vec::new(),
+            max_webhook_body_bytes: default_max_webhook_body_bytes(),
+            signal_rate_limit_per_minute: default_signal_rate_limit_per_minute(),
         }
     }
 }
@@ -81,4 +91,12 @@ fn default_notification_lag_log_every() -> u64 {
 
 fn default_ws_heartbeat_interval_secs() -> u64 {
     30
+}
+
+fn default_max_webhook_body_bytes() -> usize {
+    524288
+}
+
+fn default_signal_rate_limit_per_minute() -> u32 {
+    100
 }

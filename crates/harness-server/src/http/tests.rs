@@ -186,10 +186,11 @@ fn intake_app(state: Arc<AppState>) -> Router {
 }
 
 fn webhook_app(state: Arc<AppState>) -> Router {
+    let body_limit = state.core.server.config.server.max_webhook_body_bytes;
     Router::new()
         .route(
             "/webhook",
-            post(github_webhook).layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES)),
+            post(github_webhook).layer(DefaultBodyLimit::max(body_limit)),
         )
         .with_state(state)
 }
@@ -494,9 +495,10 @@ async fn webhook_body_limit_rejects_large_payload() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let body_limit = state.core.server.config.server.max_webhook_body_bytes;
     let app = webhook_app(state);
 
-    let oversized = vec![b'a'; MAX_WEBHOOK_BODY_BYTES + 1024];
+    let oversized = vec![b'a'; body_limit + 1024];
     let signature = webhook_signature(secret, &oversized);
     let response = app
         .oneshot(
