@@ -443,6 +443,37 @@ pub fn sibling_task_context(siblings: &[SiblingTask]) -> String {
     )
 }
 
+/// Build the "Available Skills" listing injected into every agent prompt.
+///
+/// Each entry is a `(name, description)` pair. Returns an empty string when
+/// the slice is empty so callers can skip appending.
+pub fn build_available_skills_listing(skills: &[(&str, &str)]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut out = "\n\n## Available Skills\n".to_string();
+    for (name, desc) in skills {
+        out.push_str(&format!("- **{}**: {}\n", name, desc));
+    }
+    out
+}
+
+/// Build the "Relevant Skills" section for skills whose trigger patterns matched
+/// the current prompt.
+///
+/// Each entry is a `(name, content)` pair. Returns an empty string when the
+/// slice is empty so callers can skip appending.
+pub fn build_matched_skills_section(skills: &[(&str, &str)]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut out = "\n\n## Relevant Skills\n".to_string();
+    for (name, content) in skills {
+        out.push_str(&format!("### {}\n{}\n", name, content));
+    }
+    out
+}
+
 /// Wrap `s` in POSIX single quotes, escaping any embedded single quotes via `'\''`.
 ///
 /// This ensures the value is treated as literal data by the shell and cannot
@@ -971,5 +1002,58 @@ PR_URL=https://github.com/owner/repo/pull/269";
         let ctx = sibling_task_context(&siblings);
         assert!(ctx.contains("- refactor auth middleware"));
         assert!(!ctx.contains('#'));
+    }
+
+    #[test]
+    fn build_available_skills_listing_empty_returns_empty_string() {
+        assert!(build_available_skills_listing(&[]).is_empty());
+    }
+
+    #[test]
+    fn build_available_skills_listing_formats_all_entries() {
+        let skills = [
+            ("review", "Code review tool"),
+            ("deploy", "Deploy to production"),
+        ];
+        let result = build_available_skills_listing(&skills);
+        assert!(result.contains("## Available Skills"));
+        assert!(result.contains("**review**"));
+        assert!(result.contains("Code review tool"));
+        assert!(result.contains("**deploy**"));
+        assert!(result.contains("Deploy to production"));
+    }
+
+    #[test]
+    fn build_available_skills_listing_starts_with_double_newline() {
+        let skills = [("a", "desc")];
+        let result = build_available_skills_listing(&skills);
+        assert!(
+            result.starts_with("\n\n"),
+            "section must start with two newlines"
+        );
+    }
+
+    #[test]
+    fn build_matched_skills_section_empty_returns_empty_string() {
+        assert!(build_matched_skills_section(&[]).is_empty());
+    }
+
+    #[test]
+    fn build_matched_skills_section_formats_name_and_content() {
+        let skills = [("review", "# Review\nReview code carefully.")];
+        let result = build_matched_skills_section(&skills);
+        assert!(result.contains("## Relevant Skills"));
+        assert!(result.contains("### review"));
+        assert!(result.contains("Review code carefully."));
+    }
+
+    #[test]
+    fn build_matched_skills_section_starts_with_double_newline() {
+        let skills = [("a", "content")];
+        let result = build_matched_skills_section(&skills);
+        assert!(
+            result.starts_with("\n\n"),
+            "section must start with two newlines"
+        );
     }
 }

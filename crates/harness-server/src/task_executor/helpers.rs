@@ -305,6 +305,65 @@ pub(crate) async fn collect_context_items(
     items
 }
 
+/// Match skills against the prompt, record usage for each match, and return a
+/// string to append directly to the agent prompt.
+///
+/// Since harness uses single-turn `claude -p`, context items are not visible to
+/// agents — this function injects skill content into the prompt text itself.
+///
+/// Two sections are appended:
+/// - **Available Skills**: a brief listing of every skill (name + description).
+/// - **Relevant Skills**: full content of skills whose trigger patterns matched.
+///
+/// Returns an empty string when the store is empty (no sections added).
+/// The "Relevant Skills" section is omitted when no skills match.
+///
+/// Lock discipline: holds read lock briefly, drops it, then acquires write lock
+/// only if there are matched skills to record usage for. Never holds both locks
+/// simultaneously.
+pub(crate) async fn inject_skills_into_prompt(
+    skills: &RwLock<harness_skills::SkillStore>,
+    prompt: &str,
+) -> String {
+    // Read phase: collect all needed data while holding read lock minimally.
+    let (matched_data, all_skills) = {
+        let guard = skills.read().await;
+        let matched: Vec<(harness_core::SkillId, String, String)> = guard
+            .match_prompt(prompt)
+            .into_iter()
+            .map(|s| (s.id.clone(), s.name.clone(), s.content.clone()))
+            .collect();
+        let all: Vec<(String, String)> = guard
+            .list()
+            .iter()
+            .map(|s| (s.name.clone(), s.description.clone()))
+            .collect();
+        (matched, all)
+    };
+
+    // Write phase: record usage for matched skills (brief write lock).
+    if !matched_data.is_empty() {
+        let mut guard = skills.write().await;
+        for (id, _, _) in &matched_data {
+            guard.record_use(id);
+        }
+    }
+
+    // Build prompt additions.
+    let all_refs: Vec<(&str, &str)> = all_skills
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_str()))
+        .collect();
+    let matched_refs: Vec<(&str, &str)> = matched_data
+        .iter()
+        .map(|(_, n, c)| (n.as_str(), c.as_str()))
+        .collect();
+
+    let listing = harness_core::prompts::build_available_skills_listing(&all_refs);
+    let section = harness_core::prompts::build_matched_skills_section(&matched_refs);
+    format!("{listing}{section}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,6 +756,97 @@ mod tests {
         };
         let result = run_post_tool_use(&interceptors, &event, std::path::Path::new("/tmp")).await;
         assert!(result.is_none());
+    }
+
+    // ── inject_skills_into_prompt ─────────────────────────────────────────────
+
+    fn make_skill_store_with_review() -> harness_skills::SkillStore {
+        let mut store = harness_skills::SkillStore::new();
+        store.create(
+            "review".to_string(),
+            "# Review\n<!-- trigger-patterns: code review -->\nReview code carefully.".to_string(),
+        );
+        store
+    }
+
+    #[tokio::test]
+    async fn inject_skills_includes_all_skills_listing() {
+        let skills = RwLock::new(make_skill_store_with_review());
+        let result = inject_skills_into_prompt(&skills, "unrelated prompt").await;
+        assert!(
+            result.contains("## Available Skills"),
+            "listing must appear even when no skill matches"
+        );
+        assert!(
+            result.contains("review"),
+            "listing must include skill names"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_skills_adds_relevant_section_when_prompt_matches() {
+        let skills = RwLock::new(make_skill_store_with_review());
+        let result = inject_skills_into_prompt(&skills, "please do a code review").await;
+        assert!(
+            result.contains("## Relevant Skills"),
+            "matched skills section must appear"
+        );
+        assert!(
+            result.contains("### review"),
+            "matched skill name must appear in section header"
+        );
+        assert!(
+            result.contains("Review code carefully."),
+            "matched skill content must appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_skills_omits_relevant_section_when_no_match() {
+        let skills = RwLock::new(make_skill_store_with_review());
+        let result = inject_skills_into_prompt(&skills, "implement feature X").await;
+        assert!(
+            !result.contains("## Relevant Skills"),
+            "relevant section must not appear when no skill matches"
+        );
+        assert!(
+            result.contains("## Available Skills"),
+            "available skills listing must still appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_skills_records_usage_for_matched_skill() {
+        let skills = RwLock::new(make_skill_store_with_review());
+        inject_skills_into_prompt(&skills, "please do a code review").await;
+        let guard = skills.read().await;
+        assert_eq!(
+            guard.list()[0].usage_count,
+            1,
+            "usage must be recorded for matched skill"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_skills_does_not_record_usage_for_unmatched_skill() {
+        let skills = RwLock::new(make_skill_store_with_review());
+        inject_skills_into_prompt(&skills, "implement feature X").await;
+        let guard = skills.read().await;
+        assert_eq!(
+            guard.list()[0].usage_count,
+            0,
+            "usage must not be recorded when skill did not match"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_skills_empty_store_returns_empty_string() {
+        let skills = RwLock::new(harness_skills::SkillStore::new());
+        let result = inject_skills_into_prompt(&skills, "any prompt").await;
+        assert!(
+            result.is_empty(),
+            "empty skill store must produce empty string"
+        );
     }
 
     // ── truncate_validation_error ─────────────────────────────────────────────
