@@ -94,9 +94,7 @@ impl CodeAgent for CodexAgent {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         crate::strip_claude_env(&mut cmd);
-        for (key, value) in &req.env_vars {
-            cmd.env(key, value);
-        }
+        cmd.envs(&req.env_vars);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {
@@ -156,9 +154,7 @@ impl CodeAgent for CodexAgent {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         crate::strip_claude_env(&mut cmd);
-        for (key, value) in &req.env_vars {
-            cmd.env(key, value);
-        }
+        cmd.envs(&req.env_vars);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {
