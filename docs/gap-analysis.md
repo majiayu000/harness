@@ -5,20 +5,20 @@
 
 ## Summary
 
-**Overall coverage: 95%** — All 38 JSON-RPC methods are routed and functional. Thread persistence, parallel dispatch, skill persistence, ExecPlan DB, and all observability methods are implemented. Remaining gaps are minor: guard script library, auto-fix patterns, and SDK publishing.
+**Overall coverage: ~56%** — Core JSON-RPC routing, thread/task persistence, and observability infrastructure are in place. Significant gaps remain in runtime rule enforcement, multi-agent parallel dispatch, improvement cycle tracking, and external feedback ingestion.
 
 ## Coverage Table
 
 | Dimension | Coverage | Status | Notes |
 |-----------|----------|--------|-------|
-| Golden Principles | 95% | Rules enforce via pre-turn interceptor + Starlark exec policy | Minor: guard script library thin |
-| App Server (Thread/Turn/Item) | 95% | All 38 methods routed, Thread persisted to SQLite, WebSocket transport | Minor: approval flow untested |
-| GC Agent | 90% | Signal detection + draft lifecycle + adopt pipeline with git commit/PR | Minor: no incremental scanning |
-| Taste Invariants | 85% | 83 rules deployed, QualityGrader 4-axis scoring | Minor: fix_pattern always None |
-| Improvement Cycles | 90% | ExecPlan persisted, Skills with disk persistence + auto-injection | Minor: no usage stats |
-| Feedback Loops | 90% | EventLog/EventQuery wired, OTLP export, auto-trigger Gemini review | Minor: no external signal ingestion |
-| Multi-Agent Coordination | 90% | Parallel dispatch with file-aware decomposition + isolated worktrees | Minor: no agent tool isolation |
-| Skill System | 90% | CRUD + 4-layer discovery + disk persistence + trigger patterns | Minor: no versioning |
+| Golden Principles | 70% | Rules scannable; pre-turn interceptor wired | Missing: runtime hook blocking, TurnSteer, auto-PR on GC violation |
+| App Server (Thread/Turn/Item) | 55% | Core methods routed, Thread+Task persisted to SQLite | Missing: real streaming, approval flow, full WS handshake |
+| GC Agent | 60% | Signal detection + draft lifecycle + adopt pipeline | Missing: auto PR creation, artifact parsing, incremental scanning |
+| Taste Invariants | 65% | 83 rules deployed, QualityGrader 4-axis scoring | Missing: auto-fix, guard script library, real-time hook integration |
+| Improvement Cycles | 35% | ExecPlan Markdown serialization, MEMORY.md via remem | Missing: ExecPlan DB persistence, skill usage stats, auto-trigger |
+| Feedback Loops | 40% | EventStore (JSONL), QualityGrader, GC signal detection | Missing: EventLog/EventQuery routing, external signals, telemetry export |
+| Multi-Agent Coordination | 25% | AgentRegistry multi-agent routing, async task spawn | Missing: true parallel dispatch, TaskClassification use, agent isolation |
+| Skill System | 50% | 4-layer discovery, CRUD CLI, trigger_patterns field | Missing: auto-injection, persistence, routing, trigger_patterns parsing |
 
 ## Dimension Details
 
