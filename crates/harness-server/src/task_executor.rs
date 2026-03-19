@@ -192,14 +192,75 @@ fn compute_backoff_ms(base_ms: u64, max_ms: u64, attempt: u32) -> u64 {
     base_ms.saturating_mul(1u64 << shift).min(max_ms)
 }
 
+/// Persist a completed stream item as a task artifact when it carries content
+/// worth retaining across context loss (shell commands, file edits, tool calls).
+async fn persist_artifact(
+    store: &TaskStore,
+    task_id: &TaskId,
+    turn: u32,
+    item: &harness_core::Item,
+) {
+    let (artifact_type, content) = match item {
+        harness_core::Item::ShellCommand {
+            command,
+            exit_code,
+            stdout,
+            stderr,
+        } => {
+            let c = serde_json::json!({
+                "command": command,
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+            })
+            .to_string();
+            ("shell_command", c)
+        }
+        harness_core::Item::FileEdit {
+            path,
+            before,
+            after,
+        } => {
+            let c = serde_json::json!({
+                "path": path,
+                "before": before,
+                "after": after,
+            })
+            .to_string();
+            ("file_edit", c)
+        }
+        harness_core::Item::ToolCall {
+            name,
+            input,
+            output,
+        } => {
+            let c = serde_json::json!({
+                "name": name,
+                "input": input,
+                "output": output,
+            })
+            .to_string();
+            ("tool_call", c)
+        }
+        _ => return,
+    };
+    store
+        .insert_artifact(task_id, turn, artifact_type, &content)
+        .await;
+}
+
 /// Execute an agent request via [`CodeAgent::execute_stream`], broadcasting
 /// each [`StreamItem`] to the per-task channel in real time, and reconstruct
 /// an [`AgentResponse`] from the collected stream events.
+///
+/// `turn` is stored with each captured artifact so callers can distinguish
+/// implementation turn (1) from later review or retry turns.
 async fn run_agent_streaming(
     agent: &dyn CodeAgent,
     req: AgentRequest,
     task_id: &TaskId,
     store: &TaskStore,
+    turn: u32,
 ) -> harness_core::Result<AgentResponse> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamItem>(128);
     let mut exec = std::pin::pin!(agent.execute_stream(req, tx));
@@ -226,6 +287,9 @@ async fn run_agent_streaming(
                             } => {
                                 // Prefer the full content over accumulated deltas.
                                 output = content.clone();
+                            }
+                            StreamItem::ItemCompleted { item: completed_item } => {
+                                persist_artifact(store, task_id, turn, completed_item).await;
                             }
                             StreamItem::TokenUsage { usage } => {
                                 token_usage = usage.clone();
@@ -400,7 +464,7 @@ pub(crate) async fn run_task(
     let resp = loop {
         let raw = tokio::time::timeout(
             turn_timeout,
-            run_agent_streaming(agent, impl_req.clone(), task_id, store),
+            run_agent_streaming(agent, impl_req.clone(), task_id, store, 1),
         )
         .await;
         match raw {

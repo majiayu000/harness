@@ -831,6 +831,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .route("/tasks", get(list_tasks))
         .route("/tasks/batch", post(task_routes::create_tasks_batch))
         .route("/tasks/{id}", get(get_task))
+        .route("/tasks/{id}/artifacts", get(get_task_artifacts))
         .route("/tasks/{id}/stream", get(stream_task_sse))
         .route(
             "/projects",
@@ -1175,6 +1176,29 @@ async fn get_task(State(state): State<Arc<AppState>>, Path(id): Path<String>) ->
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "task not found"})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /tasks/{id}/artifacts — all persisted artifacts for a task.
+async fn get_task_artifacts(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let task_id = task_runner::TaskId(id);
+    if state.core.tasks.get(&task_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "task not found"})),
+        )
+            .into_response();
+    }
+    match state.core.tasks.list_artifacts(&task_id).await {
+        Ok(artifacts) => Json(artifacts).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
         )
             .into_response(),
     }
