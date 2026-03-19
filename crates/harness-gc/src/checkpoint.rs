@@ -92,8 +92,8 @@ mod tests {
         let cp = GcCheckpoint::new(ts).with_head_commit("abc1234".to_string());
 
         cp.save(&path)?;
-        let loaded = GcCheckpoint::load(&path)
-            .ok_or_else(|| anyhow::anyhow!("checkpoint should load"))?;
+        let loaded =
+            GcCheckpoint::load(&path).ok_or_else(|| anyhow::anyhow!("checkpoint should load"))?;
         assert_eq!(loaded.last_scan_at, ts);
         assert_eq!(loaded.head_commit.as_deref(), Some("abc1234"));
         Ok(())
