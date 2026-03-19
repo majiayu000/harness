@@ -16,9 +16,10 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 
 pub(crate) use helpers::{
-    collect_context_items, detect_modified_files, emit_runtime_notification, mark_turn_failed,
-    persist_runtime_thread, process_stream_item, run_on_error, run_post_execute, run_post_tool_use,
-    run_pre_execute, truncate_validation_error, update_status,
+    collect_context_items, detect_modified_files, emit_runtime_notification,
+    inject_skills_into_prompt, mark_turn_failed, persist_runtime_thread, process_stream_item,
+    run_on_error, run_post_execute, run_post_tool_use, run_pre_execute, truncate_validation_error,
+    update_status,
 };
 pub(crate) use pr_detection::{
     build_fix_ci_prompt, build_pr_approved_prompt, build_pr_rework_prompt,
@@ -368,6 +369,17 @@ pub(crate) async fn run_task(
             let ctx = prompts::sibling_task_context(&sibling_tasks);
             format!("{first_prompt}\n\n{ctx}")
         }
+    };
+
+    // Inject skill content directly into the prompt text.
+    // Since harness uses single-turn `claude -p`, context items are not visible
+    // to the agent — we must embed skill content in the prompt string itself.
+    // Also records usage for any matched skills via record_use().
+    let skill_additions = inject_skills_into_prompt(&skills, &first_prompt).await;
+    let first_prompt = if skill_additions.is_empty() {
+        first_prompt
+    } else {
+        first_prompt + &skill_additions
     };
 
     let context_items = collect_context_items(&skills, &project, &first_prompt).await;

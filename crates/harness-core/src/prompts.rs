@@ -443,6 +443,51 @@ pub fn sibling_task_context(siblings: &[SiblingTask]) -> String {
     )
 }
 
+/// Build the "Available Skills" listing injected into every agent prompt.
+///
+/// Each entry is a `(name, description)` pair. Returns an empty string when
+/// the iterator is empty so callers can skip appending.
+pub fn build_available_skills_listing<'a>(
+    skills: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> String {
+    let mut iter = skills.into_iter().peekable();
+    if iter.peek().is_none() {
+        return String::new();
+    }
+    let mut out = "\n\n## Available Skills\n".to_string();
+    for (name, desc) in iter {
+        out.push_str("- **");
+        out.push_str(name);
+        out.push_str("**: ");
+        out.push_str(desc);
+        out.push('\n');
+    }
+    out
+}
+
+/// Build the "Relevant Skills" section for skills whose trigger patterns matched
+/// the current prompt.
+///
+/// Each entry is a `(name, content)` pair. Returns an empty string when the
+/// iterator is empty so callers can skip appending.
+pub fn build_matched_skills_section<'a>(
+    skills: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> String {
+    let mut iter = skills.into_iter().peekable();
+    if iter.peek().is_none() {
+        return String::new();
+    }
+    let mut out = "\n\n## Relevant Skills\n".to_string();
+    for (name, content) in iter {
+        out.push_str("### ");
+        out.push_str(name);
+        out.push('\n');
+        out.push_str(content);
+        out.push('\n');
+    }
+    out
+}
+
 /// Wrap `s` in POSIX single quotes, escaping any embedded single quotes via `'\''`.
 ///
 /// This ensures the value is treated as literal data by the shell and cannot
@@ -971,5 +1016,58 @@ PR_URL=https://github.com/owner/repo/pull/269";
         let ctx = sibling_task_context(&siblings);
         assert!(ctx.contains("- refactor auth middleware"));
         assert!(!ctx.contains('#'));
+    }
+
+    #[test]
+    fn build_available_skills_listing_empty_returns_empty_string() {
+        assert!(build_available_skills_listing(std::iter::empty::<(&str, &str)>()).is_empty());
+    }
+
+    #[test]
+    fn build_available_skills_listing_formats_all_entries() {
+        let skills = [
+            ("review", "Code review tool"),
+            ("deploy", "Deploy to production"),
+        ];
+        let result = build_available_skills_listing(skills.iter().copied());
+        assert!(result.contains("## Available Skills"));
+        assert!(result.contains("**review**"));
+        assert!(result.contains("Code review tool"));
+        assert!(result.contains("**deploy**"));
+        assert!(result.contains("Deploy to production"));
+    }
+
+    #[test]
+    fn build_available_skills_listing_starts_with_double_newline() {
+        let skills = [("a", "desc")];
+        let result = build_available_skills_listing(skills.iter().copied());
+        assert!(
+            result.starts_with("\n\n"),
+            "section must start with two newlines"
+        );
+    }
+
+    #[test]
+    fn build_matched_skills_section_empty_returns_empty_string() {
+        assert!(build_matched_skills_section(std::iter::empty::<(&str, &str)>()).is_empty());
+    }
+
+    #[test]
+    fn build_matched_skills_section_formats_name_and_content() {
+        let skills = [("review", "# Review\nReview code carefully.")];
+        let result = build_matched_skills_section(skills.iter().copied());
+        assert!(result.contains("## Relevant Skills"));
+        assert!(result.contains("### review"));
+        assert!(result.contains("Review code carefully."));
+    }
+
+    #[test]
+    fn build_matched_skills_section_starts_with_double_newline() {
+        let skills = [("a", "content")];
+        let result = build_matched_skills_section(skills.iter().copied());
+        assert!(
+            result.starts_with("\n\n"),
+            "section must start with two newlines"
+        );
     }
 }
