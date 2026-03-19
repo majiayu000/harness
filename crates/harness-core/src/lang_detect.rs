@@ -355,11 +355,7 @@ mod tests {
         let dir = tmpdir();
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"foo\"").unwrap();
         let cmds = default_pre_commit_commands(Language::Rust, dir.path());
-        assert!(cmds.iter().any(|c| c.contains("cargo fmt")));
-        assert!(!cmds.iter().any(|c| c.contains("cargo check")));
-        assert!(cmds.iter().any(|c| c.contains("cargo clippy")
-            && c.contains("-D warnings")
-            && !c.contains("--workspace")));
+        assert_eq!(cmds, vec!["cargo fmt --all", "cargo clippy --all-targets -- -D warnings"]);
     }
 
     #[test]
