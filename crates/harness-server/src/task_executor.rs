@@ -349,6 +349,15 @@ async fn run_agent_streaming(
     }
 }
 
+fn prepend_constitution(prompt: String, enabled: bool) -> String {
+    const CONSTITUTION: &str = include_str!("../../../config/constitution.md");
+    if enabled {
+        format!("{CONSTITUTION}\n\n{prompt}")
+    } else {
+        prompt
+    }
+}
+
 pub(crate) async fn run_task(
     store: &TaskStore,
     task_id: &TaskId,
@@ -465,6 +474,10 @@ pub(crate) async fn run_task(
             format!("{first_prompt}\n\n{ctx}")
         }
     };
+
+    // Prepend the Golden Principles constitution when enabled.
+    let first_prompt =
+        prepend_constitution(first_prompt, server_config.server.constitution_enabled);
 
     // Inject skill content directly into the prompt text.
     // Since harness uses single-turn `claude -p`, context items are not visible
@@ -1225,5 +1238,23 @@ mod tests {
     fn implementation_turn_uses_full_profile_no_restriction() {
         // Full profile returns None — no --allowedTools flag is passed to the agent.
         assert!(CapabilityProfile::Full.tools().is_none());
+    }
+
+    #[test]
+    fn constitution_present_when_enabled() {
+        let result = prepend_constitution("Do the task.".to_string(), true);
+        assert!(result.contains("GP-01"));
+        assert!(result.contains("GP-02"));
+        assert!(result.contains("GP-03"));
+        assert!(result.contains("GP-04"));
+        assert!(result.contains("GP-05"));
+        assert!(result.ends_with("Do the task."));
+    }
+
+    #[test]
+    fn constitution_absent_when_disabled() {
+        let result = prepend_constitution("Do the task.".to_string(), false);
+        assert_eq!(result, "Do the task.");
+        assert!(!result.contains("GP-01"));
     }
 }
