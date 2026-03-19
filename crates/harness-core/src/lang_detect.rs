@@ -153,7 +153,6 @@ pub fn default_pre_commit_commands(lang: Language, project_root: &Path) -> Vec<S
             };
             vec![
                 "cargo fmt --all".to_string(),
-                format!("cargo check {scope}"),
                 format!("cargo clippy {scope} -- -D warnings"),
             ]
         }
@@ -357,9 +356,7 @@ mod tests {
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"foo\"").unwrap();
         let cmds = default_pre_commit_commands(Language::Rust, dir.path());
         assert!(cmds.iter().any(|c| c.contains("cargo fmt")));
-        assert!(cmds
-            .iter()
-            .any(|c| c.contains("cargo check") && !c.contains("--workspace")));
+        assert!(!cmds.iter().any(|c| c.contains("cargo check")));
         assert!(cmds.iter().any(|c| c.contains("cargo clippy")
             && c.contains("-D warnings")
             && !c.contains("--workspace")));
@@ -374,9 +371,7 @@ mod tests {
         )
         .unwrap();
         let cmds = default_pre_commit_commands(Language::Rust, dir.path());
-        assert!(cmds
-            .iter()
-            .any(|c| c.contains("--workspace") && c.contains("cargo check")));
+        assert!(!cmds.iter().any(|c| c.contains("cargo check")));
         assert!(cmds
             .iter()
             .any(|c| c.contains("--workspace") && c.contains("cargo clippy")));
@@ -585,7 +580,7 @@ mod tests {
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"foo\"").unwrap();
         let instructions = validation_prompt_instructions(Language::Rust, dir.path());
         assert!(instructions.contains("cargo fmt"));
-        assert!(instructions.contains("cargo check"));
+        assert!(!instructions.contains("cargo check"));
         assert!(instructions.contains("cargo clippy"));
         assert!(instructions.contains("cargo test"));
     }
