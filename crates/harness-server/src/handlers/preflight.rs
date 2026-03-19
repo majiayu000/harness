@@ -92,10 +92,7 @@ pub async fn run_preflight(
         prompt,
         project_root,
         allowed_tools: vec!["Read".to_string()],
-        model: None,
-        max_budget_usd: None,
-        context: vec![],
-        execution_phase: None,
+        ..Default::default()
     };
 
     let resp = agent.execute(req).await?;
