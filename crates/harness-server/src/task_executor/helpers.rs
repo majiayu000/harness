@@ -325,6 +325,14 @@ pub(crate) async fn inject_skills_into_prompt(
     skills: &RwLock<harness_skills::SkillStore>,
     prompt: &str,
 ) -> String {
+    // Early return when the store is empty — avoids acquiring locks unnecessarily.
+    {
+        let guard = skills.read().await;
+        if guard.list().is_empty() {
+            return String::new();
+        }
+    }
+
     // Read phase: collect all needed data while holding read lock minimally.
     let (matched_data, all_skills) = {
         let guard = skills.read().await;
@@ -358,7 +366,9 @@ pub(crate) async fn inject_skills_into_prompt(
             .iter()
             .map(|(_, n, c)| (n.as_str(), c.as_str())),
     );
-    format!("{listing}{section}")
+    let mut result = listing;
+    result.push_str(&section);
+    result
 }
 
 #[cfg(test)]
