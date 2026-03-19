@@ -507,6 +507,7 @@ pub async fn spawn_task(
         permit,
         completion_callback,
         None,
+        None,
     )
     .await
 }
@@ -526,6 +527,8 @@ pub async fn register_pending_task(store: Arc<TaskStore>, source: Option<String>
 
 /// Begin execution for a task pre-registered via `register_pending_task`.
 /// The caller must have already acquired a concurrency permit; it is held for the task's lifetime.
+/// `group_permit` is an optional semaphore permit that serialises tasks within a conflict group;
+/// it is held inside the innermost spawned future for the full duration of task execution.
 pub async fn spawn_preregistered_task(
     task_id: TaskId,
     store: Arc<TaskStore>,
@@ -539,6 +542,7 @@ pub async fn spawn_preregistered_task(
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
+    group_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) {
     spawn_task_with_worktree_detector(
         store,
@@ -554,6 +558,7 @@ pub async fn spawn_preregistered_task(
         permit,
         completion_callback,
         Some(task_id),
+        group_permit,
     )
     .await;
 }
@@ -572,6 +577,7 @@ async fn spawn_task_with_worktree_detector<F>(
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
     preregistered_id: Option<TaskId>,
+    group_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> TaskId
 where
     F: Fn() -> PathBuf + Send + Sync + 'static,
@@ -598,9 +604,11 @@ where
     let detect_worktree = Arc::new(detect_worktree);
 
     let handle = tokio::spawn(async move {
-        // Hold the concurrency permit for the task's lifetime.
-        // Dropped automatically when this future completes (including on panic).
+        // Hold both permits for the task's lifetime so that the group serialisation
+        // semaphore is not released until actual execution completes (not just until
+        // spawn_preregistered_task returns, which happens almost immediately).
         let _permit = permit;
+        let _group_permit = group_permit;
         let detect_worktree = detect_worktree.clone();
         let raw_project =
             resolve_project_root_with(req.project.clone(), move || detect_worktree()).await?;
@@ -1283,6 +1291,7 @@ mod tests {
             },
             None,
             permit,
+            None,
             None,
             None,
         )

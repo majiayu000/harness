@@ -279,6 +279,7 @@ impl ExecutionService for DefaultExecutionService {
                         workspace_mgr,
                         permit,
                         completion_callback,
+                        None,
                     )
                     .await;
                 }

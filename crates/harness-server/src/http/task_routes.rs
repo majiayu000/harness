@@ -290,9 +290,10 @@ async fn enqueue_task_background(
     {
         let task_id2 = task_id.clone();
         tokio::spawn(async move {
-            // Hold the group serialisation permit for the entire task duration so
-            // that at most one file-conflicting task from the same batch runs at a time.
-            let _group_permit = if let Some(sem) = group_sem {
+            // Acquire the group serialisation permit before competing for the
+            // per-project concurrency slot, then pass it into spawn_preregistered_task
+            // so it is held inside the innermost future for the full task lifetime.
+            let group_permit = if let Some(sem) = group_sem {
                 sem.acquire_owned().await.ok()
             } else {
                 None
@@ -312,6 +313,7 @@ async fn enqueue_task_background(
                         state.concurrency.workspace_mgr.clone(),
                         permit,
                         state.intake.completion_callback.clone(),
+                        group_permit,
                     )
                     .await;
                 }
