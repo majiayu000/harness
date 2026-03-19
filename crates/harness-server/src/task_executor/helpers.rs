@@ -350,17 +350,14 @@ pub(crate) async fn inject_skills_into_prompt(
     }
 
     // Build prompt additions.
-    let all_refs: Vec<(&str, &str)> = all_skills
-        .iter()
-        .map(|(n, d)| (n.as_str(), d.as_str()))
-        .collect();
-    let matched_refs: Vec<(&str, &str)> = matched_data
-        .iter()
-        .map(|(_, n, c)| (n.as_str(), c.as_str()))
-        .collect();
-
-    let listing = harness_core::prompts::build_available_skills_listing(&all_refs);
-    let section = harness_core::prompts::build_matched_skills_section(&matched_refs);
+    let listing = harness_core::prompts::build_available_skills_listing(
+        all_skills.iter().map(|(n, d)| (n.as_str(), d.as_str())),
+    );
+    let section = harness_core::prompts::build_matched_skills_section(
+        matched_data
+            .iter()
+            .map(|(_, n, c)| (n.as_str(), c.as_str())),
+    );
     format!("{listing}{section}")
 }
 

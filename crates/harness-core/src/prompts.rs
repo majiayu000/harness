@@ -446,13 +446,16 @@ pub fn sibling_task_context(siblings: &[SiblingTask]) -> String {
 /// Build the "Available Skills" listing injected into every agent prompt.
 ///
 /// Each entry is a `(name, description)` pair. Returns an empty string when
-/// the slice is empty so callers can skip appending.
-pub fn build_available_skills_listing(skills: &[(&str, &str)]) -> String {
-    if skills.is_empty() {
+/// the iterator is empty so callers can skip appending.
+pub fn build_available_skills_listing<'a>(
+    skills: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> String {
+    let mut iter = skills.into_iter().peekable();
+    if iter.peek().is_none() {
         return String::new();
     }
     let mut out = "\n\n## Available Skills\n".to_string();
-    for (name, desc) in skills {
+    for (name, desc) in iter {
         out.push_str("- **");
         out.push_str(name);
         out.push_str("**: ");
@@ -466,13 +469,16 @@ pub fn build_available_skills_listing(skills: &[(&str, &str)]) -> String {
 /// the current prompt.
 ///
 /// Each entry is a `(name, content)` pair. Returns an empty string when the
-/// slice is empty so callers can skip appending.
-pub fn build_matched_skills_section(skills: &[(&str, &str)]) -> String {
-    if skills.is_empty() {
+/// iterator is empty so callers can skip appending.
+pub fn build_matched_skills_section<'a>(
+    skills: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> String {
+    let mut iter = skills.into_iter().peekable();
+    if iter.peek().is_none() {
         return String::new();
     }
     let mut out = "\n\n## Relevant Skills\n".to_string();
-    for (name, content) in skills {
+    for (name, content) in iter {
         out.push_str("### ");
         out.push_str(name);
         out.push('\n');
@@ -1014,7 +1020,7 @@ PR_URL=https://github.com/owner/repo/pull/269";
 
     #[test]
     fn build_available_skills_listing_empty_returns_empty_string() {
-        assert!(build_available_skills_listing(&[]).is_empty());
+        assert!(build_available_skills_listing(std::iter::empty::<(&str, &str)>()).is_empty());
     }
 
     #[test]
@@ -1023,7 +1029,7 @@ PR_URL=https://github.com/owner/repo/pull/269";
             ("review", "Code review tool"),
             ("deploy", "Deploy to production"),
         ];
-        let result = build_available_skills_listing(&skills);
+        let result = build_available_skills_listing(skills.iter().copied());
         assert!(result.contains("## Available Skills"));
         assert!(result.contains("**review**"));
         assert!(result.contains("Code review tool"));
@@ -1034,7 +1040,7 @@ PR_URL=https://github.com/owner/repo/pull/269";
     #[test]
     fn build_available_skills_listing_starts_with_double_newline() {
         let skills = [("a", "desc")];
-        let result = build_available_skills_listing(&skills);
+        let result = build_available_skills_listing(skills.iter().copied());
         assert!(
             result.starts_with("\n\n"),
             "section must start with two newlines"
@@ -1043,13 +1049,13 @@ PR_URL=https://github.com/owner/repo/pull/269";
 
     #[test]
     fn build_matched_skills_section_empty_returns_empty_string() {
-        assert!(build_matched_skills_section(&[]).is_empty());
+        assert!(build_matched_skills_section(std::iter::empty::<(&str, &str)>()).is_empty());
     }
 
     #[test]
     fn build_matched_skills_section_formats_name_and_content() {
         let skills = [("review", "# Review\nReview code carefully.")];
-        let result = build_matched_skills_section(&skills);
+        let result = build_matched_skills_section(skills.iter().copied());
         assert!(result.contains("## Relevant Skills"));
         assert!(result.contains("### review"));
         assert!(result.contains("Review code carefully."));
@@ -1058,7 +1064,7 @@ PR_URL=https://github.com/owner/repo/pull/269";
     #[test]
     fn build_matched_skills_section_starts_with_double_newline() {
         let skills = [("a", "content")];
-        let result = build_matched_skills_section(&skills);
+        let result = build_matched_skills_section(skills.iter().copied());
         assert!(
             result.starts_with("\n\n"),
             "section must start with two newlines"

@@ -379,7 +379,7 @@ pub(crate) async fn run_task(
     let first_prompt = if skill_additions.is_empty() {
         first_prompt
     } else {
-        format!("{first_prompt}{skill_additions}")
+        first_prompt + &skill_additions
     };
 
     let context_items = collect_context_items(&skills, &project, &first_prompt).await;
