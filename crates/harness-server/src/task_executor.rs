@@ -464,6 +464,11 @@ pub(crate) async fn run_task(
         }
     };
 
+    // Prepend constitution principles so every agent turn starts from shared
+    // architectural ground truth. Skipped when constitution_enabled is false.
+    let first_prompt =
+        inject_constitution_if_enabled(first_prompt, server_config.server.constitution_enabled);
+
     // Inject skill content directly into the prompt text.
     // Since harness uses single-turn `claude -p`, context items are not visible
     // to the agent — we must embed skill content in the prompt string itself.
@@ -983,6 +988,16 @@ async fn run_agent_review(
     Ok(())
 }
 
+/// Prepend the Harness Constitution to the prompt when the flag is enabled.
+pub(crate) fn inject_constitution_if_enabled(prompt: String, enabled: bool) -> String {
+    const CONSTITUTION: &str = include_str!("../../../config/constitution.md");
+    if enabled {
+        format!("{CONSTITUTION}\n\n---\n\n{prompt}")
+    } else {
+        prompt
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,5 +1169,28 @@ mod tests {
     fn implementation_turn_uses_full_profile_no_restriction() {
         // Full profile returns None — no --allowedTools flag is passed to the agent.
         assert!(CapabilityProfile::Full.tools().is_none());
+    }
+
+    #[test]
+    fn constitution_injected_when_enabled() {
+        let result = inject_constitution_if_enabled("task prompt".to_string(), true);
+        assert!(result.contains("GP-01"), "GP-01 must appear in prompt");
+        assert!(result.contains("GP-05"), "GP-05 must appear in prompt");
+        assert!(
+            result.contains("task prompt"),
+            "original prompt must be preserved"
+        );
+        assert!(result.contains("---"), "separator must be present");
+        // Constitution must come before the task prompt.
+        assert!(
+            result.find("---\n\n") < result.find("task prompt"),
+            "constitution must precede the task prompt"
+        );
+    }
+
+    #[test]
+    fn constitution_absent_when_disabled() {
+        let result = inject_constitution_if_enabled("task prompt".to_string(), false);
+        assert_eq!(result, "task prompt");
     }
 }

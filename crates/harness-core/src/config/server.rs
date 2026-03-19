@@ -47,6 +47,10 @@ pub struct ServerConfig {
     /// Default: 100.
     #[serde(default = "default_signal_rate_limit_per_minute")]
     pub signal_rate_limit_per_minute: u32,
+    /// When true, the Harness Constitution (GP-01 through GP-05) is prepended
+    /// to every agent prompt. Default: true.
+    #[serde(default = "default_true")]
+    pub constitution_enabled: bool,
 }
 
 impl Default for ServerConfig {
@@ -65,6 +69,7 @@ impl Default for ServerConfig {
             allowed_project_roots: Vec::new(),
             max_webhook_body_bytes: default_max_webhook_body_bytes(),
             signal_rate_limit_per_minute: default_signal_rate_limit_per_minute(),
+            constitution_enabled: default_true(),
         }
     }
 }
@@ -99,4 +104,8 @@ fn default_max_webhook_body_bytes() -> usize {
 
 fn default_signal_rate_limit_per_minute() -> u32 {
     100
+}
+
+fn default_true() -> bool {
+    true
 }
