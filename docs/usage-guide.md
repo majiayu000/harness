@@ -467,6 +467,125 @@ Frequency adapts to code quality:
 
 Scans for violation signals → generates remediation drafts → optionally adopts fixes.
 
+## GC Learn Pipeline (Self-Improving Rules)
+
+Harness can learn from its own execution history: detect recurring problems, generate fixes, and extract reusable rules/skills. This is a 4-step pipeline.
+
+### Prerequisites
+
+- Server running with accumulated task data (`events.db`)
+- RPC handshake required before each session:
+
+```bash
+curl -X POST http://127.0.0.1:9800/rpc -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+curl -X POST http://127.0.0.1:9800/rpc -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"initialized"}'
+```
+
+### Step 1: Signal Detection (`gc_run`)
+
+Scans the event store for recurring problem patterns:
+
+```bash
+curl -X POST http://127.0.0.1:9800/rpc -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"gc_run","params":{"project_id":null}}'
+```
+
+Detected signal types:
+
+| Signal | Meaning | Remediation |
+|--------|---------|-------------|
+| `RepeatedWarn` | Same hook fires N+ warnings | Guard script |
+| `ChronicBlock` | M+ hard blocks (CI failures) | Rule |
+| `HotFiles` | Same files edited K+ times | Skill |
+| `SlowSessions` | Operations exceed T ms | Skill |
+| `WarnEscalation` | Warn rate exceeds baseline | Rule |
+| `LinterViolations` | M+ violations of same rule | Guard script |
+
+This call spawns an agent per signal to generate remediation drafts. May take several minutes depending on the number of signals and agent availability.
+
+### Step 2: Review Drafts (`gc_drafts`)
+
+List generated drafts and their status:
+
+```bash
+curl -X POST http://127.0.0.1:9800/rpc -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":4,"method":"gc_drafts"}'
+```
+
+Draft statuses: `pending` → `adopted` | `rejected` | `expired`
+
+You can also inspect drafts directly:
+
+```bash
+ls ~/Library/Application\ Support/harness/drafts/
+# Each .json file contains: signal, rationale, artifacts (rules/guards/skills)
+```
+
+### Step 3: Adopt or Reject (`gc_adopt` / `gc_reject`)
+
+Adopt a draft to mark it as approved for learning:
+
+```bash
+# Adopt (also spawns a task to apply the fix)
+curl -X POST http://127.0.0.1:9800/rpc -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":5,"method":"gc_adopt","params":{"draft_id":"<DRAFT_ID>"}}'
+
+# Reject
+curl -X POST http://127.0.0.1:9800/rpc -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":6,"method":"gc_reject","params":{"draft_id":"<DRAFT_ID>"}}'
+```
+
+### Step 4: Extract Rules or Skills (`learn_rules` / `learn_skills`)
+
+After drafts are adopted, extract reusable rules or skills from the remediation content:
+
+```bash
+# Extract guard rules from adopted drafts
+curl -X POST http://127.0.0.1:9800/rpc -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":7,"method":"learn_rules","params":{"project_root":"/path/to/project"}}'
+
+# Extract reusable skills from adopted drafts
+curl -X POST http://127.0.0.1:9800/rpc -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":8,"method":"learn_skills","params":{"project_root":"/path/to/project"}}'
+```
+
+These calls invoke an agent to analyze adopted draft artifacts and produce:
+- **Rules:** Structured `## RULE_ID: Title` blocks with severity, added to `RuleEngine`
+- **Skills:** Structured `=== skill: name ===` blocks, added to `SkillStore`
+
+### Full Pipeline Diagram
+
+```
+Events (task execution telemetry)
+  ↓
+Signal Detector (gc_run)
+  ├→ RepeatedWarn
+  ├→ ChronicBlock
+  ├→ WarnEscalation
+  └→ ...
+  ↓
+Draft Generation (agent analyzes signals)
+  ↓
+Drafts (pending)
+  ↓ (user reviews)
+gc_adopt / gc_reject
+  ↓
+Adopted Drafts
+  ↓
+learn_rules / learn_skills (agent extracts patterns)
+  ↓
+RuleEngine / SkillStore (permanently prevents recurrence)
+```
+
+### Tips
+
+- **Budget:** Default `budget_per_signal_usd = 0.50` may be too low for complex analysis. Increase to `1.0` in `config/default.toml` if drafts are truncated with "Exceeded USD budget".
+- **Timing:** Run `gc_run` after accumulating 50+ tasks for meaningful signals. Running too early produces noise.
+- **learn_rules is synchronous:** It blocks until the agent finishes. If other tasks are running, the agent may queue — consider running learn when the server is idle.
+- **Manual review:** Always inspect draft content before adopting. Draft quality depends on agent capability and available context.
+
 ## CLI Commands
 
 ```bash
