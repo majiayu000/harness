@@ -677,6 +677,7 @@ pub(crate) async fn run_task(
                 turn_timeout,
                 pr_num,
                 &events,
+                &cargo_env,
             )
             .await?;
         } else {
@@ -818,12 +819,8 @@ async fn run_agent_review(
     turn_timeout: Duration,
     pr_num: u64,
     events: &harness_observe::EventStore,
+    cargo_env: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
-    let cargo_env: HashMap<String, String> = [(
-        "CARGO_TARGET_DIR".to_string(),
-        format!("{}/target", project.display()),
-    )]
-    .into();
     let max_rounds = review_config.max_rounds;
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
