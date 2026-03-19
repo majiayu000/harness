@@ -43,9 +43,8 @@ pub fn check_existing_pr(pr: u64, review_bot_command: &str) -> String {
     let body = shell_single_quote(review_bot_command);
     format!(
         "Check PR #{pr}:\n\
-         1. Run `gh pr checks {pr} --json name,state` — parse the JSON array; \
-         CI passes if no entry has `\"state\"` equal to `\"FAILURE\"`, `\"ERROR\"`, or `\"TIMED_OUT\"` \
-         (states like `\"SKIPPED\"`, `\"NEUTRAL\"`, and `\"PENDING\"` are not failures)\n\
+         1. Run `gh pr view {pr} --json statusCheckRollup` — parse the JSON. \
+         CI passes only if the `state` field in the `statusCheckRollup` object is `SUCCESS`\n\
          2. `gh api repos/{{owner}}/{{repo}}/pulls/{pr}/comments` — read inline review comments\n\
          3. If CI passes and there are no unresolved review comments, print LGTM on the last line\n\
          4. Otherwise fix each comment, commit, push, \
@@ -182,9 +181,8 @@ pub fn review_prompt(
     format!(
         "{context}\
          Steps:\n\
-         1. Run `gh pr checks {pr} --json name,state` and parse the JSON array; \
-         CI passes if no entry has `\"state\"` equal to `\"FAILURE\"`, `\"ERROR\"`, or `\"TIMED_OUT\"` \
-         (states like `\"SKIPPED\"`, `\"NEUTRAL\"`, and `\"PENDING\"` are not failures)\n\
+         1. Run `gh pr view {pr} --json statusCheckRollup` and parse the JSON. \
+         CI passes only if the `state` field in the `statusCheckRollup` object is `SUCCESS`\n\
          2. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/reviews` to read review verdicts\n\
          3. Run `gh api repos/{{{{owner}}}}/{{{{repo}}}}/pulls/{pr}/comments` to read inline review comments\n\
          4. {severity_guidance}\n\
@@ -527,12 +525,12 @@ mod tests {
         assert!(p.contains("LGTM"));
         assert!(p.contains("PR_URL="));
         assert!(
-            p.contains("--json name,state"),
-            "must use structured JSON output"
+            p.contains("statusCheckRollup"),
+            "must use statusCheckRollup for CI status"
         );
         assert!(
-            p.contains("\"state\"") && p.contains("\"FAILURE\""),
-            "must instruct agent to check state field"
+            p.contains("state") && p.contains("SUCCESS"),
+            "must instruct agent to check state field for SUCCESS"
         );
     }
 
