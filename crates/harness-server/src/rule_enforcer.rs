@@ -1,9 +1,11 @@
 use async_trait::async_trait;
+use dashmap::DashMap;
 use harness_core::{
     interceptor::{InterceptResult, TurnInterceptor},
     AgentRequest, Severity,
 };
 use harness_rules::engine::RuleEngine;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -15,11 +17,16 @@ use tokio::sync::RwLock;
 /// When no guards are registered the enforcer passes through silently.
 pub struct RuleEnforcer {
     rules: Arc<RwLock<RuleEngine>>,
+    /// Per-workspace violation count from the previous scan, used to compute deltas.
+    prev_counts: DashMap<PathBuf, usize>,
 }
 
 impl RuleEnforcer {
     pub fn new(rules: Arc<RwLock<RuleEngine>>) -> Self {
-        Self { rules }
+        Self {
+            rules,
+            prev_counts: DashMap::new(),
+        }
     }
 }
 
@@ -65,11 +72,37 @@ impl TurnInterceptor for RuleEnforcer {
             return InterceptResult::pass();
         }
 
-        tracing::info!(
-            violation_count = violations.len(),
-            project_root = %req.project_root.display(),
-            "rule_enforcer: scan completed"
-        );
+        let total = violations.len();
+        let prev = self
+            .prev_counts
+            .get(&req.project_root)
+            .map(|v| *v)
+            .unwrap_or(0);
+        let new_violations = total.saturating_sub(prev);
+        let fixed_violations = prev.saturating_sub(total);
+        self.prev_counts.insert(req.project_root.clone(), total);
+
+        // Only log at INFO when the count changes; repeat-same scans go to DEBUG.
+        let delta_zero = new_violations == 0 && fixed_violations == 0 && prev > 0;
+        if delta_zero {
+            tracing::debug!(
+                violation_count = total,
+                violations_total = total,
+                violations_new = new_violations,
+                violations_fixed = fixed_violations,
+                project_root = %req.project_root.display(),
+                "rule_enforcer: scan completed"
+            );
+        } else {
+            tracing::info!(
+                violation_count = total,
+                violations_total = total,
+                violations_new = new_violations,
+                violations_fixed = fixed_violations,
+                project_root = %req.project_root.display(),
+                "rule_enforcer: scan completed"
+            );
+        }
 
         let critical: Vec<_> = violations
             .iter()
