@@ -5,8 +5,8 @@ use crate::signal_detector::SignalDetector;
 use anyhow::Context;
 use chrono::Utc;
 use harness_core::{
-    AgentRequest, Artifact, ArtifactType, CodeAgent, Draft, DraftId, DraftStatus, GcConfig,
-    Project, RemediationType, Signal, SignalType,
+    AgentRequest, Artifact, ArtifactType, CapabilityProfile, CodeAgent, Draft, DraftId,
+    DraftStatus, GcConfig, Project, RemediationType, Signal, SignalType,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
@@ -162,7 +162,14 @@ impl GcAgent {
             .unwrap_or_else(|| DEFAULT_GC_TOOLS.iter().map(|s| s.to_string()).collect());
 
         for signal in signals.iter().take(self.config.max_drafts_per_run) {
-            let prompt = build_prompt(signal, project);
+            let base_prompt = build_prompt(signal, project);
+            // Inject capability restriction note — primary enforcement since --allowedTools
+            // is not passed to the CLI (issue #483).
+            let prompt = if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
+                format!("{note}\n\n{base_prompt}")
+            } else {
+                base_prompt
+            };
 
             let result = agent
                 .execute(AgentRequest {

@@ -56,10 +56,13 @@ impl ClaudeCodeAgent {
             OsString::from("--verbose"),
         ];
 
-        if !req.allowed_tools.is_empty() {
-            base_args.push(OsString::from("--allowedTools"));
-            base_args.push(OsString::from(req.allowed_tools.join(",")));
-        }
+        // NOTE: --allowedTools is intentionally NOT passed to Claude CLI.
+        // In Claude CLI 2.1.70, --allowedTools conflicts with
+        // --dangerously-skip-permissions and causes an immediate exit code 1.
+        // Tool restriction is enforced via:
+        //   1. Prompt-level instructions (CapabilityProfile::prompt_note injected
+        //      by the task executor for restricted profiles).
+        //   2. Post-execution validation (validate_tool_usage in tool_isolation.rs).
 
         if let Some(budget) = req.max_budget_usd {
             base_args.push(OsString::from("--max-budget-usd"));
@@ -188,6 +191,30 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    #[test]
+    fn base_args_never_includes_allowed_tools_flag() {
+        // --allowedTools conflicts with --dangerously-skip-permissions in
+        // Claude CLI 2.1.70 (issue #483). Verify it is never emitted.
+        let agent = ClaudeCodeAgent::new(
+            PathBuf::from("claude"),
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
+        let req = AgentRequest {
+            allowed_tools: vec!["Read".to_string(), "Write".to_string(), "Bash".to_string()],
+            ..AgentRequest::default()
+        };
+        let args = agent.base_args(&req);
+        let args_str: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !args_str.contains(&"--allowedTools".to_string()),
+            "--allowedTools must not be passed to Claude CLI; got: {args_str:?}"
+        );
+    }
 
     #[test]
     fn resolve_model_uses_phase_when_budget_configured() {
