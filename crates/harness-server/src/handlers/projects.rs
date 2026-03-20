@@ -47,9 +47,12 @@ pub async fn register_project(
 
     let allowed = &state.core.server.config.server.allowed_project_roots;
     if !allowed.is_empty() {
-        let permitted = allowed.iter().any(|base| {
-            let canonical_base = base.canonicalize().unwrap_or_else(|_| base.clone());
-            root.starts_with(&canonical_base)
+        let permitted = allowed.iter().any(|base| match base.canonicalize() {
+            Ok(canonical_base) => root.starts_with(&canonical_base),
+            Err(e) => {
+                tracing::error!("failed to canonicalize allowed root {:?}: {}", base, e);
+                false
+            }
         });
         if !permitted {
             return (
