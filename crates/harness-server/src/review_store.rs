@@ -79,8 +79,18 @@ impl ReviewStore {
         )
         .execute(&pool)
         .await?;
-        // Unique index enables atomic INSERT OR IGNORE + UPDATE deduplication
-        // without a TOCTOU race between a SELECT check and an INSERT.
+        // Remove duplicate (rule_id, file, status) rows that may exist from
+        // before this unique index was introduced; keep the most recent row per group.
+        sqlx::query(
+            "DELETE FROM review_findings \
+             WHERE rowid NOT IN ( \
+                 SELECT MAX(rowid) FROM review_findings GROUP BY rule_id, file, status \
+             )",
+        )
+        .execute(&pool)
+        .await?;
+        // Unique index enables specific-conflict INSERT deduplication without a
+        // TOCTOU race between a SELECT check and an INSERT.
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_dedup \
              ON review_findings(rule_id, file, status)",
@@ -92,13 +102,27 @@ impl ReviewStore {
 
     /// Persist findings from a review run, deduplicating against existing open findings.
     ///
-    /// Uses a transaction with INSERT OR IGNORE + conditional UPDATE to eliminate
-    /// the TOCTOU race that existed in the previous check-then-insert pattern.
+    /// Same-batch PK duplicates (same id within one review) are caught eagerly and
+    /// returned as an error rather than silently dropped by INSERT OR IGNORE.
+    /// Cross-review dedup (same rule_id+file already open) is handled atomically by
+    /// INSERT OR IGNORE + conditional UPDATE, eliminating the TOCTOU race.
     pub async fn persist_findings(
         &self,
         review_id: &str,
         findings: &[ReviewFinding],
     ) -> anyhow::Result<usize> {
+        // Detect PK duplicates within the batch before touching the DB.
+        // INSERT OR IGNORE would silently drop them; surface an explicit error instead.
+        let mut seen_ids = std::collections::HashSet::with_capacity(findings.len());
+        for f in findings {
+            if !seen_ids.insert(f.id.as_str()) {
+                anyhow::bail!(
+                    "duplicate finding id '{}' in review '{}' batch",
+                    f.id,
+                    review_id
+                );
+            }
+        }
         let mut tx = self.pool.begin().await?;
         let mut inserted = 0;
         for f in findings {
