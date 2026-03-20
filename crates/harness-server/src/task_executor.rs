@@ -353,6 +353,26 @@ fn prepend_constitution(prompt: String, enabled: bool) -> String {
     }
 }
 
+/// RAII guard that removes the task-specific Cargo target directory on drop.
+///
+/// This ensures disk space is reclaimed when `run_task` returns, regardless of
+/// whether it succeeds or fails.
+struct TaskTargetDir(PathBuf);
+
+impl Drop for TaskTargetDir {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                tracing::warn!(
+                    path = %self.0.display(),
+                    error = %e,
+                    "failed to remove task-specific cargo target dir"
+                );
+            }
+        }
+    }
+}
+
 pub(crate) async fn run_task(
     store: &TaskStore,
     task_id: &TaskId,
@@ -369,12 +389,16 @@ pub(crate) async fn run_task(
     update_status(store, task_id, TaskStatus::Implementing, 1).await?;
     let impl_phase_start = Instant::now();
 
-    // Set CARGO_TARGET_DIR to a per-workspace path so parallel agents using isolated
-    // git worktrees each build to their own target directory, eliminating cargo file
-    // lock contention when 4+ agents run cargo check/test simultaneously.
+    // Use a per-task temp directory for CARGO_TARGET_DIR to eliminate lock
+    // contention when multiple tasks run concurrently on the same project.
+    // The guard removes the directory when run_task returns (success or error).
+    let task_target = std::env::temp_dir()
+        .join("harness-cargo-targets")
+        .join(task_id.to_string());
+    let _task_target_guard = TaskTargetDir(task_target.clone());
     let cargo_env: HashMap<String, String> = [(
         "CARGO_TARGET_DIR".to_string(),
-        format!("{}/target", project.display()),
+        task_target.display().to_string(),
     )]
     .into();
 
@@ -1343,5 +1367,72 @@ mod tests {
         let result = prepend_constitution("Do the task.".to_string(), false);
         assert_eq!(result, "Do the task.");
         assert!(!result.contains("GP-01"));
+    }
+
+    /// TaskTargetDir drop removes the directory when it exists.
+    #[test]
+    fn task_target_dir_cleanup_on_drop() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target = dir
+            .path()
+            .join("harness-cargo-targets")
+            .join("test-task-123");
+        std::fs::create_dir_all(&target)?;
+        assert!(target.exists());
+
+        drop(TaskTargetDir(target.clone()));
+
+        assert!(
+            !target.exists(),
+            "TaskTargetDir must remove the directory on drop"
+        );
+        Ok(())
+    }
+
+    /// TaskTargetDir drop is a no-op when the directory does not exist yet.
+    #[test]
+    fn task_target_dir_no_op_when_absent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target = dir
+            .path()
+            .join("harness-cargo-targets")
+            .join("never-created");
+        assert!(!target.exists());
+        // Must not panic when the directory is absent.
+        drop(TaskTargetDir(target));
+        Ok(())
+    }
+
+    /// Two different task IDs must produce distinct CARGO_TARGET_DIR paths.
+    #[test]
+    fn per_task_target_paths_are_distinct() {
+        let id_a = TaskId::new();
+        let id_b = TaskId::new();
+        let base = std::env::temp_dir().join("harness-cargo-targets");
+        let path_a = base.join(id_a.to_string());
+        let path_b = base.join(id_b.to_string());
+        assert_ne!(
+            path_a, path_b,
+            "distinct task IDs must produce distinct target paths"
+        );
+    }
+
+    /// CARGO_TARGET_DIR must be placed under the system temp dir, not the project root.
+    #[test]
+    fn cargo_target_dir_is_under_temp_not_project_root() {
+        let id = TaskId::new();
+        let task_target = std::env::temp_dir()
+            .join("harness-cargo-targets")
+            .join(id.to_string());
+        let fake_project = std::path::PathBuf::from("/home/user/myapp");
+        // The per-task path must not start with the project root.
+        assert!(
+            !task_target.starts_with(&fake_project),
+            "CARGO_TARGET_DIR must not be inside the project root"
+        );
+        assert!(
+            task_target.starts_with(std::env::temp_dir()),
+            "CARGO_TARGET_DIR must be under the system temp dir"
+        );
     }
 }
