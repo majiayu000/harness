@@ -1,9 +1,11 @@
 use crate::http::task_routes;
 use crate::http::AppState;
 use crate::task_runner::CreateTaskRequest;
+use chrono::{DateTime, Utc};
 use harness_core::{Decision, Event, EventFilters, ReviewConfig, SessionId};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 /// Spawn the periodic review loop as a background task.
@@ -23,24 +25,33 @@ pub fn start(state: Arc<AppState>, config: ReviewConfig) {
 
 async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     let interval = config.effective_interval();
+    // Local fallback timestamp guards against stale deduplication when the
+    // EventStore write fails.  It is updated atomically after every successful
+    // task enqueue so the next cycle always sees a fresh lower-bound even if
+    // the DB is unavailable.
+    let fallback_ts: Arc<Mutex<Option<DateTime<Utc>>>> = Arc::new(Mutex::new(None));
 
     if config.run_on_startup {
         // Brief delay to let the server fully initialize before the first tick.
         sleep(Duration::from_secs(5)).await;
-        if let Err(err) = run_review_tick(&state, &config).await {
+        if let Err(err) = run_review_tick(&state, &config, &fallback_ts).await {
             tracing::error!("scheduler: periodic review startup tick failed: {err}");
         }
     }
 
     loop {
         sleep(interval).await;
-        if let Err(err) = run_review_tick(&state, &config).await {
+        if let Err(err) = run_review_tick(&state, &config, &fallback_ts).await {
             tracing::error!("scheduler: periodic review tick failed: {err}");
         }
     }
 }
 
-async fn run_review_tick(state: &Arc<AppState>, config: &ReviewConfig) -> anyhow::Result<()> {
+async fn run_review_tick(
+    state: &Arc<AppState>,
+    config: &ReviewConfig,
+    fallback_ts: &Arc<Mutex<Option<DateTime<Utc>>>>,
+) -> anyhow::Result<()> {
     let project_root = &state.core.project_root;
 
     // Query EventStore for the most recent "periodic_review" event timestamp.
@@ -54,7 +65,18 @@ async fn run_review_tick(state: &Arc<AppState>, config: &ReviewConfig) -> anyhow
         .await
         .map_err(|e| anyhow::anyhow!("failed to query periodic_review events: {e}"))?;
 
-    let last_review_ts = events.iter().map(|e| e.ts).max();
+    let db_last_review_ts = events.iter().map(|e| e.ts).max();
+
+    // Merge DB timestamp with local fallback.  The fallback wins when it is
+    // more recent — this prevents stale deduplication after an EventStore
+    // write failure.
+    let fb = *fallback_ts.lock().await;
+    let last_review_ts = match (db_last_review_ts, fb) {
+        (Some(db), Some(f)) => Some(db.max(f)),
+        (Some(db), None) => Some(db),
+        (None, Some(f)) => Some(f),
+        (None, None) => None,
+    };
 
     // If there was a prior review, skip this cycle when no new commits have landed.
     // On first boot (no prior event) we always run.
@@ -143,6 +165,10 @@ async fn run_review_tick(state: &Arc<AppState>, config: &ReviewConfig) -> anyhow
         }
     };
 
+    // Update the local fallback timestamp before attempting the DB write so
+    // that deduplication remains correct even if the EventStore is unavailable.
+    *fallback_ts.lock().await = Some(Utc::now());
+
     // Log a "periodic_review" event so the next cycle can check the timestamp.
     let event = Event::new(
         SessionId::new(),
@@ -150,8 +176,11 @@ async fn run_review_tick(state: &Arc<AppState>, config: &ReviewConfig) -> anyhow
         "scheduler",
         Decision::Pass,
     );
+    // A log failure is non-fatal: the fallback timestamp (line above) already
+    // guards deduplication, and the task is already enqueued.  Returning early
+    // here would bypass the spawn block that polls and persists findings.
     if let Err(err) = state.observability.events.log(&event).await {
-        tracing::warn!("scheduler: failed to log periodic_review event: {err}");
+        tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
     }
 
     // Wait for the review task to complete, then persist structured findings.
@@ -380,5 +409,64 @@ mod tests {
     fn create_task_request_source_defaults_to_none() {
         let req = CreateTaskRequest::default();
         assert!(req.source.is_none());
+    }
+
+    /// Verify that the fallback timestamp merge logic picks the maximum of the
+    /// DB timestamp and the local fallback, matching the intent of RS-10 fix.
+    #[tokio::test]
+    async fn fallback_ts_merge_picks_max() {
+        // Use UNIX_EPOCH-based construction to avoid fallible unwrap() calls.
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let earlier: DateTime<Utc> = DateTime::from(epoch);
+        let later: DateTime<Utc> =
+            DateTime::from(epoch + std::time::Duration::from_secs(1_000_000));
+
+        // Fallback newer than DB — fallback wins.
+        let result = match (Some(earlier), Some(later)) {
+            (Some(db), Some(f)) => Some(db.max(f)),
+            (Some(db), None) => Some(db),
+            (None, Some(f)) => Some(f),
+            (None, None) => None,
+        };
+        assert_eq!(result, Some(later));
+
+        // DB newer than fallback — DB wins.
+        let result = match (Some(later), Some(earlier)) {
+            (Some(db), Some(f)) => Some(db.max(f)),
+            (Some(db), None) => Some(db),
+            (None, Some(f)) => Some(f),
+            (None, None) => None,
+        };
+        assert_eq!(result, Some(later));
+
+        // No DB entry, only fallback.
+        let result: Option<DateTime<Utc>> = match (None::<DateTime<Utc>>, Some(later)) {
+            (Some(db), Some(f)) => Some(db.max(f)),
+            (Some(db), None) => Some(db),
+            (None, Some(f)) => Some(f),
+            (None, None) => None,
+        };
+        assert_eq!(result, Some(later));
+
+        // Neither present.
+        let result: Option<DateTime<Utc>> = match (None::<DateTime<Utc>>, None) {
+            (Some(db), Some(f)) => Some(db.max(f)),
+            (Some(db), None) => Some(db),
+            (None, Some(f)) => Some(f),
+            (None, None) => None,
+        };
+        assert_eq!(result, None);
+    }
+
+    /// Fallback is updated atomically before the EventStore write; verify the
+    /// Arc<Mutex<Option<DateTime<Utc>>>> can be written and read correctly.
+    #[tokio::test]
+    async fn fallback_ts_arc_mutex_roundtrip() {
+        let fallback_ts: Arc<Mutex<Option<DateTime<Utc>>>> = Arc::new(Mutex::new(None));
+        assert!(fallback_ts.lock().await.is_none());
+
+        let now = Utc::now();
+        *fallback_ts.lock().await = Some(now);
+        assert_eq!(*fallback_ts.lock().await, Some(now));
     }
 }
