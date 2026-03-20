@@ -306,6 +306,20 @@ async fn enqueue_task_background(
                             "group semaphore closed unexpectedly, aborting task to prevent \
                              unserialized execution: {e}"
                         );
+                        if let Err(persist_err) =
+                            task_runner::mutate_and_persist(&state.core.tasks, &task_id2, |s| {
+                                s.status = task_runner::TaskStatus::Failed;
+                                s.error = Some(format!("group semaphore closed unexpectedly: {e}"));
+                            })
+                            .await
+                        {
+                            tracing::error!(
+                                task_id = %task_id2.0,
+                                "failed to persist task failure after semaphore close: \
+                                 {persist_err}"
+                            );
+                        }
+                        state.core.tasks.close_task_stream(&task_id2);
                         return;
                     }
                 }
