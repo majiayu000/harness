@@ -4,6 +4,7 @@ mod pr_detection;
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
+use harness_core::tool_isolation::validate_tool_usage;
 use harness_core::{
     config::load_project_config, interceptor::ToolUseEvent, lang_detect, prompts, AgentRequest,
     AgentResponse, CapabilityProfile, CodeAgent, ContextItem, Event, ExecutionPhase, HarnessError,
@@ -563,6 +564,15 @@ pub(crate) async fn run_task(
         .await;
         match raw {
             Ok(Ok(r)) => {
+                // Post-execution tool isolation check. Since --allowedTools is not
+                // passed to the CLI, we scan the output for disallowed tool calls.
+                let tool_violations = validate_tool_usage(&r.output, &impl_req.allowed_tools);
+                if !tool_violations.is_empty() {
+                    tracing::warn!(
+                        ?tool_violations,
+                        "implementation turn: agent used tools outside allowed list"
+                    );
+                }
                 // PreToolUse / PostToolUse hook injection point:
                 // detect files written during this turn and fire post_tool_use hooks.
                 let hook_err = {
@@ -785,7 +795,16 @@ pub(crate) async fn run_task(
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let check_req = AgentRequest {
-            prompt: prompts::check_existing_pr(pr_num, &review_config.review_bot_command),
+            prompt: {
+                let base = prompts::check_existing_pr(pr_num, &review_config.review_bot_command);
+                // Inject capability note — primary enforcement now that --allowedTools
+                // is not passed to the CLI (issue #483).
+                if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
+                    format!("{note}\n\n{base}")
+                } else {
+                    base
+                }
+            },
             project_root: project.clone(),
             context: context_items.clone(),
             execution_phase: Some(ExecutionPhase::Validation),
@@ -798,6 +817,14 @@ pub(crate) async fn run_task(
         let resp = tokio::time::timeout(turn_timeout, agent.execute(check_req.clone())).await;
         let resp = match resp {
             Ok(Ok(r)) => {
+                let tool_violations = validate_tool_usage(&r.output, &check_req.allowed_tools);
+                if !tool_violations.is_empty() {
+                    tracing::warn!(
+                        round,
+                        ?tool_violations,
+                        "review check: agent used tools outside allowed list"
+                    );
+                }
                 if let Some(val_err) = run_post_execute(&interceptors, &check_req, &r).await {
                     tracing::warn!(
                         round,
@@ -939,7 +966,16 @@ async fn run_agent_review(
 
         // Reviewer evaluates the PR diff — read-only, no write access needed.
         let review_req = AgentRequest {
-            prompt: prompts::agent_review_prompt(pr_num, agent_round),
+            prompt: {
+                let base = prompts::agent_review_prompt(pr_num, agent_round);
+                // Inject capability note — primary enforcement now that --allowedTools
+                // is not passed to the CLI (issue #483).
+                if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
+                    format!("{note}\n\n{base}")
+                } else {
+                    base
+                }
+            },
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Validation),
@@ -952,6 +988,14 @@ async fn run_agent_review(
         let resp = tokio::time::timeout(turn_timeout, reviewer.execute(review_req.clone())).await;
         let resp = match resp {
             Ok(Ok(r)) => {
+                let tool_violations = validate_tool_usage(&r.output, &review_req.allowed_tools);
+                if !tool_violations.is_empty() {
+                    tracing::warn!(
+                        agent_round,
+                        ?tool_violations,
+                        "agent review: agent used tools outside allowed list"
+                    );
+                }
                 if let Some(val_err) = run_post_execute(interceptors, &review_req, &r).await {
                     tracing::warn!(
                         agent_round,
