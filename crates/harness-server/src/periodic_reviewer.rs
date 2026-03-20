@@ -176,11 +176,11 @@ async fn run_review_tick(
         "scheduler",
         Decision::Pass,
     );
+    // A log failure is non-fatal: the fallback timestamp (line above) already
+    // guards deduplication, and the task is already enqueued.  Returning early
+    // here would bypass the spawn block that polls and persists findings.
     if let Err(err) = state.observability.events.log(&event).await {
-        tracing::error!("scheduler: failed to log periodic_review event: {err}");
-        return Err(anyhow::anyhow!(
-            "failed to log periodic_review event: {err}"
-        ));
+        tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
     }
 
     // Wait for the review task to complete, then persist structured findings.
