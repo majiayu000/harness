@@ -7,7 +7,7 @@ pub async fn rule_load(
     id: Option<serde_json::Value>,
     project_root: PathBuf,
 ) -> RpcResponse {
-    let project_root = validate_root!(&project_root, id);
+    let project_root = validate_root!(&project_root, id, &state.core.home_dir);
     let mut rules = state.engines.rules.write().await;
     match rules.load(&project_root) {
         Ok(()) => {
@@ -24,7 +24,7 @@ pub async fn rule_check(
     project_root: PathBuf,
     files: Option<Vec<PathBuf>>,
 ) -> RpcResponse {
-    let project_root = validate_root!(&project_root, id);
+    let project_root = validate_root!(&project_root, id, &state.core.home_dir);
     let file_count = files.as_ref().map_or(0, |paths| paths.len());
     let result = {
         let rules = state.engines.rules.read().await;

@@ -58,6 +58,9 @@ async fn make_test_state_with_config_and_registry(
         core: crate::http::CoreServices {
             server,
             project_root: dir.to_path_buf(),
+            home_dir: std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| dir.to_path_buf()),
             tasks,
             thread_db: Some(thread_db),
             plan_db: None,
@@ -1347,6 +1350,9 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         core: crate::http::CoreServices {
             server,
             project_root: dir.to_path_buf(),
+            home_dir: std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| dir.to_path_buf()),
             tasks,
             thread_db: Some(thread_db),
             plan_db: Some(plan_db),

@@ -9,7 +9,7 @@ pub async fn exec_plan_init(
     spec: String,
     project_root: PathBuf,
 ) -> RpcResponse {
-    let project_root = validate_root!(&project_root, id);
+    let project_root = validate_root!(&project_root, id, &state.core.home_dir);
     match harness_exec::ExecPlan::from_spec(&spec, &project_root) {
         Ok(plan) => {
             let plan_id = plan.id.clone();

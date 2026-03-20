@@ -61,6 +61,9 @@ pub(crate) mod task_routes;
 pub struct CoreServices {
     pub server: Arc<HarnessServer>,
     pub project_root: std::path::PathBuf,
+    /// Home directory captured at startup to avoid TOCTOU when validating
+    /// project roots against `$HOME` in concurrent requests.
+    pub home_dir: std::path::PathBuf,
     pub tasks: Arc<task_runner::TaskStore>,
     pub thread_db: Option<crate::thread_db::ThreadDb>,
     pub plan_db: Option<crate::plan_db::PlanDb>,
@@ -526,10 +529,14 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     );
 
     let signal_rate_limit = server.config.server.signal_rate_limit_per_minute;
+    let home_dir = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| project_root.clone());
     Ok(AppState {
         core: CoreServices {
             server,
             project_root,
+            home_dir,
             tasks,
             thread_db: Some(thread_db),
             plan_db: Some(plan_db),
