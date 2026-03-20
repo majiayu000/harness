@@ -1,7 +1,9 @@
 use crate::{http::AppState, validate_root};
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
-use harness_core::{AgentRequest, CodeAgent, Event, EventFilters, SessionId, TaskComplexity};
+use harness_core::{
+    AgentRequest, CapabilityProfile, CodeAgent, Event, EventFilters, SessionId, TaskComplexity,
+};
 use harness_protocol::{RpcResponse, INTERNAL_ERROR};
 use harness_rules::engine::RuleEngine;
 use harness_skills::SkillStore;
@@ -88,10 +90,17 @@ pub async fn run_preflight(
          COMPLEXITY: <simple|medium|complex|critical>"
     );
 
+    // Inject capability restriction note — primary enforcement since --allowedTools
+    // is not passed to the CLI (issue #483).
+    let prompt = if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
+        format!("{note}\n\n{prompt}")
+    } else {
+        prompt
+    };
     let req = AgentRequest {
         prompt,
         project_root,
-        allowed_tools: vec!["Read".to_string()],
+        allowed_tools: CapabilityProfile::ReadOnly.tools().unwrap_or_default(),
         ..Default::default()
     };
 

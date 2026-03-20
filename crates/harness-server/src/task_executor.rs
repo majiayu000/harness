@@ -566,13 +566,23 @@ pub(crate) async fn run_task(
             Ok(Ok(r)) => {
                 // Post-execution tool isolation check. Since --allowedTools is not
                 // passed to the CLI, we scan the output for disallowed tool calls.
+                // Violations feed into the retry loop so the agent gets a chance to
+                // self-correct (fail-closed, not fail-open).
                 let tool_violations = validate_tool_usage(&r.output, &impl_req.allowed_tools);
-                if !tool_violations.is_empty() {
+                let violation_err: Option<String> = if !tool_violations.is_empty() {
+                    let msg = format!(
+                        "Tool isolation violation: agent used disallowed tools: [{}]. Only [{}] are permitted.",
+                        tool_violations.join(", "),
+                        impl_req.allowed_tools.join(", ")
+                    );
                     tracing::warn!(
                         ?tool_violations,
                         "implementation turn: agent used tools outside allowed list"
                     );
-                }
+                    Some(msg)
+                } else {
+                    None
+                };
                 // PreToolUse / PostToolUse hook injection point:
                 // detect files written during this turn and fire post_tool_use hooks.
                 let hook_err = {
@@ -589,7 +599,7 @@ pub(crate) async fn run_task(
                     }
                 };
                 let post_err = run_post_execute(&interceptors, &impl_req, &r).await;
-                let combined_err = hook_err.or(post_err);
+                let combined_err = violation_err.or(hook_err).or(post_err);
                 if let Some(err) = combined_err {
                     if validation_attempt < max_validation_retries {
                         validation_attempt += 1;
@@ -819,11 +829,17 @@ pub(crate) async fn run_task(
             Ok(Ok(r)) => {
                 let tool_violations = validate_tool_usage(&r.output, &check_req.allowed_tools);
                 if !tool_violations.is_empty() {
+                    let msg = format!(
+                        "Tool isolation violation in review check round {round}: agent used disallowed tools: [{}]",
+                        tool_violations.join(", ")
+                    );
                     tracing::warn!(
                         round,
                         ?tool_violations,
                         "review check: agent used tools outside allowed list"
                     );
+                    run_on_error(&interceptors, &check_req, &msg).await;
+                    return Err(anyhow::anyhow!("{msg}"));
                 }
                 if let Some(val_err) = run_post_execute(&interceptors, &check_req, &r).await {
                     tracing::warn!(
@@ -990,11 +1006,17 @@ async fn run_agent_review(
             Ok(Ok(r)) => {
                 let tool_violations = validate_tool_usage(&r.output, &review_req.allowed_tools);
                 if !tool_violations.is_empty() {
+                    let msg = format!(
+                        "Tool isolation violation in agent review round {agent_round}: agent used disallowed tools: [{}]",
+                        tool_violations.join(", ")
+                    );
                     tracing::warn!(
                         agent_round,
                         ?tool_violations,
                         "agent review: agent used tools outside allowed list"
                     );
+                    run_on_error(interceptors, &review_req, &msg).await;
+                    return Err(anyhow::anyhow!("{msg}"));
                 }
                 if let Some(val_err) = run_post_execute(interceptors, &review_req, &r).await {
                     tracing::warn!(
