@@ -503,6 +503,17 @@ pub(crate) async fn run_task(
         Vec::new()
     };
 
+    tracing::info!(
+        task_id = %task_id,
+        prompt_len = first_prompt.len(),
+        prompt_empty = first_prompt.is_empty(),
+        source = ?req.source,
+        "run_task: prompt constructed"
+    );
+    if first_prompt.is_empty() {
+        tracing::error!(task_id = %task_id, "run_task: prompt is empty — agent will fail");
+    }
+
     let initial_req = AgentRequest {
         prompt: first_prompt,
         project_root: project.clone(),
