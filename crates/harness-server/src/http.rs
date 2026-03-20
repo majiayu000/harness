@@ -39,9 +39,21 @@ impl SignalRateLimiter {
     }
 
     /// Returns `true` if the request is within the rate limit and increments the counter.
+    ///
+    /// Rejects sources with keys longer than 128 bytes to prevent memory abuse.
+    /// The map is capped at 10 000 distinct sources; new sources beyond this limit
+    /// are rejected until existing entries expire.
     pub fn check_and_increment(&self, source: &str) -> bool {
+        if source.len() > 128 {
+            return false;
+        }
         let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
+        // Evict expired entries to keep the map bounded.
+        counts.retain(|_, (_, ts)| now.duration_since(*ts) < std::time::Duration::from_secs(60));
+        if !counts.contains_key(source) && counts.len() >= 10_000 {
+            return false;
+        }
         let entry = counts.entry(source.to_string()).or_insert((0, now));
         if now.duration_since(entry.1) >= std::time::Duration::from_secs(60) {
             *entry = (1, now);

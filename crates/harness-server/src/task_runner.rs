@@ -855,6 +855,10 @@ pub(crate) async fn update_status(
 }
 
 /// Mutate a task in the cache then persist to SQLite.
+///
+/// Returns an error if the task ID is not present in the cache — this prevents
+/// silent no-ops where the mutation function `f` is never called but the caller
+/// receives `Ok(())` and believes the state was updated.
 pub(crate) async fn mutate_and_persist(
     store: &TaskStore,
     id: &TaskId,
@@ -862,6 +866,8 @@ pub(crate) async fn mutate_and_persist(
 ) -> anyhow::Result<()> {
     if let Some(mut entry) = store.cache.get_mut(id) {
         f(entry.value_mut());
+    } else {
+        anyhow::bail!("mutate_and_persist: task {:?} not found in cache", id);
     }
     store.persist(id).await
 }

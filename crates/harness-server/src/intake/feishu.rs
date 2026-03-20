@@ -26,6 +26,12 @@ struct TokenResponse {
 
 impl FeishuIntake {
     pub fn new(config: harness_core::FeishuIntakeConfig) -> Self {
+        if config.verification_token.is_none() {
+            tracing::warn!(
+                "feishu: no verification_token configured; \
+                 the /webhook/feishu endpoint is unauthenticated and accepts any payload"
+            );
+        }
         Self {
             config,
             http: reqwest::Client::new(),

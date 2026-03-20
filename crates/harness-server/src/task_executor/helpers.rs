@@ -137,7 +137,9 @@ pub(crate) fn emit_runtime_notification(
     notification: Notification,
 ) {
     crate::notify::emit(notify_tx, notification.clone());
-    let _ = notification_tx.send(RpcNotification::new(notification));
+    if let Err(e) = notification_tx.send(RpcNotification::new(notification)) {
+        tracing::trace!("notification broadcast dropped (no active receivers): {e}");
+    }
 }
 
 pub(crate) async fn persist_runtime_thread(

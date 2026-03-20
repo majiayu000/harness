@@ -293,8 +293,22 @@ async fn enqueue_task_background(
             // Acquire the group serialisation permit before competing for the
             // per-project concurrency slot, then pass it into spawn_preregistered_task
             // so it is held inside the innermost future for the full task lifetime.
+            //
+            // A semaphore can only fail to acquire if it was explicitly closed, which
+            // is a programming error. Log an error and abort rather than silently
+            // running the task without group serialisation.
             let group_permit = if let Some(sem) = group_sem {
-                sem.acquire_owned().await.ok()
+                match sem.acquire_owned().await {
+                    Ok(permit) => Some(permit),
+                    Err(e) => {
+                        tracing::error!(
+                            task_id = %task_id2,
+                            "group semaphore closed unexpectedly, aborting task to prevent \
+                             unserialized execution: {e}"
+                        );
+                        return;
+                    }
+                }
             } else {
                 None
             };
