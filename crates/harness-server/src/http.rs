@@ -198,7 +198,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let dir = expand_tilde(&server.config.server.data_dir);
     let project_root = resolve_project_root(&server.config.server.project_root)?;
     std::fs::create_dir_all(&dir)?;
-    tracing::info!(
+    tracing::debug!(
         data_dir = %dir.display(),
         project_root = %project_root.display(),
         discovery_paths = ?server.config.rules.discovery_paths,
@@ -207,7 +207,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         requirements_path = ?server.config.rules.requirements_path,
         session_renewal_secs = server.config.observe.session_renewal_secs,
         log_retention_days = server.config.observe.log_retention_days,
-        "harness: effective config"
+        "config details (use RUST_LOG=debug to see)"
     );
     match server.config.server.github_webhook_secret.as_deref() {
         Some("") => {
@@ -224,7 +224,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     }
 
     let db_path = dir.join("tasks.db");
-    tracing::info!("task db: {}", db_path.display());
+    tracing::debug!("task db: {}", db_path.display());
     let tasks = task_runner::TaskStore::open(&db_path).await?;
 
     let mut rule_engine = harness_rules::engine::RuleEngine::new();
@@ -238,7 +238,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     }
     match rule_engine.auto_register_builtin_guards(&dir) {
         Ok(registered) => {
-            tracing::info!(
+            tracing::debug!(
                 registered_guard_count = registered,
                 total_guard_count = rule_engine.guards().len(),
                 "rules: builtin guard auto-registration completed"
@@ -250,7 +250,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     }
     match rule_engine.auto_register_project_guards(&project_root.join(".harness/guards")) {
         Ok(registered) => {
-            tracing::info!(
+            tracing::debug!(
                 registered_guard_count = registered,
                 total_guard_count = rule_engine.guards().len(),
                 "rules: project guard auto-registration completed"
@@ -265,7 +265,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     for (name, path) in &server.startup_projects {
         match rule_engine.auto_register_project_guards(&path.join(".harness/guards")) {
             Ok(registered) => {
-                tracing::info!(
+                tracing::debug!(
                     project = %name,
                     registered_guard_count = registered,
                     total_guard_count = rule_engine.guards().len(),
@@ -331,11 +331,6 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     };
     if let Err(e) = project_registry.register(default_project).await {
         tracing::warn!("failed to auto-register default project: {e}");
-    } else {
-        tracing::info!(
-            project_root = %project_root.display(),
-            "project registry: default project registered"
-        );
     }
     // Register any extra named projects supplied via --project CLI flags.
     for (name, path) in &server.startup_projects {
@@ -349,14 +344,12 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         };
         if let Err(e) = project_registry.register(proj).await {
             tracing::warn!(project = %name, "failed to register startup project: {e}");
-        } else {
-            tracing::info!(project = %name, root = %path.display(), "project registry: startup project registered");
         }
     }
     let plans_md_dir = dir.join("plans");
     match plan_db.migrate_from_markdown_dir(&plans_md_dir).await {
         Ok(0) => {}
-        Ok(n) => tracing::info!(
+        Ok(n) => tracing::debug!(
             count = n,
             "plan migration: imported {} plan(s) from markdown",
             n
@@ -388,7 +381,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                 plan_cache.insert(plan.id.as_str().to_string(), plan);
             }
             if count > 0 {
-                tracing::info!(count, "plan cache: loaded {} plan(s) from db", count);
+                tracing::debug!(count, "plan cache: loaded {} plan(s) from db", count);
             }
         }
         Err(e) => tracing::warn!("plan cache: failed to load plans on startup: {e}"),
@@ -409,7 +402,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let workspace_mgr =
         match crate::workspace::WorkspaceManager::new(server.config.workspace.clone()) {
             Ok(mgr) => {
-                tracing::info!(
+                tracing::debug!(
                     root = %server.config.workspace.root.display(),
                     "workspace manager initialized"
                 );
@@ -443,7 +436,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let task_queue = Arc::new(crate::task_queue::TaskQueue::new(
         &server.config.concurrency,
     ));
-    tracing::info!(
+    tracing::debug!(
         max_concurrent = server.config.concurrency.max_concurrent_tasks,
         max_queue_size = server.config.concurrency.max_queue_size,
         "task queue initialized"
@@ -795,7 +788,21 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Record true server start time before accepting any connections.
     crate::handlers::dashboard::SERVER_START.get_or_init(std::time::Instant::now);
 
-    let state = Arc::new(build_app_state(server).await?);
+    let state = Arc::new(build_app_state(server.clone()).await?);
+
+    // Startup summary — one clean line instead of scattered logs.
+    {
+        let guard_count = state.engines.rules.read().await.guards().len();
+        let skill_count = state.engines.skills.read().await.list().len();
+        let task_count = state.core.tasks.list_all().len();
+        tracing::info!(
+            project = %state.core.project_root.display(),
+            guards = guard_count,
+            skills = skill_count,
+            pending_tasks = task_count,
+            "harness: ready"
+        );
+    }
 
     let initial_grade = {
         let events = state
