@@ -44,6 +44,27 @@ pub(crate) use pr_detection::{
 #[cfg(test)]
 pub(crate) use pr_detection::PromptBuilder;
 
+/// RAII guard that removes a per-task Cargo target directory on drop.
+///
+/// Each invocation of `run_task` gets an isolated `CARGO_TARGET_DIR` under
+/// `$TMPDIR/harness-cargo-targets/<task_id>`.  When the guard is dropped
+/// (whether the task succeeds, fails, or times out) the directory is removed,
+/// preventing disk exhaustion from accumulated build artefacts.
+struct TempTargetDir(PathBuf);
+
+impl Drop for TempTargetDir {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                tracing::warn!(
+                    path = %self.0.display(),
+                    "failed to clean up per-task CARGO_TARGET_DIR: {e}"
+                );
+            }
+        }
+    }
+}
+
 pub(crate) async fn run_turn_lifecycle(
     server: Arc<crate::server::HarnessServer>,
     thread_db: Option<crate::thread_db::ThreadDb>,
@@ -369,12 +390,16 @@ pub(crate) async fn run_task(
     update_status(store, task_id, TaskStatus::Implementing, 1).await?;
     let impl_phase_start = Instant::now();
 
-    // Set CARGO_TARGET_DIR to a per-workspace path so parallel agents using isolated
-    // git worktrees each build to their own target directory, eliminating cargo file
-    // lock contention when 4+ agents run cargo check/test simultaneously.
+    // Use a per-task CARGO_TARGET_DIR so concurrent agents on the same project
+    // each build to an isolated directory, eliminating cargo file-lock contention
+    // (issue #488).  The guard removes the directory when run_task returns.
+    let task_target = std::env::temp_dir()
+        .join("harness-cargo-targets")
+        .join(task_id.to_string());
+    let _target_guard = TempTargetDir(task_target.clone());
     let cargo_env: HashMap<String, String> = [(
         "CARGO_TARGET_DIR".to_string(),
-        format!("{}/target", project.display()),
+        task_target.display().to_string(),
     )]
     .into();
 
