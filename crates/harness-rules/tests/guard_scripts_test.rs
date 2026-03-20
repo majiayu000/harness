@@ -155,6 +155,62 @@ fn populate(map: &mut HashMap<u32, String>, key: u32) {
 }
 
 // ---------------------------------------------------------------------------
+// RS-02B: SQL TOCTOU — SELECT then INSERT on same table
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rs02b_detects_sql_select_then_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("store.rs"),
+        r#"
+async fn persist(pool: &SqlitePool, id: &str) -> Result<()> {
+    let existing = sqlx::query("SELECT id FROM findings WHERE rule_id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    if existing.is_none() {
+        sqlx::query("INSERT INTO findings (rule_id) VALUES (?)")
+            .bind(id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+"#,
+    )
+    .unwrap();
+    assert_violation(
+        &guard_path("rs-02b-sql-toctou.sh"),
+        dir.path(),
+        "RS-02B",
+    );
+}
+
+#[test]
+fn rs02b_passes_insert_or_ignore() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("store.rs"),
+        r#"
+async fn persist(pool: &SqlitePool, id: &str) -> Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO findings (rule_id) VALUES (?)")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+"#,
+    )
+    .unwrap();
+    assert_clean(&guard_path("rs-02b-sql-toctou.sh"), dir.path());
+}
+
+// ---------------------------------------------------------------------------
 // RS-10: silent Result discard
 // ---------------------------------------------------------------------------
 
