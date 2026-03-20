@@ -62,6 +62,8 @@ impl PostExecutionValidator {
             .args(["pr", "view", pr_url, "--json", "state"])
             .current_dir(project)
             .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
         {

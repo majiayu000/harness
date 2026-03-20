@@ -637,7 +637,10 @@ where
         let detect_worktree = detect_worktree.clone();
         let raw_project =
             resolve_project_root_with(req.project.clone(), move || detect_worktree()).await?;
-        let project_root = crate::handlers::validate_project_root(&raw_project)
+        let home_dir = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| raw_project.clone());
+        let project_root = crate::handlers::validate_project_root(&raw_project, &home_dir)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // Populate transient sibling-awareness fields in the in-memory cache.

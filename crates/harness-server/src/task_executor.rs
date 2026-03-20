@@ -785,7 +785,7 @@ pub(crate) async fn run_task(
     // Agent review loop (if enabled and reviewer available)
     if review_config.enabled {
         if let Some(reviewer) = reviewer {
-            tracing::info!("starting agent review for PR #{pr_num}");
+            tracing::info!(pr_url = %pr_url.as_deref().unwrap_or(""), "starting agent review");
             run_agent_review(
                 store,
                 task_id,
@@ -796,7 +796,7 @@ pub(crate) async fn run_task(
                 &project,
                 &interceptors,
                 turn_timeout,
-                pr_num,
+                pr_url.as_deref().unwrap_or(""),
                 &events,
                 &cargo_env,
             )
@@ -991,7 +991,7 @@ async fn run_agent_review(
     project: &Path,
     interceptors: &[Arc<dyn harness_core::interceptor::TurnInterceptor>],
     turn_timeout: Duration,
-    pr_num: u64,
+    pr_url: &str,
     events: &harness_observe::EventStore,
     cargo_env: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
@@ -999,22 +999,27 @@ async fn run_agent_review(
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
 
-        // Reviewer evaluates the PR diff — read-only, no write access needed.
+        // Reviewer evaluates the PR diff — read-only except Bash for `gh pr diff`.
         let review_req = AgentRequest {
             prompt: {
-                let base = prompts::agent_review_prompt(pr_num, agent_round);
+                let base = prompts::agent_review_prompt(pr_url, agent_round);
                 // Inject capability note — primary enforcement now that --allowedTools
                 // is not passed to the CLI (issue #483).
-                if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
-                    format!("{note}\n\n{base}")
-                } else {
-                    base
-                }
+                let note = "Tool restriction: you are operating in review mode. \
+                     Only Read, Grep, Glob, and Bash are permitted. \
+                     Use Bash ONLY for read-only commands like `gh pr diff`. \
+                     Do NOT call Write, Edit, or any other tool.";
+                format!("{note}\n\n{base}")
             },
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Validation),
-            allowed_tools: restricted_tools(CapabilityProfile::ReadOnly)?,
+            allowed_tools: vec![
+                "Read".to_string(),
+                "Grep".to_string(),
+                "Glob".to_string(),
+                "Bash".to_string(),
+            ],
             env_vars: cargo_env.clone(),
             ..Default::default()
         };
@@ -1095,7 +1100,7 @@ async fn run_agent_review(
                 harness_core::Decision::Warn
             },
         );
-        ev.detail = Some(format!("pr={pr_num}"));
+        ev.detail = Some(format!("pr={pr_url}"));
         ev.reason = Some(if approved {
             format!("round {agent_round}: approved")
         } else {
@@ -1131,7 +1136,7 @@ async fn run_agent_review(
 
         // Implementor fixes the issues
         let fix_req = AgentRequest {
-            prompt: prompts::agent_review_fix_prompt(pr_num, &issues, agent_round),
+            prompt: prompts::agent_review_fix_prompt(pr_url, &issues, agent_round),
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Execution),

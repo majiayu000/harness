@@ -13,8 +13,45 @@ const STDERR_ERROR_KEYWORDS: &[&str] = &[
 ];
 const MAX_STDERR_LINE_LEN: usize = 1000;
 
+/// Agent-internal line prefixes that should never surface as WARN.
+/// These are progress/reasoning lines emitted by Codex and similar agents,
+/// not actionable errors for the harness operator.
+const AGENT_INTERNAL_PREFIXES: &[&str] = &[
+    // ISO-8601 timestamps from Codex internal tracing
+    "2025-",
+    "2026-",
+    "2027-",
+    // Codex session header lines
+    "--------",
+    "workdir:",
+    "model:",
+    "provider:",
+    "approval:",
+    "sandbox:",
+    "reasoning effort:",
+    "reasoning summaries:",
+    "session id:",
+    "mcp startup:",
+    // Codex reasoning/exec progress lines
+    "codex ",
+    "exec ",
+    "tokens used",
+    // Cargo/rustc build output that agents emit to stderr
+    "compiling ",
+    "   compiling ",
+    "    checking ",
+    "    finished ",
+];
+
+fn is_agent_internal(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    AGENT_INTERNAL_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
 /// Read agent stderr line-by-line. Lines matching error keywords are logged
-/// at warn level; all others at debug level (invisible by default).
+/// at warn level; agent-internal progress lines are always debug.
 pub(crate) async fn filter_agent_stderr(stderr: tokio::process::ChildStderr, agent_name: &str) {
     let reader = BufReader::new(stderr);
     let mut lines = reader.lines();
@@ -24,7 +61,10 @@ pub(crate) async fn filter_agent_stderr(stderr: tokio::process::ChildStderr, age
         if trimmed.is_empty() {
             continue;
         }
-
+        if is_agent_internal(trimmed) {
+            tracing::debug!(agent = agent_name, "{trimmed}");
+            continue;
+        }
         let lower = trimmed.to_lowercase();
         if STDERR_ERROR_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
             tracing::warn!(agent = agent_name, "{trimmed}");
@@ -39,6 +79,10 @@ pub(crate) fn log_captured_stderr(stderr: &str, agent_name: &str) {
     for line in stderr.lines() {
         let trimmed = &line[..line.len().min(MAX_STDERR_LINE_LEN)];
         if trimmed.is_empty() {
+            continue;
+        }
+        if is_agent_internal(trimmed) {
+            tracing::debug!(agent = agent_name, "{trimmed}");
             continue;
         }
         let lower = trimmed.to_lowercase();

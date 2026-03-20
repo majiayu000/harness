@@ -25,7 +25,7 @@ pub async fn cross_review(
     target: String,
     max_rounds: Option<u32>,
 ) -> RpcResponse {
-    let project_root = validate_root!(&project_root, id);
+    let project_root = validate_root!(&project_root, id, &state.core.home_dir);
 
     let primary = match state.core.server.agent_registry.default_agent() {
         Some(a) => a,

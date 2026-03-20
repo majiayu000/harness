@@ -41,7 +41,7 @@ pub async fn metrics_collect(
     id: Option<serde_json::Value>,
     project_root: PathBuf,
 ) -> RpcResponse {
-    let project_root = validate_root!(&project_root, id);
+    let project_root = validate_root!(&project_root, id, &state.core.home_dir);
 
     // scan -> persist -> query -> grade
     let violations = {
