@@ -13,23 +13,17 @@ use harness_core::{
 use harness_protocol::{Notification, RpcNotification};
 use std::collections::HashMap;
 
-/// Extract tool list from a capability profile, falling back to ReadOnly if
-/// the profile unexpectedly returns `None` (which means Full/unrestricted).
-/// This prevents silent privilege escalation: a misconfigured restricted profile
-/// never degrades to Full access.
-fn restricted_tools(profile: CapabilityProfile) -> Vec<String> {
-    match profile.tools() {
-        Some(tools) => tools,
-        None => {
-            tracing::warn!(
-                ?profile,
-                "restricted profile returned None (Full); falling back to ReadOnly"
-            );
-            CapabilityProfile::ReadOnly
-                .tools()
-                .unwrap_or_else(|| vec!["Read".to_string(), "Grep".to_string(), "Glob".to_string()])
-        }
-    }
+/// Extract tool list from a capability profile, returning an error if the
+/// profile unexpectedly returns `None` (which means Full/unrestricted).
+/// A misconfigured profile causes a hard failure rather than silent degradation,
+/// per U-23 (no silent capability downgrade).
+fn restricted_tools(profile: CapabilityProfile) -> anyhow::Result<Vec<String>> {
+    profile.tools().ok_or_else(|| {
+        anyhow::anyhow!(
+            "capability profile {:?} returned None from tools() — misconfiguration",
+            profile
+        )
+    })
 }
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -504,7 +498,7 @@ pub(crate) async fn run_task(
     let (initial_allowed_tools, capability_prompt_note) =
         if req.source.as_deref() == Some("periodic_review") {
             (
-                restricted_tools(CapabilityProfile::Standard),
+                restricted_tools(CapabilityProfile::Standard)?,
                 CapabilityProfile::Standard.prompt_note(),
             )
         } else {
@@ -818,7 +812,7 @@ pub(crate) async fn run_task(
             project_root: project.clone(),
             context: context_items.clone(),
             execution_phase: Some(ExecutionPhase::Validation),
-            allowed_tools: restricted_tools(CapabilityProfile::ReadOnly),
+            allowed_tools: restricted_tools(CapabilityProfile::ReadOnly)?,
             env_vars: cargo_env.clone(),
             ..Default::default()
         };
@@ -995,7 +989,7 @@ async fn run_agent_review(
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Validation),
-            allowed_tools: restricted_tools(CapabilityProfile::ReadOnly),
+            allowed_tools: restricted_tools(CapabilityProfile::ReadOnly)?,
             env_vars: cargo_env.clone(),
             ..Default::default()
         };
@@ -1307,7 +1301,7 @@ mod tests {
 
     #[test]
     fn review_check_turn_uses_readonly_profile() {
-        let tools = restricted_tools(CapabilityProfile::ReadOnly);
+        let tools = restricted_tools(CapabilityProfile::ReadOnly).unwrap();
         assert!(tools.contains(&"Read".to_string()));
         assert!(tools.contains(&"Grep".to_string()));
         assert!(tools.contains(&"Glob".to_string()));
@@ -1318,7 +1312,7 @@ mod tests {
 
     #[test]
     fn periodic_review_turn_uses_standard_profile_with_bash() {
-        let tools = restricted_tools(CapabilityProfile::Standard);
+        let tools = restricted_tools(CapabilityProfile::Standard).unwrap();
         assert!(tools.contains(&"Bash".to_string()));
         assert!(tools.contains(&"Read".to_string()));
         assert!(tools.contains(&"Write".to_string()));
