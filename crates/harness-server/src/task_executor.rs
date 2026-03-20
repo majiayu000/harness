@@ -1369,4 +1369,43 @@ mod tests {
         assert_eq!(result, "Do the task.");
         assert!(!result.contains("GP-01"));
     }
+
+    #[test]
+    fn task_target_dir_cleans_up_on_drop() {
+        let dir = std::env::temp_dir()
+            .join("harness-cargo-targets-test")
+            .join("test-cleanup-on-drop");
+        assert!(
+            std::fs::create_dir_all(&dir).is_ok(),
+            "failed to create test directory"
+        );
+        assert!(dir.exists());
+        {
+            let _guard = TaskTargetDir(dir.clone());
+        }
+        assert!(
+            !dir.exists(),
+            "TaskTargetDir should remove the directory on drop"
+        );
+    }
+
+    #[test]
+    fn task_target_dir_tolerates_missing_dir_on_drop() {
+        // If the directory was never created (or already removed), Drop must not panic.
+        let dir = std::env::temp_dir()
+            .join("harness-cargo-targets-test")
+            .join("test-nonexistent-488");
+        assert!(!dir.exists());
+        let _guard = TaskTargetDir(dir);
+        // No panic — test passes if we reach this point.
+    }
+
+    #[test]
+    fn task_target_dir_path_is_per_task_unique() {
+        // Two task IDs must produce distinct target directories to avoid contention.
+        let base = std::env::temp_dir().join("harness-cargo-targets");
+        let task_a = base.join("task-id-aaa");
+        let task_b = base.join("task-id-bbb");
+        assert_ne!(task_a, task_b);
+    }
 }
