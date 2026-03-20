@@ -137,6 +137,9 @@ async fn make_state_inner(
         core: crate::http::CoreServices {
             server,
             project_root: project_root.to_path_buf(),
+            home_dir: std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/")),
             tasks,
             thread_db: Some(thread_db),
             plan_db: None,

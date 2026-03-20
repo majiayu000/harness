@@ -9,7 +9,7 @@ pub async fn health_check(
     id: Option<serde_json::Value>,
     project_root: PathBuf,
 ) -> RpcResponse {
-    let project_root = validate_root!(&project_root, id);
+    let project_root = validate_root!(&project_root, id, &state.core.home_dir);
 
     // Query historical events before persisting the current scan to avoid the
     // just-persisted rule_check events inflating the quality stability score.

@@ -627,6 +627,12 @@ where
     let id_watcher = id.clone();
     let interceptors = Arc::new(interceptors);
     let detect_worktree = Arc::new(detect_worktree);
+    // Capture HOME once before spawning so the path-boundary check uses the
+    // value that was current when the task was enqueued, not when it executes.
+    // This eliminates the RS-01 TOCTOU window inside the spawned future.
+    let home_dir = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/"));
 
     let handle = tokio::spawn(async move {
         // Hold both permits for the task's lifetime so that the group serialisation
@@ -637,7 +643,7 @@ where
         let detect_worktree = detect_worktree.clone();
         let raw_project =
             resolve_project_root_with(req.project.clone(), move || detect_worktree()).await?;
-        let project_root = crate::handlers::validate_project_root(&raw_project)
+        let project_root = crate::handlers::validate_project_root(&raw_project, &home_dir)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // Populate transient sibling-awareness fields in the in-memory cache.

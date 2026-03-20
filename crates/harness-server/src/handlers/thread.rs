@@ -55,7 +55,7 @@ pub async fn thread_start(
     id: Option<serde_json::Value>,
     cwd: PathBuf,
 ) -> RpcResponse {
-    let cwd = validate_root!(&cwd, id);
+    let cwd = validate_root!(&cwd, id, &state.core.home_dir);
     let thread_id = state.core.server.thread_manager.start_thread(cwd);
     persist_thread_insert(state, &thread_id).await;
     crate::notify::emit(

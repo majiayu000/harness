@@ -17,12 +17,12 @@ pub mod thread;
 ///
 /// # Example
 /// ```ignore
-/// let project_root = validate_root!(&project_root, id);
+/// let project_root = validate_root!(&project_root, id, &state.core.home_dir);
 /// ```
 #[macro_export]
 macro_rules! validate_root {
-    ($path:expr, $id:expr) => {
-        match $crate::handlers::validate_project_root($path) {
+    ($path:expr, $id:expr, $home:expr) => {
+        match $crate::handlers::validate_project_root($path, $home) {
             Ok(p) => p,
             Err(e) => {
                 return harness_protocol::RpcResponse::error(
@@ -54,12 +54,17 @@ pub(crate) fn validate_file_in_root(
     Ok(canonical)
 }
 
-/// Validate that a project root is an existing directory within `$HOME`.
+/// Validate that a project root is an existing directory within `home`.
+///
+/// `home` must be captured once at server startup (from `AppState.core.home_dir`)
+/// rather than read from the environment per-request, eliminating the TOCTOU
+/// window that existed when `HOME` was read inside each request handler.
+///
 /// Returns the canonicalized path on success.
-pub(crate) fn validate_project_root(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let home = std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .map_err(|_| "HOME environment variable not set".to_string())?;
+pub(crate) fn validate_project_root(
+    path: &std::path::Path,
+    home: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
     let canonical = path
         .canonicalize()
         .map_err(|e| format!("invalid project root '{}': {e}", path.display()))?;
@@ -69,7 +74,7 @@ pub(crate) fn validate_project_root(path: &std::path::Path) -> Result<std::path:
             canonical.display()
         ));
     }
-    if !canonical.starts_with(&home) {
+    if !canonical.starts_with(home) {
         return Err(format!(
             "project root must be within HOME: {}",
             canonical.display()

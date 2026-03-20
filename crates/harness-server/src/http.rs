@@ -61,6 +61,10 @@ pub(crate) mod task_routes;
 pub struct CoreServices {
     pub server: Arc<HarnessServer>,
     pub project_root: std::path::PathBuf,
+    /// The value of `$HOME` captured once at server startup.
+    /// All path-boundary checks use this fixed value to eliminate the TOCTOU
+    /// window that arises when `HOME` is read from the environment per-request.
+    pub home_dir: std::path::PathBuf,
     pub tasks: Arc<task_runner::TaskStore>,
     pub thread_db: Option<crate::thread_db::ThreadDb>,
     pub plan_db: Option<crate::plan_db::PlanDb>,
@@ -197,6 +201,12 @@ fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
 pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppState> {
     let dir = expand_tilde(&server.config.server.data_dir);
     let project_root = resolve_project_root(&server.config.server.project_root)?;
+    // Capture HOME once at startup. All per-request path-boundary checks read
+    // this fixed value (via AppState.core.home_dir) instead of calling
+    // std::env::var("HOME") per-request, eliminating the RS-01 TOCTOU window.
+    let home_dir = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/"));
     std::fs::create_dir_all(&dir)?;
     tracing::debug!(
         data_dir = %dir.display(),
@@ -530,6 +540,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         core: CoreServices {
             server,
             project_root,
+            home_dir,
             tasks,
             thread_db: Some(thread_db),
             plan_db: Some(plan_db),
