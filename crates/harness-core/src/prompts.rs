@@ -336,9 +336,20 @@ pub fn periodic_review_prompt(
          P2 Quality: oversized files (>400 lines), god objects (>10 pub fields), dead code, \
          error handling (unwrap in prod, silent discards), duplicate types, config divergence\n\
          P3 Performance: unnecessary allocations, repeated patterns, dependency bloat\n\n\
-         ## Output Format\n\n\
-         You MUST output valid JSON and nothing else. No markdown, no explanation outside the JSON.\n\n\
-         ```json\n\
+         ## Workflow\n\n\
+         You MUST follow this exact order:\n\n\
+         ### Step 1: Create GitHub issues FIRST\n\
+         For EACH P0 and P1 finding, create a GitHub issue using `gh issue create`.\n\
+         CRITICAL: Do NOT create an issue if the same problem is already listed in Existing Issues below.\n\
+         Issue format:\n\
+         - Title: `[PRIORITY] RULE_ID: short title`\n\
+         - Body: description + recommended action + file:line reference\n\
+         - Labels: `review`, priority label (e.g. `p0`, `p1`)\n\
+         Do NOT create issues for P2 or P3 findings. Do NOT create PRs or edit any files.\n\n\
+         ### Step 2: Output structured JSON LAST\n\
+         After all issues are created, output the review JSON wrapped in markers.\n\
+         The JSON MUST appear between `REVIEW_JSON_START` and `REVIEW_JSON_END` markers.\n\n\
+         REVIEW_JSON_START\n\
          {{\n\
            \"findings\": [\n\
              {{\n\
@@ -363,23 +374,16 @@ pub fn periodic_review_prompt(
              \"health_score\": 75\n\
            }}\n\
          }}\n\
-         ```\n\n\
+         REVIEW_JSON_END\n\n\
          Rules:\n\
          - health_score: 100 minus deductions (P0: -15 each, P1: -8, P2: -3, P3: -1), minimum 0\n\
          - line: use 0 if unknown\n\
          - rule_id: use guard rule_id if from scan (e.g. RS-03, SEC-07), or REVIEW-XX for new findings\n\
          - id: sequential F001, F002, etc.\n\
-         - Output ONLY the JSON object. No text before or after it.\n\n\
+         - The JSON between the markers must be valid and parseable. No markdown fences inside the markers.\n\n\
          ## Existing Issues (DO NOT DUPLICATE)\n\n\
          {existing_issues_section}\
-         ## Post-Review Actions\n\n\
-         After outputting the JSON, create a GitHub issue for EACH P0 and P1 finding using `gh issue create`.\n\
-         CRITICAL: Do NOT create an issue if the same problem is already listed in Existing Issues above.\n\
-         Issue format:\n\
-         - Title: `[PRIORITY] RULE_ID: short title`\n\
-         - Body: description + recommended action + file:line reference\n\
-         - Labels: `review`, priority label (e.g. `p0`, `p1`)\n\n\
-         Do NOT create issues for P2 or P3 findings. Do NOT create PRs or edit any files."
+         Do NOT duplicate any finding already listed above."
     )
 }
 

@@ -194,8 +194,20 @@ impl ReviewStore {
 /// strips them before parsing.
 pub fn parse_review_output(raw: &str) -> anyhow::Result<ReviewOutput> {
     let trimmed = raw.trim();
-    // Extract the JSON object between the first '{' and last '}'.
-    // Handles: raw JSON, markdown-fenced JSON, text before/after JSON.
+
+    // Strategy 1: Extract JSON between REVIEW_JSON_START / REVIEW_JSON_END markers.
+    const START_MARKER: &str = "REVIEW_JSON_START";
+    const END_MARKER: &str = "REVIEW_JSON_END";
+    if let Some(s) = trimmed.find(START_MARKER) {
+        let after_marker = &trimmed[s + START_MARKER.len()..];
+        if let Some(e) = after_marker.find(END_MARKER) {
+            let json_slice = after_marker[..e].trim();
+            return serde_json::from_str(json_slice)
+                .map_err(|e| anyhow::anyhow!("failed to parse marked review JSON: {e}"));
+        }
+    }
+
+    // Strategy 2 (fallback): Extract between first '{' and last '}'.
     let start = trimmed
         .find('{')
         .ok_or_else(|| anyhow::anyhow!("no JSON object found in review output"))?;
@@ -243,6 +255,15 @@ mod tests {
     fn parse_with_text_before_json() -> anyhow::Result<()> {
         let raw = "Here is my analysis:\n```json\n{\"findings\":[], \"summary\":{\"p0_count\":0,\"p1_count\":0,\"p2_count\":0,\"p3_count\":0,\"health_score\":100}}\n```\nDone.";
         let output = parse_review_output(raw)?;
+        assert_eq!(output.summary.health_score, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_marked_json() -> anyhow::Result<()> {
+        let raw = "Created issues #1 and #2.\n\nREVIEW_JSON_START\n{\"findings\":[], \"summary\":{\"p0_count\":0,\"p1_count\":0,\"p2_count\":0,\"p3_count\":0,\"health_score\":100}}\nREVIEW_JSON_END\n\nDone.";
+        let output = parse_review_output(raw)?;
+        assert!(output.findings.is_empty());
         assert_eq!(output.summary.health_score, 100);
         Ok(())
     }
