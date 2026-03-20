@@ -79,30 +79,54 @@ impl ReviewStore {
         )
         .execute(&pool)
         .await?;
+        // Unique index enables atomic INSERT OR IGNORE + UPDATE deduplication
+        // without a TOCTOU race between a SELECT check and an INSERT.
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_dedup \
+             ON review_findings(rule_id, file, status)",
+        )
+        .execute(&pool)
+        .await?;
         Ok(Self { pool })
     }
 
     /// Persist findings from a review run, deduplicating against existing open findings.
+    ///
+    /// Uses a transaction with INSERT OR IGNORE + conditional UPDATE to eliminate
+    /// the TOCTOU race that existed in the previous check-then-insert pattern.
     pub async fn persist_findings(
         &self,
         review_id: &str,
         findings: &[ReviewFinding],
     ) -> anyhow::Result<usize> {
+        let mut tx = self.pool.begin().await?;
         let mut inserted = 0;
         for f in findings {
-            // Check if an open finding with the same rule_id + file already exists.
-            let existing: Option<(String,)> = sqlx::query_as(
-                "SELECT id FROM review_findings \
-                 WHERE rule_id = ? AND file = ? AND status = 'open' \
-                 LIMIT 1",
+            let result = sqlx::query(
+                "INSERT OR IGNORE INTO review_findings \
+                 (id, review_id, rule_id, priority, impact, confidence, effort, \
+                  file, line, title, description, action) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
+            .bind(&f.id)
+            .bind(review_id)
             .bind(&f.rule_id)
+            .bind(&f.priority)
+            .bind(f.impact)
+            .bind(f.confidence)
+            .bind(f.effort)
             .bind(&f.file)
-            .fetch_optional(&self.pool)
+            .bind(f.line)
+            .bind(&f.title)
+            .bind(&f.description)
+            .bind(&f.action)
+            .execute(&mut *tx)
             .await?;
 
-            if existing.is_some() {
-                // Mark as recurring — update the review_id to latest.
+            if result.rows_affected() == 1 {
+                inserted += 1;
+            } else {
+                // Existing open finding for the same rule_id+file — mark as recurring.
                 sqlx::query(
                     "UPDATE review_findings SET review_id = ? \
                      WHERE rule_id = ? AND file = ? AND status = 'open'",
@@ -110,32 +134,11 @@ impl ReviewStore {
                 .bind(review_id)
                 .bind(&f.rule_id)
                 .bind(&f.file)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
-            } else {
-                sqlx::query(
-                    "INSERT INTO review_findings \
-                     (id, review_id, rule_id, priority, impact, confidence, effort, \
-                      file, line, title, description, action) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(&f.id)
-                .bind(review_id)
-                .bind(&f.rule_id)
-                .bind(&f.priority)
-                .bind(f.impact)
-                .bind(f.confidence)
-                .bind(f.effort)
-                .bind(&f.file)
-                .bind(f.line)
-                .bind(&f.title)
-                .bind(&f.description)
-                .bind(&f.action)
-                .execute(&self.pool)
-                .await?;
-                inserted += 1;
             }
         }
+        tx.commit().await?;
         Ok(inserted)
     }
 
@@ -272,6 +275,47 @@ mod tests {
     fn parse_invalid_json_returns_error() {
         let raw = "not json at all";
         assert!(parse_review_output(raw).is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_persist_no_duplicates() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = std::sync::Arc::new(ReviewStore::open(&dir.path().join("review.db")).await?);
+
+        let finding = ReviewFinding {
+            id: "F001".into(),
+            rule_id: "RS-03".into(),
+            priority: "P2".into(),
+            impact: 3,
+            confidence: 5,
+            effort: 2,
+            file: "src/lib.rs".into(),
+            line: 10,
+            title: "unwrap in prod".into(),
+            description: "panic risk".into(),
+            action: "use ?".into(),
+        };
+        let findings = vec![finding];
+
+        let store1 = store.clone();
+        let store2 = store.clone();
+        let f1 = findings.clone();
+        let f2 = findings.clone();
+
+        let (r1, r2) = tokio::join!(
+            store1.persist_findings("rev-1", &f1),
+            store2.persist_findings("rev-2", &f2),
+        );
+
+        // Both calls must succeed without constraint violation errors.
+        r1?;
+        r2?;
+
+        // Exactly one open finding must exist (dedup enforced atomically).
+        let open = store.list_open().await?;
+        assert_eq!(open.len(), 1);
+
+        Ok(())
     }
 
     #[tokio::test]
