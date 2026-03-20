@@ -517,6 +517,7 @@ pub async fn spawn_task(
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
+    home_dir: std::path::PathBuf,
 ) -> TaskId {
     spawn_task_with_worktree_detector(
         store,
@@ -533,6 +534,7 @@ pub async fn spawn_task(
         completion_callback,
         None,
         None,
+        home_dir,
     )
     .await
 }
@@ -568,6 +570,7 @@ pub async fn spawn_preregistered_task(
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
     group_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    home_dir: std::path::PathBuf,
 ) {
     spawn_task_with_worktree_detector(
         store,
@@ -584,6 +587,7 @@ pub async fn spawn_preregistered_task(
         completion_callback,
         Some(task_id),
         group_permit,
+        home_dir,
     )
     .await;
 }
@@ -603,6 +607,7 @@ async fn spawn_task_with_worktree_detector<F>(
     completion_callback: Option<CompletionCallback>,
     preregistered_id: Option<TaskId>,
     group_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    home_dir: std::path::PathBuf,
 ) -> TaskId
 where
     F: Fn() -> PathBuf + Send + Sync + 'static,
@@ -637,7 +642,7 @@ where
         let detect_worktree = detect_worktree.clone();
         let raw_project =
             resolve_project_root_with(req.project.clone(), move || detect_worktree()).await?;
-        let project_root = crate::handlers::validate_project_root(&raw_project)
+        let project_root = crate::handlers::validate_project_root(&raw_project, &home_dir)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // Populate transient sibling-awareness fields in the in-memory cache.
@@ -1141,6 +1146,9 @@ mod tests {
         let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
         let queue = crate::task_queue::TaskQueue::unbounded();
         let permit = queue.acquire("test").await?;
+        let home_dir = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| dir.path().to_path_buf());
         spawn_task(
             store,
             agent_clone,
@@ -1153,6 +1161,7 @@ mod tests {
             None,
             permit,
             None,
+            home_dir,
         )
         .await;
 
@@ -1215,6 +1224,9 @@ mod tests {
 
         let queue = crate::task_queue::TaskQueue::unbounded();
         let permit = queue.acquire("test").await?;
+        let home_dir = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| dir.path().to_path_buf());
         let task_id = spawn_task(
             store.clone(),
             agent,
@@ -1227,6 +1239,7 @@ mod tests {
             None,
             permit,
             None,
+            home_dir,
         )
         .await;
 
@@ -1319,6 +1332,9 @@ mod tests {
             None,
             None,
             None,
+            std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| dir.path().to_path_buf()),
         )
         .await;
 
@@ -1468,6 +1484,9 @@ mod tests {
             None,
             permit,
             None,
+            std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| dir.path().to_path_buf()),
         )
         .await;
 
@@ -1525,6 +1544,9 @@ mod tests {
             None,
             permit,
             None,
+            std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| dir.path().to_path_buf()),
         )
         .await;
 

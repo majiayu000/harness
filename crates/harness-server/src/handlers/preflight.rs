@@ -212,7 +212,7 @@ pub async fn preflight(
     project_root: PathBuf,
     task_description: String,
 ) -> RpcResponse {
-    let project_root = validate_root!(&project_root, id);
+    let project_root = validate_root!(&project_root, id, &state.core.home_dir);
 
     let agent = match state.core.server.agent_registry.default_agent() {
         Some(a) => a,

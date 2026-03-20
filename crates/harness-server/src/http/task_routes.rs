@@ -122,6 +122,7 @@ pub(crate) async fn enqueue_task(
         state.concurrency.workspace_mgr.clone(),
         permit,
         state.intake.completion_callback.clone(),
+        state.core.home_dir.clone(),
     )
     .await;
 
@@ -314,6 +315,7 @@ async fn enqueue_task_background(
                         permit,
                         state.intake.completion_callback.clone(),
                         group_permit,
+                        state.core.home_dir.clone(),
                     )
                     .await;
                 }

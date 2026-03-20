@@ -71,6 +71,8 @@ pub struct DefaultExecutionService {
     completion_callback: Option<CompletionCallback>,
     project_registry: Option<Arc<ProjectRegistry>>,
     allowed_project_roots: Vec<PathBuf>,
+    /// HOME directory captured at startup; passed to `validate_project_root` (RS-01).
+    home_dir: PathBuf,
 }
 
 impl DefaultExecutionService {
@@ -87,6 +89,7 @@ impl DefaultExecutionService {
         completion_callback: Option<CompletionCallback>,
         project_registry: Option<Arc<ProjectRegistry>>,
         allowed_project_roots: Vec<PathBuf>,
+        home_dir: PathBuf,
     ) -> Arc<Self> {
         Arc::new(Self {
             tasks,
@@ -100,6 +103,7 @@ impl DefaultExecutionService {
             completion_callback,
             project_registry,
             allowed_project_roots,
+            home_dir,
         })
     }
 
@@ -218,6 +222,7 @@ impl ExecutionService for DefaultExecutionService {
             self.workspace_mgr.clone(),
             permit,
             self.completion_callback.clone(),
+            self.home_dir.clone(),
         )
         .await;
 
@@ -262,6 +267,7 @@ impl ExecutionService for DefaultExecutionService {
         let workspace_mgr = self.workspace_mgr.clone();
         let task_queue = self.task_queue.clone();
         let completion_callback = self.completion_callback.clone();
+        let home_dir = self.home_dir.clone();
         let task_id2 = task_id.clone();
         tokio::spawn(async move {
             match task_queue.acquire(&project_id).await {
@@ -280,6 +286,7 @@ impl ExecutionService for DefaultExecutionService {
                         permit,
                         completion_callback,
                         None,
+                        home_dir,
                     )
                     .await;
                 }
@@ -483,6 +490,9 @@ mod tests {
     ) -> Arc<DefaultExecutionService> {
         let config = Arc::new(HarnessConfig::default());
         let agent_registry = Arc::new(AgentRegistry::new("test"));
+        let home_dir = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"));
         DefaultExecutionService::new(
             store,
             agent_registry,
@@ -495,6 +505,7 @@ mod tests {
             None,
             registry,
             vec![],
+            home_dir,
         )
     }
 
@@ -504,6 +515,9 @@ mod tests {
     ) -> Arc<DefaultExecutionService> {
         let config = Arc::new(HarnessConfig::default());
         let agent_registry = Arc::new(AgentRegistry::new("test"));
+        let home_dir = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"));
         DefaultExecutionService::new(
             store,
             agent_registry,
@@ -516,6 +530,7 @@ mod tests {
             None,
             None,
             allowed,
+            home_dir,
         )
     }
 }

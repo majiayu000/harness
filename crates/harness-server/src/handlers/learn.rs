@@ -9,7 +9,7 @@ pub async fn learn_rules(
     id: Option<serde_json::Value>,
     project_root: PathBuf,
 ) -> RpcResponse {
-    let project_root = validate_root!(&project_root, id);
+    let project_root = validate_root!(&project_root, id, &state.core.home_dir);
 
     let draft_contents = match collect_adopted_draft_contents(state) {
         Ok(d) => d,
@@ -61,7 +61,7 @@ pub async fn learn_skills(
     id: Option<serde_json::Value>,
     project_root: PathBuf,
 ) -> RpcResponse {
-    let project_root = validate_root!(&project_root, id);
+    let project_root = validate_root!(&project_root, id, &state.core.home_dir);
 
     let draft_contents = match collect_adopted_draft_contents(state) {
         Ok(d) => d,

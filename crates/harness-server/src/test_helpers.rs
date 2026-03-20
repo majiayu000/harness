@@ -119,6 +119,9 @@ async fn make_state_inner(
         project_root.to_path_buf(),
     );
     let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
+    let home_dir = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().expect("resolve cwd"));
     let execution_svc = crate::services::DefaultExecutionService::new(
         tasks.clone(),
         server.agent_registry.clone(),
@@ -131,12 +134,13 @@ async fn make_state_inner(
         None,
         None,
         vec![],
+        home_dir.clone(),
     );
-
     Ok(AppState {
         core: crate::http::CoreServices {
             server,
             project_root: project_root.to_path_buf(),
+            home_dir,
             tasks,
             thread_db: Some(thread_db),
             plan_db: None,

@@ -15,14 +15,17 @@ pub mod thread;
 /// Validate a project root path, returning early with an `INTERNAL_ERROR`
 /// response on failure.
 ///
+/// `$home` must be a `&std::path::Path` capturing the HOME directory at
+/// server startup — do **not** pass `std::env::var("HOME")` here.
+///
 /// # Example
 /// ```ignore
-/// let project_root = validate_root!(&project_root, id);
+/// let project_root = validate_root!(&project_root, id, &state.core.home_dir);
 /// ```
 #[macro_export]
 macro_rules! validate_root {
-    ($path:expr, $id:expr) => {
-        match $crate::handlers::validate_project_root($path) {
+    ($path:expr, $id:expr, $home:expr) => {
+        match $crate::handlers::validate_project_root($path, $home) {
             Ok(p) => p,
             Err(e) => {
                 return harness_protocol::RpcResponse::error(
@@ -54,12 +57,17 @@ pub(crate) fn validate_file_in_root(
     Ok(canonical)
 }
 
-/// Validate that a project root is an existing directory within `$HOME`.
+/// Validate that a project root is an existing directory within `home`.
+///
+/// `home` must be the HOME directory captured **once at server startup**,
+/// not read from the environment on each call — callers are responsible for
+/// passing a stable value (e.g. `&state.core.home_dir`).
+///
 /// Returns the canonicalized path on success.
-pub(crate) fn validate_project_root(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let home = std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .map_err(|_| "HOME environment variable not set".to_string())?;
+pub(crate) fn validate_project_root(
+    path: &std::path::Path,
+    home: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
     let canonical = path
         .canonicalize()
         .map_err(|e| format!("invalid project root '{}': {e}", path.display()))?;
@@ -69,7 +77,7 @@ pub(crate) fn validate_project_root(path: &std::path::Path) -> Result<std::path:
             canonical.display()
         ));
     }
-    if !canonical.starts_with(&home) {
+    if !canonical.starts_with(home) {
         return Err(format!(
             "project root must be within HOME: {}",
             canonical.display()

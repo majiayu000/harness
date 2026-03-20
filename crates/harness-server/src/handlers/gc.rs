@@ -173,6 +173,7 @@ pub async fn gc_adopt(
                     state.concurrency.workspace_mgr.clone(),
                     permit,
                     None,
+                    state.core.home_dir.clone(),
                 )
                 .await;
                 Some(tid.0)
