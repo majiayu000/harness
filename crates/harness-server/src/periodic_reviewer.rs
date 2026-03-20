@@ -209,7 +209,7 @@ async fn run_review_tick(state: &Arc<AppState>, config: &ReviewConfig) -> anyhow
                     // (instructed in the prompt to create GitHub issues for P0/P1 findings).
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         task_id = %task_id,
                         "scheduler: failed to parse review output as JSON: {e}"
                     );
