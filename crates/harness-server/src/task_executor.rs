@@ -1328,6 +1328,22 @@ mod tests {
     }
 
     #[test]
+    fn full_profile_hard_fails_in_restricted_tools() {
+        // Passing Full (which returns None) to restricted_tools must return Err, not
+        // silently degrade to ReadOnly. This guards against U-23 regressions.
+        let result = restricted_tools(CapabilityProfile::Full);
+        assert!(
+            result.is_err(),
+            "Full profile must produce an error, not silent fallback"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("misconfiguration"),
+            "error message should mention misconfiguration"
+        );
+    }
+
+    #[test]
     fn constitution_present_when_enabled() {
         let result = prepend_constitution("Do the task.".to_string(), true);
         assert!(result.contains("GP-01"));
