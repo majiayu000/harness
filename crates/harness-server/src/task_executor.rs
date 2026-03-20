@@ -28,6 +28,24 @@ fn restricted_tools(profile: CapabilityProfile) -> anyhow::Result<Vec<String>> {
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
+
+/// RAII guard that removes the per-task Cargo target directory on drop.
+/// This ensures cleanup regardless of how `run_task` exits (success, error,
+/// or timeout), preventing disk exhaustion from accumulated build artifacts.
+struct TaskTargetDir(PathBuf);
+
+impl Drop for TaskTargetDir {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                tracing::warn!(
+                    path = %self.0.display(),
+                    "failed to remove per-task cargo target dir: {e}"
+                );
+            }
+        }
+    }
+}
 use tokio::time::{sleep, Duration, Instant};
 
 pub(crate) use helpers::{
@@ -369,14 +387,21 @@ pub(crate) async fn run_task(
     update_status(store, task_id, TaskStatus::Implementing, 1).await?;
     let impl_phase_start = Instant::now();
 
-    // Set CARGO_TARGET_DIR to a per-workspace path so parallel agents using isolated
-    // git worktrees each build to their own target directory, eliminating cargo file
-    // lock contention when 4+ agents run cargo check/test simultaneously.
+    // Set CARGO_TARGET_DIR to a per-task temp path so parallel agents running
+    // cargo check/test simultaneously do not contend on the same build directory.
+    // A per-project path caused `.cargo-lock` contention and build failures when
+    // two tasks targeted the same project concurrently (issue #488).
+    let task_target = std::env::temp_dir()
+        .join("harness-cargo-targets")
+        .join(task_id.as_str());
     let cargo_env: HashMap<String, String> = [(
         "CARGO_TARGET_DIR".to_string(),
-        format!("{}/target", project.display()),
+        task_target.display().to_string(),
     )]
     .into();
+    // Guard ensures the directory is removed when run_task exits, regardless of
+    // the exit path (success, validation failure, timeout, or review exhaustion).
+    let _task_target_guard = TaskTargetDir(task_target);
 
     let project_config = load_project_config(&project);
     let resolved = harness_core::config::resolve_config(server_config, &project_config);

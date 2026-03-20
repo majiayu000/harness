@@ -182,11 +182,7 @@ async fn persist(pool: &SqlitePool, id: &str) -> Result<()> {
 "#,
     )
     .unwrap();
-    assert_violation(
-        &guard_path("rs-02b-sql-toctou.sh"),
-        dir.path(),
-        "RS-02B",
-    );
+    assert_violation(&guard_path("rs-02b-sql-toctou.sh"), dir.path(), "RS-02B");
 }
 
 #[test]
