@@ -94,6 +94,22 @@ mod tests {
     }
 
     #[test]
+    fn standard_has_prompt_note() {
+        // Standard profile must provide a note so task_executor can inject it
+        // into the prompt — the primary tool-restriction enforcement path now
+        // that --allowedTools is not passed to Claude CLI (issue #483).
+        assert!(
+            CapabilityProfile::Standard
+                .prompt_note()
+                .is_some_and(|n| n.contains("Read")
+                    && n.contains("Write")
+                    && n.contains("Edit")
+                    && n.contains("Bash")),
+            "Standard prompt_note must mention all permitted tools"
+        );
+    }
+
+    #[test]
     fn full_profile_no_prompt_note() {
         assert!(CapabilityProfile::Full.prompt_note().is_none());
     }

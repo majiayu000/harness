@@ -497,10 +497,26 @@ pub(crate) async fn run_task(
     // Periodic review tasks need Bash to run guard check commands but should
     // not have unrestricted write access — use Standard profile. All other
     // tasks (implementation) keep Full (no restriction, Vec::new()).
-    let initial_allowed_tools = if req.source.as_deref() == Some("periodic_review") {
-        restricted_tools(CapabilityProfile::Standard)
+    //
+    // NOTE: --allowedTools is NOT passed as a CLI flag (see claude.rs).
+    // Tool restriction is enforced via prompt_note injection below.
+    let (initial_allowed_tools, capability_prompt_note) =
+        if req.source.as_deref() == Some("periodic_review") {
+            (
+                restricted_tools(CapabilityProfile::Standard),
+                CapabilityProfile::Standard.prompt_note(),
+            )
+        } else {
+            (Vec::new(), None)
+        };
+
+    // Prepend capability restriction note so the agent knows which tools are
+    // permitted. This is the primary enforcement path now that --allowedTools
+    // is not passed to the CLI.
+    let first_prompt = if let Some(note) = capability_prompt_note {
+        format!("{note}\n\n{first_prompt}")
     } else {
-        Vec::new()
+        first_prompt
     };
 
     tracing::info!(
@@ -1247,7 +1263,7 @@ mod tests {
 
     #[test]
     fn implementation_turn_uses_full_profile_no_restriction() {
-        // Full profile returns None — no --allowedTools flag is passed to the agent.
+        // Full profile returns None — no tool restriction is applied to the agent.
         assert!(CapabilityProfile::Full.tools().is_none());
     }
 
