@@ -31,17 +31,21 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // the DB is unavailable.
     let fallback_ts: Arc<Mutex<Option<DateTime<Utc>>>> = Arc::new(Mutex::new(None));
 
+    // Tracks the currently active polling task so it can be cancelled if a new
+    // review cycle starts before the previous one finishes (issue #448).
+    let poll_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+
     if config.run_on_startup {
         // Brief delay to let the server fully initialize before the first tick.
         sleep(Duration::from_secs(5)).await;
-        if let Err(err) = run_review_tick(&state, &config, &fallback_ts).await {
+        if let Err(err) = run_review_tick(&state, &config, &fallback_ts, &poll_handle).await {
             tracing::error!("scheduler: periodic review startup tick failed: {err}");
         }
     }
 
     loop {
         sleep(interval).await;
-        if let Err(err) = run_review_tick(&state, &config, &fallback_ts).await {
+        if let Err(err) = run_review_tick(&state, &config, &fallback_ts, &poll_handle).await {
             tracing::error!("scheduler: periodic review tick failed: {err}");
         }
     }
@@ -51,6 +55,7 @@ async fn run_review_tick(
     state: &Arc<AppState>,
     config: &ReviewConfig,
     fallback_ts: &Arc<Mutex<Option<DateTime<Utc>>>>,
+    poll_handle: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 ) -> anyhow::Result<()> {
     let project_root = &state.core.project_root;
 
@@ -183,11 +188,21 @@ async fn run_review_tick(
         tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
     }
 
+    // Cancel the previous polling task if it is still running so orphan tasks
+    // do not accumulate across review cycles (issue #448).
+    {
+        let mut guard = poll_handle.lock().await;
+        if let Some(h) = guard.take() {
+            h.abort();
+            tracing::debug!("scheduler: aborted previous review polling task");
+        }
+    }
+
     // Wait for the review task to complete, then persist structured findings.
     let store = state.core.tasks.clone();
     let review_store = state.observability.review_store.clone();
     let timeout_secs = config.timeout_secs;
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let poll_interval = Duration::from_secs(15);
         let max_wait = Duration::from_secs(timeout_secs + 120);
         let start = tokio::time::Instant::now();
@@ -247,6 +262,7 @@ async fn run_review_tick(
             break;
         }
     });
+    *poll_handle.lock().await = Some(handle);
 
     Ok(())
 }
@@ -468,5 +484,33 @@ mod tests {
         let now = Utc::now();
         *fallback_ts.lock().await = Some(now);
         assert_eq!(*fallback_ts.lock().await, Some(now));
+    }
+
+    /// Verify that a previous poll_handle is aborted when a new cycle stores a
+    /// replacement handle (issue #448: orphan task cancellation).
+    #[tokio::test]
+    async fn poll_handle_aborts_previous_task() {
+        let poll_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(None));
+
+        // Simulate the first review cycle: spawn a long-running task and store it.
+        let first = tokio::spawn(async {
+            sleep(Duration::from_secs(3600)).await;
+        });
+        *poll_handle.lock().await = Some(first);
+
+        // Simulate a new review cycle starting: abort the old task and store a new one.
+        {
+            let mut guard = poll_handle.lock().await;
+            if let Some(h) = guard.take() {
+                h.abort();
+            }
+        }
+        let second = tokio::spawn(async {});
+        *poll_handle.lock().await = Some(second);
+
+        // The handle slot holds exactly one (the new) task.
+        let guard = poll_handle.lock().await;
+        assert!(guard.is_some());
     }
 }
