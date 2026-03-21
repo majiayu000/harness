@@ -188,13 +188,19 @@ async fn run_review_tick(
         tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
     }
 
-    // Cancel the previous polling task if it is still running so orphan tasks
-    // do not accumulate across review cycles (issue #448).
+    // Drop the previous poll handle without aborting: in Tokio, dropping a
+    // JoinHandle does NOT cancel the spawned task — the old poller keeps running
+    // until its review task reaches Done/Failed or its internal timeout fires.
+    // Calling h.abort() here would silently discard findings when the prior
+    // review task had not yet completed, because the poller is the only path
+    // that calls parse_review_output + persist_findings (issue #448 / round-1
+    // review correctness fix).
     {
         let mut guard = poll_handle.lock().await;
-        if let Some(h) = guard.take() {
-            h.abort();
-            tracing::debug!("scheduler: aborted previous review polling task");
+        if guard.take().is_some() {
+            tracing::debug!(
+                "scheduler: dropped previous review poll handle (task continues to completion)"
+            );
         }
     }
 
@@ -486,30 +492,49 @@ mod tests {
         assert_eq!(*fallback_ts.lock().await, Some(now));
     }
 
-    /// Verify that a previous poll_handle is aborted when a new cycle stores a
-    /// replacement handle (issue #448: orphan task cancellation).
+    /// Verify that replacing a poll_handle drops the old JoinHandle WITHOUT
+    /// aborting the underlying task, so the old poller can still persist its
+    /// findings after a new review cycle starts (issue #448 / round-1 review).
+    ///
+    /// The previous test only checked `guard.is_some()` after replacement, which
+    /// would pass even if `h.abort()` were present and the old task was killed.
+    /// This test additionally asserts that the old spawned task is still running.
     #[tokio::test]
-    async fn poll_handle_aborts_previous_task() {
+    async fn poll_handle_replaced_without_aborting_previous() {
         let poll_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> =
             Arc::new(Mutex::new(None));
 
-        // Simulate the first review cycle: spawn a long-running task and store it.
+        // First cycle: spawn a long-running task and store it.
         let first = tokio::spawn(async {
             sleep(Duration::from_secs(3600)).await;
         });
         *poll_handle.lock().await = Some(first);
 
-        // Simulate a new review cycle starting: abort the old task and store a new one.
-        {
+        // Second cycle: take the old handle (drop without abort) and store a new one.
+        let old_handle = {
             let mut guard = poll_handle.lock().await;
-            if let Some(h) = guard.take() {
-                h.abort();
-            }
-        }
+            guard.take()
+        };
         let second = tokio::spawn(async {});
         *poll_handle.lock().await = Some(second);
 
-        // The handle slot holds exactly one (the new) task.
+        // Yield so the runtime can process any pending state changes.
+        tokio::task::yield_now().await;
+
+        // The old task must still be running — dropping the handle must NOT cancel it.
+        assert!(old_handle.is_some(), "first handle must have been stored");
+        let old = match old_handle {
+            Some(h) => h,
+            None => return, // unreachable: asserted above
+        };
+        assert!(
+            !old.is_finished(),
+            "old poller must still be running after handle replacement; \
+             aborting it would silently drop findings"
+        );
+        old.abort(); // clean up the long-running task
+
+        // The slot holds exactly one (the new) task.
         let guard = poll_handle.lock().await;
         assert!(guard.is_some());
     }
