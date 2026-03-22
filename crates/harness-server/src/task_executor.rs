@@ -55,7 +55,7 @@ pub(crate) use helpers::{
     update_status,
 };
 pub(crate) use pr_detection::{
-    build_fix_ci_prompt, build_pr_approved_prompt, build_pr_rework_prompt,
+    build_fix_ci_prompt, build_pr_approved_prompt, build_pr_rework_prompt, detect_repo_slug,
     find_existing_pr_for_issue, parse_harness_mention_command, HarnessMentionCommand,
 };
 // PromptBuilder is used internally by pr_detection and re-exported for tests.
@@ -407,14 +407,18 @@ pub(crate) async fn run_task(
     let resolved = harness_core::config::resolve_config(server_config, &project_config);
     let review_config = &resolved.review;
     let git = Some(&project_config.git);
+    let repo_slug = detect_repo_slug(&project)
+        .await
+        .unwrap_or_else(|| "{owner}/{repo}".to_string());
 
     let first_prompt = if let Some(issue) = req.issue {
         let base = match find_existing_pr_for_issue(&project, issue).await {
-            Ok(Some((pr_num, branch))) => {
+            Ok(Some((pr_num, branch, pr_url))) => {
                 tracing::info!(
                     "reusing existing PR #{pr_num} on branch `{branch}` for issue #{issue}"
                 );
-                prompts::continue_existing_pr(issue, pr_num, &branch)
+                let slug = prompts::repo_slug_from_pr_url(Some(&pr_url));
+                prompts::continue_existing_pr(issue, pr_num, &branch, &slug)
             }
             Ok(None) => prompts::implement_from_issue(issue, git).to_prompt_string(),
             Err(e) => {
@@ -434,7 +438,7 @@ pub(crate) async fn run_task(
             base
         }
     } else if let Some(pr) = req.pr {
-        prompts::check_existing_pr(pr, &review_config.review_bot_command)
+        prompts::check_existing_pr(pr, &review_config.review_bot_command, &repo_slug)
     } else if req.source.as_deref() == Some("periodic_review") {
         // Review tasks use their prompt as-is — no "create PR" wrapper.
         req.prompt.clone().unwrap_or_default()
@@ -825,7 +829,9 @@ pub(crate) async fn run_task(
 
         let check_req = AgentRequest {
             prompt: {
-                let base = prompts::check_existing_pr(pr_num, &review_config.review_bot_command);
+                let slug = prompts::repo_slug_from_pr_url(pr_url.as_deref());
+                let base =
+                    prompts::check_existing_pr(pr_num, &review_config.review_bot_command, &slug);
                 // Inject capability note — primary enforcement now that --allowedTools
                 // is not passed to the CLI (issue #483).
                 if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
