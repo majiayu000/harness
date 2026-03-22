@@ -179,7 +179,10 @@ impl CodeAgent for ClaudeCodeAgent {
             });
         }
 
-        let idle_timeout = self.stream_timeout_secs.map(std::time::Duration::from_secs);
+        let idle_timeout = self
+            .stream_timeout_secs
+            .filter(|&s| s > 0)
+            .map(std::time::Duration::from_secs);
         stream_child_output(&mut child, &tx, self.name(), idle_timeout).await?;
         send_stream_item(
             &tx,
