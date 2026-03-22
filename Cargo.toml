@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.12"
+version = "0.6.13"
 edition = "2021"
 license = "MIT"
 rust-version = "1.75"
@@ -60,7 +60,7 @@ dashmap = "6"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
 opentelemetry = { version = "0.27", features = ["trace", "metrics", "logs"] }
 opentelemetry_sdk = { version = "0.27", features = ["trace", "metrics", "logs", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-client"] }

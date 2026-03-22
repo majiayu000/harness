@@ -8,6 +8,9 @@ struct GhPrListItem {
     number: u64,
     #[serde(rename = "headRefName")]
     head_ref_name: String,
+    /// Full PR URL, e.g. `https://github.com/owner/repo/pull/42`.
+    #[serde(default)]
+    url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,11 +174,11 @@ pub(crate) fn build_pr_approved_prompt(
 }
 
 /// Query GitHub for an existing open PR linked to the given issue.
-/// Returns `(pr_number, branch_name)` if found.
+/// Returns `(pr_number, branch_name, pr_url)` if found.
 pub(crate) async fn find_existing_pr_for_issue(
     project: &Path,
     issue: u64,
-) -> anyhow::Result<Option<(u64, String)>> {
+) -> anyhow::Result<Option<(u64, String, String)>> {
     let output = Command::new("gh")
         .current_dir(project)
         .args([
@@ -186,7 +189,7 @@ pub(crate) async fn find_existing_pr_for_issue(
             "--state",
             "open",
         ])
-        .args(["--json", "number,headRefName", "--limit", "1"])
+        .args(["--json", "number,headRefName,url", "--limit", "1"])
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("failed to run `gh pr list` for issue #{issue}: {e}"))?;
@@ -204,5 +207,50 @@ pub(crate) async fn find_existing_pr_for_issue(
     Ok(items
         .into_iter()
         .next()
-        .map(|item| (item.number, item.head_ref_name)))
+        .map(|item| (item.number, item.head_ref_name, item.url)))
+}
+
+/// Parse `"owner/repo"` from a git remote URL.
+///
+/// Handles HTTPS (`https://github.com/owner/repo.git`) and
+/// SSH (`git@github.com:owner/repo.git`) formats.
+pub(crate) fn parse_repo_slug_from_remote_url(url: &str) -> Option<String> {
+    // SSH: git@github.com:owner/repo.git
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let slug = rest.trim_end_matches(".git");
+        if slug.contains('/') {
+            return Some(slug.to_string());
+        }
+    }
+    // HTTPS: https://github.com/owner/repo.git
+    if let Some(rest) = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+    {
+        let slug = rest.trim_end_matches(".git");
+        if slug.contains('/') {
+            return Some(slug.to_string());
+        }
+    }
+    None
+}
+
+/// Detect the `"owner/repo"` slug by parsing the git remote URL.
+///
+/// Uses `git remote get-url <remote>` (pure git, no GitHub auth required).
+pub(crate) async fn detect_repo_slug(project: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(project)
+        .args(["remote", "get-url", "origin"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    parse_repo_slug_from_remote_url(&url)
 }

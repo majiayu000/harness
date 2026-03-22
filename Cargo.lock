@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "harness-agents"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1111,7 +1111,7 @@ dependencies = [
 
 [[package]]
 name = "harness-api"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "harness-core",
  "harness-exec",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "harness-cli"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "harness-core"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "harness-exec"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1176,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "harness-gc"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "harness-observe"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "harness-protocol"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1228,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "harness-rules"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1249,7 +1249,7 @@ dependencies = [
 
 [[package]]
 name = "harness-sandbox"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "harness-core",
  "tempfile",
@@ -1258,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "harness-server"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "harness-skills"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2721,9 +2721,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.9"
+version = "0.103.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7df23109aa6c1567d1c575b9952556388da57401e4ace1d15f79eedad0d8f53"
+checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -3878,6 +3878,7 @@ version = "0.3.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f30143827ddab0d256fd843b7a66d164e9f271cfa0dde49142c5ca0ca291f1e"
 dependencies = [
+ "chrono",
  "matchers",
  "nu-ansi-term",
  "once_cell",
