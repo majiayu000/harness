@@ -47,6 +47,10 @@ pub struct ServerConfig {
     /// Default: 100.
     #[serde(default = "default_signal_rate_limit_per_minute")]
     pub signal_rate_limit_per_minute: u32,
+    /// Maximum number of password reset requests per identifier (email) per hour.
+    /// Default: 5.
+    #[serde(default = "default_password_reset_rate_limit_per_hour")]
+    pub password_reset_rate_limit_per_hour: u32,
     /// Prepend the Golden Principles constitution to every agent prompt.
     /// Default: true.
     #[serde(default = "default_constitution_enabled")]
@@ -69,6 +73,7 @@ impl Default for ServerConfig {
             allowed_project_roots: Vec::new(),
             max_webhook_body_bytes: default_max_webhook_body_bytes(),
             signal_rate_limit_per_minute: default_signal_rate_limit_per_minute(),
+            password_reset_rate_limit_per_hour: default_password_reset_rate_limit_per_hour(),
             constitution_enabled: true,
         }
     }
@@ -104,6 +109,10 @@ fn default_max_webhook_body_bytes() -> usize {
 
 fn default_signal_rate_limit_per_minute() -> u32 {
     100
+}
+
+fn default_password_reset_rate_limit_per_hour() -> u32 {
+    5
 }
 
 fn default_constitution_enabled() -> bool {
