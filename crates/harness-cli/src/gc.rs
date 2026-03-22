@@ -41,7 +41,8 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
                 config.agents.claude.cli_path.clone(),
                 config.agents.claude.default_model.clone(),
                 config.agents.sandbox_mode,
-            );
+            )
+            .with_stream_timeout(config.agents.stream_timeout_secs);
 
             let report = gc_agent.run(&project, &events, &[], &claude).await?;
             println!("Signals detected: {}", report.signals.len());

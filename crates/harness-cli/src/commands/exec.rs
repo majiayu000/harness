@@ -353,18 +353,24 @@ pub async fn run(
     let mut agent_registry = harness_agents::AgentRegistry::new(&config.agents.default_agent);
     agent_registry.register(
         "claude",
-        Arc::new(harness_agents::claude::ClaudeCodeAgent::new(
-            config.agents.claude.cli_path.clone(),
-            config.agents.claude.default_model.clone(),
-            runtime_sandbox_mode,
-        )),
+        Arc::new(
+            harness_agents::claude::ClaudeCodeAgent::new(
+                config.agents.claude.cli_path.clone(),
+                config.agents.claude.default_model.clone(),
+                runtime_sandbox_mode,
+            )
+            .with_stream_timeout(config.agents.stream_timeout_secs),
+        ),
     );
     agent_registry.register(
         "codex",
-        Arc::new(harness_agents::codex::CodexAgent::from_config(
-            config.agents.codex.clone(),
-            runtime_sandbox_mode,
-        )),
+        Arc::new(
+            harness_agents::codex::CodexAgent::from_config(
+                config.agents.codex.clone(),
+                runtime_sandbox_mode,
+            )
+            .with_stream_timeout(config.agents.stream_timeout_secs),
+        ),
     );
     if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
         agent_registry.register(
