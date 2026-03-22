@@ -8,6 +8,9 @@ mod gc;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+            "%Y-%m-%dT%H:%M:%S%.3f%:z".to_string(),
+        ))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "harness=info,warn".into()),
