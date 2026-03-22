@@ -93,6 +93,47 @@ impl PostExecutionValidator {
         }
     }
 
+    /// Returns true if the error indicates a transient network failure worth retrying.
+    fn is_transient_error(error: &str) -> bool {
+        const TRANSIENT_PATTERNS: &[&str] = &[
+            "EOF",
+            "connection reset",
+            "connection refused",
+            "broken pipe",
+        ];
+        TRANSIENT_PATTERNS.iter().any(|p| error.contains(p))
+    }
+
+    /// Retry [`verify_pr_exists`] up to 3 times for transient network errors.
+    /// Permanent errors (repo not found, auth failure, timeout) are returned immediately.
+    async fn verify_pr_exists_with_retry(
+        gh_bin: &str,
+        pr_url: &str,
+        project: &Path,
+        timeout_secs: u64,
+    ) -> Result<(), String> {
+        let max_attempts = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=max_attempts {
+            match Self::verify_pr_exists(gh_bin, pr_url, project, timeout_secs).await {
+                Ok(()) => return Ok(()),
+                Err(e) if !Self::is_transient_error(&e) => return Err(e),
+                Err(e) => {
+                    last_err = e;
+                    if attempt < max_attempts {
+                        tracing::debug!(
+                            attempt,
+                            pr_url,
+                            "post_validator: transient failure, retrying"
+                        );
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
+
     /// Run a shell command via `sh -c` to support pipes, quotes, and complex expressions.
     ///
     /// Uses `kill_on_drop(true)` so that if the timeout fires and the future is dropped,
@@ -223,7 +264,7 @@ impl TurnInterceptor for PostExecutionValidator {
                         pr_url = %pr_url,
                         "post_validator: verifying PR existence via GitHub API"
                     );
-                    match Self::verify_pr_exists(
+                    match Self::verify_pr_exists_with_retry(
                         &self.gh_bin,
                         &pr_url,
                         project,

@@ -87,6 +87,9 @@ async fn run_review_loop(
 
         println!("[harness] Review round {round}/{max_rounds}, PR #{pr}");
 
+        let repo = pr_url
+            .map(|u| prompts::repo_slug_from_pr_url(Some(u)))
+            .unwrap_or_else(|| "{owner}/{repo}".to_string());
         let req = AgentRequest {
             prompt: prompts::review_prompt(
                 issue,
@@ -95,6 +98,7 @@ async fn run_review_loop(
                 prev_fixed,
                 "/gemini review",
                 "gemini-code-assist[bot]",
+                &repo,
             ),
             project_root: project.clone(),
             ..Default::default()
