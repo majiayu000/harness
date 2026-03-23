@@ -44,7 +44,29 @@ const AGENT_INTERNAL_PREFIXES: &[&str] = &[
     "    finished ",
 ];
 
+/// Detect code-content lines emitted by Codex to stderr (e.g. `   7        "error",`).
+/// These contain source code keywords but are not real errors.
+fn looks_like_code_content(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    // Lines starting with a digit followed by whitespace are numbered source lines.
+    trimmed
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_digit())
+        && trimmed
+            .find(|c: char| !c.is_ascii_digit())
+            .is_some_and(|pos| {
+                trimmed
+                    .as_bytes()
+                    .get(pos)
+                    .is_some_and(|b| b.is_ascii_whitespace())
+            })
+}
+
 fn is_agent_internal(line: &str) -> bool {
+    if looks_like_code_content(line) {
+        return true;
+    }
     let lower = line.to_lowercase();
     AGENT_INTERNAL_PREFIXES
         .iter()
