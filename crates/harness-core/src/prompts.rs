@@ -429,6 +429,31 @@ pub fn periodic_review_prompt(project_root: &str, since: &str) -> String {
     )
 }
 
+/// Build prompt: synthesize two independent reviews into a final verdict.
+///
+/// Claude reads both its own review and Codex's review, classifies each finding
+/// as CONFIRMED / FALSE-POSITIVE / UNIQUE, and produces the final REVIEW_JSON.
+pub fn review_synthesis_prompt(claude_review: &str, codex_review: &str) -> String {
+    let safe_claude = wrap_external_data(claude_review);
+    let safe_codex = wrap_external_data(codex_review);
+    format!(
+        "You are a Staff Engineer synthesizing two independent code reviews into a final verdict.\n\n\
+         ## Claude's Review\n{safe_claude}\n\n\
+         ## Codex's Review\n{safe_codex}\n\n\
+         ## Task\n\n\
+         For each finding across both reviews, classify it:\n\
+         - **CONFIRMED**: found by both reviewers → high confidence, include in final report\n\
+         - **FALSE-POSITIVE**: one reviewer flagged it but it's not a real issue → exclude\n\
+         - **UNIQUE**: found by only one reviewer but is a real issue → include with note\n\n\
+         Then produce the final REVIEW_JSON between markers (same format as the individual reviews).\n\
+         Only include CONFIRMED and UNIQUE findings. Deduplicate overlapping findings.\n\
+         Create GitHub issues for P0/P1 findings with `gh issue create` (check `gh issue list --state open --label review` first).\n\n\
+         REVIEW_JSON_START\n\
+         {{ \"findings\": [...], \"summary\": {{ \"p0_count\": N, \"p1_count\": N, \"p2_count\": N, \"p3_count\": N, \"health_score\": N }} }}\n\
+         REVIEW_JSON_END"
+    )
+}
+
 /// Check if agent output indicates approval (last non-empty line is "APPROVED").
 pub fn is_approved(output: &str) -> bool {
     last_non_empty_line(output) == Some("APPROVED")
