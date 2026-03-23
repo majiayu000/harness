@@ -1,4 +1,5 @@
 use harness_core::{HarnessError, Item, StreamItem};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::Sender;
 
@@ -115,10 +116,16 @@ pub(crate) async fn send_stream_item(
 
 /// Read stdout from a spawned child process line-by-line, stream deltas via `tx`,
 /// wait for exit, and return the collected output.
+///
+/// `idle_timeout` sets the maximum time to wait for the next line. When a line
+/// is not received within the timeout the subprocess is considered a zombie: an
+/// error is returned and the caller's `kill_on_drop(true)` child is dropped,
+/// terminating the process.
 pub(crate) async fn stream_child_output(
     child: &mut tokio::process::Child,
     tx: &Sender<StreamItem>,
     agent_name: &str,
+    idle_timeout: Option<Duration>,
 ) -> harness_core::Result<String> {
     let stdout = child
         .stdout
@@ -129,9 +136,25 @@ pub(crate) async fn stream_child_output(
     let mut output = String::new();
 
     loop {
-        let maybe_line = lines.next_line().await.map_err(|error| {
-            HarnessError::AgentExecution(format!("failed reading {agent_name} stdout: {error}"))
-        })?;
+        let maybe_line = if let Some(dur) = idle_timeout {
+            tokio::time::timeout(dur, lines.next_line())
+                .await
+                .map_err(|_| {
+                    HarnessError::AgentExecution(format!(
+                        "{agent_name} stream idle timeout after {}s: zombie connection terminated",
+                        dur.as_secs()
+                    ))
+                })?
+                .map_err(|error| {
+                    HarnessError::AgentExecution(format!(
+                        "failed reading {agent_name} stdout: {error}"
+                    ))
+                })?
+        } else {
+            lines.next_line().await.map_err(|error| {
+                HarnessError::AgentExecution(format!("failed reading {agent_name} stdout: {error}"))
+            })?
+        };
         let Some(line) = maybe_line else {
             break;
         };
@@ -193,7 +216,7 @@ mod tests {
             .expect("spawn sh");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let result = stream_child_output(&mut child, &tx, "test-agent")
+        let result = stream_child_output(&mut child, &tx, "test-agent", None)
             .await
             .expect("stream_child_output should succeed");
 
@@ -232,7 +255,7 @@ mod tests {
             .expect("spawn sh");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        stream_child_output(&mut child, &tx, "test-agent")
+        stream_child_output(&mut child, &tx, "test-agent", None)
             .await
             .expect("stream_child_output should succeed");
         drop(tx);
@@ -268,7 +291,7 @@ mod tests {
             .expect("spawn sh");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        stream_child_output(&mut child, &tx, "test-agent")
+        stream_child_output(&mut child, &tx, "test-agent", None)
             .await
             .expect("stream_child_output should succeed");
         drop(tx);
@@ -308,7 +331,7 @@ mod tests {
             .expect("spawn sh");
 
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let result = stream_child_output(&mut child, &tx, "test-agent").await;
+        let result = stream_child_output(&mut child, &tx, "test-agent", None).await;
         assert!(result.is_err(), "expected Err on non-zero exit");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -334,7 +357,7 @@ mod tests {
 
         let result = timeout(
             Duration::from_secs(5),
-            stream_child_output(&mut child, &tx, "test-agent"),
+            stream_child_output(&mut child, &tx, "test-agent", None),
         )
         .await
         .expect("stream_child_output should not hang");
@@ -354,6 +377,40 @@ mod tests {
         if let Err(e) = child.wait().await {
             eprintln!("child wait: {e}");
         }
+    }
+
+    /// stream_child_output returns Err with a "zombie" message when no output
+    /// arrives within the configured idle timeout.
+    #[tokio::test]
+    async fn stream_child_output_idle_timeout_terminates_zombie() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .stdout(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sh");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = stream_child_output(
+            &mut child,
+            &tx,
+            "test-agent",
+            Some(Duration::from_millis(200)),
+        )
+        .await;
+
+        assert!(result.is_err(), "expected Err on idle timeout");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("zombie"),
+            "error must mention zombie connection, got: {msg}"
+        );
+        assert!(
+            msg.contains("test-agent"),
+            "error must identify the agent, got: {msg}"
+        );
     }
 
     // ── filter_agent_stderr ──────────────────────────────────────────────────

@@ -19,6 +19,9 @@ pub struct ClaudeCodeAgent {
     /// Per-phase model selection. When set, model is chosen based on
     /// `req.execution_phase`. Falls back to `req.model` or `default_model`.
     pub reasoning_budget: Option<ReasoningBudget>,
+    /// Maximum seconds of idle silence on the output stream before the
+    /// subprocess is declared a zombie and terminated. `None` = no timeout.
+    pub stream_timeout_secs: Option<u64>,
 }
 
 impl ClaudeCodeAgent {
@@ -28,12 +31,19 @@ impl ClaudeCodeAgent {
             default_model,
             sandbox_mode,
             reasoning_budget: None,
+            stream_timeout_secs: Some(1800),
         }
     }
 
     /// Attach a ReasoningBudget for per-phase model selection.
     pub fn with_reasoning_budget(mut self, budget: ReasoningBudget) -> Self {
         self.reasoning_budget = Some(budget);
+        self
+    }
+
+    /// Set the per-line idle timeout for stream zombie detection.
+    pub fn with_stream_timeout(mut self, secs: Option<u64>) -> Self {
+        self.stream_timeout_secs = secs;
         self
     }
 
@@ -169,7 +179,11 @@ impl CodeAgent for ClaudeCodeAgent {
             });
         }
 
-        stream_child_output(&mut child, &tx, self.name()).await?;
+        let idle_timeout = self
+            .stream_timeout_secs
+            .filter(|&s| s > 0)
+            .map(std::time::Duration::from_secs);
+        stream_child_output(&mut child, &tx, self.name(), idle_timeout).await?;
         send_stream_item(
             &tx,
             StreamItem::TokenUsage {

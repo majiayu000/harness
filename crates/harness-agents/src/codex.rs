@@ -18,6 +18,9 @@ pub struct CodexAgent {
     pub cli_path: PathBuf,
     pub cloud: CodexCloudConfig,
     pub sandbox_mode: SandboxMode,
+    /// Maximum seconds of idle silence on the output stream before the
+    /// subprocess is declared a zombie and terminated. `None` = no timeout.
+    pub stream_timeout_secs: Option<u64>,
 }
 
 impl CodexAgent {
@@ -34,11 +37,18 @@ impl CodexAgent {
             cli_path,
             cloud,
             sandbox_mode,
+            stream_timeout_secs: Some(1800),
         }
     }
 
     pub fn from_config(config: CodexAgentConfig, sandbox_mode: SandboxMode) -> Self {
         Self::with_cloud(config.cli_path, config.cloud, sandbox_mode)
+    }
+
+    /// Set the per-line idle timeout for stream zombie detection.
+    pub fn with_stream_timeout(mut self, secs: Option<u64>) -> Self {
+        self.stream_timeout_secs = secs;
+        self
     }
 
     async fn run_setup_phase(&self, project_root: &Path) -> harness_core::Result<()> {
@@ -173,7 +183,11 @@ impl CodeAgent for CodexAgent {
             });
         }
 
-        stream_child_output(&mut child, &tx, self.name()).await?;
+        let idle_timeout = self
+            .stream_timeout_secs
+            .filter(|&s| s > 0)
+            .map(std::time::Duration::from_secs);
+        stream_child_output(&mut child, &tx, self.name(), idle_timeout).await?;
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
     }

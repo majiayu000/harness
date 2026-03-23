@@ -132,13 +132,17 @@ pub async fn run(
     if let Some(budget) = serve_config.agents.claude.reasoning_budget.clone() {
         claude_agent = claude_agent.with_reasoning_budget(budget);
     }
+    claude_agent = claude_agent.with_stream_timeout(serve_config.agents.stream_timeout_secs);
     agent_registry.register("claude", Arc::new(claude_agent));
     agent_registry.register(
         "codex",
-        Arc::new(harness_agents::codex::CodexAgent::from_config(
-            serve_config.agents.codex.clone(),
-            serve_config.agents.sandbox_mode,
-        )),
+        Arc::new(
+            harness_agents::codex::CodexAgent::from_config(
+                serve_config.agents.codex.clone(),
+                serve_config.agents.sandbox_mode,
+            )
+            .with_stream_timeout(serve_config.agents.stream_timeout_secs),
+        ),
     );
     if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
         agent_registry.register(
