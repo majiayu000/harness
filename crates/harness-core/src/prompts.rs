@@ -62,28 +62,105 @@ pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str, repo: &str
     )
 }
 
-/// Build prompt parts: implement from a GitHub issue, create PR.
+/// Build triage prompt: Tech Lead evaluates whether an issue is worth implementing.
 ///
-/// Returns a [`PromptParts`] with:
-/// - `static_instructions`: the workflow instruction (read issue, implement, test, create PR)
-///   and output format — identical for every issue-based task.
-/// - `context`: git config targeting instructions — semi-static per project session.
-/// - `dynamic_payload`: empty for now; future callers may populate this with the fetched
-///   issue body, labels, and comments to enable prompt caching of the static layers.
-///
-/// Call [`.to_prompt_string()`](PromptParts::to_prompt_string) to obtain the final prompt
-/// string, which is identical to what the previous `String`-returning version produced.
-pub fn implement_from_issue(issue: u64, git: Option<&GitConfig>) -> PromptParts {
-    let git_line = git_config_line(git);
+/// Outputs a triage decision on the last line:
+/// - `TRIAGE=PROCEED` — trivial change, skip planning, go straight to implement
+/// - `TRIAGE=PROCEED_WITH_PLAN` — complex change, needs a plan phase first
+/// - `TRIAGE=NEEDS_CLARIFICATION` — issue is ambiguous, list questions
+/// - `TRIAGE=SKIP` — not worth doing, out of scope, or duplicate
+pub fn triage_prompt(issue: u64) -> PromptParts {
     PromptParts {
         static_instructions: format!(
-            "Read GitHub issue #{issue}, understand the requirements, implement the code in this project, \
-             run cargo check and cargo test, create a feature branch, commit, push, \
-             and create a PR with gh pr create."
+            "You are a Tech Lead evaluating GitHub issue #{issue} before any code is written.\n\n\
+             Your job is to THINK before committing engineering effort. Read the issue carefully, then assess:\n\n\
+             1. **Complexity**: Is this trivial (typo, config, 1-file change), moderate (2-3 files, \
+             clear scope), or complex (4+ files, new API surface, architectural change)?\n\
+             2. **Clarity**: Are the requirements specific enough to implement without guessing? \
+             What assumptions would an engineer have to make?\n\
+             3. **Risk**: What could go wrong in production? Are there edge cases, \
+             backward compatibility concerns, or security implications?\n\
+             4. **Scope**: Does this issue try to do too much? Should it be split?\n\n\
+             Based on your assessment, choose ONE recommendation:\n\
+             - PROCEED — trivial/clear change, no planning needed, go straight to implementation\n\
+             - PROCEED_WITH_PLAN — non-trivial change that needs an implementation plan first\n\
+             - NEEDS_CLARIFICATION — issue is ambiguous; list the specific questions that must be answered\n\
+             - SKIP — not worth doing (explain why: duplicate, out of scope, or fundamentally flawed)\n\n\
+             Output format: Write your assessment (2-5 sentences), then on the LAST line print:\n\
+             TRIAGE=<recommendation>"
+        ),
+        context: String::new(),
+        dynamic_payload: String::new(),
+    }
+}
+
+/// Build plan prompt: Architect designs an implementation plan before coding begins.
+///
+/// Takes the triage output as context. Outputs `PLAN=READY` on the last line.
+pub fn plan_prompt(issue: u64, triage_assessment: &str) -> PromptParts {
+    let safe_triage = wrap_external_data(triage_assessment);
+    PromptParts {
+        static_instructions: format!(
+            "You are a Software Architect designing the implementation plan for GitHub issue #{issue}.\n\n\
+             A Tech Lead already assessed this issue and recommended it needs a plan:\n\
+             {safe_triage}\n\n\
+             Create a concise implementation plan:\n\n\
+             1. **Files to modify** — list each file with a one-line rationale\n\
+             2. **Files to create** — only if truly needed (prefer modifying existing files)\n\
+             3. **Key changes** — the 2-3 most important code changes (function signatures, \
+             types, data flow)\n\
+             4. **Test plan** — what to test, key edge cases, expected test count\n\
+             5. **Risks** — what could go wrong, how to mitigate\n\n\
+             Keep the plan actionable. An engineer should be able to follow it without asking questions.\n\
+             Do NOT write any code — only describe what to do.\n\n\
+             On the LAST line, print: PLAN=READY"
+        ),
+        context: String::new(),
+        dynamic_payload: String::new(),
+    }
+}
+
+/// Build prompt parts: implement from a GitHub issue, create PR.
+///
+/// When `plan` is provided, the engineer follows the plan instead of figuring
+/// out the approach from scratch. When `plan` is `None`, the engineer reads
+/// the issue directly and decides the approach (used for trivial issues that
+/// skip the plan phase).
+///
+/// Returns a [`PromptParts`] with three layers for future prompt caching.
+pub fn implement_from_issue(
+    issue: u64,
+    git: Option<&GitConfig>,
+    plan: Option<&str>,
+) -> PromptParts {
+    let git_line = git_config_line(git);
+    let plan_section = match plan {
+        Some(p) => {
+            let safe_plan = wrap_external_data(p);
+            format!(
+                "\n\nAn architect created the following implementation plan. Follow it closely.\n\
+                 If the plan is wrong or incomplete, output PLAN_ISSUE=<description> instead of \
+                 deviating silently.\n{safe_plan}\n"
+            )
+        }
+        None => String::new(),
+    };
+    PromptParts {
+        static_instructions: format!(
+            "You are a Senior Engineer implementing a change for GitHub issue #{issue}.\n\n\
+             Your job is to write correct, tested, minimal code. Do not add features beyond \
+             what the issue requests. Do not refactor unrelated code.\n\
+             {plan_section}\n\
+             Steps:\n\
+             1. Read the issue: `gh issue view {issue}`\n\
+             2. Understand the requirements and existing code\n\
+             3. Implement the change with the minimum necessary modifications\n\
+             4. Run `cargo check` and `cargo test` — fix any failures before proceeding\n\
+             5. Create a feature branch, commit with a descriptive message, push\n\
+             6. Create a PR with `gh pr create`"
         ),
         context: git_line,
-        dynamic_payload: "On the last line of your output, print PR_URL=<full PR URL>"
-            .to_string(),
+        dynamic_payload: "On the last line of your output, print PR_URL=<full PR URL>".to_string(),
     }
 }
 
@@ -254,16 +331,24 @@ pub fn review_prompt(
 /// or lists issues prefixed with `ISSUE:`.
 pub fn agent_review_prompt(pr_url: &str, round: u32) -> String {
     format!(
-        "You are an independent code reviewer. Review PR {pr_url} (agent review round {round}).\n\n\
+        "You are a Staff Engineer conducting an independent code review of PR {pr_url} \
+         (review round {round}).\n\n\
+         Your job is to find bugs that pass CI but blow up in production. Think about:\n\
+         - Error paths: what happens when this fails? Is the failure handled or silently swallowed?\n\
+         - Concurrency: race conditions, deadlocks, shared mutable state\n\
+         - Edge cases: empty inputs, large inputs, unicode, off-by-one\n\
+         - Security: injection, path traversal, unvalidated input at system boundaries\n\n\
          Steps:\n\
          1. Run `gh pr diff {pr_url}` to read the full diff\n\
-         2. Check for correctness, safety, and style issues\n\
-         3. If everything looks good, print APPROVED on the last line\n\
-         4. Otherwise, list each issue on its own line prefixed with \"ISSUE: \"\n\n\
+         2. For each changed file, understand the CONTEXT — read surrounding code if needed\n\
+         3. Evaluate correctness and safety in priority order: security > logic > quality > style\n\
+         4. If everything looks good, print APPROVED on the last line\n\
+         5. Otherwise, list each issue on its own line prefixed with \"ISSUE: \"\n\n\
          Constraints:\n\
          - Focus on correctness and safety, not cosmetic preferences\n\
          - NEVER downgrade dependency versions\n\
-         - Be specific: reference file names and line numbers"
+         - Be specific: reference file names and line numbers\n\
+         - Do NOT flag style preferences as issues (naming, formatting, comment density)"
     )
 }
 
@@ -469,6 +554,50 @@ pub fn is_waiting(output: &str) -> bool {
     last_non_empty_line(output) == Some("WAITING")
 }
 
+/// Triage decision from the Tech Lead evaluation phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriageDecision {
+    /// Trivial change — skip planning, go straight to implement.
+    Proceed,
+    /// Complex change — needs an implementation plan first.
+    ProceedWithPlan,
+    /// Issue is ambiguous — questions must be answered before proceeding.
+    NeedsClarification,
+    /// Not worth doing — skip this issue.
+    Skip,
+}
+
+/// Parse the triage decision from agent output.
+///
+/// Looks for `TRIAGE=<decision>` on the last non-empty line.
+/// Returns `None` if the output doesn't contain a valid triage line.
+pub fn parse_triage(output: &str) -> Option<TriageDecision> {
+    let last = last_non_empty_line(output)?;
+    let value = last.strip_prefix("TRIAGE=")?;
+    match value.trim() {
+        "PROCEED" => Some(TriageDecision::Proceed),
+        "PROCEED_WITH_PLAN" => Some(TriageDecision::ProceedWithPlan),
+        "NEEDS_CLARIFICATION" => Some(TriageDecision::NeedsClarification),
+        "SKIP" => Some(TriageDecision::Skip),
+        _ => None,
+    }
+}
+
+/// Check if the agent flagged an issue with the implementation plan.
+///
+/// During the implement phase, if the plan is wrong the agent outputs
+/// `PLAN_ISSUE=<description>` instead of implementing. Returns the
+/// description if present.
+pub fn parse_plan_issue(output: &str) -> Option<String> {
+    for line in output.lines().rev() {
+        let line = line.trim();
+        if let Some(desc) = line.strip_prefix("PLAN_ISSUE=") {
+            return Some(desc.trim().to_string());
+        }
+    }
+    None
+}
+
 /// Describes a sibling task running in parallel on the same project.
 ///
 /// Used by [`sibling_task_context`] to build a constraint block for the agent.
@@ -621,28 +750,21 @@ mod tests {
 
     #[test]
     fn test_implement_from_issue() {
-        let p = implement_from_issue(42, None).to_prompt_string();
+        let p = implement_from_issue(42, None, None).to_prompt_string();
         assert!(p.contains("issue #42"));
         assert!(p.contains("PR_URL="));
     }
 
     #[test]
     fn test_prompt_parts_to_prompt_string_no_git() {
-        let parts = implement_from_issue(42, None);
+        let parts = implement_from_issue(42, None, None);
         let s = parts.to_prompt_string();
-        // static_instructions contains the issue reference and workflow steps
         assert!(s.contains("issue #42"));
-        // dynamic_payload contains the output format
         assert!(s.contains("PR_URL=<full PR URL>"));
-        // context is empty when no git config provided
+        assert!(s.contains("Senior Engineer"));
+        assert!(s.contains("cargo check"));
+        assert!(s.contains("gh pr create"));
         assert!(parts.context.is_empty());
-        // concatenation produces the same string as the old implementation
-        let expected = "Read GitHub issue #42, understand the requirements, implement the code in this project, \
-             run cargo check and cargo test, create a feature branch, commit, push, \
-             and create a PR with gh pr create.\
-             On the last line of your output, print PR_URL=<full PR URL>"
-            .to_string();
-        assert_eq!(s, expected);
     }
 
     #[test]
@@ -653,29 +775,29 @@ mod tests {
             remote: "origin".to_string(),
             branch_prefix: "feat/".to_string(),
         };
-        let parts = implement_from_issue(7, Some(&git));
-        // context holds the git config line
+        let parts = implement_from_issue(7, Some(&git), None);
         assert!(parts.context.contains("main"));
         assert!(parts.context.contains("origin"));
         assert!(parts.context.contains("feat/"));
         let s = parts.to_prompt_string();
-        // full string contains all three layers
         assert!(s.contains("issue #7"));
         assert!(s.contains("main"));
         assert!(s.contains("PR_URL=<full PR URL>"));
-        // identical to old implementation
-        let expected = "Read GitHub issue #7, understand the requirements, implement the code in this project, \
-             run cargo check and cargo test, create a feature branch, commit, push, \
-             and create a PR with gh pr create. Create your PR targeting the main branch on the origin remote. \
-             Use branch prefix feat/.\n\
-             On the last line of your output, print PR_URL=<full PR URL>"
-            .to_string();
-        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn test_implement_from_issue_with_plan() {
+        let plan = "1. Modify src/lib.rs\n2. Add test";
+        let p = implement_from_issue(42, None, Some(plan)).to_prompt_string();
+        assert!(p.contains("issue #42"));
+        assert!(p.contains("implementation plan"));
+        assert!(p.contains("Modify src/lib.rs"));
+        assert!(p.contains("PLAN_ISSUE="));
     }
 
     #[test]
     fn test_prompt_parts_fields_are_accessible() {
-        let parts = implement_from_issue(99, None);
+        let parts = implement_from_issue(99, None, None);
         assert!(parts.static_instructions.contains("issue #99"));
         assert!(parts.dynamic_payload.contains("PR_URL="));
         assert!(parts.context.is_empty());
@@ -1193,5 +1315,81 @@ PR_URL=https://github.com/owner/repo/pull/269";
             result.starts_with("\n\n"),
             "section must start with two newlines"
         );
+    }
+
+    // --- Triage / Plan phase tests ---
+
+    #[test]
+    fn test_triage_prompt_contains_issue_and_recommendations() {
+        let parts = triage_prompt(42);
+        let s = parts.to_prompt_string();
+        assert!(s.contains("issue #42"));
+        assert!(s.contains("Tech Lead"));
+        assert!(s.contains("PROCEED"));
+        assert!(s.contains("PROCEED_WITH_PLAN"));
+        assert!(s.contains("NEEDS_CLARIFICATION"));
+        assert!(s.contains("SKIP"));
+        assert!(s.contains("TRIAGE="));
+    }
+
+    #[test]
+    fn test_plan_prompt_contains_triage_context() {
+        let parts = plan_prompt(7, "Moderate complexity, 3 files affected");
+        let s = parts.to_prompt_string();
+        assert!(s.contains("issue #7"));
+        assert!(s.contains("Architect"));
+        assert!(s.contains("Moderate complexity"));
+        assert!(s.contains("PLAN=READY"));
+    }
+
+    #[test]
+    fn test_parse_triage_all_variants() {
+        assert_eq!(
+            parse_triage("Assessment done.\nTRIAGE=PROCEED"),
+            Some(TriageDecision::Proceed)
+        );
+        assert_eq!(
+            parse_triage("Complex issue.\nTRIAGE=PROCEED_WITH_PLAN"),
+            Some(TriageDecision::ProceedWithPlan)
+        );
+        assert_eq!(
+            parse_triage("Unclear.\nTRIAGE=NEEDS_CLARIFICATION"),
+            Some(TriageDecision::NeedsClarification)
+        );
+        assert_eq!(
+            parse_triage("Not worth it.\nTRIAGE=SKIP"),
+            Some(TriageDecision::Skip)
+        );
+    }
+
+    #[test]
+    fn test_parse_triage_invalid() {
+        assert_eq!(parse_triage("no triage here"), None);
+        assert_eq!(parse_triage("TRIAGE=UNKNOWN"), None);
+        assert_eq!(parse_triage(""), None);
+    }
+
+    #[test]
+    fn test_parse_triage_trailing_whitespace() {
+        assert_eq!(
+            parse_triage("done\nTRIAGE=PROCEED\n"),
+            Some(TriageDecision::Proceed)
+        );
+    }
+
+    #[test]
+    fn test_parse_plan_issue() {
+        assert_eq!(
+            parse_plan_issue("Working on it...\nPLAN_ISSUE=The plan missed error handling"),
+            Some("The plan missed error handling".to_string())
+        );
+        assert_eq!(parse_plan_issue("PR_URL=https://example.com/pull/1"), None);
+    }
+
+    #[test]
+    fn test_agent_review_prompt_has_role() {
+        let p = agent_review_prompt("https://github.com/owner/repo/pull/42", 1);
+        assert!(p.contains("Staff Engineer"));
+        assert!(p.contains("security > logic > quality > style"));
     }
 }

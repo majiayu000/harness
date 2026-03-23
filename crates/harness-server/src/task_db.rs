@@ -278,6 +278,9 @@ impl TaskRow {
             project_root: None,
             issue: None,
             description: None,
+            phase: crate::task_runner::TaskPhase::default(),
+            triage_output: None,
+            plan_output: None,
         })
     }
 }
@@ -355,6 +358,9 @@ mod tests {
             project_root: None,
             issue: None,
             description: None,
+            phase: crate::task_runner::TaskPhase::default(),
+            triage_output: None,
+            plan_output: None,
         }
     }
 

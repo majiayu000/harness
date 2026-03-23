@@ -19,6 +19,26 @@ const TASK_STREAM_CAPACITY: usize = 512;
 pub type CompletionCallback =
     Arc<dyn Fn(TaskState) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Current phase in the task pipeline.
+///
+/// Tasks progress through phases sequentially. Simple tasks may skip
+/// Triage/Plan and go directly to Implement.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    /// Initial phase — Tech Lead evaluates the issue.
+    Triage,
+    /// Architect designs the implementation plan.
+    Plan,
+    /// Engineer writes and tests code (default starting phase).
+    #[default]
+    Implement,
+    /// Independent code review.
+    Review,
+    /// Terminal — task completed or failed.
+    Terminal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -103,6 +123,15 @@ pub struct TaskState {
     /// Short description derived from the task prompt or issue number. Set at spawn time; not persisted.
     #[serde(skip)]
     pub description: Option<String>,
+    /// Current pipeline phase. Defaults to Implement for backward compatibility.
+    #[serde(default)]
+    pub phase: TaskPhase,
+    /// Output from the Triage phase (Tech Lead assessment). Not persisted to DB.
+    #[serde(skip)]
+    pub triage_output: Option<String>,
+    /// Output from the Plan phase (Architect plan). Not persisted to DB.
+    #[serde(skip)]
+    pub plan_output: Option<String>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -135,6 +164,9 @@ impl TaskState {
             project_root: None,
             issue: None,
             description: None,
+            phase: TaskPhase::default(),
+            triage_output: None,
+            plan_output: None,
         }
     }
 
