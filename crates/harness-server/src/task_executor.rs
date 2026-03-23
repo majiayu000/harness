@@ -890,7 +890,11 @@ pub(crate) async fn run_task(
             } else {
                 "no_pr".into()
             },
-            detail: None,
+            detail: if output.is_empty() {
+                None
+            } else {
+                Some(output.clone())
+            },
         });
     })
     .await?;
