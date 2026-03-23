@@ -846,9 +846,12 @@ pub(crate) async fn run_task(
 
     // Review-only tasks produce a report, not a PR.
     // Persist the output and return immediately — no PR parsing or review loop.
-    let is_review_task = store
-        .get(task_id)
-        .is_some_and(|s| s.source.as_deref() == Some("periodic_review"));
+    let is_review_task = store.get(task_id).is_some_and(|s| {
+        matches!(
+            s.source.as_deref(),
+            Some("periodic_review") | Some("sprint_planner")
+        )
+    });
 
     if is_review_task {
         mutate_and_persist(store, task_id, |s| {
