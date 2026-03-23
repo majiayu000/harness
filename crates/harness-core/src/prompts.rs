@@ -431,26 +431,26 @@ pub fn periodic_review_prompt(project_root: &str, since: &str) -> String {
 
 /// Build prompt: synthesize two independent reviews into a final verdict.
 ///
-/// Claude reads both its own review and Codex's review, classifies each finding
-/// as CONFIRMED / FALSE-POSITIVE / UNIQUE, and produces the final REVIEW_JSON.
+/// The agent receives both raw reviews and decides what's real, what's noise,
+/// and what the final report should contain. No pre-classification framework.
 pub fn review_synthesis_prompt(claude_review: &str, codex_review: &str) -> String {
     let safe_claude = wrap_external_data(claude_review);
     let safe_codex = wrap_external_data(codex_review);
     format!(
-        "You are a Staff Engineer synthesizing two independent code reviews into a final verdict.\n\n\
+        "You are a Staff Engineer. Two independent reviewers (Claude and Codex) just reviewed the same codebase.\n\n\
          ## Claude's Review\n{safe_claude}\n\n\
          ## Codex's Review\n{safe_codex}\n\n\
-         ## Task\n\n\
-         For each finding across both reviews, classify it:\n\
-         - **CONFIRMED**: found by both reviewers → high confidence, include in final report\n\
-         - **FALSE-POSITIVE**: one reviewer flagged it but it's not a real issue → exclude\n\
-         - **UNIQUE**: found by only one reviewer but is a real issue → include with note\n\n\
-         Then produce the final REVIEW_JSON between markers (same format as the individual reviews).\n\
-         Only include CONFIRMED and UNIQUE findings. Deduplicate overlapping findings.\n\
-         Create GitHub issues for P0/P1 findings with `gh issue create` (check `gh issue list --state open --label review` first).\n\n\
+         Read both reviews. Use your own judgment to produce the final report:\n\
+         - Read the actual code to verify any finding you're unsure about\n\
+         - Findings both reviewers agree on are likely real\n\
+         - Findings only one reviewer caught may still be valid — check the code\n\
+         - Discard anything that's wrong or not actionable\n\
+         - Create GitHub issues for P0/P1 findings (`gh issue list --state open --label review` first to avoid duplicates)\n\n\
+         Output the final REVIEW_JSON between markers:\n\n\
          REVIEW_JSON_START\n\
          {{ \"findings\": [...], \"summary\": {{ \"p0_count\": N, \"p1_count\": N, \"p2_count\": N, \"p3_count\": N, \"health_score\": N }} }}\n\
-         REVIEW_JSON_END"
+         REVIEW_JSON_END\n\n\
+         health_score = 100 minus deductions (P0: -15, P1: -8, P2: -3, P3: -1), minimum 0."
     )
 }
 
