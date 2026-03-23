@@ -1,0 +1,15 @@
+SPRINT_PLAN_START
+{
+  "rounds": [
+    {
+      "issues": [453, 454, 452],
+      "reason": "all P1, non-overlapping files: handlers/rules.rs (#453), db-path files (#454), periodic_reviewer.rs (#452)"
+    },
+    {
+      "issues": [447],
+      "reason": "bug fix in periodic_reviewer.rs — must follow #452 which rewrites the same file"
+    }
+  ],
+  "skip": []
+}
+SPRINT_PLAN_END
