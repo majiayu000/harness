@@ -371,6 +371,121 @@ fn prepend_constitution(prompt: String, enabled: bool) -> String {
     }
 }
 
+/// Run triage → plan pipeline for a fresh issue-based task.
+///
+/// Returns `Some(plan_text)` if the triage decided a plan is needed and the plan
+/// phase completed. Returns `None` only when triage says PROCEED (trivial issue,
+/// skip planning). All failures propagate as errors — no silent fallbacks.
+async fn run_triage_plan_pipeline(
+    agent: &dyn CodeAgent,
+    store: &TaskStore,
+    task_id: &TaskId,
+    issue: u64,
+    cargo_env: &HashMap<String, String>,
+    project: &Path,
+    req: &CreateTaskRequest,
+) -> anyhow::Result<Option<String>> {
+    use crate::task_runner::TaskPhase;
+
+    // --- Phase 1: Triage ---
+    tracing::info!(task_id = %task_id, issue, "pipeline: starting triage phase");
+    mutate_and_persist(store, task_id, |state| {
+        state.phase = TaskPhase::Triage;
+    })
+    .await?;
+
+    let triage_prompt = prompts::triage_prompt(issue).to_prompt_string();
+    let triage_req = AgentRequest {
+        prompt: triage_prompt,
+        project_root: project.to_path_buf(),
+        env_vars: cargo_env.clone(),
+        execution_phase: Some(ExecutionPhase::Planning),
+        ..Default::default()
+    };
+
+    let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
+    let triage_resp = tokio::time::timeout(
+        turn_timeout,
+        run_agent_streaming(agent, triage_req, task_id, store, 0),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("triage phase timed out after {}s", req.turn_timeout_secs))?
+    .map_err(|e| anyhow::anyhow!("triage phase agent error: {e}"))?;
+
+    let triage_text = triage_resp.output.clone();
+    mutate_and_persist(store, task_id, |state| {
+        state.triage_output = Some(triage_text.clone());
+    })
+    .await?;
+
+    let decision = prompts::parse_triage(&triage_resp.output).ok_or_else(|| {
+        anyhow::anyhow!("triage output unparseable — agent did not produce TRIAGE=<decision>")
+    })?;
+    tracing::info!(task_id = %task_id, ?decision, "triage decision");
+
+    match decision {
+        prompts::TriageDecision::Skip => {
+            mutate_and_persist(store, task_id, |state| {
+                state.status = crate::task_runner::TaskStatus::Done;
+                state.phase = TaskPhase::Terminal;
+                state.error = Some("Triage: skipped — not worth implementing".to_string());
+            })
+            .await?;
+            anyhow::bail!("triage decided to skip issue #{issue}");
+        }
+        prompts::TriageDecision::NeedsClarification => {
+            mutate_and_persist(store, task_id, |state| {
+                state.status = crate::task_runner::TaskStatus::Failed;
+                state.phase = TaskPhase::Terminal;
+                state.error = Some("Triage: needs clarification before implementation".to_string());
+            })
+            .await?;
+            anyhow::bail!("triage requires clarification on issue #{issue}");
+        }
+        prompts::TriageDecision::Proceed => {
+            tracing::info!(task_id = %task_id, "triage: PROCEED — skipping plan phase");
+            return Ok(None);
+        }
+        prompts::TriageDecision::ProceedWithPlan => {
+            // Fall through to plan phase.
+        }
+    }
+
+    // --- Phase 2: Plan ---
+    tracing::info!(task_id = %task_id, issue, "pipeline: starting plan phase");
+    mutate_and_persist(store, task_id, |state| {
+        state.phase = TaskPhase::Plan;
+    })
+    .await?;
+
+    let plan_prompt = prompts::plan_prompt(issue, &triage_resp.output).to_prompt_string();
+    let plan_req = AgentRequest {
+        prompt: plan_prompt,
+        project_root: project.to_path_buf(),
+        env_vars: cargo_env.clone(),
+        execution_phase: Some(ExecutionPhase::Planning),
+        ..Default::default()
+    };
+
+    let plan_resp = tokio::time::timeout(
+        turn_timeout,
+        run_agent_streaming(agent, plan_req, task_id, store, 0),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("plan phase timed out after {}s", req.turn_timeout_secs))?
+    .map_err(|e| anyhow::anyhow!("plan phase agent error: {e}"))?;
+
+    let plan_text = plan_resp.output.clone();
+    mutate_and_persist(store, task_id, |state| {
+        state.plan_output = Some(plan_text.clone());
+        state.phase = TaskPhase::Implement;
+    })
+    .await?;
+
+    tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete");
+    Ok(Some(plan_text))
+}
+
 pub(crate) async fn run_task(
     store: &TaskStore,
     task_id: &TaskId,
@@ -384,8 +499,6 @@ pub(crate) async fn run_task(
     server_config: &harness_core::HarnessConfig,
 ) -> anyhow::Result<()> {
     let task_start = Instant::now();
-    update_status(store, task_id, TaskStatus::Implementing, 1).await?;
-    let impl_phase_start = Instant::now();
 
     // Set CARGO_TARGET_DIR to a per-task temp path so parallel agents running
     // cargo check/test simultaneously do not contend on the same build directory.
@@ -411,6 +524,30 @@ pub(crate) async fn run_task(
         .await
         .unwrap_or_else(|| "{owner}/{repo}".to_string());
 
+    // --- Pipeline: Triage → Plan → Implement ---
+    // For issue-based tasks without an existing PR, run triage first.
+    // Triage decides whether to skip planning or go through a plan phase.
+    let plan_output = if let Some(issue) = req.issue {
+        // Only triage fresh issues (no existing PR to continue).
+        let has_existing_pr = find_existing_pr_for_issue(&project, issue)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !has_existing_pr {
+            run_triage_plan_pipeline(agent, store, task_id, issue, &cargo_env, &project, req)
+                .await?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Resume normal flow — update status to Implementing for the main turn.
+    update_status(store, task_id, TaskStatus::Implementing, 1).await?;
+    let impl_phase_start = Instant::now();
+
     let first_prompt = if let Some(issue) = req.issue {
         let base = match find_existing_pr_for_issue(&project, issue).await {
             Ok(Some((pr_num, branch, pr_url))) => {
@@ -420,10 +557,12 @@ pub(crate) async fn run_task(
                 let slug = prompts::repo_slug_from_pr_url(Some(&pr_url));
                 prompts::continue_existing_pr(issue, pr_num, &branch, &slug)
             }
-            Ok(None) => prompts::implement_from_issue(issue, git).to_prompt_string(),
+            Ok(None) => {
+                prompts::implement_from_issue(issue, git, plan_output.as_deref()).to_prompt_string()
+            }
             Err(e) => {
                 tracing::warn!("failed to check for existing PR for issue #{issue}: {e}");
-                prompts::implement_from_issue(issue, git).to_prompt_string()
+                prompts::implement_from_issue(issue, git, plan_output.as_deref()).to_prompt_string()
             }
         };
         // If the caller also supplied a description alongside the issue number, include it
@@ -735,6 +874,30 @@ pub(crate) async fn run_task(
             total_elapsed_secs = task_start.elapsed().as_secs(),
             "task_completed"
         );
+        return Ok(());
+    }
+
+    // Check if the agent flagged an issue with the implementation plan before
+    // attempting PR parsing. When present, PLAN_ISSUE means no code was written —
+    // mark the task failed so it is not silently treated as successful completion.
+    if let Some(plan_issue) = prompts::parse_plan_issue(&output) {
+        tracing::error!(
+            task_id = %task_id,
+            plan_issue = %plan_issue,
+            "agent reported PLAN_ISSUE; marking task failed"
+        );
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Failed;
+            s.turn = 1;
+            s.error = Some(format!("PLAN_ISSUE: {plan_issue}"));
+            s.rounds.push(RoundResult {
+                turn: 1,
+                action: "implement".into(),
+                result: "plan_issue".into(),
+                detail: Some(plan_issue.clone()),
+            });
+        })
+        .await?;
         return Ok(());
     }
 

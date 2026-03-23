@@ -113,6 +113,9 @@ mod tests {
             project_root: None,
             issue: None,
             description: None,
+            phase: crate::task_runner::TaskPhase::default(),
+            triage_output: None,
+            plan_output: None,
         };
         state.source = Some("github".to_string());
         store.insert(&state).await;
@@ -146,6 +149,9 @@ mod tests {
             project_root: None,
             issue: None,
             description: None,
+            phase: crate::task_runner::TaskPhase::default(),
+            triage_output: None,
+            plan_output: None,
         };
         store.insert(&parent_state).await;
 
@@ -163,6 +169,9 @@ mod tests {
             project_root: None,
             issue: None,
             description: None,
+            phase: crate::task_runner::TaskPhase::default(),
+            triage_output: None,
+            plan_output: None,
         };
         store.insert(&child_state).await;
 

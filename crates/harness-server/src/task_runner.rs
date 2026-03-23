@@ -19,6 +19,26 @@ const TASK_STREAM_CAPACITY: usize = 512;
 pub type CompletionCallback =
     Arc<dyn Fn(TaskState) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Current phase in the task pipeline.
+///
+/// Tasks progress through phases sequentially. Simple tasks may skip
+/// Triage/Plan and go directly to Implement.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    /// Initial phase — Tech Lead evaluates the issue.
+    Triage,
+    /// Architect designs the implementation plan.
+    Plan,
+    /// Engineer writes and tests code (default starting phase).
+    #[default]
+    Implement,
+    /// Independent code review.
+    Review,
+    /// Terminal — task completed or failed.
+    Terminal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -103,6 +123,15 @@ pub struct TaskState {
     /// Short description derived from the task prompt or issue number. Set at spawn time; not persisted.
     #[serde(skip)]
     pub description: Option<String>,
+    /// Current pipeline phase. Defaults to Implement for backward compatibility.
+    #[serde(default)]
+    pub phase: TaskPhase,
+    /// Output from the Triage phase (Tech Lead assessment). Not persisted to DB.
+    #[serde(skip)]
+    pub triage_output: Option<String>,
+    /// Output from the Plan phase (Architect plan). Not persisted to DB.
+    #[serde(skip)]
+    pub plan_output: Option<String>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -135,6 +164,9 @@ impl TaskState {
             project_root: None,
             issue: None,
             description: None,
+            phase: TaskPhase::default(),
+            triage_output: None,
+            plan_output: None,
         }
     }
 
@@ -1548,6 +1580,67 @@ mod tests {
             phases[1],
             Some(ExecutionPhase::Validation),
             "review check turn must use Validation phase"
+        );
+        Ok(())
+    }
+
+    /// Regression test for REVIEW-03: an implementation turn that returns only
+    /// `PLAN_ISSUE=<desc>` must mark the task Failed, not Done.
+    #[tokio::test]
+    async fn plan_issue_output_marks_task_failed() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
+        let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
+
+        // Agent returns only a PLAN_ISSUE sentinel — no PR URL, no code written.
+        let agent = PhaseCapturingAgent::new(vec![
+            "PLAN_ISSUE=the plan is missing the database migration step".into(),
+        ]);
+
+        let req = CreateTaskRequest {
+            prompt: Some("implement something".into()),
+            project: Some(dir.path().to_path_buf()),
+            wait_secs: 0,
+            max_rounds: 0,
+            turn_timeout_secs: 30,
+            ..Default::default()
+        };
+
+        let queue = crate::task_queue::TaskQueue::unbounded();
+        let permit = queue.acquire("test").await?;
+        let task_id = spawn_task(
+            store.clone(),
+            agent,
+            None,
+            Default::default(),
+            skills,
+            events,
+            vec![],
+            req,
+            None,
+            permit,
+            None,
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let state = store.get(&task_id).expect("task must exist");
+        assert!(
+            matches!(state.status, TaskStatus::Failed),
+            "expected Failed when PLAN_ISSUE is returned, got {:?}",
+            state.status
+        );
+        let error = state.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("PLAN_ISSUE"),
+            "error field must mention PLAN_ISSUE, got: {error:?}"
+        );
+        assert!(
+            error.contains("database migration"),
+            "error field must include the plan issue description, got: {error:?}"
         );
         Ok(())
     }
