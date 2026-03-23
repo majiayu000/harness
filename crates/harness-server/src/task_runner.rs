@@ -219,6 +219,11 @@ pub struct CreateTaskRequest {
     /// Intake source name (e.g. "github", "feishu", "periodic_review"). None for manual tasks.
     #[serde(default)]
     pub source: Option<String>,
+    /// Source-specific identifier for the originating issue/message.
+    /// Propagated to `TaskState::external_id` so the completion callback can call
+    /// `IntakeSource::on_task_complete` with the correct external ID.
+    #[serde(default)]
+    pub external_id: Option<String>,
 }
 
 impl Default for CreateTaskRequest {
@@ -237,6 +242,7 @@ impl Default for CreateTaskRequest {
             retry_max_backoff_ms: default_retry_max_backoff_ms(),
             stall_timeout_secs: default_stall_timeout(),
             source: None,
+            external_id: None,
         }
     }
 }
@@ -647,6 +653,7 @@ where
         let task_id = TaskId::new();
         let mut state = TaskState::new(task_id.clone());
         state.source = req.source.clone();
+        state.external_id = req.external_id.clone();
         store.insert(&state).await;
         // Register stream channel before spawning so SSE clients can subscribe immediately.
         store.register_task_stream(&task_id);
