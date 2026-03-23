@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// GitHub Issues intake configuration.
@@ -37,7 +39,7 @@ impl Default for GitHubIntakeConfig {
 }
 
 /// Feishu (飞书) Bot intake configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FeishuIntakeConfig {
     /// Enable Feishu bot webhook. Default: false.
     #[serde(default)]
@@ -69,6 +71,69 @@ impl Default for FeishuIntakeConfig {
             trigger_keyword: default_feishu_trigger_keyword(),
             default_repo: None,
         }
+    }
+}
+
+impl fmt::Debug for FeishuIntakeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FeishuIntakeConfig")
+            .field("enabled", &self.enabled)
+            .field("app_id", &self.app_id.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "app_secret",
+                &self.app_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "verification_token",
+                &self.verification_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("trigger_keyword", &self.trigger_keyword)
+            .field("default_repo", &self.default_repo)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feishu_debug_redacts_secrets() {
+        let config = FeishuIntakeConfig {
+            enabled: true,
+            app_id: Some("app-123".to_string()),
+            app_secret: Some("super-secret".to_string()),
+            verification_token: Some("tok-abc".to_string()),
+            trigger_keyword: "harness".to_string(),
+            default_repo: Some("owner/repo".to_string()),
+        };
+        let debug_output = format!("{config:?}");
+        assert!(
+            !debug_output.contains("app-123"),
+            "app_id must not appear in Debug output"
+        );
+        assert!(
+            !debug_output.contains("super-secret"),
+            "app_secret must not appear in Debug output"
+        );
+        assert!(
+            !debug_output.contains("tok-abc"),
+            "verification_token must not appear in Debug output"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output must contain [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn feishu_debug_shows_none_for_absent_secrets() {
+        let config = FeishuIntakeConfig::default();
+        let debug_output = format!("{config:?}");
+        assert!(
+            debug_output.contains("None"),
+            "absent secrets should show as None"
+        );
     }
 }
 

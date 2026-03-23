@@ -1,3 +1,5 @@
+use std::fmt;
+
 use async_trait::async_trait;
 use harness_core::{
     AgentRequest, AgentResponse, AnthropicApiConfig, Capability, CodeAgent, Item, StreamItem,
@@ -11,6 +13,17 @@ pub struct AnthropicApiAgent {
     pub default_model: String,
     pub max_tokens: u32,
     client: reqwest::Client,
+}
+
+impl fmt::Debug for AnthropicApiAgent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnthropicApiAgent")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("default_model", &self.default_model)
+            .field("max_tokens", &self.max_tokens)
+            .finish()
+    }
 }
 
 impl AnthropicApiAgent {
@@ -212,6 +225,25 @@ mod tests {
 
         assert_eq!(body.model, "claude-custom");
         assert_eq!(body.max_tokens, 1024);
+    }
+
+    #[test]
+    fn debug_redacts_api_key() {
+        let agent = AnthropicApiAgent::new(
+            "sk-secret-key".to_string(),
+            "https://api.anthropic.com".to_string(),
+            "claude-default".to_string(),
+            2048,
+        );
+        let debug_output = format!("{agent:?}");
+        assert!(
+            !debug_output.contains("sk-secret-key"),
+            "api_key must not appear in Debug output"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output must contain [REDACTED]"
+        );
     }
 
     #[test]
