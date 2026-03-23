@@ -1,4 +1,3 @@
-SPRINT_PLAN_START
 {
   "tasks": [
     {"issue": 447, "depends_on": []},
@@ -8,4 +7,3 @@ SPRINT_PLAN_START
   ],
   "skip": []
 }
-SPRINT_PLAN_END

@@ -26,7 +26,10 @@ pub async fn rule_check(
 ) -> RpcResponse {
     let project_root = validate_root!(&project_root, id, &state.core.home_dir);
     let file_count = files.as_ref().map_or(0, |paths| paths.len());
-    let result = {
+    // Validate and snapshot inside the read lock, then release the lock before
+    // the async scan. This prevents write-lock starvation for concurrent
+    // rule_load() calls (issue #453).
+    let (ctx, validated_files) = {
         let rules = state.engines.rules.read().await;
         if let Err(err) = rules.validate_scan_request(files.as_deref()) {
             tracing::warn!(
@@ -38,27 +41,30 @@ pub async fn rule_check(
             );
             return RpcResponse::error(id, INTERNAL_ERROR, err.to_string());
         }
-        match files {
+        let validated_files = match &files {
             Some(f) => {
                 // Validate each file is within the project root to prevent path traversal.
                 let mut validated = Vec::with_capacity(f.len());
-                for file in &f {
+                for file in f {
                     match crate::handlers::validate_file_in_root(file, &project_root) {
                         Ok(p) => validated.push(p),
                         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
                     }
                 }
-                rules.scan_files(&project_root, &validated).await
+                Some(validated)
             }
-            None => rules.scan(&project_root).await,
-        }
+            None => None,
+        };
+        // Clone guards/rules into ScanContext, then drop the read lock.
+        (rules.snapshot(), validated_files)
+    };
+    let result = match validated_files {
+        Some(ref validated) => ctx.scan_files(&project_root, validated).await,
+        None => ctx.scan(&project_root).await,
     };
     match result {
         Ok(violations) => {
-            let guard_count = {
-                let rules = state.engines.rules.read().await;
-                rules.guards().len()
-            };
+            let guard_count = ctx.guards_len();
             tracing::info!(
                 project_root = %project_root.display(),
                 guard_count,

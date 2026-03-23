@@ -721,6 +721,18 @@ impl RuleEngine {
         &self.exec_policy
     }
 
+    /// Clone the data needed for scanning into a [`ScanContext`].
+    ///
+    /// Call this while holding the read lock, then drop the lock before
+    /// awaiting the scan. This prevents write-lock starvation for concurrent
+    /// `rule_load` callers.
+    pub fn snapshot(&self) -> ScanContext {
+        ScanContext {
+            guards: self.guards.clone(),
+            rules: self.rules.clone(),
+        }
+    }
+
     pub fn load_exec_policy_files(&mut self, policy_paths: &[PathBuf]) -> anyhow::Result<()> {
         if policy_paths.is_empty() {
             return Ok(());
@@ -770,6 +782,84 @@ impl RuleEngine {
 impl Default for RuleEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A point-in-time snapshot of the guards and rules needed to run a scan.
+///
+/// Obtained via [`RuleEngine::snapshot`]. Holds cloned data so the engine's
+/// read-lock can be released before the async scan begins, preventing
+/// write-lock starvation for concurrent [`RuleEngine::load`] callers.
+pub struct ScanContext {
+    guards: Vec<Guard>,
+    rules: Vec<Rule>,
+}
+
+impl ScanContext {
+    pub fn guards_len(&self) -> usize {
+        self.guards.len()
+    }
+
+    fn parse_guard_output(
+        &self,
+        output: &std::process::Output,
+        _guard: &Guard,
+    ) -> anyhow::Result<Vec<Violation>> {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut violations = Vec::new();
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.splitn(4, ':').collect();
+            if parts.len() >= 4 {
+                let rule_id = RuleId::from_str(parts[2].trim());
+                let severity = self
+                    .rules
+                    .iter()
+                    .find(|r| r.id == rule_id)
+                    .map(|r| r.severity)
+                    .unwrap_or(Severity::Medium);
+                violations.push(Violation {
+                    rule_id,
+                    file: PathBuf::from(parts[0]),
+                    line: parts[1].parse().ok(),
+                    message: parts[3].to_string(),
+                    severity,
+                });
+            }
+        }
+        Ok(violations)
+    }
+
+    pub async fn scan(&self, project_root: &Path) -> anyhow::Result<Vec<Violation>> {
+        let mut violations = Vec::new();
+        for guard in &self.guards {
+            let output = tokio::process::Command::new("bash")
+                .arg(&guard.script_path)
+                .arg(project_root)
+                .output()
+                .await?;
+            violations.extend(self.parse_guard_output(&output, guard)?);
+        }
+        Ok(violations)
+    }
+
+    pub async fn scan_files(
+        &self,
+        project_root: &Path,
+        files: &[PathBuf],
+    ) -> anyhow::Result<Vec<Violation>> {
+        let mut violations = Vec::new();
+        for guard in &self.guards {
+            for file in files {
+                let output = tokio::process::Command::new("bash")
+                    .arg(&guard.script_path)
+                    .arg(project_root)
+                    .arg(file)
+                    .output()
+                    .await?;
+                violations.extend(self.parse_guard_output(&output, guard)?);
+            }
+        }
+        Ok(violations)
     }
 }
 
