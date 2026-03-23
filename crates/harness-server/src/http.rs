@@ -464,10 +464,11 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         .intake
         .github
         .as_ref()
-        .filter(|cfg| cfg.enabled && !cfg.repo.is_empty())
-        .map(|cfg| {
+        .filter(|cfg| cfg.enabled)
+        .and_then(|cfg| cfg.effective_repos().into_iter().next())
+        .map(|repo_cfg| {
             Arc::new(crate::intake::github_issues::GitHubIssuesPoller::new(
-                cfg,
+                &repo_cfg,
                 Some(&dir),
             )) as Arc<dyn crate::intake::IntakeSource>
         });

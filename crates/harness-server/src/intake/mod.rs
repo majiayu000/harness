@@ -27,6 +27,9 @@ pub struct IncomingIssue {
     pub priority: Option<i32>,
     pub labels: Vec<String>,
     pub created_at: Option<DateTime<Utc>>,
+    /// Project root override for this issue's repo.
+    #[serde(default)]
+    pub project_root: Option<std::path::PathBuf>,
 }
 
 /// Result passed to `IntakeSource::on_task_complete`.
@@ -172,16 +175,17 @@ pub fn build_orchestrator(
     let mut poll_interval = Duration::from_secs(30);
 
     if let Some(gh_config) = &config.github {
-        if gh_config.enabled && !gh_config.repo.is_empty() {
+        if gh_config.enabled {
             poll_interval = Duration::from_secs(gh_config.poll_interval_secs);
-            let poller = github_issues::GitHubIssuesPoller::new(gh_config, data_dir);
-            sources.push(Arc::new(poller));
-            tracing::info!(
-                repo = %gh_config.repo,
-                label = %gh_config.label,
-                poll_interval_secs = gh_config.poll_interval_secs,
-                "intake: GitHub Issues poller registered"
-            );
+            for repo_cfg in gh_config.effective_repos() {
+                tracing::info!(
+                    repo = %repo_cfg.repo,
+                    label = %repo_cfg.label,
+                    "intake: GitHub Issues poller registered"
+                );
+                let poller = github_issues::GitHubIssuesPoller::new(&repo_cfg, data_dir);
+                sources.push(Arc::new(poller));
+            }
         }
     }
 
@@ -234,6 +238,7 @@ mod tests {
             priority: None,
             labels: vec!["harness".to_string()],
             created_at: None,
+            project_root: None,
         };
 
         let prompt = build_prompt_from_issue(&issue);
@@ -256,6 +261,7 @@ mod tests {
             priority: None,
             labels: vec![],
             created_at: None,
+            project_root: None,
         };
 
         let prompt = build_prompt_from_issue(&issue);
@@ -290,6 +296,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             label: "harness".to_string(),
             poll_interval_secs: 60,
+            repos: vec![],
         });
         let orchestrator = build_orchestrator(&config, None, None);
         assert_eq!(orchestrator.sources.len(), 1);
