@@ -215,7 +215,7 @@ async fn run_review_tick(
         loop {
             sleep(poll_interval).await;
             if start.elapsed() > max_wait {
-                tracing::warn!(task_id = %task_id, "scheduler: review task polling timed out");
+                tracing::error!(task_id = %task_id, "scheduler: periodic review cycle produced no output — review task polling timed out");
                 break;
             }
             let Some(task) = store.get(&task_id) else {
@@ -235,7 +235,7 @@ async fn run_review_tick(
                 .collect::<Vec<_>>()
                 .join("\n");
             if output.is_empty() {
-                tracing::warn!(task_id = %task_id, "scheduler: review task completed but no output");
+                tracing::error!(task_id = %task_id, "scheduler: periodic review cycle produced no output — review task completed with empty output");
                 break;
             }
             match crate::review_store::parse_review_output(&output) {
