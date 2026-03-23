@@ -62,17 +62,33 @@ pub trait IntakeSource: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
-/// Orchestrates all registered intake sources: polls at interval, dispatches issues as tasks.
+/// Orchestrates all registered intake sources with sprint-planned dispatch.
+///
+/// Instead of dispatching issues immediately, collects all new issues, runs a
+/// sprint planner agent to group them into rounds, then executes rounds sequentially
+/// with parallel dispatch within each round.
 pub struct IntakeOrchestrator {
     sources: Vec<Arc<dyn IntakeSource>>,
     poll_interval: Duration,
+    planner_agent: Option<String>,
 }
 
+/// Timeout for waiting on a single task or round to complete (30 minutes).
+const TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Polling interval when waiting for task completion.
+const TASK_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
 impl IntakeOrchestrator {
-    pub fn new(sources: Vec<Arc<dyn IntakeSource>>, poll_interval: Duration) -> Self {
+    pub fn new(
+        sources: Vec<Arc<dyn IntakeSource>>,
+        poll_interval: Duration,
+        planner_agent: Option<String>,
+    ) -> Self {
         Self {
             sources,
             poll_interval,
+            planner_agent,
         }
     }
 
@@ -96,6 +112,8 @@ impl IntakeOrchestrator {
     }
 
     async fn poll_tick(&self, state: &Arc<AppState>) {
+        // 1. Collect all new issues from all sources.
+        let mut all_issues: Vec<(Arc<dyn IntakeSource>, IncomingIssue)> = Vec::new();
         for source in &self.sources {
             let issues = match source.poll().await {
                 Ok(issues) => issues,
@@ -104,68 +122,231 @@ impl IntakeOrchestrator {
                     continue;
                 }
             };
-
             for issue in issues {
-                let prompt = build_prompt_from_issue(&issue);
-                let req = crate::task_runner::CreateTaskRequest {
-                    prompt: Some(prompt),
-                    issue: issue.external_id.parse().ok(),
-                    project: issue.repo.as_ref().map(|_| state.core.project_root.clone()),
-                    ..Default::default()
+                all_issues.push((Arc::clone(source), issue));
+            }
+        }
+
+        if all_issues.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            count = all_issues.len(),
+            "intake: collected issues, running sprint planner"
+        );
+
+        // 2. Run sprint planner agent.
+        let issue_summary = build_issue_summary(&all_issues);
+        let planner_prompt = harness_core::prompts::sprint_plan_prompt(&issue_summary);
+
+        let planner_req = crate::task_runner::CreateTaskRequest {
+            prompt: Some(planner_prompt),
+            agent: self.planner_agent.clone(),
+            project: Some(state.core.project_root.clone()),
+            source: Some("sprint_planner".to_string()),
+            ..Default::default()
+        };
+
+        let planner_task_id = match crate::http::task_routes::enqueue_task(state, planner_req).await
+        {
+            Ok(id) => {
+                tracing::info!(task_id = %id, "intake: sprint planner enqueued");
+                id
+            }
+            Err(e) => {
+                tracing::error!("intake: failed to enqueue sprint planner: {e:?}");
+                return;
+            }
+        };
+
+        // 3. Wait for planner to finish.
+        let Some(planner_output) = poll_task_output(&state.core.tasks, &planner_task_id).await
+        else {
+            tracing::error!(task_id = %planner_task_id, "intake: sprint planner failed or timed out");
+            return;
+        };
+
+        // 4. Parse sprint plan.
+        let Some(plan) = harness_core::prompts::parse_sprint_plan(&planner_output) else {
+            tracing::error!(task_id = %planner_task_id, "intake: failed to parse sprint plan");
+            return;
+        };
+
+        tracing::info!(
+            rounds = plan.rounds.len(),
+            skipped = plan.skip.len(),
+            "intake: sprint plan parsed"
+        );
+
+        // Build lookup from external_id -> (source, issue).
+        let issue_map: std::collections::HashMap<String, (Arc<dyn IntakeSource>, IncomingIssue)> =
+            all_issues
+                .into_iter()
+                .map(|(src, issue)| (issue.external_id.clone(), (src, issue)))
+                .collect();
+
+        // 5. Mark skipped issues.
+        for skip in &plan.skip {
+            let ext_id = skip.issue.to_string();
+            if let Some((source, _)) = issue_map.get(&ext_id) {
+                let skip_id = TaskId(format!("skip-{ext_id}"));
+                if let Err(e) = source.mark_dispatched(&ext_id, &skip_id).await {
+                    tracing::warn!(external_id = %ext_id, "intake: failed to mark skipped: {e}");
+                }
+                tracing::info!(external_id = %ext_id, reason = %skip.reason, "intake: issue skipped");
+            }
+        }
+
+        // 6. Execute rounds sequentially.
+        for (round_idx, round) in plan.rounds.iter().enumerate() {
+            tracing::info!(
+                round = round_idx + 1,
+                issues = ?round.issues,
+                reason = %round.reason,
+                "intake: starting round"
+            );
+
+            let mut round_task_ids: Vec<TaskId> = Vec::new();
+
+            for &issue_num in &round.issues {
+                let ext_id = issue_num.to_string();
+                let Some((source, issue)) = issue_map.get(&ext_id) else {
+                    tracing::warn!(external_id = %ext_id, "intake: issue not found in polled set");
+                    continue;
                 };
 
-                // Mark dispatched first to prevent duplicate tasks if enqueue
-                // succeeds but we crash before persisting the dispatched state.
-                let placeholder_id = TaskId(format!("pending-{}", issue.external_id));
-                if let Err(e) = source
-                    .mark_dispatched(&issue.external_id, &placeholder_id)
-                    .await
-                {
-                    tracing::warn!(
-                        source = source.name(),
-                        external_id = %issue.external_id,
-                        "mark_dispatched failed: {e}"
-                    );
+                let placeholder_id = TaskId(format!("pending-{ext_id}"));
+                if let Err(e) = source.mark_dispatched(&ext_id, &placeholder_id).await {
+                    tracing::warn!(external_id = %ext_id, "intake: mark_dispatched failed: {e}");
                     continue;
                 }
 
+                let prompt = build_prompt_from_issue(issue);
+                let req = crate::task_runner::CreateTaskRequest {
+                    prompt: Some(prompt),
+                    issue: issue.external_id.parse().ok(),
+                    project: issue
+                        .project_root
+                        .clone()
+                        .or_else(|| Some(state.core.project_root.clone())),
+                    ..Default::default()
+                };
+
                 match crate::http::task_routes::enqueue_task(state, req).await {
                     Ok(task_id) => {
-                        tracing::info!(
-                            source = source.name(),
-                            external_id = %issue.external_id,
-                            task_id = %task_id.0,
-                            "intake: task dispatched"
-                        );
-                        // Update with the real task ID.
-                        if let Err(e) = source.mark_dispatched(&issue.external_id, &task_id).await {
-                            tracing::warn!(
-                                source = source.name(),
-                                external_id = %issue.external_id,
-                                "mark_dispatched update failed: {e}"
-                            );
+                        tracing::info!(external_id = %ext_id, task_id = %task_id, "intake: task dispatched");
+                        if let Err(e) = source.mark_dispatched(&ext_id, &task_id).await {
+                            tracing::warn!(external_id = %ext_id, "intake: mark_dispatched update failed: {e}");
                         }
+                        round_task_ids.push(task_id);
                     }
                     Err(e) => {
-                        tracing::error!(
-                            source = source.name(),
-                            external_id = %issue.external_id,
-                            "intake: failed to spawn task: {e:?}"
-                        );
-                        // Un-mark on enqueue failure so the issue is retried next poll.
-                        source.unmark_dispatched(&issue.external_id).await;
+                        tracing::error!(external_id = %ext_id, "intake: failed to spawn task: {e:?}");
+                        source.unmark_dispatched(&ext_id).await;
                     }
                 }
+            }
+
+            // Wait for all tasks in this round to complete before starting next round.
+            if !round_task_ids.is_empty() {
+                tracing::info!(
+                    round = round_idx + 1,
+                    tasks = round_task_ids.len(),
+                    "intake: waiting for round"
+                );
+                wait_for_tasks(&state.core.tasks, &round_task_ids).await;
+                tracing::info!(round = round_idx + 1, "intake: round complete");
             }
         }
     }
 }
 
+/// Format collected issues into a summary for the planner prompt.
+fn build_issue_summary(issues: &[(Arc<dyn IntakeSource>, IncomingIssue)]) -> String {
+    issues
+        .iter()
+        .map(|(_, issue)| {
+            let labels = if issue.labels.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", issue.labels.join(", "))
+            };
+            let repo = issue.repo.as_deref().unwrap_or("");
+            format!(
+                "- #{}: {}{} ({})",
+                issue.external_id, issue.title, labels, repo
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Poll a task until terminal state, return its output.
+async fn poll_task_output(
+    store: &crate::task_runner::TaskStore,
+    task_id: &TaskId,
+) -> Option<String> {
+    let start = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(TASK_POLL_INTERVAL).await;
+        if start.elapsed() > TASK_TIMEOUT {
+            tracing::warn!(task_id = %task_id, "intake: task polling timed out");
+            return None;
+        }
+        let Some(task) = store.get(task_id) else {
+            continue;
+        };
+        if !matches!(task.status, TaskStatus::Done | TaskStatus::Failed) {
+            continue;
+        }
+        if matches!(task.status, TaskStatus::Failed) {
+            tracing::error!(task_id = %task_id, error = ?task.error, "intake: task failed");
+            return None;
+        }
+        let output: String = task
+            .rounds
+            .iter()
+            .filter_map(|r| r.detail.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if output.is_empty() {
+            tracing::warn!(task_id = %task_id, "intake: task completed but no output");
+            return None;
+        }
+        return Some(output);
+    }
+}
+
+/// Wait for all tasks to reach a terminal state.
+async fn wait_for_tasks(store: &crate::task_runner::TaskStore, task_ids: &[TaskId]) {
+    let start = tokio::time::Instant::now();
+    let mut pending: std::collections::HashSet<String> =
+        task_ids.iter().map(|id| id.0.clone()).collect();
+
+    loop {
+        if pending.is_empty() {
+            return;
+        }
+        tokio::time::sleep(TASK_POLL_INTERVAL).await;
+        if start.elapsed() > TASK_TIMEOUT {
+            tracing::warn!(
+                remaining = pending.len(),
+                "intake: timed out waiting for round"
+            );
+            return;
+        }
+        pending.retain(|id| {
+            let task_id = TaskId(id.clone());
+            let Some(task) = store.get(&task_id) else {
+                return true;
+            };
+            !matches!(task.status, TaskStatus::Done | TaskStatus::Failed)
+        });
+    }
+}
+
 /// Build an `IntakeOrchestrator` from config, registering all enabled sources.
-///
-/// `feishu_intake` — a pre-built `Arc<FeishuIntake>` to share with the webhook handler so
-/// both use the same `chat_ids` / `dispatched` maps. When `None`, a new instance is created
-/// from config (useful in tests or standalone use).
 pub fn build_orchestrator(
     config: &harness_core::IntakeConfig,
     data_dir: Option<&std::path::Path>,
@@ -173,10 +354,12 @@ pub fn build_orchestrator(
 ) -> IntakeOrchestrator {
     let mut sources: Vec<Arc<dyn IntakeSource>> = Vec::new();
     let mut poll_interval = Duration::from_secs(30);
+    let mut planner_agent = None;
 
     if let Some(gh_config) = &config.github {
         if gh_config.enabled {
             poll_interval = Duration::from_secs(gh_config.poll_interval_secs);
+            planner_agent = gh_config.planner_agent.clone();
             for repo_cfg in gh_config.effective_repos() {
                 tracing::info!(
                     repo = %repo_cfg.repo,
@@ -201,7 +384,7 @@ pub fn build_orchestrator(
         }
     }
 
-    IntakeOrchestrator::new(sources, poll_interval)
+    IntakeOrchestrator::new(sources, poll_interval, planner_agent)
 }
 
 pub(crate) fn build_prompt_from_issue(issue: &IncomingIssue) -> String {
@@ -296,7 +479,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             label: "harness".to_string(),
             poll_interval_secs: 60,
-            repos: vec![],
+            ..Default::default()
         });
         let orchestrator = build_orchestrator(&config, None, None);
         assert_eq!(orchestrator.sources.len(), 1);

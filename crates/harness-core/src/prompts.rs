@@ -662,6 +662,71 @@ pub fn build_matched_skills_section<'a>(
     out
 }
 
+/// A single round in a sprint plan: issues to dispatch in parallel.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
+pub struct SprintRound {
+    pub issues: Vec<u64>,
+    pub reason: String,
+}
+
+/// An issue the planner decided to skip.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
+pub struct SprintSkip {
+    pub issue: u64,
+    pub reason: String,
+}
+
+/// Structured sprint plan produced by the planner agent.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
+pub struct SprintPlan {
+    pub rounds: Vec<SprintRound>,
+    #[serde(default)]
+    pub skip: Vec<SprintSkip>,
+}
+
+/// Build prompt for the sprint planner agent.
+///
+/// The agent reads all pending issues, checks the codebase for file overlap,
+/// and groups issues into sequential rounds with parallel execution within each round.
+pub fn sprint_plan_prompt(issues: &str) -> String {
+    let safe_issues = wrap_external_data(issues);
+    format!(
+        "You are an Engineering Manager planning a sprint.\n\n\
+         ## Pending Issues\n\n\
+         {safe_issues}\n\n\
+         ## Task\n\n\
+         Group these issues into execution rounds. Issues within the same round will be \
+         worked on in parallel by separate agents, while rounds execute sequentially.\n\n\
+         For each issue, read its description and check the codebase to understand which \
+         files it touches. Issues that modify overlapping files MUST be in different rounds \
+         to avoid merge conflicts.\n\n\
+         Higher priority issues (P0 > P1 > P2) should go in earlier rounds.\n\
+         If issue B depends on issue A's fix, A must be in an earlier round.\n\n\
+         Mark issues as \"skip\" if they are already fixed by recent commits, are duplicates, \
+         or are invalid.\n\n\
+         SPRINT_PLAN_START\n\
+         {{\n\
+           \"rounds\": [\n\
+             {{\"issues\": [510, 514], \"reason\": \"independent security fixes\"}},\n\
+             {{\"issues\": [511], \"reason\": \"depends on 510 changes\"}}\n\
+           ],\n\
+           \"skip\": [\n\
+             {{\"issue\": 452, \"reason\": \"fixed by recent commit\"}}\n\
+           ]\n\
+         }}\n\
+         SPRINT_PLAN_END\n\n\
+         Every pending issue must appear in exactly one round or in skip.\n\
+         The JSON between markers must be valid and parseable."
+    )
+}
+
+/// Parse a `SprintPlan` from agent output by extracting JSON between markers.
+pub fn parse_sprint_plan(output: &str) -> Option<SprintPlan> {
+    let start = output.find("SPRINT_PLAN_START")? + "SPRINT_PLAN_START".len();
+    let end = output[start..].find("SPRINT_PLAN_END")? + start;
+    serde_json::from_str(output[start..end].trim()).ok()
+}
+
 /// Wrap `s` in POSIX single quotes, escaping any embedded single quotes via `'\''`.
 ///
 /// This ensures the value is treated as literal data by the shell and cannot
