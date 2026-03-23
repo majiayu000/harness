@@ -16,13 +16,80 @@ use axum::{
 use dashmap::DashMap;
 use harness_protocol::{RpcNotification, RpcRequest};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, RwLock};
+
+/// Per-identifier rate limiter for `POST /auth/reset-password`.
+///
+/// Uses a 1-hour rolling window per email address to prevent brute-force
+/// and enumeration attacks on the password reset flow.
+///
+/// Memory is bounded: at most `max_tracked_keys` identifiers are tracked at
+/// once; expired timestamps are evicted lazily on each access.
+pub struct PasswordResetRateLimiter {
+    timestamps: Mutex<HashMap<String, VecDeque<Instant>>>,
+    max_per_hour: usize,
+    max_tracked_keys: usize,
+}
+
+impl PasswordResetRateLimiter {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    pub fn new(max_per_hour: u32) -> Self {
+        Self {
+            timestamps: Mutex::new(HashMap::new()),
+            max_per_hour: max_per_hour as usize,
+            max_tracked_keys: 100_000,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_cap(max_per_hour: u32, max_tracked_keys: usize) -> Self {
+        Self {
+            timestamps: Mutex::new(HashMap::new()),
+            max_per_hour: max_per_hour as usize,
+            max_tracked_keys,
+        }
+    }
+
+    /// Returns `true` if the request is within the rate limit and increments the counter.
+    pub fn check_and_increment(&self, identifier: &str) -> bool {
+        let mut map = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+
+        // Evict timestamps outside the rolling window for this identifier.
+        if let Some(entry) = map.get_mut(identifier) {
+            while let Some(&front) = entry.front() {
+                if now.duration_since(front) >= Self::WINDOW {
+                    entry.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if entry.is_empty() {
+                map.remove(identifier);
+            }
+        }
+
+        // Reject new identifiers when map is at capacity (memory-DoS guard).
+        if !map.contains_key(identifier) && map.len() >= self.max_tracked_keys {
+            return false;
+        }
+
+        let entry = map.entry(identifier.to_string()).or_default();
+        if entry.len() < self.max_per_hour {
+            entry.push_back(now);
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Per-source rate limiter for `POST /signals` ingestion.
 pub struct SignalRateLimiter {
@@ -84,6 +151,7 @@ pub struct EngineServices {
 pub struct ObservabilityServices {
     pub events: Arc<harness_observe::EventStore>,
     pub signal_rate_limiter: Arc<SignalRateLimiter>,
+    pub password_reset_rate_limiter: Arc<PasswordResetRateLimiter>,
     pub review_store: Option<Arc<crate::review_store::ReviewStore>>,
 }
 
@@ -529,6 +597,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     );
 
     let signal_rate_limit = server.config.server.signal_rate_limit_per_minute;
+    let password_reset_rate_limit = server.config.server.password_reset_rate_limit_per_hour;
     let home_dir = std::env::var("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| project_root.clone());
@@ -551,6 +620,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         observability: ObservabilityServices {
             events,
             signal_rate_limiter: Arc::new(SignalRateLimiter::new(signal_rate_limit)),
+            password_reset_rate_limiter: Arc::new(PasswordResetRateLimiter::new(
+                password_reset_rate_limit,
+            )),
             review_store: {
                 let review_db_path = dir.join("reviews.db");
                 match crate::review_store::ReviewStore::open(&review_db_path).await {
@@ -884,6 +956,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                 state.core.server.config.server.max_webhook_body_bytes,
             )),
         )
+        .route("/auth/reset-password", post(password_reset))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             api_auth_middleware,
@@ -992,7 +1065,12 @@ async fn api_auth_middleware(
     // Authorization headers on a navigation request.
     if matches!(
         path,
-        "/health" | "/webhook" | "/webhook/feishu" | "/signals" | "/favicon.ico"
+        "/health"
+            | "/webhook"
+            | "/webhook/feishu"
+            | "/signals"
+            | "/favicon.ico"
+            | "/auth/reset-password"
     ) {
         return next.run(req).await;
     }
@@ -1499,6 +1577,69 @@ async fn ingest_signal(
     )
 }
 
+#[derive(serde::Deserialize)]
+struct PasswordResetRequest {
+    email: String,
+}
+
+/// POST /auth/reset-password — initiate a password reset.
+///
+/// Rate-limited per email address to prevent enumeration and brute-force.
+/// Always returns a generic success response regardless of whether the email
+/// exists, to avoid leaking account information.
+async fn password_reset(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PasswordResetRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let email = req.email.trim().to_lowercase();
+    if email.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "email is required"})),
+        );
+    }
+
+    let limit = state
+        .core
+        .server
+        .config
+        .server
+        .password_reset_rate_limit_per_hour;
+
+    if !state
+        .observability
+        .password_reset_rate_limiter
+        .check_and_increment(&email)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": format!(
+                    "rate limit exceeded: max {} password reset requests per hour",
+                    limit
+                )
+            })),
+        );
+    }
+
+    tracing::info!(
+        email_hash = %format!("{:x}", {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            email.hash(&mut h);
+            h.finish()
+        }),
+        "password reset requested"
+    );
+
+    (
+        StatusCode::OK,
+        Json(
+            json!({"status": "ok", "message": "If that email is registered, a reset link has been sent."}),
+        ),
+    )
+}
+
 #[cfg(test)]
 mod startup_tests {
     use super::build_app_state;
@@ -1713,6 +1854,48 @@ mod startup_tests {
         Ok(())
         // _env_guard dropped here → HOME restored unconditionally
         // _lock dropped here → next test may proceed
+    }
+}
+
+#[cfg(test)]
+mod password_reset_rate_limiter_tests {
+    use super::PasswordResetRateLimiter;
+
+    #[test]
+    fn allows_requests_within_limit() {
+        let limiter = PasswordResetRateLimiter::new(3);
+        assert!(limiter.check_and_increment("user@example.com"));
+        assert!(limiter.check_and_increment("user@example.com"));
+        assert!(limiter.check_and_increment("user@example.com"));
+    }
+
+    #[test]
+    fn blocks_after_limit_exceeded() {
+        let limiter = PasswordResetRateLimiter::new(2);
+        assert!(limiter.check_and_increment("a@example.com"));
+        assert!(limiter.check_and_increment("a@example.com"));
+        assert!(!limiter.check_and_increment("a@example.com"));
+    }
+
+    #[test]
+    fn limits_are_per_identifier() {
+        let limiter = PasswordResetRateLimiter::new(1);
+        assert!(limiter.check_and_increment("alice@example.com"));
+        assert!(!limiter.check_and_increment("alice@example.com"));
+        // Different email is independent
+        assert!(limiter.check_and_increment("bob@example.com"));
+    }
+
+    #[test]
+    fn rejects_new_identifiers_when_key_cap_reached() {
+        // Cap at 2 tracked identifiers to test the memory-DoS guard.
+        let limiter = PasswordResetRateLimiter::new_with_cap(10, 2);
+        assert!(limiter.check_and_increment("a@example.com"));
+        assert!(limiter.check_and_increment("b@example.com"));
+        // Third unique identifier is rejected because cap is reached.
+        assert!(!limiter.check_and_increment("c@example.com"));
+        // Already-tracked identifiers still work.
+        assert!(limiter.check_and_increment("a@example.com"));
     }
 }
 
