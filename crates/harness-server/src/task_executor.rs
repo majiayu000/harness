@@ -877,6 +877,30 @@ pub(crate) async fn run_task(
         return Ok(());
     }
 
+    // Check if the agent flagged an issue with the implementation plan before
+    // attempting PR parsing. When present, PLAN_ISSUE means no code was written —
+    // mark the task failed so it is not silently treated as successful completion.
+    if let Some(plan_issue) = prompts::parse_plan_issue(&output) {
+        tracing::error!(
+            task_id = %task_id,
+            plan_issue = %plan_issue,
+            "agent reported PLAN_ISSUE; marking task failed"
+        );
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Failed;
+            s.turn = 1;
+            s.error = Some(format!("PLAN_ISSUE: {plan_issue}"));
+            s.rounds.push(RoundResult {
+                turn: 1,
+                action: "implement".into(),
+                result: "plan_issue".into(),
+                detail: Some(plan_issue.clone()),
+            });
+        })
+        .await?;
+        return Ok(());
+    }
+
     let pr_url = prompts::parse_pr_url(&output);
     let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
 

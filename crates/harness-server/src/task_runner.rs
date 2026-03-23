@@ -1583,4 +1583,65 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Regression test for REVIEW-03: an implementation turn that returns only
+    /// `PLAN_ISSUE=<desc>` must mark the task Failed, not Done.
+    #[tokio::test]
+    async fn plan_issue_output_marks_task_failed() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
+        let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
+
+        // Agent returns only a PLAN_ISSUE sentinel — no PR URL, no code written.
+        let agent = PhaseCapturingAgent::new(vec![
+            "PLAN_ISSUE=the plan is missing the database migration step".into(),
+        ]);
+
+        let req = CreateTaskRequest {
+            prompt: Some("implement something".into()),
+            project: Some(dir.path().to_path_buf()),
+            wait_secs: 0,
+            max_rounds: 0,
+            turn_timeout_secs: 30,
+            ..Default::default()
+        };
+
+        let queue = crate::task_queue::TaskQueue::unbounded();
+        let permit = queue.acquire("test").await?;
+        let task_id = spawn_task(
+            store.clone(),
+            agent,
+            None,
+            Default::default(),
+            skills,
+            events,
+            vec![],
+            req,
+            None,
+            permit,
+            None,
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let state = store.get(&task_id).expect("task must exist");
+        assert!(
+            matches!(state.status, TaskStatus::Failed),
+            "expected Failed when PLAN_ISSUE is returned, got {:?}",
+            state.status
+        );
+        let error = state.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("PLAN_ISSUE"),
+            "error field must mention PLAN_ISSUE, got: {error:?}"
+        );
+        assert!(
+            error.contains("database migration"),
+            "error field must include the plan issue description, got: {error:?}"
+        );
+        Ok(())
+    }
 }
