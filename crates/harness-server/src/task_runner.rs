@@ -120,6 +120,8 @@ pub struct TaskState {
     /// GitHub issue number if this is an issue-based task. Set at spawn time; not persisted.
     #[serde(skip)]
     pub issue: Option<u64>,
+    /// Repository slug (e.g. "owner/repo"). Persisted for traceability.
+    pub repo: Option<String>,
     /// Short description derived from the task prompt or issue number. Set at spawn time; not persisted.
     #[serde(skip)]
     pub description: Option<String>,
@@ -149,6 +151,12 @@ pub struct TaskSummary {
     pub source: Option<String>,
     /// Parent task ID when this is a subtask.
     pub parent_id: Option<TaskId>,
+    /// Source-specific identifier (e.g. GitHub issue number).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// Repository slug (e.g. "owner/repo").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// Short description derived from the task prompt or issue number.
     #[serde(default)]
     pub description: Option<String>,
@@ -180,6 +188,7 @@ impl TaskState {
             phase: TaskPhase::default(),
             triage_output: None,
             plan_output: None,
+            repo: None,
         }
     }
 
@@ -192,6 +201,8 @@ impl TaskState {
             error: self.error.clone(),
             source: self.source.clone(),
             parent_id: self.parent_id.clone(),
+            external_id: self.external_id.clone(),
+            repo: self.repo.clone(),
             description: self.description.clone(),
             created_at: self.created_at.clone(),
             phase: self.phase.clone(),
@@ -235,6 +246,12 @@ pub struct CreateTaskRequest {
     /// Intake source name (e.g. "github", "feishu", "periodic_review"). None for manual tasks.
     #[serde(default)]
     pub source: Option<String>,
+    /// Source-specific identifier (e.g. GitHub issue number). Stored in TaskState for traceability.
+    #[serde(default)]
+    pub external_id: Option<String>,
+    /// Repository slug (e.g. "owner/repo"). Stored in TaskState for traceability.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 impl Default for CreateTaskRequest {
@@ -253,6 +270,8 @@ impl Default for CreateTaskRequest {
             retry_max_backoff_ms: default_retry_max_backoff_ms(),
             stall_timeout_secs: default_stall_timeout(),
             source: None,
+            external_id: None,
+            repo: None,
         }
     }
 }
@@ -668,6 +687,8 @@ where
         let task_id = TaskId::new();
         let mut state = TaskState::new(task_id.clone());
         state.source = req.source.clone();
+        state.external_id = req.external_id.clone();
+        state.repo = req.repo.clone();
         store.insert(&state).await;
         // Register stream channel before spawning so SSE clients can subscribe immediately.
         store.register_task_stream(&task_id);

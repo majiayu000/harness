@@ -303,6 +303,9 @@ async fn run_repo_sprint(
                     .project_root
                     .clone()
                     .or_else(|| Some(project_root.clone())),
+                source: Some("github".to_string()),
+                external_id: Some(issue.external_id.clone()),
+                repo: Some(repo.to_string()),
                 ..Default::default()
             };
 

@@ -56,6 +56,11 @@ static TASK_MIGRATIONS: &[Migration] = &[
             created_at    TEXT NOT NULL DEFAULT (datetime('now'))
         )",
     },
+    Migration {
+        version: 6,
+        description: "add repo column",
+        sql: "ALTER TABLE tasks ADD COLUMN repo TEXT",
+    },
 ];
 
 /// A single persisted artifact captured from agent output during task execution.
@@ -93,8 +98,8 @@ impl TaskDb {
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let status = state.status.as_ref();
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, parent_id, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))",
+            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, parent_id, created_at, repo)
+             VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?)",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -104,6 +109,7 @@ impl TaskDb {
         .bind(&state.error)
         .bind(state.parent_id.as_ref().map(|id| &id.0))
         .bind(&state.created_at)
+        .bind(&state.repo)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -114,7 +120,7 @@ impl TaskDb {
         let status = state.status.as_ref();
         sqlx::query(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
-                    updated_at = datetime('now')
+                    repo = ?, updated_at = datetime('now')
              WHERE id = ?",
         )
         .bind(status)
@@ -122,6 +128,7 @@ impl TaskDb {
         .bind(&state.pr_url)
         .bind(&rounds_json)
         .bind(&state.error)
+        .bind(&state.repo)
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -130,7 +137,7 @@ impl TaskDb {
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo
              FROM tasks WHERE id = ?",
         )
         .bind(id)
@@ -141,7 +148,7 @@ impl TaskDb {
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo
              FROM tasks ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -203,7 +210,7 @@ impl TaskDb {
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo
              FROM tasks WHERE parent_id = ? ORDER BY created_at DESC",
         )
         .bind(parent_id)
@@ -276,6 +283,7 @@ struct TaskRow {
     external_id: Option<String>,
     parent_id: Option<String>,
     created_at: Option<String>,
+    repo: Option<String>,
 }
 
 impl TaskRow {
@@ -291,6 +299,7 @@ impl TaskRow {
             external_id,
             parent_id,
             created_at,
+            repo,
         } = self;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
@@ -318,6 +327,7 @@ impl TaskRow {
             phase: crate::task_runner::TaskPhase::default(),
             triage_output: None,
             plan_output: None,
+            repo,
         })
     }
 }
@@ -340,6 +350,7 @@ mod tests {
             external_id: None,
             parent_id: None,
             created_at: None,
+            repo: None,
         }
     }
 
@@ -400,6 +411,7 @@ mod tests {
             phase: crate::task_runner::TaskPhase::default(),
             triage_output: None,
             plan_output: None,
+            repo: None,
         }
     }
 
