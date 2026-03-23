@@ -296,9 +296,7 @@ async fn run_repo_sprint(
                 continue;
             }
 
-            let prompt = build_prompt_from_issue(issue);
             let req = crate::task_runner::CreateTaskRequest {
-                prompt: Some(prompt),
                 issue: issue.external_id.parse().ok(),
                 project: issue
                     .project_root
