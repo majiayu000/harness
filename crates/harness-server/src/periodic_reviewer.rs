@@ -31,17 +31,21 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // the DB is unavailable.
     let fallback_ts: Arc<Mutex<Option<DateTime<Utc>>>> = Arc::new(Mutex::new(None));
 
+    // Tracks the currently active polling task so it can be cancelled if a new
+    // review cycle starts before the previous one finishes (issue #448).
+    let poll_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+
     if config.run_on_startup {
         // Brief delay to let the server fully initialize before the first tick.
         sleep(Duration::from_secs(5)).await;
-        if let Err(err) = run_review_tick(&state, &config, &fallback_ts).await {
+        if let Err(err) = run_review_tick(&state, &config, &fallback_ts, &poll_handle).await {
             tracing::error!("scheduler: periodic review startup tick failed: {err}");
         }
     }
 
     loop {
         sleep(interval).await;
-        if let Err(err) = run_review_tick(&state, &config, &fallback_ts).await {
+        if let Err(err) = run_review_tick(&state, &config, &fallback_ts, &poll_handle).await {
             tracing::error!("scheduler: periodic review tick failed: {err}");
         }
     }
@@ -51,6 +55,7 @@ async fn run_review_tick(
     state: &Arc<AppState>,
     config: &ReviewConfig,
     fallback_ts: &Arc<Mutex<Option<DateTime<Utc>>>>,
+    poll_handle: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 ) -> anyhow::Result<()> {
     let project_root = &state.core.project_root;
 
@@ -183,11 +188,27 @@ async fn run_review_tick(
         tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
     }
 
+    // Drop the previous poll handle without aborting: in Tokio, dropping a
+    // JoinHandle does NOT cancel the spawned task — the old poller keeps running
+    // until its review task reaches Done/Failed or its internal timeout fires.
+    // Calling h.abort() here would silently discard findings when the prior
+    // review task had not yet completed, because the poller is the only path
+    // that calls parse_review_output + persist_findings (issue #448 / round-1
+    // review correctness fix).
+    {
+        let mut guard = poll_handle.lock().await;
+        if guard.take().is_some() {
+            tracing::debug!(
+                "scheduler: dropped previous review poll handle (task continues to completion)"
+            );
+        }
+    }
+
     // Wait for the review task to complete, then persist structured findings.
     let store = state.core.tasks.clone();
     let review_store = state.observability.review_store.clone();
     let timeout_secs = config.timeout_secs;
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let poll_interval = Duration::from_secs(15);
         let max_wait = Duration::from_secs(timeout_secs + 120);
         let start = tokio::time::Instant::now();
@@ -247,6 +268,7 @@ async fn run_review_tick(
             break;
         }
     });
+    *poll_handle.lock().await = Some(handle);
 
     Ok(())
 }
@@ -468,5 +490,52 @@ mod tests {
         let now = Utc::now();
         *fallback_ts.lock().await = Some(now);
         assert_eq!(*fallback_ts.lock().await, Some(now));
+    }
+
+    /// Verify that replacing a poll_handle drops the old JoinHandle WITHOUT
+    /// aborting the underlying task, so the old poller can still persist its
+    /// findings after a new review cycle starts (issue #448 / round-1 review).
+    ///
+    /// The previous test only checked `guard.is_some()` after replacement, which
+    /// would pass even if `h.abort()` were present and the old task was killed.
+    /// This test additionally asserts that the old spawned task is still running.
+    #[tokio::test]
+    async fn poll_handle_replaced_without_aborting_previous() {
+        let poll_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(None));
+
+        // First cycle: spawn a long-running task and store it.
+        let first = tokio::spawn(async {
+            sleep(Duration::from_secs(3600)).await;
+        });
+        *poll_handle.lock().await = Some(first);
+
+        // Second cycle: take the old handle (drop without abort) and store a new one.
+        let old_handle = {
+            let mut guard = poll_handle.lock().await;
+            guard.take()
+        };
+        let second = tokio::spawn(async {});
+        *poll_handle.lock().await = Some(second);
+
+        // Yield so the runtime can process any pending state changes.
+        tokio::task::yield_now().await;
+
+        // The old task must still be running — dropping the handle must NOT cancel it.
+        assert!(old_handle.is_some(), "first handle must have been stored");
+        let old = match old_handle {
+            Some(h) => h,
+            None => return, // unreachable: asserted above
+        };
+        assert!(
+            !old.is_finished(),
+            "old poller must still be running after handle replacement; \
+             aborting it would silently drop findings"
+        );
+        old.abort(); // clean up the long-running task
+
+        // The slot holds exactly one (the new) task.
+        let guard = poll_handle.lock().await;
+        assert!(guard.is_some());
     }
 }
