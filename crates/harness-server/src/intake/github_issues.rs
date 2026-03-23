@@ -154,21 +154,24 @@ impl IntakeSource for GitHubIssuesPoller {
     }
 
     async fn poll(&self) -> anyhow::Result<Vec<IncomingIssue>> {
+        let mut args = vec![
+            "issue",
+            "list",
+            "--repo",
+            &self.repo,
+            "--state",
+            "open",
+            "--json",
+            "number,title,body,url,labels,createdAt",
+            "--limit",
+            "1000",
+        ];
+        if !self.label.is_empty() {
+            args.push("--label");
+            args.push(&self.label);
+        }
         let output = tokio::process::Command::new("gh")
-            .args([
-                "issue",
-                "list",
-                "--repo",
-                &self.repo,
-                "--label",
-                &self.label,
-                "--state",
-                "open",
-                "--json",
-                "number,title,body,url,labels,createdAt",
-                "--limit",
-                "1000",
-            ])
+            .args(&args)
             .output()
             .await?;
 
