@@ -81,9 +81,7 @@ impl PasswordResetRateLimiter {
             return false;
         }
 
-        let entry = map
-            .entry(identifier.to_string())
-            .or_default();
+        let entry = map.entry(identifier.to_string()).or_default();
         if entry.len() < self.max_per_hour {
             entry.push_back(now);
             true
