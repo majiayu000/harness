@@ -162,7 +162,7 @@ impl IntakeOrchestrator {
 async fn run_repo_sprint(
     state: &Arc<AppState>,
     repo: &str,
-    issues: Vec<(Arc<dyn IntakeSource>, IncomingIssue)>,
+    issues: Vec<IntakeIssueEntry>,
     planner_agent: Option<&str>,
 ) {
     tracing::info!(
@@ -217,11 +217,10 @@ async fn run_repo_sprint(
     );
 
     // Build lookup.
-    let issue_map: std::collections::HashMap<String, (Arc<dyn IntakeSource>, IncomingIssue)> =
-        issues
-            .into_iter()
-            .map(|(src, issue)| (issue.external_id.clone(), (src, issue)))
-            .collect();
+    let issue_map: std::collections::HashMap<String, IntakeIssueEntry> = issues
+        .into_iter()
+        .map(|(src, issue)| (issue.external_id.clone(), (src, issue)))
+        .collect();
 
     // 2. Mark skipped.
     for skip in &plan.skip {
@@ -363,7 +362,7 @@ async fn run_repo_sprint(
 }
 
 /// Format collected issues into a summary for the planner prompt.
-fn build_issue_summary(issues: &[(Arc<dyn IntakeSource>, IncomingIssue)]) -> String {
+fn build_issue_summary(issues: &[IntakeIssueEntry]) -> String {
     issues
         .iter()
         .map(|(_, issue)| {

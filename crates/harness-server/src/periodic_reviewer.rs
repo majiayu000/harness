@@ -75,6 +75,9 @@ async fn run_review_tick(
     // Merge DB timestamp with local fallback.  The fallback wins when it is
     // more recent — this prevents stale deduplication after an EventStore
     // write failure.
+    // Sequential (non-nested) lock acquisition: `fallback_ts` lock is
+    // acquired, value copied, and the guard dropped before any other await.
+    // There is no nesting with `poll_handle`; RS-01 deadlock risk does not apply.
     let fb = *fallback_ts.lock().await;
     let last_review_ts = match (db_last_review_ts, fb) {
         (Some(db), Some(f)) => Some(db.max(f)),
@@ -148,6 +151,9 @@ async fn run_review_tick(
         None
     };
 
+    // Sequential (non-nested): `fallback_ts` guard is taken and released
+    // before the `poll_handle` guard below is acquired.  No concurrent lock
+    // holding between the two mutexes.
     *fallback_ts.lock().await = Some(Utc::now());
 
     let event = Event::new(
@@ -161,6 +167,10 @@ async fn run_review_tick(
     }
 
     {
+        // Sequential (non-nested): `fallback_ts` guard was released above.
+        // This block scopes `poll_handle` guard so it drops before the spawn
+        // at the end of this function acquires it again — preventing any
+        // double-acquisition on the same call stack.  RS-01 does not apply.
         let mut guard = poll_handle.lock().await;
         if guard.take().is_some() {
             tracing::debug!(
@@ -241,6 +251,10 @@ async fn run_review_tick(
             }
         }
     });
+    // Sequential (non-nested): the scoped block above released `poll_handle`
+    // before this function returns.  This final store is the only live
+    // acquisition of `poll_handle` at this point — no nesting with
+    // `fallback_ts` or earlier `poll_handle` guards.
     *poll_handle.lock().await = Some(handle);
 
     Ok(())
