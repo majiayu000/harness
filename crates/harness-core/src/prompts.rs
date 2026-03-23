@@ -723,10 +723,16 @@ pub fn sprint_plan_prompt(issues: &str) -> String {
 }
 
 /// Parse a `SprintPlan` from agent output by extracting JSON between markers.
+/// Robust: finds the first `{` and last `}` between markers, ignoring
+/// markdown fences, prose, or other wrapper text agents may add.
 pub fn parse_sprint_plan(output: &str) -> Option<SprintPlan> {
     let start = output.find("SPRINT_PLAN_START")? + "SPRINT_PLAN_START".len();
     let end = output[start..].find("SPRINT_PLAN_END")? + start;
-    serde_json::from_str(output[start..end].trim()).ok()
+    let region = &output[start..end];
+    // Extract the JSON object: first '{' to last '}'.
+    let json_start = region.find('{')?;
+    let json_end = region.rfind('}')? + 1;
+    serde_json::from_str(&region[json_start..json_end]).ok()
 }
 
 /// Wrap `s` in POSIX single quotes, escaping any embedded single quotes via `'\''`.
