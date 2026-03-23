@@ -369,72 +369,35 @@ pub fn agent_review_fix_prompt(pr_url: &str, issues: &[String], round: u32) -> S
     )
 }
 
-/// Build prompt: periodic codebase review with an 11-item checklist.
+/// Build prompt: periodic codebase review.
 ///
-/// `repo_structure` is the output of a directory listing (e.g., `find . -type f -name '*.rs'`).
-/// `diff_stat` is the output of `git diff --stat` since the last review.
-/// `recent_commits` is the output of `git log --oneline` since the last review.
-pub fn periodic_review_prompt(
-    repo_structure: &str,
-    diff_stat: &str,
-    recent_commits: &str,
-    guard_violations: &str,
-    existing_issues: &str,
-) -> String {
-    let safe_structure = wrap_external_data(repo_structure);
-    let safe_diff_stat = wrap_external_data(diff_stat);
-    let safe_commits = wrap_external_data(recent_commits);
-    let existing_issues_section = if existing_issues.is_empty() {
-        "No existing review issues.\n\n".to_string()
-    } else {
-        format!(
-            "The following issues are ALREADY tracked. Skip any finding that matches:\n{}\n\n",
-            wrap_external_data(existing_issues)
-        )
-    };
-    let violations_section = if guard_violations.is_empty() {
-        "No guard violations detected.\n".to_string()
-    } else {
-        format!(
-            "The following violations were detected by automated guard scripts. \
-             These are machine-verified facts — do not re-verify them. \
-             Add context, prioritize, and suggest fixes:\n{}\n",
-            wrap_external_data(guard_violations)
-        )
-    };
+/// The agent receives only the project path and explores the codebase itself
+/// using its tools (read files, run commands, `gh issue list`). No pre-chewed
+/// data is stuffed into the prompt — the agent decides what to look at.
+pub fn periodic_review_prompt(project_root: &str, since: &str) -> String {
     format!(
-        "You are a code review agent conducting a periodic codebase health review.\n\n\
-         ## Instructions\n\n\
-         1. Review in priority order: P0 (security) → P1 (logic/correctness) → P2 (quality) → P3 (performance)\n\
-         2. Guard scan results below are confirmed violations — include them as findings with added context\n\
-         3. Also check for issues the guards cannot detect (architectural, cross-module, semantic)\n\
-         4. Score each finding: impact (1-5), confidence (1-5), effort to fix (1-5)\n\
-         5. Focus on changes since last review when available; flag pre-existing issues only if critical\n\n\
-         ## Guard Scan Results\n\n\
-         {violations_section}\n\
-         ## Repository Context\n\n\
-         Structure:\n{safe_structure}\n\n\
-         Changes since last review:\n{safe_diff_stat}\n\n\
-         Recent commits:\n{safe_commits}\n\n\
-         ## Review Categories\n\n\
-         P0 Security: injection, XSS, path traversal, hardcoded secrets, unauth endpoints\n\
-         P1 Logic: deadlocks, race conditions, declaration-execution gaps, data inconsistency\n\
-         P2 Quality: oversized files (>400 lines), god objects (>10 pub fields), dead code, \
-         error handling (unwrap in prod, silent discards), duplicate types, config divergence\n\
-         P3 Performance: unnecessary allocations, repeated patterns, dependency bloat\n\n\
-         ## Workflow\n\n\
-         You MUST follow this exact order:\n\n\
-         ### Step 1: Create GitHub issues FIRST\n\
-         For EACH P0 and P1 finding, create a GitHub issue using `gh issue create`.\n\
-         CRITICAL: Do NOT create an issue if the same problem is already listed in Existing Issues below.\n\
-         Issue format:\n\
+        "You are a Staff Engineer conducting a periodic health review of this project.\n\n\
+         Project: {project_root}\n\
+         Last review: {since}\n\n\
+         ## Steps\n\n\
+         1. Run `git log --oneline --since=\"{since}\"` to see what changed\n\
+         2. Run `git diff --stat HEAD~20` (or since last review) to identify changed files\n\
+         3. Read the changed files — focus on correctness and safety, not style\n\
+         4. Run guard scripts if they exist: `bash .vibeguard/run-guards.sh` or similar\n\
+         5. Check existing issues: `gh issue list --state open --label review` — do NOT duplicate\n\
+         6. For P0 (security) and P1 (logic) findings, create GitHub issues with `gh issue create`\n\n\
+         ## Priority\n\n\
+         P0 Security: injection, path traversal, hardcoded secrets, unauth endpoints\n\
+         P1 Logic: deadlocks, race conditions, declaration-execution gaps, error handling\n\
+         P2 Quality: oversized files, dead code, duplicate types\n\
+         P3 Performance: unnecessary allocations, dependency bloat\n\n\
+         ## Issue format\n\n\
          - Title: `[PRIORITY] RULE_ID: short title`\n\
          - Body: description + recommended action + file:line reference\n\
-         - Labels: `review`, priority label (e.g. `p0`, `p1`)\n\
-         Do NOT create issues for P2 or P3 findings. Do NOT create PRs or edit any files.\n\n\
-         ### Step 2: Output structured JSON LAST\n\
-         After all issues are created, output the review JSON wrapped in markers.\n\
-         The JSON MUST appear between `REVIEW_JSON_START` and `REVIEW_JSON_END` markers.\n\n\
+         - Labels: `review`, priority label (`p0`, `p1`)\n\
+         - Only create issues for P0 and P1. Do NOT create PRs or edit files.\n\n\
+         ## Output\n\n\
+         After creating issues, output structured JSON between markers:\n\n\
          REVIEW_JSON_START\n\
          {{\n\
            \"findings\": [\n\
@@ -461,15 +424,8 @@ pub fn periodic_review_prompt(
            }}\n\
          }}\n\
          REVIEW_JSON_END\n\n\
-         Rules:\n\
-         - health_score: 100 minus deductions (P0: -15 each, P1: -8, P2: -3, P3: -1), minimum 0\n\
-         - line: use 0 if unknown\n\
-         - rule_id: use guard rule_id if from scan (e.g. RS-03, SEC-07), or REVIEW-XX for new findings\n\
-         - id: sequential F001, F002, etc.\n\
-         - The JSON between the markers must be valid and parseable. No markdown fences inside the markers.\n\n\
-         ## Existing Issues (DO NOT DUPLICATE)\n\n\
-         {existing_issues_section}\
-         Do NOT duplicate any finding already listed above."
+         health_score = 100 minus deductions (P0: -15, P1: -8, P2: -3, P3: -1), minimum 0.\n\
+         The JSON must be valid and parseable. No markdown fences inside the markers."
     )
 }
 

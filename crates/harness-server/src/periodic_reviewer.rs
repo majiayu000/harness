@@ -103,51 +103,13 @@ async fn run_review_tick(
         }
     }
 
-    // Gather context strings for the review prompt.
     let since_arg = last_review_ts
         .map(|ts| ts.to_rfc3339())
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
-    let repo_structure = gather_repo_structure(project_root).await;
-    let diff_stat = gather_diff_stat(project_root, &since_arg).await;
-    let recent_commits = gather_recent_commits(project_root, &since_arg).await;
-
-    // Run VibeGuard guard scans and include violations in the review context.
-    let guard_violations = {
-        let rules = state.engines.rules.read().await;
-        match rules.scan(project_root).await {
-            Ok(violations) => {
-                if violations.is_empty() {
-                    String::new()
-                } else {
-                    let mut buf = String::from("Guard scan found the following violations:\n");
-                    for v in &violations {
-                        buf.push_str(&format!(
-                            "- [{}] {}: {}\n",
-                            v.rule_id,
-                            v.file.display(),
-                            v.message
-                        ));
-                    }
-                    buf
-                }
-            }
-            Err(e) => {
-                tracing::warn!("scheduler: guard scan failed, proceeding without: {e}");
-                String::new()
-            }
-        }
-    };
-
-    // Gather existing review issues to prevent duplicate creation.
-    let existing_issues = gather_existing_review_issues(project_root).await;
-
     let prompt = harness_core::prompts::periodic_review_prompt(
-        &repo_structure,
-        &diff_stat,
-        &recent_commits,
-        &guard_violations,
-        &existing_issues,
+        &project_root.display().to_string(),
+        &since_arg,
     );
 
     let req = CreateTaskRequest {
@@ -271,98 +233,6 @@ async fn run_review_tick(
     *poll_handle.lock().await = Some(handle);
 
     Ok(())
-}
-
-async fn gather_repo_structure(project_root: &std::path::Path) -> String {
-    let output = tokio::process::Command::new("git")
-        .args(["ls-files", "--", "*.rs"])
-        .current_dir(project_root)
-        .output()
-        .await;
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => String::new(),
-    }
-}
-
-async fn gather_diff_stat(project_root: &std::path::Path, since: &str) -> String {
-    // Find the first new commit after `since` to diff from its parent.
-    let rev_output = tokio::process::Command::new("git")
-        .args([
-            "log",
-            "--format=%H",
-            &format!("--since={since}"),
-            "--reverse",
-            "-1",
-        ])
-        .current_dir(project_root)
-        .output()
-        .await;
-
-    let first_new_commit = match rev_output {
-        Ok(o) => {
-            let hash = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if hash.is_empty() {
-                return String::new();
-            }
-            hash
-        }
-        Err(_) => return String::new(),
-    };
-
-    let output = tokio::process::Command::new("git")
-        .args(["diff", "--stat", &format!("{first_new_commit}^"), "HEAD"])
-        .current_dir(project_root)
-        .output()
-        .await;
-
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => String::new(),
-    }
-}
-
-/// Fetch open GitHub issues with the "review" label so the agent can skip known problems.
-async fn gather_existing_review_issues(project_root: &std::path::Path) -> String {
-    let output = tokio::process::Command::new("gh")
-        .args([
-            "issue",
-            "list",
-            "--label",
-            "review",
-            "--state",
-            "open",
-            "--json",
-            "number,title",
-            "--jq",
-            ".[] | \"#\\(.number) \\(.title)\"",
-        ])
-        .current_dir(project_root)
-        .output()
-        .await;
-    match output {
-        Ok(o) if o.status.success() => {
-            let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if text.is_empty() {
-                String::new()
-            } else {
-                text
-            }
-        }
-        _ => String::new(),
-    }
-}
-
-async fn gather_recent_commits(project_root: &std::path::Path, since: &str) -> String {
-    let output = tokio::process::Command::new("git")
-        .args(["log", "--oneline", &format!("--since={since}")])
-        .current_dir(project_root)
-        .output()
-        .await;
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => String::new(),
-    }
 }
 
 #[cfg(test)]
