@@ -158,7 +158,7 @@ impl IntakeOrchestrator {
     }
 }
 
-/// Run a sprint planner + execute rounds for a single repo's issues.
+/// Run sprint planner + DAG-based slot-filling execution for a single repo.
 async fn run_repo_sprint(
     state: &Arc<AppState>,
     repo: &str,
@@ -171,7 +171,6 @@ async fn run_repo_sprint(
         "intake: planning sprint for repo"
     );
 
-    // Resolve project_root from the first issue, fall back to server default.
     let project_root = issues
         .first()
         .and_then(|(_, i)| i.project_root.clone())
@@ -212,7 +211,7 @@ async fn run_repo_sprint(
 
     tracing::info!(
         repo,
-        rounds = plan.rounds.len(),
+        tasks = plan.tasks.len(),
         skipped = plan.skip.len(),
         "intake: sprint plan parsed"
     );
@@ -236,22 +235,64 @@ async fn run_repo_sprint(
         }
     }
 
-    // 3. Execute rounds sequentially.
-    for (round_idx, round) in plan.rounds.iter().enumerate() {
-        tracing::info!(repo, round = round_idx + 1, issues = ?round.issues, "intake: starting round");
+    // 3. DAG slot-filling execution.
+    // Track: which issues are completed, which are running, which are waiting.
+    let mut completed: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut running: std::collections::HashMap<u64, TaskId> = std::collections::HashMap::new();
+    let all_task_issues: std::collections::HashSet<u64> =
+        plan.tasks.iter().map(|t| t.issue).collect();
+    let deps: std::collections::HashMap<u64, Vec<u64>> = plan
+        .tasks
+        .iter()
+        .map(|t| (t.issue, t.depends_on.clone()))
+        .collect();
 
-        let mut round_task_ids: Vec<TaskId> = Vec::new();
+    let max_slots = 4usize; // matches max_concurrent in config
+    let start = tokio::time::Instant::now();
 
-        for &issue_num in &round.issues {
+    loop {
+        // All done?
+        if completed.len() + plan.skip.len() >= all_task_issues.len() + plan.skip.len()
+            && running.is_empty()
+        {
+            break;
+        }
+        if completed.len() >= all_task_issues.len() {
+            break;
+        }
+        if start.elapsed() > TASK_TIMEOUT {
+            tracing::warn!(repo, "intake: DAG execution timed out");
+            break;
+        }
+
+        // Find ready tasks: not started, not completed, all deps satisfied.
+        let ready: Vec<u64> = all_task_issues
+            .iter()
+            .filter(|&&issue| {
+                !completed.contains(&issue)
+                    && !running.contains_key(&issue)
+                    && deps
+                        .get(&issue)
+                        .map(|d| d.iter().all(|dep| completed.contains(dep)))
+                        .unwrap_or(true)
+            })
+            .copied()
+            .collect();
+
+        // Fill available slots.
+        let available = max_slots.saturating_sub(running.len());
+        for &issue_num in ready.iter().take(available) {
             let ext_id = issue_num.to_string();
             let Some((source, issue)) = issue_map.get(&ext_id) else {
                 tracing::warn!(repo, external_id = %ext_id, "intake: issue not found");
+                completed.insert(issue_num);
                 continue;
             };
 
             let placeholder_id = TaskId(format!("pending-{ext_id}"));
             if let Err(e) = source.mark_dispatched(&ext_id, &placeholder_id).await {
                 tracing::warn!(external_id = %ext_id, "intake: mark_dispatched failed: {e}");
+                completed.insert(issue_num);
                 continue;
             }
 
@@ -268,30 +309,59 @@ async fn run_repo_sprint(
 
             match crate::http::task_routes::enqueue_task(state, req).await {
                 Ok(task_id) => {
-                    tracing::info!(repo, external_id = %ext_id, task_id = %task_id, "intake: dispatched");
+                    tracing::info!(
+                        repo,
+                        external_id = %ext_id,
+                        task_id = %task_id,
+                        running = running.len() + 1,
+                        "intake: dispatched (slot filled)"
+                    );
                     if let Err(e) = source.mark_dispatched(&ext_id, &task_id).await {
                         tracing::warn!(external_id = %ext_id, "intake: mark_dispatched update failed: {e}");
                     }
-                    round_task_ids.push(task_id);
+                    running.insert(issue_num, task_id);
                 }
                 Err(e) => {
                     tracing::error!(repo, external_id = %ext_id, "intake: failed to spawn: {e:?}");
                     source.unmark_dispatched(&ext_id).await;
+                    completed.insert(issue_num);
                 }
             }
         }
 
-        if !round_task_ids.is_empty() {
-            tracing::info!(
-                repo,
-                round = round_idx + 1,
-                tasks = round_task_ids.len(),
-                "intake: waiting for round"
-            );
-            wait_for_tasks(&state.core.tasks, &round_task_ids).await;
-            tracing::info!(repo, round = round_idx + 1, "intake: round complete");
+        if running.is_empty() {
+            break;
+        }
+
+        // Wait for any running task to complete.
+        tokio::time::sleep(TASK_POLL_INTERVAL).await;
+        let mut newly_done = Vec::new();
+        for (&issue_num, task_id) in &running {
+            if let Some(task) = state.core.tasks.get(task_id) {
+                if matches!(task.status, TaskStatus::Done | TaskStatus::Failed) {
+                    tracing::info!(
+                        repo,
+                        external_id = issue_num,
+                        task_id = %task_id,
+                        status = task.status.as_ref(),
+                        "intake: task finished"
+                    );
+                    newly_done.push(issue_num);
+                }
+            }
+        }
+        for issue_num in newly_done {
+            running.remove(&issue_num);
+            completed.insert(issue_num);
         }
     }
+
+    tracing::info!(
+        repo,
+        completed = completed.len(),
+        elapsed_secs = start.elapsed().as_secs(),
+        "intake: repo sprint complete"
+    );
 }
 
 /// Format collected issues into a summary for the planner prompt.
@@ -347,34 +417,6 @@ async fn poll_task_output(
             return None;
         }
         return Some(output);
-    }
-}
-
-/// Wait for all tasks to reach a terminal state.
-async fn wait_for_tasks(store: &crate::task_runner::TaskStore, task_ids: &[TaskId]) {
-    let start = tokio::time::Instant::now();
-    let mut pending: std::collections::HashSet<String> =
-        task_ids.iter().map(|id| id.0.clone()).collect();
-
-    loop {
-        if pending.is_empty() {
-            return;
-        }
-        tokio::time::sleep(TASK_POLL_INTERVAL).await;
-        if start.elapsed() > TASK_TIMEOUT {
-            tracing::warn!(
-                remaining = pending.len(),
-                "intake: timed out waiting for round"
-            );
-            return;
-        }
-        pending.retain(|id| {
-            let task_id = TaskId(id.clone());
-            let Some(task) = store.get(&task_id) else {
-                return true;
-            };
-            !matches!(task.status, TaskStatus::Done | TaskStatus::Failed)
-        });
     }
 }
 

@@ -662,11 +662,12 @@ pub fn build_matched_skills_section<'a>(
     out
 }
 
-/// A single round in a sprint plan: issues to dispatch in parallel.
+/// A task node in the sprint DAG.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
-pub struct SprintRound {
-    pub issues: Vec<u64>,
-    pub reason: String,
+pub struct SprintTask {
+    pub issue: u64,
+    #[serde(default)]
+    pub depends_on: Vec<u64>,
 }
 
 /// An issue the planner decided to skip.
@@ -676,18 +677,19 @@ pub struct SprintSkip {
     pub reason: String,
 }
 
-/// Structured sprint plan produced by the planner agent.
+/// DAG-based sprint plan. The scheduler fills slots with tasks whose
+/// dependencies are satisfied, keeping all slots busy at all times.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
 pub struct SprintPlan {
-    pub rounds: Vec<SprintRound>,
+    pub tasks: Vec<SprintTask>,
     #[serde(default)]
     pub skip: Vec<SprintSkip>,
 }
 
 /// Build prompt for the sprint planner agent.
 ///
-/// The agent reads all pending issues, checks the codebase for file overlap,
-/// and groups issues into sequential rounds with parallel execution within each round.
+/// The agent outputs a dependency graph (DAG), not rounds. The scheduler
+/// handles parallelism by filling slots with ready tasks.
 pub fn sprint_plan_prompt(issues: &str) -> String {
     let safe_issues = wrap_external_data(issues);
     format!(
@@ -695,27 +697,27 @@ pub fn sprint_plan_prompt(issues: &str) -> String {
          ## Pending Issues\n\n\
          {safe_issues}\n\n\
          ## Task\n\n\
-         Group these issues into execution rounds. Issues within the same round will be \
-         worked on in parallel by separate agents, while rounds execute sequentially.\n\n\
          For each issue, read its description and check the codebase to understand which \
-         files it touches. Issues that modify overlapping files MUST be in different rounds \
-         to avoid merge conflicts.\n\n\
-         Higher priority issues (P0 > P1 > P2) should go in earlier rounds.\n\
-         If issue B depends on issue A's fix, A must be in an earlier round.\n\n\
-         Mark issues as \"skip\" if they are already fixed by recent commits, are duplicates, \
-         or are invalid.\n\n\
+         files it would touch. Then output a dependency graph:\n\
+         - `depends_on`: list issue numbers that MUST complete before this one starts \
+         (because they touch the same files or this fix builds on that fix)\n\
+         - Empty `depends_on` means the issue can start immediately\n\
+         - Higher priority (P0 > P1) issues should have fewer dependencies\n\
+         - Mark issues as \"skip\" if already fixed, duplicate, or invalid\n\n\
          SPRINT_PLAN_START\n\
          {{\n\
-           \"rounds\": [\n\
-             {{\"issues\": [510, 514], \"reason\": \"independent security fixes\"}},\n\
-             {{\"issues\": [511], \"reason\": \"depends on 510 changes\"}}\n\
+           \"tasks\": [\n\
+             {{\"issue\": 510, \"depends_on\": []}},\n\
+             {{\"issue\": 514, \"depends_on\": []}},\n\
+             {{\"issue\": 511, \"depends_on\": [510]}},\n\
+             {{\"issue\": 515, \"depends_on\": [514]}}\n\
            ],\n\
            \"skip\": [\n\
              {{\"issue\": 452, \"reason\": \"fixed by recent commit\"}}\n\
            ]\n\
          }}\n\
          SPRINT_PLAN_END\n\n\
-         Every pending issue must appear in exactly one round or in skip.\n\
+         Every pending issue must appear in tasks or skip.\n\
          The JSON between markers must be valid and parseable."
     )
 }
