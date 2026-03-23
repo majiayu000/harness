@@ -10,7 +10,7 @@ pub use agents::{
     AgentReviewConfig, AgentsConfig, AnthropicApiConfig, ApprovalPolicy, CapabilityProfile,
     ClaudeAgentConfig, CodexAgentConfig, CodexCloudConfig, SandboxMode,
 };
-pub use intake::{FeishuIntakeConfig, GitHubIntakeConfig, IntakeConfig};
+pub use intake::{FeishuIntakeConfig, GitHubIntakeConfig, GitHubRepoConfig, IntakeConfig};
 pub use misc::{
     ConcurrencyConfig, GcConfig, ObserveConfig, OtelConfig, OtelExporter, ReviewConfig,
     RulesConfig, SignalThresholdsConfig, ValidationConfig, WorkspaceConfig,

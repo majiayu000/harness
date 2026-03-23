@@ -291,6 +291,7 @@ pub async fn feishu_webhook(
         priority: None,
         labels: vec!["feishu".to_string()],
         created_at: None,
+        project_root: None,
     };
 
     // 9. Store chat_id before dispatching so mark_dispatched can reply.
@@ -518,6 +519,7 @@ mod tests {
             priority: None,
             labels: vec!["feishu".to_string()],
             created_at: None,
+            project_root: None,
         };
 
         assert_eq!(issue.source, "feishu");

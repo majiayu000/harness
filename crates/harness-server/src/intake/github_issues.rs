@@ -11,18 +11,20 @@ use crate::task_runner::{TaskId, TaskStatus};
 pub struct GitHubIssuesPoller {
     repo: String,
     label: String,
+    project_root: Option<PathBuf>,
     dispatched: DashMap<String, TaskId>,
     persist_path: Option<PathBuf>,
 }
 
 impl GitHubIssuesPoller {
-    pub fn new(config: &harness_core::GitHubIntakeConfig, data_dir: Option<&Path>) -> Self {
-        let repo_slug = config.repo.replace('/', "_");
+    pub fn new(repo_config: &harness_core::GitHubRepoConfig, data_dir: Option<&Path>) -> Self {
+        let repo_slug = repo_config.repo.replace('/', "_");
         let persist_path = data_dir.map(|d| d.join(format!("github_dispatched_{repo_slug}.json")));
         let dispatched = Self::load_dispatched(persist_path.as_deref());
         Self {
-            repo: config.repo.clone(),
-            label: config.label.clone(),
+            repo: repo_config.repo.clone(),
+            label: repo_config.label.clone(),
+            project_root: repo_config.project_root.as_ref().map(PathBuf::from),
             dispatched,
             persist_path,
         }
@@ -117,6 +119,7 @@ fn parse_gh_output(
     json: &[u8],
     repo: &str,
     dispatched: &DashMap<String, TaskId>,
+    project_root: Option<&std::path::Path>,
 ) -> anyhow::Result<ParsedGhOutput> {
     let issues: Vec<GhIssue> = serde_json::from_slice(json)?;
     let open_issue_ids: std::collections::HashSet<String> =
@@ -135,6 +138,7 @@ fn parse_gh_output(
             priority: None,
             labels: issue.labels.into_iter().map(|l| l.name).collect(),
             created_at: issue.created_at,
+            project_root: project_root.map(|p| p.to_path_buf()),
         })
         .collect();
     Ok(ParsedGhOutput {
@@ -173,7 +177,12 @@ impl IntakeSource for GitHubIssuesPoller {
             anyhow::bail!("gh issue list failed: {stderr}");
         }
 
-        let parsed = parse_gh_output(&output.stdout, &self.repo, &self.dispatched)?;
+        let parsed = parse_gh_output(
+            &output.stdout,
+            &self.repo,
+            &self.dispatched,
+            self.project_root.as_deref(),
+        )?;
 
         // Evict dispatched entries for issues no longer open (closed/deleted).
         // This prevents unbounded growth of the dispatched map.
@@ -250,7 +259,7 @@ mod tests {
         ]"#;
 
         let dispatched = DashMap::new();
-        let parsed = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
 
         assert_eq!(parsed.new_issues.len(), 1);
         assert_eq!(parsed.open_issue_ids.len(), 1);
@@ -282,7 +291,7 @@ mod tests {
 
         // Issues 1 and 2 already dispatched
         let dispatched = make_dispatched(&["1", "2"]);
-        let parsed = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
 
         assert_eq!(parsed.new_issues.len(), 1);
         assert_eq!(parsed.new_issues[0].external_id, "3");
@@ -293,7 +302,7 @@ mod tests {
     fn parse_gh_output_empty_array() {
         let json = b"[]";
         let dispatched = DashMap::new();
-        let parsed = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
         assert!(parsed.new_issues.is_empty());
         assert!(parsed.open_issue_ids.is_empty());
     }
@@ -302,7 +311,7 @@ mod tests {
     fn parse_gh_output_invalid_json_returns_error() {
         let json = b"not valid json";
         let dispatched = DashMap::new();
-        let result = parse_gh_output(json, "owner/repo", &dispatched);
+        let result = parse_gh_output(json, "owner/repo", &dispatched, None);
         assert!(result.is_err());
     }
 
@@ -312,7 +321,7 @@ mod tests {
             {"number": 5, "title": "No body", "body": null, "url": "u", "labels": [], "createdAt": null}
         ]"#;
         let dispatched = DashMap::new();
-        let parsed = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
         assert_eq!(parsed.new_issues[0].description, None);
     }
 
@@ -325,7 +334,7 @@ mod tests {
 
         // Issue 5 was dispatched but is no longer in the open list (closed).
         let dispatched = make_dispatched(&["5", "10"]);
-        let parsed = parse_gh_output(json, "owner/repo", &dispatched).unwrap();
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
 
         // Only issue 20 is new (10 already dispatched).
         assert_eq!(parsed.new_issues.len(), 1);
@@ -339,13 +348,12 @@ mod tests {
 
     #[test]
     fn github_issues_poller_name_is_github() {
-        let config = harness_core::GitHubIntakeConfig {
-            enabled: true,
+        let repo_cfg = harness_core::GitHubRepoConfig {
             repo: "owner/repo".to_string(),
             label: "harness".to_string(),
-            poll_interval_secs: 30,
+            project_root: None,
         };
-        let poller = GitHubIssuesPoller::new(&config, None);
+        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
         assert_eq!(poller.name(), "github");
     }
 }
