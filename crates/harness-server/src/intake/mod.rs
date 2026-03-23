@@ -79,6 +79,9 @@ const TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Polling interval when waiting for task completion.
 const TASK_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
+type IntakeIssueEntry = (Arc<dyn IntakeSource>, IncomingIssue);
+type IssuesByRepo = std::collections::HashMap<String, Vec<IntakeIssueEntry>>;
+
 impl IntakeOrchestrator {
     pub fn new(
         sources: Vec<Arc<dyn IntakeSource>>,
@@ -113,10 +116,7 @@ impl IntakeOrchestrator {
 
     async fn poll_tick(&self, state: &Arc<AppState>) {
         // 1. Collect all new issues from all sources, grouped by repo.
-        let mut by_repo: std::collections::HashMap<
-            String,
-            Vec<(Arc<dyn IntakeSource>, IncomingIssue)>,
-        > = std::collections::HashMap::new();
+        let mut by_repo: IssuesByRepo = std::collections::HashMap::new();
 
         for source in &self.sources {
             let issues = match source.poll().await {
