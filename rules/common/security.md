@@ -29,3 +29,16 @@ Use `yaml.safe_load()`, avoid `pickle` on untrusted data.
 
 ## SEC-10: Sensitive data in logs (medium)
 Redact passwords and tokens with `***`.
+
+## SEC-11: Security logic invisible to agents (high)
+Auth, authz, and input validation hidden in config files, decorators, or middleware causes AI agents to miss security checks when adding new routes/endpoints. Fix: security checks must be explicitly visible in business code (e.g., call `check_auth()` inside route handlers), not rely solely on framework implicit injection.
+
+Source: Armin Ronacher (Flask author) agentic coding observations.
+
+## SEC-12: MCP Docker config causes container leaks (medium)
+MCP servers launched via `docker run -i` leave orphaned containers when Claude Code exits without sending SIGINT. Fix: prefer `uvx` (Python) or `npx` (Node.js) over `docker run`; periodically check `docker ps | grep mcp`.
+
+## SEC-13: MCP tool poisoning and rug pulls (high)
+MCP tool definitions can be maliciously replaced (Tool Poisoning) or mutate behavior after trust is established (Rug Pull). Fix: audit tool definitions and permission scope after installing new MCP servers; diff tool lists when updating MCP dependencies (`diff <(old) <(new)`); do not trust community MCP servers from unknown sources.
+
+Source: ETDI (arXiv:2506.01333) — Enhanced Tool Definition Interface proposes cryptographic identity verification + immutable versioned definitions + OAuth 2.0 permission management.
