@@ -108,7 +108,12 @@ async fn run_review_tick(
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
     let project_str = project_root.display().to_string();
-    let base_prompt = harness_core::prompts::periodic_review_prompt(&project_str, &since_arg);
+    let project_cfg = harness_core::config::load_project_config(project_root);
+    let base_prompt = harness_core::prompts::periodic_review_prompt(
+        &project_str,
+        &since_arg,
+        project_cfg.review_type.as_str(),
+    );
 
     // --- Phase 1: Parallel review by Claude + Codex ---
     let claude_req = CreateTaskRequest {
