@@ -994,6 +994,11 @@ pub(crate) async fn run_task(
 
     let review_phase_start = Instant::now();
 
+    // Impasse detection state (issue #530).
+    // Tracks consecutive rounds with the same error signature to detect a stuck agent.
+    let mut last_error_sig: Option<u64> = None;
+    let mut error_sig_streak: u32 = 0;
+
     // Review loop
     for round in 1..=effective_max_rounds {
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
@@ -1005,10 +1010,16 @@ pub(crate) async fn run_task(
                     prompts::check_existing_pr(pr_num, &review_config.review_bot_command, &slug);
                 // Inject capability note — primary enforcement now that --allowedTools
                 // is not passed to the CLI (issue #483).
-                if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
+                let with_cap = if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
                     format!("{note}\n\n{base}")
                 } else {
                     base
+                };
+                // Inject impasse intervention note when the agent appears stuck.
+                if error_sig_streak >= prompts::IMPASSE_INTERVENTION_THRESHOLD {
+                    format!("{}\n\n{}", prompts::impasse_intervention_note(), with_cap)
+                } else {
+                    with_cap
                 }
             },
             project_root: project.clone(),
@@ -1115,6 +1126,48 @@ pub(crate) async fn run_task(
             tracing::info!(
                 task_id = %task_id,
                 status = "done",
+                turns = round.saturating_add(1),
+                pr_url = pr_url.as_deref().unwrap_or(""),
+                total_elapsed_secs = task_start.elapsed().as_secs(),
+                "task_completed"
+            );
+            return Ok(());
+        }
+
+        // Impasse detection: track consecutive rounds with identical error signatures.
+        let sig = prompts::review_error_signature(&output);
+        if last_error_sig == Some(sig) {
+            error_sig_streak += 1;
+        } else {
+            last_error_sig = Some(sig);
+            error_sig_streak = 1;
+        }
+        tracing::info!(
+            task_id = %task_id,
+            round,
+            error_sig_streak,
+            "impasse check"
+        );
+        if error_sig_streak >= prompts::IMPASSE_FAIL_THRESHOLD {
+            tracing::warn!(
+                task_id = %task_id,
+                round,
+                error_sig_streak,
+                "impasse detected — agent stuck repeating same error; failing early"
+            );
+            mutate_and_persist(store, task_id, |s| {
+                s.status = TaskStatus::Failed;
+                s.turn = round.saturating_add(1);
+                s.error = Some(format!(
+                    "Impasse detected: same error repeated {} consecutive rounds. \
+                     Failing early to avoid burning remaining rounds.",
+                    error_sig_streak
+                ));
+            })
+            .await?;
+            tracing::info!(
+                task_id = %task_id,
+                status = "failed",
                 turns = round.saturating_add(1),
                 pr_url = pr_url.as_deref().unwrap_or(""),
                 total_elapsed_secs = task_start.elapsed().as_secs(),

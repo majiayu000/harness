@@ -183,6 +183,40 @@ pub fn check_existing_pr(pr: u64, review_bot_command: &str, repo: &str) -> Strin
     )
 }
 
+/// Build an impasse intervention note to prepend to review prompts when the agent
+/// appears stuck repeating the same failing approach.
+///
+/// This note is injected into the `check_existing_pr` prompt after the same error
+/// signature is observed for `IMPASSE_INTERVENTION_THRESHOLD` consecutive rounds.
+pub fn impasse_intervention_note() -> &'static str {
+    "IMPORTANT: The previous review rounds produced identical errors. \
+     Step back and try a completely different approach to fix the underlying issue. \
+     Do not repeat the same fix strategy that has already failed multiple times."
+}
+
+/// Consecutive identical-error-signature rounds that trigger an intervention note.
+pub const IMPASSE_INTERVENTION_THRESHOLD: u32 = 3;
+
+/// Consecutive identical-error-signature rounds that trigger an immediate failure.
+pub const IMPASSE_FAIL_THRESHOLD: u32 = 5;
+
+/// Compute a stable signature for review-round output used in impasse detection.
+///
+/// Normalises the output (lowercase, first 1 024 chars) and returns a 64-bit hash.
+/// Two rounds whose signatures are equal are considered to contain the same error.
+pub fn review_error_signature(output: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let normalised: String = output
+        .chars()
+        .take(1024)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let mut h = DefaultHasher::new();
+    normalised.hash(&mut h);
+    h.finish()
+}
+
 /// Wrap user-supplied content in delimiters to separate it from trusted instructions.
 /// Escapes the closing tag within content to prevent delimiter injection.
 pub fn wrap_external_data(content: &str) -> String {
@@ -1564,5 +1598,53 @@ PR_URL=https://github.com/owner/repo/pull/269";
         let p = agent_review_prompt("https://github.com/owner/repo/pull/42", 1);
         assert!(p.contains("Staff Engineer"));
         assert!(p.contains("security > logic > quality > style"));
+    }
+
+    #[test]
+    fn test_review_error_signature_same_output() {
+        let out = "Some error: foo bar baz\nFIXED";
+        assert_eq!(
+            review_error_signature(out),
+            review_error_signature(out),
+            "same output must produce same signature"
+        );
+    }
+
+    #[test]
+    fn test_review_error_signature_different_output() {
+        let a = "Error: missing semicolon on line 42\nFIXED";
+        let b = "Error: undefined variable `x`\nFIXED";
+        assert_ne!(
+            review_error_signature(a),
+            review_error_signature(b),
+            "different errors should produce different signatures"
+        );
+    }
+
+    #[test]
+    fn test_review_error_signature_case_insensitive() {
+        let lower = "error: foo\nfixed";
+        let upper = "ERROR: FOO\nFIXED";
+        assert_eq!(
+            review_error_signature(lower),
+            review_error_signature(upper),
+            "signature should be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn test_impasse_thresholds() {
+        const {
+            assert!(IMPASSE_INTERVENTION_THRESHOLD < IMPASSE_FAIL_THRESHOLD);
+            assert!(IMPASSE_INTERVENTION_THRESHOLD == 3);
+            assert!(IMPASSE_FAIL_THRESHOLD == 5);
+        }
+    }
+
+    #[test]
+    fn test_impasse_intervention_note_non_empty() {
+        let note = impasse_intervention_note();
+        assert!(!note.is_empty());
+        assert!(note.contains("different approach"));
     }
 }
