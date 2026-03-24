@@ -392,6 +392,35 @@ pub fn agent_review_fix_prompt(
     )
 }
 
+/// Build prompt: impasse detected — same issues repeated from the previous round.
+///
+/// Tells the implementor that their previous fix did not resolve the flagged issues
+/// and asks them to try a different approach rather than repeating the same strategy.
+pub fn agent_review_intervention_prompt(
+    pr_url: &str,
+    issues: &[String],
+    round: u32,
+    project_type: &str,
+) -> String {
+    let issue_list: String = issues
+        .iter()
+        .enumerate()
+        .map(|(i, issue)| format!("{}. {issue}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let safe_issue_list = wrap_external_data(&issue_list);
+    let validation_cmd = validation_cmd_for_type(project_type);
+    format!(
+        "IMPASSE DETECTED: The previous fix attempt did not resolve the issues in PR {pr_url} \
+         (agent review round {round}). The reviewer flagged the same problems again.\n\n\
+         Re-examine root causes rather than symptoms. Consider a different approach entirely \
+         instead of repeating the same fix strategy.\n\n\
+         Issues that remain unresolved:\n\n{safe_issue_list}\n\n\
+         Fix each issue, run {validation_cmd}, then commit and push.\n\
+         On the last line of your output, print PR_URL=<PR URL>"
+    )
+}
+
 /// Return project-type-specific P1 Logic review criteria.
 fn p1_logic_for_type(project_type: &str) -> &'static str {
     match project_type {

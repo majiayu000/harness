@@ -1166,6 +1166,18 @@ pub(crate) async fn run_task(
     Ok(())
 }
 
+/// Compute a stable hash over a set of review issues.
+/// Issues are sorted before hashing so insertion order does not affect the result.
+fn hash_issues(issues: &[String]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut sorted = issues.to_vec();
+    sorted.sort();
+    let mut hasher = DefaultHasher::new();
+    sorted.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_review(
     store: &TaskStore,
@@ -1183,6 +1195,7 @@ async fn run_agent_review(
     cargo_env: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
     let max_rounds = review_config.max_rounds;
+    let mut prev_issues_hash: Option<u64> = None;
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
 
@@ -1331,9 +1344,29 @@ async fn run_agent_review(
             break;
         }
 
+        // Detect impasse: same issues repeated from the previous round.
+        let current_hash = hash_issues(&issues);
+        let is_impasse = prev_issues_hash == Some(current_hash);
+        prev_issues_hash = Some(current_hash);
+        if is_impasse {
+            tracing::warn!(
+                agent_round,
+                "agent review impasse detected — same issues repeated, using intervention prompt"
+            );
+        }
+
         // Implementor fixes the issues
         let fix_req = AgentRequest {
-            prompt: prompts::agent_review_fix_prompt(pr_url, &issues, agent_round, project_type),
+            prompt: if is_impasse {
+                prompts::agent_review_intervention_prompt(
+                    pr_url,
+                    &issues,
+                    agent_round,
+                    project_type,
+                )
+            } else {
+                prompts::agent_review_fix_prompt(pr_url, &issues, agent_round, project_type)
+            },
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Execution),
@@ -1570,5 +1603,57 @@ mod tests {
         let result = prepend_constitution("Do the task.".to_string(), false);
         assert_eq!(result, "Do the task.");
         assert!(!result.contains("GP-01"));
+    }
+
+    #[test]
+    fn hash_issues_same_issues_produce_same_hash() {
+        let issues = vec!["issue A".to_string(), "issue B".to_string()];
+        assert_eq!(hash_issues(&issues), hash_issues(&issues));
+    }
+
+    #[test]
+    fn hash_issues_different_issues_produce_different_hash() {
+        let issues_a = vec!["issue A".to_string()];
+        let issues_b = vec!["issue B".to_string()];
+        assert_ne!(hash_issues(&issues_a), hash_issues(&issues_b));
+    }
+
+    #[test]
+    fn hash_issues_order_invariant() {
+        let issues_ordered = vec!["issue A".to_string(), "issue B".to_string()];
+        let issues_reversed = vec!["issue B".to_string(), "issue A".to_string()];
+        assert_eq!(hash_issues(&issues_ordered), hash_issues(&issues_reversed));
+    }
+
+    #[test]
+    fn impasse_detection_logic_no_impasse_on_first_round() {
+        let issues = vec!["null pointer".to_string()];
+        let mut prev_hash: Option<u64> = None;
+        let current_hash = hash_issues(&issues);
+        let is_impasse = prev_hash == Some(current_hash);
+        prev_hash = Some(current_hash);
+        assert!(!is_impasse);
+        assert_eq!(prev_hash, Some(current_hash));
+    }
+
+    #[test]
+    fn impasse_detection_logic_detected_when_issues_repeat() {
+        let issues = vec!["null pointer".to_string()];
+        let mut prev_hash: Option<u64> = None;
+        // Round 1
+        let h1 = hash_issues(&issues);
+        let impasse_r1 = prev_hash == Some(h1);
+        prev_hash = Some(h1);
+        // Round 2 — same issues
+        let h2 = hash_issues(&issues);
+        let impasse_r2 = prev_hash == Some(h2);
+        prev_hash = Some(h2);
+        // Round 3 — different issues
+        let other_issues = vec!["different bug".to_string()];
+        let h3 = hash_issues(&other_issues);
+        let impasse_r3 = prev_hash == Some(h3);
+        assert!(!impasse_r1, "no impasse on first round");
+        assert!(impasse_r2, "impasse when same issues repeated");
+        assert!(!impasse_r3, "no impasse when issues change");
     }
 }
