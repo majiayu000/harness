@@ -500,6 +500,10 @@ pub(crate) async fn run_task(
 ) -> anyhow::Result<()> {
     let task_start = Instant::now();
 
+    if !project.exists() {
+        anyhow::bail!("project_root does not exist: {}", project.display());
+    }
+
     // Set CARGO_TARGET_DIR to a per-task temp path so parallel agents running
     // cargo check/test simultaneously do not contend on the same build directory.
     // A per-project path caused `.cargo-lock` contention and build failures when
