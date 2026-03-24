@@ -1,0 +1,148 @@
+{
+  "updated_at": "2026-03-24T00:00:00Z",
+  "rules": {
+    "RS-01": {
+      "lifecycle": "warn",
+      "tp": 0,
+      "fp": 0,
+      "acceptable": 0,
+      "samples": 0,
+      "precision": null,
+      "promoted_at": null,
+      "last_fp_at": null,
+      "notes": "Nested lock acquisition — deadlock risk."
+    },
+    "RS-02": {
+      "lifecycle": "warn",
+      "tp": 0,
+      "fp": 0,
+      "acceptable": 0,
+      "samples": 0,
+      "precision": null,
+      "promoted_at": null,
+      "last_fp_at": null,
+      "notes": "TOCTOU: get() then insert() without Entry API."
+    },
+    "RS-02B": {
+      "lifecycle": "warn",
+      "tp": 0,
+      "fp": 0,
+      "acceptable": 0,
+      "samples": 0,
+      "precision": null,
+      "promoted_at": null,
+      "last_fp_at": null,
+      "notes": "TOCTOU in SQL queries."
+    },
+    "RS-03": {
+      "lifecycle": "warn",
+      "tp": 0,
+      "fp": 0,
+      "acceptable": 0,
+      "samples": 0,
+      "precision": null,
+      "promoted_at": null,
+      "last_fp_at": null,
+      "notes": "unwrap()/expect() in non-test code. Exempt: fn main(), Mutex::lock().unwrap(), RwLock::{read,write}().unwrap()."
+    },
+    "RS-10": {
+      "lifecycle": "warn",
+      "tp": 0,
+      "fp": 0,
+      "acceptable": 0,
+      "samples": 0,
+      "precision": null,
+      "promoted_at": null,
+      "last_fp_at": null,
+      "notes": "Silent result dropping via let _ = ..."
+    },
+    "RS-12": {
+      "lifecycle": "warn",
+      "tp": 0,
+      "fp": 0,
+      "acceptable": 0,
+      "samples": 0,
+      "precision": null,
+      "promoted_at": null,
+      "last_fp_at": null,
+      "notes": "Dual naming system (Task* vs Todo*, Manager* vs Handler*)."
+    },
+    "SEC-01": {
+      "lifecycle": "warn",
+      "tp": 0,
+      "fp": 0,
+      "acceptable": 0,
+      "samples": 0,
+      "precision": null,
+      "promoted_at": null,
+      "last_fp_at": null,
+      "notes": "SQL string concatenation — injection risk."
+    },
+    "SEC-02": {
+      "lifecycle": "warn",
+      "tp": 0,
+      "fp": 0,
+      "acceptable": 0,
+      "samples": 0,
+      "precision": null,
+      "promoted_at": null,
+      "last_fp_at": null,
+      "notes": "Hardcoded secrets/API keys."
+    },
+    "SEC-03": {
+      "lifecycle": "warn",
+      "tp": 0,
+      "fp": 0,
+      "acceptable": 0,
+      "samples": 0,
+      "precision": null,
+      "promoted_at": null,
+      "last_fp_at": null,
+      "notes": "XSS: user input to HTML without escaping."
+    },
+    "SEC-04": {
+      "lifecycle": "warn",
+      "tp": 0,
+      "fp": 0,
+      "acceptable": 0,
+      "samples": 0,
+      "precision": null,
+      "promoted_at": null,
+      "last_fp_at": null,
+      "notes": "API endpoints without auth/authz."
+    },
+    "SEC-07": {
+      "lifecycle": "warn",
+      "tp": 0,
+      "fp": 0,
+      "acceptable": 0,
+      "samples": 0,
+      "precision": null,
+      "promoted_at": null,
+      "last_fp_at": null,
+      "notes": "Path traversal via unvalidated user input."
+    },
+    "U-11": {
+      "lifecycle": "warn",
+      "tp": 0,
+      "fp": 0,
+      "acceptable": 0,
+      "samples": 0,
+      "precision": null,
+      "promoted_at": null,
+      "last_fp_at": null,
+      "notes": "Divergent hardcoded .db paths across binaries."
+    },
+    "LEARN-003": {
+      "lifecycle": "experimental",
+      "tp": 0,
+      "fp": 0,
+      "acceptable": 0,
+      "samples": 0,
+      "precision": null,
+      "promoted_at": null,
+      "last_fp_at": null,
+      "notes": "Review loop stuck detection — new rule, gathering data."
+    }
+  }
+}

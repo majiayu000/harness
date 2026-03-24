@@ -765,6 +765,45 @@ impl RuleEngine {
     ) -> ExecPolicyCheckOutput {
         self.exec_policy.check_command(command, options)
     }
+
+    /// Filter out violations suppressed by an inline comment on the preceding line.
+    ///
+    /// A violation at line `N` is suppressed when line `N-1` contains:
+    /// ```text
+    /// // vibeguard-disable-next-line <RULE_ID> -- <reason>
+    /// ```
+    /// The `-- <reason>` part is optional. The check is case-sensitive for the
+    /// rule ID and whitespace-insensitive around the directive keyword.
+    pub fn filter_suppressed(violations: Vec<Violation>, project_root: &Path) -> Vec<Violation> {
+        violations
+            .into_iter()
+            .filter(|v| {
+                let Some(line) = v.line else { return true };
+                if line == 0 {
+                    return true;
+                }
+                let file_path = if v.file.is_absolute() {
+                    v.file.clone()
+                } else {
+                    project_root.join(&v.file)
+                };
+                let Ok(content) = std::fs::read_to_string(&file_path) else {
+                    return true;
+                };
+                let lines: Vec<&str> = content.lines().collect();
+                // line is 1-indexed; preceding line is at index line-2
+                let prev_idx = match line.checked_sub(2) {
+                    Some(i) => i,
+                    None => return true,
+                };
+                let Some(prev) = lines.get(prev_idx) else {
+                    return true;
+                };
+                let needle = format!("vibeguard-disable-next-line {}", v.rule_id);
+                !prev.contains(&needle)
+            })
+            .collect()
+    }
 }
 
 impl Default for RuleEngine {

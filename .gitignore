@@ -3,6 +3,8 @@ config/*.toml
 exec-plan-*.md
 .harness/*
 !.harness/guards
+!.harness/pre-commit-scan.sh
+!.harness/rule-scorecard.json
 crates/*/.harness/
 **/.harness/drafts/
 .claude/
