@@ -93,8 +93,8 @@ impl TaskDb {
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let status = state.status.as_ref();
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, parent_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, parent_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -103,6 +103,7 @@ impl TaskDb {
         .bind(&rounds_json)
         .bind(&state.error)
         .bind(state.parent_id.as_ref().map(|id| &id.0))
+        .bind(&state.created_at)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -129,7 +130,7 @@ impl TaskDb {
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at
              FROM tasks WHERE id = ?",
         )
         .bind(id)
@@ -140,7 +141,7 @@ impl TaskDb {
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at
              FROM tasks ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -202,7 +203,7 @@ impl TaskDb {
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at
              FROM tasks WHERE parent_id = ? ORDER BY created_at DESC",
         )
         .bind(parent_id)
@@ -274,6 +275,7 @@ struct TaskRow {
     source: Option<String>,
     external_id: Option<String>,
     parent_id: Option<String>,
+    created_at: Option<String>,
 }
 
 impl TaskRow {
@@ -288,6 +290,7 @@ impl TaskRow {
             source,
             external_id,
             parent_id,
+            created_at,
         } = self;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
@@ -311,6 +314,7 @@ impl TaskRow {
             project_root: None,
             issue: None,
             description: None,
+            created_at,
             phase: crate::task_runner::TaskPhase::default(),
             triage_output: None,
             plan_output: None,
@@ -335,6 +339,7 @@ mod tests {
             source: None,
             external_id: None,
             parent_id: None,
+            created_at: None,
         }
     }
 
@@ -391,6 +396,7 @@ mod tests {
             project_root: None,
             issue: None,
             description: None,
+            created_at: None,
             phase: crate::task_runner::TaskPhase::default(),
             triage_output: None,
             plan_output: None,

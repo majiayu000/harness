@@ -123,6 +123,9 @@ pub struct TaskState {
     /// Short description derived from the task prompt or issue number. Set at spawn time; not persisted.
     #[serde(skip)]
     pub description: Option<String>,
+    /// ISO 8601 creation timestamp. Set at spawn time and persisted to the tasks DB.
+    #[serde(default)]
+    pub created_at: Option<String>,
     /// Current pipeline phase. Defaults to Implement for backward compatibility.
     #[serde(default)]
     pub phase: TaskPhase,
@@ -146,6 +149,15 @@ pub struct TaskSummary {
     pub source: Option<String>,
     /// Parent task ID when this is a subtask.
     pub parent_id: Option<TaskId>,
+    /// Short description derived from the task prompt or issue number.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// ISO 8601 creation timestamp.
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// Current pipeline phase.
+    #[serde(default)]
+    pub phase: TaskPhase,
 }
 
 impl TaskState {
@@ -164,6 +176,7 @@ impl TaskState {
             project_root: None,
             issue: None,
             description: None,
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
             phase: TaskPhase::default(),
             triage_output: None,
             plan_output: None,
@@ -179,6 +192,9 @@ impl TaskState {
             error: self.error.clone(),
             source: self.source.clone(),
             parent_id: self.parent_id.clone(),
+            description: self.description.clone(),
+            created_at: self.created_at.clone(),
+            phase: self.phase.clone(),
         }
     }
 }
