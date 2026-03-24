@@ -437,7 +437,6 @@ impl TaskStore {
             persist_locks,
             stream_txs: DashMap::new(),
         });
-        store.validate_recovered_tasks().await;
         Ok(store)
     }
 
@@ -580,15 +579,17 @@ impl TaskStore {
 
     /// Validate recovered pending tasks by checking their GitHub PR state via `gh`.
     ///
-    /// Called once at startup after `recover_in_progress()`. For each pending task
-    /// that has a `pr_url`, fetches the current PR state:
-    /// - MERGED → mark Done
-    /// - CLOSED → mark Failed
+    /// Spawned as a background task from `http.rs` after the completion callback is
+    /// built, so it does not block server startup. For each pending task that has a
+    /// `pr_url`, fetches the current PR state with a per-call timeout:
+    /// - MERGED → mark Done  (completion_callback invoked)
+    /// - CLOSED → mark Failed (completion_callback invoked so intake sources can
+    ///            remove the issue from their `dispatched` map and allow retry)
     /// - OPEN   → leave as Pending
     ///
     /// `gh` CLI failures are treated as transient network errors; the task is left
     /// Pending so it will be retried normally.
-    async fn validate_recovered_tasks(&self) {
+    pub async fn validate_recovered_tasks(&self, completion_callback: Option<CompletionCallback>) {
         let candidates: Vec<(TaskId, String)> = self
             .cache
             .iter()
@@ -624,58 +625,79 @@ impl TaskStore {
             };
 
             let pr_ref = format!("{owner}/{repo}#{number}");
-            let output = tokio::process::Command::new("gh")
-                .args(["pr", "view", &pr_ref, "--json", "state", "--jq", ".state"])
-                .output()
-                .await;
+            let gh_result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tokio::process::Command::new("gh")
+                    .args(["pr", "view", &pr_ref, "--json", "state", "--jq", ".state"])
+                    .output(),
+            )
+            .await;
 
-            match output {
-                Err(e) => {
+            let output = match gh_result {
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        task_id = %task_id.0,
+                        pr_url,
+                        "gh pr view timed out after 10s; leaving pending"
+                    );
+                    continue;
+                }
+                Ok(Err(e)) => {
                     tracing::warn!(
                         task_id = %task_id.0,
                         pr_url,
                         "gh CLI error: {e}; leaving pending"
                     );
+                    continue;
                 }
-                Ok(out) if !out.status.success() => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    tracing::warn!(
+                Ok(Ok(out)) => out,
+            };
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(
+                    task_id = %task_id.0,
+                    pr_url,
+                    "gh pr view failed: {stderr}; leaving pending"
+                );
+                continue;
+            }
+
+            let state = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_uppercase();
+            let new_status = match state.as_str() {
+                "MERGED" => Some(TaskStatus::Done),
+                "CLOSED" => Some(TaskStatus::Failed),
+                _ => None,
+            };
+
+            if let Some(status) = new_status {
+                if let Some(mut entry) = self.cache.get_mut(&task_id) {
+                    entry.status = status;
+                }
+                if let Err(e) = self.persist(&task_id).await {
+                    tracing::error!(
                         task_id = %task_id.0,
-                        pr_url,
-                        "gh pr view failed: {stderr}; leaving pending"
+                        "failed to persist PR state update: {e}"
                     );
                 }
-                Ok(out) => {
-                    let state = String::from_utf8_lossy(&out.stdout).trim().to_uppercase();
-                    let new_status = match state.as_str() {
-                        "MERGED" => Some(TaskStatus::Done),
-                        "CLOSED" => Some(TaskStatus::Failed),
-                        _ => None,
-                    };
-
-                    if let Some(status) = new_status {
-                        if let Some(mut entry) = self.cache.get_mut(&task_id) {
-                            entry.status = status;
-                        }
-                        if let Err(e) = self.persist(&task_id).await {
-                            tracing::error!(
-                                task_id = %task_id.0,
-                                "failed to persist PR state update: {e}"
-                            );
-                        }
-                        tracing::info!(
-                            task_id = %task_id.0,
-                            pr_url,
-                            "startup recovery: PR state {state} → task status updated"
-                        );
-                    } else {
-                        tracing::info!(
-                            task_id = %task_id.0,
-                            pr_url,
-                            "startup recovery: PR state {state} → leaving pending"
-                        );
+                tracing::info!(
+                    task_id = %task_id.0,
+                    pr_url,
+                    "startup recovery: PR state {state} → task status updated"
+                );
+                if let Some(cb) = &completion_callback {
+                    if let Some(final_state) = self.get(&task_id) {
+                        cb(final_state).await;
                     }
                 }
+            } else {
+                tracing::info!(
+                    task_id = %task_id.0,
+                    pr_url,
+                    "startup recovery: PR state {state} → leaving pending"
+                );
             }
         }
     }

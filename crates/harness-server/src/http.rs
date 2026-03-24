@@ -560,6 +560,20 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         Some(quality_trigger),
     );
 
+    // Validate recovered pending tasks in the background so startup is not blocked
+    // by serial `gh pr view` calls. The completion_callback is passed so that tasks
+    // marked Failed (closed PR) trigger intake cleanup (e.g. removing the issue from
+    // the dispatched map so it can be re-dispatched on the next poll cycle).
+    {
+        let tasks_for_recovery = tasks.clone();
+        let cb_for_recovery = completion_callback.clone();
+        tokio::spawn(async move {
+            tasks_for_recovery
+                .validate_recovered_tasks(cb_for_recovery)
+                .await;
+        });
+    }
+
     let hook_enforcement = server.config.rules.hook_enforcement;
     let events_for_hooks = events.clone();
 
