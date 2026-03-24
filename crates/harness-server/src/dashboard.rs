@@ -33,70 +33,79 @@ pub async fn index(State(state): State<Arc<crate::http::AppState>>) -> impl Into
     <div>
       <p class="eyebrow">Harness Orchestration</p>
       <h1 class="hero-title">Operations Dashboard</h1>
-      <p class="hero-copy">Task pipeline status, agent activity, and review progress.</p>
     </div>
-    <div>
+    <div class="hero-right">
       <span id="conn-badge" class="status-badge">Offline</span>
     </div>
   </div>
+  <section class="metric-grid">
+    <article class="metric-card">
+      <p class="metric-label">Total</p>
+      <p class="metric-value" id="metric-total">0</p>
+    </article>
+    <article class="metric-card">
+      <p class="metric-label">Running</p>
+      <p class="metric-value" id="metric-running">0</p>
+    </article>
+    <article class="metric-card">
+      <p class="metric-label">Done</p>
+      <p class="metric-value" id="metric-done">0</p>
+    </article>
+    <article class="metric-card">
+      <p class="metric-label">Failed</p>
+      <p class="metric-value" id="metric-failed">0</p>
+    </article>
+  </section>
 </header>
 
-<section class="metric-grid">
-  <article class="metric-card">
-    <p class="metric-label">Total</p>
-    <p class="metric-value" id="metric-total">0</p>
-  </article>
-  <article class="metric-card">
-    <p class="metric-label">Running</p>
-    <p class="metric-value" id="metric-running">0</p>
-  </article>
-  <article class="metric-card">
-    <p class="metric-label">Done</p>
-    <p class="metric-value" id="metric-done">0</p>
-  </article>
-  <article class="metric-card">
-    <p class="metric-label">Failed</p>
-    <p class="metric-value" id="metric-failed">0</p>
-  </article>
-</section>
+<nav class="tab-bar" id="tab-bar">
+  <button class="tab-btn tab-btn-active" data-tab="board">Active</button>
+  <button class="tab-btn" data-tab="history">History</button>
+  <button class="tab-btn" data-tab="channels">Channels</button>
+  <button class="tab-btn" data-tab="submit">Submit</button>
+</nav>
 
-<section class="section-card">
-  <h2 class="section-title">Intake Channels</h2>
-  <div id="pipeline-row" class="pipeline-row"></div>
-  <div id="channel-grid" class="channel-grid"></div>
-</section>
+<div id="tab-board" class="tab-panel tab-panel-active">
+  <div id="board" class="board"></div>
+</div>
 
-<section class="section-card">
-  <h2 class="section-title">Submit Task</h2>
-  <form id="task-form" class="task-form" novalidate>
-    <div class="form-group">
-      <label class="form-label" for="f-title">Title</label>
-      <input id="f-title" class="form-input" type="text" name="title" placeholder="Brief title" required />
-    </div>
-    <div class="form-group">
-      <label class="form-label" for="f-description">Description</label>
-      <textarea id="f-description" class="form-input form-textarea" name="description" placeholder="Describe the task in detail..." rows="4" required></textarea>
-    </div>
-    <div class="form-row">
-      <button id="task-submit-btn" class="btn-primary" type="submit">Submit Task</button>
-    </div>
-    <div id="task-form-feedback" class="form-feedback" aria-live="polite"></div>
-  </form>
-</section>
-
-<section class="section-card">
-  <h2 class="section-title">Task Board</h2>
+<div id="tab-history" class="tab-panel">
   <div class="search-bar">
-    <input id="search-input" class="form-input search-input" type="search" placeholder="Search by description, ID, repo, or error\u2026" />
-    <select id="status-filter" class="form-input form-select filter-select">
-      <option value="all">All Status</option>
-      <option value="active">Active</option>
+    <input id="history-search" class="form-input search-input" type="search" placeholder="Search done/failed tasks\u2026" />
+    <select id="history-filter" class="form-input form-select filter-select">
+      <option value="all">All</option>
       <option value="done">Done</option>
       <option value="failed">Failed</option>
     </select>
   </div>
-  <div id="board" class="board"></div>
-</section>
+  <div id="history-list" class="history-list"></div>
+  <div id="history-pager" class="pager"></div>
+</div>
+
+<div id="tab-channels" class="tab-panel">
+  <div id="pipeline-row" class="pipeline-row"></div>
+  <div id="channel-grid" class="channel-grid"></div>
+</div>
+
+<div id="tab-submit" class="tab-panel">
+  <div class="section-card">
+    <h2 class="section-title">Submit Task</h2>
+    <form id="task-form" class="task-form" novalidate>
+      <div class="form-group">
+        <label class="form-label" for="f-title">Title</label>
+        <input id="f-title" class="form-input" type="text" name="title" placeholder="Brief title" required />
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="f-description">Description</label>
+        <textarea id="f-description" class="form-input form-textarea" name="description" placeholder="Describe the task in detail..." rows="4" required></textarea>
+      </div>
+      <div class="form-row">
+        <button id="task-submit-btn" class="btn-primary" type="submit">Submit Task</button>
+      </div>
+      <div id="task-form-feedback" class="form-feedback" aria-live="polite"></div>
+    </form>
+  </div>
+</div>
 
 </section>
 </main>

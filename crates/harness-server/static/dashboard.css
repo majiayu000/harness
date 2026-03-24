@@ -83,16 +83,14 @@ body {
 
 .hero-title {
   margin: 0.35rem 0 0;
-  font-size: clamp(2rem, 4vw, 3.3rem);
-  line-height: 0.98;
+  font-size: clamp(1.4rem, 3vw, 2rem);
+  line-height: 1;
   letter-spacing: -0.04em;
 }
 
-.hero-copy {
-  margin: 0.75rem 0 0;
-  max-width: 46rem;
-  color: var(--muted);
-  font-size: 1rem;
+.hero-right {
+  display: flex;
+  align-items: center;
 }
 
 .status-badge {
@@ -124,13 +122,17 @@ body {
 
 .metric-grid {
   display: grid;
-  gap: 0.85rem;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.65rem;
+  grid-template-columns: repeat(4, 1fr);
+  margin-top: 1rem;
 }
 
 .metric-card {
-  border-radius: 22px;
-  padding: 1rem 1.05rem 1.1rem;
+  border-radius: 14px;
+  padding: 0.65rem 0.85rem;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid var(--line);
+  box-shadow: none;
 }
 
 .metric-label {
@@ -752,19 +754,101 @@ body {
 
 .detail-link:hover { color: var(--accent); }
 
+/* --- Tab bar --- */
+
+.tab-bar {
+  display: flex;
+  gap: 0.25rem;
+  background: var(--card);
+  border: 1px solid rgba(217, 217, 227, 0.82);
+  border-radius: 16px;
+  padding: 0.3rem;
+  box-shadow: var(--shadow-sm);
+}
+
+.tab-btn {
+  flex: 1;
+  padding: 0.55rem 0.85rem;
+  border-radius: 12px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.88rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.tab-btn:hover { background: var(--card-muted); color: var(--ink); }
+
+.tab-btn-active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.tab-btn-active:hover { background: var(--accent); color: #fff; }
+
+.tab-panel { display: none; }
+
+.tab-panel-active { display: block; }
+
+/* --- History list --- */
+
+.history-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 0.6rem;
+}
+
+/* --- Pager --- */
+
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.85rem;
+  margin-top: 1rem;
+  padding: 0.5rem 0;
+}
+
+.pager-btn {
+  padding: 0.4rem 0.85rem;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  background: var(--card);
+  color: var(--ink);
+  font-size: 0.82rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.pager-btn:hover { background: var(--card-muted); }
+
+.pager-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.pager-info {
+  font-size: 0.82rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
 @media (max-width: 860px) {
   .app-shell { padding: 1rem 0.85rem 2rem; }
   .hero-grid { grid-template-columns: 1fr; }
   .board-active { grid-template-columns: repeat(3, 1fr); }
-  .board-terminal { grid-template-columns: repeat(2, 1fr); }
+  .history-list { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 560px) {
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .board-active { grid-template-columns: repeat(2, 1fr); }
-  .board-terminal { grid-template-columns: 1fr; }
   .hero-card { border-radius: 20px; padding: 1rem; }
   .section-card { border-radius: 20px; padding: 1rem; }
+  .tab-bar { border-radius: 12px; }
+  .tab-btn { font-size: 0.78rem; padding: 0.45rem 0.5rem; }
   .search-bar { flex-direction: column; }
   .filter-select { width: 100%; }
   .detail-sheet { width: 100vw; }

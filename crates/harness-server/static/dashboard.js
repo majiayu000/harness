@@ -6,24 +6,21 @@ const COLUMNS = [
   { key: "agent_review", label: "Agent Review" },
   { key: "waiting", label: "Waiting" },
   { key: "reviewing", label: "Reviewing" },
-  { key: "done", label: "Done" },
-  { key: "failed", label: "Failed" },
 ];
 
-const TERMINAL_DEFAULT_LIMIT = 5;
+const HISTORY_PAGE_SIZE = 20;
 const POLL_INTERVAL_MS = 5000;
 const WS_RECONNECT_MS = 3000;
 
 let ws = null;
 let pollTimer = null;
 let currentTasks = [];
-let searchQuery = "";
-let statusFilter = "all";
-const terminalExpanded = new Set();
+let historyPage = 0;
+let historyQuery = "";
+let historyFilter = "all";
 
 function $(sel) { return document.querySelector(sel); }
 
-/** Returns Authorization headers if a token is configured, otherwise {}. */
 function authHeaders() {
   const tok = window.__HARNESS_TOKEN__;
   return tok ? { "Authorization": "Bearer " + tok } : {};
@@ -40,6 +37,8 @@ function relativeTime(ts) {
   return Math.floor(diff / 86400) + "d ago";
 }
 
+// --- Data fetching ---
+
 async function fetchTasks() {
   try {
     const resp = await fetch("/tasks", { headers: authHeaders() });
@@ -48,6 +47,7 @@ async function fetchTasks() {
     renderBoard(currentTasks);
     updateMetrics(currentTasks);
     renderPipeline(currentTasks);
+    renderHistory();
     updateStatus(true);
   } catch {
     updateStatus(false);
@@ -60,19 +60,18 @@ async function fetchIntake() {
     if (!resp.ok) return;
     const data = await resp.json();
     renderIntakeChannels(data.channels || []);
-  } catch {
-    // intake api unavailable — leave channel grid empty
-  }
+  } catch {}
 }
+
+// --- Metrics ---
 
 function updateMetrics(tasks) {
   const counts = {};
-  COLUMNS.forEach(c => counts[c.key] = 0);
   tasks.forEach(t => { counts[t.status] = (counts[t.status] || 0) + 1; });
-
   $("#metric-total").textContent = tasks.length;
   $("#metric-running").textContent =
-    (counts.implementing || 0) + (counts.agent_review || 0) + (counts.reviewing || 0);
+    (counts.implementing || 0) + (counts.agent_review || 0) +
+    (counts.reviewing || 0) + (counts.waiting || 0);
   $("#metric-done").textContent = counts.done || 0;
   $("#metric-failed").textContent = counts.failed || 0;
 }
@@ -88,10 +87,11 @@ function updateStatus(connected) {
   }
 }
 
+// --- Pipeline ---
+
 function renderPipeline(tasks) {
   const row = document.getElementById("pipeline-row");
   if (!row) return;
-
   const stages = [
     { keys: ["pending"], label: "Queued" },
     { keys: ["implementing", "agent_review", "waiting"], label: "Building" },
@@ -99,10 +99,8 @@ function renderPipeline(tasks) {
     { keys: ["done"], label: "Done" },
     { keys: ["failed"], label: "Failed" },
   ];
-
   const counts = {};
   tasks.forEach(t => { counts[t.status] = (counts[t.status] || 0) + 1; });
-
   row.innerHTML = stages.map((s, i) => {
     const count = s.keys.reduce((acc, k) => acc + (counts[k] || 0), 0);
     const arrow = i > 0 ? '<span class="pipeline-arrow">&#8594;</span>' : "";
@@ -114,41 +112,81 @@ function renderPipeline(tasks) {
   }).join("");
 }
 
+// --- Intake channels ---
+
 function renderIntakeChannels(channels) {
   const grid = document.getElementById("channel-grid");
   if (!grid) return;
   grid.innerHTML = "";
-
   channels.forEach(ch => {
     const enabled = Boolean(ch.enabled);
     const card = document.createElement("div");
     card.className = "channel-card" + (enabled ? " channel-card-enabled" : " channel-card-disabled");
-
     let detail = "";
     if (ch.repo) detail = ch.repo;
     else if (ch.keyword) detail = "keyword: " + ch.keyword;
-
     card.innerHTML =
       `<div class="channel-name">${escapeHtml(ch.name)}</div>` +
       (detail ? `<div class="channel-detail">${escapeHtml(detail)}</div>` : "") +
       `<div class="channel-status">${enabled ? "enabled" : "disabled"}</div>` +
       `<div class="channel-active">${escapeHtml(String(ch.active))} active</div>`;
-
     grid.appendChild(card);
   });
 }
 
-const ACTIVE_KEYS = new Set(["pending", "implementing", "agent_review", "waiting", "reviewing"]);
-const TERMINAL_KEYS = new Set(["done", "failed"]);
+// --- Active board (only active tasks) ---
 
-function applyFilter(tasks) {
-  const q = searchQuery.toLowerCase().trim();
-  return tasks.filter(t => {
-    if (statusFilter !== "all") {
-      if (statusFilter === "active" && !ACTIVE_KEYS.has(t.status)) return false;
-      if (statusFilter === "done" && t.status !== "done") return false;
-      if (statusFilter === "failed" && t.status !== "failed") return false;
-    }
+const ACTIVE_KEYS = new Set(["pending", "implementing", "agent_review", "waiting", "reviewing"]);
+
+function renderBoard(tasks) {
+  const active = tasks.filter(t => ACTIVE_KEYS.has(t.status));
+  const grouped = {};
+  COLUMNS.forEach(c => grouped[c.key] = []);
+  active.forEach(t => {
+    if (grouped[t.status]) grouped[t.status].push(t);
+  });
+
+  const board = $("#board");
+  board.innerHTML = "";
+
+  if (active.length === 0) {
+    board.innerHTML = '<p class="empty-state" style="padding:1rem">No active tasks</p>';
+    return;
+  }
+
+  const row = document.createElement("div");
+  row.className = "board-active";
+
+  COLUMNS.forEach(col => {
+    const items = grouped[col.key];
+    if (items.length === 0) return;
+    const div = document.createElement("div");
+    div.className = "column";
+    div.innerHTML =
+      `<div class="column-header col-border-${col.key}">` +
+        `<span class="column-title">${col.label}</span>` +
+        `<span class="column-count">${items.length}</span>` +
+      `</div>`;
+    items.forEach(task => div.appendChild(renderCard(task, col.key)));
+    row.appendChild(div);
+  });
+
+  board.appendChild(row);
+}
+
+// --- History tab (done + failed, paginated) ---
+
+function getFilteredHistory() {
+  const terminal = currentTasks.filter(t => t.status === "done" || t.status === "failed");
+  terminal.sort((a, b) => {
+    const da = a.created_at ? new Date(a.created_at).getTime() : 0;
+    const db = b.created_at ? new Date(b.created_at).getTime() : 0;
+    return db - da;
+  });
+
+  const q = historyQuery.toLowerCase().trim();
+  return terminal.filter(t => {
+    if (historyFilter !== "all" && t.status !== historyFilter) return false;
     if (!q) return true;
     return (
       (t.description && t.description.toLowerCase().includes(q)) ||
@@ -159,76 +197,47 @@ function applyFilter(tasks) {
   });
 }
 
-function renderBoard(tasks) {
-  const filtered = applyFilter(tasks);
-  const grouped = {};
-  COLUMNS.forEach(c => grouped[c.key] = []);
-  filtered.forEach(t => {
-    if (grouped[t.status]) grouped[t.status].push(t);
-  });
+function renderHistory() {
+  const list = document.getElementById("history-list");
+  const pager = document.getElementById("history-pager");
+  if (!list || !pager) return;
 
-  // Sort terminal columns newest first
-  TERMINAL_KEYS.forEach(key => {
-    grouped[key].sort((a, b) => {
-      const da = a.created_at ? new Date(a.created_at).getTime() : 0;
-      const db = b.created_at ? new Date(b.created_at).getTime() : 0;
-      return db - da;
+  const filtered = getFilteredHistory();
+  const totalPages = Math.max(1, Math.ceil(filtered.length / HISTORY_PAGE_SIZE));
+  if (historyPage >= totalPages) historyPage = totalPages - 1;
+  if (historyPage < 0) historyPage = 0;
+
+  const start = historyPage * HISTORY_PAGE_SIZE;
+  const page = filtered.slice(start, start + HISTORY_PAGE_SIZE);
+
+  list.innerHTML = "";
+  if (page.length === 0) {
+    list.innerHTML = '<p class="empty-state">No tasks match</p>';
+  } else {
+    page.forEach(task => list.appendChild(renderCard(task, task.status)));
+  }
+
+  // Pager
+  if (totalPages <= 1) {
+    pager.innerHTML = `<span class="pager-info">${filtered.length} tasks</span>`;
+    return;
+  }
+
+  let html = "";
+  html += `<button class="pager-btn" ${historyPage === 0 ? "disabled" : ""} data-page="${historyPage - 1}">&laquo; Prev</button>`;
+  html += `<span class="pager-info">Page ${historyPage + 1} / ${totalPages} (${filtered.length} tasks)</span>`;
+  html += `<button class="pager-btn" ${historyPage >= totalPages - 1 ? "disabled" : ""} data-page="${historyPage + 1}">Next &raquo;</button>`;
+  pager.innerHTML = html;
+
+  pager.querySelectorAll(".pager-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      historyPage = parseInt(btn.dataset.page, 10);
+      renderHistory();
     });
   });
-
-  const board = $("#board");
-  board.innerHTML = "";
-
-  const activeRow = document.createElement("div");
-  activeRow.className = "board-active";
-
-  const terminalRow = document.createElement("div");
-  terminalRow.className = "board-terminal";
-
-  COLUMNS.forEach(col => {
-    const items = grouped[col.key];
-    const div = document.createElement("div");
-    div.className = "column";
-    div.innerHTML =
-      `<div class="column-header col-border-${col.key}">` +
-        `<span class="column-title">${col.label}</span>` +
-        `<span class="column-count">${items.length}</span>` +
-      `</div>`;
-
-    if (items.length === 0) {
-      div.innerHTML += `<p class="empty-state">No tasks</p>`;
-    } else if (TERMINAL_KEYS.has(col.key)) {
-      const isExpanded = terminalExpanded.has(col.key);
-      const visible = isExpanded ? items : items.slice(0, TERMINAL_DEFAULT_LIMIT);
-      visible.forEach(task => div.appendChild(renderCard(task, col.key)));
-      if (items.length > TERMINAL_DEFAULT_LIMIT) {
-        const btn = document.createElement("button");
-        btn.className = "btn-collapse";
-        btn.textContent = isExpanded ? "Show less" : `Show all (${items.length})`;
-        btn.addEventListener("click", () => {
-          if (terminalExpanded.has(col.key)) {
-            terminalExpanded.delete(col.key);
-          } else {
-            terminalExpanded.add(col.key);
-          }
-          renderBoard(currentTasks);
-        });
-        div.appendChild(btn);
-      }
-    } else {
-      items.forEach(task => div.appendChild(renderCard(task, col.key)));
-    }
-
-    if (TERMINAL_KEYS.has(col.key)) {
-      terminalRow.appendChild(div);
-    } else {
-      activeRow.appendChild(div);
-    }
-  });
-
-  board.appendChild(activeRow);
-  board.appendChild(terminalRow);
 }
+
+// --- Card rendering (shared) ---
 
 function renderCard(task, status) {
   const card = document.createElement("div");
@@ -249,13 +258,11 @@ function renderCard(task, status) {
   }
   html += `</div>`;
 
-  // Title: prefer description, fallback to short ID
   const rawTitle = task.description
     ? (task.description.length > 80 ? task.description.slice(0, 80) + "\u2026" : task.description)
     : shortId;
   html += `<div class="task-title">${escapeHtml(rawTitle)}</div>`;
 
-  // Meta row: turn, external_id, time
   const metaParts = [];
   if (task.turn > 0) metaParts.push("Turn " + task.turn);
   if (task.external_id != null) metaParts.push("#" + escapeHtml(String(task.external_id)));
@@ -280,6 +287,8 @@ function renderCard(task, status) {
   card.addEventListener("click", () => showDetail(task));
   return card;
 }
+
+// --- Detail panel ---
 
 function showDetail(task) {
   let panel = document.getElementById("detail-panel");
@@ -366,19 +375,33 @@ function escapeHtml(str) {
   return d.innerHTML;
 }
 
+// --- Tabs ---
+
+function initTabs() {
+  const bar = document.getElementById("tab-bar");
+  if (!bar) return;
+  bar.addEventListener("click", (e) => {
+    const btn = e.target.closest(".tab-btn");
+    if (!btn) return;
+    const tab = btn.dataset.tab;
+    bar.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("tab-btn-active"));
+    btn.classList.add("tab-btn-active");
+    document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("tab-panel-active"));
+    const panel = document.getElementById("tab-" + tab);
+    if (panel) panel.classList.add("tab-panel-active");
+  });
+}
+
+// --- WebSocket ---
+
 function connectWebSocket() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const tok = window.__HARNESS_TOKEN__;
   const url = tok
     ? `${proto}//${location.host}/ws?token=${encodeURIComponent(tok)}`
     : `${proto}//${location.host}/ws`;
-
-  try {
-    ws = new WebSocket(url);
-  } catch { return; }
-
+  try { ws = new WebSocket(url); } catch { return; }
   ws.onopen = () => { fetchTasks(); fetchIntake(); };
-
   ws.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
@@ -387,18 +410,13 @@ function connectWebSocket() {
         fetchTasks();
         fetchIntake();
       }
-    } catch { /* ignore non-JSON */ }
+    } catch {}
   };
-
-  ws.onclose = () => {
-    ws = null;
-    setTimeout(connectWebSocket, WS_RECONNECT_MS);
-  };
-
-  ws.onerror = () => {
-    if (ws) ws.close();
-  };
+  ws.onclose = () => { ws = null; setTimeout(connectWebSocket, WS_RECONNECT_MS); };
+  ws.onerror = () => { if (ws) ws.close(); };
 }
+
+// --- Form ---
 
 function showFeedback(el, msg, type) {
   el.textContent = msg;
@@ -408,26 +426,21 @@ function showFeedback(el, msg, type) {
 function initForm() {
   const form = document.getElementById("task-form");
   if (!form) return;
-
   const feedback = document.getElementById("task-form-feedback");
   const btn = document.getElementById("task-submit-btn");
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
-
     const title = form.elements["title"].value.trim();
     const description = form.elements["description"].value.trim();
-
     if (!title || !description) {
       showFeedback(feedback, "Title and description are required.", "error");
       return;
     }
-
     feedback.textContent = "";
     feedback.className = "form-feedback";
     btn.disabled = true;
     btn.textContent = "Submitting\u2026";
-
     const prompt = `${title}\n\n${description}`;
     try {
       const resp = await fetch("/tasks", {
@@ -451,31 +464,36 @@ function initForm() {
   });
 }
 
-function initSearchFilter() {
-  const searchInput = document.getElementById("search-input");
-  const statusSelect = document.getElementById("status-filter");
+// --- History search/filter ---
 
-  if (searchInput) {
-    searchInput.addEventListener("input", () => {
-      searchQuery = searchInput.value;
-      renderBoard(currentTasks);
+function initHistoryControls() {
+  const search = document.getElementById("history-search");
+  const filter = document.getElementById("history-filter");
+  if (search) {
+    search.addEventListener("input", () => {
+      historyQuery = search.value;
+      historyPage = 0;
+      renderHistory();
     });
   }
-
-  if (statusSelect) {
-    statusSelect.addEventListener("change", () => {
-      statusFilter = statusSelect.value;
-      renderBoard(currentTasks);
+  if (filter) {
+    filter.addEventListener("change", () => {
+      historyFilter = filter.value;
+      historyPage = 0;
+      renderHistory();
     });
   }
 }
 
+// --- Init ---
+
 function init() {
+  initTabs();
   fetchTasks();
   fetchIntake();
   connectWebSocket();
   initForm();
-  initSearchFilter();
+  initHistoryControls();
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") closeDetail();
   });
