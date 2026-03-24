@@ -1026,6 +1026,18 @@ pub(crate) async fn run_task(
                 r
             }
             Ok(Err(e)) => {
+                // Quota exhausted is not retryable — break immediately instead of
+                // burning remaining review rounds on repeated 402 errors.
+                if matches!(e, HarnessError::QuotaExhausted(_)) {
+                    tracing::error!(round, error = %e, "quota exhausted during review — aborting review loop");
+                    run_on_error(&interceptors, &check_req, &e.to_string()).await;
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.error = Some(e.to_string());
+                    })
+                    .await?;
+                    return Ok(());
+                }
                 run_on_error(&interceptors, &check_req, &e.to_string()).await;
                 return Err(e.into());
             }
@@ -1208,6 +1220,16 @@ async fn run_agent_review(
                 r
             }
             Ok(Err(e)) => {
+                if matches!(e, HarnessError::QuotaExhausted(_)) {
+                    tracing::error!(agent_round, error = %e, "quota exhausted during agent review — aborting");
+                    run_on_error(interceptors, &review_req, &e.to_string()).await;
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.error = Some(e.to_string());
+                    })
+                    .await?;
+                    return Ok(());
+                }
                 run_on_error(interceptors, &review_req, &e.to_string()).await;
                 return Err(e.into());
             }
