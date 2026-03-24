@@ -1,0 +1,7 @@
+id: ts-03-console
+language: TypeScript
+severity: warning
+message: "console.$METHOD() in production code — use a structured logger"
+note: "Replace with a logger that supports log levels and structured fields"
+rule:
+  pattern: console.$METHOD($$$ARGS)

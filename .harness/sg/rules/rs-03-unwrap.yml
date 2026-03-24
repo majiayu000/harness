@@ -1,0 +1,45 @@
+id: rs-03-unwrap
+language: Rust
+severity: warning
+message: "unwrap() in non-test code risks panic in production"
+note: "Use the ? operator, if let, or match to handle errors explicitly"
+rule:
+  pattern: $A.unwrap()
+  not:
+    any:
+      # Mutex/RwLock poisoning unwraps are acceptable (panic = programmer error)
+      - pattern: $X.lock().unwrap()
+      - pattern: $X.read().unwrap()
+      - pattern: $X.write().unwrap()
+      # fn main() may use unwrap for infallible setup
+      - inside:
+          kind: function_item
+          has:
+            field: name
+            regex: "^main$"
+      # #[cfg(test)] module blocks
+      - inside:
+          kind: mod_item
+          has:
+            kind: attribute_item
+            regex: "cfg.*test"
+---
+id: rs-03-expect
+language: Rust
+severity: warning
+message: "expect() in non-test code risks panic in production"
+note: "Use the ? operator, if let, or match to handle errors explicitly"
+rule:
+  pattern: $A.expect($MSG)
+  not:
+    any:
+      - inside:
+          kind: function_item
+          has:
+            field: name
+            regex: "^main$"
+      - inside:
+          kind: mod_item
+          has:
+            kind: attribute_item
+            regex: "cfg.*test"
