@@ -135,10 +135,17 @@ impl CodeAgent for ClaudeCodeAgent {
         log_captured_stderr(&stderr, self.name());
 
         if !output.status.success() {
-            let stdout_tail = if stdout.len() > 500 {
-                &stdout[stdout.len() - 500..]
+            let stdout_tail: String = if stdout.chars().count() > 500 {
+                stdout
+                    .chars()
+                    .rev()
+                    .take(500)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
             } else {
-                &stdout
+                stdout.clone()
             };
             return Err(harness_core::HarnessError::AgentExecution(format!(
                 "claude exited with {}: stderr=[{}] stdout_tail=[{}]",
