@@ -431,12 +431,14 @@ impl TaskStore {
             persist_locks.insert(task.id.clone(), Arc::new(Mutex::new(())));
             cache.insert(task.id.clone(), task);
         }
-        Ok(Arc::new(Self {
+        let store = Arc::new(Self {
             cache,
             db,
             persist_locks,
             stream_txs: DashMap::new(),
-        }))
+        });
+        store.validate_recovered_tasks().await;
+        Ok(store)
     }
 
     pub fn get(&self, id: &TaskId) -> Option<TaskState> {
@@ -575,6 +577,126 @@ impl TaskStore {
         }
         Ok(())
     }
+
+    /// Validate recovered pending tasks by checking their GitHub PR state via `gh`.
+    ///
+    /// Called once at startup after `recover_in_progress()`. For each pending task
+    /// that has a `pr_url`, fetches the current PR state:
+    /// - MERGED → mark Done
+    /// - CLOSED → mark Failed
+    /// - OPEN   → leave as Pending
+    ///
+    /// `gh` CLI failures are treated as transient network errors; the task is left
+    /// Pending so it will be retried normally.
+    async fn validate_recovered_tasks(&self) {
+        let candidates: Vec<(TaskId, String)> = self
+            .cache
+            .iter()
+            .filter_map(|e| {
+                let task = e.value();
+                if matches!(task.status, TaskStatus::Pending) {
+                    task.pr_url
+                        .as_ref()
+                        .map(|url| (task.id.clone(), url.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            "startup: validating {} recovered pending task(s) with PR URLs",
+            candidates.len()
+        );
+
+        for (task_id, pr_url) in candidates {
+            let Some((owner, repo, number)) = parse_pr_url(&pr_url) else {
+                tracing::warn!(
+                    task_id = %task_id.0,
+                    pr_url,
+                    "could not parse PR URL; leaving pending"
+                );
+                continue;
+            };
+
+            let pr_ref = format!("{owner}/{repo}#{number}");
+            let output = tokio::process::Command::new("gh")
+                .args(["pr", "view", &pr_ref, "--json", "state", "--jq", ".state"])
+                .output()
+                .await;
+
+            match output {
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task_id.0,
+                        pr_url,
+                        "gh CLI error: {e}; leaving pending"
+                    );
+                }
+                Ok(out) if !out.status.success() => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    tracing::warn!(
+                        task_id = %task_id.0,
+                        pr_url,
+                        "gh pr view failed: {stderr}; leaving pending"
+                    );
+                }
+                Ok(out) => {
+                    let state = String::from_utf8_lossy(&out.stdout).trim().to_uppercase();
+                    let new_status = match state.as_str() {
+                        "MERGED" => Some(TaskStatus::Done),
+                        "CLOSED" => Some(TaskStatus::Failed),
+                        _ => None,
+                    };
+
+                    if let Some(status) = new_status {
+                        if let Some(mut entry) = self.cache.get_mut(&task_id) {
+                            entry.status = status;
+                        }
+                        if let Err(e) = self.persist(&task_id).await {
+                            tracing::error!(
+                                task_id = %task_id.0,
+                                "failed to persist PR state update: {e}"
+                            );
+                        }
+                        tracing::info!(
+                            task_id = %task_id.0,
+                            pr_url,
+                            "startup recovery: PR state {state} → task status updated"
+                        );
+                    } else {
+                        tracing::info!(
+                            task_id = %task_id.0,
+                            pr_url,
+                            "startup recovery: PR state {state} → leaving pending"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract `(owner, repo, number)` from a GitHub PR URL.
+///
+/// Expects format: `https://github.com/{owner}/{repo}/pull/{number}[#...]`
+fn parse_pr_url(pr_url: &str) -> Option<(String, String, u64)> {
+    // Strip fragment (e.g. #discussion_r...)
+    let url = pr_url.split('#').next().unwrap_or(pr_url);
+    let parts: Vec<&str> = url.trim_end_matches('/').split('/').collect();
+    // Expected: ["https:", "", "github.com", owner, repo, "pull", number]
+    let pull_idx = parts.iter().rposition(|&p| p == "pull")?;
+    if pull_idx + 1 >= parts.len() || pull_idx < 2 {
+        return None;
+    }
+    let number: u64 = parts[pull_idx + 1].parse().ok()?;
+    let repo = parts[pull_idx - 1].to_string();
+    let owner = parts[pull_idx - 2].to_string();
+    Some((owner, repo, number))
 }
 
 pub async fn spawn_task(
@@ -1624,5 +1746,46 @@ mod tests {
             "review check turn must use Validation phase"
         );
         Ok(())
+    }
+
+    #[test]
+    fn parse_pr_url_standard() {
+        let Some((owner, repo, number)) = parse_pr_url("https://github.com/acme/myrepo/pull/42")
+        else {
+            panic!("expected Some for standard GitHub PR URL");
+        };
+        assert_eq!(owner, "acme");
+        assert_eq!(repo, "myrepo");
+        assert_eq!(number, 42);
+    }
+
+    #[test]
+    fn parse_pr_url_with_fragment() {
+        let Some((owner, repo, number)) =
+            parse_pr_url("https://github.com/acme/myrepo/pull/99#issuecomment-123")
+        else {
+            panic!("expected Some for PR URL with fragment");
+        };
+        assert_eq!(owner, "acme");
+        assert_eq!(repo, "myrepo");
+        assert_eq!(number, 99);
+    }
+
+    #[test]
+    fn parse_pr_url_trailing_slash() {
+        let Some((owner, repo, number)) = parse_pr_url("https://github.com/acme/myrepo/pull/7/")
+        else {
+            panic!("expected Some for PR URL with trailing slash");
+        };
+        assert_eq!(owner, "acme");
+        assert_eq!(repo, "myrepo");
+        assert_eq!(number, 7);
+    }
+
+    #[test]
+    fn parse_pr_url_invalid_returns_none() {
+        assert!(parse_pr_url("https://github.com/acme/myrepo").is_none());
+        assert!(parse_pr_url("not-a-url").is_none());
+        assert!(parse_pr_url("https://github.com/acme/myrepo/issues/1").is_none());
     }
 }
