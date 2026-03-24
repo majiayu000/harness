@@ -68,6 +68,15 @@ pub struct TaskArtifact {
     pub created_at: String,
 }
 
+/// Result of [`TaskDb::recover_in_progress`].
+#[derive(Debug, Default)]
+pub struct RecoveryResult {
+    /// Tasks that were in `implementing` or `agent_review` and are now `failed`.
+    pub failed: u32,
+    /// Tasks that were in `reviewing` or `waiting` and are now `pending` for retry.
+    pub requeued: u32,
+}
+
 pub struct TaskDb {
     pool: SqlitePool,
 }
@@ -139,18 +148,42 @@ impl TaskDb {
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 
-    /// Mark all in-progress (non-terminal) tasks as Failed with a restart-recovery error.
-    /// Returns the number of tasks recovered.
-    pub async fn recover_in_progress(&self) -> anyhow::Result<u32> {
-        let result = sqlx::query(
-            "UPDATE tasks SET status = 'failed', \
-             error = 'recovered after server restart', \
-             updated_at = datetime('now') \
-             WHERE status NOT IN ('done', 'failed')",
+    /// Differentiated recovery on server restart.
+    ///
+    /// - `implementing` / `agent_review` → `failed` (agent process is dead; cannot resume)
+    /// - `reviewing` / `waiting` → `pending` (safe to re-queue; no live agent process)
+    /// - `pending` → unchanged (will be picked up naturally)
+    ///
+    /// Diagnostic context is embedded in the `error` field for failed tasks so operators
+    /// can correlate recovery events with their original execution state.
+    ///
+    /// Returns a [`RecoveryResult`] with counts for each outcome.
+    pub async fn recover_in_progress(&self) -> anyhow::Result<RecoveryResult> {
+        let failed = sqlx::query(
+            "UPDATE tasks \
+             SET status = 'failed', \
+                 error = 'recovered after restart (was: ' || status \
+                      || ', round: ' || turn \
+                      || ', pr: ' || COALESCE(pr_url, 'none') || ')', \
+                 updated_at = datetime('now') \
+             WHERE status IN ('implementing', 'agent_review')",
         )
         .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() as u32)
+        .await?
+        .rows_affected() as u32;
+
+        let requeued = sqlx::query(
+            "UPDATE tasks \
+             SET status = 'pending', \
+                 error = 'recovered from ' || status || ' after server restart', \
+                 updated_at = datetime('now') \
+             WHERE status IN ('reviewing', 'waiting')",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected() as u32;
+
+        Ok(RecoveryResult { failed, requeued })
     }
 
     /// Return the `pr_url` of the most recently completed Done task that has one, or `None`.
@@ -541,7 +574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_in_progress_marks_non_terminal_tasks_failed() -> anyhow::Result<()> {
+    async fn recover_in_progress_differentiates_by_status() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
 
@@ -549,26 +582,71 @@ mod tests {
             .await?;
         db.insert(&make_task("t-implementing", TaskStatus::Implementing))
             .await?;
+        db.insert(&make_task("t-agent-review", TaskStatus::AgentReview))
+            .await?;
+        db.insert(&make_task("t-reviewing", TaskStatus::Reviewing))
+            .await?;
         db.insert(&make_task("t-waiting", TaskStatus::Waiting))
             .await?;
         db.insert(&make_task("t-done", TaskStatus::Done)).await?;
         db.insert(&make_task("t-failed", TaskStatus::Failed))
             .await?;
 
-        let recovered = db.recover_in_progress().await?;
-        assert_eq!(recovered, 3, "should recover 3 in-progress tasks");
-
-        let pending = db.get("t-pending").await?.expect("should exist");
-        assert!(matches!(pending.status, TaskStatus::Failed));
+        let result = db.recover_in_progress().await?;
         assert_eq!(
-            pending.error.as_deref(),
-            Some("recovered after server restart")
+            result.failed, 2,
+            "implementing + agent_review should be failed"
+        );
+        assert_eq!(result.requeued, 2, "reviewing + waiting should be requeued");
+
+        // pending stays pending, no error set
+        let pending = db.get("t-pending").await?.expect("should exist");
+        assert!(matches!(pending.status, TaskStatus::Pending));
+        assert!(pending.error.is_none());
+
+        // implementing → failed with diagnostic info
+        let implementing = db.get("t-implementing").await?.expect("should exist");
+        assert!(matches!(implementing.status, TaskStatus::Failed));
+        let err = implementing.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("was: implementing"),
+            "error should contain original status"
+        );
+        assert!(err.contains("round:"), "error should contain round info");
+
+        // agent_review → failed with diagnostic info
+        let agent_review = db.get("t-agent-review").await?.expect("should exist");
+        assert!(matches!(agent_review.status, TaskStatus::Failed));
+        assert!(agent_review
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("was: agent_review"));
+
+        // reviewing → pending for retry
+        let reviewing = db.get("t-reviewing").await?.expect("should exist");
+        assert!(matches!(reviewing.status, TaskStatus::Pending));
+        let err = reviewing.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("recovered from reviewing"),
+            "error should note original status"
         );
 
+        // waiting → pending for retry
+        let waiting = db.get("t-waiting").await?.expect("should exist");
+        assert!(matches!(waiting.status, TaskStatus::Pending));
+        assert!(waiting
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("recovered from waiting"));
+
+        // terminal states unchanged
         let done = db.get("t-done").await?.expect("should exist");
         assert!(matches!(done.status, TaskStatus::Done));
         let failed = db.get("t-failed").await?.expect("should exist");
         assert!(matches!(failed.status, TaskStatus::Failed));
+
         Ok(())
     }
 

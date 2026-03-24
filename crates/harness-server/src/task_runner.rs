@@ -377,12 +377,17 @@ pub struct TaskStore {
 impl TaskStore {
     pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
         let db = TaskDb::open(db_path).await?;
-        let recovered = db.recover_in_progress().await?;
-        if recovered > 0 {
+        let recovery = db.recover_in_progress().await?;
+        if recovery.failed > 0 {
             tracing::warn!(
-                recovered,
-                "startup recovery: marked {} in-progress task(s) as failed",
-                recovered
+                "startup recovery: marked {} implementing/agent_review task(s) as failed",
+                recovery.failed
+            );
+        }
+        if recovery.requeued > 0 {
+            tracing::warn!(
+                "startup recovery: reset {} reviewing/waiting task(s) to pending for retry",
+                recovery.requeued
             );
         }
         let cache = DashMap::new();
