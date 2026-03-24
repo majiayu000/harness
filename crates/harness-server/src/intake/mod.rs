@@ -7,6 +7,8 @@ use std::time::Duration;
 use crate::http::AppState;
 use crate::task_runner::{TaskId, TaskStatus};
 
+type IssuesByRepo = std::collections::HashMap<String, Vec<(Arc<dyn IntakeSource>, IncomingIssue)>>;
+
 pub mod feishu;
 pub mod github_issues;
 
@@ -113,10 +115,7 @@ impl IntakeOrchestrator {
 
     async fn poll_tick(&self, state: &Arc<AppState>) {
         // 1. Collect all new issues from all sources, grouped by repo.
-        let mut by_repo: std::collections::HashMap<
-            String,
-            Vec<(Arc<dyn IntakeSource>, IncomingIssue)>,
-        > = std::collections::HashMap::new();
+        let mut by_repo: IssuesByRepo = std::collections::HashMap::new();
 
         for source in &self.sources {
             let issues = match source.poll().await {
