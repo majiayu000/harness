@@ -1062,6 +1062,20 @@ pub(crate) async fn run_task(
         }
 
         let lgtm = prompts::is_lgtm(&output);
+        let waiting = prompts::is_waiting(&output);
+
+        // WAITING means review bot hasn't posted yet (e.g., quota exhausted).
+        // Don't consume a round — just sleep and retry without incrementing.
+        if waiting {
+            tracing::info!(
+                round,
+                "PR #{pr_num} review bot has not responded yet; sleeping without consuming round"
+            );
+            waiting_count += 1;
+            update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
+            sleep(Duration::from_secs(wait_secs)).await;
+            continue;
+        }
 
         mutate_and_persist(store, task_id, |s| {
             s.rounds.push(RoundResult {
