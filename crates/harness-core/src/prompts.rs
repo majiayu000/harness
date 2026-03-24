@@ -86,8 +86,11 @@ pub fn triage_prompt(issue: u64) -> PromptParts {
              - PROCEED_WITH_PLAN — non-trivial change that needs an implementation plan first\n\
              - NEEDS_CLARIFICATION — issue is ambiguous; list the specific questions that must be answered\n\
              - SKIP — not worth doing (explain why: duplicate, out of scope, or fundamentally flawed)\n\n\
-             Output format: Write your assessment (2-5 sentences), then on the LAST line print:\n\
-             TRIAGE=<recommendation>"
+             Output format: Write your assessment (2-5 sentences), then print these two lines:\n\
+             COMPLEXITY=<level>  (low / medium / high)\n\
+             TRIAGE=<recommendation>\n\n\
+             Complexity mapping: low = trivial/single-file, medium = 2-3 files/moderate scope, \
+             high = 4+ files/new API surface/architectural change."
         ),
         context: String::new(),
         dynamic_payload: String::new(),
@@ -546,6 +549,55 @@ pub enum TriageDecision {
     NeedsClarification,
     /// Not worth doing — skip this issue.
     Skip,
+}
+
+/// Task complexity derived from the triage phase.
+///
+/// Maps to runtime execution parameters: `max_rounds` and whether to skip agent review.
+/// Defaults to `Medium` when the `COMPLEXITY=` tag is absent (backward compatible).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TaskComplexity {
+    /// Trivial change — max_rounds=2, agent review skipped.
+    Low,
+    /// Moderate change — max_rounds=4. Default fallback.
+    #[default]
+    Medium,
+    /// Complex change — max_rounds=8.
+    High,
+}
+
+impl TaskComplexity {
+    /// Maximum external review rounds for this complexity level.
+    pub fn max_rounds(&self) -> u32 {
+        match self {
+            TaskComplexity::Low => 2,
+            TaskComplexity::Medium => 4,
+            TaskComplexity::High => 8,
+        }
+    }
+
+    /// Whether to skip the agent review loop for this complexity level.
+    pub fn skip_agent_review(&self) -> bool {
+        matches!(self, TaskComplexity::Low)
+    }
+}
+
+/// Parse the task complexity from triage agent output.
+///
+/// Scans lines from last to first for `COMPLEXITY=<level>`.
+/// Returns `TaskComplexity::Medium` as a safe fallback when the tag is absent.
+pub fn parse_complexity(output: &str) -> TaskComplexity {
+    for line in output.lines().rev() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("COMPLEXITY=") {
+            return match val.trim() {
+                "low" => TaskComplexity::Low,
+                "high" => TaskComplexity::High,
+                _ => TaskComplexity::Medium,
+            };
+        }
+    }
+    TaskComplexity::Medium
 }
 
 /// Parse the triage decision from agent output.
@@ -1427,6 +1479,73 @@ PR_URL=https://github.com/owner/repo/pull/269";
     fn test_parse_triage_trailing_whitespace() {
         assert_eq!(
             parse_triage("done\nTRIAGE=PROCEED\n"),
+            Some(TriageDecision::Proceed)
+        );
+    }
+
+    #[test]
+    fn test_triage_prompt_contains_complexity_instructions() {
+        let parts = triage_prompt(42);
+        let s = parts.to_prompt_string();
+        assert!(s.contains("COMPLEXITY="));
+        assert!(s.contains("low"));
+        assert!(s.contains("medium"));
+        assert!(s.contains("high"));
+    }
+
+    #[test]
+    fn test_parse_complexity_all_levels() {
+        assert_eq!(
+            parse_complexity("Assessment.\nCOMPLEXITY=low\nTRIAGE=PROCEED"),
+            TaskComplexity::Low
+        );
+        assert_eq!(
+            parse_complexity("Assessment.\nCOMPLEXITY=medium\nTRIAGE=PROCEED_WITH_PLAN"),
+            TaskComplexity::Medium
+        );
+        assert_eq!(
+            parse_complexity("Assessment.\nCOMPLEXITY=high\nTRIAGE=PROCEED_WITH_PLAN"),
+            TaskComplexity::High
+        );
+    }
+
+    #[test]
+    fn test_parse_complexity_fallback_to_medium() {
+        assert_eq!(
+            parse_complexity("no complexity tag here"),
+            TaskComplexity::Medium
+        );
+        assert_eq!(parse_complexity("TRIAGE=PROCEED"), TaskComplexity::Medium);
+        assert_eq!(parse_complexity(""), TaskComplexity::Medium);
+    }
+
+    #[test]
+    fn test_parse_complexity_unknown_value_is_medium() {
+        assert_eq!(
+            parse_complexity("COMPLEXITY=extreme\nTRIAGE=PROCEED"),
+            TaskComplexity::Medium
+        );
+    }
+
+    #[test]
+    fn test_task_complexity_max_rounds() {
+        assert_eq!(TaskComplexity::Low.max_rounds(), 2);
+        assert_eq!(TaskComplexity::Medium.max_rounds(), 4);
+        assert_eq!(TaskComplexity::High.max_rounds(), 8);
+    }
+
+    #[test]
+    fn test_task_complexity_skip_agent_review() {
+        assert!(TaskComplexity::Low.skip_agent_review());
+        assert!(!TaskComplexity::Medium.skip_agent_review());
+        assert!(!TaskComplexity::High.skip_agent_review());
+    }
+
+    #[test]
+    fn test_parse_triage_still_works_with_complexity_line() {
+        // Ensure backward compat: TRIAGE= still parses when COMPLEXITY= precedes it.
+        assert_eq!(
+            parse_triage("Assessment.\nCOMPLEXITY=low\nTRIAGE=PROCEED"),
             Some(TriageDecision::Proceed)
         );
     }

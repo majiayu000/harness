@@ -373,9 +373,13 @@ fn prepend_constitution(prompt: String, enabled: bool) -> String {
 
 /// Run triage → plan pipeline for a fresh issue-based task.
 ///
-/// Returns `Some(plan_text)` if the triage decided a plan is needed and the plan
-/// phase completed. Returns `None` only when triage says PROCEED (trivial issue,
-/// skip planning). All failures propagate as errors — no silent fallbacks.
+/// Returns `(plan_text, complexity)`:
+/// - `plan_text` is `Some` when triage decided a plan is needed and the plan phase completed,
+///   `None` when triage says PROCEED (trivial issue, skip planning).
+/// - `complexity` is derived from the `COMPLEXITY=` tag in triage output; defaults to
+///   `Medium` when the tag is absent (backward compatible).
+///
+/// All failures propagate as errors — no silent fallbacks.
 async fn run_triage_plan_pipeline(
     agent: &dyn CodeAgent,
     store: &TaskStore,
@@ -384,7 +388,7 @@ async fn run_triage_plan_pipeline(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<(Option<String>, prompts::TaskComplexity)> {
     use crate::task_runner::TaskPhase;
 
     // --- Phase 1: Triage ---
@@ -418,6 +422,9 @@ async fn run_triage_plan_pipeline(
     })
     .await?;
 
+    let complexity = prompts::parse_complexity(&triage_resp.output);
+    tracing::info!(task_id = %task_id, ?complexity, "triage complexity");
+
     let decision = prompts::parse_triage(&triage_resp.output).ok_or_else(|| {
         anyhow::anyhow!("triage output unparseable — agent did not produce TRIAGE=<decision>")
     })?;
@@ -444,7 +451,7 @@ async fn run_triage_plan_pipeline(
         }
         prompts::TriageDecision::Proceed => {
             tracing::info!(task_id = %task_id, "triage: PROCEED — skipping plan phase");
-            return Ok(None);
+            return Ok((None, complexity));
         }
         prompts::TriageDecision::ProceedWithPlan => {
             // Fall through to plan phase.
@@ -483,7 +490,7 @@ async fn run_triage_plan_pipeline(
     .await?;
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete");
-    Ok(Some(plan_text))
+    Ok((Some(plan_text), complexity))
 }
 
 pub(crate) async fn run_task(
@@ -526,8 +533,9 @@ pub(crate) async fn run_task(
 
     // --- Pipeline: Triage → Plan → Implement ---
     // For issue-based tasks without an existing PR, run triage first.
-    // Triage decides whether to skip planning or go through a plan phase.
-    let plan_output = if let Some(issue) = req.issue {
+    // Triage decides whether to skip planning or go through a plan phase,
+    // and also produces a complexity estimate used to set execution parameters.
+    let (plan_output, complexity) = if let Some(issue) = req.issue {
         // Only triage fresh issues (no existing PR to continue).
         let has_existing_pr = find_existing_pr_for_issue(&project, issue)
             .await
@@ -538,11 +546,28 @@ pub(crate) async fn run_task(
             run_triage_plan_pipeline(agent, store, task_id, issue, &cargo_env, &project, req)
                 .await?
         } else {
-            None
+            (None, prompts::TaskComplexity::Medium)
         }
     } else {
-        None
+        (None, prompts::TaskComplexity::Medium)
     };
+
+    // Derive execution parameters from complexity.
+    // For issue-based tasks that went through triage, these override the request defaults.
+    // For all other tasks (PR review, prompt-only), fall back to req.max_rounds.
+    let effective_max_rounds = if req.issue.is_some() {
+        complexity.max_rounds()
+    } else {
+        req.max_rounds
+    };
+    let skip_agent_review = complexity.skip_agent_review();
+    tracing::info!(
+        task_id = %task_id,
+        ?complexity,
+        effective_max_rounds,
+        skip_agent_review,
+        "complexity parameters applied"
+    );
 
     // Resume normal flow — update status to Implementing for the main turn.
     update_status(store, task_id, TaskStatus::Implementing, 1).await?;
@@ -932,8 +957,8 @@ pub(crate) async fn run_task(
         return Ok(());
     };
 
-    // Agent review loop (if enabled and reviewer available)
-    if review_config.enabled {
+    // Agent review loop (if enabled, reviewer available, and not skipped for low-complexity tasks)
+    if review_config.enabled && !skip_agent_review {
         if let Some(reviewer) = reviewer {
             tracing::info!(pr_url = %pr_url.as_deref().unwrap_or(""), "starting agent review");
             run_agent_review(
@@ -970,7 +995,7 @@ pub(crate) async fn run_task(
     let review_phase_start = Instant::now();
 
     // Review loop
-    for round in 1..=req.max_rounds {
+    for round in 1..=effective_max_rounds {
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let check_req = AgentRequest {
@@ -1099,7 +1124,7 @@ pub(crate) async fn run_task(
         }
 
         tracing::info!("PR #{pr_num} not yet approved at round {round}; waiting");
-        if round < req.max_rounds {
+        if round < effective_max_rounds {
             waiting_count += 1;
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
             sleep(Duration::from_secs(wait_secs)).await;
@@ -1108,10 +1133,10 @@ pub(crate) async fn run_task(
 
     mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Failed;
-        s.turn = req.max_rounds.saturating_add(1);
+        s.turn = effective_max_rounds.saturating_add(1);
         s.error = Some(format!(
             "Task did not receive LGTM after {} review rounds.",
-            req.max_rounds
+            effective_max_rounds
         ));
     })
     .await?;
@@ -1124,7 +1149,7 @@ pub(crate) async fn run_task(
     tracing::info!(
         task_id = %task_id,
         status = "failed",
-        turns = req.max_rounds.saturating_add(1),
+        turns = effective_max_rounds.saturating_add(1),
         pr_url = pr_url.as_deref().unwrap_or(""),
         total_elapsed_secs = task_start.elapsed().as_secs(),
         "task_completed"
