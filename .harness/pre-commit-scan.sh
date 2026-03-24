@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # pre-commit-scan.sh — Baseline guard scan for staged (added) lines only.
 #
-# Runs every guard in .harness/guards/ against files that have staged changes,
-# then filters violations to lines present in the diff.
+# Runs every guard in .harness/guards/ against the STAGED snapshot of files
+# (not the working tree), then filters violations to lines present in the diff.
 #
 # Usage (from project root):
 #   .harness/pre-commit-scan.sh
@@ -52,6 +52,22 @@ if [[ ! -d "${GUARDS_DIR}" ]]; then
   exit 0
 fi
 
+# -------------------------------------------------------------------
+# Populate a temp snapshot directory with the STAGED version of each
+# changed file.  Guards and suppression checks both read from this
+# snapshot, so line numbers are always consistent with what will be
+# committed — independent of any unstaged working-tree modifications.
+# -------------------------------------------------------------------
+STAGED_SNAPSHOT=$(mktemp -d)
+trap 'rm -rf "${STAGED_SNAPSHOT}"' EXIT
+
+for staged_file in "${STAGED_FILES[@]}"; do
+  target_dir="${STAGED_SNAPSHOT}/$(dirname "${staged_file}")"
+  mkdir -p "${target_dir}"
+  git -C "${PROJECT_ROOT}" show ":${staged_file}" \
+    > "${STAGED_SNAPSHOT}/${staged_file}" 2>/dev/null || true
+done
+
 violations=0
 blocking=0
 
@@ -71,11 +87,28 @@ for rid, e in sc.get('rules', {}).items():
   )
 fi
 
-# Run each guard and collect output.
+# Run each guard against the staged snapshot and collect output.
+# If a guard exits non-zero (e.g. unsupported flag on this platform),
+# emit a warning to stderr so the failure is visible rather than silently
+# treated as "no violations".
 for guard in "${GUARDS_DIR}"/*.sh; do
   [[ -f "${guard}" ]] || continue
-  # shellcheck disable=SC2207
-  mapfile -t guard_output < <(bash "${guard}" "${PROJECT_ROOT}" 2>/dev/null || true)
+
+  guard_stdout=$(mktemp)
+  guard_stderr=$(mktemp)
+
+  bash "${guard}" "${STAGED_SNAPSHOT}" >"${guard_stdout}" 2>"${guard_stderr}"
+  guard_exit=$?
+
+  if [[ ${guard_exit} -ne 0 ]]; then
+    echo "vibeguard: WARNING: guard $(basename "${guard}") exited ${guard_exit} — violations from this guard may be missing" >&2
+    if [[ -s "${guard_stderr}" ]]; then
+      cat "${guard_stderr}" >&2
+    fi
+  fi
+
+  mapfile -t guard_output < "${guard_stdout}"
+  rm -f "${guard_stdout}" "${guard_stderr}"
 
   for line in "${guard_output[@]}"; do
     # Expected format: FILE:LINE:RULE_ID:MESSAGE
@@ -86,19 +119,22 @@ for guard in "${GUARDS_DIR}"/*.sh; do
     lineno="${parts[1]}"
     rule_id="${parts[2]}"
 
-    # Strip project_root prefix if present.
-    rel_file="${file#${PROJECT_ROOT}/}"
+    # Strip snapshot prefix to get the repo-relative path.
+    rel_file="${file#${STAGED_SNAPSHOT}/}"
 
     # Only report violations on staged added lines.
     key="${rel_file}:${lineno}"
     [[ "${ADDED_LINES[${key}]+_}" ]] || continue
 
-    # Check suppression comment on the preceding line.
-    suppression_check_file="${PROJECT_ROOT}/${rel_file}"
-    if [[ -f "${suppression_check_file}" && "${lineno}" -gt 1 ]]; then
+    # Check suppression comment on the preceding line — read from the
+    # staged snapshot so unstaged working-tree comments cannot suppress.
+    snapshot_file="${STAGED_SNAPSHOT}/${rel_file}"
+    if [[ -f "${snapshot_file}" && "${lineno}" -gt 1 ]]; then
       prev_lineno=$(( lineno - 1 ))
-      prev_line="$(sed -n "${prev_lineno}p" "${suppression_check_file}" 2>/dev/null || true)"
-      if echo "${prev_line}" | grep -qF "vibeguard-disable-next-line ${rule_id}"; then
+      prev_line="$(sed -n "${prev_lineno}p" "${snapshot_file}" 2>/dev/null || true)"
+      # Match exact rule ID: must be followed by whitespace or end-of-line,
+      # so "RS-02" does NOT suppress "RS-02B".
+      if echo "${prev_line}" | grep -qE "vibeguard-disable-next-line ${rule_id}([[:space:]]|$)"; then
         continue
       fi
     fi

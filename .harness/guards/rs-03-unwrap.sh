@@ -43,12 +43,12 @@ check_file() {
     [[ $in_test_block -eq 1 ]] && continue
 
     # Detect .unwrap() — flag unless it's unwrap_or / unwrap_or_else / unwrap_or_default
-    if echo "$line" | grep -qP '\.unwrap\(\)' && ! echo "$line" | grep -qP '//.*\.unwrap\(\)'; then
+    if echo "$line" | grep -qE '\.unwrap\(\)' && ! echo "$line" | grep -qE '//.*\.unwrap\(\)'; then
       echo "${file}:${lineno}:RS-03:unwrap() in non-test code risks panic in production"
     fi
 
     # Detect .expect("...") calls
-    if echo "$line" | grep -qP '\.expect\(' && ! echo "$line" | grep -qP '//.*\.expect\('; then
+    if echo "$line" | grep -qE '\.expect\(' && ! echo "$line" | grep -qE '//.*\.expect\('; then
       echo "${file}:${lineno}:RS-03:expect() in non-test code risks panic in production"
     fi
 

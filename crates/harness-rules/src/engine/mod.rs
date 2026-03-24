@@ -800,7 +800,13 @@ impl RuleEngine {
                     return true;
                 };
                 let needle = format!("vibeguard-disable-next-line {}", v.rule_id);
-                !prev.contains(&needle)
+                // Exact rule-id match: the needle must be followed by whitespace
+                // or end-of-line so that e.g. "RS-02" does not suppress "RS-02B".
+                let suppressed = prev.find(&needle as &str).map_or(false, |pos| {
+                    let after = &prev[pos + needle.len()..];
+                    after.is_empty() || after.starts_with(char::is_whitespace)
+                });
+                !suppressed
             })
             .collect()
     }
