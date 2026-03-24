@@ -421,10 +421,16 @@ async fn poll_task_output(
 }
 
 /// Build an `IntakeOrchestrator` from config, registering all enabled sources.
+///
+/// `github_sources` must be the same `Arc<dyn IntakeSource>` instances used by
+/// the completion callback so that `on_task_complete` (e.g. removing a failed
+/// issue from the `dispatched` map) operates on the live poller's in-memory
+/// state rather than a detached clone.
 pub fn build_orchestrator(
     config: &harness_core::IntakeConfig,
     data_dir: Option<&std::path::Path>,
     feishu_intake: Option<Arc<feishu::FeishuIntake>>,
+    github_sources: Vec<Arc<dyn IntakeSource>>,
 ) -> IntakeOrchestrator {
     let mut sources: Vec<Arc<dyn IntakeSource>> = Vec::new();
     let mut poll_interval = Duration::from_secs(30);
@@ -434,14 +440,20 @@ pub fn build_orchestrator(
         if gh_config.enabled {
             poll_interval = Duration::from_secs(gh_config.poll_interval_secs);
             planner_agent = gh_config.planner_agent.clone();
-            for repo_cfg in gh_config.effective_repos() {
-                tracing::info!(
-                    repo = %repo_cfg.repo,
-                    label = %repo_cfg.label,
-                    "intake: GitHub Issues poller registered"
-                );
-                let poller = github_issues::GitHubIssuesPoller::new(&repo_cfg, data_dir);
-                sources.push(Arc::new(poller));
+            if github_sources.is_empty() {
+                // Fallback: build fresh pollers when no shared instances are supplied
+                // (e.g. during testing or when called without pre-built sources).
+                for repo_cfg in gh_config.effective_repos() {
+                    tracing::info!(
+                        repo = %repo_cfg.repo,
+                        label = %repo_cfg.label,
+                        "intake: GitHub Issues poller registered (fallback)"
+                    );
+                    let poller = github_issues::GitHubIssuesPoller::new(&repo_cfg, data_dir);
+                    sources.push(Arc::new(poller));
+                }
+            } else {
+                sources.extend(github_sources);
             }
         }
     }
@@ -529,7 +541,7 @@ mod tests {
     #[test]
     fn build_orchestrator_with_no_config_returns_empty_orchestrator() {
         let config = harness_core::IntakeConfig::default();
-        let orchestrator = build_orchestrator(&config, None, None);
+        let orchestrator = build_orchestrator(&config, None, None, vec![]);
         assert!(orchestrator.sources.is_empty());
     }
 
@@ -541,7 +553,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             ..Default::default()
         });
-        let orchestrator = build_orchestrator(&config, None, None);
+        let orchestrator = build_orchestrator(&config, None, None, vec![]);
         assert!(orchestrator.sources.is_empty());
     }
 
@@ -555,7 +567,7 @@ mod tests {
             poll_interval_secs: 60,
             ..Default::default()
         });
-        let orchestrator = build_orchestrator(&config, None, None);
+        let orchestrator = build_orchestrator(&config, None, None, vec![]);
         assert_eq!(orchestrator.sources.len(), 1);
         assert_eq!(orchestrator.sources[0].name(), "github");
         assert_eq!(orchestrator.poll_interval, Duration::from_secs(60));

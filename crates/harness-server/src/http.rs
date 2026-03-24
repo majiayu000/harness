@@ -185,8 +185,11 @@ pub struct NotificationServices {
 pub struct IntakeServices {
     /// Feishu Bot intake handler. None when feishu intake is disabled or not configured.
     pub feishu_intake: Option<Arc<crate::intake::feishu::FeishuIntake>>,
-    /// Pre-built GitHub intake poller, shared between orchestrator and completion callback.
-    pub github_intake: Option<Arc<dyn crate::intake::IntakeSource>>,
+    /// All GitHub issue pollers, one per configured repo. The same Arc instances
+    /// are shared between the completion callback and the orchestrator so that
+    /// `on_task_complete` (e.g. evicting a failed issue from `dispatched`)
+    /// operates on the live poller rather than a detached clone.
+    pub github_pollers: Vec<Arc<dyn crate::intake::IntakeSource>>,
     /// Completion callback invoked when a task reaches a terminal state.
     pub completion_callback: Option<task_runner::CompletionCallback>,
 }
@@ -527,19 +530,37 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         }
     });
 
-    let github_intake: Option<Arc<dyn crate::intake::IntakeSource>> = server
+    // Build ALL GitHub pollers once. The same Arc instances are shared between
+    // the completion callback and the orchestrator, so on_task_complete operates
+    // on the live poller's dispatched map rather than a detached clone.
+    // Keyed as "github:{owner/repo}" for per-repo routing in the callback;
+    // a "github" fallback entry (first poller) supports tasks persisted before
+    // this multi-repo routing was introduced.
+    let github_pollers: Vec<(String, Arc<dyn crate::intake::IntakeSource>)> = server
         .config
         .intake
         .github
         .as_ref()
         .filter(|cfg| cfg.enabled)
-        .and_then(|cfg| cfg.effective_repos().into_iter().next())
-        .map(|repo_cfg| {
-            Arc::new(crate::intake::github_issues::GitHubIssuesPoller::new(
-                &repo_cfg,
-                Some(&dir),
-            )) as Arc<dyn crate::intake::IntakeSource>
-        });
+        .map(|cfg| {
+            cfg.effective_repos()
+                .into_iter()
+                .map(|repo_cfg| {
+                    tracing::info!(
+                        repo = %repo_cfg.repo,
+                        label = %repo_cfg.label,
+                        "intake: GitHub Issues poller registered"
+                    );
+                    let key = format!("github:{}", repo_cfg.repo);
+                    let poller = Arc::new(crate::intake::github_issues::GitHubIssuesPoller::new(
+                        &repo_cfg,
+                        Some(&dir),
+                    )) as Arc<dyn crate::intake::IntakeSource>;
+                    (key, poller)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let quality_trigger = {
         let gc_cfg = &server.config.gc;
@@ -555,7 +576,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     let completion_callback = build_completion_callback(
         &feishu_intake,
-        &github_intake,
+        &github_pollers,
         server.config.agents.review.clone(),
         Some(quality_trigger),
     );
@@ -667,7 +688,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         interceptors,
         intake: IntakeServices {
             feishu_intake,
-            github_intake,
+            github_pollers: github_pollers.into_iter().map(|(_, p)| p).collect(),
             completion_callback,
         },
         project_svc,
@@ -678,14 +699,21 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
 fn build_completion_callback(
     feishu_intake: &Option<Arc<crate::intake::feishu::FeishuIntake>>,
-    github_intake: &Option<Arc<dyn crate::intake::IntakeSource>>,
+    github_pollers: &[(String, Arc<dyn crate::intake::IntakeSource>)],
     review_config: harness_core::AgentReviewConfig,
     quality_trigger: Option<Arc<crate::quality_trigger::QualityTrigger>>,
 ) -> Option<task_runner::CompletionCallback> {
     let mut sources: std::collections::HashMap<String, Arc<dyn crate::intake::IntakeSource>> =
         std::collections::HashMap::new();
-    if let Some(gh) = github_intake {
-        sources.insert(gh.name().to_string(), gh.clone());
+    // Insert each GitHub poller keyed by "github:{owner/repo}" for precise
+    // per-repo routing. Also insert the first poller under the bare "github"
+    // key as a backward-compat fallback for tasks that pre-date multi-repo
+    // support and have task.repo == None.
+    for (i, (key, poller)) in github_pollers.iter().enumerate() {
+        sources.insert(key.clone(), poller.clone());
+        if i == 0 {
+            sources.insert("github".to_string(), poller.clone());
+        }
     }
     if let Some(fi) = feishu_intake {
         let fi_source: Arc<dyn crate::intake::IntakeSource> = fi.clone();
@@ -759,10 +787,22 @@ fn build_completion_callback(
                 );
                 return;
             };
-            let Some(source) = sources.get(source_name) else {
+            // For GitHub tasks, route to the specific repo's poller using
+            // "github:{owner/repo}". Fall back to the bare "github" key for
+            // tasks persisted before multi-repo support (task.repo == None).
+            let lookup_key = if source_name == "github" {
+                task.repo
+                    .as_ref()
+                    .map(|r| format!("github:{r}"))
+                    .unwrap_or_else(|| "github".to_string())
+            } else {
+                source_name.to_string()
+            };
+            let Some(source) = sources.get(&lookup_key) else {
                 tracing::warn!(
                     task_id = ?task.id,
                     source = source_name,
+                    lookup_key,
                     "completion_callback: intake source not found, skipping"
                 );
                 return;
@@ -921,10 +961,15 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         harness_observe::quality::QualityGrader::grade(&events, violation_count).grade
     };
     crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
+    // Pass the pre-built GitHub pollers from AppState to the orchestrator so
+    // both share the same Arc instances and on_task_complete operates on the
+    // live poller's dispatched map.
+    let github_sources = state.intake.github_pollers.clone();
     crate::intake::build_orchestrator(
         &state.core.server.config.intake,
         Some(&expand_tilde(&state.core.server.config.server.data_dir)),
         state.intake.feishu_intake.clone(),
+        github_sources,
     )
     .start(state.clone());
 

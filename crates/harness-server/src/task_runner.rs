@@ -625,13 +625,14 @@ impl TaskStore {
             };
 
             let pr_ref = format!("{owner}/{repo}#{number}");
-            let gh_result = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                tokio::process::Command::new("gh")
-                    .args(["pr", "view", &pr_ref, "--json", "state", "--jq", ".state"])
-                    .output(),
-            )
-            .await;
+            // kill_on_drop(true) ensures the child process is killed when the
+            // timeout future is dropped, preventing zombie `gh` processes during
+            // startup when many tasks are recovered concurrently.
+            let mut cmd = tokio::process::Command::new("gh");
+            cmd.args(["pr", "view", &pr_ref, "--json", "state", "--jq", ".state"])
+                .kill_on_drop(true);
+            let gh_result =
+                tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await;
 
             let output = match gh_result {
                 Err(_elapsed) => {
@@ -676,11 +677,19 @@ impl TaskStore {
                 if let Some(mut entry) = self.cache.get_mut(&task_id) {
                     entry.status = status;
                 }
+                // Persist before invoking the callback. If persist fails the task
+                // remains `pending` in SQLite; firing the callback anyway would push
+                // external state (Feishu notifications, GitHub intake cleanup) into a
+                // terminal state while the DB still thinks the task is pending. On
+                // the next restart the same task would be recovered and trigger the
+                // same side-effects again (state split). Skip the callback so the
+                // task can be safely retried on the next restart.
                 if let Err(e) = self.persist(&task_id).await {
                     tracing::error!(
                         task_id = %task_id.0,
-                        "failed to persist PR state update: {e}"
+                        "failed to persist PR state update: {e}; skipping completion callback to avoid state split"
                     );
+                    continue;
                 }
                 tracing::info!(
                     task_id = %task_id.0,
