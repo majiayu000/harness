@@ -113,11 +113,9 @@ impl IntakeOrchestrator {
 
     async fn poll_tick(&self, state: &Arc<AppState>) {
         // 1. Collect all new issues from all sources, grouped by repo.
-        #[allow(clippy::type_complexity)]
-        let mut by_repo: std::collections::HashMap<
-            String,
-            Vec<(Arc<dyn IntakeSource>, IncomingIssue)>,
-        > = std::collections::HashMap::new();
+        type RepoIssues = Vec<(Arc<dyn IntakeSource>, IncomingIssue)>;
+        let mut by_repo: std::collections::HashMap<String, RepoIssues> =
+            std::collections::HashMap::new();
 
         for source in &self.sources {
             let issues = match source.poll().await {
