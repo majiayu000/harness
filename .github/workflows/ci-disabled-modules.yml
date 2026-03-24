@@ -8,6 +8,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   check-all-features:
     name: Compile-check disabled modules (--all-features)

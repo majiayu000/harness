@@ -5,6 +5,10 @@ on:
     tags:
       - "sdk-v*"
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   verify-typescript:
     name: Verify TypeScript SDK

@@ -7,6 +7,10 @@ on:
 permissions:
   pull-requests: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   pr-body:
     name: PR Description

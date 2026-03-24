@@ -1,0 +1,4 @@
+# Force LF line endings for scripts and Python files to prevent
+# CRLF issues on Windows that break bash script execution.
+*.sh text eol=lf
+*.py text eol=lf
