@@ -61,6 +61,11 @@ static TASK_MIGRATIONS: &[Migration] = &[
         description: "add repo column",
         sql: "ALTER TABLE tasks ADD COLUMN repo TEXT",
     },
+    Migration {
+        version: 7,
+        description: "add depends_on column",
+        sql: "ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'",
+    },
 ];
 
 /// A single persisted artifact captured from agent output during task execution.
@@ -96,10 +101,11 @@ impl TaskDb {
 
     pub async fn insert(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
+        let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let status = state.status.as_ref();
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, parent_id, created_at, repo)
-             VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?)",
+            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, parent_id, created_at, repo, depends_on)
+             VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?)",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -110,6 +116,7 @@ impl TaskDb {
         .bind(state.parent_id.as_ref().map(|id| &id.0))
         .bind(&state.created_at)
         .bind(&state.repo)
+        .bind(&depends_on_json)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -117,10 +124,11 @@ impl TaskDb {
 
     pub async fn update(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
+        let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let status = state.status.as_ref();
         sqlx::query(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
-                    repo = ?, updated_at = datetime('now')
+                    repo = ?, depends_on = ?, updated_at = datetime('now')
              WHERE id = ?",
         )
         .bind(status)
@@ -129,6 +137,7 @@ impl TaskDb {
         .bind(&rounds_json)
         .bind(&state.error)
         .bind(&state.repo)
+        .bind(&depends_on_json)
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -137,7 +146,7 @@ impl TaskDb {
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on
              FROM tasks WHERE id = ?",
         )
         .bind(id)
@@ -148,7 +157,7 @@ impl TaskDb {
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on
              FROM tasks ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -210,7 +219,7 @@ impl TaskDb {
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on
              FROM tasks WHERE parent_id = ? ORDER BY created_at DESC",
         )
         .bind(parent_id)
@@ -284,6 +293,7 @@ struct TaskRow {
     parent_id: Option<String>,
     created_at: Option<String>,
     repo: Option<String>,
+    depends_on: String,
 }
 
 impl TaskRow {
@@ -300,6 +310,7 @@ impl TaskRow {
             parent_id,
             created_at,
             repo,
+            depends_on,
         } = self;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
@@ -319,6 +330,7 @@ impl TaskRow {
             source,
             external_id,
             parent_id: parent_id.map(TaskId),
+            depends_on: serde_json::from_str(&depends_on).unwrap_or_default(),
             subtask_ids: Vec::new(),
             project_root: None,
             issue: None,
@@ -351,6 +363,7 @@ mod tests {
             parent_id: None,
             created_at: None,
             repo: None,
+            depends_on: "[]".to_string(),
         }
     }
 
@@ -403,6 +416,7 @@ mod tests {
             source: None,
             external_id: None,
             parent_id: None,
+            depends_on: vec![],
             subtask_ids: vec![],
             project_root: None,
             issue: None,

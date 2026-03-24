@@ -597,6 +597,27 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         server.config.server.allowed_project_roots.clone(),
     );
 
+    // Spawn background watcher for AwaitingDeps tasks.
+    {
+        let store = tasks.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let ready_ids = crate::task_runner::check_awaiting_deps(&store);
+                for task_id in ready_ids {
+                    if let Err(e) = store.persist(&task_id).await {
+                        tracing::warn!(
+                            "dep-watcher: failed to persist {} after transition: {e}",
+                            task_id.0
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     let signal_rate_limit = server.config.server.signal_rate_limit_per_minute;
     let password_reset_rate_limit = server.config.server.password_reset_rate_limit_per_hour;
     let home_dir = std::env::var("HOME")
