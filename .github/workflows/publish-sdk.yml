@@ -21,6 +21,8 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      - name: Tarball smoke test
+        run: bash scripts/verify-package-contents.sh
 
   verify-python:
     name: Verify Python SDK

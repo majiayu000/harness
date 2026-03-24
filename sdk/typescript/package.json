@@ -8,7 +8,8 @@
   "module": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
-    "dist"
+    "dist",
+    "scripts"
   ],
   "exports": {
     ".": {
@@ -20,7 +21,8 @@
   },
   "scripts": {
     "build": "tsup src/index.ts --format cjs,esm --dts --clean",
-    "test": "tsx --test tests/harness.test.ts"
+    "test": "tsx --test tests/harness.test.ts",
+    "prepublishOnly": "npm run build && bash scripts/verify-package-contents.sh"
   },
   "devDependencies": {
     "@types/node": "^20.17.57",
