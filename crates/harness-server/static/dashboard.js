@@ -244,7 +244,7 @@ function renderCard(task, status) {
   if (task.repo) {
     html += `<span class="repo-badge">${escapeHtml(task.repo)}</span>`;
   }
-  if (task.phase && task.phase !== "default") {
+  if (task.phase && task.phase !== "implement") {
     html += `<span class="phase-badge">${escapeHtml(task.phase)}</span>`;
   }
   html += `</div>`;
@@ -308,7 +308,7 @@ function showDetail(task) {
   body += `<span class="state-badge badge-${escapeHtml(status)}">${escapeHtml(status.replace("_", " "))}</span>`;
   if (task.source) body += `<span class="source-badge source-badge-${escapeHtml(task.source)}">${escapeHtml(task.source)}</span>`;
   if (task.repo) body += `<span class="repo-badge">${escapeHtml(task.repo)}</span>`;
-  if (task.phase && task.phase !== "default") body += `<span class="phase-badge">${escapeHtml(task.phase)}</span>`;
+  if (task.phase && task.phase !== "implement") body += `<span class="phase-badge">${escapeHtml(task.phase)}</span>`;
   body += `</div>`;
 
   body += `<table class="detail-table">`;
