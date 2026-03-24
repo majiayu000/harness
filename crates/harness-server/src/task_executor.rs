@@ -582,7 +582,10 @@ pub(crate) async fn run_task(
         }
     } else if let Some(pr) = req.pr {
         prompts::check_existing_pr(pr, &review_config.review_bot_command, &repo_slug)
-    } else if matches!(req.source.as_deref(), Some("periodic_review") | Some("sprint_planner")) {
+    } else if matches!(
+        req.source.as_deref(),
+        Some("periodic_review") | Some("sprint_planner")
+    ) {
         // Review/planner tasks use their prompt as-is — no "create PR" wrapper.
         req.prompt.clone().unwrap_or_default()
     } else {
