@@ -43,6 +43,7 @@ pub enum TaskPhase {
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
+    AwaitingDeps,
     Implementing,
     AgentReview,
     Waiting,
@@ -55,6 +56,7 @@ impl AsRef<str> for TaskStatus {
     fn as_ref(&self) -> &str {
         match self {
             TaskStatus::Pending => "pending",
+            TaskStatus::AwaitingDeps => "awaiting_deps",
             TaskStatus::Implementing => "implementing",
             TaskStatus::AgentReview => "agent_review",
             TaskStatus::Waiting => "waiting",
@@ -71,6 +73,7 @@ impl std::str::FromStr for TaskStatus {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "pending" => Ok(TaskStatus::Pending),
+            "awaiting_deps" => Ok(TaskStatus::AwaitingDeps),
             "implementing" => Ok(TaskStatus::Implementing),
             "agent_review" => Ok(TaskStatus::AgentReview),
             "waiting" => Ok(TaskStatus::Waiting),
@@ -109,6 +112,10 @@ pub struct TaskState {
     /// Parent task ID when this task is a subtask spawned via parallel dispatch.
     /// Persisted so parent-child relationships survive server restart.
     pub parent_id: Option<TaskId>,
+    /// Task IDs that must reach Done before this task may start.
+    /// Persisted as JSON in the database.
+    #[serde(default)]
+    pub depends_on: Vec<TaskId>,
     /// IDs of subtasks spawned by this task during parallel dispatch.
     /// Populated at runtime; not persisted (use `TaskStore::list_children` after restart).
     #[serde(default)]
@@ -166,6 +173,12 @@ pub struct TaskSummary {
     /// Current pipeline phase.
     #[serde(default)]
     pub phase: TaskPhase,
+    /// Task IDs that must reach Done before this task may start.
+    #[serde(default)]
+    pub depends_on: Vec<TaskId>,
+    /// IDs of subtasks spawned by this task during parallel dispatch.
+    #[serde(default)]
+    pub subtask_ids: Vec<TaskId>,
 }
 
 impl TaskState {
@@ -180,6 +193,7 @@ impl TaskState {
             source: None,
             external_id: None,
             parent_id: None,
+            depends_on: Vec::new(),
             subtask_ids: Vec::new(),
             project_root: None,
             issue: None,
@@ -206,6 +220,8 @@ impl TaskState {
             description: self.description.clone(),
             created_at: self.created_at.clone(),
             phase: self.phase.clone(),
+            depends_on: self.depends_on.clone(),
+            subtask_ids: self.subtask_ids.clone(),
         }
     }
 }
@@ -252,6 +268,12 @@ pub struct CreateTaskRequest {
     /// Repository slug (e.g. "owner/repo"). Stored in TaskState for traceability.
     #[serde(default)]
     pub repo: Option<String>,
+    /// Explicit parent task ID.
+    #[serde(default)]
+    pub parent_task_id: Option<TaskId>,
+    /// Task IDs that must complete (Done) before this task starts.
+    #[serde(default)]
+    pub depends_on: Vec<TaskId>,
 }
 
 impl Default for CreateTaskRequest {
@@ -272,6 +294,8 @@ impl Default for CreateTaskRequest {
             source: None,
             external_id: None,
             repo: None,
+            parent_task_id: None,
+            depends_on: Vec::new(),
         }
     }
 }
@@ -782,9 +806,9 @@ where
         let is_review = req.source.as_deref() == Some("periodic_review");
         if req.issue.is_none() && req.pr.is_none() && is_complex && !is_review {
             if let Some(ref wmgr) = workspace_mgr {
-                let mut subtask_prompts =
+                let mut subtask_specs =
                     crate::parallel_dispatch::decompose(req.prompt.as_deref().unwrap_or_default());
-                if subtask_prompts.len() > 1 {
+                if subtask_specs.len() > 1 {
                     // Prepend sibling-awareness context to each subtask prompt so parallel
                     // agents know what other top-level tasks are running on the same project.
                     let siblings = store.list_siblings(&project_root, &id);
@@ -805,9 +829,12 @@ where
                             })
                             .collect();
                         let ctx = harness_core::prompts::sibling_task_context(&sibling_tasks);
-                        subtask_prompts = subtask_prompts
+                        subtask_specs = subtask_specs
                             .into_iter()
-                            .map(|p| format!("{ctx}\n\n{p}"))
+                            .map(|mut spec| {
+                                spec.prompt = format!("{ctx}\n\n{}", spec.prompt);
+                                spec
+                            })
                             .collect();
                     }
                     let project_config = harness_core::config::load_project_config(&project_root);
@@ -815,7 +842,7 @@ where
                     let base_branch = project_config.git.base_branch.clone();
 
                     // Register subtask IDs in the parent before dispatch.
-                    let sub_ids: Vec<TaskId> = (0..subtask_prompts.len())
+                    let sub_ids: Vec<TaskId> = (0..subtask_specs.len())
                         .map(|i| TaskId(format!("{}-p{i}", id.0)))
                         .collect();
                     mutate_and_persist(&store, &id, |s| {
@@ -834,7 +861,7 @@ where
                     let results = crate::parallel_dispatch::run_parallel_subtasks(
                         &id,
                         agent.clone(),
-                        subtask_prompts,
+                        subtask_specs,
                         wmgr.clone(),
                         &project_root,
                         &remote,
@@ -1022,6 +1049,131 @@ pub(crate) async fn mutate_and_persist(
         f(entry.value_mut());
     }
     store.persist(id).await
+}
+
+// --- dependency scheduling ---
+
+/// DFS cycle detection. Returns true if any dependency transitively reaches `new_id`.
+/// Called before the new task is inserted into the store.
+fn detect_cycle(store: &TaskStore, new_id: &TaskId, depends_on: &[TaskId]) -> bool {
+    let mut stack: Vec<TaskId> = depends_on.to_vec();
+    let mut visited: std::collections::HashSet<TaskId> = std::collections::HashSet::new();
+    while let Some(dep_id) = stack.pop() {
+        if dep_id == *new_id {
+            return true;
+        }
+        if visited.contains(&dep_id) {
+            continue;
+        }
+        visited.insert(dep_id.clone());
+        if let Some(dep_state) = store.get(&dep_id) {
+            for transitive in &dep_state.depends_on {
+                stack.push(transitive.clone());
+            }
+        }
+    }
+    false
+}
+
+/// Create a task that waits for its dependencies before starting.
+///
+/// If all deps are already Done, registers as Pending immediately.
+/// If deps are unresolved, registers as AwaitingDeps.
+/// Returns Err if a circular dependency is detected.
+pub async fn spawn_task_awaiting_deps(
+    store: Arc<TaskStore>,
+    req: CreateTaskRequest,
+) -> anyhow::Result<TaskId> {
+    let depends_on = req.depends_on.clone();
+    let task_id = TaskId::new();
+
+    if detect_cycle(&store, &task_id, &depends_on) {
+        anyhow::bail!("circular dependency detected for task {}", task_id.0);
+    }
+
+    let all_done = depends_on.iter().all(|dep_id| {
+        store
+            .get(dep_id)
+            .map(|s| matches!(s.status, TaskStatus::Done))
+            .unwrap_or(false)
+    });
+
+    let mut state = TaskState::new(task_id.clone());
+    state.depends_on = depends_on;
+    state.source = req.source.clone();
+    state.external_id = req.external_id.clone();
+    state.repo = req.repo.clone();
+    if let Some(parent) = req.parent_task_id.clone() {
+        state.parent_id = Some(parent);
+    }
+
+    if !all_done && !state.depends_on.is_empty() {
+        state.status = TaskStatus::AwaitingDeps;
+    }
+
+    store.insert(&state).await;
+    store.register_task_stream(&task_id);
+    Ok(task_id)
+}
+
+/// Check all AwaitingDeps tasks and transition ready ones to Pending.
+/// Returns the IDs of tasks that were transitioned to Pending.
+pub fn check_awaiting_deps(store: &TaskStore) -> Vec<TaskId> {
+    let mut ready = Vec::new();
+    let mut failed_deps: Vec<(TaskId, TaskId)> = Vec::new();
+
+    for entry in store.cache.iter() {
+        let task = entry.value();
+        if !matches!(task.status, TaskStatus::AwaitingDeps) {
+            continue;
+        }
+        let any_failed = task.depends_on.iter().any(|dep_id| {
+            store
+                .get(dep_id)
+                .map(|s| matches!(s.status, TaskStatus::Failed))
+                .unwrap_or(false)
+        });
+        if any_failed {
+            let Some(failed_dep) = task
+                .depends_on
+                .iter()
+                .find(|dep_id| {
+                    store
+                        .get(dep_id)
+                        .map(|s| matches!(s.status, TaskStatus::Failed))
+                        .unwrap_or(false)
+                })
+                .cloned()
+            else {
+                continue;
+            };
+            failed_deps.push((task.id.clone(), failed_dep));
+            continue;
+        }
+        let all_done = task.depends_on.iter().all(|dep_id| {
+            store
+                .get(dep_id)
+                .map(|s| matches!(s.status, TaskStatus::Done))
+                .unwrap_or(false)
+        });
+        if all_done {
+            ready.push(task.id.clone());
+        }
+    }
+
+    for (task_id, failed_dep_id) in &failed_deps {
+        if let Some(mut entry) = store.cache.get_mut(task_id) {
+            entry.status = TaskStatus::Failed;
+            entry.error = Some(format!("dependency {} failed", failed_dep_id.0));
+        }
+    }
+    for task_id in &ready {
+        if let Some(mut entry) = store.cache.get_mut(task_id) {
+            entry.status = TaskStatus::Pending;
+        }
+    }
+
+    ready
 }
 
 #[cfg(test)]
