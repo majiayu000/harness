@@ -10,11 +10,16 @@ const COLUMNS = [
   { key: "failed", label: "Failed" },
 ];
 
+const TERMINAL_DEFAULT_LIMIT = 5;
 const POLL_INTERVAL_MS = 5000;
 const WS_RECONNECT_MS = 3000;
 
 let ws = null;
 let pollTimer = null;
+let currentTasks = [];
+let searchQuery = "";
+let statusFilter = "all";
+const terminalExpanded = new Set();
 
 function $(sel) { return document.querySelector(sel); }
 
@@ -24,14 +29,25 @@ function authHeaders() {
   return tok ? { "Authorization": "Bearer " + tok } : {};
 }
 
+function relativeTime(ts) {
+  if (!ts) return null;
+  const date = new Date(ts);
+  if (isNaN(date.getTime())) return null;
+  const diff = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (diff < 60) return "just now";
+  if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+  if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+  return Math.floor(diff / 86400) + "d ago";
+}
+
 async function fetchTasks() {
   try {
     const resp = await fetch("/tasks", { headers: authHeaders() });
     if (!resp.ok) return;
-    const tasks = await resp.json();
-    renderBoard(tasks);
-    updateMetrics(tasks);
-    renderPipeline(tasks);
+    currentTasks = await resp.json();
+    renderBoard(currentTasks);
+    updateMetrics(currentTasks);
+    renderPipeline(currentTasks);
     updateStatus(true);
   } catch {
     updateStatus(false);
@@ -125,11 +141,39 @@ function renderIntakeChannels(channels) {
 const ACTIVE_KEYS = new Set(["pending", "implementing", "agent_review", "waiting", "reviewing"]);
 const TERMINAL_KEYS = new Set(["done", "failed"]);
 
+function applyFilter(tasks) {
+  const q = searchQuery.toLowerCase().trim();
+  return tasks.filter(t => {
+    if (statusFilter !== "all") {
+      if (statusFilter === "active" && !ACTIVE_KEYS.has(t.status)) return false;
+      if (statusFilter === "done" && t.status !== "done") return false;
+      if (statusFilter === "failed" && t.status !== "failed") return false;
+    }
+    if (!q) return true;
+    return (
+      (t.description && t.description.toLowerCase().includes(q)) ||
+      (t.id && t.id.toLowerCase().includes(q)) ||
+      (t.repo && t.repo.toLowerCase().includes(q)) ||
+      (t.error && t.error.toLowerCase().includes(q))
+    );
+  });
+}
+
 function renderBoard(tasks) {
+  const filtered = applyFilter(tasks);
   const grouped = {};
   COLUMNS.forEach(c => grouped[c.key] = []);
-  tasks.forEach(t => {
+  filtered.forEach(t => {
     if (grouped[t.status]) grouped[t.status].push(t);
+  });
+
+  // Sort terminal columns newest first
+  TERMINAL_KEYS.forEach(key => {
+    grouped[key].sort((a, b) => {
+      const da = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const db = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return db - da;
+    });
   });
 
   const board = $("#board");
@@ -153,6 +197,24 @@ function renderBoard(tasks) {
 
     if (items.length === 0) {
       div.innerHTML += `<p class="empty-state">No tasks</p>`;
+    } else if (TERMINAL_KEYS.has(col.key)) {
+      const isExpanded = terminalExpanded.has(col.key);
+      const visible = isExpanded ? items : items.slice(0, TERMINAL_DEFAULT_LIMIT);
+      visible.forEach(task => div.appendChild(renderCard(task, col.key)));
+      if (items.length > TERMINAL_DEFAULT_LIMIT) {
+        const btn = document.createElement("button");
+        btn.className = "btn-collapse";
+        btn.textContent = isExpanded ? "Show less" : `Show all (${items.length})`;
+        btn.addEventListener("click", () => {
+          if (terminalExpanded.has(col.key)) {
+            terminalExpanded.delete(col.key);
+          } else {
+            terminalExpanded.add(col.key);
+          }
+          renderBoard(currentTasks);
+        });
+        div.appendChild(btn);
+      }
     } else {
       items.forEach(task => div.appendChild(renderCard(task, col.key)));
     }
@@ -170,34 +232,132 @@ function renderBoard(tasks) {
 
 function renderCard(task, status) {
   const card = document.createElement("div");
-  card.className = "task-card";
+  card.className = "task-card task-card-clickable";
 
-  const shortId = task.id.length > 8 ? task.id.slice(0, 8) : task.id;
+  const shortId = (task.id && task.id.length > 8) ? task.id.slice(0, 8) : (task.id || "");
 
-  let html = `<span class="state-badge badge-${status}">${status}</span>`;
-
+  let html = `<div class="task-card-header">`;
+  html += `<span class="state-badge badge-${escapeHtml(status)}">${escapeHtml(status.replace("_", " "))}</span>`;
   if (task.source) {
     html += `<span class="source-badge source-badge-${escapeHtml(task.source)}">${escapeHtml(task.source)}</span>`;
   }
+  if (task.repo) {
+    html += `<span class="repo-badge">${escapeHtml(task.repo)}</span>`;
+  }
+  if (task.phase && task.phase !== "default") {
+    html += `<span class="phase-badge">${escapeHtml(task.phase)}</span>`;
+  }
+  html += `</div>`;
 
-  html += `<div class="task-id" title="${escapeHtml(task.id)}">${escapeHtml(shortId)}</div>`;
+  // Title: prefer description, fallback to short ID
+  const rawTitle = task.description
+    ? (task.description.length > 80 ? task.description.slice(0, 80) + "\u2026" : task.description)
+    : shortId;
+  html += `<div class="task-title">${escapeHtml(rawTitle)}</div>`;
 
-  if (task.turn > 0) {
-    html += `<div class="task-turn">Turn ${escapeHtml(String(task.turn))}</div>`;
+  // Meta row: turn, external_id, time
+  const metaParts = [];
+  if (task.turn > 0) metaParts.push("Turn " + task.turn);
+  if (task.external_id != null) metaParts.push("#" + escapeHtml(String(task.external_id)));
+  const timeAgo = relativeTime(task.created_at);
+  if (timeAgo) metaParts.push(timeAgo);
+  if (metaParts.length > 0) {
+    html += `<div class="task-meta">${metaParts.join(" \u00b7 ")}</div>`;
   }
 
   if (task.pr_url) {
     const match = task.pr_url.match(/\/pull\/(\d+)/);
-    const label = match ? `PR #${match[1]}` : "PR";
-    html += `<div class="task-pr"><a href="${escapeHtml(task.pr_url)}" target="_blank">${label}</a></div>`;
+    const label = match ? "PR #" + match[1] : "PR";
+    html += `<div class="task-pr"><a href="${escapeHtml(task.pr_url)}" target="_blank" onclick="event.stopPropagation()">${label}</a></div>`;
   }
 
   if (task.error) {
-    html += `<div class="task-error" title="${escapeHtml(task.error)}">${escapeHtml(task.error)}</div>`;
+    const shortErr = task.error.length > 80 ? task.error.slice(0, 80) + "\u2026" : task.error;
+    html += `<div class="task-error">${escapeHtml(shortErr)}</div>`;
   }
 
   card.innerHTML = html;
+  card.addEventListener("click", () => showDetail(task));
   return card;
+}
+
+function showDetail(task) {
+  let panel = document.getElementById("detail-panel");
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.id = "detail-panel";
+    panel.className = "detail-panel";
+    panel.innerHTML =
+      `<div class="detail-overlay" id="detail-overlay"></div>` +
+      `<div class="detail-sheet" id="detail-sheet">` +
+        `<button class="detail-close" id="detail-close" aria-label="Close">&times;</button>` +
+        `<div id="detail-body" class="detail-body"></div>` +
+      `</div>`;
+    document.body.appendChild(panel);
+    document.getElementById("detail-overlay").addEventListener("click", closeDetail);
+    document.getElementById("detail-close").addEventListener("click", closeDetail);
+  }
+
+  const status = task.status || "unknown";
+  const timeAgo = relativeTime(task.created_at);
+  const createdStr = task.created_at ? new Date(task.created_at).toLocaleString() : null;
+
+  let body = `<h2 class="detail-title">${escapeHtml(task.description || task.id || "")}</h2>`;
+
+  body += `<div class="detail-badges">`;
+  body += `<span class="state-badge badge-${escapeHtml(status)}">${escapeHtml(status.replace("_", " "))}</span>`;
+  if (task.source) body += `<span class="source-badge source-badge-${escapeHtml(task.source)}">${escapeHtml(task.source)}</span>`;
+  if (task.repo) body += `<span class="repo-badge">${escapeHtml(task.repo)}</span>`;
+  if (task.phase && task.phase !== "default") body += `<span class="phase-badge">${escapeHtml(task.phase)}</span>`;
+  body += `</div>`;
+
+  body += `<table class="detail-table">`;
+  body += `<tr><th>ID</th><td><code class="detail-code">${escapeHtml(task.id || "")}</code></td></tr>`;
+  if (task.repo) body += `<tr><th>Repo</th><td>${escapeHtml(task.repo)}</td></tr>`;
+  if (task.external_id != null) body += `<tr><th>External ID</th><td>${escapeHtml(String(task.external_id))}</td></tr>`;
+  if (task.source) body += `<tr><th>Source</th><td>${escapeHtml(task.source)}</td></tr>`;
+  if (task.phase) body += `<tr><th>Phase</th><td>${escapeHtml(task.phase)}</td></tr>`;
+  if (task.turn > 0) body += `<tr><th>Turn</th><td>${escapeHtml(String(task.turn))}</td></tr>`;
+  if (createdStr) {
+    const timeLabel = timeAgo ? timeAgo + " (" + createdStr + ")" : createdStr;
+    body += `<tr><th>Created</th><td>${escapeHtml(timeLabel)}</td></tr>`;
+  }
+  body += `</table>`;
+
+  if (task.description) {
+    body += `<div class="detail-section">`;
+    body += `<div class="detail-section-title">Prompt / Description</div>`;
+    body += `<pre class="detail-pre">${escapeHtml(task.description)}</pre>`;
+    body += `</div>`;
+  }
+
+  if (task.pr_url) {
+    const match = task.pr_url.match(/\/pull\/(\d+)/);
+    const label = match ? "PR #" + match[1] : "View PR";
+    body += `<div class="detail-section">`;
+    body += `<div class="detail-section-title">Pull Request</div>`;
+    body += `<a href="${escapeHtml(task.pr_url)}" target="_blank" class="detail-link">${escapeHtml(label)} \u2197</a>`;
+    body += `</div>`;
+  }
+
+  if (task.error) {
+    body += `<div class="detail-section">`;
+    body += `<div class="detail-section-title detail-section-error">Error</div>`;
+    body += `<pre class="detail-pre detail-pre-error">${escapeHtml(task.error)}</pre>`;
+    body += `</div>`;
+  }
+
+  document.getElementById("detail-body").innerHTML = body;
+  panel.classList.add("detail-panel-open");
+  document.body.style.overflow = "hidden";
+}
+
+function closeDetail() {
+  const panel = document.getElementById("detail-panel");
+  if (panel) {
+    panel.classList.remove("detail-panel-open");
+    document.body.style.overflow = "";
+  }
 }
 
 function escapeHtml(str) {
@@ -291,11 +451,34 @@ function initForm() {
   });
 }
 
+function initSearchFilter() {
+  const searchInput = document.getElementById("search-input");
+  const statusSelect = document.getElementById("status-filter");
+
+  if (searchInput) {
+    searchInput.addEventListener("input", () => {
+      searchQuery = searchInput.value;
+      renderBoard(currentTasks);
+    });
+  }
+
+  if (statusSelect) {
+    statusSelect.addEventListener("change", () => {
+      statusFilter = statusSelect.value;
+      renderBoard(currentTasks);
+    });
+  }
+}
+
 function init() {
   fetchTasks();
   fetchIntake();
   connectWebSocket();
   initForm();
+  initSearchFilter();
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeDetail();
+  });
   pollTimer = setInterval(fetchTasks, POLL_INTERVAL_MS);
   setInterval(fetchIntake, POLL_INTERVAL_MS);
 }

@@ -86,6 +86,15 @@ pub async fn index(State(state): State<Arc<crate::http::AppState>>) -> impl Into
 
 <section class="section-card">
   <h2 class="section-title">Task Board</h2>
+  <div class="search-bar">
+    <input id="search-input" class="form-input search-input" type="search" placeholder="Search by description, ID, repo, or error\u2026" />
+    <select id="status-filter" class="form-input form-select filter-select">
+      <option value="all">All Status</option>
+      <option value="active">Active</option>
+      <option value="done">Done</option>
+      <option value="failed">Failed</option>
+    </select>
+  </div>
   <div id="board" class="board"></div>
 </section>
 
