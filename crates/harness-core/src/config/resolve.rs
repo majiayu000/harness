@@ -1,4 +1,4 @@
-use super::project::ProjectConfig;
+use super::project::{ProjectConfig, ReviewType};
 use super::{AgentReviewConfig, ConcurrencyConfig, GcConfig, HarnessConfig};
 
 /// Effective configuration for a task, merging server defaults with per-project overrides.
@@ -15,6 +15,12 @@ pub struct ResolvedConfig {
     pub concurrency: ConcurrencyConfig,
     /// Effective GC configuration.
     pub gc: GcConfig,
+    /// Project type for review focus selection.
+    pub review_type: ReviewType,
+    /// Per-project override: seconds to wait for review bot before the review loop.
+    pub review_wait_secs: Option<u64>,
+    /// Per-project override: maximum review bot rounds.
+    pub review_max_rounds: Option<u32>,
 }
 
 /// Merge server-level defaults with per-project overrides.
@@ -52,11 +58,25 @@ pub fn resolve_config(server: &HarnessConfig, project: &ProjectConfig) -> Resolv
         }
     }
 
+    let mut review_wait_secs: Option<u64> = None;
+    let mut review_max_rounds: Option<u32> = None;
+    if let Some(proj_review) = &project.review {
+        if let Some(secs) = proj_review.review_wait_secs {
+            review_wait_secs = Some(secs);
+        }
+        if let Some(rounds) = proj_review.review_max_rounds {
+            review_max_rounds = Some(rounds);
+        }
+    }
+
     ResolvedConfig {
         default_agent,
         review,
         concurrency,
         gc,
+        review_type: project.review_type,
+        review_wait_secs,
+        review_max_rounds,
     }
 }
 
@@ -106,7 +126,9 @@ mod tests {
         let project = ProjectConfig {
             review: Some(ProjectReviewConfig {
                 enabled: Some(true),
-                bot_command: None, // not overriding bot_command
+                bot_command: None,
+                review_wait_secs: None,
+                review_max_rounds: None,
             }),
             ..Default::default()
         };
@@ -127,6 +149,8 @@ mod tests {
             review: Some(ProjectReviewConfig {
                 enabled: Some(true),
                 bot_command: Some("/custom review".to_string()),
+                review_wait_secs: None,
+                review_max_rounds: None,
             }),
             ..Default::default()
         };

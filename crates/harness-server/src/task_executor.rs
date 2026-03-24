@@ -954,6 +954,7 @@ pub(crate) async fn run_task(
                 &interceptors,
                 turn_timeout,
                 pr_url.as_deref().unwrap_or(""),
+                project_config.review_type.as_str(),
                 &events,
                 &cargo_env,
             )
@@ -1163,6 +1164,7 @@ async fn run_agent_review(
     interceptors: &[Arc<dyn harness_core::interceptor::TurnInterceptor>],
     turn_timeout: Duration,
     pr_url: &str,
+    project_type: &str,
     events: &harness_observe::EventStore,
     cargo_env: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
@@ -1173,7 +1175,7 @@ async fn run_agent_review(
         // Reviewer evaluates the PR diff — read-only except Bash for `gh pr diff`.
         let review_req = AgentRequest {
             prompt: {
-                let base = prompts::agent_review_prompt(pr_url, agent_round);
+                let base = prompts::agent_review_prompt(pr_url, agent_round, project_type);
                 // Inject capability note — primary enforcement now that --allowedTools
                 // is not passed to the CLI (issue #483).
                 let note = "Tool restriction: you are operating in review mode. \
@@ -1317,7 +1319,7 @@ async fn run_agent_review(
 
         // Implementor fixes the issues
         let fix_req = AgentRequest {
-            prompt: prompts::agent_review_fix_prompt(pr_url, &issues, agent_round),
+            prompt: prompts::agent_review_fix_prompt(pr_url, &issues, agent_round, project_type),
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Execution),

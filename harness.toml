@@ -1,0 +1,16 @@
+# harness.toml — per-project review type configuration
+#
+# Each named section shows the .harness/config.toml settings for a project.
+# Copy the relevant section into {project_root}/.harness/config.toml.
+#
+# Supported review_type values: rust | shell | documentation | mixed (default)
+
+[vibeguard]
+review_type = "documentation"
+
+[refine]
+review_type = "rust"
+
+[refine.review]
+review_wait_secs = 300
+review_max_rounds = 8

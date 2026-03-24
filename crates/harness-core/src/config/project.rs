@@ -1,6 +1,32 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Project type used to select review focus criteria.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewType {
+    /// Rust projects: focus on concurrency, deadlocks, error handling.
+    Rust,
+    /// Shell scripts: focus on quoting, portability, command injection.
+    Shell,
+    /// Documentation projects: focus on accuracy, broken links, completeness.
+    Documentation,
+    /// Mixed or unknown projects: general correctness and security review.
+    #[default]
+    Mixed,
+}
+
+impl ReviewType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewType::Rust => "rust",
+            ReviewType::Shell => "shell",
+            ReviewType::Documentation => "documentation",
+            ReviewType::Mixed => "mixed",
+        }
+    }
+}
+
 /// Per-project agent configuration overrides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectAgentConfig {
@@ -18,6 +44,12 @@ pub struct ProjectReviewConfig {
     /// Review bot command override (e.g. "/gemini review").
     #[serde(default)]
     pub bot_command: Option<String>,
+    /// Override seconds to wait for the review bot before starting the review loop.
+    #[serde(default)]
+    pub review_wait_secs: Option<u64>,
+    /// Override maximum review bot rounds for this project.
+    #[serde(default)]
+    pub review_max_rounds: Option<u32>,
 }
 
 /// Per-project concurrency configuration overrides.
@@ -97,6 +129,9 @@ pub struct ProjectConfig {
     /// Per-project GC overrides. `None` inherits from server defaults.
     #[serde(default)]
     pub gc: Option<ProjectGcConfig>,
+    /// Project type used to select review focus criteria. Default: mixed.
+    #[serde(default)]
+    pub review_type: ReviewType,
 }
 
 /// Load project config from `{project_root}/.harness/config.toml`.
