@@ -964,6 +964,26 @@ pub(crate) async fn run_task(
         }
     }
 
+    // Skip external review bot wait when auto-trigger is disabled — there is
+    // no bot to wait for, so the loop would always exhaust all rounds and fail.
+    if !review_config.review_bot_auto_trigger {
+        tracing::info!("review_bot_auto_trigger disabled; skipping external review wait");
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Done;
+            s.turn = 2;
+        })
+        .await?;
+        tracing::info!(
+            task_id = %task_id,
+            status = "done",
+            turns = 2,
+            pr_url = pr_url.as_deref().unwrap_or(""),
+            total_elapsed_secs = task_start.elapsed().as_secs(),
+            "task_completed"
+        );
+        return Ok(());
+    }
+
     // Wait for external review bot.
     // Use a local counter instead of querying the store to derive waiting_count —
     // task execution is sequential within a single tokio task, so a plain u32 suffices.
