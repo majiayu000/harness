@@ -1171,7 +1171,7 @@ pub(crate) async fn run_task(
 fn hash_issues(issues: &[String]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    let mut sorted = issues.to_vec();
+    let mut sorted: Vec<_> = issues.iter().collect();
     sorted.sort();
     let mut hasher = DefaultHasher::new();
     sorted.hash(&mut hasher);
@@ -1195,7 +1195,8 @@ async fn run_agent_review(
     cargo_env: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
     let max_rounds = review_config.max_rounds;
-    let mut prev_issues_hash: Option<u64> = None;
+    // (hash, consecutive_count): tracks how many consecutive rounds produced identical issues.
+    let mut impasse_tracker: Option<(u64, u32)> = None;
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
 
@@ -1344,28 +1345,50 @@ async fn run_agent_review(
             break;
         }
 
-        // Detect impasse: same issues repeated from the previous round.
+        // Detect impasse: track how many consecutive rounds produced identical issues.
         let current_hash = hash_issues(&issues);
-        let is_impasse = prev_issues_hash == Some(current_hash);
-        prev_issues_hash = Some(current_hash);
+        let consecutive_count = match impasse_tracker {
+            Some((h, c)) if h == current_hash => c + 1,
+            _ => 1,
+        };
+        impasse_tracker = Some((current_hash, consecutive_count));
+
+        // 5 consecutive rounds with identical issues → mark task as Failed immediately.
+        if consecutive_count >= 5 {
+            tracing::warn!(
+                agent_round,
+                consecutive_count,
+                "agent review impasse: same issues repeated 5 times — marking task as failed"
+            );
+            mutate_and_persist(store, task_id, |s| {
+                s.status = TaskStatus::Failed;
+                s.error = Some(format!(
+                    "Impasse detected: identical issues repeated {consecutive_count} consecutive rounds."
+                ));
+            })
+            .await?;
+            return Ok(());
+        }
+
+        // 3+ consecutive rounds with identical issues → use the intervention prompt.
+        let is_impasse = consecutive_count >= 3;
         if is_impasse {
             tracing::warn!(
                 agent_round,
+                consecutive_count,
                 "agent review impasse detected — same issues repeated, using intervention prompt"
             );
         }
 
         // Implementor fixes the issues
         let fix_req = AgentRequest {
-            prompt: if is_impasse {
-                prompts::agent_review_intervention_prompt(
-                    pr_url,
-                    &issues,
-                    agent_round,
-                    project_type,
-                )
-            } else {
-                prompts::agent_review_fix_prompt(pr_url, &issues, agent_round, project_type)
+            prompt: {
+                let prompt_fn = if is_impasse {
+                    prompts::agent_review_intervention_prompt
+                } else {
+                    prompts::agent_review_fix_prompt
+                };
+                prompt_fn(pr_url, &issues, agent_round, project_type)
             },
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
@@ -1625,35 +1648,65 @@ mod tests {
         assert_eq!(hash_issues(&issues_ordered), hash_issues(&issues_reversed));
     }
 
-    #[test]
-    fn impasse_detection_logic_no_impasse_on_first_round() {
-        let issues = vec!["null pointer".to_string()];
-        let mut prev_hash: Option<u64> = None;
-        let current_hash = hash_issues(&issues);
-        let is_impasse = prev_hash == Some(current_hash);
-        prev_hash = Some(current_hash);
-        assert!(!is_impasse);
-        assert_eq!(prev_hash, Some(current_hash));
+    fn step_tracker(tracker: &mut Option<(u64, u32)>, issues: &[String]) -> (u32, bool, bool) {
+        let h = hash_issues(issues);
+        let count = match *tracker {
+            Some((prev_h, c)) if prev_h == h => c + 1,
+            _ => 1,
+        };
+        *tracker = Some((h, count));
+        let intervention = count >= 3;
+        let fatal = count >= 5;
+        (count, intervention, fatal)
     }
 
     #[test]
-    fn impasse_detection_logic_detected_when_issues_repeat() {
+    fn impasse_no_intervention_for_first_two_rounds() {
         let issues = vec!["null pointer".to_string()];
-        let mut prev_hash: Option<u64> = None;
-        // Round 1
-        let h1 = hash_issues(&issues);
-        let impasse_r1 = prev_hash == Some(h1);
-        prev_hash = Some(h1);
-        // Round 2 — same issues
-        let h2 = hash_issues(&issues);
-        let impasse_r2 = prev_hash == Some(h2);
-        prev_hash = Some(h2);
-        // Round 3 — different issues
-        let other_issues = vec!["different bug".to_string()];
-        let h3 = hash_issues(&other_issues);
-        let impasse_r3 = prev_hash == Some(h3);
-        assert!(!impasse_r1, "no impasse on first round");
-        assert!(impasse_r2, "impasse when same issues repeated");
-        assert!(!impasse_r3, "no impasse when issues change");
+        let mut tracker: Option<(u64, u32)> = None;
+        let (c1, i1, f1) = step_tracker(&mut tracker, &issues);
+        let (c2, i2, f2) = step_tracker(&mut tracker, &issues);
+        assert_eq!(c1, 1);
+        assert!(!i1 && !f1, "no action on first occurrence");
+        assert_eq!(c2, 2);
+        assert!(!i2 && !f2, "no action on second occurrence");
+    }
+
+    #[test]
+    fn impasse_intervention_at_third_consecutive_round() {
+        let issues = vec!["null pointer".to_string()];
+        let mut tracker: Option<(u64, u32)> = None;
+        step_tracker(&mut tracker, &issues); // round 1
+        step_tracker(&mut tracker, &issues); // round 2
+        let (c3, i3, f3) = step_tracker(&mut tracker, &issues); // round 3
+        assert_eq!(c3, 3);
+        assert!(i3, "intervention at 3rd consecutive round");
+        assert!(!f3, "not yet fatal at round 3");
+    }
+
+    #[test]
+    fn impasse_fatal_at_fifth_consecutive_round() {
+        let issues = vec!["null pointer".to_string()];
+        let mut tracker: Option<(u64, u32)> = None;
+        for _ in 0..4 {
+            step_tracker(&mut tracker, &issues);
+        }
+        let (c5, i5, f5) = step_tracker(&mut tracker, &issues);
+        assert_eq!(c5, 5);
+        assert!(i5, "intervention still active at round 5");
+        assert!(f5, "fatal at 5th consecutive round");
+    }
+
+    #[test]
+    fn impasse_counter_resets_when_issues_change() {
+        let issues = vec!["null pointer".to_string()];
+        let other = vec!["different bug".to_string()];
+        let mut tracker: Option<(u64, u32)> = None;
+        step_tracker(&mut tracker, &issues); // count 1
+        step_tracker(&mut tracker, &issues); // count 2
+        step_tracker(&mut tracker, &issues); // count 3 — would trigger intervention
+        let (c_reset, i_reset, _) = step_tracker(&mut tracker, &other); // different issues
+        assert_eq!(c_reset, 1, "counter resets on different issues");
+        assert!(!i_reset, "no intervention after reset");
     }
 }
