@@ -943,7 +943,7 @@ pub(crate) async fn run_task(
     if review_config.enabled {
         if let Some(reviewer) = reviewer {
             tracing::info!(pr_url = %pr_url.as_deref().unwrap_or(""), "starting agent review");
-            run_agent_review(
+            let review_ok = run_agent_review(
                 store,
                 task_id,
                 agent,
@@ -959,6 +959,9 @@ pub(crate) async fn run_task(
                 &cargo_env,
             )
             .await?;
+            if !review_ok {
+                return Ok(());
+            }
         } else {
             tracing::warn!("agent review enabled but no reviewer agent configured; skipping");
         }
@@ -1193,7 +1196,7 @@ async fn run_agent_review(
     project_type: &str,
     events: &harness_observe::EventStore,
     cargo_env: &HashMap<String, String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let max_rounds = review_config.max_rounds;
     // (hash, consecutive_count): tracks how many consecutive rounds produced identical issues.
     let mut impasse_tracker: Option<(u64, u32)> = None;
@@ -1261,7 +1264,7 @@ async fn run_agent_review(
                         s.error = Some(e.to_string());
                     })
                     .await?;
-                    return Ok(());
+                    return Ok(false);
                 }
                 run_on_error(interceptors, &review_req, &e.to_string()).await;
                 return Err(e.into());
@@ -1338,14 +1341,8 @@ async fn run_agent_review(
             break;
         }
 
-        if agent_round == max_rounds {
-            tracing::info!(
-                "agent review exhausted {max_rounds} rounds, proceeding to GitHub review"
-            );
-            break;
-        }
-
         // Detect impasse: track how many consecutive rounds produced identical issues.
+        // Must happen before the max_rounds break so thresholds are reachable at the last round.
         let current_hash = hash_issues(&issues);
         let consecutive_count = match impasse_tracker {
             Some((h, c)) if h == current_hash => c + 1,
@@ -1367,7 +1364,7 @@ async fn run_agent_review(
                 ));
             })
             .await?;
-            return Ok(());
+            return Ok(false);
         }
 
         // 3+ consecutive rounds with identical issues → use the intervention prompt.
@@ -1378,6 +1375,13 @@ async fn run_agent_review(
                 consecutive_count,
                 "agent review impasse detected — same issues repeated, using intervention prompt"
             );
+        }
+
+        if agent_round == max_rounds {
+            tracing::info!(
+                "agent review exhausted {max_rounds} rounds, proceeding to GitHub review"
+            );
+            break;
         }
 
         // Implementor fixes the issues
@@ -1434,7 +1438,7 @@ async fn run_agent_review(
         .await?;
     }
 
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
