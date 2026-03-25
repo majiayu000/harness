@@ -159,7 +159,6 @@ function renderBoard(tasks) {
 
   COLUMNS.forEach(col => {
     const items = grouped[col.key];
-    if (items.length === 0) return;
     const div = document.createElement("div");
     div.className = "column";
     div.innerHTML =
@@ -167,7 +166,11 @@ function renderBoard(tasks) {
         `<span class="column-title">${col.label}</span>` +
         `<span class="column-count">${items.length}</span>` +
       `</div>`;
-    items.forEach(task => div.appendChild(renderCard(task, col.key)));
+    if (items.length === 0) {
+      div.innerHTML += '<p class="empty-state">No tasks</p>';
+    } else {
+      items.forEach(task => div.appendChild(renderCard(task, col.key)));
+    }
     row.appendChild(div);
   });
 
