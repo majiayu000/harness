@@ -1171,14 +1171,10 @@ pub(crate) async fn run_task(
 
 /// Compute a stable hash over a set of review issues.
 /// Issues are sorted before hashing so insertion order does not affect the result.
-fn hash_issues(issues: &[String]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut sorted: Vec<_> = issues.iter().collect();
+fn normalize_issues(issues: &[String]) -> Vec<String> {
+    let mut sorted = issues.to_vec();
     sorted.sort();
-    let mut hasher = DefaultHasher::new();
-    sorted.hash(&mut hasher);
-    hasher.finish()
+    sorted
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1198,8 +1194,8 @@ async fn run_agent_review(
     cargo_env: &HashMap<String, String>,
 ) -> anyhow::Result<bool> {
     let max_rounds = review_config.max_rounds;
-    // (hash, consecutive_count): tracks how many consecutive rounds produced identical issues.
-    let mut impasse_tracker: Option<(u64, u32)> = None;
+    // (normalized_issues, consecutive_count): tracks how many consecutive rounds produced identical issues.
+    let mut impasse_tracker: Option<(Vec<String>, u32)> = None;
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
 
@@ -1343,12 +1339,13 @@ async fn run_agent_review(
 
         // Detect impasse: track how many consecutive rounds produced identical issues.
         // Must happen before the max_rounds break so thresholds are reachable at the last round.
-        let current_hash = hash_issues(&issues);
-        let consecutive_count = match impasse_tracker {
-            Some((h, c)) if h == current_hash => c + 1,
+        // Compare normalized issue lists directly to avoid false positives from hash collisions.
+        let normalized = normalize_issues(&issues);
+        let consecutive_count = match &impasse_tracker {
+            Some((prev, c)) if *prev == normalized => c + 1,
             _ => 1,
         };
-        impasse_tracker = Some((current_hash, consecutive_count));
+        impasse_tracker = Some((normalized, consecutive_count));
 
         // 5 consecutive rounds with identical issues → mark task as Failed immediately.
         if consecutive_count >= 5 {
@@ -1377,7 +1374,10 @@ async fn run_agent_review(
             );
         }
 
-        if agent_round == max_rounds {
+        // Skip the fix round only when rounds are exhausted and there is no impasse.
+        // When impasse is detected at the last round, we still apply the intervention prompt
+        // to give the agent one final attempt to break the cycle before GitHub review.
+        if agent_round == max_rounds && !is_impasse {
             tracing::info!(
                 "agent review exhausted {max_rounds} rounds, proceeding to GitHub review"
             );
@@ -1633,32 +1633,22 @@ mod tests {
     }
 
     #[test]
-    fn hash_issues_same_issues_produce_same_hash() {
-        let issues = vec!["issue A".to_string(), "issue B".to_string()];
-        assert_eq!(hash_issues(&issues), hash_issues(&issues));
+    fn normalize_issues_is_order_invariant() {
+        let ordered = vec!["issue A".to_string(), "issue B".to_string()];
+        let reversed = vec!["issue B".to_string(), "issue A".to_string()];
+        assert_eq!(normalize_issues(&ordered), normalize_issues(&reversed));
     }
 
-    #[test]
-    fn hash_issues_different_issues_produce_different_hash() {
-        let issues_a = vec!["issue A".to_string()];
-        let issues_b = vec!["issue B".to_string()];
-        assert_ne!(hash_issues(&issues_a), hash_issues(&issues_b));
-    }
-
-    #[test]
-    fn hash_issues_order_invariant() {
-        let issues_ordered = vec!["issue A".to_string(), "issue B".to_string()];
-        let issues_reversed = vec!["issue B".to_string(), "issue A".to_string()];
-        assert_eq!(hash_issues(&issues_ordered), hash_issues(&issues_reversed));
-    }
-
-    fn step_tracker(tracker: &mut Option<(u64, u32)>, issues: &[String]) -> (u32, bool, bool) {
-        let h = hash_issues(issues);
-        let count = match *tracker {
-            Some((prev_h, c)) if prev_h == h => c + 1,
+    fn step_tracker(
+        tracker: &mut Option<(Vec<String>, u32)>,
+        issues: &[String],
+    ) -> (u32, bool, bool) {
+        let normalized = normalize_issues(issues);
+        let count = match tracker.as_ref() {
+            Some((prev, c)) if *prev == normalized => c + 1,
             _ => 1,
         };
-        *tracker = Some((h, count));
+        *tracker = Some((normalized, count));
         let intervention = count >= 3;
         let fatal = count >= 5;
         (count, intervention, fatal)
@@ -1667,7 +1657,7 @@ mod tests {
     #[test]
     fn impasse_no_intervention_for_first_two_rounds() {
         let issues = vec!["null pointer".to_string()];
-        let mut tracker: Option<(u64, u32)> = None;
+        let mut tracker: Option<(Vec<String>, u32)> = None;
         let (c1, i1, f1) = step_tracker(&mut tracker, &issues);
         let (c2, i2, f2) = step_tracker(&mut tracker, &issues);
         assert_eq!(c1, 1);
@@ -1679,7 +1669,7 @@ mod tests {
     #[test]
     fn impasse_intervention_at_third_consecutive_round() {
         let issues = vec!["null pointer".to_string()];
-        let mut tracker: Option<(u64, u32)> = None;
+        let mut tracker: Option<(Vec<String>, u32)> = None;
         step_tracker(&mut tracker, &issues); // round 1
         step_tracker(&mut tracker, &issues); // round 2
         let (c3, i3, f3) = step_tracker(&mut tracker, &issues); // round 3
@@ -1691,7 +1681,7 @@ mod tests {
     #[test]
     fn impasse_fatal_at_fifth_consecutive_round() {
         let issues = vec!["null pointer".to_string()];
-        let mut tracker: Option<(u64, u32)> = None;
+        let mut tracker: Option<(Vec<String>, u32)> = None;
         for _ in 0..4 {
             step_tracker(&mut tracker, &issues);
         }
@@ -1705,7 +1695,7 @@ mod tests {
     fn impasse_counter_resets_when_issues_change() {
         let issues = vec!["null pointer".to_string()];
         let other = vec!["different bug".to_string()];
-        let mut tracker: Option<(u64, u32)> = None;
+        let mut tracker: Option<(Vec<String>, u32)> = None;
         step_tracker(&mut tracker, &issues); // count 1
         step_tracker(&mut tracker, &issues); // count 2
         step_tracker(&mut tracker, &issues); // count 3 — would trigger intervention
