@@ -226,6 +226,24 @@ fn compute_backoff_ms(base_ms: u64, max_ms: u64, attempt: u32) -> u64 {
     base_ms.saturating_mul(1u64 << shift).min(max_ms)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImplementationOutcome {
+    PlanIssue(String),
+    ParsedPr {
+        pr_url: Option<String>,
+        pr_num: Option<u64>,
+    },
+}
+
+fn parse_implementation_outcome(output: &str) -> ImplementationOutcome {
+    if let Some(desc) = prompts::parse_plan_issue(output) {
+        return ImplementationOutcome::PlanIssue(desc);
+    }
+    let pr_url = prompts::parse_pr_url(output);
+    let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
+    ImplementationOutcome::ParsedPr { pr_url, pr_num }
+}
+
 /// Persist a completed stream item as a task artifact when it carries content
 /// worth retaining across context loss (shell commands, file edits, tool calls).
 async fn persist_artifact(
@@ -887,8 +905,41 @@ pub(crate) async fn run_task(
         return Ok(());
     }
 
-    let pr_url = prompts::parse_pr_url(&output);
-    let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
+    let (pr_url, pr_num) = match parse_implementation_outcome(&output) {
+        ImplementationOutcome::PlanIssue(plan_issue) => {
+            tracing::error!(
+                task_id = %task_id,
+                plan_issue = %plan_issue,
+                "implementation returned PLAN_ISSUE; marking task failed"
+            );
+            mutate_and_persist(store, task_id, |s| {
+                s.status = TaskStatus::Failed;
+                s.turn = 2;
+                s.error = Some(plan_issue.clone());
+                s.rounds.push(RoundResult {
+                    turn: 1,
+                    action: "implement".into(),
+                    result: "plan_issue".into(),
+                    detail: if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.clone())
+                    },
+                });
+            })
+            .await?;
+            tracing::info!(
+                task_id = %task_id,
+                status = "failed",
+                turns = 2,
+                pr_url = tracing::field::Empty,
+                total_elapsed_secs = task_start.elapsed().as_secs(),
+                "task_completed"
+            );
+            return Ok(());
+        }
+        ImplementationOutcome::ParsedPr { pr_url, pr_num } => (pr_url, pr_num),
+    };
 
     mutate_and_persist(store, task_id, |s| {
         s.pr_url = pr_url.clone();
@@ -1577,6 +1628,30 @@ mod tests {
     fn implementation_turn_uses_full_profile_no_restriction() {
         // Full profile returns None — no tool restriction is applied to the agent.
         assert!(CapabilityProfile::Full.tools().is_none());
+    }
+
+    #[test]
+    fn parse_implementation_outcome_prefers_plan_issue() {
+        let output =
+            "PLAN_ISSUE=Plan missed rollback path\nPR_URL=https://github.com/o/r/pull/123";
+        let parsed = parse_implementation_outcome(output);
+        assert_eq!(
+            parsed,
+            ImplementationOutcome::PlanIssue("Plan missed rollback path".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_implementation_outcome_extracts_pr_when_no_plan_issue() {
+        let output = "Done.\nPR_URL=https://github.com/majiayu000/harness/pull/42";
+        let parsed = parse_implementation_outcome(output);
+        assert_eq!(
+            parsed,
+            ImplementationOutcome::ParsedPr {
+                pr_url: Some("https://github.com/majiayu000/harness/pull/42".to_string()),
+                pr_num: Some(42),
+            }
+        );
     }
 
     #[test]
