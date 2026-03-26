@@ -66,6 +66,7 @@ enabled = false
 # interval_secs = 300
 # interval_hours = 24
 # agent = "codex"
+# strategy = "single" # or "cross" for dual-review + synthesis
 # timeout_secs = 900
 
 # Register projects below (can also pass --project-root / --project on CLI).

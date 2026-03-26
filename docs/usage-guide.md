@@ -343,6 +343,7 @@ curl -X DELETE http://127.0.0.1:9800/api/projects/new-project
 | `enabled` | `false` | Enable periodic whole-repo review |
 | `interval_hours` | `24` | Hours between review cycles |
 | `agent` | — | Agent for review tasks (defaults to `agents.default_agent`) |
+| `strategy` | `"single"` | Review mode: `single` (one reviewer) or `cross` (dual-review + synthesis) |
 | `timeout_secs` | `900` | Per-turn timeout for review tasks |
 
 When enabled, the scheduler runs a background loop that:
@@ -437,6 +438,7 @@ Whole-repo code review on a timer. Disabled by default.
 [review]
 enabled = true
 interval_hours = 24
+# strategy = "cross"
 ```
 
 **What happens when enabled:**

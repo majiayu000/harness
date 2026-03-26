@@ -478,13 +478,18 @@ pub fn periodic_review_prompt(project_root: &str, since: &str, project_type: &st
 ///
 /// The agent receives both raw reviews and decides what's real, what's noise,
 /// and what the final report should contain. No pre-classification framework.
-pub fn review_synthesis_prompt(claude_review: &str, codex_review: &str) -> String {
-    let safe_claude = wrap_external_data(claude_review);
-    let safe_codex = wrap_external_data(codex_review);
+pub fn review_synthesis_prompt_with_agents(
+    left_agent: &str,
+    left_review: &str,
+    right_agent: &str,
+    right_review: &str,
+) -> String {
+    let safe_left = wrap_external_data(left_review);
+    let safe_right = wrap_external_data(right_review);
     format!(
-        "You are a Staff Engineer. Two independent reviewers (Claude and Codex) just reviewed the same codebase.\n\n\
-         ## Claude's Review\n{safe_claude}\n\n\
-         ## Codex's Review\n{safe_codex}\n\n\
+        "You are a Staff Engineer. Two independent reviewers ({left_agent} and {right_agent}) just reviewed the same codebase.\n\n\
+         ## {left_agent}'s Review\n{safe_left}\n\n\
+         ## {right_agent}'s Review\n{safe_right}\n\n\
          Read both reviews. Use your own judgment to produce the final report:\n\
          - Read the actual code to verify any finding you're unsure about\n\
          - Findings both reviewers agree on are likely real\n\
@@ -497,6 +502,10 @@ pub fn review_synthesis_prompt(claude_review: &str, codex_review: &str) -> Strin
          REVIEW_JSON_END\n\n\
          health_score = 100 minus deductions (P0: -15, P1: -8, P2: -3, P3: -1), minimum 0."
     )
+}
+
+pub fn review_synthesis_prompt(claude_review: &str, codex_review: &str) -> String {
+    review_synthesis_prompt_with_agents("Claude", claude_review, "Codex", codex_review)
 }
 
 /// Check if agent output indicates approval (last non-empty line is "APPROVED").
@@ -917,6 +926,14 @@ mod tests {
             p.contains("state") && p.contains("SUCCESS"),
             "must instruct agent to check state field for SUCCESS"
         );
+    }
+
+    #[test]
+    fn test_review_synthesis_prompt_with_custom_agents() {
+        let p = review_synthesis_prompt_with_agents("Codex", "left", "Claude", "right");
+        assert!(p.contains("Codex and Claude"));
+        assert!(p.contains("## Codex's Review"));
+        assert!(p.contains("## Claude's Review"));
     }
 
     #[test]
