@@ -995,7 +995,15 @@ pub(crate) async fn run_task(
     // Cap WAITING polls so a permanently-unavailable review bot cannot hold an execution
     // slot indefinitely. Scale with max_rounds (6× gives ~60 min at default 120 s/poll);
     // floor at 20 so low max_rounds configs still get a reasonable grace period.
-    let max_waiting_polls = req.max_rounds.saturating_mul(6).max(20);
+    // Hard-cap at 1000 to prevent u32 saturation: if max_rounds >= u32::MAX/6 the
+    // saturating_mul would produce u32::MAX and the termination condition
+    // `waiting_count > max_waiting_polls` could never be satisfied.
+    const MAX_WAITING_POLLS_CAP: u32 = 1000;
+    let max_waiting_polls = req
+        .max_rounds
+        .saturating_mul(6)
+        .max(20)
+        .min(MAX_WAITING_POLLS_CAP);
     tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
     sleep(Duration::from_secs(wait_secs)).await;
 
@@ -1097,7 +1105,10 @@ pub(crate) async fn run_task(
         // WAITING means review bot hasn't posted yet — do not consume a round.
         // `round` is intentionally not incremented here.
         if waiting {
-            waiting_count += 1;
+            // Use saturating_add as an extra defence against u32 overflow; in practice
+            // max_waiting_polls is now capped at MAX_WAITING_POLLS_CAP so this path
+            // exits long before saturation could occur.
+            waiting_count = waiting_count.saturating_add(1);
             if waiting_count > max_waiting_polls {
                 let msg = format!(
                     "Review bot did not respond after {waiting_count} polls ({} s each); \
