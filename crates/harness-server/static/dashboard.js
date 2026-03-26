@@ -278,7 +278,8 @@ function renderCard(task, status) {
   if (task.pr_url) {
     const match = task.pr_url.match(/\/pull\/(\d+)/);
     const label = match ? "PR #" + match[1] : "PR";
-    html += `<div class="task-pr"><a href="${escapeHtml(task.pr_url)}" target="_blank" onclick="event.stopPropagation()">${label}</a></div>`;
+    const safeCardUrl = (task.pr_url.startsWith("https://") || task.pr_url.startsWith("http://")) ? escapeHtml(task.pr_url) : "#";
+    html += `<div class="task-pr"><a href="${safeCardUrl}" target="_blank" onclick="event.stopPropagation()">${label}</a></div>`;
   }
 
   if (task.error) {
@@ -348,7 +349,8 @@ function showDetail(task) {
     const label = match ? "PR #" + match[1] : "View PR";
     body += `<div class="detail-section">`;
     body += `<div class="detail-section-title">Pull Request</div>`;
-    body += `<a href="${escapeHtml(task.pr_url)}" target="_blank" class="detail-link">${escapeHtml(label)} \u2197</a>`;
+    const safeUrl = (task.pr_url.startsWith("https://") || task.pr_url.startsWith("http://")) ? escapeHtml(task.pr_url) : "#";
+    body += `<a href="${safeUrl}" target="_blank" class="detail-link">${escapeHtml(label)} \u2197</a>`;
     body += `</div>`;
   }
 

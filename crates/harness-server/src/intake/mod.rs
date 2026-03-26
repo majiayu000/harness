@@ -157,6 +157,84 @@ impl IntakeOrchestrator {
     }
 }
 
+/// Validate the sprint DAG for missing upstream dependencies and cycles.
+///
+/// `all_task_issues` — the full set of issue numbers the sprint will execute.
+/// `deps` — mapping from issue number to its (already-filtered) dependency list.
+///
+/// Skipped issues must be removed from dep lists before calling this function,
+/// so that a task depending on a skipped issue is not incorrectly flagged.
+fn validate_dag(
+    all_task_issues: &std::collections::HashSet<u64>,
+    deps: &std::collections::HashMap<u64, Vec<u64>>,
+) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+
+    // Check for deps that reference issues not in the sprint plan.
+    for (&issue, dep_list) in deps {
+        for &dep in dep_list {
+            if !all_task_issues.contains(&dep) {
+                errors.push(format!(
+                    "issue {issue} depends on {dep} which is not in the sprint plan"
+                ));
+            }
+        }
+    }
+
+    // Kahn's algorithm: detect cycles among the plan issues.
+    // Build in-degree map and downstream adjacency list.
+    let mut in_degree: std::collections::HashMap<u64, usize> =
+        all_task_issues.iter().map(|&id| (id, 0usize)).collect();
+    let mut dependents: std::collections::HashMap<u64, Vec<u64>> =
+        all_task_issues.iter().map(|&id| (id, Vec::new())).collect();
+
+    for (&issue, dep_list) in deps {
+        for &dep in dep_list {
+            if all_task_issues.contains(&dep) {
+                // Edge direction: dep → issue (dep must complete first)
+                *in_degree.entry(issue).or_insert(0) += 1;
+                dependents.entry(dep).or_default().push(issue);
+            }
+        }
+    }
+
+    // BFS starting from zero-in-degree nodes.
+    let mut queue: std::collections::VecDeque<u64> = in_degree
+        .iter()
+        .filter(|(_, &deg)| deg == 0)
+        .map(|(&id, _)| id)
+        .collect();
+
+    let mut processed = 0usize;
+    while let Some(node) = queue.pop_front() {
+        processed += 1;
+        for &dependent in dependents.get(&node).into_iter().flatten() {
+            let deg = in_degree.entry(dependent).or_insert(0);
+            *deg = deg.saturating_sub(1);
+            if *deg == 0 {
+                queue.push_back(dependent);
+            }
+        }
+    }
+
+    if processed < all_task_issues.len() {
+        // Nodes remaining with in-degree > 0 are participants in a cycle.
+        let mut cycle_nodes: Vec<u64> = in_degree
+            .iter()
+            .filter(|(_, &deg)| deg > 0)
+            .map(|(&id, _)| id)
+            .collect();
+        cycle_nodes.sort_unstable();
+        errors.push(format!("cycle detected among issues: {cycle_nodes:?}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 /// Run sprint planner + DAG-based slot-filling execution for a single repo.
 async fn run_repo_sprint(
     state: &Arc<AppState>,
@@ -240,11 +318,29 @@ async fn run_repo_sprint(
     let mut running: std::collections::HashMap<u64, TaskId> = std::collections::HashMap::new();
     let all_task_issues: std::collections::HashSet<u64> =
         plan.tasks.iter().map(|t| t.issue).collect();
+
+    // Build the dep map, filtering out any dep IDs that belong to skipped issues
+    // so they are not flagged as missing upstreams.
+    let skip_set: std::collections::HashSet<u64> = plan.skip.iter().map(|s| s.issue).collect();
     let deps: std::collections::HashMap<u64, Vec<u64>> = plan
         .tasks
         .iter()
-        .map(|t| (t.issue, t.depends_on.clone()))
+        .map(|t| {
+            let filtered: Vec<u64> = t
+                .depends_on
+                .iter()
+                .copied()
+                .filter(|dep| !skip_set.contains(dep))
+                .collect();
+            (t.issue, filtered)
+        })
         .collect();
+
+    // Validate DAG before starting execution.
+    if let Err(e) = validate_dag(&all_task_issues, &deps) {
+        tracing::error!(repo, error = %e, "intake: invalid sprint DAG — aborting");
+        return;
+    }
 
     let max_slots = 4usize; // matches max_concurrent in config
     let start = tokio::time::Instant::now();
@@ -329,7 +425,17 @@ async fn run_repo_sprint(
             }
         }
 
+        // Detect deadlock: no running tasks but unresolved tasks still pending.
         if running.is_empty() {
+            let pending: std::collections::HashSet<u64> =
+                all_task_issues.difference(&completed).copied().collect();
+            if !pending.is_empty() {
+                tracing::error!(
+                    repo,
+                    stranded = ?pending,
+                    "intake: DAG deadlock — tasks stranded with unresolvable deps"
+                );
+            }
             break;
         }
 
@@ -356,12 +462,24 @@ async fn run_repo_sprint(
         }
     }
 
+    let stranded: std::collections::HashSet<u64> =
+        all_task_issues.difference(&completed).copied().collect();
+
     tracing::info!(
         repo,
         completed = completed.len(),
+        stranded = stranded.len(),
         elapsed_secs = start.elapsed().as_secs(),
         "intake: repo sprint complete"
     );
+
+    if !stranded.is_empty() {
+        tracing::error!(
+            repo,
+            issues = ?stranded,
+            "intake: sprint ended with unresolved tasks"
+        );
+    }
 }
 
 /// Format collected issues into a summary for the planner prompt.
@@ -481,6 +599,117 @@ pub(crate) fn build_prompt_from_issue(issue: &IncomingIssue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_deps(pairs: &[(u64, &[u64])]) -> std::collections::HashMap<u64, Vec<u64>> {
+        pairs
+            .iter()
+            .map(|&(issue, deps)| (issue, deps.to_vec()))
+            .collect()
+    }
+
+    fn make_issues(ids: &[u64]) -> std::collections::HashSet<u64> {
+        ids.iter().copied().collect()
+    }
+
+    // --- validate_dag tests ---
+
+    #[test]
+    fn validate_dag_empty() {
+        assert!(validate_dag(&make_issues(&[]), &make_deps(&[])).is_ok());
+    }
+
+    #[test]
+    fn validate_dag_valid_linear() {
+        // A(1) → B(2) → C(3)
+        let issues = make_issues(&[1, 2, 3]);
+        let deps = make_deps(&[(1, &[]), (2, &[1]), (3, &[2])]);
+        assert!(validate_dag(&issues, &deps).is_ok());
+    }
+
+    #[test]
+    fn validate_dag_valid_diamond() {
+        // A(1) → {B(2), C(3)} → D(4)
+        let issues = make_issues(&[1, 2, 3, 4]);
+        let deps = make_deps(&[(1, &[]), (2, &[1]), (3, &[1]), (4, &[2, 3])]);
+        assert!(validate_dag(&issues, &deps).is_ok());
+    }
+
+    #[test]
+    fn validate_dag_missing_upstream() {
+        // Issue 2 depends on issue 99 which is not in the plan.
+        let issues = make_issues(&[1, 2]);
+        let deps = make_deps(&[(1, &[]), (2, &[99])]);
+        let err = validate_dag(&issues, &deps).unwrap_err();
+        assert!(
+            err.contains("99"),
+            "error should mention the missing issue: {err}"
+        );
+        assert!(
+            err.contains("2"),
+            "error should mention the dependent issue: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_dag_self_cycle() {
+        // Issue 1 depends on itself.
+        let issues = make_issues(&[1]);
+        let deps = make_deps(&[(1, &[1])]);
+        let err = validate_dag(&issues, &deps).unwrap_err();
+        assert!(err.contains("cycle"), "error should mention cycle: {err}");
+        assert!(err.contains('1'), "error should mention issue 1: {err}");
+    }
+
+    #[test]
+    fn validate_dag_two_node_cycle() {
+        // 1 depends on 2 and 2 depends on 1.
+        let issues = make_issues(&[1, 2]);
+        let deps = make_deps(&[(1, &[2]), (2, &[1])]);
+        let err = validate_dag(&issues, &deps).unwrap_err();
+        assert!(err.contains("cycle"), "error should mention cycle: {err}");
+        assert!(
+            err.contains('1') && err.contains('2'),
+            "error should mention both issues: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_dag_multi_component_cycle() {
+        // 3-node cycle {1,2,3} isolated from valid node 4.
+        let issues = make_issues(&[1, 2, 3, 4]);
+        let deps = make_deps(&[(1, &[3]), (2, &[1]), (3, &[2]), (4, &[])]);
+        let err = validate_dag(&issues, &deps).unwrap_err();
+        assert!(err.contains("cycle"), "error should mention cycle: {err}");
+        // Issues 1, 2, 3 should all appear in the error
+        assert!(err.contains('1') && err.contains('2') && err.contains('3'));
+        // Issue 4 is valid and should not be in the cycle error
+        // (4 is not in cycle_nodes because its in-degree stays 0)
+    }
+
+    #[test]
+    fn validate_dag_missing_plus_cycle() {
+        // Issue 1 depends on missing 99, and issues 2 and 3 form a cycle.
+        let issues = make_issues(&[1, 2, 3]);
+        let deps = make_deps(&[(1, &[99]), (2, &[3]), (3, &[2])]);
+        let err = validate_dag(&issues, &deps).unwrap_err();
+        assert!(
+            err.contains("99"),
+            "error should mention missing dep 99: {err}"
+        );
+        assert!(err.contains("cycle"), "error should mention cycle: {err}");
+    }
+
+    #[test]
+    fn validate_dag_skipped_dep_excluded() {
+        // Issue 2 depends on issue 10, but 10 is skipped (not in all_task_issues).
+        // When the caller pre-filters skipped deps from the dep list, no error.
+        let issues = make_issues(&[1, 2]);
+        // Simulates the caller filtering out dep 10 (a skipped issue) before calling validate_dag.
+        let deps = make_deps(&[(1, &[]), (2, &[])]);
+        assert!(validate_dag(&issues, &deps).is_ok());
+    }
+
+    // --- existing tests ---
 
     #[test]
     fn build_prompt_from_issue_formats_correctly() {

@@ -67,29 +67,83 @@ pub(crate) fn extract_file_refs(prompt: &str) -> Vec<String> {
     refs
 }
 
-/// Decompose a complex prompt into parallel subtask prompts.
+/// A subtask produced by decomposing a complex prompt.
+pub struct SubtaskSpec {
+    /// The full prompt for this subtask (including focus directive).
+    pub prompt: String,
+    /// Zero-based indices of subtasks that must complete before this one starts.
+    /// Empty means this subtask can run immediately (parallel).
+    pub depends_on_indices: Vec<usize>,
+}
+
+/// Returns true if the prompt uses numbered list ordering (sequential intent).
 ///
-/// Partitions file references evenly across two subtasks. Each subtask receives
-/// the original prompt with an added focus directive. Returns a single-element
-/// vec when decomposition is not meaningful (< 2 file references found).
-pub fn decompose(prompt: &str) -> Vec<String> {
+/// Detects patterns like "1. ...", "1) ..." at the start of lines.
+fn is_numbered_list(prompt: &str) -> bool {
+    prompt.lines().filter(|l| !l.trim().is_empty()).any(|l| {
+        let trimmed = l.trim_start();
+        trimmed.starts_with("1. ") || trimmed.starts_with("1) ")
+    })
+}
+
+/// Decompose a complex prompt into subtask specs.
+///
+/// Numbered lists (e.g. "1. write X\n2. refactor Y") produce sequential specs
+/// where each spec depends on the previous. Plain file-ref partitioning produces
+/// parallel specs with no dependencies.
+///
+/// Returns a single-element vec when decomposition is not meaningful.
+pub fn decompose(prompt: &str) -> Vec<SubtaskSpec> {
+    // Numbered list → sequential subtasks.
+    if is_numbered_list(prompt) {
+        let items: Vec<&str> = prompt
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with(|c: char| c.is_ascii_digit())
+                    && (t.contains(". ") || t.contains(") "))
+            })
+            .collect();
+        if items.len() >= 2 {
+            return items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| SubtaskSpec {
+                    prompt: format!(
+                        "{}\n\n[Sequential subtask {}/{}] {}",
+                        prompt,
+                        i + 1,
+                        items.len(),
+                        item.trim()
+                    ),
+                    depends_on_indices: if i == 0 { vec![] } else { vec![i - 1] },
+                })
+                .collect();
+        }
+    }
+
+    // File-ref partitioning → parallel subtasks.
     let files = extract_file_refs(prompt);
     if files.len() < 2 {
-        return vec![prompt.to_string()];
+        return vec![SubtaskSpec {
+            prompt: prompt.to_string(),
+            depends_on_indices: vec![],
+        }];
     }
     let mid = files.len().div_ceil(2);
     let total_chunks = files.chunks(mid).count();
     files
         .chunks(mid)
         .enumerate()
-        .map(|(i, group)| {
-            format!(
+        .map(|(i, group)| SubtaskSpec {
+            prompt: format!(
                 "{}\n\n[Parallel subtask {}/{}] Focus on these files: {}",
                 prompt,
                 i + 1,
                 total_chunks,
                 group.join(", ")
-            )
+            ),
+            depends_on_indices: vec![],
         })
         .collect()
 }
@@ -115,7 +169,7 @@ pub struct SubtaskResult {
 pub async fn run_parallel_subtasks(
     task_id: &TaskId,
     agent: Arc<dyn CodeAgent>,
-    subtask_prompts: Vec<String>,
+    subtasks: Vec<SubtaskSpec>,
     workspace_mgr: Arc<WorkspaceManager>,
     source_repo: &Path,
     remote: &str,
@@ -123,12 +177,12 @@ pub async fn run_parallel_subtasks(
     context: Vec<ContextItem>,
     turn_timeout: Duration,
 ) -> Vec<SubtaskResult> {
-    let count = subtask_prompts.len();
+    let count = subtasks.len();
     let mut handles: Vec<tokio::task::JoinHandle<(usize, Result<AgentResponse, String>)>> =
         Vec::with_capacity(count);
     let mut sub_ids: Vec<Option<TaskId>> = Vec::with_capacity(count);
 
-    for (i, prompt) in subtask_prompts.into_iter().enumerate() {
+    for (i, spec) in subtasks.into_iter().enumerate() {
         let sub_id = TaskId(format!("{}-p{i}", task_id.0));
         match workspace_mgr
             .create_workspace(&sub_id, source_repo, remote, base_branch)
@@ -139,7 +193,7 @@ pub async fn run_parallel_subtasks(
                 let agent = agent.clone();
                 let context = context.clone();
                 let req = AgentRequest {
-                    prompt,
+                    prompt: spec.prompt,
                     project_root: workspace,
                     context,
                     ..Default::default()
@@ -213,7 +267,7 @@ mod tests {
         let prompt = "Fix the login bug";
         let subtasks = decompose(prompt);
         assert_eq!(subtasks.len(), 1);
-        assert_eq!(subtasks[0], prompt);
+        assert_eq!(subtasks[0].prompt, prompt);
     }
 
     #[test]
@@ -221,7 +275,7 @@ mod tests {
         let prompt = "Fix the bug in src/main.rs";
         let subtasks = decompose(prompt);
         assert_eq!(subtasks.len(), 1);
-        assert_eq!(subtasks[0], prompt);
+        assert_eq!(subtasks[0].prompt, prompt);
     }
 
     #[test]
@@ -236,8 +290,8 @@ mod tests {
         let prompt = "Refactor src/a.rs src/b.rs src/c.rs src/d.rs";
         let subtasks = decompose(prompt);
         assert_eq!(subtasks.len(), 2);
-        assert!(subtasks[0].contains("[Parallel subtask 1/2]"));
-        assert!(subtasks[1].contains("[Parallel subtask 2/2]"));
+        assert!(subtasks[0].prompt.contains("[Parallel subtask 1/2]"));
+        assert!(subtasks[1].prompt.contains("[Parallel subtask 2/2]"));
     }
 
     #[test]
@@ -245,7 +299,7 @@ mod tests {
         let prompt = "Fix auth.rs and db.rs together";
         let subtasks = decompose(prompt);
         for subtask in &subtasks {
-            assert!(subtask.starts_with(prompt));
+            assert!(subtask.prompt.starts_with(prompt));
         }
     }
 
@@ -313,7 +367,25 @@ mod tests {
         let prompt = "Update auth.rs and db.rs";
         let subtasks = decompose(prompt);
         assert_eq!(subtasks.len(), 2);
-        assert!(subtasks[0].contains("Focus on these files:"));
-        assert!(subtasks[1].contains("Focus on these files:"));
+        assert!(subtasks[0].prompt.contains("Focus on these files:"));
+        assert!(subtasks[1].prompt.contains("Focus on these files:"));
+    }
+
+    #[test]
+    fn decompose_numbered_list_yields_sequential_specs() {
+        let prompt = "1. Write the auth module\n2. Refactor the db layer";
+        let subtasks = decompose(prompt);
+        assert_eq!(subtasks.len(), 2);
+        assert!(subtasks[0].depends_on_indices.is_empty());
+        assert_eq!(subtasks[1].depends_on_indices, vec![0]);
+    }
+
+    #[test]
+    fn decompose_parallel_specs_have_no_dependencies() {
+        let prompt = "Update src/auth.rs and src/db.rs";
+        let subtasks = decompose(prompt);
+        assert_eq!(subtasks.len(), 2);
+        assert!(subtasks[0].depends_on_indices.is_empty());
+        assert!(subtasks[1].depends_on_indices.is_empty());
     }
 }
