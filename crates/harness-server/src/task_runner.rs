@@ -415,14 +415,8 @@ impl TaskStore {
         let recovery = db.recover_in_progress().await?;
         if recovery.failed > 0 {
             tracing::warn!(
-                "startup recovery: marked {} implementing/agent_review task(s) as failed",
+                "startup recovery: marked {} interrupted task(s) as failed (reviewing/waiting states cannot resume after restart)",
                 recovery.failed
-            );
-        }
-        if recovery.requeued > 0 {
-            tracing::warn!(
-                "startup recovery: reset {} reviewing/waiting task(s) to pending for retry",
-                recovery.requeued
             );
         }
         let cache = DashMap::new();
