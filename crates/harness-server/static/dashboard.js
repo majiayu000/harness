@@ -348,7 +348,8 @@ function showDetail(task) {
     const label = match ? "PR #" + match[1] : "View PR";
     body += `<div class="detail-section">`;
     body += `<div class="detail-section-title">Pull Request</div>`;
-    body += `<a href="${escapeHtml(task.pr_url)}" target="_blank" class="detail-link">${escapeHtml(label)} \u2197</a>`;
+    const safeUrl = (task.pr_url.startsWith("https://") || task.pr_url.startsWith("http://")) ? escapeHtml(task.pr_url) : "#";
+    body += `<a href="${safeUrl}" target="_blank" class="detail-link">${escapeHtml(label)} \u2197</a>`;
     body += `</div>`;
   }
 
