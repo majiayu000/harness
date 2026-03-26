@@ -222,7 +222,7 @@ async fn run_review_tick(
 
         // Persist findings from the final output.
         let Some(output) = final_output else {
-            tracing::warn!("scheduler: no review output to parse");
+            tracing::error!("scheduler: periodic review cycle produced no output — no review output to parse");
             return;
         };
         match crate::review_store::parse_review_output(&output) {
@@ -263,7 +263,7 @@ async fn poll_task_output(
     loop {
         sleep(poll_interval).await;
         if start.elapsed() > max_wait {
-            tracing::warn!(task_id = %task_id, "poll_task_output: timed out");
+            tracing::error!(task_id = %task_id, "scheduler: periodic review cycle produced no output — poll_task_output timed out");
             return None;
         }
         let Some(task) = store.get(task_id) else {
@@ -282,7 +282,7 @@ async fn poll_task_output(
             .collect::<Vec<_>>()
             .join("\n");
         if output.is_empty() {
-            tracing::warn!(task_id = %task_id, "poll_task_output: completed but no output");
+            tracing::error!(task_id = %task_id, "scheduler: periodic review cycle produced no output — poll_task_output completed with empty output");
             return None;
         }
         return Some(output);
