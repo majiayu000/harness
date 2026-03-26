@@ -9,6 +9,7 @@
     clippy::unnecessary_to_owned
 )]
 
+pub mod app_state;
 pub mod complexity_router;
 pub mod contract_validator;
 pub mod dashboard;

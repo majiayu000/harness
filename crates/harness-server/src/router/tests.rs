@@ -1,108 +1,20 @@
 use super::*;
 use crate::{
-    http::AppState,
-    server::HarnessServer,
+    app_state::AppState,
     test_helpers::{make_test_state, make_test_state_with_registry},
-    thread_manager::ThreadManager,
 };
 use harness_agents::AgentRegistry;
 use harness_core::HarnessConfig;
 use harness_protocol::{Method, RpcRequest, INTERNAL_ERROR};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 async fn make_test_state_with_config_and_registry(
     dir: &std::path::Path,
     config: HarnessConfig,
     agent_registry: AgentRegistry,
 ) -> anyhow::Result<AppState> {
-    let server = Arc::new(HarnessServer::new(
-        config,
-        ThreadManager::new(),
-        agent_registry,
-    ));
-    let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
-    let events = Arc::new(harness_observe::EventStore::new(dir).await?);
-    let signal_detector = harness_gc::SignalDetector::new(
-        server.config.gc.signal_thresholds.clone().into(),
-        harness_core::ProjectId::new(),
-    );
-    let draft_store = harness_gc::DraftStore::new(dir)?;
-    let gc_agent = Arc::new(harness_gc::GcAgent::new(
-        server.config.gc.clone(),
-        signal_detector,
-        draft_store,
-        dir.to_path_buf(),
-    ));
-    let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
-    let (notification_tx, _) = tokio::sync::broadcast::channel(64);
-    let _project_svc_tmp =
-        crate::project_registry::ProjectRegistry::open(&dir.join("svc_projects.db")).await?;
-    let project_svc =
-        crate::services::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
-    let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
-    let execution_svc = crate::services::DefaultExecutionService::new(
-        tasks.clone(),
-        server.agent_registry.clone(),
-        Arc::new(server.config.clone()),
-        Default::default(),
-        events.clone(),
-        vec![],
-        None,
-        Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-        None,
-        None,
-        vec![],
-    );
-    Ok(AppState {
-        core: crate::http::CoreServices {
-            server,
-            project_root: dir.to_path_buf(),
-            home_dir: std::env::var("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| dir.to_path_buf()),
-            tasks,
-            thread_db: Some(thread_db),
-            plan_db: None,
-            plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
-            project_registry: None,
-        },
-        engines: crate::http::EngineServices {
-            skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
-            rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
-            gc_agent,
-        },
-        observability: crate::http::ObservabilityServices {
-            events,
-            signal_rate_limiter: std::sync::Arc::new(crate::http::SignalRateLimiter::new(100)),
-            password_reset_rate_limiter: std::sync::Arc::new(
-                crate::http::PasswordResetRateLimiter::new(5),
-            ),
-            review_store: None,
-        },
-        concurrency: crate::http::ConcurrencyServices {
-            task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-            workspace_mgr: None,
-        },
-        notifications: crate::http::NotificationServices {
-            notification_tx,
-            notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            notification_lag_log_every: 1,
-            notify_tx: None,
-            initializing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
-        },
-        interceptors: vec![],
-        intake: crate::http::IntakeServices {
-            feishu_intake: None,
-            github_intake: None,
-            completion_callback: None,
-        },
-        project_svc,
-        task_svc,
-        execution_svc,
-    })
+    crate::test_helpers::make_test_state_with_config_and_registry(dir, dir, config, agent_registry)
+        .await
 }
 
 #[tokio::test]
@@ -1310,94 +1222,9 @@ async fn learn_skills_returns_zero_when_no_adopted_drafts() -> anyhow::Result<()
 // --- ExecPlan persistence tests ---
 
 async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<AppState> {
-    let server = Arc::new(HarnessServer::new(
-        HarnessConfig::default(),
-        ThreadManager::new(),
-        AgentRegistry::new("test"),
-    ));
-    let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
-    let events = Arc::new(harness_observe::EventStore::new(dir).await?);
-    let signal_detector = harness_gc::SignalDetector::new(
-        server.config.gc.signal_thresholds.clone().into(),
-        harness_core::ProjectId::new(),
-    );
-    let draft_store = harness_gc::DraftStore::new(dir)?;
-    let gc_agent = Arc::new(harness_gc::GcAgent::new(
-        server.config.gc.clone(),
-        signal_detector,
-        draft_store,
-        dir.to_path_buf(),
-    ));
-    let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
-    let plan_db = crate::plan_db::PlanDb::open(&dir.join("exec_plans.db")).await?;
-    let (notification_tx, _) = tokio::sync::broadcast::channel(64);
-    let _project_svc_tmp =
-        crate::project_registry::ProjectRegistry::open(&dir.join("svc_projects.db")).await?;
-    let project_svc =
-        crate::services::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
-    let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
-    let execution_svc = crate::services::DefaultExecutionService::new(
-        tasks.clone(),
-        server.agent_registry.clone(),
-        Arc::new(server.config.clone()),
-        Default::default(),
-        events.clone(),
-        vec![],
-        None,
-        Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-        None,
-        None,
-        vec![],
-    );
-    Ok(AppState {
-        core: crate::http::CoreServices {
-            server,
-            project_root: dir.to_path_buf(),
-            home_dir: std::env::var("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| dir.to_path_buf()),
-            tasks,
-            thread_db: Some(thread_db),
-            plan_db: Some(plan_db),
-            plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
-            project_registry: None,
-        },
-        engines: crate::http::EngineServices {
-            skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
-            rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
-            gc_agent,
-        },
-        observability: crate::http::ObservabilityServices {
-            events,
-            signal_rate_limiter: std::sync::Arc::new(crate::http::SignalRateLimiter::new(100)),
-            password_reset_rate_limiter: std::sync::Arc::new(
-                crate::http::PasswordResetRateLimiter::new(5),
-            ),
-            review_store: None,
-        },
-        concurrency: crate::http::ConcurrencyServices {
-            task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-            workspace_mgr: None,
-        },
-        notifications: crate::http::NotificationServices {
-            notification_tx,
-            notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            notification_lag_log_every: 1,
-            notify_tx: None,
-            initializing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
-        },
-        interceptors: vec![],
-        intake: crate::http::IntakeServices {
-            feishu_intake: None,
-            github_intake: None,
-            completion_callback: None,
-        },
-        project_svc,
-        task_svc,
-        execution_svc,
-    })
+    let mut state = crate::test_helpers::make_test_state(dir).await?;
+    state.core.plan_db = Some(crate::plan_db::PlanDb::open(&dir.join("exec_plans.db")).await?);
+    Ok(state)
 }
 
 #[tokio::test]

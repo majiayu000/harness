@@ -72,14 +72,14 @@ impl CodeAgent for MockPrAgent {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn make_state(root: &Path) -> anyhow::Result<harness_server::http::AppState> {
+async fn make_state(root: &Path) -> anyhow::Result<harness_server::app_state::AppState> {
     make_state_with_auto_pr(root, true).await
 }
 
 async fn make_state_with_auto_pr(
     root: &Path,
     auto_pr: bool,
-) -> anyhow::Result<harness_server::http::AppState> {
+) -> anyhow::Result<harness_server::app_state::AppState> {
     let project_root = root.join("project");
     std::fs::create_dir_all(&project_root)?;
 

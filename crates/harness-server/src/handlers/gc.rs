@@ -1,4 +1,4 @@
-use crate::http::{resolve_reviewer, AppState};
+use crate::app_state::{resolve_reviewer, AppState};
 use harness_core::{config::resolve_config, DraftId};
 use harness_protocol::{RpcResponse, INTERNAL_ERROR, NOT_FOUND};
 

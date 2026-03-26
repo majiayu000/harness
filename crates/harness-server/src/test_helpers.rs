@@ -39,7 +39,14 @@ impl Drop for HomeGuard {
     }
 }
 
-use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
+use crate::{
+    app_state::{
+        AppState, ConcurrencyServices, CoreServices, EngineServices, IntakeServices,
+        NotificationServices, ObservabilityServices, PasswordResetRateLimiter, SignalRateLimiter,
+    },
+    server::HarnessServer,
+    thread_manager::ThreadManager,
+};
 use harness_agents::AgentRegistry;
 use harness_core::HarnessConfig;
 
@@ -62,14 +69,36 @@ pub fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
 }
 
 pub async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
-    make_state_inner(dir, dir, AgentRegistry::new("test")).await
+    make_state_inner(
+        dir,
+        dir,
+        HarnessConfig::default(),
+        AgentRegistry::new("test"),
+    )
+    .await
 }
 
 pub async fn make_test_state_with_registry(
     dir: &std::path::Path,
     agent_registry: AgentRegistry,
 ) -> anyhow::Result<AppState> {
-    make_state_inner(dir, dir, agent_registry).await
+    make_state_inner(dir, dir, HarnessConfig::default(), agent_registry).await
+}
+
+pub async fn make_test_state_with_config(
+    dir: &std::path::Path,
+    config: HarnessConfig,
+) -> anyhow::Result<AppState> {
+    make_state_inner(dir, dir, config, AgentRegistry::new("test")).await
+}
+
+pub async fn make_test_state_with_config_and_registry(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    config: HarnessConfig,
+    agent_registry: AgentRegistry,
+) -> anyhow::Result<AppState> {
+    make_state_inner(dir, project_root, config, agent_registry).await
 }
 
 /// Build a test `AppState` wrapped in `Arc`, using separate data and project-root directories.
@@ -81,17 +110,24 @@ pub async fn make_test_state_with_project_root(
     project_root: &std::path::Path,
 ) -> anyhow::Result<Arc<AppState>> {
     Ok(Arc::new(
-        make_state_inner(dir, project_root, AgentRegistry::new("test")).await?,
+        make_state_inner(
+            dir,
+            project_root,
+            HarnessConfig::default(),
+            AgentRegistry::new("test"),
+        )
+        .await?,
     ))
 }
 
 async fn make_state_inner(
     dir: &std::path::Path,
     project_root: &std::path::Path,
+    config: HarnessConfig,
     agent_registry: AgentRegistry,
 ) -> anyhow::Result<AppState> {
     let server = Arc::new(HarnessServer::new(
-        HarnessConfig::default(),
+        config,
         ThreadManager::new(),
         agent_registry,
     ));
@@ -109,8 +145,14 @@ async fn make_state_inner(
         project_root.to_path_buf(),
     ));
     let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
-    let (notification_tx, _) = tokio::sync::broadcast::channel(64);
-    let task_queue = Arc::new(crate::task_queue::TaskQueue::new(&Default::default()));
+    let notification_broadcast_capacity =
+        server.config.server.notification_broadcast_capacity.max(1);
+    let notification_lag_log_every = server.config.server.notification_lag_log_every;
+    let (notification_tx, _) = tokio::sync::broadcast::channel(notification_broadcast_capacity);
+    let (ws_shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+    let task_queue = Arc::new(crate::task_queue::TaskQueue::new(
+        &server.config.concurrency,
+    ));
 
     // Service layer — use concrete defaults backed by the same infrastructure.
     let project_svc = crate::services::DefaultProjectService::new(
@@ -134,7 +176,7 @@ async fn make_state_inner(
     );
 
     Ok(AppState {
-        core: crate::http::CoreServices {
+        core: CoreServices {
             server,
             project_root: project_root.to_path_buf(),
             home_dir: std::env::var("HOME")
@@ -146,32 +188,32 @@ async fn make_state_inner(
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             project_registry: None,
         },
-        engines: crate::http::EngineServices {
+        engines: EngineServices {
             skills: Default::default(),
             rules: Default::default(),
             gc_agent,
         },
-        observability: crate::http::ObservabilityServices {
+        observability: ObservabilityServices {
             events,
-            signal_rate_limiter: Arc::new(crate::http::SignalRateLimiter::new(100)),
-            password_reset_rate_limiter: Arc::new(crate::http::PasswordResetRateLimiter::new(5)),
+            signal_rate_limiter: Arc::new(SignalRateLimiter::new(100)),
+            password_reset_rate_limiter: Arc::new(PasswordResetRateLimiter::new(5)),
             review_store: None,
         },
-        concurrency: crate::http::ConcurrencyServices {
+        concurrency: ConcurrencyServices {
             task_queue,
             workspace_mgr: None,
         },
-        notifications: crate::http::NotificationServices {
+        notifications: NotificationServices {
             notification_tx,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),
-            notification_lag_log_every: 1,
+            notification_lag_log_every,
             notify_tx: None,
             initializing: Arc::new(AtomicBool::new(true)),
             initialized: Arc::new(AtomicBool::new(true)),
-            ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            ws_shutdown_tx,
         },
         interceptors: vec![],
-        intake: crate::http::IntakeServices {
+        intake: IntakeServices {
             feishu_intake: None,
             github_intake: None,
             completion_callback: None,

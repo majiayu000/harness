@@ -62,93 +62,15 @@ async fn make_test_state_with(
     config: harness_core::HarnessConfig,
     agent_registry: harness_agents::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
-    let thread_manager = crate::thread_manager::ThreadManager::new();
-    let server = Arc::new(crate::server::HarnessServer::new(
-        config,
-        thread_manager,
-        agent_registry,
-    ));
-    let tasks = task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
-    let events = Arc::new(harness_observe::EventStore::new(dir).await?);
-    let signal_detector = harness_gc::SignalDetector::new(
-        server.config.gc.signal_thresholds.clone().into(),
-        harness_core::ProjectId::new(),
-    );
-    let draft_store = harness_gc::DraftStore::new(dir)?;
-    let gc_agent = Arc::new(harness_gc::GcAgent::new(
-        server.config.gc.clone(),
-        signal_detector,
-        draft_store,
-        dir.to_path_buf(),
-    ));
-    let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
-    let _project_svc_tmp =
-        crate::project_registry::ProjectRegistry::open(&dir.join("svc_projects.db")).await?;
-    let project_svc =
-        crate::services::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
-    let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
-    let execution_svc = crate::services::DefaultExecutionService::new(
-        tasks.clone(),
-        server.agent_registry.clone(),
-        Arc::new(server.config.clone()),
-        Default::default(),
-        events.clone(),
-        vec![],
-        None,
-        Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-        None,
-        None,
-        vec![],
-    );
-    Ok(Arc::new(AppState {
-        core: crate::http::CoreServices {
-            server,
-            project_root: dir.to_path_buf(),
-            home_dir: std::env::var("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| dir.to_path_buf()),
-            tasks,
-            thread_db: Some(thread_db),
-            plan_db: None,
-            plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
-            project_registry: None,
-        },
-        engines: crate::http::EngineServices {
-            skills: Arc::new(tokio::sync::RwLock::new(harness_skills::SkillStore::new())),
-            rules: Arc::new(tokio::sync::RwLock::new(
-                harness_rules::engine::RuleEngine::new(),
-            )),
-            gc_agent,
-        },
-        observability: crate::http::ObservabilityServices {
-            events,
-            signal_rate_limiter: Arc::new(crate::http::SignalRateLimiter::new(100)),
-            password_reset_rate_limiter: Arc::new(crate::http::PasswordResetRateLimiter::new(5)),
-            review_store: None,
-        },
-        concurrency: crate::http::ConcurrencyServices {
-            task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-            workspace_mgr: None,
-        },
-        notifications: crate::http::NotificationServices {
-            notification_tx: tokio::sync::broadcast::channel(32).0,
-            notification_lagged_total: Arc::new(AtomicU64::new(0)),
-            notification_lag_log_every: 1,
-            notify_tx: None,
-            initializing: Arc::new(AtomicBool::new(true)),
-            initialized: Arc::new(AtomicBool::new(true)),
-            ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
-        },
-        interceptors: vec![],
-        intake: crate::http::IntakeServices {
-            feishu_intake: None,
-            github_intake: None,
-            completion_callback: None,
-        },
-        project_svc,
-        task_svc,
-        execution_svc,
-    }))
+    Ok(Arc::new(
+        crate::test_helpers::make_test_state_with_config_and_registry(
+            dir,
+            dir,
+            config,
+            agent_registry,
+        )
+        .await?,
+    ))
 }
 
 async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>> {
@@ -1019,7 +941,7 @@ impl CodeAgent for DispatchCapturingAgent {
     }
 }
 
-/// Build a test AppState with a "test" (default) and a "claude" DispatchCapturingAgent.
+/// Build a test AppState with a "test" (default) and a "codex" DispatchCapturingAgent.
 /// Returns the state and atomic flags for each agent so tests can detect which was invoked.
 async fn make_test_state_with_dispatch_agents(
     dir: &std::path::Path,
@@ -1029,12 +951,12 @@ async fn make_test_state_with_dispatch_agents(
     Arc<std::sync::atomic::AtomicBool>,
 )> {
     let (default_agent, default_invoked) = DispatchCapturingAgent::new("test");
-    let (claude_agent, claude_invoked) = DispatchCapturingAgent::new("claude");
+    let (codex_agent, codex_invoked) = DispatchCapturingAgent::new("codex");
     let mut registry = harness_agents::AgentRegistry::new("test");
     registry.register("test", default_agent);
-    registry.register("claude", claude_agent);
+    registry.register("codex", codex_agent);
     let state = make_test_state_with(dir, harness_core::HarnessConfig::default(), registry).await?;
-    Ok((state, default_invoked, claude_invoked))
+    Ok((state, default_invoked, codex_invoked))
 }
 
 /// Poll (with 5 s deadline) until `flag` is set; panic with `msg` on timeout.
@@ -1052,14 +974,14 @@ async fn wait_for_invocation(flag: &std::sync::atomic::AtomicBool, msg: &str) {
 }
 
 #[tokio::test]
-async fn dispatch_complex_prompt_selects_claude_agent() -> anyhow::Result<()> {
+async fn dispatch_complex_prompt_selects_codex_agent() -> anyhow::Result<()> {
     let _lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = crate::test_helpers::tempdir_in_home("dispatch-complex-")?;
-    let (state, default_invoked, claude_invoked) =
+    let (state, default_invoked, codex_invoked) =
         make_test_state_with_dispatch_agents(dir.path()).await?;
     let app = task_app(state);
 
-    // 6 distinct file references → Complex complexity → registry.dispatch() selects "claude"
+    // 6 distinct file references → Complex complexity → registry.dispatch() selects "codex"
     let body = serde_json::json!({
         "prompt": "Refactor src/a.rs src/b.rs src/c.rs src/d.rs src/e.rs src/f.rs",
         "project": dir.path(),
@@ -1076,14 +998,14 @@ async fn dispatch_complex_prompt_selects_claude_agent() -> anyhow::Result<()> {
     assert_eq!(response.status(), StatusCode::ACCEPTED);
 
     wait_for_invocation(
-        &claude_invoked,
-        "claude agent was not invoked within 500ms for complex task",
+        &codex_invoked,
+        "codex agent was not invoked within 500ms for complex task",
     )
     .await;
 
     assert!(
-        claude_invoked.load(std::sync::atomic::Ordering::SeqCst),
-        "claude agent should have been invoked for complex task"
+        codex_invoked.load(std::sync::atomic::Ordering::SeqCst),
+        "codex agent should have been invoked for complex task"
     );
     assert!(
         !default_invoked.load(std::sync::atomic::Ordering::SeqCst),
@@ -1096,7 +1018,7 @@ async fn dispatch_complex_prompt_selects_claude_agent() -> anyhow::Result<()> {
 async fn dispatch_simple_prompt_selects_default_agent() -> anyhow::Result<()> {
     let _lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = crate::test_helpers::tempdir_in_home("dispatch-simple-")?;
-    let (state, default_invoked, claude_invoked) =
+    let (state, default_invoked, codex_invoked) =
         make_test_state_with_dispatch_agents(dir.path()).await?;
     let app = task_app(state);
 
@@ -1127,8 +1049,8 @@ async fn dispatch_simple_prompt_selects_default_agent() -> anyhow::Result<()> {
         "default agent should have been invoked for simple task"
     );
     assert!(
-        !claude_invoked.load(std::sync::atomic::Ordering::SeqCst),
-        "claude agent should not have been invoked for simple task"
+        !codex_invoked.load(std::sync::atomic::Ordering::SeqCst),
+        "codex agent should not have been invoked for simple task"
     );
     Ok(())
 }

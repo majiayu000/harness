@@ -106,7 +106,7 @@ impl CodeAgent for MockAgent {
 // State builders
 // ---------------------------------------------------------------------------
 
-async fn make_state(root: &std::path::Path) -> anyhow::Result<harness_server::http::AppState> {
+async fn make_state(root: &std::path::Path) -> anyhow::Result<harness_server::app_state::AppState> {
     let project_root = root.join("project");
     std::fs::create_dir_all(&project_root)?;
 
@@ -125,7 +125,7 @@ async fn make_state(root: &std::path::Path) -> anyhow::Result<harness_server::ht
 async fn make_state_with_mock(
     root: &std::path::Path,
     agent: Arc<MockAgent>,
-) -> anyhow::Result<harness_server::http::AppState> {
+) -> anyhow::Result<harness_server::app_state::AppState> {
     let project_root = root.join("project");
     std::fs::create_dir_all(&project_root)?;
 

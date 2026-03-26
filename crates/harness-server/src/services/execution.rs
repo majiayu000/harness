@@ -2,8 +2,8 @@
 //! workspace allocation, concurrency management, and completion callbacks.
 
 use crate::{
+    app_state::resolve_reviewer,
     complexity_router,
-    http::resolve_reviewer,
     project_registry::ProjectRegistry,
     task_queue::TaskQueue,
     task_runner::{self, CompletionCallback, CreateTaskRequest, TaskId, TaskStore},
@@ -15,7 +15,7 @@ use harness_core::{interceptor::TurnInterceptor, HarnessConfig};
 use harness_skills::SkillStore;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 /// Error returned by [`ExecutionService::enqueue`] and
 /// [`ExecutionService::enqueue_background`].
@@ -56,6 +56,14 @@ pub trait ExecutionService: Send + Sync {
     /// background tokio task handles permit acquisition and execution, keeping
     /// HTTP handlers responsive under load.
     async fn enqueue_background(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError>;
+
+    /// Register a task immediately and execute in the background, optionally
+    /// serialised by a shared conflict-group semaphore.
+    async fn enqueue_background_with_group(
+        &self,
+        req: CreateTaskRequest,
+        group_sem: Option<Arc<Semaphore>>,
+    ) -> Result<TaskId, EnqueueTaskError>;
 }
 
 /// All dependencies required to execute a task end-to-end.
@@ -176,6 +184,95 @@ impl DefaultExecutionService {
                 .map_err(|e| EnqueueTaskError::Internal(e.to_string()))
         }
     }
+
+    async fn enqueue_background_internal(
+        &self,
+        mut req: CreateTaskRequest,
+        group_sem: Option<Arc<Semaphore>>,
+    ) -> Result<TaskId, EnqueueTaskError> {
+        Self::validate_request(&req)?;
+
+        req.project = self.resolve_project(req.project).await?;
+
+        // Resolve agent up-front so validation errors surface immediately.
+        let agent = self.select_agent(&req)?;
+        let (reviewer, _) = resolve_reviewer(
+            &self.agent_registry,
+            &self.server_config.agents.review,
+            agent.name(),
+        );
+
+        let canonical = task_runner::resolve_canonical_project(req.project.clone())
+            .await
+            .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+        self.check_allowed_roots(&canonical)?;
+
+        let project_id = canonical.to_string_lossy().into_owned();
+        req.project = Some(canonical);
+
+        let server_config = self.server_config.clone();
+
+        // Register the task immediately so the caller gets an ID without blocking.
+        let task_id =
+            task_runner::register_pending_task(self.tasks.clone(), req.source.clone()).await;
+
+        // Spawn a background tokio task that waits for a concurrency slot then executes.
+        let tasks = self.tasks.clone();
+        let skills = self.skills.clone();
+        let events = self.events.clone();
+        let interceptors = self.interceptors.clone();
+        let workspace_mgr = self.workspace_mgr.clone();
+        let task_queue = self.task_queue.clone();
+        let completion_callback = self.completion_callback.clone();
+        let task_id2 = task_id.clone();
+        tokio::spawn(async move {
+            // Acquire conflict-group semaphore before queue permit so the task
+            // holds serialisation for its full lifetime once spawned.
+            let group_permit = if let Some(sem) = group_sem {
+                sem.acquire_owned().await.ok()
+            } else {
+                None
+            };
+
+            match task_queue.acquire(&project_id).await {
+                Ok(permit) => {
+                    task_runner::spawn_preregistered_task(
+                        task_id2,
+                        tasks,
+                        agent,
+                        reviewer,
+                        server_config,
+                        skills,
+                        events,
+                        interceptors,
+                        req,
+                        workspace_mgr,
+                        permit,
+                        completion_callback,
+                        group_permit,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    if let Err(persist_err) =
+                        task_runner::mutate_and_persist(&tasks, &task_id2, |s| {
+                            s.status = task_runner::TaskStatus::Failed;
+                            s.error = Some(format!("task queue full: {e}"));
+                        })
+                        .await
+                    {
+                        tracing::error!(
+                            task_id = %task_id2.0,
+                            "failed to persist task failure after queue full: {persist_err}"
+                        );
+                    }
+                    tasks.close_task_stream(&task_id2);
+                }
+            }
+        });
+
+        Ok(task_id)
+    }
 }
 
 #[async_trait]
@@ -224,84 +321,16 @@ impl ExecutionService for DefaultExecutionService {
         Ok(task_id)
     }
 
-    async fn enqueue_background(
+    async fn enqueue_background(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError> {
+        self.enqueue_background_internal(req, None).await
+    }
+
+    async fn enqueue_background_with_group(
         &self,
-        mut req: CreateTaskRequest,
+        req: CreateTaskRequest,
+        group_sem: Option<Arc<Semaphore>>,
     ) -> Result<TaskId, EnqueueTaskError> {
-        Self::validate_request(&req)?;
-
-        req.project = self.resolve_project(req.project).await?;
-
-        // Resolve agent up-front so validation errors surface immediately.
-        let agent = self.select_agent(&req)?;
-        let (reviewer, _) = resolve_reviewer(
-            &self.agent_registry,
-            &self.server_config.agents.review,
-            agent.name(),
-        );
-
-        let canonical = task_runner::resolve_canonical_project(req.project.clone())
-            .await
-            .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
-        self.check_allowed_roots(&canonical)?;
-
-        let project_id = canonical.to_string_lossy().into_owned();
-        req.project = Some(canonical);
-
-        let server_config = self.server_config.clone();
-
-        // Register the task immediately so the caller gets an ID without blocking.
-        let task_id =
-            task_runner::register_pending_task(self.tasks.clone(), req.source.clone()).await;
-
-        // Spawn a background tokio task that waits for a concurrency slot then executes.
-        let tasks = self.tasks.clone();
-        let skills = self.skills.clone();
-        let events = self.events.clone();
-        let interceptors = self.interceptors.clone();
-        let workspace_mgr = self.workspace_mgr.clone();
-        let task_queue = self.task_queue.clone();
-        let completion_callback = self.completion_callback.clone();
-        let task_id2 = task_id.clone();
-        tokio::spawn(async move {
-            match task_queue.acquire(&project_id).await {
-                Ok(permit) => {
-                    task_runner::spawn_preregistered_task(
-                        task_id2,
-                        tasks,
-                        agent,
-                        reviewer,
-                        server_config,
-                        skills,
-                        events,
-                        interceptors,
-                        req,
-                        workspace_mgr,
-                        permit,
-                        completion_callback,
-                        None,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    if let Err(persist_err) =
-                        task_runner::mutate_and_persist(&tasks, &task_id2, |s| {
-                            s.status = task_runner::TaskStatus::Failed;
-                            s.error = Some(format!("task queue full: {e}"));
-                        })
-                        .await
-                    {
-                        tracing::error!(
-                            task_id = %task_id2.0,
-                            "failed to persist task failure after queue full: {persist_err}"
-                        );
-                    }
-                    tasks.close_task_stream(&task_id2);
-                }
-            }
-        });
-
-        Ok(task_id)
+        self.enqueue_background_internal(req, group_sem).await
     }
 }
 
@@ -337,6 +366,15 @@ mod tests {
         async fn enqueue_background(
             &self,
             _req: CreateTaskRequest,
+        ) -> Result<TaskId, EnqueueTaskError> {
+            self.called.store(true, Ordering::SeqCst);
+            Ok(TaskId("mock-bg-task".to_string()))
+        }
+
+        async fn enqueue_background_with_group(
+            &self,
+            _req: CreateTaskRequest,
+            _group_sem: Option<Arc<Semaphore>>,
         ) -> Result<TaskId, EnqueueTaskError> {
             self.called.store(true, Ordering::SeqCst);
             Ok(TaskId("mock-bg-task".to_string()))

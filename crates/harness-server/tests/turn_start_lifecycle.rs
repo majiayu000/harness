@@ -118,7 +118,7 @@ impl CodeAgent for MockAgent {
 async fn make_state(
     root: &Path,
     agent: Arc<dyn CodeAgent>,
-) -> anyhow::Result<harness_server::http::AppState> {
+) -> anyhow::Result<harness_server::app_state::AppState> {
     let project_root = root.join("project");
     std::fs::create_dir_all(&project_root)?;
 
@@ -158,7 +158,7 @@ fn parse_turn_id(value: &serde_json::Value) -> anyhow::Result<TurnId> {
 }
 
 async fn fetch_turn(
-    state: &harness_server::http::AppState,
+    state: &harness_server::app_state::AppState,
     turn_id: &TurnId,
 ) -> anyhow::Result<Turn> {
     let value =
@@ -167,7 +167,7 @@ async fn fetch_turn(
 }
 
 async fn wait_for_status(
-    state: &harness_server::http::AppState,
+    state: &harness_server::app_state::AppState,
     turn_id: &TurnId,
     expected: TurnStatus,
     timeout: Duration,
@@ -190,7 +190,7 @@ async fn wait_for_status(
 }
 
 async fn start_thread_and_turn(
-    state: &harness_server::http::AppState,
+    state: &harness_server::app_state::AppState,
     cwd: PathBuf,
     input: &str,
 ) -> anyhow::Result<(ThreadId, TurnId)> {
