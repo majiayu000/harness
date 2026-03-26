@@ -1159,7 +1159,12 @@ pub(crate) async fn run_task(
         }
 
         // Non-WAITING, non-LGTM response consumed this round — advance.
-        round += 1;
+        // Use checked_add to avoid overflow when max_rounds == u32::MAX.
+        if let Some(next) = round.checked_add(1) {
+            round = next;
+        } else {
+            break;
+        }
 
         tracing::info!(
             "PR #{pr_num} not yet approved at round {}; waiting",
