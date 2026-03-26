@@ -45,6 +45,9 @@ pub fn resolve_config(server: &HarnessConfig, project: &ProjectConfig) -> Resolv
         if let Some(name) = &proj_review.reviewer_name {
             review.reviewer_name = name.clone();
         }
+        if let Some(auto_trigger) = proj_review.review_bot_auto_trigger {
+            review.review_bot_auto_trigger = auto_trigger;
+        }
     }
 
     let mut concurrency = server.concurrency.clone();
@@ -131,6 +134,7 @@ mod tests {
                 enabled: Some(true),
                 bot_command: None,
                 reviewer_name: None,
+                review_bot_auto_trigger: None,
                 review_wait_secs: None,
                 review_max_rounds: None,
             }),
@@ -154,6 +158,7 @@ mod tests {
                 enabled: Some(true),
                 bot_command: Some("/custom review".to_string()),
                 reviewer_name: None,
+                review_bot_auto_trigger: None,
                 review_wait_secs: None,
                 review_max_rounds: None,
             }),
@@ -191,6 +196,36 @@ mod tests {
 
         let resolved = resolve_config(&server, &project);
         assert_eq!(resolved.gc.max_drafts_per_run, 10);
+    }
+
+    #[test]
+    fn resolve_config_review_wait_secs_and_max_rounds_override() {
+        let server = HarnessConfig::default();
+        let project = ProjectConfig {
+            review: Some(ProjectReviewConfig {
+                enabled: None,
+                bot_command: None,
+                reviewer_name: None,
+                review_bot_auto_trigger: None,
+                review_wait_secs: Some(300),
+                review_max_rounds: Some(8),
+            }),
+            ..Default::default()
+        };
+
+        let resolved = resolve_config(&server, &project);
+        assert_eq!(resolved.review_wait_secs, Some(300));
+        assert_eq!(resolved.review_max_rounds, Some(8));
+    }
+
+    #[test]
+    fn resolve_config_review_wait_secs_absent_yields_none() {
+        let server = HarnessConfig::default();
+        let project = ProjectConfig::default();
+
+        let resolved = resolve_config(&server, &project);
+        assert_eq!(resolved.review_wait_secs, None);
+        assert_eq!(resolved.review_max_rounds, None);
     }
 
     #[test]

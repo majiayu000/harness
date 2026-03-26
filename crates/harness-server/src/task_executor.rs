@@ -226,6 +226,24 @@ fn compute_backoff_ms(base_ms: u64, max_ms: u64, attempt: u32) -> u64 {
     base_ms.saturating_mul(1u64 << shift).min(max_ms)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImplementationOutcome {
+    PlanIssue(String),
+    ParsedPr {
+        pr_url: Option<String>,
+        pr_num: Option<u64>,
+    },
+}
+
+fn parse_implementation_outcome(output: &str) -> ImplementationOutcome {
+    if let Some(desc) = prompts::parse_plan_issue(output) {
+        return ImplementationOutcome::PlanIssue(desc);
+    }
+    let pr_url = prompts::parse_pr_url(output);
+    let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
+    ImplementationOutcome::ParsedPr { pr_url, pr_num }
+}
+
 /// Persist a completed stream item as a task artifact when it carries content
 /// worth retaining across context loss (shell commands, file edits, tool calls).
 async fn persist_artifact(
@@ -893,8 +911,41 @@ pub(crate) async fn run_task(
         return Ok(());
     }
 
-    let pr_url = prompts::parse_pr_url(&output);
-    let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
+    let (pr_url, pr_num) = match parse_implementation_outcome(&output) {
+        ImplementationOutcome::PlanIssue(plan_issue) => {
+            tracing::error!(
+                task_id = %task_id,
+                plan_issue = %plan_issue,
+                "implementation returned PLAN_ISSUE; marking task failed"
+            );
+            mutate_and_persist(store, task_id, |s| {
+                s.status = TaskStatus::Failed;
+                s.turn = 2;
+                s.error = Some(plan_issue.clone());
+                s.rounds.push(RoundResult {
+                    turn: 1,
+                    action: "implement".into(),
+                    result: "plan_issue".into(),
+                    detail: if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.clone())
+                    },
+                });
+            })
+            .await?;
+            tracing::info!(
+                task_id = %task_id,
+                status = "failed",
+                turns = 2,
+                pr_url = tracing::field::Empty,
+                total_elapsed_secs = task_start.elapsed().as_secs(),
+                "task_completed"
+            );
+            return Ok(());
+        }
+        ImplementationOutcome::ParsedPr { pr_url, pr_num } => (pr_url, pr_num),
+    };
 
     mutate_and_persist(store, task_id, |s| {
         s.pr_url = pr_url.clone();
@@ -975,6 +1026,26 @@ pub(crate) async fn run_task(
         }
     }
 
+    // Skip external review bot wait when auto-trigger is disabled — there is
+    // no bot to wait for, so the loop would always exhaust all rounds and fail.
+    if !review_config.review_bot_auto_trigger {
+        tracing::info!("review_bot_auto_trigger disabled; skipping external review wait");
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Done;
+            s.turn = 2;
+        })
+        .await?;
+        tracing::info!(
+            task_id = %task_id,
+            status = "done",
+            turns = 2,
+            pr_url = pr_url.as_deref().unwrap_or(""),
+            total_elapsed_secs = task_start.elapsed().as_secs(),
+            "task_completed"
+        );
+        return Ok(());
+    }
+
     // Wait for external review bot.
     // Use a local counter instead of querying the store to derive waiting_count —
     // task execution is sequential within a single tokio task, so a plain u32 suffices.
@@ -982,7 +1053,8 @@ pub(crate) async fn run_task(
     waiting_count += 1;
     update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
 
-    let wait_secs = req.wait_secs;
+    let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
+    let max_rounds = resolved.review_max_rounds.unwrap_or(req.max_rounds);
     tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
     sleep(Duration::from_secs(wait_secs)).await;
 
@@ -994,10 +1066,11 @@ pub(crate) async fn run_task(
     // freshness check in every round after a fix commit, not just round 1.
     let mut prev_fixed = agent_pushed_commit;
 
-    // Review loop — WAITING rounds do not consume a numbered round slot so that a slow
-    // review bot cannot exhaust max_rounds before any real review is received.
+    // Review loop.
+    // Use an explicit counter so WAITING responses don't consume a round — `continue`
+    // inside a `for` loop would silently advance the iterator even without a real review.
     let mut round: u32 = 1;
-    while round <= req.max_rounds {
+    while round <= max_rounds {
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let check_req = AgentRequest {
@@ -1161,21 +1234,20 @@ pub(crate) async fn run_task(
         prev_fixed = true;
 
         tracing::info!("PR #{pr_num} not yet approved at round {round}; waiting");
-        if round < req.max_rounds {
+        if round < max_rounds {
             waiting_count += 1;
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
             sleep(Duration::from_secs(wait_secs)).await;
         }
-
         round += 1;
     }
 
     mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Failed;
-        s.turn = req.max_rounds.saturating_add(1);
+        s.turn = max_rounds.saturating_add(1);
         s.error = Some(format!(
             "Task did not receive LGTM after {} review rounds.",
-            req.max_rounds
+            max_rounds
         ));
     })
     .await?;
@@ -1188,7 +1260,7 @@ pub(crate) async fn run_task(
     tracing::info!(
         task_id = %task_id,
         status = "failed",
-        turns = req.max_rounds.saturating_add(1),
+        turns = max_rounds.saturating_add(1),
         pr_url = pr_url.as_deref().unwrap_or(""),
         total_elapsed_secs = task_start.elapsed().as_secs(),
         "task_completed"
@@ -1643,6 +1715,29 @@ mod tests {
     fn implementation_turn_uses_full_profile_no_restriction() {
         // Full profile returns None — no tool restriction is applied to the agent.
         assert!(CapabilityProfile::Full.tools().is_none());
+    }
+
+    #[test]
+    fn parse_implementation_outcome_prefers_plan_issue() {
+        let output = "PLAN_ISSUE=Plan missed rollback path\nPR_URL=https://github.com/o/r/pull/123";
+        let parsed = parse_implementation_outcome(output);
+        assert_eq!(
+            parsed,
+            ImplementationOutcome::PlanIssue("Plan missed rollback path".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_implementation_outcome_extracts_pr_when_no_plan_issue() {
+        let output = "Done.\nPR_URL=https://github.com/majiayu000/harness/pull/42";
+        let parsed = parse_implementation_outcome(output);
+        assert_eq!(
+            parsed,
+            ImplementationOutcome::ParsedPr {
+                pr_url: Some("https://github.com/majiayu000/harness/pull/42".to_string()),
+                pr_num: Some(42),
+            }
+        );
     }
 
     #[test]

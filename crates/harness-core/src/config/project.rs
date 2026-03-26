@@ -48,6 +48,10 @@ pub struct ProjectReviewConfig {
     /// Must match the `user.login` field returned by the GitHub reviews API.
     #[serde(default)]
     pub reviewer_name: Option<String>,
+    /// Whether to auto-trigger and wait for external review bot (e.g. Gemini).
+    /// Set to `false` for projects without an external review bot installed.
+    #[serde(default)]
+    pub review_bot_auto_trigger: Option<bool>,
     /// Override seconds to wait for the review bot before starting the review loop.
     #[serde(default)]
     pub review_wait_secs: Option<u64>,

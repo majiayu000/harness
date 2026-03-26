@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::circuit_breaker::CircuitBreaker;
+
 /// Post-tool-use hook enforcer.
 ///
 /// When `enabled`, this interceptor fires after each agent turn, detects files
@@ -16,14 +18,34 @@ use tokio::sync::RwLock;
 /// registered guards, logs a `hook_enforcement` event to the [`EventStore`],
 /// and returns any violations as feedback for the agent's next turn prompt.
 ///
+/// ## Infinite-loop protection (circuit breaker)
+///
+/// The enforcer embeds a [`CircuitBreaker`] that tracks consecutive block
+/// counts per session. After 3 consecutive blocks the circuit opens and all
+/// subsequent calls auto-pass for 5 minutes, preventing the analysis-paralysis
+/// loop described in GitHub issues #3573 and #10205.
+///
+/// This mirrors the role of Claude Code's `stop_hook_active` input field: once
+/// the circuit is open the enforcer stops emitting blocking signals, breaking
+/// the loop.
+///
+/// ## CI guard
+///
+/// When the `CI` environment variable is set the enforcer skips all
+/// enforcement unconditionally. Desktop-specific hooks must not run in CI
+/// environments (GitHub issue #3573).
+///
 /// The enforcer silently passes through when:
 /// - `enabled` is `false` (controlled by `rules.hook_enforcement` in config)
+/// - `CI` environment variable is set
 /// - no guards are registered
 /// - no files were modified during the turn
+/// - the circuit breaker is open (consecutive-block limit reached)
 pub struct HookEnforcer {
     rules: Arc<RwLock<RuleEngine>>,
     events: Arc<EventStore>,
     enabled: bool,
+    breaker: CircuitBreaker,
 }
 
 impl HookEnforcer {
@@ -32,6 +54,7 @@ impl HookEnforcer {
             rules,
             events,
             enabled,
+            breaker: CircuitBreaker::new(),
         }
     }
 
@@ -71,6 +94,17 @@ impl HookEnforcer {
             }
         }
     }
+
+    /// Returns the circuit-breaker key for a session.
+    ///
+    /// Uses the session ID when available so each agent session has its own
+    /// failure counter. Falls back to a shared key when the session is unknown.
+    fn breaker_key(session_id: Option<&SessionId>) -> String {
+        match session_id {
+            Some(sid) => format!("session:{sid}"),
+            None => "global".to_string(),
+        }
+    }
 }
 
 #[async_trait]
@@ -86,16 +120,36 @@ impl TurnInterceptor for HookEnforcer {
     /// Scan `event.affected_files` with all registered guards, log a
     /// `hook_enforcement` event to the [`EventStore`], and return violation
     /// feedback when violations are found.
+    ///
+    /// Auto-passes (returns clean) when the CI environment variable is set or
+    /// when the per-session circuit breaker has opened due to repeated blocks.
     async fn post_tool_use(&self, event: &ToolUseEvent, project_root: &Path) -> PostToolUseResult {
         if !self.enabled {
             return PostToolUseResult::clean();
         }
+
+        // CI guard: skip all enforcement in CI environments (#3573).
+        if std::env::var("CI").is_ok() {
+            return PostToolUseResult::clean();
+        }
+
         if event.affected_files.is_empty() {
             return PostToolUseResult::clean();
         }
 
         let engine = self.rules.read().await;
         if engine.guards().is_empty() {
+            return PostToolUseResult::clean();
+        }
+
+        // Circuit breaker: auto-pass when the consecutive-block limit has been
+        // reached (stop_hook_active equivalent — prevents infinite loops).
+        let key = Self::breaker_key(event.session_id.as_ref());
+        if !self.breaker.allow(&key) {
+            tracing::warn!(
+                session = %key,
+                "hook_enforcer: circuit open, auto-passing to break enforcement loop"
+            );
             return PostToolUseResult::clean();
         }
 
@@ -134,8 +188,11 @@ impl TurnInterceptor for HookEnforcer {
         }
 
         if violations.is_empty() {
+            self.breaker.record_pass(&key);
             return PostToolUseResult::clean();
         }
+
+        self.breaker.record_block(&key);
 
         let feedback = violations
             .iter()
@@ -313,6 +370,70 @@ mod tests {
         let rules = Arc::new(RwLock::new(RuleEngine::new()));
         let enforcer = HookEnforcer::new(rules, events, false);
         assert_eq!(enforcer.name(), "hook_enforcer");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_opens_after_repeated_blocks() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let events = make_event_store(dir.path()).await;
+        let rules = make_engine_with_guard(dir.path(), "U-16", "medium");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project)?;
+
+        let sid = SessionId::new();
+        let enforcer = HookEnforcer::new(rules, events, true);
+        let event = ToolUseEvent {
+            tool_name: "write_file".to_string(),
+            affected_files: vec![PathBuf::from("src/main.rs")],
+            session_id: Some(sid.clone()),
+        };
+
+        // First two blocks: violations returned, circuit still closed.
+        for _ in 0..2 {
+            let result = enforcer.post_tool_use(&event, &project).await;
+            assert!(
+                result.violation_feedback.is_some(),
+                "should return violations before circuit opens"
+            );
+        }
+
+        // Third block: circuit opens.
+        let _ = enforcer.post_tool_use(&event, &project).await;
+
+        // Fourth call: circuit is open — auto-pass (no violation feedback).
+        let result = enforcer.post_tool_use(&event, &project).await;
+        assert!(
+            result.violation_feedback.is_none(),
+            "open circuit must auto-pass to break the enforcement loop"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ci_env_skips_enforcement() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let events = make_event_store(dir.path()).await;
+        let rules = make_engine_with_guard(dir.path(), "U-16", "medium");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project)?;
+
+        let enforcer = HookEnforcer::new(rules, events, true);
+        let event = ToolUseEvent {
+            tool_name: "write_file".to_string(),
+            affected_files: vec![PathBuf::from("src/main.rs")],
+            session_id: None,
+        };
+
+        // SAFETY: test process only; env mutation isolated by unique var name.
+        unsafe { std::env::set_var("CI", "true") };
+        let result = enforcer.post_tool_use(&event, &project).await;
+        unsafe { std::env::remove_var("CI") };
+
+        assert!(
+            result.violation_feedback.is_none(),
+            "CI environment must bypass hook enforcement"
+        );
         Ok(())
     }
 }
