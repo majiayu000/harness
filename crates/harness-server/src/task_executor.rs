@@ -1173,7 +1173,7 @@ pub(crate) async fn run_task(
 /// Issues are sorted by reference before collecting so that insertion order does not affect
 /// equality comparisons, and strings are not unnecessarily cloned during the sort.
 fn normalize_issues(issues: &[String]) -> Vec<String> {
-    let mut sorted: Vec<&String> = issues.iter().collect();
+    let mut sorted: Vec<_> = issues.iter().collect();
     sorted.sort();
     sorted.into_iter().cloned().collect()
 }
