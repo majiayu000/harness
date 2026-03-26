@@ -173,7 +173,7 @@ async fn make_state_inner(
         interceptors: vec![],
         intake: crate::http::IntakeServices {
             feishu_intake: None,
-            github_intake: None,
+            github_pollers: vec![],
             completion_callback: None,
         },
         project_svc,
