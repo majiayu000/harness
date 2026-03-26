@@ -532,10 +532,11 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         .intake
         .github
         .as_ref()
-        .filter(|cfg| cfg.enabled && !cfg.repo.is_empty())
-        .map(|cfg| {
+        .filter(|cfg| cfg.enabled)
+        .and_then(|cfg| cfg.effective_repos().into_iter().next())
+        .map(|repo_cfg| {
             Arc::new(crate::intake::github_issues::GitHubIssuesPoller::new(
-                cfg,
+                &repo_cfg,
                 Some(&dir),
             )) as Arc<dyn crate::intake::IntakeSource>
         });
@@ -595,6 +596,27 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         Some(project_registry.clone()),
         server.config.server.allowed_project_roots.clone(),
     );
+
+    // Spawn background watcher for AwaitingDeps tasks.
+    {
+        let store = tasks.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let ready_ids = crate::task_runner::check_awaiting_deps(&store);
+                for task_id in ready_ids {
+                    if let Err(e) = store.persist(&task_id).await {
+                        tracing::warn!(
+                            "dep-watcher: failed to persist {} after transition: {e}",
+                            task_id.0
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     let signal_rate_limit = server.config.server.signal_rate_limit_per_minute;
     let password_reset_rate_limit = server.config.server.password_reset_rate_limit_per_hour;
@@ -862,6 +884,25 @@ pub(crate) fn resolve_reviewer(
     (None, config.clone())
 }
 
+/// Extract the PR number from a GitHub PR URL.
+///
+/// Handles:
+/// - `.../pull/42`
+/// - `.../pull/42/files`
+/// - `.../pull/42#discussion_r...`
+fn parse_pr_num_from_url(url: &str) -> Option<u64> {
+    // Strip fragment first
+    let url = url.split('#').next().unwrap_or(url);
+    // Walk path segments looking for "pull", then parse the segment that follows
+    let mut parts = url.split('/');
+    while let Some(seg) = parts.next() {
+        if seg == "pull" {
+            return parts.next()?.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
 pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Result<()> {
     tracing::info!("harness: HTTP server listening on {addr}");
     // Record true server start time before accepting any connections.
@@ -881,6 +922,140 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             pending_tasks = task_count,
             "harness: ready"
         );
+    }
+
+    // Re-dispatch tasks that were recovered to pending after server restart.
+    // These had PRs when the server crashed and need their review loop re-started.
+    // Without this, recovered tasks silently hang in pending forever.
+    //
+    // Each task is re-dispatched in a background tokio task so that permit
+    // acquisition never blocks serve() — if more tasks exist than available
+    // concurrency slots, the background futures will simply wait in queue.
+    {
+        let recovered: Vec<_> = state
+            .core
+            .tasks
+            .list_all()
+            .into_iter()
+            .filter(|t| matches!(t.status, task_runner::TaskStatus::Pending) && t.pr_url.is_some())
+            .collect();
+        if !recovered.is_empty() {
+            tracing::info!(
+                count = recovered.len(),
+                "startup: re-dispatching recovered pending task(s) with PRs"
+            );
+            for task in recovered {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let pr_url = task.pr_url.as_deref().unwrap_or("");
+                    // Issue 4: robust parsing handles /pull/42/files and #fragment suffixes
+                    let pr_num = match parse_pr_num_from_url(pr_url) {
+                        Some(n) => n,
+                        None => {
+                            tracing::warn!(
+                                task_id = ?task.id,
+                                pr_url,
+                                "startup recovery: cannot parse PR number from URL, skipping"
+                            );
+                            return;
+                        }
+                    };
+
+                    // Issues 2 & 3: resolve canonical project path from repo name so that
+                    // (a) the correct per-project concurrency bucket is used, and
+                    // (b) req.project is populated so the agent runs in the right worktree.
+                    let project_path = match task.repo.as_deref() {
+                        Some(repo) => {
+                            if let Some(registry) = state.core.project_registry.as_deref() {
+                                match registry.resolve_path(repo).await {
+                                    Ok(Some(p)) => Some(p),
+                                    Ok(None) => Some(std::path::PathBuf::from(repo)),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            task_id = ?task.id,
+                                            repo,
+                                            "startup recovery: registry lookup failed: {e}, using repo as path"
+                                        );
+                                        Some(std::path::PathBuf::from(repo))
+                                    }
+                                }
+                            } else {
+                                Some(std::path::PathBuf::from(repo))
+                            }
+                        }
+                        None => None,
+                    };
+
+                    let canonical = match task_runner::resolve_canonical_project(project_path).await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to resolve project path: {e}"
+                            );
+                            return;
+                        }
+                    };
+                    let project_id = canonical.to_string_lossy().into_owned();
+
+                    // Issue 1: acquire permit here inside the spawned future so serve()
+                    // is never blocked waiting for a concurrency slot.
+                    let permit = match state.concurrency.task_queue.acquire(&project_id).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to acquire permit: {e}"
+                            );
+                            return;
+                        }
+                    };
+
+                    let req = task_runner::CreateTaskRequest {
+                        pr: Some(pr_num),
+                        project: Some(canonical),
+                        repo: task.repo.clone(),
+                        source: task.source.clone(),
+                        external_id: task.external_id.clone(),
+                        ..Default::default()
+                    };
+                    let classification = crate::complexity_router::classify("", None, Some(pr_num));
+                    let agent = match state.core.server.agent_registry.dispatch(&classification) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to dispatch agent: {e}"
+                            );
+                            return;
+                        }
+                    };
+                    let (reviewer, _) = resolve_reviewer(
+                        &state.core.server.agent_registry,
+                        &state.core.server.config.agents.review,
+                        agent.name(),
+                    );
+                    state.core.tasks.register_task_stream(&task.id);
+                    task_runner::spawn_preregistered_task(
+                        task.id,
+                        state.core.tasks.clone(),
+                        agent,
+                        reviewer,
+                        Arc::new(state.core.server.config.clone()),
+                        state.engines.skills.clone(),
+                        state.observability.events.clone(),
+                        state.interceptors.clone(),
+                        req,
+                        state.concurrency.workspace_mgr.clone(),
+                        permit,
+                        state.intake.completion_callback.clone(),
+                        None,
+                    )
+                    .await;
+                });
+            }
+        }
     }
 
     let initial_grade = {

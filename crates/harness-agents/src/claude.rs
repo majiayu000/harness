@@ -106,6 +106,13 @@ impl CodeAgent for ClaudeCodeAgent {
                 ))
             })?;
 
+        tracing::debug!(
+            cli = %wrapped_command.program.display(),
+            project_root = %req.project_root.display(),
+            model = %self.resolve_model(&req),
+            "spawning claude agent"
+        );
+
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
@@ -128,9 +135,21 @@ impl CodeAgent for ClaudeCodeAgent {
         log_captured_stderr(&stderr, self.name());
 
         if !output.status.success() {
+            let stdout_tail: String = if stdout.chars().count() > 500 {
+                stdout
+                    .chars()
+                    .rev()
+                    .take(500)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
+            } else {
+                stdout.clone()
+            };
             return Err(harness_core::HarnessError::AgentExecution(format!(
-                "claude exited with {}: {stderr}",
-                output.status
+                "claude exited with {}: stderr=[{}] stdout_tail=[{}]",
+                output.status, stderr, stdout_tail
             )));
         }
 

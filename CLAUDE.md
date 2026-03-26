@@ -25,6 +25,12 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 - ZERO `Command::new("gh")` or `Command::new("git")` calls inside harness crates — all GitHub/git interaction must be in agent prompts only
 - When user says "fix issue X" or "handle PR Y", ALWAYS delegate to harness server (`POST /tasks`) instead of implementing directly
 
+## Worktree Usage
+
+- NEVER use `isolation: "worktree"` for tasks that depend on unpushed local commits — worktrees check out from remote, missing local changes
+- Before using worktree isolation, check `git log origin/main..HEAD` — if there are unpushed commits that affect the files being modified, work directly on main instead
+- Worktrees are only safe for truly independent tasks on code that hasn't been locally modified
+
 ## PR Workflow
 
 - After creating a PR, wait for Gemini code review bot before merging

@@ -709,6 +709,7 @@ async fn intake_status_shows_github_repo_when_configured() -> anyhow::Result<()>
         repo: "owner/myrepo".to_string(),
         label: "harness".to_string(),
         poll_interval_secs: 30,
+        ..Default::default()
     });
     let state = make_test_state_with(
         dir.path(),

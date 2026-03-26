@@ -19,10 +19,31 @@ const TASK_STREAM_CAPACITY: usize = 512;
 pub type CompletionCallback =
     Arc<dyn Fn(TaskState) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Current phase in the task pipeline.
+///
+/// Tasks progress through phases sequentially. Simple tasks may skip
+/// Triage/Plan and go directly to Implement.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    /// Initial phase — Tech Lead evaluates the issue.
+    Triage,
+    /// Architect designs the implementation plan.
+    Plan,
+    /// Engineer writes and tests code (default starting phase).
+    #[default]
+    Implement,
+    /// Independent code review.
+    Review,
+    /// Terminal — task completed or failed.
+    Terminal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
+    AwaitingDeps,
     Implementing,
     AgentReview,
     Waiting,
@@ -35,6 +56,7 @@ impl AsRef<str> for TaskStatus {
     fn as_ref(&self) -> &str {
         match self {
             TaskStatus::Pending => "pending",
+            TaskStatus::AwaitingDeps => "awaiting_deps",
             TaskStatus::Implementing => "implementing",
             TaskStatus::AgentReview => "agent_review",
             TaskStatus::Waiting => "waiting",
@@ -51,6 +73,7 @@ impl std::str::FromStr for TaskStatus {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "pending" => Ok(TaskStatus::Pending),
+            "awaiting_deps" => Ok(TaskStatus::AwaitingDeps),
             "implementing" => Ok(TaskStatus::Implementing),
             "agent_review" => Ok(TaskStatus::AgentReview),
             "waiting" => Ok(TaskStatus::Waiting),
@@ -89,6 +112,10 @@ pub struct TaskState {
     /// Parent task ID when this task is a subtask spawned via parallel dispatch.
     /// Persisted so parent-child relationships survive server restart.
     pub parent_id: Option<TaskId>,
+    /// Task IDs that must reach Done before this task may start.
+    /// Persisted as JSON in the database.
+    #[serde(default)]
+    pub depends_on: Vec<TaskId>,
     /// IDs of subtasks spawned by this task during parallel dispatch.
     /// Populated at runtime; not persisted (use `TaskStore::list_children` after restart).
     #[serde(default)]
@@ -100,9 +127,23 @@ pub struct TaskState {
     /// GitHub issue number if this is an issue-based task. Set at spawn time; not persisted.
     #[serde(skip)]
     pub issue: Option<u64>,
+    /// Repository slug (e.g. "owner/repo"). Persisted for traceability.
+    pub repo: Option<String>,
     /// Short description derived from the task prompt or issue number. Set at spawn time; not persisted.
     #[serde(skip)]
     pub description: Option<String>,
+    /// ISO 8601 creation timestamp. Set at spawn time and persisted to the tasks DB.
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// Current pipeline phase. Defaults to Implement for backward compatibility.
+    #[serde(default)]
+    pub phase: TaskPhase,
+    /// Output from the Triage phase (Tech Lead assessment). Not persisted to DB.
+    #[serde(skip)]
+    pub triage_output: Option<String>,
+    /// Output from the Plan phase (Architect plan). Not persisted to DB.
+    #[serde(skip)]
+    pub plan_output: Option<String>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -117,6 +158,27 @@ pub struct TaskSummary {
     pub source: Option<String>,
     /// Parent task ID when this is a subtask.
     pub parent_id: Option<TaskId>,
+    /// Source-specific identifier (e.g. GitHub issue number).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// Repository slug (e.g. "owner/repo").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Short description derived from the task prompt or issue number.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// ISO 8601 creation timestamp.
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// Current pipeline phase.
+    #[serde(default)]
+    pub phase: TaskPhase,
+    /// Task IDs that must reach Done before this task may start.
+    #[serde(default)]
+    pub depends_on: Vec<TaskId>,
+    /// IDs of subtasks spawned by this task during parallel dispatch.
+    #[serde(default)]
+    pub subtask_ids: Vec<TaskId>,
 }
 
 impl TaskState {
@@ -131,10 +193,16 @@ impl TaskState {
             source: None,
             external_id: None,
             parent_id: None,
+            depends_on: Vec::new(),
             subtask_ids: Vec::new(),
             project_root: None,
             issue: None,
             description: None,
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+            phase: TaskPhase::default(),
+            triage_output: None,
+            plan_output: None,
+            repo: None,
         }
     }
 
@@ -147,6 +215,13 @@ impl TaskState {
             error: self.error.clone(),
             source: self.source.clone(),
             parent_id: self.parent_id.clone(),
+            external_id: self.external_id.clone(),
+            repo: self.repo.clone(),
+            description: self.description.clone(),
+            created_at: self.created_at.clone(),
+            phase: self.phase.clone(),
+            depends_on: self.depends_on.clone(),
+            subtask_ids: self.subtask_ids.clone(),
         }
     }
 }
@@ -187,6 +262,18 @@ pub struct CreateTaskRequest {
     /// Intake source name (e.g. "github", "feishu", "periodic_review"). None for manual tasks.
     #[serde(default)]
     pub source: Option<String>,
+    /// Source-specific identifier (e.g. GitHub issue number). Stored in TaskState for traceability.
+    #[serde(default)]
+    pub external_id: Option<String>,
+    /// Repository slug (e.g. "owner/repo"). Stored in TaskState for traceability.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Explicit parent task ID.
+    #[serde(default)]
+    pub parent_task_id: Option<TaskId>,
+    /// Task IDs that must complete (Done) before this task starts.
+    #[serde(default)]
+    pub depends_on: Vec<TaskId>,
 }
 
 impl Default for CreateTaskRequest {
@@ -205,6 +292,10 @@ impl Default for CreateTaskRequest {
             retry_max_backoff_ms: default_retry_max_backoff_ms(),
             stall_timeout_secs: default_stall_timeout(),
             source: None,
+            external_id: None,
+            repo: None,
+            parent_task_id: None,
+            depends_on: Vec::new(),
         }
     }
 }
@@ -235,7 +326,7 @@ fn default_wait() -> u64 {
     120
 }
 fn default_max_rounds() -> u32 {
-    5
+    8
 }
 fn default_retry_base_backoff_ms() -> u64 {
     10_000
@@ -316,6 +407,37 @@ async fn log_task_failure_event(
     }
 }
 
+/// Patterns that indicate a transient (retryable) failure rather than a permanent one.
+const TRANSIENT_PATTERNS: &[&str] = &[
+    "at capacity",
+    "rate limit",
+    "rate_limit",
+    "429",
+    "502 Bad Gateway",
+    "503 Service",
+    "overloaded",
+    "connection reset",
+    "connection refused",
+    "broken pipe",
+    "EOF",
+    "stream idle timeout",
+    "stream stall",
+    "ECONNRESET",
+    "ETIMEDOUT",
+];
+
+/// Maximum number of automatic retries for transient failures.
+const MAX_TRANSIENT_RETRIES: u32 = 2;
+
+/// Check if an error message indicates a transient failure that may succeed on retry.
+fn is_transient_error(reason: &str) -> bool {
+    let lower = reason.to_lowercase();
+    TRANSIENT_PATTERNS
+        .iter()
+        .any(|p| lower.contains(&p.to_lowercase()))
+}
+
+/// Record a task failure, marking the task as failed.
 async fn record_task_failure(
     store: &TaskStore,
     events: &harness_observe::EventStore,
@@ -345,12 +467,11 @@ pub struct TaskStore {
 impl TaskStore {
     pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
         let db = TaskDb::open(db_path).await?;
-        let recovered = db.recover_in_progress().await?;
-        if recovered > 0 {
+        let recovery = db.recover_in_progress().await?;
+        if recovery.failed > 0 {
             tracing::warn!(
-                recovered,
-                "startup recovery: marked {} in-progress task(s) as failed",
-                recovered
+                "startup recovery: marked {} interrupted task(s) as failed (reviewing/waiting states cannot resume after restart)",
+                recovery.failed
             );
         }
         let cache = DashMap::new();
@@ -615,6 +736,8 @@ where
         let task_id = TaskId::new();
         let mut state = TaskState::new(task_id.clone());
         state.source = req.source.clone();
+        state.external_id = req.external_id.clone();
+        state.repo = req.repo.clone();
         store.insert(&state).await;
         // Register stream channel before spawning so SSE clients can subscribe immediately.
         store.register_task_stream(&task_id);
@@ -677,9 +800,9 @@ where
         let is_review = req.source.as_deref() == Some("periodic_review");
         if req.issue.is_none() && req.pr.is_none() && is_complex && !is_review {
             if let Some(ref wmgr) = workspace_mgr {
-                let mut subtask_prompts =
+                let mut subtask_specs =
                     crate::parallel_dispatch::decompose(req.prompt.as_deref().unwrap_or_default());
-                if subtask_prompts.len() > 1 {
+                if subtask_specs.len() > 1 {
                     // Prepend sibling-awareness context to each subtask prompt so parallel
                     // agents know what other top-level tasks are running on the same project.
                     let siblings = store.list_siblings(&project_root, &id);
@@ -700,9 +823,12 @@ where
                             })
                             .collect();
                         let ctx = harness_core::prompts::sibling_task_context(&sibling_tasks);
-                        subtask_prompts = subtask_prompts
+                        subtask_specs = subtask_specs
                             .into_iter()
-                            .map(|p| format!("{ctx}\n\n{p}"))
+                            .map(|mut spec| {
+                                spec.prompt = format!("{ctx}\n\n{}", spec.prompt);
+                                spec
+                            })
                             .collect();
                     }
                     let project_config = harness_core::config::load_project_config(&project_root);
@@ -710,7 +836,7 @@ where
                     let base_branch = project_config.git.base_branch.clone();
 
                     // Register subtask IDs in the parent before dispatch.
-                    let sub_ids: Vec<TaskId> = (0..subtask_prompts.len())
+                    let sub_ids: Vec<TaskId> = (0..subtask_specs.len())
                         .map(|i| TaskId(format!("{}-p{i}", id.0)))
                         .collect();
                     mutate_and_persist(&store, &id, |s| {
@@ -729,7 +855,7 @@ where
                     let results = crate::parallel_dispatch::run_parallel_subtasks(
                         &id,
                         agent.clone(),
-                        subtask_prompts,
+                        subtask_specs,
                         wmgr.clone(),
                         &project_root,
                         &remote,
@@ -789,19 +915,69 @@ where
             project_root
         };
 
-        let task_result = crate::task_executor::run_task(
-            &store,
-            &id,
-            agent.as_ref(),
-            reviewer.as_deref(),
-            skills,
-            events,
-            interceptors,
-            &req,
-            run_project,
-            server_config.as_ref(),
-        )
-        .await;
+        // Retry loop: on transient errors, back off and retry up to MAX_TRANSIENT_RETRIES.
+        // Retrying inside the spawn means the stream stays open and the task actually re-runs.
+        let mut transient_attempts = 0u32;
+        let task_result = loop {
+            let result = crate::task_executor::run_task(
+                &store,
+                &id,
+                agent.as_ref(),
+                reviewer.as_deref(),
+                skills.clone(),
+                events.clone(),
+                interceptors.clone(),
+                &req,
+                run_project.clone(),
+                server_config.as_ref(),
+            )
+            .await;
+
+            match result {
+                ok @ Ok(()) => break ok,
+                Err(ref e)
+                    if is_transient_error(&e.to_string())
+                        && transient_attempts < MAX_TRANSIENT_RETRIES =>
+                {
+                    transient_attempts += 1;
+                    let reason = e.to_string();
+                    let backoff_secs = 30u64 * (1u64 << (transient_attempts - 1).min(4));
+                    tracing::warn!(
+                        task_id = %id.0,
+                        attempt = transient_attempts,
+                        max = MAX_TRANSIENT_RETRIES,
+                        backoff_secs,
+                        "transient failure detected; retrying after backoff: {reason}"
+                    );
+                    log_task_failure_event(
+                        &events,
+                        &id,
+                        &format!("transient (attempt {transient_attempts}): {reason}"),
+                    )
+                    .await;
+                    if let Err(pe) = mutate_and_persist(&store, &id, |s| {
+                        s.rounds.push(RoundResult {
+                            turn: s.turn,
+                            action: "transient_retry".into(),
+                            result: format!(
+                                "attempt {transient_attempts}/{MAX_TRANSIENT_RETRIES}"
+                            ),
+                            detail: Some(reason.clone()),
+                        });
+                        s.status = TaskStatus::Pending;
+                        s.error = Some(format!(
+                            "retrying after transient failure (attempt {transient_attempts}): {reason}"
+                        ));
+                    })
+                    .await
+                    {
+                        tracing::error!("failed to record retry for task {id:?}: {pe}");
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                }
+                err @ Err(_) => break err,
+            }
+        };
 
         // Cleanup workspace when task ends (Done or Failed) if auto_cleanup is set.
         if let Some(wmgr) = workspace_mgr {
@@ -867,6 +1043,131 @@ pub(crate) async fn mutate_and_persist(
         f(entry.value_mut());
     }
     store.persist(id).await
+}
+
+// --- dependency scheduling ---
+
+/// DFS cycle detection. Returns true if any dependency transitively reaches `new_id`.
+/// Called before the new task is inserted into the store.
+fn detect_cycle(store: &TaskStore, new_id: &TaskId, depends_on: &[TaskId]) -> bool {
+    let mut stack: Vec<TaskId> = depends_on.to_vec();
+    let mut visited: std::collections::HashSet<TaskId> = std::collections::HashSet::new();
+    while let Some(dep_id) = stack.pop() {
+        if dep_id == *new_id {
+            return true;
+        }
+        if visited.contains(&dep_id) {
+            continue;
+        }
+        visited.insert(dep_id.clone());
+        if let Some(dep_state) = store.get(&dep_id) {
+            for transitive in &dep_state.depends_on {
+                stack.push(transitive.clone());
+            }
+        }
+    }
+    false
+}
+
+/// Create a task that waits for its dependencies before starting.
+///
+/// If all deps are already Done, registers as Pending immediately.
+/// If deps are unresolved, registers as AwaitingDeps.
+/// Returns Err if a circular dependency is detected.
+pub async fn spawn_task_awaiting_deps(
+    store: Arc<TaskStore>,
+    req: CreateTaskRequest,
+) -> anyhow::Result<TaskId> {
+    let depends_on = req.depends_on.clone();
+    let task_id = TaskId::new();
+
+    if detect_cycle(&store, &task_id, &depends_on) {
+        anyhow::bail!("circular dependency detected for task {}", task_id.0);
+    }
+
+    let all_done = depends_on.iter().all(|dep_id| {
+        store
+            .get(dep_id)
+            .map(|s| matches!(s.status, TaskStatus::Done))
+            .unwrap_or(false)
+    });
+
+    let mut state = TaskState::new(task_id.clone());
+    state.depends_on = depends_on;
+    state.source = req.source.clone();
+    state.external_id = req.external_id.clone();
+    state.repo = req.repo.clone();
+    if let Some(parent) = req.parent_task_id.clone() {
+        state.parent_id = Some(parent);
+    }
+
+    if !all_done && !state.depends_on.is_empty() {
+        state.status = TaskStatus::AwaitingDeps;
+    }
+
+    store.insert(&state).await;
+    store.register_task_stream(&task_id);
+    Ok(task_id)
+}
+
+/// Check all AwaitingDeps tasks and transition ready ones to Pending.
+/// Returns the IDs of tasks that were transitioned to Pending.
+pub fn check_awaiting_deps(store: &TaskStore) -> Vec<TaskId> {
+    let mut ready = Vec::new();
+    let mut failed_deps: Vec<(TaskId, TaskId)> = Vec::new();
+
+    for entry in store.cache.iter() {
+        let task = entry.value();
+        if !matches!(task.status, TaskStatus::AwaitingDeps) {
+            continue;
+        }
+        let any_failed = task.depends_on.iter().any(|dep_id| {
+            store
+                .get(dep_id)
+                .map(|s| matches!(s.status, TaskStatus::Failed))
+                .unwrap_or(false)
+        });
+        if any_failed {
+            let Some(failed_dep) = task
+                .depends_on
+                .iter()
+                .find(|dep_id| {
+                    store
+                        .get(dep_id)
+                        .map(|s| matches!(s.status, TaskStatus::Failed))
+                        .unwrap_or(false)
+                })
+                .cloned()
+            else {
+                continue;
+            };
+            failed_deps.push((task.id.clone(), failed_dep));
+            continue;
+        }
+        let all_done = task.depends_on.iter().all(|dep_id| {
+            store
+                .get(dep_id)
+                .map(|s| matches!(s.status, TaskStatus::Done))
+                .unwrap_or(false)
+        });
+        if all_done {
+            ready.push(task.id.clone());
+        }
+    }
+
+    for (task_id, failed_dep_id) in &failed_deps {
+        if let Some(mut entry) = store.cache.get_mut(task_id) {
+            entry.status = TaskStatus::Failed;
+            entry.error = Some(format!("dependency {} failed", failed_dep_id.0));
+        }
+    }
+    for task_id in &ready {
+        if let Some(mut entry) = store.cache.get_mut(task_id) {
+            entry.status = TaskStatus::Pending;
+        }
+    }
+
+    ready
 }
 
 #[cfg(test)]
@@ -1550,5 +1851,38 @@ mod tests {
             "review check turn must use Validation phase"
         );
         Ok(())
+    }
+
+    #[test]
+    fn transient_error_detection() {
+        // Positive cases — should match transient patterns.
+        assert!(is_transient_error(
+            "agent execution failed: claude exited with exit status: 1: Selected model is at capacity"
+        ));
+        assert!(is_transient_error("rate limit exceeded, retry after 30s"));
+        assert!(is_transient_error("HTTP 429 Too Many Requests"));
+        assert!(is_transient_error("502 Bad Gateway"));
+        assert!(is_transient_error(
+            "Agent stream stalled: no output for 300s"
+        ));
+        assert!(is_transient_error("connection reset by peer"));
+        assert!(is_transient_error(
+            "stream idle timeout after 300s: zombie connection terminated"
+        ));
+
+        // Negative cases — permanent errors should not match.
+        assert!(!is_transient_error(
+            "Task did not receive LGTM after 5 review rounds."
+        ));
+        assert!(!is_transient_error(
+            "triage output unparseable — agent did not produce TRIAGE=<decision>"
+        ));
+        assert!(!is_transient_error("all parallel subtasks failed"));
+        assert!(!is_transient_error(
+            "task failed unexpectedly: task 102 panicked"
+        ));
+        assert!(!is_transient_error(
+            "budget exceeded: spent $5.00, limit $3.00"
+        ));
     }
 }

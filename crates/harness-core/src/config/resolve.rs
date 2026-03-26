@@ -1,4 +1,4 @@
-use super::project::ProjectConfig;
+use super::project::{ProjectConfig, ReviewType};
 use super::{AgentReviewConfig, ConcurrencyConfig, GcConfig, HarnessConfig};
 
 /// Effective configuration for a task, merging server defaults with per-project overrides.
@@ -15,6 +15,12 @@ pub struct ResolvedConfig {
     pub concurrency: ConcurrencyConfig,
     /// Effective GC configuration.
     pub gc: GcConfig,
+    /// Project type for review focus selection.
+    pub review_type: ReviewType,
+    /// Per-project override: seconds to wait for review bot before the review loop.
+    pub review_wait_secs: Option<u64>,
+    /// Per-project override: maximum review bot rounds.
+    pub review_max_rounds: Option<u32>,
 }
 
 /// Merge server-level defaults with per-project overrides.
@@ -36,6 +42,9 @@ pub fn resolve_config(server: &HarnessConfig, project: &ProjectConfig) -> Resolv
         if let Some(cmd) = &proj_review.bot_command {
             review.review_bot_command = cmd.clone();
         }
+        if let Some(auto_trigger) = proj_review.review_bot_auto_trigger {
+            review.review_bot_auto_trigger = auto_trigger;
+        }
     }
 
     let mut concurrency = server.concurrency.clone();
@@ -52,11 +61,25 @@ pub fn resolve_config(server: &HarnessConfig, project: &ProjectConfig) -> Resolv
         }
     }
 
+    let mut review_wait_secs: Option<u64> = None;
+    let mut review_max_rounds: Option<u32> = None;
+    if let Some(proj_review) = &project.review {
+        if let Some(secs) = proj_review.review_wait_secs {
+            review_wait_secs = Some(secs);
+        }
+        if let Some(rounds) = proj_review.review_max_rounds {
+            review_max_rounds = Some(rounds);
+        }
+    }
+
     ResolvedConfig {
         default_agent,
         review,
         concurrency,
         gc,
+        review_type: project.review_type,
+        review_wait_secs,
+        review_max_rounds,
     }
 }
 
@@ -106,7 +129,10 @@ mod tests {
         let project = ProjectConfig {
             review: Some(ProjectReviewConfig {
                 enabled: Some(true),
-                bot_command: None, // not overriding bot_command
+                bot_command: None,
+                review_bot_auto_trigger: None,
+                review_wait_secs: None,
+                review_max_rounds: None,
             }),
             ..Default::default()
         };
@@ -127,6 +153,9 @@ mod tests {
             review: Some(ProjectReviewConfig {
                 enabled: Some(true),
                 bot_command: Some("/custom review".to_string()),
+                review_bot_auto_trigger: None,
+                review_wait_secs: None,
+                review_max_rounds: None,
             }),
             ..Default::default()
         };
@@ -162,6 +191,35 @@ mod tests {
 
         let resolved = resolve_config(&server, &project);
         assert_eq!(resolved.gc.max_drafts_per_run, 10);
+    }
+
+    #[test]
+    fn resolve_config_review_wait_secs_and_max_rounds_override() {
+        let server = HarnessConfig::default();
+        let project = ProjectConfig {
+            review: Some(ProjectReviewConfig {
+                enabled: None,
+                bot_command: None,
+                review_bot_auto_trigger: None,
+                review_wait_secs: Some(300),
+                review_max_rounds: Some(8),
+            }),
+            ..Default::default()
+        };
+
+        let resolved = resolve_config(&server, &project);
+        assert_eq!(resolved.review_wait_secs, Some(300));
+        assert_eq!(resolved.review_max_rounds, Some(8));
+    }
+
+    #[test]
+    fn resolve_config_review_wait_secs_absent_yields_none() {
+        let server = HarnessConfig::default();
+        let project = ProjectConfig::default();
+
+        let resolved = resolve_config(&server, &project);
+        assert_eq!(resolved.review_wait_secs, None);
+        assert_eq!(resolved.review_max_rounds, None);
     }
 
     #[test]

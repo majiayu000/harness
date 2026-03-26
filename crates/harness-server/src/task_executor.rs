@@ -371,6 +371,121 @@ fn prepend_constitution(prompt: String, enabled: bool) -> String {
     }
 }
 
+/// Run triage → plan pipeline for a fresh issue-based task.
+///
+/// Returns `Some(plan_text)` if the triage decided a plan is needed and the plan
+/// phase completed. Returns `None` only when triage says PROCEED (trivial issue,
+/// skip planning). All failures propagate as errors — no silent fallbacks.
+async fn run_triage_plan_pipeline(
+    agent: &dyn CodeAgent,
+    store: &TaskStore,
+    task_id: &TaskId,
+    issue: u64,
+    cargo_env: &HashMap<String, String>,
+    project: &Path,
+    req: &CreateTaskRequest,
+) -> anyhow::Result<Option<String>> {
+    use crate::task_runner::TaskPhase;
+
+    // --- Phase 1: Triage ---
+    tracing::info!(task_id = %task_id, issue, "pipeline: starting triage phase");
+    mutate_and_persist(store, task_id, |state| {
+        state.phase = TaskPhase::Triage;
+    })
+    .await?;
+
+    let triage_prompt = prompts::triage_prompt(issue).to_prompt_string();
+    let triage_req = AgentRequest {
+        prompt: triage_prompt,
+        project_root: project.to_path_buf(),
+        env_vars: cargo_env.clone(),
+        execution_phase: Some(ExecutionPhase::Planning),
+        ..Default::default()
+    };
+
+    let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
+    let triage_resp = tokio::time::timeout(
+        turn_timeout,
+        run_agent_streaming(agent, triage_req, task_id, store, 0),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("triage phase timed out after {}s", req.turn_timeout_secs))?
+    .map_err(|e| anyhow::anyhow!("triage phase agent error: {e}"))?;
+
+    let triage_text = triage_resp.output.clone();
+    mutate_and_persist(store, task_id, |state| {
+        state.triage_output = Some(triage_text.clone());
+    })
+    .await?;
+
+    let decision = prompts::parse_triage(&triage_resp.output).ok_or_else(|| {
+        anyhow::anyhow!("triage output unparseable — agent did not produce TRIAGE=<decision>")
+    })?;
+    tracing::info!(task_id = %task_id, ?decision, "triage decision");
+
+    match decision {
+        prompts::TriageDecision::Skip => {
+            mutate_and_persist(store, task_id, |state| {
+                state.status = crate::task_runner::TaskStatus::Done;
+                state.phase = TaskPhase::Terminal;
+                state.error = Some("Triage: skipped — not worth implementing".to_string());
+            })
+            .await?;
+            anyhow::bail!("triage decided to skip issue #{issue}");
+        }
+        prompts::TriageDecision::NeedsClarification => {
+            mutate_and_persist(store, task_id, |state| {
+                state.status = crate::task_runner::TaskStatus::Failed;
+                state.phase = TaskPhase::Terminal;
+                state.error = Some("Triage: needs clarification before implementation".to_string());
+            })
+            .await?;
+            anyhow::bail!("triage requires clarification on issue #{issue}");
+        }
+        prompts::TriageDecision::Proceed => {
+            tracing::info!(task_id = %task_id, "triage: PROCEED — skipping plan phase");
+            return Ok(None);
+        }
+        prompts::TriageDecision::ProceedWithPlan => {
+            // Fall through to plan phase.
+        }
+    }
+
+    // --- Phase 2: Plan ---
+    tracing::info!(task_id = %task_id, issue, "pipeline: starting plan phase");
+    mutate_and_persist(store, task_id, |state| {
+        state.phase = TaskPhase::Plan;
+    })
+    .await?;
+
+    let plan_prompt = prompts::plan_prompt(issue, &triage_resp.output).to_prompt_string();
+    let plan_req = AgentRequest {
+        prompt: plan_prompt,
+        project_root: project.to_path_buf(),
+        env_vars: cargo_env.clone(),
+        execution_phase: Some(ExecutionPhase::Planning),
+        ..Default::default()
+    };
+
+    let plan_resp = tokio::time::timeout(
+        turn_timeout,
+        run_agent_streaming(agent, plan_req, task_id, store, 0),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("plan phase timed out after {}s", req.turn_timeout_secs))?
+    .map_err(|e| anyhow::anyhow!("plan phase agent error: {e}"))?;
+
+    let plan_text = plan_resp.output.clone();
+    mutate_and_persist(store, task_id, |state| {
+        state.plan_output = Some(plan_text.clone());
+        state.phase = TaskPhase::Implement;
+    })
+    .await?;
+
+    tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete");
+    Ok(Some(plan_text))
+}
+
 pub(crate) async fn run_task(
     store: &TaskStore,
     task_id: &TaskId,
@@ -384,8 +499,10 @@ pub(crate) async fn run_task(
     server_config: &harness_core::HarnessConfig,
 ) -> anyhow::Result<()> {
     let task_start = Instant::now();
-    update_status(store, task_id, TaskStatus::Implementing, 1).await?;
-    let impl_phase_start = Instant::now();
+
+    if !project.exists() {
+        anyhow::bail!("project_root does not exist: {}", project.display());
+    }
 
     // Set CARGO_TARGET_DIR to a per-task temp path so parallel agents running
     // cargo check/test simultaneously do not contend on the same build directory.
@@ -411,6 +528,30 @@ pub(crate) async fn run_task(
         .await
         .unwrap_or_else(|| "{owner}/{repo}".to_string());
 
+    // --- Pipeline: Triage → Plan → Implement ---
+    // For issue-based tasks without an existing PR, run triage first.
+    // Triage decides whether to skip planning or go through a plan phase.
+    let plan_output = if let Some(issue) = req.issue {
+        // Only triage fresh issues (no existing PR to continue).
+        let has_existing_pr = find_existing_pr_for_issue(&project, issue)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !has_existing_pr {
+            run_triage_plan_pipeline(agent, store, task_id, issue, &cargo_env, &project, req)
+                .await?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Resume normal flow — update status to Implementing for the main turn.
+    update_status(store, task_id, TaskStatus::Implementing, 1).await?;
+    let impl_phase_start = Instant::now();
+
     let first_prompt = if let Some(issue) = req.issue {
         let base = match find_existing_pr_for_issue(&project, issue).await {
             Ok(Some((pr_num, branch, pr_url))) => {
@@ -420,10 +561,12 @@ pub(crate) async fn run_task(
                 let slug = prompts::repo_slug_from_pr_url(Some(&pr_url));
                 prompts::continue_existing_pr(issue, pr_num, &branch, &slug)
             }
-            Ok(None) => prompts::implement_from_issue(issue, git).to_prompt_string(),
+            Ok(None) => {
+                prompts::implement_from_issue(issue, git, plan_output.as_deref()).to_prompt_string()
+            }
             Err(e) => {
                 tracing::warn!("failed to check for existing PR for issue #{issue}: {e}");
-                prompts::implement_from_issue(issue, git).to_prompt_string()
+                prompts::implement_from_issue(issue, git, plan_output.as_deref()).to_prompt_string()
             }
         };
         // If the caller also supplied a description alongside the issue number, include it
@@ -439,8 +582,11 @@ pub(crate) async fn run_task(
         }
     } else if let Some(pr) = req.pr {
         prompts::check_existing_pr(pr, &review_config.review_bot_command, &repo_slug)
-    } else if req.source.as_deref() == Some("periodic_review") {
-        // Review tasks use their prompt as-is — no "create PR" wrapper.
+    } else if matches!(
+        req.source.as_deref(),
+        Some("periodic_review") | Some("sprint_planner")
+    ) {
+        // Review/planner tasks use their prompt as-is — no "create PR" wrapper.
         req.prompt.clone().unwrap_or_default()
     } else {
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default(), git)
@@ -707,9 +853,12 @@ pub(crate) async fn run_task(
 
     // Review-only tasks produce a report, not a PR.
     // Persist the output and return immediately — no PR parsing or review loop.
-    let is_review_task = store
-        .get(task_id)
-        .is_some_and(|s| s.source.as_deref() == Some("periodic_review"));
+    let is_review_task = store.get(task_id).is_some_and(|s| {
+        matches!(
+            s.source.as_deref(),
+            Some("periodic_review") | Some("sprint_planner")
+        )
+    });
 
     if is_review_task {
         mutate_and_persist(store, task_id, |s| {
@@ -751,7 +900,11 @@ pub(crate) async fn run_task(
             } else {
                 "no_pr".into()
             },
-            detail: None,
+            detail: if output.is_empty() {
+                None
+            } else {
+                Some(output.clone())
+            },
         });
     })
     .await?;
@@ -801,6 +954,7 @@ pub(crate) async fn run_task(
                 &interceptors,
                 turn_timeout,
                 pr_url.as_deref().unwrap_or(""),
+                project_config.review_type.as_str(),
                 &events,
                 &cargo_env,
             )
@@ -810,6 +964,26 @@ pub(crate) async fn run_task(
         }
     }
 
+    // Skip external review bot wait when auto-trigger is disabled — there is
+    // no bot to wait for, so the loop would always exhaust all rounds and fail.
+    if !review_config.review_bot_auto_trigger {
+        tracing::info!("review_bot_auto_trigger disabled; skipping external review wait");
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Done;
+            s.turn = 2;
+        })
+        .await?;
+        tracing::info!(
+            task_id = %task_id,
+            status = "done",
+            turns = 2,
+            pr_url = pr_url.as_deref().unwrap_or(""),
+            total_elapsed_secs = task_start.elapsed().as_secs(),
+            "task_completed"
+        );
+        return Ok(());
+    }
+
     // Wait for external review bot.
     // Use a local counter instead of querying the store to derive waiting_count —
     // task execution is sequential within a single tokio task, so a plain u32 suffices.
@@ -817,14 +991,18 @@ pub(crate) async fn run_task(
     waiting_count += 1;
     update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
 
-    let wait_secs = req.wait_secs;
+    let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
+    let max_rounds = resolved.review_max_rounds.unwrap_or(req.max_rounds);
     tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
     sleep(Duration::from_secs(wait_secs)).await;
 
     let review_phase_start = Instant::now();
 
-    // Review loop
-    for round in 1..=req.max_rounds {
+    // Review loop.
+    // Use an explicit counter so WAITING responses don't consume a round — `continue`
+    // inside a `for` loop would silently advance the iterator even without a real review.
+    let mut round: u32 = 1;
+    while round <= max_rounds {
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let check_req = AgentRequest {
@@ -876,6 +1054,18 @@ pub(crate) async fn run_task(
                 r
             }
             Ok(Err(e)) => {
+                // Quota exhausted is not retryable — break immediately instead of
+                // burning remaining review rounds on repeated 402 errors.
+                if matches!(e, HarnessError::QuotaExhausted(_)) {
+                    tracing::error!(round, error = %e, "quota exhausted during review — aborting review loop");
+                    run_on_error(&interceptors, &check_req, &e.to_string()).await;
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.error = Some(e.to_string());
+                    })
+                    .await?;
+                    return Ok(());
+                }
                 run_on_error(&interceptors, &check_req, &e.to_string()).await;
                 return Err(e.into());
             }
@@ -896,6 +1086,20 @@ pub(crate) async fn run_task(
         }
 
         let lgtm = prompts::is_lgtm(&output);
+        let waiting = prompts::is_waiting(&output);
+
+        // WAITING means review bot hasn't posted yet (e.g., quota exhausted).
+        // Don't consume a round — just sleep and retry without incrementing.
+        if waiting {
+            tracing::info!(
+                round,
+                "PR #{pr_num} review bot has not responded yet; sleeping without consuming round"
+            );
+            waiting_count += 1;
+            update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
+            sleep(Duration::from_secs(wait_secs)).await;
+            continue;
+        }
 
         mutate_and_persist(store, task_id, |s| {
             s.rounds.push(RoundResult {
@@ -953,19 +1157,20 @@ pub(crate) async fn run_task(
         }
 
         tracing::info!("PR #{pr_num} not yet approved at round {round}; waiting");
-        if round < req.max_rounds {
+        if round < max_rounds {
             waiting_count += 1;
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
             sleep(Duration::from_secs(wait_secs)).await;
         }
+        round += 1;
     }
 
     mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Failed;
-        s.turn = req.max_rounds.saturating_add(1);
+        s.turn = max_rounds.saturating_add(1);
         s.error = Some(format!(
             "Task did not receive LGTM after {} review rounds.",
-            req.max_rounds
+            max_rounds
         ));
     })
     .await?;
@@ -978,7 +1183,7 @@ pub(crate) async fn run_task(
     tracing::info!(
         task_id = %task_id,
         status = "failed",
-        turns = req.max_rounds.saturating_add(1),
+        turns = max_rounds.saturating_add(1),
         pr_url = pr_url.as_deref().unwrap_or(""),
         total_elapsed_secs = task_start.elapsed().as_secs(),
         "task_completed"
@@ -998,6 +1203,7 @@ async fn run_agent_review(
     interceptors: &[Arc<dyn harness_core::interceptor::TurnInterceptor>],
     turn_timeout: Duration,
     pr_url: &str,
+    project_type: &str,
     events: &harness_observe::EventStore,
     cargo_env: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
@@ -1008,7 +1214,7 @@ async fn run_agent_review(
         // Reviewer evaluates the PR diff — read-only except Bash for `gh pr diff`.
         let review_req = AgentRequest {
             prompt: {
-                let base = prompts::agent_review_prompt(pr_url, agent_round);
+                let base = prompts::agent_review_prompt(pr_url, agent_round, project_type);
                 // Inject capability note — primary enforcement now that --allowedTools
                 // is not passed to the CLI (issue #483).
                 let note = "Tool restriction: you are operating in review mode. \
@@ -1058,6 +1264,16 @@ async fn run_agent_review(
                 r
             }
             Ok(Err(e)) => {
+                if matches!(e, HarnessError::QuotaExhausted(_)) {
+                    tracing::error!(agent_round, error = %e, "quota exhausted during agent review — aborting");
+                    run_on_error(interceptors, &review_req, &e.to_string()).await;
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.error = Some(e.to_string());
+                    })
+                    .await?;
+                    return Ok(());
+                }
                 run_on_error(interceptors, &review_req, &e.to_string()).await;
                 return Err(e.into());
             }
@@ -1142,7 +1358,7 @@ async fn run_agent_review(
 
         // Implementor fixes the issues
         let fix_req = AgentRequest {
-            prompt: prompts::agent_review_fix_prompt(pr_url, &issues, agent_round),
+            prompt: prompts::agent_review_fix_prompt(pr_url, &issues, agent_round, project_type),
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Execution),

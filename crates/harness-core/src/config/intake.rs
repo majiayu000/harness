@@ -2,21 +2,58 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// Per-repo GitHub intake entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubRepoConfig {
+    /// GitHub repository in "owner/repo" format.
+    pub repo: String,
+    /// Issue label to filter on. Default: "harness".
+    #[serde(default = "default_intake_label")]
+    pub label: String,
+    /// Project root to associate with issues from this repo.
+    pub project_root: Option<String>,
+}
+
 /// GitHub Issues intake configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubIntakeConfig {
     /// Enable polling GitHub Issues for tasks. Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// GitHub repository in "owner/repo" format.
+    /// Single repo (backward compat shorthand).
     #[serde(default)]
     pub repo: String,
-    /// Issue label to filter on. Default: "harness".
+    /// Issue label to filter on (used with single `repo`). Default: "harness".
     #[serde(default = "default_intake_label")]
     pub label: String,
     /// Polling interval in seconds. Default: 30.
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
+    /// Multiple repos to poll.
+    #[serde(default)]
+    pub repos: Vec<GitHubRepoConfig>,
+    /// Agent name for the sprint planner. None = use server default.
+    #[serde(default)]
+    pub planner_agent: Option<String>,
+}
+
+/// Expand config into a flat list of (repo, label, project_root) tuples.
+/// Merges the single `repo` field with the `repos` array.
+impl GitHubIntakeConfig {
+    pub fn effective_repos(&self) -> Vec<GitHubRepoConfig> {
+        let mut result: Vec<GitHubRepoConfig> = self.repos.clone();
+        if !self.repo.is_empty() {
+            let already = result.iter().any(|r| r.repo == self.repo);
+            if !already {
+                result.push(GitHubRepoConfig {
+                    repo: self.repo.clone(),
+                    label: self.label.clone(),
+                    project_root: None,
+                });
+            }
+        }
+        result
+    }
 }
 
 fn default_intake_label() -> String {
@@ -34,6 +71,8 @@ impl Default for GitHubIntakeConfig {
             repo: String::new(),
             label: default_intake_label(),
             poll_interval_secs: default_poll_interval_secs(),
+            repos: Vec::new(),
+            planner_agent: None,
         }
     }
 }
