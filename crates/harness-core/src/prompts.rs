@@ -520,17 +520,25 @@ pub fn extract_review_issues(output: &str) -> Vec<String> {
 /// Parse `PR_URL=<url>` from agent output (searches from last line).
 ///
 /// Only returns URLs matching the strict GitHub PR format
-/// `https://github.com/{owner}/{repo}/pull/{number}[#{fragment}]`.
+/// `https://github.com/{owner}/{repo}/pull/{number}[/...][#{fragment}]`.
 /// This prevents javascript: URI injection (SEC-03) and shell metacharacter
 /// injection (e.g. `$(...)` in path segments) when the URL is embedded in
 /// reviewer prompts that invoke `gh pr diff`.
+///
+/// The fragment (if any) is stripped from the returned URL so it cannot
+/// escape shell quoting in downstream commands.
 pub fn parse_pr_url(output: &str) -> Option<String> {
     for line in output.lines().rev() {
         let line = line.trim();
         if let Some(url) = line.strip_prefix("PR_URL=") {
             let url = url.trim();
             if is_valid_github_pr_url(url) {
-                return Some(url.to_string());
+                // Strip fragment and trailing slash before returning.
+                // The fragment is not needed by `gh pr diff` and a malicious
+                // fragment (e.g. `#';cmd;'`) would escape shell quoting when
+                // the URL is embedded in reviewer prompts.
+                let normalized = url.split('#').next().unwrap_or(url).trim_end_matches('/');
+                return Some(normalized.to_string());
             }
         }
     }
@@ -539,19 +547,28 @@ pub fn parse_pr_url(output: &str) -> Option<String> {
 
 /// Returns `true` only for well-formed GitHub PR URLs.
 ///
-/// Accepted: `https://github.com/{owner}/{repo}/pull/{number}[#{fragment}]`
-/// Rejected: any other scheme, non-GitHub host, shell metacharacters, extra
-/// path segments, or non-numeric PR numbers.
+/// Accepted:
+///   `https://github.com/{owner}/{repo}/pull/{number}[/extra...][#{fragment}]`
+///
+/// Extra path segments after the PR number (e.g. `/files`, `/commits`) are
+/// allowed as long as they contain only safe slug characters.  This avoids
+/// silently skipping review for PR URLs that GitHub itself generates with
+/// path suffixes.
+///
+/// Rejected: any other scheme, non-GitHub host, shell metacharacters in any
+/// path segment, or non-numeric PR numbers.
 fn is_valid_github_pr_url(url: &str) -> bool {
     let rest = match url.strip_prefix("https://github.com/") {
         Some(r) => r,
         None => return false,
     };
-    // Strip optional fragment (#discussion_rXXX etc.)
+    // Strip optional fragment (#discussion_rXXX etc.) before path parsing.
     let path = rest.split_once('#').map_or(rest, |(p, _)| p);
+    // Trim trailing slashes so that `/pull/42/` normalises to `/pull/42`.
+    let path = path.trim_end_matches('/');
     let parts: Vec<&str> = path.split('/').collect();
-    // Must be exactly owner/repo/pull/number — no extra segments
-    if parts.len() != 4 {
+    // Must have at least: owner / repo / "pull" / number
+    if parts.len() < 4 {
         return false;
     }
     let is_valid_slug = |s: &str| {
@@ -559,11 +576,18 @@ fn is_valid_github_pr_url(url: &str) -> bool {
             && s.chars()
                 .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
     };
-    is_valid_slug(parts[0]) // owner
+    // Validate the mandatory core four segments.
+    let core_valid = is_valid_slug(parts[0]) // owner
         && is_valid_slug(parts[1]) // repo
         && parts[2] == "pull"
         && !parts[3].is_empty()
-        && parts[3].chars().all(|c| c.is_ascii_digit()) // PR number only
+        && parts[3].chars().all(|c| c.is_ascii_digit()); // PR number — digits only
+    if !core_valid {
+        return false;
+    }
+    // Any extra path segments (e.g. "files", "commits") must also be safe slugs
+    // so that injected shell metacharacters are rejected even in suffix position.
+    parts[4..].iter().all(|s| is_valid_slug(s))
 }
 
 /// Extract PR number from a GitHub PR URL.
@@ -1194,6 +1218,42 @@ mod tests {
         assert_eq!(
             parse_pr_url("PR_URL=http://github.com/owner/repo/pull/1"),
             None
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_url_strips_fragment() {
+        // SEC-03: the fragment must be stripped from the returned URL so that a
+        // malicious fragment (e.g. `#';touch /tmp/pwn;'`) cannot escape shell
+        // quoting when the URL is embedded in `gh pr diff '{pr_url}'`.
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/1#';touch /tmp/pwn;'"),
+            Some("https://github.com/owner/repo/pull/1".to_string()),
+        );
+        // Legitimate discussion fragments are also stripped (not needed by gh cli).
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/42#discussion_r123456"),
+            Some("https://github.com/owner/repo/pull/42".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_url_accepts_path_suffixes() {
+        // Regression: URLs with /files or /commits suffix produced by GitHub must
+        // be accepted — the previous strict 4-segment check silently dropped them,
+        // causing the review loop to be skipped entirely.
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/42/files"),
+            Some("https://github.com/owner/repo/pull/42/files".to_string())
+        );
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/42/commits"),
+            Some("https://github.com/owner/repo/pull/42/commits".to_string())
+        );
+        // Trailing slash must also be accepted.
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/42/"),
+            Some("https://github.com/owner/repo/pull/42".to_string())
         );
     }
 
