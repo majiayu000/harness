@@ -8,8 +8,8 @@
 //!
 //! See `docs/api-contract.md` for the full transport role description.
 
+use crate::app_state::AppState;
 use crate::handlers;
-use crate::http::AppState;
 use harness_protocol::{Method, RpcRequest, RpcResponse};
 
 /// Route a JSON-RPC request to the appropriate handler.

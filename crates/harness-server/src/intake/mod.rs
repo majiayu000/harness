@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::http::AppState;
+use crate::app_state::AppState;
 use crate::task_runner::{TaskId, TaskStatus};
 
 pub mod feishu;

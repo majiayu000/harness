@@ -1,4 +1,4 @@
-use crate::{http::AppState, validate_root};
+use crate::{app_state::AppState, validate_root};
 use harness_core::{ThreadId, ThreadStatus, TurnStatus};
 use harness_protocol::{Notification, RpcResponse, INTERNAL_ERROR, NOT_FOUND};
 use std::path::PathBuf;

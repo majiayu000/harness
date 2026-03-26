@@ -842,6 +842,77 @@ body {
   .history-list { grid-template-columns: 1fr; }
 }
 
+/* --- Token Usage --- */
+
+.tok-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  margin-top: 0.75rem;
+}
+
+.tok-table th {
+  text-align: left;
+  padding: 0.5rem 0.65rem;
+  border-bottom: 2px solid var(--line-strong);
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.tok-table td {
+  padding: 0.45rem 0.65rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.tok-table tr:hover td {
+  background: var(--card-muted);
+}
+
+.tok-table td:nth-child(n+2) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.tok-table th:nth-child(n+2) {
+  text-align: right;
+}
+
+.tok-two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.tok-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  padding: 0.5rem 0;
+  justify-content: center;
+}
+
+.tok-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.76rem;
+  color: var(--muted);
+}
+
+.tok-legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+#tok-req-chart svg rect:hover,
+#tok-model-chart svg path:hover { opacity: 1; }
+
 @media (max-width: 560px) {
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .board-active { grid-template-columns: repeat(2, 1fr); }

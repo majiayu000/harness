@@ -2,7 +2,7 @@
 //!
 //! Each module defines a trait interface plus a default concrete implementation.
 //! The traits enable independent testing via mock implementations without
-//! constructing the full [`crate::http::AppState`].
+//! constructing the full [`crate::app_state::AppState`].
 //!
 //! # Services
 //! - [`ProjectService`] — project registry CRUD, path resolution, default root.

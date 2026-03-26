@@ -1,4 +1,4 @@
-use crate::http::AppState;
+use crate::app_state::AppState;
 use crate::project_registry::{validate_project_root, Project};
 use axum::{
     extract::{Path, State},

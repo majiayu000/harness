@@ -1,4 +1,4 @@
-use crate::http::AppState;
+use crate::app_state::AppState;
 use harness_core::SkillId;
 use harness_protocol::{RpcResponse, INTERNAL_ERROR, NOT_FOUND};
 

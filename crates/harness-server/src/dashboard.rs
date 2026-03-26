@@ -6,7 +6,7 @@ use std::sync::Arc;
 const CSS: &str = include_str!("../static/dashboard.css");
 const JS: &str = include_str!("../static/dashboard.js");
 
-pub async fn index(State(state): State<Arc<crate::http::AppState>>) -> impl IntoResponse {
+pub async fn index(State(state): State<Arc<crate::app_state::AppState>>) -> impl IntoResponse {
     // When API auth is configured, inject the token as a JS variable so the
     // browser client can attach it to fetch requests and the WebSocket URL.
     // The dashboard HTML itself is exempt from auth (it contains no sensitive
@@ -62,6 +62,7 @@ pub async fn index(State(state): State<Arc<crate::http::AppState>>) -> impl Into
   <button class="tab-btn tab-btn-active" data-tab="board">Active</button>
   <button class="tab-btn" data-tab="history">History</button>
   <button class="tab-btn" data-tab="channels">Channels</button>
+  <button class="tab-btn" data-tab="tokens">Tokens</button>
   <button class="tab-btn" data-tab="submit">Submit</button>
 </nav>
 
@@ -85,6 +86,48 @@ pub async fn index(State(state): State<Arc<crate::http::AppState>>) -> impl Into
 <div id="tab-channels" class="tab-panel">
   <div id="pipeline-row" class="pipeline-row"></div>
   <div id="channel-grid" class="channel-grid"></div>
+</div>
+
+<div id="tab-tokens" class="tab-panel">
+  <section class="metric-grid" style="grid-template-columns:repeat(6,1fr)">
+    <article class="metric-card"><p class="metric-label">Requests</p><p class="metric-value" id="tok-requests">-</p></article>
+    <article class="metric-card"><p class="metric-label">Avg/Hour</p><p class="metric-value" id="tok-avg-req">-</p></article>
+    <article class="metric-card"><p class="metric-label">Sessions</p><p class="metric-value" id="tok-sessions">-</p></article>
+    <article class="metric-card"><p class="metric-label">Context Tokens</p><p class="metric-value" id="tok-context">-</p></article>
+    <article class="metric-card"><p class="metric-label">Output Tokens</p><p class="metric-value" id="tok-output">-</p></article>
+    <article class="metric-card"><p class="metric-label">Est. Cost</p><p class="metric-value" id="tok-cost">-</p></article>
+  </section>
+  <div class="section-card" style="margin-top:1rem">
+    <h3 class="section-title">Request Count (hourly)</h3>
+    <div id="tok-req-chart"></div>
+  </div>
+  <div class="section-card" style="margin-top:1rem">
+    <h3 class="section-title">Model Usage Trend</h3>
+    <div id="tok-model-chart"></div>
+  </div>
+  <div class="section-card" style="margin-top:1rem">
+    <h3 class="section-title">Daily Breakdown</h3>
+    <table class="tok-table">
+      <thead><tr><th>Date</th><th>Requests</th><th>Context</th><th>Output</th><th>~Cost</th></tr></thead>
+      <tbody id="tok-day-body"></tbody>
+    </table>
+  </div>
+  <div class="tok-two-col">
+    <div class="section-card">
+      <h3 class="section-title">By Model</h3>
+      <table class="tok-table">
+        <thead><tr><th>Model</th><th>Requests</th><th>Context</th><th>Output</th><th>~Cost</th></tr></thead>
+        <tbody id="tok-model-body"></tbody>
+      </table>
+    </div>
+    <div class="section-card">
+      <h3 class="section-title">Top Tasks</h3>
+      <table class="tok-table">
+        <thead><tr><th>Task</th><th>Repo</th><th>Status</th><th>Reqs</th><th>Context</th><th>~Cost</th></tr></thead>
+        <tbody id="tok-task-body"></tbody>
+      </table>
+    </div>
+  </div>
 </div>
 
 <div id="tab-submit" class="tab-panel">

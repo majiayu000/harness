@@ -1,4 +1,4 @@
-use crate::{http::AppState, validate_root};
+use crate::{app_state::AppState, validate_root};
 use harness_core::{EventFilters, Violation};
 use harness_observe::{health::generate_health_report, stats};
 use harness_protocol::{RpcResponse, INTERNAL_ERROR};

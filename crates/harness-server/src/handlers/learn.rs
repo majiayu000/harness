@@ -1,4 +1,4 @@
-use crate::{http::AppState, validate_root};
+use crate::{app_state::AppState, validate_root};
 use harness_core::{AgentRequest, Category, DraftStatus, RuleId, Severity};
 use harness_protocol::{RpcResponse, INTERNAL_ERROR};
 use harness_rules::engine::Rule;

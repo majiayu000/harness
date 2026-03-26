@@ -6,7 +6,7 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
 use super::{IncomingIssue, IntakeSource, TaskCompletionResult};
-use crate::http::AppState;
+use crate::app_state::AppState;
 use crate::task_runner::{TaskId, TaskStatus};
 
 /// Feishu (飞书) Bot intake — webhook-driven task creation from chat messages.

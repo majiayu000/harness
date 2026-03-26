@@ -1,4 +1,4 @@
-use crate::{http::AppState, validate_root};
+use crate::{app_state::AppState, validate_root};
 use harness_core::ExecPlanId;
 use harness_protocol::{RpcResponse, INTERNAL_ERROR, NOT_FOUND};
 use std::path::PathBuf;
