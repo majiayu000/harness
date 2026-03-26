@@ -47,7 +47,7 @@ pub enum Command {
         #[arg(long)]
         project: Option<PathBuf>,
         /// Agent to use
-        #[arg(long, default_value = "claude")]
+        #[arg(long, default_value = "codex")]
         agent: String,
         /// Optional model override
         #[arg(long)]
@@ -206,7 +206,7 @@ pub struct LoopArgs {
     #[arg(long, default_value = "120")]
     pub wait: u64,
     /// Maximum number of review rounds
-    #[arg(long, default_value = "5")]
+    #[arg(long, default_value = "8")]
     pub max_rounds: u32,
     /// Project directory
     #[arg(long, default_value = ".")]
@@ -768,7 +768,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(prompt, "fix the bug");
-                assert_eq!(agent, "claude");
+                assert_eq!(agent, "codex");
                 assert_eq!(sandbox_mode, "workspace-write");
                 assert!(drop_sudo);
             }
@@ -873,7 +873,7 @@ mod tests {
             } => {
                 assert_eq!(issue, 42);
                 assert_eq!(args.wait, 120);
-                assert_eq!(args.max_rounds, 5);
+                assert_eq!(args.max_rounds, 8);
             }
             _ => panic!("expected Pr Fix command"),
         }

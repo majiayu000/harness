@@ -61,6 +61,11 @@ static TASK_MIGRATIONS: &[Migration] = &[
         description: "add repo column",
         sql: "ALTER TABLE tasks ADD COLUMN repo TEXT",
     },
+    Migration {
+        version: 7,
+        description: "add depends_on column",
+        sql: "ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'",
+    },
 ];
 
 /// A single persisted artifact captured from agent output during task execution.
@@ -76,8 +81,10 @@ pub struct TaskArtifact {
 /// Result of [`TaskDb::recover_in_progress`].
 #[derive(Debug, Default)]
 pub struct RecoveryResult {
-    /// Tasks that were in any interrupted state and are now `failed`.
+    /// Tasks that were in interrupted states and are now `failed`.
     pub failed: u32,
+    /// Tasks that were `pending` mid-transient-retry at crash time and are now `failed`.
+    pub transient_failed: u32,
 }
 
 pub struct TaskDb {
@@ -94,10 +101,11 @@ impl TaskDb {
 
     pub async fn insert(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
+        let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let status = state.status.as_ref();
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, parent_id, created_at, repo)
-             VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?)",
+            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, parent_id, created_at, repo, depends_on)
+             VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?)",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -108,6 +116,7 @@ impl TaskDb {
         .bind(state.parent_id.as_ref().map(|id| &id.0))
         .bind(&state.created_at)
         .bind(&state.repo)
+        .bind(&depends_on_json)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -115,10 +124,11 @@ impl TaskDb {
 
     pub async fn update(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
+        let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let status = state.status.as_ref();
         sqlx::query(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
-                    repo = ?, updated_at = datetime('now')
+                    repo = ?, depends_on = ?, updated_at = datetime('now')
              WHERE id = ?",
         )
         .bind(status)
@@ -127,6 +137,7 @@ impl TaskDb {
         .bind(&rounds_json)
         .bind(&state.error)
         .bind(&state.repo)
+        .bind(&depends_on_json)
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -135,7 +146,7 @@ impl TaskDb {
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on
              FROM tasks WHERE id = ?",
         )
         .bind(id)
@@ -146,7 +157,7 @@ impl TaskDb {
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on
              FROM tasks ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -156,18 +167,18 @@ impl TaskDb {
 
     /// Recovery on server restart.
     ///
-    /// All interrupted states (`implementing`, `agent_review`, `reviewing`, `waiting`) are
-    /// marked `failed`. These tasks had their agent process killed mid-flight and cannot
-    /// safely resume without a new agent invocation. The operator can resubmit.
-    ///
-    /// - `pending` → unchanged
-    /// - terminal states (`done`, `failed`) → unchanged
+    /// - interrupted states (`implementing`, `agent_review`, `reviewing`, `waiting`) → `failed`
+    ///   (agent process died mid-flight; no safe resume path)
+    /// - `pending` with transient-retry error → `failed` (crashed mid-backoff, no PR to resume)
+    /// - `pending` otherwise → unchanged (will be picked up by the re-dispatch loop)
     ///
     /// Diagnostic context is embedded in the `error` field so operators can correlate
     /// recovery events with their original execution state.
     ///
-    /// Returns a [`RecoveryResult`] with the count of tasks marked failed.
+    /// Returns a [`RecoveryResult`] with counts for failed outcomes.
     pub async fn recover_in_progress(&self) -> anyhow::Result<RecoveryResult> {
+        // Interrupted tasks cannot be resumed safely after restart without a fresh
+        // agent invocation, so mark them failed with diagnostic context.
         let failed = sqlx::query(
             "UPDATE tasks \
              SET status = 'failed', \
@@ -181,7 +192,34 @@ impl TaskDb {
         .await?
         .rows_affected() as u32;
 
-        Ok(RecoveryResult { failed })
+        // Tasks that were mid-transient-retry (status=pending, error starts with
+        // "retrying after transient failure") crashed during the backoff window.
+        // They have no PR yet and no persisted issue/prompt, so they cannot be
+        // re-dispatched. Mark them failed so they don't silently stay pending forever.
+        let transient_failed = sqlx::query(
+            "UPDATE tasks \
+             SET status = 'failed', \
+                 error = 'recovered after restart (was: pending in transient retry): ' \
+                      || COALESCE(error, ''), \
+                 updated_at = datetime('now') \
+             WHERE status = 'pending' \
+               AND error LIKE 'retrying after transient failure%'",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected() as u32;
+
+        if transient_failed > 0 {
+            tracing::info!(
+                "startup recovery: failed {} task(s) that were pending mid-transient-retry",
+                transient_failed
+            );
+        }
+
+        Ok(RecoveryResult {
+            failed,
+            transient_failed,
+        })
     }
 
     /// Return the `pr_url` of the most recently completed Done task that has one, or `None`.
@@ -200,7 +238,7 @@ impl TaskDb {
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on
              FROM tasks WHERE parent_id = ? ORDER BY created_at DESC",
         )
         .bind(parent_id)
@@ -274,6 +312,7 @@ struct TaskRow {
     parent_id: Option<String>,
     created_at: Option<String>,
     repo: Option<String>,
+    depends_on: String,
 }
 
 impl TaskRow {
@@ -290,6 +329,7 @@ impl TaskRow {
             parent_id,
             created_at,
             repo,
+            depends_on,
         } = self;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
@@ -309,6 +349,7 @@ impl TaskRow {
             source,
             external_id,
             parent_id: parent_id.map(TaskId),
+            depends_on: serde_json::from_str(&depends_on).unwrap_or_default(),
             subtask_ids: Vec::new(),
             project_root: None,
             issue: None,
@@ -341,6 +382,7 @@ mod tests {
             parent_id: None,
             created_at: None,
             repo: None,
+            depends_on: "[]".to_string(),
         }
     }
 
@@ -393,6 +435,7 @@ mod tests {
             source: None,
             external_id: None,
             parent_id: None,
+            depends_on: vec![],
             subtask_ids: vec![],
             project_root: None,
             issue: None,
@@ -588,8 +631,10 @@ mod tests {
 
         db.insert(&make_task("t-pending", TaskStatus::Pending))
             .await?;
+        // implementing WITHOUT PR → should fail
         db.insert(&make_task("t-implementing", TaskStatus::Implementing))
             .await?;
+        // agent_review WITHOUT PR → should fail
         db.insert(&make_task("t-agent-review", TaskStatus::AgentReview))
             .await?;
         db.insert(&make_task("t-reviewing", TaskStatus::Reviewing))
@@ -605,14 +650,18 @@ mod tests {
             result.failed, 4,
             "implementing + agent_review + reviewing + waiting should all be failed"
         );
+        assert_eq!(result.transient_failed, 0);
 
         // pending stays pending, no error set
         let pending = db.get("t-pending").await?.expect("should exist");
         assert!(matches!(pending.status, TaskStatus::Pending));
         assert!(pending.error.is_none());
 
-        // implementing → failed with diagnostic info
-        let implementing = db.get("t-implementing").await?.expect("should exist");
+        // implementing (no PR) → failed with diagnostic info
+        let implementing = db
+            .get("t-implementing")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("t-implementing should exist"))?;
         assert!(matches!(implementing.status, TaskStatus::Failed));
         let err = implementing.error.as_deref().unwrap_or("");
         assert!(
@@ -621,8 +670,11 @@ mod tests {
         );
         assert!(err.contains("round:"), "error should contain round info");
 
-        // agent_review → failed with diagnostic info
-        let agent_review = db.get("t-agent-review").await?.expect("should exist");
+        // agent_review (no PR) → failed with diagnostic info
+        let agent_review = db
+            .get("t-agent-review")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("t-agent-review should exist"))?;
         assert!(matches!(agent_review.status, TaskStatus::Failed));
         assert!(agent_review
             .error
@@ -636,7 +688,7 @@ mod tests {
         let err = reviewing.error.as_deref().unwrap_or("");
         assert!(
             err.contains("was: reviewing"),
-            "error should contain original status"
+            "error should note original status"
         );
 
         // waiting → failed with diagnostic info
@@ -651,94 +703,71 @@ mod tests {
         // terminal states unchanged
         let done = db.get("t-done").await?.expect("should exist");
         assert!(matches!(done.status, TaskStatus::Done));
-        let already_failed = db.get("t-failed").await?.expect("should exist");
-        assert!(matches!(already_failed.status, TaskStatus::Failed));
+        let failed = db.get("t-failed").await?.expect("should exist");
+        assert!(matches!(failed.status, TaskStatus::Failed));
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn recover_marks_reviewing_as_failed() -> anyhow::Result<()> {
+    async fn recover_marks_tasks_with_pr_as_failed() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
-        db.insert(&make_task("t1", TaskStatus::Reviewing)).await?;
-        db.recover_in_progress().await?;
-        let t = db.get("t1").await?.expect("should exist");
-        assert!(matches!(t.status, TaskStatus::Failed));
-        assert!(
-            t.error.as_deref().unwrap_or("").contains("reviewing"),
-            "error should contain original status"
-        );
-        Ok(())
-    }
 
-    #[tokio::test]
-    async fn recover_marks_waiting_as_failed() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
-        db.insert(&make_task("t1", TaskStatus::Waiting)).await?;
-        db.recover_in_progress().await?;
-        let t = db.get("t1").await?.expect("should exist");
-        assert!(matches!(t.status, TaskStatus::Failed));
-        assert!(
-            t.error.as_deref().unwrap_or("").contains("waiting"),
-            "error should contain original status"
-        );
-        Ok(())
-    }
+        // implementing WITH PR → should fail
+        let mut with_pr = make_task("t-impl-pr", TaskStatus::Implementing);
+        with_pr.pr_url = Some("https://github.com/owner/repo/pull/42".to_string());
+        db.insert(&with_pr).await?;
 
-    #[tokio::test]
-    async fn recover_marks_implementing_as_failed() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
-        db.insert(&make_task("t1", TaskStatus::Implementing))
+        // agent_review WITH PR → should fail
+        let mut review_pr = make_task("t-review-pr", TaskStatus::AgentReview);
+        review_pr.pr_url = Some("https://github.com/owner/repo/pull/43".to_string());
+        db.insert(&review_pr).await?;
+
+        // implementing WITHOUT PR → should fail
+        db.insert(&make_task("t-impl-no-pr", TaskStatus::Implementing))
             .await?;
-        db.recover_in_progress().await?;
-        let t = db.get("t1").await?.expect("should exist");
-        assert!(matches!(t.status, TaskStatus::Failed));
-        assert!(
-            t.error.as_deref().unwrap_or("").contains("implementing"),
-            "error should contain original status"
-        );
-        Ok(())
-    }
 
-    #[tokio::test]
-    async fn recover_leaves_done_tasks_untouched() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
-        db.insert(&make_task("t-done", TaskStatus::Done)).await?;
-        db.insert(&make_task("t-failed", TaskStatus::Failed))
-            .await?;
-        db.insert(&make_task("t-pending", TaskStatus::Pending))
-            .await?;
         let result = db.recover_in_progress().await?;
-        assert_eq!(result.failed, 0);
-        assert!(matches!(
-            db.get("t-done").await?.expect("should exist").status,
-            TaskStatus::Done
-        ));
-        assert!(matches!(
-            db.get("t-failed").await?.expect("should exist").status,
-            TaskStatus::Failed
-        ));
-        assert!(matches!(
-            db.get("t-pending").await?.expect("should exist").status,
-            TaskStatus::Pending
-        ));
-        Ok(())
-    }
+        assert_eq!(result.failed, 3, "all interrupted tasks should fail");
+        assert_eq!(result.transient_failed, 0);
 
-    #[tokio::test]
-    async fn recovery_result_count_is_accurate() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
-        db.insert(&make_task("r1", TaskStatus::Reviewing)).await?;
-        db.insert(&make_task("r2", TaskStatus::Reviewing)).await?;
-        db.insert(&make_task("i1", TaskStatus::Implementing))
-            .await?;
-        let result = db.recover_in_progress().await?;
-        assert_eq!(result.failed, 3);
+        // Verify: implementing with PR → failed
+        let impl_pr = db
+            .get("t-impl-pr")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("t-impl-pr should exist"))?;
+        assert!(
+            matches!(impl_pr.status, TaskStatus::Failed),
+            "implementing with PR should be marked failed"
+        );
+        let err = impl_pr.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("was: implementing"),
+            "should contain original status"
+        );
+        assert!(
+            err.contains("pull/42"),
+            "should preserve PR URL in error context"
+        );
+
+        // Verify: agent_review with PR → failed
+        let review = db
+            .get("t-review-pr")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("t-review-pr should exist"))?;
+        assert!(
+            matches!(review.status, TaskStatus::Failed),
+            "agent_review with PR should be marked failed"
+        );
+
+        // Verify: implementing without PR → failed
+        let no_pr = db
+            .get("t-impl-no-pr")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("t-impl-no-pr should exist"))?;
+        assert!(matches!(no_pr.status, TaskStatus::Failed));
+
         Ok(())
     }
 

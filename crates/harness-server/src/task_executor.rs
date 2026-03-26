@@ -991,14 +991,18 @@ pub(crate) async fn run_task(
     waiting_count += 1;
     update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
 
-    let wait_secs = req.wait_secs;
+    let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
+    let max_rounds = resolved.review_max_rounds.unwrap_or(req.max_rounds);
     tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
     sleep(Duration::from_secs(wait_secs)).await;
 
     let review_phase_start = Instant::now();
 
-    // Review loop
-    for round in 1..=req.max_rounds {
+    // Review loop.
+    // Use an explicit counter so WAITING responses don't consume a round — `continue`
+    // inside a `for` loop would silently advance the iterator even without a real review.
+    let mut round: u32 = 1;
+    while round <= max_rounds {
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let check_req = AgentRequest {
@@ -1153,19 +1157,20 @@ pub(crate) async fn run_task(
         }
 
         tracing::info!("PR #{pr_num} not yet approved at round {round}; waiting");
-        if round < req.max_rounds {
+        if round < max_rounds {
             waiting_count += 1;
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
             sleep(Duration::from_secs(wait_secs)).await;
         }
+        round += 1;
     }
 
     mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Failed;
-        s.turn = req.max_rounds.saturating_add(1);
+        s.turn = max_rounds.saturating_add(1);
         s.error = Some(format!(
             "Task did not receive LGTM after {} review rounds.",
-            req.max_rounds
+            max_rounds
         ));
     })
     .await?;
@@ -1178,7 +1183,7 @@ pub(crate) async fn run_task(
     tracing::info!(
         task_id = %task_id,
         status = "failed",
-        turns = req.max_rounds.saturating_add(1),
+        turns = max_rounds.saturating_add(1),
         pr_url = pr_url.as_deref().unwrap_or(""),
         total_elapsed_secs = task_start.elapsed().as_secs(),
         "task_completed"
