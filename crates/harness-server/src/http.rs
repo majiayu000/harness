@@ -884,6 +884,94 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         );
     }
 
+    // Re-dispatch tasks that were recovered to pending after server restart.
+    // These had PRs when the server crashed and need their review loop re-started.
+    // Without this, recovered tasks silently hang in pending forever.
+    {
+        let recovered: Vec<_> = state
+            .core
+            .tasks
+            .list_all()
+            .into_iter()
+            .filter(|t| matches!(t.status, task_runner::TaskStatus::Pending) && t.pr_url.is_some())
+            .collect();
+        if !recovered.is_empty() {
+            tracing::info!(
+                count = recovered.len(),
+                "startup: re-dispatching recovered pending task(s) with PRs"
+            );
+            for task in recovered {
+                let pr_url = task.pr_url.as_deref().unwrap_or("");
+                let pr_num = match pr_url
+                    .rsplit('/')
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    Some(n) => n,
+                    None => {
+                        tracing::warn!(
+                            task_id = ?task.id,
+                            pr_url,
+                            "startup recovery: cannot parse PR number from URL, skipping"
+                        );
+                        continue;
+                    }
+                };
+                let project_id = task.repo.clone().unwrap_or_default();
+                let permit = match state.concurrency.task_queue.acquire(&project_id).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(
+                            task_id = ?task.id,
+                            "startup recovery: failed to acquire permit: {e}"
+                        );
+                        continue;
+                    }
+                };
+                let req = task_runner::CreateTaskRequest {
+                    pr: Some(pr_num),
+                    repo: task.repo.clone(),
+                    source: task.source.clone(),
+                    external_id: task.external_id.clone(),
+                    ..Default::default()
+                };
+                let classification = crate::complexity_router::classify("", None, Some(pr_num));
+                let agent = match state.core.server.agent_registry.dispatch(&classification) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!(
+                            task_id = ?task.id,
+                            "startup recovery: failed to dispatch agent: {e}"
+                        );
+                        continue;
+                    }
+                };
+                let (reviewer, _) = resolve_reviewer(
+                    &state.core.server.agent_registry,
+                    &state.core.server.config.agents.review,
+                    agent.name(),
+                );
+                state.core.tasks.register_task_stream(&task.id);
+                task_runner::spawn_preregistered_task(
+                    task.id,
+                    state.core.tasks.clone(),
+                    agent,
+                    reviewer,
+                    Arc::new(state.core.server.config.clone()),
+                    state.engines.skills.clone(),
+                    state.observability.events.clone(),
+                    state.interceptors.clone(),
+                    req,
+                    state.concurrency.workspace_mgr.clone(),
+                    permit,
+                    state.intake.completion_callback.clone(),
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+
     let initial_grade = {
         let events = state
             .observability
