@@ -29,9 +29,7 @@ impl AgentRegistry {
 
     pub fn dispatch(&self, task: &TaskClassification) -> harness_core::Result<Arc<dyn CodeAgent>> {
         let preferred = match task.complexity {
-            TaskComplexity::Critical | TaskComplexity::Complex => {
-                self.get("claude").or_else(|| self.get("anthropic-api"))
-            }
+            TaskComplexity::Critical | TaskComplexity::Complex => self.get("codex"),
             _ => None,
         };
 
@@ -147,23 +145,23 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_complex_task_prefers_claude() {
+    fn dispatch_complex_task_prefers_codex() {
         let mut registry = registry_with_default();
         registry.register(
-            "claude",
+            "codex",
             Arc::new(StubAgent {
-                agent_name: "claude",
+                agent_name: "codex",
             }),
         );
 
         let agent = registry
             .dispatch(&classification(TaskComplexity::Complex))
             .unwrap();
-        assert_eq!(agent.name(), "claude");
+        assert_eq!(agent.name(), "codex");
     }
 
     #[test]
-    fn dispatch_complex_task_falls_back_to_anthropic_api_when_no_claude() {
+    fn dispatch_complex_task_falls_back_to_default_when_no_codex() {
         let mut registry = registry_with_default();
         registry.register(
             "anthropic-api",
@@ -175,16 +173,16 @@ mod tests {
         let agent = registry
             .dispatch(&classification(TaskComplexity::Complex))
             .unwrap();
-        assert_eq!(agent.name(), "anthropic-api");
+        assert_eq!(agent.name(), "default-agent");
     }
 
     #[test]
     fn dispatch_simple_task_uses_default_agent() {
         let mut registry = registry_with_default();
         registry.register(
-            "claude",
+            "codex",
             Arc::new(StubAgent {
-                agent_name: "claude",
+                agent_name: "codex",
             }),
         );
 
@@ -195,23 +193,23 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_critical_task_prefers_claude() {
+    fn dispatch_critical_task_prefers_codex() {
         let mut registry = registry_with_default();
         registry.register(
-            "claude",
+            "codex",
             Arc::new(StubAgent {
-                agent_name: "claude",
+                agent_name: "codex",
             }),
         );
 
         let agent = registry
             .dispatch(&classification(TaskComplexity::Critical))
             .unwrap();
-        assert_eq!(agent.name(), "claude");
+        assert_eq!(agent.name(), "codex");
     }
 
     #[test]
-    fn dispatch_critical_task_falls_back_to_anthropic_api_when_no_claude() {
+    fn dispatch_critical_task_falls_back_to_default_when_no_codex() {
         let mut registry = registry_with_default();
         registry.register(
             "anthropic-api",
@@ -223,16 +221,16 @@ mod tests {
         let agent = registry
             .dispatch(&classification(TaskComplexity::Critical))
             .unwrap();
-        assert_eq!(agent.name(), "anthropic-api");
+        assert_eq!(agent.name(), "default-agent");
     }
 
     #[test]
     fn dispatch_medium_task_uses_default_agent() {
         let mut registry = registry_with_default();
         registry.register(
-            "claude",
+            "codex",
             Arc::new(StubAgent {
-                agent_name: "claude",
+                agent_name: "codex",
             }),
         );
 

@@ -37,14 +37,13 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
                 project.root.clone(),
             );
 
-            let claude = harness_agents::claude::ClaudeCodeAgent::new(
-                config.agents.claude.cli_path.clone(),
-                config.agents.claude.default_model.clone(),
+            let codex = harness_agents::codex::CodexAgent::from_config(
+                config.agents.codex.clone(),
                 config.agents.sandbox_mode,
             )
             .with_stream_timeout(config.agents.stream_timeout_secs);
 
-            let report = gc_agent.run(&project, &events, &[], &claude).await?;
+            let report = gc_agent.run(&project, &events, &[], &codex).await?;
             println!("Signals detected: {}", report.signals.len());
             println!("Drafts generated: {}", report.drafts_generated);
             for e in &report.errors {

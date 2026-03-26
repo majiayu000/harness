@@ -1,5 +1,5 @@
-use crate::http::task_routes;
 use crate::app_state::AppState;
+use crate::http::task_routes;
 use crate::task_runner::CreateTaskRequest;
 use chrono::{DateTime, Utc};
 use harness_core::{Decision, Event, EventFilters, ReviewConfig, SessionId};
@@ -115,43 +115,19 @@ async fn run_review_tick(
         project_cfg.review_type.as_str(),
     );
 
-    // --- Phase 1: Parallel review by Claude + Codex ---
-    let claude_req = CreateTaskRequest {
-        prompt: Some(base_prompt.clone()),
-        agent: config.agent.clone(),
+    let review_agent = config.agent.clone().unwrap_or_else(|| "codex".to_string());
+    let review_req = CreateTaskRequest {
+        prompt: Some(base_prompt),
+        agent: Some(review_agent.clone()),
         turn_timeout_secs: config.timeout_secs,
         source: Some("periodic_review".to_string()),
         ..CreateTaskRequest::default()
     };
 
-    let has_codex = state.core.server.agent_registry.get("codex").is_some();
-    let codex_req = if has_codex {
-        Some(CreateTaskRequest {
-            prompt: Some(base_prompt),
-            agent: Some("codex".to_string()),
-            turn_timeout_secs: config.timeout_secs,
-            source: Some("periodic_review".to_string()),
-            ..CreateTaskRequest::default()
-        })
-    } else {
-        None
-    };
-
-    let claude_id = task_routes::enqueue_task(state, claude_req)
+    let review_id = task_routes::enqueue_task(state, review_req)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to enqueue claude review: {e}"))?;
-    tracing::info!(task_id = %claude_id, "scheduler: claude review enqueued");
-
-    let codex_id = if let Some(req) = codex_req {
-        let id = task_routes::enqueue_task(state, req)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to enqueue codex review: {e}"))?;
-        tracing::info!(task_id = %id, "scheduler: codex review enqueued");
-        Some(id)
-    } else {
-        tracing::info!("scheduler: codex not configured, single-model review");
-        None
-    };
+        .map_err(|e| anyhow::anyhow!("failed to enqueue periodic review: {e}"))?;
+    tracing::info!(task_id = %review_id, agent = %review_agent, "scheduler: periodic review enqueued");
 
     *fallback_ts.lock().await = Some(Utc::now());
 
@@ -174,54 +150,18 @@ async fn run_review_tick(
         }
     }
 
-    // --- Phase 2: Wait for both, then synthesize ---
+    // Wait for review completion, then persist parsed findings.
     let store = state.core.tasks.clone();
     let review_store = state.observability.review_store.clone();
     let timeout_secs = config.timeout_secs;
-    let state_clone = state.clone();
-    let synth_agent = config.agent.clone();
-    let synth_timeout = config.timeout_secs;
     let handle = tokio::spawn(async move {
-        let claude_output = poll_task_output(&store, &claude_id, timeout_secs).await;
-        let codex_output = match &codex_id {
-            Some(id) => poll_task_output(&store, id, timeout_secs).await,
-            None => None,
-        };
-
+        let output = poll_task_output(&store, &review_id, timeout_secs).await;
         tracing::info!(
-            claude_len = claude_output.as_ref().map(|s| s.len()).unwrap_or(0),
-            codex_len = codex_output.as_ref().map(|s| s.len()).unwrap_or(0),
-            "scheduler: both reviews complete"
+            output_len = output.as_ref().map(|s| s.len()).unwrap_or(0),
+            "scheduler: periodic review completed"
         );
 
-        // Synthesize: Claude merges both reviews into final output.
-        let final_output = if let Some(codex_out) = codex_output {
-            let claude_out = claude_output.unwrap_or_default();
-            let synth_prompt =
-                harness_core::prompts::review_synthesis_prompt(&claude_out, &codex_out);
-            let synth_req = CreateTaskRequest {
-                prompt: Some(synth_prompt),
-                agent: synth_agent,
-                turn_timeout_secs: synth_timeout,
-                source: Some("periodic_review".to_string()),
-                ..CreateTaskRequest::default()
-            };
-            match task_routes::enqueue_task(&state_clone, synth_req).await {
-                Ok(synth_id) => {
-                    tracing::info!(task_id = %synth_id, "scheduler: synthesis task enqueued");
-                    poll_task_output(&store, &synth_id, synth_timeout).await
-                }
-                Err(e) => {
-                    tracing::error!("scheduler: failed to enqueue synthesis: {e}");
-                    Some(claude_out)
-                }
-            }
-        } else {
-            claude_output
-        };
-
-        // Persist findings from the final output.
-        let Some(output) = final_output else {
+        let Some(output) = output else {
             tracing::warn!("scheduler: no review output to parse");
             return;
         };
@@ -233,7 +173,7 @@ async fn run_review_tick(
                     "scheduler: periodic review parsed"
                 );
                 if let Some(ref rs) = review_store {
-                    match rs.persist_findings(&claude_id.0, &review.findings).await {
+                    match rs.persist_findings(&review_id.0, &review.findings).await {
                         Ok(n) => {
                             tracing::info!(new_findings = n, "scheduler: review findings persisted")
                         }
@@ -311,13 +251,13 @@ mod tests {
             run_on_startup: true,
             interval_hours: 12,
             interval_secs: None,
-            agent: Some("claude".to_string()),
+            agent: Some("codex".to_string()),
             timeout_secs: 600,
         };
         assert!(config.enabled);
         assert!(config.run_on_startup);
         assert_eq!(config.interval_hours, 12);
-        assert_eq!(config.agent.as_deref(), Some("claude"));
+        assert_eq!(config.agent.as_deref(), Some("codex"));
         assert_eq!(config.timeout_secs, 600);
     }
 

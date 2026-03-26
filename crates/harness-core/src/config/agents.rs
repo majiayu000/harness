@@ -143,7 +143,7 @@ impl AgentsConfig {
 impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
-            default_agent: "claude".to_string(),
+            default_agent: "codex".to_string(),
             claude: ClaudeAgentConfig::default(),
             codex: CodexAgentConfig::default(),
             anthropic_api: AnthropicApiConfig::default(),

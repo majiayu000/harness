@@ -62,8 +62,8 @@ Harness is a Rust-native platform that wraps AI coding agents (Claude Code, Code
 
 - Rust 1.75+
 - At least one agent runtime:
-  - [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI (default)
-  - [`codex`](https://github.com/openai/codex) CLI
+  - [`codex`](https://github.com/openai/codex) CLI (default)
+  - [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI
   - Anthropic API key (for direct API adapter)
 
 ### Build
@@ -130,7 +130,7 @@ data_dir = "~/.local/share/harness"
 project_root = "."
 
 [agents]
-default_agent = "claude"
+default_agent = "codex"
 sandbox_mode = "danger-full-access"
 
 [agents.claude]
@@ -180,7 +180,7 @@ max_concurrent = 2          # max parallel tasks for this project
 name = "litellm-rs"
 root = "/path/to/litellm-rs"
 max_concurrent = 2
-default_agent = "claude"    # override default agent per project
+default_agent = "codex"    # override default agent per project
 
 [[projects]]
 name = "vibeguard"
@@ -206,7 +206,7 @@ pre_commit = ["cargo fmt --all -- --check", "cargo check"]
 timeout_secs = 120
 
 [agent]
-default = "claude"
+default = "codex"
 
 [review]
 enabled = true

@@ -30,9 +30,13 @@ pub async fn run(
     default_project: Option<String>,
 ) -> Result<()> {
     // On macOS, sandbox-exec (Seatbelt) with deny-default policy causes SIGTRAP
-    // in Claude Code CLI. Require danger-full-access until Seatbelt policy is
-    // expanded to cover all syscalls Claude Code needs.
+    // in Claude Code CLI. Only enforce danger-full-access when a Claude path
+    // is actually configured to run.
+    let claude_in_use = config.agents.default_agent == "claude"
+        || config.review.agent.as_deref() == Some("claude")
+        || config.agents.review.reviewer_agent == "claude";
     if cfg!(target_os = "macos")
+        && claude_in_use
         && config.agents.sandbox_mode != harness_core::SandboxMode::DangerFullAccess
     {
         anyhow::bail!(

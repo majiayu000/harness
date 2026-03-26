@@ -1,15 +1,11 @@
-use harness_agents::claude::ClaudeCodeAgent;
+use harness_agents::codex::CodexAgent;
 use harness_core::{prompts, AgentRequest, CodeAgent, HarnessConfig};
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
 
-fn create_agent(config: &HarnessConfig) -> ClaudeCodeAgent {
-    ClaudeCodeAgent::new(
-        config.agents.claude.cli_path.clone(),
-        config.agents.claude.default_model.clone(),
-        config.agents.sandbox_mode,
-    )
-    .with_stream_timeout(config.agents.stream_timeout_secs)
+fn create_agent(config: &HarnessConfig) -> CodexAgent {
+    CodexAgent::from_config(config.agents.codex.clone(), config.agents.sandbox_mode)
+        .with_stream_timeout(config.agents.stream_timeout_secs)
 }
 
 pub async fn fix(
