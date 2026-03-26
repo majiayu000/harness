@@ -165,10 +165,43 @@ pub fn implement_from_issue(
 }
 
 /// Build prompt: check an existing PR's CI and review status.
-pub fn check_existing_pr(pr: u64, review_bot_command: &str, repo: &str) -> String {
+///
+/// When `prev_fixed` is true (the previous round pushed a fix commit), the agent
+/// must first verify that `reviewer_name` has submitted a **new** review covering
+/// the latest commit before declaring LGTM. If no new review exists yet, the agent
+/// outputs WAITING.
+pub fn check_existing_pr(
+    pr: u64,
+    review_bot_command: &str,
+    repo: &str,
+    reviewer_name: &str,
+    prev_fixed: bool,
+) -> String {
     let body = shell_single_quote(review_bot_command);
+    let freshness_check = if prev_fixed {
+        let login_filter =
+            format!("[.[] | select(.user.login == \"{reviewer_name}\")] | last | .submitted_at");
+        format!(
+            "\n\nIMPORTANT — New review verification:\n\
+             The previous round pushed a fix commit. Before evaluating review status, \
+             you MUST verify that {reviewer_name} has submitted a NEW review covering the latest commit:\n\
+             1. Run `gh api repos/{repo}/pulls/{pr}/reviews \
+             --jq '{login_filter}'` \
+             to get the timestamp of {reviewer_name}'s most recent review\n\
+             2. Run `gh api repos/{repo}/pulls/{pr}/commits --jq '.[-1].commit.committer.date'` \
+             to get the timestamp of the latest commit\n\
+             3. If {reviewer_name}'s latest review was submitted BEFORE the latest commit \
+             (or no review from {reviewer_name} exists), \
+             {reviewer_name} has not yet re-reviewed the new code. \
+             In this case, print WAITING on the last line and stop.\n\
+             4. Only proceed with the checks below if {reviewer_name}'s latest review \
+             was submitted AFTER the latest commit."
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "Check PR #{pr}:\n\
+        "Check PR #{pr}:{freshness_check}\n\
          1. Run `gh pr view {pr} --json statusCheckRollup` — parse the JSON. \
          CI passes only if the `state` field in the `statusCheckRollup` object is `SUCCESS`\n\
          2. `gh api repos/{repo}/pulls/{pr}/comments` — read inline review comments\n\
@@ -933,7 +966,13 @@ mod tests {
 
     #[test]
     fn test_check_existing_pr() {
-        let p = check_existing_pr(10, "/gemini review", "owner/repo");
+        let p = check_existing_pr(
+            10,
+            "/gemini review",
+            "owner/repo",
+            "gemini-code-assist[bot]",
+            false,
+        );
         assert!(p.contains("PR #10"));
         assert!(p.contains("LGTM"));
         assert!(p.contains("PR_URL=https://github.com/owner/repo/pull/10"));
@@ -1119,7 +1158,7 @@ mod tests {
     #[test]
     fn test_check_existing_pr_shell_quoting() {
         // A command containing a single quote must not break single-quoting
-        let p = check_existing_pr(5, "it's a test", "owner/repo");
+        let p = check_existing_pr(5, "it's a test", "owner/repo", "bot[bot]", false);
         assert!(
             p.contains(r"'it'\''s a test'"),
             "single quote must be escaped"

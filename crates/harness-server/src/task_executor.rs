@@ -581,7 +581,13 @@ pub(crate) async fn run_task(
             base
         }
     } else if let Some(pr) = req.pr {
-        prompts::check_existing_pr(pr, &review_config.review_bot_command, &repo_slug)
+        prompts::check_existing_pr(
+            pr,
+            &review_config.review_bot_command,
+            &repo_slug,
+            &review_config.reviewer_name,
+            false,
+        )
     } else if matches!(
         req.source.as_deref(),
         Some("periodic_review") | Some("sprint_planner")
@@ -940,10 +946,11 @@ pub(crate) async fn run_task(
     };
 
     // Agent review loop (if enabled and reviewer available)
+    let mut agent_pushed_commit = false;
     if review_config.enabled {
         if let Some(reviewer) = reviewer {
             tracing::info!(pr_url = %pr_url.as_deref().unwrap_or(""), "starting agent review");
-            let review_ok = run_agent_review(
+            let (review_ok, pushed) = run_agent_review(
                 store,
                 task_id,
                 agent,
@@ -962,6 +969,7 @@ pub(crate) async fn run_task(
             if !review_ok {
                 return Ok(());
             }
+            agent_pushed_commit = pushed;
         } else {
             tracing::warn!("agent review enabled but no reviewer agent configured; skipping");
         }
@@ -987,8 +995,13 @@ pub(crate) async fn run_task(
         let check_req = AgentRequest {
             prompt: {
                 let slug = prompts::repo_slug_from_pr_url(pr_url.as_deref());
-                let base =
-                    prompts::check_existing_pr(pr_num, &review_config.review_bot_command, &slug);
+                let base = prompts::check_existing_pr(
+                    pr_num,
+                    &review_config.review_bot_command,
+                    &slug,
+                    &review_config.reviewer_name,
+                    round == 1 && agent_pushed_commit,
+                );
                 // Inject capability note — primary enforcement now that --allowedTools
                 // is not passed to the CLI (issue #483).
                 if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
@@ -1193,10 +1206,12 @@ async fn run_agent_review(
     project_type: &str,
     events: &harness_observe::EventStore,
     cargo_env: &HashMap<String, String>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(bool, bool)> {
     let max_rounds = review_config.max_rounds;
     // (normalized_issues, consecutive_count): tracks how many consecutive rounds produced identical issues.
     let mut impasse_tracker: Option<(Vec<String>, u32)> = None;
+    // Whether the last action in this loop pushed a new commit (fix or intervention).
+    let mut pushed_commit = false;
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
 
@@ -1261,7 +1276,7 @@ async fn run_agent_review(
                         s.error = Some(e.to_string());
                     })
                     .await?;
-                    return Ok(false);
+                    return Ok((false, false));
                 }
                 run_on_error(interceptors, &review_req, &e.to_string()).await;
                 return Err(e.into());
@@ -1362,7 +1377,7 @@ async fn run_agent_review(
                 ));
             })
             .await?;
-            return Ok(false);
+            return Ok((false, false));
         }
 
         // 3+ consecutive rounds with identical issues → use the intervention prompt.
@@ -1437,9 +1452,10 @@ async fn run_agent_review(
             });
         })
         .await?;
+        pushed_commit = true;
     }
 
-    Ok(true)
+    Ok((true, pushed_commit))
 }
 
 #[cfg(test)]
