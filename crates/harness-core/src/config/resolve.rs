@@ -194,6 +194,35 @@ mod tests {
     }
 
     #[test]
+    fn resolve_config_review_wait_secs_and_max_rounds_override() {
+        let server = HarnessConfig::default();
+        let project = ProjectConfig {
+            review: Some(ProjectReviewConfig {
+                enabled: None,
+                bot_command: None,
+                review_bot_auto_trigger: None,
+                review_wait_secs: Some(300),
+                review_max_rounds: Some(8),
+            }),
+            ..Default::default()
+        };
+
+        let resolved = resolve_config(&server, &project);
+        assert_eq!(resolved.review_wait_secs, Some(300));
+        assert_eq!(resolved.review_max_rounds, Some(8));
+    }
+
+    #[test]
+    fn resolve_config_review_wait_secs_absent_yields_none() {
+        let server = HarnessConfig::default();
+        let project = ProjectConfig::default();
+
+        let resolved = resolve_config(&server, &project);
+        assert_eq!(resolved.review_wait_secs, None);
+        assert_eq!(resolved.review_max_rounds, None);
+    }
+
+    #[test]
     fn resolve_config_mixed_partial_overrides() {
         let server = HarnessConfig::default();
         let project = ProjectConfig {
