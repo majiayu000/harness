@@ -423,7 +423,8 @@ mod tests {
     #[test]
     fn harness_config_default_roundtrip() {
         let config = HarnessConfig::default();
-        assert_eq!(config.agents.default_agent, "claude");
+        assert_eq!(config.agents.default_agent, "auto");
+        assert!(config.agents.complexity_preferred_agents.is_empty());
         assert_eq!(config.server.transport, Transport::Http);
         assert!(!config.agents.review.enabled);
         assert_eq!(config.otel.exporter, OtelExporter::Disabled);

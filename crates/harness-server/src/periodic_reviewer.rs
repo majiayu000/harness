@@ -115,9 +115,31 @@ async fn run_review_tick(
         project_cfg.review_type.as_str(),
     );
 
-    let review_agent = config.agent.clone().unwrap_or_else(|| "codex".to_string());
+    let review_agent = config
+        .agent
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            state
+                .core
+                .server
+                .agent_registry
+                .resolved_default_agent_name()
+                .map(str::to_string)
+        })
+        .ok_or_else(|| anyhow::anyhow!("no default review agent available"))?;
+    let registered_agents: Vec<String> = state
+        .core
+        .server
+        .agent_registry
+        .list()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     let secondary_agent = if config.strategy == ReviewStrategy::Cross {
-        pick_secondary_review_agent(&review_agent, |agent| {
+        pick_secondary_review_agent(&review_agent, &registered_agents, |agent| {
             state.core.server.agent_registry.get(agent).is_some()
         })
     } else {
@@ -277,7 +299,10 @@ async fn run_review_tick(
                     "scheduler: periodic review parsed"
                 );
                 if let Some(ref rs) = review_store {
-                    match rs.persist_findings(&final_task_id.0, &review.findings).await {
+                    match rs
+                        .persist_findings(&final_task_id.0, &review.findings)
+                        .await
+                    {
                         Ok(n) => {
                             tracing::info!(new_findings = n, "scheduler: review findings persisted")
                         }
@@ -295,21 +320,18 @@ async fn run_review_tick(
     Ok(())
 }
 
-fn pick_secondary_review_agent<F>(primary_agent: &str, mut is_available: F) -> Option<String>
+fn pick_secondary_review_agent<F>(
+    primary_agent: &str,
+    candidates: &[String],
+    mut is_available: F,
+) -> Option<String>
 where
     F: FnMut(&str) -> bool,
 {
-    let candidates: &[&str] = match primary_agent {
-        "codex" => &["claude", "anthropic-api"],
-        "claude" => &["codex", "anthropic-api"],
-        _ => &["codex", "claude", "anthropic-api"],
-    };
-
     candidates
         .iter()
-        .copied()
-        .find(|agent| *agent != primary_agent && is_available(agent))
-        .map(str::to_string)
+        .find(|agent| agent.as_str() != primary_agent && is_available(agent.as_str()))
+        .cloned()
 }
 
 /// Poll a task until it reaches a terminal state, then extract its output.
@@ -387,19 +409,31 @@ mod tests {
 
     #[test]
     fn pick_secondary_review_agent_prefers_claude_for_codex_primary() {
-        let agent = pick_secondary_review_agent("codex", |name| name == "claude");
+        let candidates = vec![
+            "codex".to_string(),
+            "claude".to_string(),
+            "anthropic-api".to_string(),
+        ];
+        let agent = pick_secondary_review_agent("codex", &candidates, |name| name == "claude");
         assert_eq!(agent.as_deref(), Some("claude"));
     }
 
     #[test]
     fn pick_secondary_review_agent_prefers_codex_for_claude_primary() {
-        let agent = pick_secondary_review_agent("claude", |name| name == "codex");
+        let candidates = vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "anthropic-api".to_string(),
+        ];
+        let agent = pick_secondary_review_agent("claude", &candidates, |name| name == "codex");
         assert_eq!(agent.as_deref(), Some("codex"));
     }
 
     #[test]
     fn pick_secondary_review_agent_falls_back_to_anthropic_api() {
-        let agent = pick_secondary_review_agent("codex", |name| name == "anthropic-api");
+        let candidates = vec!["codex".to_string(), "anthropic-api".to_string()];
+        let agent =
+            pick_secondary_review_agent("codex", &candidates, |name| name == "anthropic-api");
         assert_eq!(agent.as_deref(), Some("anthropic-api"));
     }
 

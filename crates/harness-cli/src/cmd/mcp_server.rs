@@ -484,6 +484,7 @@ async fn write_json_line(stdout: &mut tokio::io::Stdout, value: &Value) -> anyho
 
 pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
     let mut agent_registry = AgentRegistry::new(&config.agents.default_agent);
+    agent_registry.set_complexity_preferences(config.agents.complexity_preferred_agents.clone());
     agent_registry.register(
         "claude",
         Arc::new(
@@ -503,8 +504,12 @@ pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
         ),
     );
 
+    let default_agent_name = agent_registry
+        .resolved_default_agent_name()
+        .unwrap_or(config.agents.default_agent.as_str())
+        .to_string();
     let executor = Arc::new(RegistryExecutor::new(Arc::new(agent_registry)));
-    let server = McpServer::new(config.agents.default_agent.clone(), executor);
+    let server = McpServer::new(default_agent_name, executor);
     server.serve_stdio().await
 }
 

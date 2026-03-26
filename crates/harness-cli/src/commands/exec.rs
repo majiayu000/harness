@@ -351,6 +351,7 @@ pub async fn run(
     };
 
     let mut agent_registry = harness_agents::AgentRegistry::new(&config.agents.default_agent);
+    agent_registry.set_complexity_preferences(config.agents.complexity_preferred_agents.clone());
     agent_registry.register(
         "claude",
         Arc::new(

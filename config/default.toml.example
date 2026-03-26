@@ -11,7 +11,9 @@ data_dir = "/home/yourname/.local/share/harness"
 project_root = "."
 
 [agents]
-default_agent = "codex"
+default_agent = "auto"
+# Optional: preferred routing order for complex/critical tasks.
+# complexity_preferred_agents = ["codex", "claude"]
 sandbox_mode = "danger-full-access"
 
 [agents.claude]
