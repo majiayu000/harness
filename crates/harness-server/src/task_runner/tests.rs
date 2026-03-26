@@ -1,4 +1,3 @@
-
 use super::*;
 use async_trait::async_trait;
 use harness_core::{
@@ -671,8 +670,8 @@ async fn validation_phase_is_set_on_review_loop_turns() -> anyhow::Result<()> {
     );
     assert_eq!(
         phases[1],
-        Some(ExecutionPhase::Validation),
-        "review check turn must use Validation phase"
+        Some(ExecutionPhase::Execution),
+        "review loop turn must use Execution phase (agent needs write access to fix bot comments)"
     );
     Ok(())
 }

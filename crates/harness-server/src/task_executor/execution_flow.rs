@@ -511,27 +511,27 @@ pub(crate) async fn run_task(
 
     let review_phase_start = Instant::now();
 
-    // Review loop
+    // Review loop — agent checks bot review, fixes issues, pushes, triggers re-review.
+    // Uses review_prompt (full write access) instead of check_existing_pr (read-only)
+    // so the agent can actually fix issues the bot found.
+    let mut prev_fixed = false;
+    let repo_slug = prompts::repo_slug_from_pr_url(pr_url.as_deref());
     for round in 1..=req.max_rounds {
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let check_req = AgentRequest {
-            prompt: {
-                let slug = prompts::repo_slug_from_pr_url(pr_url.as_deref());
-                let base =
-                    prompts::check_existing_pr(pr_num, &review_config.review_bot_command, &slug);
-                // Inject capability note — primary enforcement now that --allowedTools
-                // is not passed to the CLI (issue #483).
-                if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
-                    format!("{note}\n\n{base}")
-                } else {
-                    base
-                }
-            },
+            prompt: prompts::review_prompt(
+                req.issue,
+                pr_num,
+                round,
+                prev_fixed,
+                &review_config.review_bot_command,
+                &review_config.reviewer_name,
+                &repo_slug,
+            ),
             project_root: project.clone(),
             context: context_items.clone(),
-            execution_phase: Some(ExecutionPhase::Validation),
-            allowed_tools: restricted_tools(CapabilityProfile::ReadOnly)?,
+            execution_phase: Some(ExecutionPhase::Execution),
             env_vars: cargo_env.clone(),
             ..Default::default()
         };
@@ -597,6 +597,7 @@ pub(crate) async fn run_task(
 
         let lgtm = prompts::is_lgtm(&output);
         let waiting = prompts::is_waiting(&output);
+        let fixed = !lgtm && !waiting;
 
         // WAITING means review bot hasn't posted yet (e.g., quota exhausted).
         // Don't consume a round — just sleep and retry without incrementing.
@@ -611,11 +612,12 @@ pub(crate) async fn run_task(
             continue;
         }
 
+        let result_label = if lgtm { "lgtm" } else { "fixed" };
         mutate_and_persist(store, task_id, |s| {
             s.rounds.push(RoundResult {
                 turn: round,
                 action: "review".into(),
-                result: if lgtm { "lgtm".into() } else { "fixed".into() },
+                result: result_label.into(),
                 detail: None,
             });
         })
@@ -633,11 +635,7 @@ pub(crate) async fn run_task(
             },
         );
         ev.detail = Some(format!("pr={pr_num}"));
-        ev.reason = Some(if lgtm {
-            format!("round {round}: lgtm")
-        } else {
-            format!("round {round}: fixed")
-        });
+        ev.reason = Some(format!("round {round}: {result_label}"));
         if let Err(e) = events.log(&ev).await {
             tracing::warn!("failed to log pr_review event: {e}");
         }
@@ -666,7 +664,10 @@ pub(crate) async fn run_task(
             return Ok(());
         }
 
-        tracing::info!("PR #{pr_num} not yet approved at round {round}; waiting");
+        // Agent output FIXED — it already fixed the bot's comments and pushed.
+        // Track prev_fixed so the next round's prompt includes freshness check.
+        prev_fixed = fixed;
+        tracing::info!("PR #{pr_num} fixed at round {round}; waiting for bot re-review");
         if round < req.max_rounds {
             waiting_count += 1;
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
