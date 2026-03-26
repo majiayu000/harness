@@ -183,6 +183,9 @@ pub struct AgentReviewConfig {
     /// Automatically post review_bot_command as a PR comment when a task completes with a PR.
     #[serde(default = "default_review_bot_auto_trigger")]
     pub review_bot_auto_trigger: bool,
+    /// GitHub login of the review bot (used for freshness checks in review loop).
+    #[serde(default = "default_reviewer_name")]
+    pub reviewer_name: String,
 }
 
 impl Default for AgentReviewConfig {
@@ -193,8 +196,13 @@ impl Default for AgentReviewConfig {
             max_rounds: default_max_agent_review_rounds(),
             review_bot_command: default_review_bot_command(),
             review_bot_auto_trigger: default_review_bot_auto_trigger(),
+            reviewer_name: default_reviewer_name(),
         }
     }
+}
+
+fn default_reviewer_name() -> String {
+    "gemini-code-assist[bot]".to_string()
 }
 
 fn default_review_bot_command() -> String {

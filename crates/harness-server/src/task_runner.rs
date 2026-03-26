@@ -2000,8 +2000,8 @@ mod tests {
         );
         assert_eq!(
             phases[1],
-            Some(ExecutionPhase::Validation),
-            "review check turn must use Validation phase"
+            Some(ExecutionPhase::Execution),
+            "review loop turn must use Execution phase (agent needs write access to fix bot comments)"
         );
         Ok(())
     }
