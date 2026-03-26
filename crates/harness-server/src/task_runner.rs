@@ -413,63 +413,13 @@ fn is_transient_error(reason: &str) -> bool {
         .any(|p| lower.contains(&p.to_lowercase()))
 }
 
-/// Record a task failure, or requeue if the error is transient and retries remain.
-///
-/// Returns `true` if the task was requeued for retry, `false` if marked as failed.
+/// Record a task failure, marking the task as failed.
 async fn record_task_failure(
     store: &TaskStore,
     events: &harness_observe::EventStore,
     task_id: &TaskId,
     reason: String,
-) -> bool {
-    let retry_count = store
-        .get(task_id)
-        .map(|s| {
-            s.rounds
-                .iter()
-                .filter(|r| r.action == "transient_retry")
-                .count() as u32
-        })
-        .unwrap_or(0);
-
-    if is_transient_error(&reason) && retry_count < MAX_TRANSIENT_RETRIES {
-        let attempt = retry_count + 1;
-        let backoff_secs = 30u64 * (1u64 << retry_count.min(4));
-        tracing::warn!(
-            task_id = %task_id.0,
-            attempt,
-            max = MAX_TRANSIENT_RETRIES,
-            backoff_secs,
-            "transient failure detected; will requeue after backoff: {reason}"
-        );
-        log_task_failure_event(
-            events,
-            task_id,
-            &format!("transient (attempt {attempt}): {reason}"),
-        )
-        .await;
-        // Record the retry attempt as a round for tracking.
-        if let Err(e) = mutate_and_persist(store, task_id, |s| {
-            s.rounds.push(RoundResult {
-                turn: s.turn,
-                action: "transient_retry".into(),
-                result: format!("attempt {attempt}/{MAX_TRANSIENT_RETRIES}"),
-                detail: Some(reason.clone()),
-            });
-            s.status = TaskStatus::Pending;
-            s.error = Some(format!(
-                "requeued after transient failure (attempt {attempt}): {reason}"
-            ));
-        })
-        .await
-        {
-            tracing::error!("failed to requeue task {task_id:?} for retry: {e}");
-        }
-        // Backoff before the task gets picked up again.
-        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
-        return true;
-    }
-
+) {
     log_task_failure_event(events, task_id, &reason).await;
     if let Err(e) = mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Failed;
@@ -479,7 +429,6 @@ async fn record_task_failure(
     {
         tracing::error!("failed to persist task failure for {task_id:?}: {e}");
     }
-    false
 }
 
 /// In-memory cache + SQLite persistence.
@@ -945,19 +894,69 @@ where
             project_root
         };
 
-        let task_result = crate::task_executor::run_task(
-            &store,
-            &id,
-            agent.as_ref(),
-            reviewer.as_deref(),
-            skills,
-            events,
-            interceptors,
-            &req,
-            run_project,
-            server_config.as_ref(),
-        )
-        .await;
+        // Retry loop: on transient errors, back off and retry up to MAX_TRANSIENT_RETRIES.
+        // Retrying inside the spawn means the stream stays open and the task actually re-runs.
+        let mut transient_attempts = 0u32;
+        let task_result = loop {
+            let result = crate::task_executor::run_task(
+                &store,
+                &id,
+                agent.as_ref(),
+                reviewer.as_deref(),
+                skills.clone(),
+                events.clone(),
+                interceptors.clone(),
+                &req,
+                run_project.clone(),
+                server_config.as_ref(),
+            )
+            .await;
+
+            match result {
+                ok @ Ok(()) => break ok,
+                Err(ref e)
+                    if is_transient_error(&e.to_string())
+                        && transient_attempts < MAX_TRANSIENT_RETRIES =>
+                {
+                    transient_attempts += 1;
+                    let reason = e.to_string();
+                    let backoff_secs = 30u64 * (1u64 << (transient_attempts - 1).min(4));
+                    tracing::warn!(
+                        task_id = %id.0,
+                        attempt = transient_attempts,
+                        max = MAX_TRANSIENT_RETRIES,
+                        backoff_secs,
+                        "transient failure detected; retrying after backoff: {reason}"
+                    );
+                    log_task_failure_event(
+                        &events,
+                        &id,
+                        &format!("transient (attempt {transient_attempts}): {reason}"),
+                    )
+                    .await;
+                    if let Err(pe) = mutate_and_persist(&store, &id, |s| {
+                        s.rounds.push(RoundResult {
+                            turn: s.turn,
+                            action: "transient_retry".into(),
+                            result: format!(
+                                "attempt {transient_attempts}/{MAX_TRANSIENT_RETRIES}"
+                            ),
+                            detail: Some(reason.clone()),
+                        });
+                        s.status = TaskStatus::Pending;
+                        s.error = Some(format!(
+                            "retrying after transient failure (attempt {transient_attempts}): {reason}"
+                        ));
+                    })
+                    .await
+                    {
+                        tracing::error!("failed to record retry for task {id:?}: {pe}");
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                }
+                err @ Err(_) => break err,
+            }
+        };
 
         // Cleanup workspace when task ends (Done or Failed) if auto_cleanup is set.
         if let Some(wmgr) = workspace_mgr {
