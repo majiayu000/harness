@@ -42,6 +42,9 @@ pub fn resolve_config(server: &HarnessConfig, project: &ProjectConfig) -> Resolv
         if let Some(cmd) = &proj_review.bot_command {
             review.review_bot_command = cmd.clone();
         }
+        if let Some(name) = &proj_review.reviewer_name {
+            review.reviewer_name = name.clone();
+        }
         if let Some(auto_trigger) = proj_review.review_bot_auto_trigger {
             review.review_bot_auto_trigger = auto_trigger;
         }
@@ -130,6 +133,7 @@ mod tests {
             review: Some(ProjectReviewConfig {
                 enabled: Some(true),
                 bot_command: None,
+                reviewer_name: None,
                 review_bot_auto_trigger: None,
                 review_wait_secs: None,
                 review_max_rounds: None,
@@ -153,6 +157,7 @@ mod tests {
             review: Some(ProjectReviewConfig {
                 enabled: Some(true),
                 bot_command: Some("/custom review".to_string()),
+                reviewer_name: None,
                 review_bot_auto_trigger: None,
                 review_wait_secs: None,
                 review_max_rounds: None,
@@ -200,6 +205,7 @@ mod tests {
             review: Some(ProjectReviewConfig {
                 enabled: None,
                 bot_command: None,
+                reviewer_name: None,
                 review_bot_auto_trigger: None,
                 review_wait_secs: Some(300),
                 review_max_rounds: Some(8),

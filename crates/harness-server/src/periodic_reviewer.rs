@@ -222,7 +222,9 @@ async fn run_review_tick(
 
         // Persist findings from the final output.
         let Some(output) = final_output else {
-            tracing::error!("scheduler: periodic review cycle produced no output — no review output to parse");
+            tracing::error!(
+                "scheduler: periodic review cycle produced no output — no review output to parse"
+            );
             return;
         };
         match crate::review_store::parse_review_output(&output) {

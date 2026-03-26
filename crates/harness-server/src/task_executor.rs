@@ -599,7 +599,13 @@ pub(crate) async fn run_task(
             base
         }
     } else if let Some(pr) = req.pr {
-        prompts::check_existing_pr(pr, &review_config.review_bot_command, &repo_slug)
+        prompts::check_existing_pr(
+            pr,
+            &review_config.review_bot_command,
+            &repo_slug,
+            &review_config.reviewer_name,
+            false,
+        )
     } else if matches!(
         req.source.as_deref(),
         Some("periodic_review") | Some("sprint_planner")
@@ -991,10 +997,11 @@ pub(crate) async fn run_task(
     };
 
     // Agent review loop (if enabled and reviewer available)
+    let mut agent_pushed_commit = false;
     if review_config.enabled {
         if let Some(reviewer) = reviewer {
             tracing::info!(pr_url = %pr_url.as_deref().unwrap_or(""), "starting agent review");
-            run_agent_review(
+            let (review_ok, pushed) = run_agent_review(
                 store,
                 task_id,
                 agent,
@@ -1010,6 +1017,10 @@ pub(crate) async fn run_task(
                 &cargo_env,
             )
             .await?;
+            if !review_ok {
+                return Ok(());
+            }
+            agent_pushed_commit = pushed;
         } else {
             tracing::warn!("agent review enabled but no reviewer agent configured; skipping");
         }
@@ -1049,6 +1060,12 @@ pub(crate) async fn run_task(
 
     let review_phase_start = Instant::now();
 
+    // `prev_fixed` tracks whether a commit was pushed that hasn't been re-reviewed yet.
+    // Starts true if the implementation phase pushed a commit, and is set to true again
+    // whenever a review round produces FIXED (agent commits + pushes). This drives the
+    // freshness check in every round after a fix commit, not just round 1.
+    let mut prev_fixed = agent_pushed_commit;
+
     // Review loop.
     // Use an explicit counter so WAITING responses don't consume a round — `continue`
     // inside a `for` loop would silently advance the iterator even without a real review.
@@ -1059,8 +1076,13 @@ pub(crate) async fn run_task(
         let check_req = AgentRequest {
             prompt: {
                 let slug = prompts::repo_slug_from_pr_url(pr_url.as_deref());
-                let base =
-                    prompts::check_existing_pr(pr_num, &review_config.review_bot_command, &slug);
+                let base = prompts::check_existing_pr(
+                    pr_num,
+                    &review_config.review_bot_command,
+                    &slug,
+                    &review_config.reviewer_name,
+                    prev_fixed,
+                );
                 // Inject capability note — primary enforcement now that --allowedTools
                 // is not passed to the CLI (issue #483).
                 if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
@@ -1207,6 +1229,10 @@ pub(crate) async fn run_task(
             return Ok(());
         }
 
+        // The agent committed and pushed a fix; mark so the next round requires
+        // re-verification that the review bot has reviewed the new commit.
+        prev_fixed = true;
+
         tracing::info!("PR #{pr_num} not yet approved at round {round}; waiting");
         if round < max_rounds {
             waiting_count += 1;
@@ -1242,6 +1268,15 @@ pub(crate) async fn run_task(
     Ok(())
 }
 
+/// Normalize a set of review issues into a canonical ordered form.
+/// Issues are sorted by reference before collecting so that insertion order does not affect
+/// equality comparisons, and strings are not unnecessarily cloned during the sort.
+fn normalize_issues(issues: &[String]) -> Vec<String> {
+    let mut sorted: Vec<_> = issues.iter().collect();
+    sorted.sort();
+    sorted.into_iter().cloned().collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_review(
     store: &TaskStore,
@@ -1257,8 +1292,12 @@ async fn run_agent_review(
     project_type: &str,
     events: &harness_observe::EventStore,
     cargo_env: &HashMap<String, String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(bool, bool)> {
     let max_rounds = review_config.max_rounds;
+    // (normalized_issues, consecutive_count): tracks how many consecutive rounds produced identical issues.
+    let mut impasse_tracker: Option<(Vec<String>, u32)> = None;
+    // Whether the last action in this loop pushed a new commit (fix or intervention).
+    let mut pushed_commit = false;
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
 
@@ -1323,7 +1362,7 @@ async fn run_agent_review(
                         s.error = Some(e.to_string());
                     })
                     .await?;
-                    return Ok(());
+                    return Ok((false, false));
                 }
                 run_on_error(interceptors, &review_req, &e.to_string()).await;
                 return Err(e.into());
@@ -1400,7 +1439,47 @@ async fn run_agent_review(
             break;
         }
 
-        if agent_round == max_rounds {
+        // Detect impasse: track how many consecutive rounds produced identical issues.
+        // Must happen before the max_rounds break so thresholds are reachable at the last round.
+        // Compare normalized issue lists directly to avoid false positives from hash collisions.
+        let normalized = normalize_issues(&issues);
+        let consecutive_count = match &impasse_tracker {
+            Some((prev, c)) if *prev == normalized => c + 1,
+            _ => 1,
+        };
+        impasse_tracker = Some((normalized, consecutive_count));
+
+        // 5 consecutive rounds with identical issues → mark task as Failed immediately.
+        if consecutive_count >= 5 {
+            tracing::warn!(
+                agent_round,
+                consecutive_count,
+                "agent review impasse: same issues repeated 5 times — marking task as failed"
+            );
+            mutate_and_persist(store, task_id, |s| {
+                s.status = TaskStatus::Failed;
+                s.error = Some(format!(
+                    "Impasse detected: identical issues repeated {consecutive_count} consecutive rounds."
+                ));
+            })
+            .await?;
+            return Ok((false, false));
+        }
+
+        // 3+ consecutive rounds with identical issues → use the intervention prompt.
+        let is_impasse = consecutive_count >= 3;
+        if is_impasse {
+            tracing::warn!(
+                agent_round,
+                consecutive_count,
+                "agent review impasse detected — same issues repeated, using intervention prompt"
+            );
+        }
+
+        // Skip the fix round only when rounds are exhausted and there is no impasse.
+        // When impasse is detected at the last round, we still apply the intervention prompt
+        // to give the agent one final attempt to break the cycle before GitHub review.
+        if agent_round == max_rounds && !is_impasse {
             tracing::info!(
                 "agent review exhausted {max_rounds} rounds, proceeding to GitHub review"
             );
@@ -1409,7 +1488,14 @@ async fn run_agent_review(
 
         // Implementor fixes the issues
         let fix_req = AgentRequest {
-            prompt: prompts::agent_review_fix_prompt(pr_url, &issues, agent_round, project_type),
+            prompt: {
+                let prompt_fn = if is_impasse {
+                    prompts::agent_review_intervention_prompt
+                } else {
+                    prompts::agent_review_fix_prompt
+                };
+                prompt_fn(pr_url, &issues, agent_round, project_type)
+            },
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Execution),
@@ -1452,9 +1538,10 @@ async fn run_agent_review(
             });
         })
         .await?;
+        pushed_commit = true;
     }
 
-    Ok(())
+    Ok((true, pushed_commit))
 }
 
 #[cfg(test)]
@@ -1632,8 +1719,7 @@ mod tests {
 
     #[test]
     fn parse_implementation_outcome_prefers_plan_issue() {
-        let output =
-            "PLAN_ISSUE=Plan missed rollback path\nPR_URL=https://github.com/o/r/pull/123";
+        let output = "PLAN_ISSUE=Plan missed rollback path\nPR_URL=https://github.com/o/r/pull/123";
         let parsed = parse_implementation_outcome(output);
         assert_eq!(
             parsed,
@@ -1670,5 +1756,77 @@ mod tests {
         let result = prepend_constitution("Do the task.".to_string(), false);
         assert_eq!(result, "Do the task.");
         assert!(!result.contains("GP-01"));
+    }
+
+    #[test]
+    fn normalize_issues_is_order_invariant() {
+        let ordered = vec!["issue A".to_string(), "issue B".to_string()];
+        let reversed = vec!["issue B".to_string(), "issue A".to_string()];
+        assert_eq!(normalize_issues(&ordered), normalize_issues(&reversed));
+    }
+
+    fn step_tracker(
+        tracker: &mut Option<(Vec<String>, u32)>,
+        issues: &[String],
+    ) -> (u32, bool, bool) {
+        let normalized = normalize_issues(issues);
+        let count = match tracker.as_ref() {
+            Some((prev, c)) if *prev == normalized => c + 1,
+            _ => 1,
+        };
+        *tracker = Some((normalized, count));
+        let intervention = count >= 3;
+        let fatal = count >= 5;
+        (count, intervention, fatal)
+    }
+
+    #[test]
+    fn impasse_no_intervention_for_first_two_rounds() {
+        let issues = vec!["null pointer".to_string()];
+        let mut tracker: Option<(Vec<String>, u32)> = None;
+        let (c1, i1, f1) = step_tracker(&mut tracker, &issues);
+        let (c2, i2, f2) = step_tracker(&mut tracker, &issues);
+        assert_eq!(c1, 1);
+        assert!(!i1 && !f1, "no action on first occurrence");
+        assert_eq!(c2, 2);
+        assert!(!i2 && !f2, "no action on second occurrence");
+    }
+
+    #[test]
+    fn impasse_intervention_at_third_consecutive_round() {
+        let issues = vec!["null pointer".to_string()];
+        let mut tracker: Option<(Vec<String>, u32)> = None;
+        step_tracker(&mut tracker, &issues); // round 1
+        step_tracker(&mut tracker, &issues); // round 2
+        let (c3, i3, f3) = step_tracker(&mut tracker, &issues); // round 3
+        assert_eq!(c3, 3);
+        assert!(i3, "intervention at 3rd consecutive round");
+        assert!(!f3, "not yet fatal at round 3");
+    }
+
+    #[test]
+    fn impasse_fatal_at_fifth_consecutive_round() {
+        let issues = vec!["null pointer".to_string()];
+        let mut tracker: Option<(Vec<String>, u32)> = None;
+        for _ in 0..4 {
+            step_tracker(&mut tracker, &issues);
+        }
+        let (c5, i5, f5) = step_tracker(&mut tracker, &issues);
+        assert_eq!(c5, 5);
+        assert!(i5, "intervention still active at round 5");
+        assert!(f5, "fatal at 5th consecutive round");
+    }
+
+    #[test]
+    fn impasse_counter_resets_when_issues_change() {
+        let issues = vec!["null pointer".to_string()];
+        let other = vec!["different bug".to_string()];
+        let mut tracker: Option<(Vec<String>, u32)> = None;
+        step_tracker(&mut tracker, &issues); // count 1
+        step_tracker(&mut tracker, &issues); // count 2
+        step_tracker(&mut tracker, &issues); // count 3 — would trigger intervention
+        let (c_reset, i_reset, _) = step_tracker(&mut tracker, &other); // different issues
+        assert_eq!(c_reset, 1, "counter resets on different issues");
+        assert!(!i_reset, "no intervention after reset");
     }
 }
