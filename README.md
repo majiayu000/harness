@@ -62,7 +62,7 @@ Harness is a Rust-native platform that wraps AI coding agents (Claude Code, Code
 
 - Rust 1.75+
 - At least one agent runtime:
-  - [`codex`](https://github.com/openai/codex) CLI (default)
+  - [`codex`](https://github.com/openai/codex) CLI
   - [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI
   - Anthropic API key (for direct API adapter)
 

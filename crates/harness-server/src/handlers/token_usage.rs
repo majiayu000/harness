@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::app_state::AppState;
+use crate::http::AppState;
 
 #[derive(Debug, Default, Clone, Serialize)]
 struct UsageBucket {

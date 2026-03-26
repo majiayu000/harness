@@ -189,6 +189,15 @@ fn intake_app(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+fn token_usage_app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route(
+            "/api/token-usage",
+            get(crate::handlers::token_usage::token_usage),
+        )
+        .with_state(state)
+}
+
 fn webhook_app(state: Arc<AppState>) -> Router {
     let body_limit = state.core.server.config.server.max_webhook_body_bytes;
     Router::new()
@@ -234,6 +243,28 @@ async fn health_endpoint_returns_ok_and_task_count() -> anyhow::Result<()> {
 
     assert_eq!(health.status, "ok");
     assert_eq!(health.tasks, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn token_usage_route_is_registered() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = token_usage_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/token-usage")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        response.status() == StatusCode::OK
+            || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+    );
     Ok(())
 }
 

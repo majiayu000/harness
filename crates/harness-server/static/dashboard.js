@@ -742,6 +742,7 @@ function init() {
   initTabs();
   fetchTasks();
   fetchIntake();
+  fetchTokenUsage();
   connectWebSocket();
   initForm();
   initHistoryControls();
@@ -750,6 +751,7 @@ function init() {
   });
   pollTimer = setInterval(fetchTasks, POLL_INTERVAL_MS);
   setInterval(fetchIntake, POLL_INTERVAL_MS);
+  setInterval(fetchTokenUsage, POLL_INTERVAL_MS);
 }
 
 document.addEventListener("DOMContentLoaded", init);
