@@ -998,8 +998,11 @@ pub(crate) async fn run_task(
 
     let review_phase_start = Instant::now();
 
-    // Review loop
-    for round in 1..=max_rounds {
+    // Review loop.
+    // Use an explicit counter so WAITING responses don't consume a round — `continue`
+    // inside a `for` loop would silently advance the iterator even without a real review.
+    let mut round: u32 = 1;
+    while round <= max_rounds {
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let check_req = AgentRequest {
@@ -1159,6 +1162,7 @@ pub(crate) async fn run_task(
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
             sleep(Duration::from_secs(wait_secs)).await;
         }
+        round += 1;
     }
 
     mutate_and_persist(store, task_id, |s| {
