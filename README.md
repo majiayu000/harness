@@ -130,7 +130,8 @@ data_dir = "~/.local/share/harness"
 project_root = "."
 
 [agents]
-default_agent = "codex"
+default_agent = "auto"
+# complexity_preferred_agents = ["codex", "claude"]
 sandbox_mode = "danger-full-access"
 
 [agents.claude]
@@ -180,7 +181,7 @@ max_concurrent = 2          # max parallel tasks for this project
 name = "litellm-rs"
 root = "/path/to/litellm-rs"
 max_concurrent = 2
-default_agent = "codex"    # override default agent per project
+# default_agent = "auto"    # optional override; or set a registered agent name
 
 [[projects]]
 name = "vibeguard"
@@ -206,7 +207,7 @@ pre_commit = ["cargo fmt --all -- --check", "cargo check"]
 timeout_secs = 120
 
 [agent]
-default = "codex"
+default = "auto"            # or set a registered agent name
 
 [review]
 enabled = true

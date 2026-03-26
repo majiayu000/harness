@@ -33,6 +33,7 @@ pub async fn run(
     // in Claude Code CLI. Only enforce danger-full-access when a Claude path
     // is actually configured to run.
     let claude_in_use = config.agents.default_agent == "claude"
+        || config.agents.default_agent.eq_ignore_ascii_case("auto")
         || config.review.agent.as_deref() == Some("claude")
         || config.agents.review.reviewer_agent == "claude";
     if cfg!(target_os = "macos")
@@ -128,6 +129,8 @@ pub async fn run(
 
     let thread_manager = harness_server::thread_manager::ThreadManager::new();
     let mut agent_registry = harness_agents::AgentRegistry::new(&serve_config.agents.default_agent);
+    agent_registry
+        .set_complexity_preferences(serve_config.agents.complexity_preferred_agents.clone());
     let mut claude_agent = harness_agents::claude::ClaudeCodeAgent::new(
         serve_config.agents.claude.cli_path.clone(),
         serve_config.agents.claude.default_model.clone(),

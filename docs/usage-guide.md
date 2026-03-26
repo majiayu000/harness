@@ -34,7 +34,8 @@ http_addr = "127.0.0.1:9800"
 data_dir = "~/.local/share/harness"
 
 [agents]
-default_agent = "codex"
+default_agent = "auto"
+# complexity_preferred_agents = ["codex", "claude"]
 sandbox_mode = "danger-full-access"
 
 [agents.claude]
@@ -72,7 +73,7 @@ max_concurrent = 2
 name = "my-lib"
 root = "/path/to/my-lib"
 max_concurrent = 1
-default_agent = "codex"
+# default_agent = "auto" # optional override; or set a registered agent name
 ```
 
 Start with:
@@ -301,7 +302,8 @@ curl -X DELETE http://127.0.0.1:9800/api/projects/new-project
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `default_agent` | `"codex"` | Agent used for task execution: `codex`, `claude`, or `anthropic-api` |
+| `default_agent` | `"auto"` | Default execution agent; `"auto"` picks the first registered agent |
+| `complexity_preferred_agents` | `[]` | Optional ordered list for complex/critical routing (for example `["codex","claude"]`) |
 | `sandbox_mode` | `"danger-full-access"` | Sandbox policy: `read-only`, `workspace-write`, `danger-full-access` |
 | `approval_policy` | `"auto-edit"` | Approval policy for agent actions |
 

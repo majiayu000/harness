@@ -953,6 +953,7 @@ async fn make_test_state_with_dispatch_agents(
     let (default_agent, default_invoked) = DispatchCapturingAgent::new("test");
     let (codex_agent, codex_invoked) = DispatchCapturingAgent::new("codex");
     let mut registry = harness_agents::AgentRegistry::new("test");
+    registry.set_complexity_preferences(vec!["codex".to_string()]);
     registry.register("test", default_agent);
     registry.register("codex", codex_agent);
     let state = make_test_state_with(dir, harness_core::HarnessConfig::default(), registry).await?;

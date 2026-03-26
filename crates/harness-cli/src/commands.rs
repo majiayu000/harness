@@ -47,7 +47,7 @@ pub enum Command {
         #[arg(long)]
         project: Option<PathBuf>,
         /// Agent to use
-        #[arg(long, default_value = "codex")]
+        #[arg(long, default_value = "auto")]
         agent: String,
         /// Optional model override
         #[arg(long)]
@@ -768,7 +768,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(prompt, "fix the bug");
-                assert_eq!(agent, "codex");
+                assert_eq!(agent, "auto");
                 assert_eq!(sandbox_mode, "workspace-write");
                 assert!(drop_sudo);
             }
