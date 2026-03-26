@@ -237,7 +237,10 @@ async fn run_review_tick(
                         Ok(n) => {
                             tracing::info!(new_findings = n, "scheduler: review findings persisted")
                         }
-                        Err(e) => tracing::warn!("scheduler: failed to persist findings: {e}"),
+                        Err(e) => tracing::error!(
+                            task_id = %claude_id,
+                            "scheduler: failed to persist findings: {e}"
+                        ),
                     }
                 }
             }
