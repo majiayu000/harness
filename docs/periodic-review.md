@@ -190,6 +190,7 @@ unnecessary dependencies.
 enabled = true
 interval_hours = 24
 # agent = "claude"      # optional: specific agent for review
+# strategy = "cross"    # optional: dual-review + synthesis
 # timeout_secs = 900    # optional: per-turn timeout
 ```
 
@@ -198,6 +199,7 @@ pub struct ReviewConfig {
     pub enabled: bool,           // default: false
     pub interval_hours: u64,     // default: 24
     pub agent: Option<String>,   // default: None (use default agent)
+    pub strategy: ReviewStrategy, // default: single
     pub timeout_secs: u64,       // default: 900
 }
 ```

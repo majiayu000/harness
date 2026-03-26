@@ -13,7 +13,7 @@ pub use agents::{
 pub use intake::{FeishuIntakeConfig, GitHubIntakeConfig, GitHubRepoConfig, IntakeConfig};
 pub use misc::{
     ConcurrencyConfig, GcConfig, ObserveConfig, OtelConfig, OtelExporter, ReviewConfig,
-    RulesConfig, SignalThresholdsConfig, ValidationConfig, WorkspaceConfig,
+    ReviewStrategy, RulesConfig, SignalThresholdsConfig, ValidationConfig, WorkspaceConfig,
 };
 pub use project::{
     load_project_config, GitConfig, ProjectAgentConfig, ProjectConcurrencyConfig, ProjectConfig,

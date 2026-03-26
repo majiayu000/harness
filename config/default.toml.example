@@ -11,7 +11,7 @@ data_dir = "/home/yourname/.local/share/harness"
 project_root = "."
 
 [agents]
-default_agent = "claude"
+default_agent = "codex"
 sandbox_mode = "danger-full-access"
 
 [agents.claude]
@@ -65,7 +65,8 @@ enabled = false
 # Override interval in seconds (takes precedence over interval_hours).
 # interval_secs = 300
 # interval_hours = 24
-# agent = "claude"
+# agent = "codex"
+# strategy = "single" # or "cross" for dual-review + synthesis
 # timeout_secs = 900
 
 # Register projects below (can also pass --project-root / --project on CLI).
