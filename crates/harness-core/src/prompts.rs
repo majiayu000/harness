@@ -518,11 +518,15 @@ pub fn extract_review_issues(output: &str) -> Vec<String> {
 }
 
 /// Parse `PR_URL=<url>` from agent output (searches from last line).
+/// Only returns URLs with `https://` or `http://` scheme to prevent javascript: URI injection.
 pub fn parse_pr_url(output: &str) -> Option<String> {
     for line in output.lines().rev() {
         let line = line.trim();
         if let Some(url) = line.strip_prefix("PR_URL=") {
-            return Some(url.trim().to_string());
+            let url = url.trim();
+            if url.starts_with("https://") || url.starts_with("http://") {
+                return Some(url.to_string());
+            }
         }
     }
     None
@@ -1126,6 +1130,16 @@ mod tests {
     #[test]
     fn test_parse_pr_url_not_found() {
         assert_eq!(parse_pr_url("no url here"), None);
+    }
+
+    #[test]
+    fn test_parse_pr_url_rejects_javascript_scheme() {
+        // SEC-03: javascript: URIs must be rejected to prevent XSS
+        assert_eq!(
+            parse_pr_url("PR_URL=javascript:alert(document.cookie)"),
+            None
+        );
+        assert_eq!(parse_pr_url("output\nPR_URL=javascript:void(0)"), None);
     }
 
     #[test]
