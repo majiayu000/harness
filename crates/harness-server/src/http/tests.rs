@@ -1031,7 +1031,7 @@ async fn make_test_state_with_dispatch_agents(
     let (default_agent, default_invoked) = DispatchCapturingAgent::new("test");
     let (claude_agent, claude_invoked) = DispatchCapturingAgent::new("claude");
     let mut registry = harness_agents::AgentRegistry::new("test");
-    registry.set_complexity_preferences(vec!["codex".to_string()]);
+    registry.set_complexity_preferences(vec!["claude".to_string()]);
     registry.register("test", default_agent);
     registry.register("claude", claude_agent);
     let state = make_test_state_with(dir, harness_core::HarnessConfig::default(), registry).await?;
