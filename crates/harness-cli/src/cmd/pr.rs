@@ -24,7 +24,7 @@ pub async fn fix(
     println!("[harness] Round 1 — Implementing issue #{issue} and creating PR");
 
     let req = AgentRequest {
-        prompt: prompts::implement_from_issue(issue, None).to_prompt_string(),
+        prompt: prompts::implement_from_issue(issue, None, None).to_prompt_string(),
         project_root: project.clone(),
         ..Default::default()
     };
@@ -65,6 +65,52 @@ pub async fn loop_pr(
     run_review_loop(&agent, &project, None, pr, None, wait, max_rounds).await
 }
 
+/// Resolve `owner/repo` slug from a PR URL or by querying `gh pr view`.
+///
+/// Returns an error if `pr_url` is `None` and `gh pr view` fails, so callers
+/// always receive a real slug or a descriptive error — never the literal
+/// `{owner}/{repo}` placeholder.
+async fn resolve_repo_slug(pr: u64, pr_url: Option<&str>) -> anyhow::Result<String> {
+    if let Some(url) = pr_url {
+        return Ok(prompts::repo_slug_from_pr_url(Some(url)));
+    }
+
+    // No URL supplied — ask gh for the PR URL, then parse the slug from it.
+    let output = tokio::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr.to_string(),
+            "--json",
+            "url",
+            "--jq",
+            ".url",
+        ])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to run `gh pr view {pr}`: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "`gh pr view {pr}` failed (exit {:?}): {stderr}",
+            output.status.code()
+        ));
+    }
+
+    let fetched_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let slug = prompts::repo_slug_from_pr_url(Some(&fetched_url));
+
+    // Guard: if parsing still produced the placeholder the URL was unparseable.
+    if slug == "{owner}/{repo}" {
+        return Err(anyhow::anyhow!(
+            "Could not parse owner/repo from `gh pr view` output: {fetched_url:?}"
+        ));
+    }
+
+    Ok(slug)
+}
+
 async fn run_review_loop(
     agent: &impl CodeAgent,
     project: &PathBuf,
@@ -79,6 +125,9 @@ async fn run_review_loop(
         None => std::borrow::Cow::Owned(format!("PR #{pr}")),
     };
 
+    // Resolve once before entering the loop so failures surface immediately.
+    let repo = resolve_repo_slug(pr, pr_url).await?;
+
     let mut prev_fixed = false;
     let mut round = 1u32;
 
@@ -88,9 +137,6 @@ async fn run_review_loop(
 
         println!("[harness] Review round {round}/{max_rounds}, PR #{pr}");
 
-        let repo = pr_url
-            .map(|u| prompts::repo_slug_from_pr_url(Some(u)))
-            .unwrap_or_else(|| "{owner}/{repo}".to_string());
         let req = AgentRequest {
             prompt: prompts::review_prompt(
                 issue,
@@ -124,4 +170,55 @@ async fn run_review_loop(
 
     println!("[harness] Reached max rounds ({max_rounds}), PR status: {url_display}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resolve_repo_slug_with_url_does_not_call_gh() -> anyhow::Result<()> {
+        // When pr_url is Some, the slug is derived from the URL without
+        // spawning any subprocess.
+        let slug = resolve_repo_slug(42, Some("https://github.com/owner/myrepo/pull/42")).await?;
+        assert_eq!(slug, "owner/myrepo");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_slug_with_url_various_formats() -> anyhow::Result<()> {
+        let cases = [
+            ("https://github.com/org/repo/pull/1", "org/repo"),
+            ("https://github.com/org/repo/pull/1/files", "org/repo"),
+        ];
+        for (url, expected) in cases {
+            let slug = resolve_repo_slug(1, Some(url)).await?;
+            assert_eq!(slug, expected, "url = {url}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_slug_none_fails_without_gh() {
+        // When pr_url is None, resolve_repo_slug calls `gh pr view`.  In a
+        // test environment without a real gh context this should return an
+        // Err rather than the literal "{owner}/{repo}" placeholder.
+        //
+        // We use a non-existent PR number to guarantee gh exits non-zero even
+        // if gh is installed and authenticated.
+        let result = resolve_repo_slug(u64::MAX, None).await;
+        // Either gh is not installed (IoError) or it returned non-zero — both
+        // map to Err.  The key assertion is that we do NOT get Ok("{owner}/{repo}").
+        match result {
+            Ok(slug) => {
+                assert_ne!(
+                    slug, "{owner}/{repo}",
+                    "resolve_repo_slug must never return the literal placeholder"
+                );
+            }
+            Err(_) => {
+                // Expected path in CI / no-auth environments.
+            }
+        }
+    }
 }

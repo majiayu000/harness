@@ -3,6 +3,7 @@ config/*.toml
 exec-plan-*.md
 .harness/*
 !.harness/guards
+!.harness/sg
 crates/*/.harness/
 **/.harness/drafts/
 .claude/

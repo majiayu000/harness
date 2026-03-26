@@ -1,0 +1,10 @@
+id: ts-01-any
+language: TypeScript
+severity: warning
+message: "'any' type suppresses type checking — use unknown or a specific type"
+note: "Replace with unknown for unsafe input, or narrow to a concrete type"
+rule:
+  kind: type_annotation
+  has:
+    kind: predefined_type
+    regex: "^any$"

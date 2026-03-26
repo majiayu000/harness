@@ -109,10 +109,16 @@ mod tests {
             source: None,
             external_id: None,
             parent_id: None,
+            depends_on: vec![],
             subtask_ids: vec![],
             project_root: None,
             issue: None,
             description: None,
+            created_at: None,
+            phase: crate::task_runner::TaskPhase::default(),
+            triage_output: None,
+            plan_output: None,
+            repo: None,
         };
         state.source = Some("github".to_string());
         store.insert(&state).await;
@@ -142,10 +148,16 @@ mod tests {
             source: None,
             external_id: None,
             parent_id: None,
+            depends_on: vec![],
             subtask_ids: vec![child_id.clone()],
             project_root: None,
             issue: None,
             description: None,
+            created_at: None,
+            phase: crate::task_runner::TaskPhase::default(),
+            triage_output: None,
+            plan_output: None,
+            repo: None,
         };
         store.insert(&parent_state).await;
 
@@ -159,10 +171,16 @@ mod tests {
             source: None,
             external_id: None,
             parent_id: Some(parent_id.clone()),
+            depends_on: vec![],
             subtask_ids: vec![],
             project_root: None,
             issue: None,
             description: None,
+            created_at: None,
+            phase: crate::task_runner::TaskPhase::default(),
+            triage_output: None,
+            plan_output: None,
+            repo: None,
         };
         store.insert(&child_state).await;
 

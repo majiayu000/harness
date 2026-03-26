@@ -103,98 +103,68 @@ async fn run_review_tick(
         }
     }
 
-    // Gather context strings for the review prompt.
     let since_arg = last_review_ts
         .map(|ts| ts.to_rfc3339())
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
-    let repo_structure = gather_repo_structure(project_root).await;
-    let diff_stat = gather_diff_stat(project_root, &since_arg).await;
-    let recent_commits = gather_recent_commits(project_root, &since_arg).await;
-
-    // Run VibeGuard guard scans and include violations in the review context.
-    let guard_violations = {
-        let rules = state.engines.rules.read().await;
-        match rules.scan(project_root).await {
-            Ok(violations) => {
-                if violations.is_empty() {
-                    String::new()
-                } else {
-                    let mut buf = String::from("Guard scan found the following violations:\n");
-                    for v in &violations {
-                        buf.push_str(&format!(
-                            "- [{}] {}: {}\n",
-                            v.rule_id,
-                            v.file.display(),
-                            v.message
-                        ));
-                    }
-                    buf
-                }
-            }
-            Err(e) => {
-                tracing::warn!("scheduler: guard scan failed, proceeding without: {e}");
-                String::new()
-            }
-        }
-    };
-
-    // Gather existing review issues to prevent duplicate creation.
-    let existing_issues = gather_existing_review_issues(project_root).await;
-
-    let prompt = harness_core::prompts::periodic_review_prompt(
-        &repo_structure,
-        &diff_stat,
-        &recent_commits,
-        &guard_violations,
-        &existing_issues,
+    let project_str = project_root.display().to_string();
+    let project_cfg = harness_core::config::load_project_config(project_root);
+    let base_prompt = harness_core::prompts::periodic_review_prompt(
+        &project_str,
+        &since_arg,
+        project_cfg.review_type.as_str(),
     );
 
-    let req = CreateTaskRequest {
-        prompt: Some(prompt),
+    // --- Phase 1: Parallel review by Claude + Codex ---
+    let claude_req = CreateTaskRequest {
+        prompt: Some(base_prompt.clone()),
         agent: config.agent.clone(),
         turn_timeout_secs: config.timeout_secs,
         source: Some("periodic_review".to_string()),
         ..CreateTaskRequest::default()
     };
 
-    let task_id = match task_routes::enqueue_task(state, req).await {
-        Ok(id) => {
-            tracing::info!(task_id = %id, "scheduler: periodic review task enqueued");
-            id
-        }
-        Err(err) => {
-            return Err(anyhow::anyhow!(
-                "failed to enqueue periodic review task: {err}"
-            ));
-        }
+    let has_codex = state.core.server.agent_registry.get("codex").is_some();
+    let codex_req = if has_codex {
+        Some(CreateTaskRequest {
+            prompt: Some(base_prompt),
+            agent: Some("codex".to_string()),
+            turn_timeout_secs: config.timeout_secs,
+            source: Some("periodic_review".to_string()),
+            ..CreateTaskRequest::default()
+        })
+    } else {
+        None
     };
 
-    // Update the local fallback timestamp before attempting the DB write so
-    // that deduplication remains correct even if the EventStore is unavailable.
+    let claude_id = task_routes::enqueue_task(state, claude_req)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to enqueue claude review: {e}"))?;
+    tracing::info!(task_id = %claude_id, "scheduler: claude review enqueued");
+
+    let codex_id = if let Some(req) = codex_req {
+        let id = task_routes::enqueue_task(state, req)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to enqueue codex review: {e}"))?;
+        tracing::info!(task_id = %id, "scheduler: codex review enqueued");
+        Some(id)
+    } else {
+        tracing::info!("scheduler: codex not configured, single-model review");
+        None
+    };
+
     *fallback_ts.lock().await = Some(Utc::now());
 
-    // Log a "periodic_review" event so the next cycle can check the timestamp.
     let event = Event::new(
         SessionId::new(),
         "periodic_review",
         "scheduler",
         Decision::Pass,
     );
-    // A log failure is non-fatal: the fallback timestamp (line above) already
-    // guards deduplication, and the task is already enqueued.  Returning early
-    // here would bypass the spawn block that polls and persists findings.
     if let Err(err) = state.observability.events.log(&event).await {
         tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
     }
 
-    // Drop the previous poll handle without aborting: in Tokio, dropping a
-    // JoinHandle does NOT cancel the spawned task — the old poller keeps running
-    // until its review task reaches Done/Failed or its internal timeout fires.
-    // Calling h.abort() here would silently discard findings when the prior
-    // review task had not yet completed, because the poller is the only path
-    // that calls parse_review_output + persist_findings (issue #448 / round-1
-    // review correctness fix).
     {
         let mut guard = poll_handle.lock().await;
         if guard.take().is_some() {
@@ -204,70 +174,79 @@ async fn run_review_tick(
         }
     }
 
-    // Wait for the review task to complete, then persist structured findings.
+    // --- Phase 2: Wait for both, then synthesize ---
     let store = state.core.tasks.clone();
     let review_store = state.observability.review_store.clone();
     let timeout_secs = config.timeout_secs;
+    let state_clone = state.clone();
+    let synth_agent = config.agent.clone();
+    let synth_timeout = config.timeout_secs;
     let handle = tokio::spawn(async move {
-        let poll_interval = Duration::from_secs(15);
-        let max_wait = Duration::from_secs(timeout_secs + 120);
-        let start = tokio::time::Instant::now();
-        loop {
-            sleep(poll_interval).await;
-            if start.elapsed() > max_wait {
-                tracing::warn!(task_id = %task_id, "scheduler: review task polling timed out");
-                break;
-            }
-            let Some(task) = store.get(&task_id) else {
-                continue;
+        let claude_output = poll_task_output(&store, &claude_id, timeout_secs).await;
+        let codex_output = match &codex_id {
+            Some(id) => poll_task_output(&store, id, timeout_secs).await,
+            None => None,
+        };
+
+        tracing::info!(
+            claude_len = claude_output.as_ref().map(|s| s.len()).unwrap_or(0),
+            codex_len = codex_output.as_ref().map(|s| s.len()).unwrap_or(0),
+            "scheduler: both reviews complete"
+        );
+
+        // Synthesize: Claude merges both reviews into final output.
+        let final_output = if let Some(codex_out) = codex_output {
+            let claude_out = claude_output.unwrap_or_default();
+            let synth_prompt =
+                harness_core::prompts::review_synthesis_prompt(&claude_out, &codex_out);
+            let synth_req = CreateTaskRequest {
+                prompt: Some(synth_prompt),
+                agent: synth_agent,
+                turn_timeout_secs: synth_timeout,
+                source: Some("periodic_review".to_string()),
+                ..CreateTaskRequest::default()
             };
-            if !matches!(
-                task.status,
-                crate::task_runner::TaskStatus::Done | crate::task_runner::TaskStatus::Failed
-            ) {
-                continue;
-            }
-            // Collect agent output from round details.
-            let output: String = task
-                .rounds
-                .iter()
-                .filter_map(|r| r.detail.as_deref())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if output.is_empty() {
-                tracing::warn!(task_id = %task_id, "scheduler: review task completed but no output");
-                break;
-            }
-            match crate::review_store::parse_review_output(&output) {
-                Ok(review) => {
-                    tracing::info!(
-                        task_id = %task_id,
-                        findings = review.findings.len(),
-                        health_score = review.summary.health_score,
-                        "scheduler: periodic review parsed"
-                    );
-                    if let Some(ref rs) = review_store {
-                        match rs.persist_findings(&task_id.0, &review.findings).await {
-                            Ok(n) => tracing::info!(
-                                new_findings = n,
-                                "scheduler: review findings persisted"
-                            ),
-                            Err(e) => {
-                                tracing::error!(task_id = %task_id, "scheduler: failed to persist findings: {e}")
-                            }
-                        }
-                    }
-                    // Issue creation is handled by the review agent itself
-                    // (instructed in the prompt to create GitHub issues for P0/P1 findings).
+            match task_routes::enqueue_task(&state_clone, synth_req).await {
+                Ok(synth_id) => {
+                    tracing::info!(task_id = %synth_id, "scheduler: synthesis task enqueued");
+                    poll_task_output(&store, &synth_id, synth_timeout).await
                 }
                 Err(e) => {
-                    tracing::error!(
-                        task_id = %task_id,
-                        "scheduler: failed to parse review output as JSON: {e}"
-                    );
+                    tracing::error!("scheduler: failed to enqueue synthesis: {e}");
+                    Some(claude_out)
                 }
             }
-            break;
+        } else {
+            claude_output
+        };
+
+        // Persist findings from the final output.
+        let Some(output) = final_output else {
+            tracing::error!("scheduler: periodic review cycle produced no output — no review output to parse");
+            return;
+        };
+        match crate::review_store::parse_review_output(&output) {
+            Ok(review) => {
+                tracing::info!(
+                    findings = review.findings.len(),
+                    health_score = review.summary.health_score,
+                    "scheduler: periodic review parsed"
+                );
+                if let Some(ref rs) = review_store {
+                    match rs.persist_findings(&claude_id.0, &review.findings).await {
+                        Ok(n) => {
+                            tracing::info!(new_findings = n, "scheduler: review findings persisted")
+                        }
+                        Err(e) => tracing::error!(
+                            task_id = %claude_id,
+                            "scheduler: failed to persist findings: {e}"
+                        ),
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("scheduler: failed to parse review output as JSON: {e}");
+            }
         }
     });
     *poll_handle.lock().await = Some(handle);
@@ -275,95 +254,41 @@ async fn run_review_tick(
     Ok(())
 }
 
-async fn gather_repo_structure(project_root: &std::path::Path) -> String {
-    let output = tokio::process::Command::new("git")
-        .args(["ls-files", "--", "*.rs"])
-        .current_dir(project_root)
-        .output()
-        .await;
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => String::new(),
-    }
-}
-
-async fn gather_diff_stat(project_root: &std::path::Path, since: &str) -> String {
-    // Find the first new commit after `since` to diff from its parent.
-    let rev_output = tokio::process::Command::new("git")
-        .args([
-            "log",
-            "--format=%H",
-            &format!("--since={since}"),
-            "--reverse",
-            "-1",
-        ])
-        .current_dir(project_root)
-        .output()
-        .await;
-
-    let first_new_commit = match rev_output {
-        Ok(o) => {
-            let hash = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if hash.is_empty() {
-                return String::new();
-            }
-            hash
+/// Poll a task until it reaches a terminal state, then extract its output.
+async fn poll_task_output(
+    store: &crate::task_runner::TaskStore,
+    task_id: &harness_core::TaskId,
+    timeout_secs: u64,
+) -> Option<String> {
+    let poll_interval = Duration::from_secs(15);
+    let max_wait = Duration::from_secs(timeout_secs + 120);
+    let start = tokio::time::Instant::now();
+    loop {
+        sleep(poll_interval).await;
+        if start.elapsed() > max_wait {
+            tracing::error!(task_id = %task_id, "scheduler: periodic review cycle produced no output — poll_task_output timed out");
+            return None;
         }
-        Err(_) => return String::new(),
-    };
-
-    let output = tokio::process::Command::new("git")
-        .args(["diff", "--stat", &format!("{first_new_commit}^"), "HEAD"])
-        .current_dir(project_root)
-        .output()
-        .await;
-
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => String::new(),
-    }
-}
-
-/// Fetch open GitHub issues with the "review" label so the agent can skip known problems.
-async fn gather_existing_review_issues(project_root: &std::path::Path) -> String {
-    let output = tokio::process::Command::new("gh")
-        .args([
-            "issue",
-            "list",
-            "--label",
-            "review",
-            "--state",
-            "open",
-            "--json",
-            "number,title",
-            "--jq",
-            ".[] | \"#\\(.number) \\(.title)\"",
-        ])
-        .current_dir(project_root)
-        .output()
-        .await;
-    match output {
-        Ok(o) if o.status.success() => {
-            let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if text.is_empty() {
-                String::new()
-            } else {
-                text
-            }
+        let Some(task) = store.get(task_id) else {
+            continue;
+        };
+        if !matches!(
+            task.status,
+            crate::task_runner::TaskStatus::Done | crate::task_runner::TaskStatus::Failed
+        ) {
+            continue;
         }
-        _ => String::new(),
-    }
-}
-
-async fn gather_recent_commits(project_root: &std::path::Path, since: &str) -> String {
-    let output = tokio::process::Command::new("git")
-        .args(["log", "--oneline", &format!("--since={since}")])
-        .current_dir(project_root)
-        .output()
-        .await;
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => String::new(),
+        let output: String = task
+            .rounds
+            .iter()
+            .filter_map(|r| r.detail.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if output.is_empty() {
+            tracing::error!(task_id = %task_id, "scheduler: periodic review cycle produced no output — poll_task_output completed with empty output");
+            return None;
+        }
+        return Some(output);
     }
 }
 
