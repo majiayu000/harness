@@ -32,6 +32,9 @@ pub struct GitHubIntakeConfig {
     /// Multiple repos to poll.
     #[serde(default)]
     pub repos: Vec<GitHubRepoConfig>,
+    /// Agent name for the sprint planner. None = use server default.
+    #[serde(default)]
+    pub planner_agent: Option<String>,
 }
 
 /// Expand config into a flat list of (repo, label, project_root) tuples.
@@ -69,6 +72,7 @@ impl Default for GitHubIntakeConfig {
             label: default_intake_label(),
             poll_interval_secs: default_poll_interval_secs(),
             repos: Vec::new(),
+            planner_agent: None,
         }
     }
 }

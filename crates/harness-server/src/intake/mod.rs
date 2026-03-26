@@ -62,17 +62,33 @@ pub trait IntakeSource: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
-/// Orchestrates all registered intake sources: polls at interval, dispatches issues as tasks.
+/// Orchestrates all registered intake sources with sprint-planned dispatch.
+///
+/// Instead of dispatching issues immediately, collects all new issues, runs a
+/// sprint planner agent to group them into rounds, then executes rounds sequentially
+/// with parallel dispatch within each round.
 pub struct IntakeOrchestrator {
     sources: Vec<Arc<dyn IntakeSource>>,
     poll_interval: Duration,
+    planner_agent: Option<String>,
 }
 
+/// Timeout for waiting on a single task or round to complete (30 minutes).
+const TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Polling interval when waiting for task completion.
+const TASK_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
 impl IntakeOrchestrator {
-    pub fn new(sources: Vec<Arc<dyn IntakeSource>>, poll_interval: Duration) -> Self {
+    pub fn new(
+        sources: Vec<Arc<dyn IntakeSource>>,
+        poll_interval: Duration,
+        planner_agent: Option<String>,
+    ) -> Self {
         Self {
             sources,
             poll_interval,
+            planner_agent,
         }
     }
 
@@ -96,6 +112,11 @@ impl IntakeOrchestrator {
     }
 
     async fn poll_tick(&self, state: &Arc<AppState>) {
+        // 1. Collect all new issues from all sources, grouped by repo.
+        type RepoIssues = Vec<(Arc<dyn IntakeSource>, IncomingIssue)>;
+        let mut by_repo: std::collections::HashMap<String, RepoIssues> =
+            std::collections::HashMap::new();
+
         for source in &self.sources {
             let issues = match source.poll().await {
                 Ok(issues) => issues,
@@ -104,68 +125,420 @@ impl IntakeOrchestrator {
                     continue;
                 }
             };
-
             for issue in issues {
-                let prompt = build_prompt_from_issue(&issue);
-                let req = crate::task_runner::CreateTaskRequest {
-                    prompt: Some(prompt),
-                    issue: issue.external_id.parse().ok(),
-                    project: issue.repo.as_ref().map(|_| state.core.project_root.clone()),
-                    ..Default::default()
-                };
+                let repo_key = issue.repo.clone().unwrap_or_else(|| "default".to_string());
+                by_repo
+                    .entry(repo_key)
+                    .or_default()
+                    .push((Arc::clone(source), issue));
+            }
+        }
 
-                // Mark dispatched first to prevent duplicate tasks if enqueue
-                // succeeds but we crash before persisting the dispatched state.
-                let placeholder_id = TaskId(format!("pending-{}", issue.external_id));
-                if let Err(e) = source
-                    .mark_dispatched(&issue.external_id, &placeholder_id)
-                    .await
-                {
-                    tracing::warn!(
-                        source = source.name(),
-                        external_id = %issue.external_id,
-                        "mark_dispatched failed: {e}"
-                    );
-                    continue;
-                }
+        if by_repo.is_empty() {
+            return;
+        }
 
-                match crate::http::task_routes::enqueue_task(state, req).await {
-                    Ok(task_id) => {
-                        tracing::info!(
-                            source = source.name(),
-                            external_id = %issue.external_id,
-                            task_id = %task_id.0,
-                            "intake: task dispatched"
-                        );
-                        // Update with the real task ID.
-                        if let Err(e) = source.mark_dispatched(&issue.external_id, &task_id).await {
-                            tracing::warn!(
-                                source = source.name(),
-                                external_id = %issue.external_id,
-                                "mark_dispatched update failed: {e}"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            source = source.name(),
-                            external_id = %issue.external_id,
-                            "intake: failed to spawn task: {e:?}"
-                        );
-                        // Un-mark on enqueue failure so the issue is retried next poll.
-                        source.unmark_dispatched(&issue.external_id).await;
-                    }
-                }
+        // 2. Run a separate sprint planner per repo, all in parallel.
+        let mut handles = Vec::new();
+        for (repo, issues) in by_repo {
+            let state = Arc::clone(state);
+            let planner_agent = self.planner_agent.clone();
+            handles.push(tokio::spawn(async move {
+                run_repo_sprint(&state, &repo, issues, planner_agent.as_deref()).await;
+            }));
+        }
+
+        // Wait for all repo sprints to finish.
+        for handle in handles {
+            if let Err(e) = handle.await {
+                tracing::error!("intake: repo sprint task panicked: {e}");
             }
         }
     }
 }
 
-/// Build an `IntakeOrchestrator` from config, registering all enabled sources.
+/// Validate the sprint DAG for missing upstream dependencies and cycles.
 ///
-/// `feishu_intake` — a pre-built `Arc<FeishuIntake>` to share with the webhook handler so
-/// both use the same `chat_ids` / `dispatched` maps. When `None`, a new instance is created
-/// from config (useful in tests or standalone use).
+/// `all_task_issues` — the full set of issue numbers the sprint will execute.
+/// `deps` — mapping from issue number to its (already-filtered) dependency list.
+///
+/// Skipped issues must be removed from dep lists before calling this function,
+/// so that a task depending on a skipped issue is not incorrectly flagged.
+fn validate_dag(
+    all_task_issues: &std::collections::HashSet<u64>,
+    deps: &std::collections::HashMap<u64, Vec<u64>>,
+) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+
+    // Check for deps that reference issues not in the sprint plan.
+    for (&issue, dep_list) in deps {
+        for &dep in dep_list {
+            if !all_task_issues.contains(&dep) {
+                errors.push(format!(
+                    "issue {issue} depends on {dep} which is not in the sprint plan"
+                ));
+            }
+        }
+    }
+
+    // Kahn's algorithm: detect cycles among the plan issues.
+    // Build in-degree map and downstream adjacency list.
+    let mut in_degree: std::collections::HashMap<u64, usize> =
+        all_task_issues.iter().map(|&id| (id, 0usize)).collect();
+    let mut dependents: std::collections::HashMap<u64, Vec<u64>> =
+        all_task_issues.iter().map(|&id| (id, Vec::new())).collect();
+
+    for (&issue, dep_list) in deps {
+        for &dep in dep_list {
+            if all_task_issues.contains(&dep) {
+                // Edge direction: dep → issue (dep must complete first)
+                *in_degree.entry(issue).or_insert(0) += 1;
+                dependents.entry(dep).or_default().push(issue);
+            }
+        }
+    }
+
+    // BFS starting from zero-in-degree nodes.
+    let mut queue: std::collections::VecDeque<u64> = in_degree
+        .iter()
+        .filter(|(_, &deg)| deg == 0)
+        .map(|(&id, _)| id)
+        .collect();
+
+    let mut processed = 0usize;
+    while let Some(node) = queue.pop_front() {
+        processed += 1;
+        for &dependent in dependents.get(&node).into_iter().flatten() {
+            let deg = in_degree.entry(dependent).or_insert(0);
+            *deg = deg.saturating_sub(1);
+            if *deg == 0 {
+                queue.push_back(dependent);
+            }
+        }
+    }
+
+    if processed < all_task_issues.len() {
+        // Nodes remaining with in-degree > 0 are participants in a cycle.
+        let mut cycle_nodes: Vec<u64> = in_degree
+            .iter()
+            .filter(|(_, &deg)| deg > 0)
+            .map(|(&id, _)| id)
+            .collect();
+        cycle_nodes.sort_unstable();
+        errors.push(format!("cycle detected among issues: {cycle_nodes:?}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// Run sprint planner + DAG-based slot-filling execution for a single repo.
+async fn run_repo_sprint(
+    state: &Arc<AppState>,
+    repo: &str,
+    issues: Vec<(Arc<dyn IntakeSource>, IncomingIssue)>,
+    planner_agent: Option<&str>,
+) {
+    tracing::info!(
+        repo,
+        count = issues.len(),
+        "intake: planning sprint for repo"
+    );
+
+    let project_root = issues
+        .first()
+        .and_then(|(_, i)| i.project_root.clone())
+        .unwrap_or_else(|| state.core.project_root.clone());
+
+    // 1. Run sprint planner.
+    let issue_summary = build_issue_summary(&issues);
+    let planner_prompt = harness_core::prompts::sprint_plan_prompt(&issue_summary);
+
+    let planner_req = crate::task_runner::CreateTaskRequest {
+        prompt: Some(planner_prompt),
+        agent: planner_agent.map(String::from),
+        project: Some(project_root.clone()),
+        source: Some("sprint_planner".to_string()),
+        ..Default::default()
+    };
+
+    let planner_task_id = match crate::http::task_routes::enqueue_task(state, planner_req).await {
+        Ok(id) => {
+            tracing::info!(repo, task_id = %id, "intake: sprint planner enqueued");
+            id
+        }
+        Err(e) => {
+            tracing::error!(repo, "intake: failed to enqueue sprint planner: {e:?}");
+            return;
+        }
+    };
+
+    let Some(planner_output) = poll_task_output(&state.core.tasks, &planner_task_id).await else {
+        tracing::error!(repo, task_id = %planner_task_id, "intake: sprint planner failed");
+        return;
+    };
+
+    let Some(plan) = harness_core::prompts::parse_sprint_plan(&planner_output) else {
+        tracing::error!(repo, task_id = %planner_task_id, "intake: failed to parse sprint plan");
+        return;
+    };
+
+    tracing::info!(
+        repo,
+        tasks = plan.tasks.len(),
+        skipped = plan.skip.len(),
+        "intake: sprint plan parsed"
+    );
+
+    // Build lookup.
+    let issue_map: std::collections::HashMap<String, (Arc<dyn IntakeSource>, IncomingIssue)> =
+        issues
+            .into_iter()
+            .map(|(src, issue)| (issue.external_id.clone(), (src, issue)))
+            .collect();
+
+    // 2. Mark skipped.
+    for skip in &plan.skip {
+        let ext_id = skip.issue.to_string();
+        if let Some((source, _)) = issue_map.get(&ext_id) {
+            let skip_id = TaskId(format!("skip-{ext_id}"));
+            if let Err(e) = source.mark_dispatched(&ext_id, &skip_id).await {
+                tracing::warn!(external_id = %ext_id, "intake: failed to mark skipped: {e}");
+            }
+            tracing::info!(repo, external_id = %ext_id, reason = %skip.reason, "intake: issue skipped");
+        }
+    }
+
+    // 3. DAG slot-filling execution.
+    // Track: which issues are completed, which are running, which are waiting.
+    let mut completed: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut running: std::collections::HashMap<u64, TaskId> = std::collections::HashMap::new();
+    let all_task_issues: std::collections::HashSet<u64> =
+        plan.tasks.iter().map(|t| t.issue).collect();
+
+    // Build the dep map, filtering out any dep IDs that belong to skipped issues
+    // so they are not flagged as missing upstreams.
+    let skip_set: std::collections::HashSet<u64> = plan.skip.iter().map(|s| s.issue).collect();
+    let deps: std::collections::HashMap<u64, Vec<u64>> = plan
+        .tasks
+        .iter()
+        .map(|t| {
+            let filtered: Vec<u64> = t
+                .depends_on
+                .iter()
+                .copied()
+                .filter(|dep| !skip_set.contains(dep))
+                .collect();
+            (t.issue, filtered)
+        })
+        .collect();
+
+    // Validate DAG before starting execution.
+    if let Err(e) = validate_dag(&all_task_issues, &deps) {
+        tracing::error!(repo, error = %e, "intake: invalid sprint DAG — aborting");
+        return;
+    }
+
+    let max_slots = 4usize; // matches max_concurrent in config
+    let start = tokio::time::Instant::now();
+
+    loop {
+        // All done?
+        if completed.len() + plan.skip.len() >= all_task_issues.len() + plan.skip.len()
+            && running.is_empty()
+        {
+            break;
+        }
+        if completed.len() >= all_task_issues.len() {
+            break;
+        }
+        if start.elapsed() > TASK_TIMEOUT {
+            tracing::warn!(repo, "intake: DAG execution timed out");
+            break;
+        }
+
+        // Find ready tasks: not started, not completed, all deps satisfied.
+        let ready: Vec<u64> = all_task_issues
+            .iter()
+            .filter(|&&issue| {
+                !completed.contains(&issue)
+                    && !running.contains_key(&issue)
+                    && deps
+                        .get(&issue)
+                        .map(|d| d.iter().all(|dep| completed.contains(dep)))
+                        .unwrap_or(true)
+            })
+            .copied()
+            .collect();
+
+        // Fill available slots.
+        let available = max_slots.saturating_sub(running.len());
+        for &issue_num in ready.iter().take(available) {
+            let ext_id = issue_num.to_string();
+            let Some((source, issue)) = issue_map.get(&ext_id) else {
+                tracing::warn!(repo, external_id = %ext_id, "intake: issue not found");
+                completed.insert(issue_num);
+                continue;
+            };
+
+            let placeholder_id = TaskId(format!("pending-{ext_id}"));
+            if let Err(e) = source.mark_dispatched(&ext_id, &placeholder_id).await {
+                tracing::warn!(external_id = %ext_id, "intake: mark_dispatched failed: {e}");
+                completed.insert(issue_num);
+                continue;
+            }
+
+            let req = crate::task_runner::CreateTaskRequest {
+                issue: issue.external_id.parse().ok(),
+                project: issue
+                    .project_root
+                    .clone()
+                    .or_else(|| Some(project_root.clone())),
+                source: Some("github".to_string()),
+                external_id: Some(issue.external_id.clone()),
+                repo: Some(repo.to_string()),
+                ..Default::default()
+            };
+
+            match crate::http::task_routes::enqueue_task(state, req).await {
+                Ok(task_id) => {
+                    tracing::info!(
+                        repo,
+                        external_id = %ext_id,
+                        task_id = %task_id,
+                        running = running.len() + 1,
+                        "intake: dispatched (slot filled)"
+                    );
+                    if let Err(e) = source.mark_dispatched(&ext_id, &task_id).await {
+                        tracing::warn!(external_id = %ext_id, "intake: mark_dispatched update failed: {e}");
+                    }
+                    running.insert(issue_num, task_id);
+                }
+                Err(e) => {
+                    tracing::error!(repo, external_id = %ext_id, "intake: failed to spawn: {e:?}");
+                    source.unmark_dispatched(&ext_id).await;
+                    completed.insert(issue_num);
+                }
+            }
+        }
+
+        // Detect deadlock: no running tasks but unresolved tasks still pending.
+        if running.is_empty() {
+            let pending: std::collections::HashSet<u64> =
+                all_task_issues.difference(&completed).copied().collect();
+            if !pending.is_empty() {
+                tracing::error!(
+                    repo,
+                    stranded = ?pending,
+                    "intake: DAG deadlock — tasks stranded with unresolvable deps"
+                );
+            }
+            break;
+        }
+
+        // Wait for any running task to complete.
+        tokio::time::sleep(TASK_POLL_INTERVAL).await;
+        let mut newly_done = Vec::new();
+        for (&issue_num, task_id) in &running {
+            if let Some(task) = state.core.tasks.get(task_id) {
+                if matches!(task.status, TaskStatus::Done | TaskStatus::Failed) {
+                    tracing::info!(
+                        repo,
+                        external_id = issue_num,
+                        task_id = %task_id,
+                        status = task.status.as_ref(),
+                        "intake: task finished"
+                    );
+                    newly_done.push(issue_num);
+                }
+            }
+        }
+        for issue_num in newly_done {
+            running.remove(&issue_num);
+            completed.insert(issue_num);
+        }
+    }
+
+    let stranded: std::collections::HashSet<u64> =
+        all_task_issues.difference(&completed).copied().collect();
+
+    tracing::info!(
+        repo,
+        completed = completed.len(),
+        stranded = stranded.len(),
+        elapsed_secs = start.elapsed().as_secs(),
+        "intake: repo sprint complete"
+    );
+
+    if !stranded.is_empty() {
+        tracing::error!(
+            repo,
+            issues = ?stranded,
+            "intake: sprint ended with unresolved tasks"
+        );
+    }
+}
+
+/// Format collected issues into a summary for the planner prompt.
+fn build_issue_summary(issues: &[(Arc<dyn IntakeSource>, IncomingIssue)]) -> String {
+    issues
+        .iter()
+        .map(|(_, issue)| {
+            let labels = if issue.labels.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", issue.labels.join(", "))
+            };
+            let repo = issue.repo.as_deref().unwrap_or("");
+            format!(
+                "- #{}: {}{} ({})",
+                issue.external_id, issue.title, labels, repo
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Poll a task until terminal state, return its output.
+async fn poll_task_output(
+    store: &crate::task_runner::TaskStore,
+    task_id: &TaskId,
+) -> Option<String> {
+    let start = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(TASK_POLL_INTERVAL).await;
+        if start.elapsed() > TASK_TIMEOUT {
+            tracing::warn!(task_id = %task_id, "intake: task polling timed out");
+            return None;
+        }
+        let Some(task) = store.get(task_id) else {
+            continue;
+        };
+        if !matches!(task.status, TaskStatus::Done | TaskStatus::Failed) {
+            continue;
+        }
+        if matches!(task.status, TaskStatus::Failed) {
+            tracing::error!(task_id = %task_id, error = ?task.error, "intake: task failed");
+            return None;
+        }
+        let output: String = task
+            .rounds
+            .iter()
+            .filter_map(|r| r.detail.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if output.is_empty() {
+            tracing::warn!(task_id = %task_id, "intake: task completed but no output");
+            return None;
+        }
+        return Some(output);
+    }
+}
+
+/// Build an `IntakeOrchestrator` from config, registering all enabled sources.
 pub fn build_orchestrator(
     config: &harness_core::IntakeConfig,
     data_dir: Option<&std::path::Path>,
@@ -173,10 +546,12 @@ pub fn build_orchestrator(
 ) -> IntakeOrchestrator {
     let mut sources: Vec<Arc<dyn IntakeSource>> = Vec::new();
     let mut poll_interval = Duration::from_secs(30);
+    let mut planner_agent = None;
 
     if let Some(gh_config) = &config.github {
         if gh_config.enabled {
             poll_interval = Duration::from_secs(gh_config.poll_interval_secs);
+            planner_agent = gh_config.planner_agent.clone();
             for repo_cfg in gh_config.effective_repos() {
                 tracing::info!(
                     repo = %repo_cfg.repo,
@@ -201,7 +576,7 @@ pub fn build_orchestrator(
         }
     }
 
-    IntakeOrchestrator::new(sources, poll_interval)
+    IntakeOrchestrator::new(sources, poll_interval, planner_agent)
 }
 
 pub(crate) fn build_prompt_from_issue(issue: &IncomingIssue) -> String {
@@ -224,6 +599,117 @@ pub(crate) fn build_prompt_from_issue(issue: &IncomingIssue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_deps(pairs: &[(u64, &[u64])]) -> std::collections::HashMap<u64, Vec<u64>> {
+        pairs
+            .iter()
+            .map(|&(issue, deps)| (issue, deps.to_vec()))
+            .collect()
+    }
+
+    fn make_issues(ids: &[u64]) -> std::collections::HashSet<u64> {
+        ids.iter().copied().collect()
+    }
+
+    // --- validate_dag tests ---
+
+    #[test]
+    fn validate_dag_empty() {
+        assert!(validate_dag(&make_issues(&[]), &make_deps(&[])).is_ok());
+    }
+
+    #[test]
+    fn validate_dag_valid_linear() {
+        // A(1) → B(2) → C(3)
+        let issues = make_issues(&[1, 2, 3]);
+        let deps = make_deps(&[(1, &[]), (2, &[1]), (3, &[2])]);
+        assert!(validate_dag(&issues, &deps).is_ok());
+    }
+
+    #[test]
+    fn validate_dag_valid_diamond() {
+        // A(1) → {B(2), C(3)} → D(4)
+        let issues = make_issues(&[1, 2, 3, 4]);
+        let deps = make_deps(&[(1, &[]), (2, &[1]), (3, &[1]), (4, &[2, 3])]);
+        assert!(validate_dag(&issues, &deps).is_ok());
+    }
+
+    #[test]
+    fn validate_dag_missing_upstream() {
+        // Issue 2 depends on issue 99 which is not in the plan.
+        let issues = make_issues(&[1, 2]);
+        let deps = make_deps(&[(1, &[]), (2, &[99])]);
+        let err = validate_dag(&issues, &deps).unwrap_err();
+        assert!(
+            err.contains("99"),
+            "error should mention the missing issue: {err}"
+        );
+        assert!(
+            err.contains("2"),
+            "error should mention the dependent issue: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_dag_self_cycle() {
+        // Issue 1 depends on itself.
+        let issues = make_issues(&[1]);
+        let deps = make_deps(&[(1, &[1])]);
+        let err = validate_dag(&issues, &deps).unwrap_err();
+        assert!(err.contains("cycle"), "error should mention cycle: {err}");
+        assert!(err.contains('1'), "error should mention issue 1: {err}");
+    }
+
+    #[test]
+    fn validate_dag_two_node_cycle() {
+        // 1 depends on 2 and 2 depends on 1.
+        let issues = make_issues(&[1, 2]);
+        let deps = make_deps(&[(1, &[2]), (2, &[1])]);
+        let err = validate_dag(&issues, &deps).unwrap_err();
+        assert!(err.contains("cycle"), "error should mention cycle: {err}");
+        assert!(
+            err.contains('1') && err.contains('2'),
+            "error should mention both issues: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_dag_multi_component_cycle() {
+        // 3-node cycle {1,2,3} isolated from valid node 4.
+        let issues = make_issues(&[1, 2, 3, 4]);
+        let deps = make_deps(&[(1, &[3]), (2, &[1]), (3, &[2]), (4, &[])]);
+        let err = validate_dag(&issues, &deps).unwrap_err();
+        assert!(err.contains("cycle"), "error should mention cycle: {err}");
+        // Issues 1, 2, 3 should all appear in the error
+        assert!(err.contains('1') && err.contains('2') && err.contains('3'));
+        // Issue 4 is valid and should not be in the cycle error
+        // (4 is not in cycle_nodes because its in-degree stays 0)
+    }
+
+    #[test]
+    fn validate_dag_missing_plus_cycle() {
+        // Issue 1 depends on missing 99, and issues 2 and 3 form a cycle.
+        let issues = make_issues(&[1, 2, 3]);
+        let deps = make_deps(&[(1, &[99]), (2, &[3]), (3, &[2])]);
+        let err = validate_dag(&issues, &deps).unwrap_err();
+        assert!(
+            err.contains("99"),
+            "error should mention missing dep 99: {err}"
+        );
+        assert!(err.contains("cycle"), "error should mention cycle: {err}");
+    }
+
+    #[test]
+    fn validate_dag_skipped_dep_excluded() {
+        // Issue 2 depends on issue 10, but 10 is skipped (not in all_task_issues).
+        // When the caller pre-filters skipped deps from the dep list, no error.
+        let issues = make_issues(&[1, 2]);
+        // Simulates the caller filtering out dep 10 (a skipped issue) before calling validate_dag.
+        let deps = make_deps(&[(1, &[]), (2, &[])]);
+        assert!(validate_dag(&issues, &deps).is_ok());
+    }
+
+    // --- existing tests ---
 
     #[test]
     fn build_prompt_from_issue_formats_correctly() {
@@ -296,7 +782,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             label: "harness".to_string(),
             poll_interval_secs: 60,
-            repos: vec![],
+            ..Default::default()
         });
         let orchestrator = build_orchestrator(&config, None, None);
         assert_eq!(orchestrator.sources.len(), 1);

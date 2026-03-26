@@ -36,6 +36,9 @@ pub enum HarnessError {
     #[error("agent execution failed: {0}")]
     AgentExecution(String),
 
+    #[error("agent quota exhausted: {0}")]
+    QuotaExhausted(String),
+
     #[error("protocol error: {0}")]
     Protocol(String),
 

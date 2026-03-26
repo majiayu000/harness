@@ -154,6 +154,7 @@ async fn make_state_inner(
         observability: crate::http::ObservabilityServices {
             events,
             signal_rate_limiter: Arc::new(crate::http::SignalRateLimiter::new(100)),
+            password_reset_rate_limiter: Arc::new(crate::http::PasswordResetRateLimiter::new(5)),
             review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {

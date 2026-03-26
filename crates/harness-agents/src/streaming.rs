@@ -14,6 +14,18 @@ const STDERR_ERROR_KEYWORDS: &[&str] = &[
 ];
 const MAX_STDERR_LINE_LEN: usize = 1000;
 
+/// Truncate a string to at most `max_bytes`, snapping to a char boundary.
+fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Agent-internal line prefixes that should never surface as WARN.
 /// These are progress/reasoning lines emitted by Codex and similar agents,
 /// not actionable errors for the harness operator.
@@ -80,7 +92,7 @@ pub(crate) async fn filter_agent_stderr(stderr: tokio::process::ChildStderr, age
     let mut lines = reader.lines();
 
     while let Ok(Some(line)) = lines.next_line().await {
-        let trimmed = &line[..line.len().min(MAX_STDERR_LINE_LEN)];
+        let trimmed = truncate_to_char_boundary(&line, MAX_STDERR_LINE_LEN);
         if trimmed.is_empty() {
             continue;
         }
@@ -100,7 +112,7 @@ pub(crate) async fn filter_agent_stderr(stderr: tokio::process::ChildStderr, age
 /// Log stderr captured from a non-streaming `output()` call.
 pub(crate) fn log_captured_stderr(stderr: &str, agent_name: &str) {
     for line in stderr.lines() {
-        let trimmed = &line[..line.len().min(MAX_STDERR_LINE_LEN)];
+        let trimmed = truncate_to_char_boundary(line, MAX_STDERR_LINE_LEN);
         if trimmed.is_empty() {
             continue;
         }

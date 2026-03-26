@@ -124,6 +124,17 @@ impl CodeAgent for CodexAgent {
         log_captured_stderr(&stderr, self.name());
 
         if !output.status.success() {
+            let stderr_lower = stderr.to_lowercase();
+            if stderr_lower.contains("402")
+                || stderr_lower.contains("quota")
+                || stderr_lower.contains("payment required")
+                || stderr_lower.contains("insufficient available balance")
+            {
+                return Err(harness_core::HarnessError::QuotaExhausted(format!(
+                    "codex quota exhausted (exit {}): {stderr}",
+                    output.status
+                )));
+            }
             return Err(harness_core::HarnessError::AgentExecution(format!(
                 "codex exited with {}: {stderr}",
                 output.status

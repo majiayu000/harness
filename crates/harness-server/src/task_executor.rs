@@ -226,6 +226,24 @@ fn compute_backoff_ms(base_ms: u64, max_ms: u64, attempt: u32) -> u64 {
     base_ms.saturating_mul(1u64 << shift).min(max_ms)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImplementationOutcome {
+    PlanIssue(String),
+    ParsedPr {
+        pr_url: Option<String>,
+        pr_num: Option<u64>,
+    },
+}
+
+fn parse_implementation_outcome(output: &str) -> ImplementationOutcome {
+    if let Some(desc) = prompts::parse_plan_issue(output) {
+        return ImplementationOutcome::PlanIssue(desc);
+    }
+    let pr_url = prompts::parse_pr_url(output);
+    let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
+    ImplementationOutcome::ParsedPr { pr_url, pr_num }
+}
+
 /// Persist a completed stream item as a task artifact when it carries content
 /// worth retaining across context loss (shell commands, file edits, tool calls).
 async fn persist_artifact(
@@ -500,6 +518,10 @@ pub(crate) async fn run_task(
 ) -> anyhow::Result<()> {
     let task_start = Instant::now();
 
+    if !project.exists() {
+        anyhow::bail!("project_root does not exist: {}", project.display());
+    }
+
     // Set CARGO_TARGET_DIR to a per-task temp path so parallel agents running
     // cargo check/test simultaneously do not contend on the same build directory.
     // A per-project path caused `.cargo-lock` contention and build failures when
@@ -578,8 +600,11 @@ pub(crate) async fn run_task(
         }
     } else if let Some(pr) = req.pr {
         prompts::check_existing_pr(pr, &review_config.review_bot_command, &repo_slug)
-    } else if req.source.as_deref() == Some("periodic_review") {
-        // Review tasks use their prompt as-is — no "create PR" wrapper.
+    } else if matches!(
+        req.source.as_deref(),
+        Some("periodic_review") | Some("sprint_planner")
+    ) {
+        // Review/planner tasks use their prompt as-is — no "create PR" wrapper.
         req.prompt.clone().unwrap_or_default()
     } else {
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default(), git)
@@ -846,9 +871,12 @@ pub(crate) async fn run_task(
 
     // Review-only tasks produce a report, not a PR.
     // Persist the output and return immediately — no PR parsing or review loop.
-    let is_review_task = store
-        .get(task_id)
-        .is_some_and(|s| s.source.as_deref() == Some("periodic_review"));
+    let is_review_task = store.get(task_id).is_some_and(|s| {
+        matches!(
+            s.source.as_deref(),
+            Some("periodic_review") | Some("sprint_planner")
+        )
+    });
 
     if is_review_task {
         mutate_and_persist(store, task_id, |s| {
@@ -877,32 +905,41 @@ pub(crate) async fn run_task(
         return Ok(());
     }
 
-    // Check if the agent flagged an issue with the implementation plan before
-    // attempting PR parsing. When present, PLAN_ISSUE means no code was written —
-    // mark the task failed so it is not silently treated as successful completion.
-    if let Some(plan_issue) = prompts::parse_plan_issue(&output) {
-        tracing::error!(
-            task_id = %task_id,
-            plan_issue = %plan_issue,
-            "agent reported PLAN_ISSUE; marking task failed"
-        );
-        mutate_and_persist(store, task_id, |s| {
-            s.status = TaskStatus::Failed;
-            s.turn = 1;
-            s.error = Some(format!("PLAN_ISSUE: {plan_issue}"));
-            s.rounds.push(RoundResult {
-                turn: 1,
-                action: "implement".into(),
-                result: "plan_issue".into(),
-                detail: Some(plan_issue.clone()),
-            });
-        })
-        .await?;
-        return Ok(());
-    }
-
-    let pr_url = prompts::parse_pr_url(&output);
-    let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
+    let (pr_url, pr_num) = match parse_implementation_outcome(&output) {
+        ImplementationOutcome::PlanIssue(plan_issue) => {
+            tracing::error!(
+                task_id = %task_id,
+                plan_issue = %plan_issue,
+                "implementation returned PLAN_ISSUE; marking task failed"
+            );
+            mutate_and_persist(store, task_id, |s| {
+                s.status = TaskStatus::Failed;
+                s.turn = 2;
+                s.error = Some(plan_issue.clone());
+                s.rounds.push(RoundResult {
+                    turn: 1,
+                    action: "implement".into(),
+                    result: "plan_issue".into(),
+                    detail: if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.clone())
+                    },
+                });
+            })
+            .await?;
+            tracing::info!(
+                task_id = %task_id,
+                status = "failed",
+                turns = 2,
+                pr_url = tracing::field::Empty,
+                total_elapsed_secs = task_start.elapsed().as_secs(),
+                "task_completed"
+            );
+            return Ok(());
+        }
+        ImplementationOutcome::ParsedPr { pr_url, pr_num } => (pr_url, pr_num),
+    };
 
     mutate_and_persist(store, task_id, |s| {
         s.pr_url = pr_url.clone();
@@ -914,7 +951,11 @@ pub(crate) async fn run_task(
             } else {
                 "no_pr".into()
             },
-            detail: None,
+            detail: if output.is_empty() {
+                None
+            } else {
+                Some(output.clone())
+            },
         });
     })
     .await?;
@@ -964,6 +1005,7 @@ pub(crate) async fn run_task(
                 &interceptors,
                 turn_timeout,
                 pr_url.as_deref().unwrap_or(""),
+                project_config.review_type.as_str(),
                 &events,
                 &cargo_env,
             )
@@ -973,6 +1015,26 @@ pub(crate) async fn run_task(
         }
     }
 
+    // Skip external review bot wait when auto-trigger is disabled — there is
+    // no bot to wait for, so the loop would always exhaust all rounds and fail.
+    if !review_config.review_bot_auto_trigger {
+        tracing::info!("review_bot_auto_trigger disabled; skipping external review wait");
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Done;
+            s.turn = 2;
+        })
+        .await?;
+        tracing::info!(
+            task_id = %task_id,
+            status = "done",
+            turns = 2,
+            pr_url = pr_url.as_deref().unwrap_or(""),
+            total_elapsed_secs = task_start.elapsed().as_secs(),
+            "task_completed"
+        );
+        return Ok(());
+    }
+
     // Wait for external review bot.
     // Use a local counter instead of querying the store to derive waiting_count —
     // task execution is sequential within a single tokio task, so a plain u32 suffices.
@@ -980,14 +1042,18 @@ pub(crate) async fn run_task(
     waiting_count += 1;
     update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
 
-    let wait_secs = req.wait_secs;
+    let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
+    let max_rounds = resolved.review_max_rounds.unwrap_or(req.max_rounds);
     tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
     sleep(Duration::from_secs(wait_secs)).await;
 
     let review_phase_start = Instant::now();
 
-    // Review loop
-    for round in 1..=req.max_rounds {
+    // Review loop.
+    // Use an explicit counter so WAITING responses don't consume a round — `continue`
+    // inside a `for` loop would silently advance the iterator even without a real review.
+    let mut round: u32 = 1;
+    while round <= max_rounds {
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let check_req = AgentRequest {
@@ -1039,6 +1105,18 @@ pub(crate) async fn run_task(
                 r
             }
             Ok(Err(e)) => {
+                // Quota exhausted is not retryable — break immediately instead of
+                // burning remaining review rounds on repeated 402 errors.
+                if matches!(e, HarnessError::QuotaExhausted(_)) {
+                    tracing::error!(round, error = %e, "quota exhausted during review — aborting review loop");
+                    run_on_error(&interceptors, &check_req, &e.to_string()).await;
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.error = Some(e.to_string());
+                    })
+                    .await?;
+                    return Ok(());
+                }
                 run_on_error(&interceptors, &check_req, &e.to_string()).await;
                 return Err(e.into());
             }
@@ -1059,6 +1137,20 @@ pub(crate) async fn run_task(
         }
 
         let lgtm = prompts::is_lgtm(&output);
+        let waiting = prompts::is_waiting(&output);
+
+        // WAITING means review bot hasn't posted yet (e.g., quota exhausted).
+        // Don't consume a round — just sleep and retry without incrementing.
+        if waiting {
+            tracing::info!(
+                round,
+                "PR #{pr_num} review bot has not responded yet; sleeping without consuming round"
+            );
+            waiting_count += 1;
+            update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
+            sleep(Duration::from_secs(wait_secs)).await;
+            continue;
+        }
 
         mutate_and_persist(store, task_id, |s| {
             s.rounds.push(RoundResult {
@@ -1116,19 +1208,20 @@ pub(crate) async fn run_task(
         }
 
         tracing::info!("PR #{pr_num} not yet approved at round {round}; waiting");
-        if round < req.max_rounds {
+        if round < max_rounds {
             waiting_count += 1;
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
             sleep(Duration::from_secs(wait_secs)).await;
         }
+        round += 1;
     }
 
     mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Failed;
-        s.turn = req.max_rounds.saturating_add(1);
+        s.turn = max_rounds.saturating_add(1);
         s.error = Some(format!(
             "Task did not receive LGTM after {} review rounds.",
-            req.max_rounds
+            max_rounds
         ));
     })
     .await?;
@@ -1141,7 +1234,7 @@ pub(crate) async fn run_task(
     tracing::info!(
         task_id = %task_id,
         status = "failed",
-        turns = req.max_rounds.saturating_add(1),
+        turns = max_rounds.saturating_add(1),
         pr_url = pr_url.as_deref().unwrap_or(""),
         total_elapsed_secs = task_start.elapsed().as_secs(),
         "task_completed"
@@ -1161,6 +1254,7 @@ async fn run_agent_review(
     interceptors: &[Arc<dyn harness_core::interceptor::TurnInterceptor>],
     turn_timeout: Duration,
     pr_url: &str,
+    project_type: &str,
     events: &harness_observe::EventStore,
     cargo_env: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
@@ -1171,7 +1265,7 @@ async fn run_agent_review(
         // Reviewer evaluates the PR diff — read-only except Bash for `gh pr diff`.
         let review_req = AgentRequest {
             prompt: {
-                let base = prompts::agent_review_prompt(pr_url, agent_round);
+                let base = prompts::agent_review_prompt(pr_url, agent_round, project_type);
                 // Inject capability note — primary enforcement now that --allowedTools
                 // is not passed to the CLI (issue #483).
                 let note = "Tool restriction: you are operating in review mode. \
@@ -1221,6 +1315,16 @@ async fn run_agent_review(
                 r
             }
             Ok(Err(e)) => {
+                if matches!(e, HarnessError::QuotaExhausted(_)) {
+                    tracing::error!(agent_round, error = %e, "quota exhausted during agent review — aborting");
+                    run_on_error(interceptors, &review_req, &e.to_string()).await;
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.error = Some(e.to_string());
+                    })
+                    .await?;
+                    return Ok(());
+                }
                 run_on_error(interceptors, &review_req, &e.to_string()).await;
                 return Err(e.into());
             }
@@ -1305,7 +1409,7 @@ async fn run_agent_review(
 
         // Implementor fixes the issues
         let fix_req = AgentRequest {
-            prompt: prompts::agent_review_fix_prompt(pr_url, &issues, agent_round),
+            prompt: prompts::agent_review_fix_prompt(pr_url, &issues, agent_round, project_type),
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Execution),
@@ -1524,6 +1628,30 @@ mod tests {
     fn implementation_turn_uses_full_profile_no_restriction() {
         // Full profile returns None — no tool restriction is applied to the agent.
         assert!(CapabilityProfile::Full.tools().is_none());
+    }
+
+    #[test]
+    fn parse_implementation_outcome_prefers_plan_issue() {
+        let output =
+            "PLAN_ISSUE=Plan missed rollback path\nPR_URL=https://github.com/o/r/pull/123";
+        let parsed = parse_implementation_outcome(output);
+        assert_eq!(
+            parsed,
+            ImplementationOutcome::PlanIssue("Plan missed rollback path".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_implementation_outcome_extracts_pr_when_no_plan_issue() {
+        let output = "Done.\nPR_URL=https://github.com/majiayu000/harness/pull/42";
+        let parsed = parse_implementation_outcome(output);
+        assert_eq!(
+            parsed,
+            ImplementationOutcome::ParsedPr {
+                pr_url: Some("https://github.com/majiayu000/harness/pull/42".to_string()),
+                pr_num: Some(42),
+            }
+        );
     }
 
     #[test]

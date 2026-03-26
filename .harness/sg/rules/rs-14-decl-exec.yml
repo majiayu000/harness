@@ -1,0 +1,39 @@
+id: rs-14-config-default
+language: Rust
+severity: warning
+message: "Config struct initialized with Default::default() — call load() to read config file"
+note: "Config structs should be initialized via load()/from_env()/from_file(), not Default::default()"
+rule:
+  pattern: $TYPE::default()
+  constraints:
+    TYPE:
+      regex: "Config$"
+  not:
+    any:
+      - inside:
+          kind: function_item
+          has:
+            field: name
+            regex: "^(test_|default$|new$)"
+      - inside:
+          kind: mod_item
+          has:
+            kind: attribute_item
+            regex: "cfg.*test"
+---
+id: rs-14-trait-unregistered
+language: Rust
+severity: warning
+message: "impl block for *Store/*Registry/*Manager — verify startup registration in build_app_state() or main()"
+note: "Implementations of Store/Registry/Manager traits must be registered at startup"
+rule:
+  kind: impl_item
+  has:
+    kind: type_identifier
+    regex: "(Store|Registry|Manager|Handler)$"
+  not:
+    inside:
+      kind: mod_item
+      has:
+        kind: attribute_item
+        regex: "cfg.*test"

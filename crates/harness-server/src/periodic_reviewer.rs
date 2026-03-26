@@ -108,7 +108,12 @@ async fn run_review_tick(
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
     let project_str = project_root.display().to_string();
-    let base_prompt = harness_core::prompts::periodic_review_prompt(&project_str, &since_arg);
+    let project_cfg = harness_core::config::load_project_config(project_root);
+    let base_prompt = harness_core::prompts::periodic_review_prompt(
+        &project_str,
+        &since_arg,
+        project_cfg.review_type.as_str(),
+    );
 
     // --- Phase 1: Parallel review by Claude + Codex ---
     let claude_req = CreateTaskRequest {
@@ -217,7 +222,7 @@ async fn run_review_tick(
 
         // Persist findings from the final output.
         let Some(output) = final_output else {
-            tracing::warn!("scheduler: no review output to parse");
+            tracing::error!("scheduler: periodic review cycle produced no output — no review output to parse");
             return;
         };
         match crate::review_store::parse_review_output(&output) {
@@ -232,7 +237,10 @@ async fn run_review_tick(
                         Ok(n) => {
                             tracing::info!(new_findings = n, "scheduler: review findings persisted")
                         }
-                        Err(e) => tracing::warn!("scheduler: failed to persist findings: {e}"),
+                        Err(e) => tracing::error!(
+                            task_id = %claude_id,
+                            "scheduler: failed to persist findings: {e}"
+                        ),
                     }
                 }
             }
@@ -258,7 +266,7 @@ async fn poll_task_output(
     loop {
         sleep(poll_interval).await;
         if start.elapsed() > max_wait {
-            tracing::warn!(task_id = %task_id, "poll_task_output: timed out");
+            tracing::error!(task_id = %task_id, "scheduler: periodic review cycle produced no output — poll_task_output timed out");
             return None;
         }
         let Some(task) = store.get(task_id) else {
@@ -277,7 +285,7 @@ async fn poll_task_output(
             .collect::<Vec<_>>()
             .join("\n");
         if output.is_empty() {
-            tracing::warn!(task_id = %task_id, "poll_task_output: completed but no output");
+            tracing::error!(task_id = %task_id, "scheduler: periodic review cycle produced no output — poll_task_output completed with empty output");
             return None;
         }
         return Some(output);

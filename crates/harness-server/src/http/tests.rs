@@ -123,6 +123,7 @@ async fn make_test_state_with(
         observability: crate::http::ObservabilityServices {
             events,
             signal_rate_limiter: Arc::new(crate::http::SignalRateLimiter::new(100)),
+            password_reset_rate_limiter: Arc::new(crate::http::PasswordResetRateLimiter::new(5)),
             review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
@@ -708,7 +709,7 @@ async fn intake_status_shows_github_repo_when_configured() -> anyhow::Result<()>
         repo: "owner/myrepo".to_string(),
         label: "harness".to_string(),
         poll_interval_secs: 30,
-        repos: vec![],
+        ..Default::default()
     });
     let state = make_test_state_with(
         dir.path(),
