@@ -81,10 +81,8 @@ pub struct TaskArtifact {
 /// Result of [`TaskDb::recover_in_progress`].
 #[derive(Debug, Default)]
 pub struct RecoveryResult {
-    /// Tasks that were in `implementing` (without PR) and are now `failed`.
+    /// Tasks that were in interrupted states and are now `failed`.
     pub failed: u32,
-    /// Tasks that were in `reviewing` / `waiting` / or had a PR and are now `pending` for retry.
-    pub requeued: u32,
     /// Tasks that were `pending` mid-transient-retry at crash time and are now `failed`.
     pub transient_failed: u32,
 }
@@ -167,56 +165,28 @@ impl TaskDb {
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 
-    /// Differentiated recovery on server restart.
+    /// Recovery on server restart.
     ///
-    /// - `implementing` / `agent_review` **with a PR** → `pending` (PR exists; safe to continue review)
-    /// - `implementing` / `agent_review` **without PR** → `failed` (nothing to resume)
-    /// - `reviewing` / `waiting` → `pending` (safe to re-queue; no live agent process)
+    /// - interrupted states (`implementing`, `agent_review`, `reviewing`, `waiting`) → `failed`
+    ///   (agent process died mid-flight; no safe resume path)
     /// - `pending` with transient-retry error → `failed` (crashed mid-backoff, no PR to resume)
     /// - `pending` otherwise → unchanged (will be picked up by the re-dispatch loop)
     ///
     /// Diagnostic context is embedded in the `error` field so operators can correlate
     /// recovery events with their original execution state.
     ///
-    /// Returns a [`RecoveryResult`] with counts for each outcome.
+    /// Returns a [`RecoveryResult`] with counts for failed outcomes.
     pub async fn recover_in_progress(&self) -> anyhow::Result<RecoveryResult> {
-        // Tasks with a PR can safely resume — the PR already exists on GitHub,
-        // so re-queuing will pick up from the review loop rather than re-implementing.
-        let requeued_with_pr = sqlx::query(
-            "UPDATE tasks \
-             SET status = 'pending', \
-                 error = 'recovered after restart (was: ' || status \
-                      || ', round: ' || turn \
-                      || ', pr: ' || pr_url || ')', \
-                 updated_at = datetime('now') \
-             WHERE status IN ('implementing', 'agent_review') \
-               AND pr_url IS NOT NULL AND pr_url != ''",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected() as u32;
-
-        // Tasks without a PR have no resumable artifact — mark as failed.
+        // Interrupted tasks cannot be resumed safely after restart without a fresh
+        // agent invocation, so mark them failed with diagnostic context.
         let failed = sqlx::query(
             "UPDATE tasks \
              SET status = 'failed', \
                  error = 'recovered after restart (was: ' || status \
                       || ', round: ' || turn \
-                      || ', pr: none)', \
+                      || ', pr: ' || COALESCE(pr_url, 'none') || ')', \
                  updated_at = datetime('now') \
-             WHERE status IN ('implementing', 'agent_review') \
-               AND (pr_url IS NULL OR pr_url = '')",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected() as u32;
-
-        let requeued_review = sqlx::query(
-            "UPDATE tasks \
-             SET status = 'pending', \
-                 error = 'recovered from ' || status || ' after server restart', \
-                 updated_at = datetime('now') \
-             WHERE status IN ('reviewing', 'waiting')",
+             WHERE status IN ('implementing', 'agent_review', 'reviewing', 'waiting')",
         )
         .execute(&self.pool)
         .await?
@@ -239,12 +209,6 @@ impl TaskDb {
         .await?
         .rows_affected() as u32;
 
-        if requeued_with_pr > 0 {
-            tracing::info!(
-                "startup recovery: re-queued {} task(s) that had PRs (was implementing/agent_review)",
-                requeued_with_pr
-            );
-        }
         if transient_failed > 0 {
             tracing::info!(
                 "startup recovery: failed {} task(s) that were pending mid-transient-retry",
@@ -254,7 +218,6 @@ impl TaskDb {
 
         Ok(RecoveryResult {
             failed,
-            requeued: requeued_review + requeued_with_pr,
             transient_failed,
         })
     }
@@ -662,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_in_progress_differentiates_by_status() -> anyhow::Result<()> {
+    async fn recover_in_progress_marks_all_interrupted_as_failed() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
 
@@ -684,10 +647,10 @@ mod tests {
 
         let result = db.recover_in_progress().await?;
         assert_eq!(
-            result.failed, 2,
-            "implementing + agent_review (no PR) should be failed"
+            result.failed, 4,
+            "implementing + agent_review + reviewing + waiting should all be failed"
         );
-        assert_eq!(result.requeued, 2, "reviewing + waiting should be requeued");
+        assert_eq!(result.transient_failed, 0);
 
         // pending stays pending, no error set
         let pending = db.get("t-pending").await?.expect("should exist");
@@ -719,23 +682,23 @@ mod tests {
             .unwrap_or("")
             .contains("was: agent_review"));
 
-        // reviewing → pending for retry
+        // reviewing → failed with diagnostic info
         let reviewing = db.get("t-reviewing").await?.expect("should exist");
-        assert!(matches!(reviewing.status, TaskStatus::Pending));
+        assert!(matches!(reviewing.status, TaskStatus::Failed));
         let err = reviewing.error.as_deref().unwrap_or("");
         assert!(
-            err.contains("recovered from reviewing"),
+            err.contains("was: reviewing"),
             "error should note original status"
         );
 
-        // waiting → pending for retry
+        // waiting → failed with diagnostic info
         let waiting = db.get("t-waiting").await?.expect("should exist");
-        assert!(matches!(waiting.status, TaskStatus::Pending));
+        assert!(matches!(waiting.status, TaskStatus::Failed));
         assert!(waiting
             .error
             .as_deref()
             .unwrap_or("")
-            .contains("recovered from waiting"));
+            .contains("was: waiting"));
 
         // terminal states unchanged
         let done = db.get("t-done").await?.expect("should exist");
@@ -747,16 +710,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_requeues_tasks_with_pr() -> anyhow::Result<()> {
+    async fn recover_marks_tasks_with_pr_as_failed() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
 
-        // implementing WITH PR → should be requeued
+        // implementing WITH PR → should fail
         let mut with_pr = make_task("t-impl-pr", TaskStatus::Implementing);
         with_pr.pr_url = Some("https://github.com/owner/repo/pull/42".to_string());
         db.insert(&with_pr).await?;
 
-        // agent_review WITH PR → should be requeued
+        // agent_review WITH PR → should fail
         let mut review_pr = make_task("t-review-pr", TaskStatus::AgentReview);
         review_pr.pr_url = Some("https://github.com/owner/repo/pull/43".to_string());
         db.insert(&review_pr).await?;
@@ -766,20 +729,17 @@ mod tests {
             .await?;
 
         let result = db.recover_in_progress().await?;
-        assert_eq!(result.failed, 1, "only implementing without PR should fail");
-        assert_eq!(
-            result.requeued, 2,
-            "implementing + agent_review with PR should be requeued"
-        );
+        assert_eq!(result.failed, 3, "all interrupted tasks should fail");
+        assert_eq!(result.transient_failed, 0);
 
-        // Verify: implementing with PR → pending
+        // Verify: implementing with PR → failed
         let impl_pr = db
             .get("t-impl-pr")
             .await?
             .ok_or_else(|| anyhow::anyhow!("t-impl-pr should exist"))?;
         assert!(
-            matches!(impl_pr.status, TaskStatus::Pending),
-            "implementing with PR should be requeued to pending"
+            matches!(impl_pr.status, TaskStatus::Failed),
+            "implementing with PR should be marked failed"
         );
         let err = impl_pr.error.as_deref().unwrap_or("");
         assert!(
@@ -791,14 +751,14 @@ mod tests {
             "should preserve PR URL in error context"
         );
 
-        // Verify: agent_review with PR → pending
+        // Verify: agent_review with PR → failed
         let review = db
             .get("t-review-pr")
             .await?
             .ok_or_else(|| anyhow::anyhow!("t-review-pr should exist"))?;
         assert!(
-            matches!(review.status, TaskStatus::Pending),
-            "agent_review with PR should be requeued to pending"
+            matches!(review.status, TaskStatus::Failed),
+            "agent_review with PR should be marked failed"
         );
 
         // Verify: implementing without PR → failed
