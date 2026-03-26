@@ -356,7 +356,7 @@ pub fn agent_review_prompt(pr_url: &str, round: u32, project_type: &str) -> Stri
          - Security: injection, path traversal, unvalidated input at system boundaries\n\
          {focus}\n\n\
          Steps:\n\
-         1. Run `gh pr diff {pr_url}` to read the full diff\n\
+         1. Run `gh pr diff '{pr_url}'` to read the full diff\n\
          2. For each changed file, understand the CONTEXT — read surrounding code if needed\n\
          3. Evaluate correctness and safety in priority order: security > logic > quality > style\n\
          4. If everything looks good, print APPROVED on the last line\n\
@@ -518,18 +518,52 @@ pub fn extract_review_issues(output: &str) -> Vec<String> {
 }
 
 /// Parse `PR_URL=<url>` from agent output (searches from last line).
-/// Only returns URLs with `https://` or `http://` scheme to prevent javascript: URI injection.
+///
+/// Only returns URLs matching the strict GitHub PR format
+/// `https://github.com/{owner}/{repo}/pull/{number}[#{fragment}]`.
+/// This prevents javascript: URI injection (SEC-03) and shell metacharacter
+/// injection (e.g. `$(...)` in path segments) when the URL is embedded in
+/// reviewer prompts that invoke `gh pr diff`.
 pub fn parse_pr_url(output: &str) -> Option<String> {
     for line in output.lines().rev() {
         let line = line.trim();
         if let Some(url) = line.strip_prefix("PR_URL=") {
             let url = url.trim();
-            if url.starts_with("https://") || url.starts_with("http://") {
+            if is_valid_github_pr_url(url) {
                 return Some(url.to_string());
             }
         }
     }
     None
+}
+
+/// Returns `true` only for well-formed GitHub PR URLs.
+///
+/// Accepted: `https://github.com/{owner}/{repo}/pull/{number}[#{fragment}]`
+/// Rejected: any other scheme, non-GitHub host, shell metacharacters, extra
+/// path segments, or non-numeric PR numbers.
+fn is_valid_github_pr_url(url: &str) -> bool {
+    let rest = match url.strip_prefix("https://github.com/") {
+        Some(r) => r,
+        None => return false,
+    };
+    // Strip optional fragment (#discussion_rXXX etc.)
+    let path = rest.split_once('#').map_or(rest, |(p, _)| p);
+    let parts: Vec<&str> = path.split('/').collect();
+    // Must be exactly owner/repo/pull/number — no extra segments
+    if parts.len() != 4 {
+        return false;
+    }
+    let is_valid_slug = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    };
+    is_valid_slug(parts[0]) // owner
+        && is_valid_slug(parts[1]) // repo
+        && parts[2] == "pull"
+        && !parts[3].is_empty()
+        && parts[3].chars().all(|c| c.is_ascii_digit()) // PR number only
 }
 
 /// Extract PR number from a GitHub PR URL.
@@ -1140,6 +1174,27 @@ mod tests {
             None
         );
         assert_eq!(parse_pr_url("output\nPR_URL=javascript:void(0)"), None);
+    }
+
+    #[test]
+    fn test_parse_pr_url_rejects_shell_metacharacters() {
+        // SEC-03: shell metacharacters in path segments must be rejected to
+        // prevent command injection when the URL is embedded in `gh pr diff`
+        // Extra path segment with command substitution
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/1/$(whoami)"),
+            None
+        );
+        // Non-numeric PR number containing shell special chars
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/1;rm+-rf+/"),
+            None
+        );
+        // http:// (non-GitHub, non-https) must be rejected
+        assert_eq!(
+            parse_pr_url("PR_URL=http://github.com/owner/repo/pull/1"),
+            None
+        );
     }
 
     #[test]
