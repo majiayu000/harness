@@ -490,6 +490,252 @@ function initHistoryControls() {
   }
 }
 
+// --- Token Usage ---
+
+const MODEL_COLORS = [
+  "#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ef4444",
+  "#06b6d4", "#ec4899", "#84cc16", "#f97316", "#6366f1",
+];
+
+function fmtNum(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(n);
+}
+function fmtTokens(n) { return n.toLocaleString(); }
+
+async function fetchTokenUsage() {
+  try {
+    const resp = await fetch("/api/token-usage", { headers: authHeaders() });
+    if (!resp.ok) {
+      let message = `HTTP ${resp.status}`;
+      try {
+        const errorBody = await resp.json();
+        if (errorBody && typeof errorBody.error === "string" && errorBody.error.length > 0) {
+          message = errorBody.error;
+        }
+      } catch {}
+      console.error("token usage fetch failed:", message);
+      renderTokenError(message);
+      return;
+    }
+    const data = await resp.json();
+    renderTokenMetrics(data);
+    renderRequestChart(data.by_hour || {});
+    renderModelTrend(data.model_trend || {}, data.models || []);
+    renderTokenDayTable(data.by_day || {});
+    renderTokenModelTable(data.by_model || {});
+    renderTokenTaskTable(data.task_usage || []);
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    console.error("token usage fetch failed:", message);
+    renderTokenError(message);
+  }
+}
+
+function renderTokenError(message) {
+  const metricIds = [
+    "tok-requests",
+    "tok-avg-req",
+    "tok-sessions",
+    "tok-context",
+    "tok-output",
+    "tok-cost",
+  ];
+  metricIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = "ERR";
+  });
+
+  const safe = escapeHtml(message || "token usage unavailable");
+  const chartIds = ["tok-req-chart", "tok-model-chart"];
+  chartIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = `<p class="empty-state">Error: ${safe}</p>`;
+  });
+
+  const tableBodies = {
+    "tok-day-body": 5,
+    "tok-model-body": 5,
+    "tok-task-body": 6,
+  };
+  Object.entries(tableBodies).forEach(([id, cols]) => {
+    const body = document.getElementById(id);
+    if (body) body.innerHTML = `<tr><td colspan="${cols}">Error: ${safe}</td></tr>`;
+  });
+}
+
+function renderTokenMetrics(data) {
+  const el = (id, val) => { const e = document.getElementById(id); if (e) e.textContent = val; };
+  el("tok-requests", fmtNum(data.total_requests || 0));
+  el("tok-context", fmtNum(data.total_context || 0));
+  el("tok-output", fmtNum((data.totals || {}).output_tokens || 0));
+  el("tok-cost", "$" + (data.estimated_cost_usd || 0).toFixed(2));
+  // Avg requests per hour (from by_hour data)
+  const hours = Object.keys(data.by_hour || {});
+  const avgReq = hours.length > 0 ? Math.round((data.total_requests || 0) / hours.length) : 0;
+  el("tok-avg-req", fmtNum(avgReq));
+  el("tok-sessions", fmtNum(data.session_count || 0));
+}
+
+// --- Request count bar chart (SVG) ---
+function renderRequestChart(byHour) {
+  const el = document.getElementById("tok-req-chart");
+  if (!el) return;
+  const hours = Object.keys(byHour).sort();
+  if (hours.length === 0) { el.innerHTML = '<p class="empty-state">No data</p>'; return; }
+  // Show last 48 hours max.
+  const recent = hours.slice(-48);
+  const vals = recent.map(h => byHour[h].request_count || 0);
+  const max = Math.max(...vals, 1);
+  const total = vals.reduce((a, b) => a + b, 0);
+  const avg = Math.round(total / vals.length);
+
+  const W = 760, H = 180, pad = 40, barGap = 1;
+  const barW = Math.max(2, (W - pad * 2) / vals.length - barGap);
+  const scaleY = (v) => (H - pad - 10) * (v / max);
+
+  let bars = "", labels = "";
+  const labelStep = Math.max(1, Math.floor(vals.length / 12));
+  vals.forEach((v, i) => {
+    const x = pad + i * (barW + barGap);
+    const bh = scaleY(v);
+    const y = H - pad - bh;
+    bars += `<rect x="${x}" y="${y}" width="${barW}" height="${bh}" rx="2" fill="#3b82f6" opacity="0.85">` +
+      `<title>${recent[i].slice(11,16)}: ${v} requests</title></rect>`;
+    if (i % labelStep === 0) {
+      labels += `<text x="${x + barW/2}" y="${H - pad + 14}" text-anchor="middle" fill="var(--muted)" font-size="10">${recent[i].slice(11,16)}</text>`;
+    }
+  });
+
+  // Y-axis labels.
+  let yLabels = "";
+  for (let i = 0; i <= 4; i++) {
+    const v = Math.round(max * i / 4);
+    const y = H - pad - scaleY(v);
+    yLabels += `<text x="${pad - 4}" y="${y + 3}" text-anchor="end" fill="var(--muted)" font-size="10">${fmtNum(v)}</text>`;
+    yLabels += `<line x1="${pad}" x2="${W - 10}" y1="${y}" y2="${y}" stroke="var(--line)" stroke-dasharray="3,3"/>`;
+  }
+
+  const summary = `<text x="${W - 10}" y="16" text-anchor="end" fill="var(--muted)" font-size="12">Total: <tspan font-weight="600" fill="var(--ink)">${fmtNum(total)}</tspan>  Avg/h: <tspan font-weight="600" fill="var(--ink)">${avg}</tspan></text>`;
+
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">${summary}${yLabels}${bars}${labels}</svg>`;
+}
+
+// --- Model usage trend (SVG area chart) ---
+function renderModelTrend(modelTrend, models) {
+  const el = document.getElementById("tok-model-chart");
+  if (!el) return;
+  const hours = Object.keys(modelTrend).sort().slice(-48);
+  if (hours.length < 2 || models.length === 0) { el.innerHTML = '<p class="empty-state">No data</p>'; return; }
+
+  const topModels = models.slice(0, 8);
+
+  // Build series: model -> [values per hour].
+  const series = {};
+  topModels.forEach(m => { series[m] = hours.map(h => (modelTrend[h] || {})[m]?.tokens || 0); });
+
+  const maxVal = Math.max(...hours.map((_, i) => topModels.reduce((s, m) => s + (series[m][i] || 0), 0)), 1);
+
+  const W = 760, H = 200, pad = 50;
+  const xStep = (W - pad - 10) / (hours.length - 1);
+  const scaleY = (v) => (H - pad - 20) * (v / maxVal);
+
+  let paths = "", legendHtml = "";
+
+  // Draw each model as a filled area.
+  topModels.forEach((m, mi) => {
+    const color = MODEL_COLORS[mi % MODEL_COLORS.length];
+    const pts = series[m];
+    let d = "";
+    pts.forEach((v, i) => {
+      const x = pad + i * xStep;
+      const y = H - pad - scaleY(v);
+      d += (i === 0 ? "M" : "L") + `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    // Line.
+    paths += `<path d="${d}" fill="none" stroke="${color}" stroke-width="2" opacity="0.9"/>`;
+    // Fill.
+    const last = pad + (pts.length - 1) * xStep;
+    paths += `<path d="${d}L${last.toFixed(1)},${H - pad}L${pad},${H - pad}Z" fill="${color}" opacity="0.12"/>`;
+    // Legend.
+    legendHtml += `<span class="tok-legend-item"><span class="tok-legend-dot" style="background:${color}"></span>${escapeHtml(m)}</span>`;
+  });
+
+  // X-axis labels.
+  let labels = "";
+  const labelStep = Math.max(1, Math.floor(hours.length / 10));
+  hours.forEach((h, i) => {
+    if (i % labelStep === 0) {
+      const x = pad + i * xStep;
+      labels += `<text x="${x}" y="${H - pad + 14}" text-anchor="middle" fill="var(--muted)" font-size="10">${h.slice(11,16)}</text>`;
+    }
+  });
+
+  // Y-axis.
+  let yLabels = "";
+  for (let i = 0; i <= 4; i++) {
+    const v = Math.round(maxVal * i / 4);
+    const y = H - pad - scaleY(v);
+    yLabels += `<text x="${pad - 4}" y="${y + 3}" text-anchor="end" fill="var(--muted)" font-size="10">${fmtNum(v)}</text>`;
+    yLabels += `<line x1="${pad}" x2="${W - 10}" y1="${y}" y2="${y}" stroke="var(--line)" stroke-dasharray="3,3"/>`;
+  }
+
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">${yLabels}${paths}${labels}</svg>` +
+    `<div class="tok-legend">${legendHtml}</div>`;
+}
+
+function estimateCost(v) {
+  const hasCache = (v.cache_read_tokens || 0) > 0 || (v.cache_create_tokens || 0) > 0;
+  let inp = v.input_tokens || 0, cr = v.cache_read_tokens || 0;
+  if (!hasCache && inp > 0) { cr = inp * 0.9; inp = inp * 0.1; }
+  return inp / 1e6 * 3 + (v.output_tokens || 0) / 1e6 * 15
+       + cr / 1e6 * 0.30 + (v.cache_create_tokens || 0) / 1e6 * 3.75;
+}
+
+function renderTokenDayTable(byDay) {
+  const body = document.getElementById("tok-day-body");
+  if (!body) return;
+  const days = Object.keys(byDay).sort().reverse();
+  body.innerHTML = days.map(d => {
+    const v = byDay[d];
+    const ctx = (v.input_tokens||0) + (v.cache_read_tokens||0) + (v.cache_create_tokens||0);
+    const cost = estimateCost(v);
+    return `<tr><td>${escapeHtml(d)}</td><td>${fmtNum(v.request_count||0)}</td>` +
+      `<td>${fmtNum(ctx)}</td><td>${fmtNum(v.output_tokens||0)}</td>` +
+      `<td>$${cost.toFixed(2)}</td></tr>`;
+  }).join("");
+}
+
+function renderTokenModelTable(byModel) {
+  const body = document.getElementById("tok-model-body");
+  if (!body) return;
+  const models = Object.entries(byModel).sort((a, b) => {
+    const ca = (a[1].input_tokens||0) + (a[1].cache_read_tokens||0);
+    const cb = (b[1].input_tokens||0) + (b[1].cache_read_tokens||0);
+    return cb - ca;
+  });
+  body.innerHTML = models.map(([name, v]) => {
+    const ctx = (v.input_tokens||0) + (v.cache_read_tokens||0) + (v.cache_create_tokens||0);
+    const cost = estimateCost(v);
+    return `<tr><td>${escapeHtml(name)}</td><td>${fmtNum(v.request_count||0)}</td>` +
+      `<td>${fmtNum(ctx)}</td><td>${fmtNum(v.output_tokens||0)}</td>` +
+      `<td>$${cost.toFixed(2)}</td></tr>`;
+  }).join("");
+}
+
+function renderTokenTaskTable(tasks) {
+  const body = document.getElementById("tok-task-body");
+  if (!body) return;
+  body.innerHTML = tasks.slice(0, 20).map(t => {
+    return `<tr><td><code>${escapeHtml((t.task_id||"").slice(0,8))}</code></td>` +
+      `<td>${escapeHtml(t.repo||"")}</td><td>${escapeHtml(t.status||"")}</td>` +
+      `<td>${fmtNum(t.requests||0)}</td><td>${fmtNum(t.context_tokens||0)}</td>` +
+      `<td>$${(t.cost_usd||0).toFixed(2)}</td></tr>`;
+  }).join("");
+}
+
 // --- Init ---
 
 function init() {
