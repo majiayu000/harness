@@ -992,6 +992,10 @@ pub(crate) async fn run_task(
     update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
 
     let wait_secs = req.wait_secs;
+    // Cap WAITING polls so a permanently-unavailable review bot cannot hold an execution
+    // slot indefinitely. Scale with max_rounds (6× gives ~60 min at default 120 s/poll);
+    // floor at 20 so low max_rounds configs still get a reasonable grace period.
+    let max_waiting_polls = req.max_rounds.saturating_mul(6).max(20);
     tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
     sleep(Duration::from_secs(wait_secs)).await;
 
@@ -1093,11 +1097,28 @@ pub(crate) async fn run_task(
         // WAITING means review bot hasn't posted yet — do not consume a round.
         // `round` is intentionally not incremented here.
         if waiting {
+            waiting_count += 1;
+            if waiting_count > max_waiting_polls {
+                let msg = format!(
+                    "Review bot did not respond after {waiting_count} polls ({} s each); \
+                     giving up to free execution slot",
+                    wait_secs
+                );
+                tracing::error!(round, waiting_count, max_waiting_polls, "{msg}");
+                run_on_error(&interceptors, &check_req, &msg).await;
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Failed;
+                    s.error = Some(msg.clone());
+                })
+                .await?;
+                return Ok(());
+            }
             tracing::info!(
                 round,
+                waiting_count,
+                max_waiting_polls,
                 "PR #{pr_num} review bot has not responded yet; sleeping without consuming round"
             );
-            waiting_count += 1;
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
             sleep(Duration::from_secs(wait_secs)).await;
             continue;
