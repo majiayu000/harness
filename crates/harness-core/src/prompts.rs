@@ -165,10 +165,43 @@ pub fn implement_from_issue(
 }
 
 /// Build prompt: check an existing PR's CI and review status.
-pub fn check_existing_pr(pr: u64, review_bot_command: &str, repo: &str) -> String {
+///
+/// When `prev_fixed` is true (the previous round pushed a fix commit), the agent
+/// must first verify that `reviewer_name` has submitted a **new** review covering
+/// the latest commit before declaring LGTM. If no new review exists yet, the agent
+/// outputs WAITING.
+pub fn check_existing_pr(
+    pr: u64,
+    review_bot_command: &str,
+    repo: &str,
+    reviewer_name: &str,
+    prev_fixed: bool,
+) -> String {
     let body = shell_single_quote(review_bot_command);
+    let freshness_check = if prev_fixed {
+        let login_filter =
+            format!("[.[] | select(.user.login == \"{reviewer_name}\")] | last | .submitted_at");
+        format!(
+            "\n\nIMPORTANT — New review verification:\n\
+             The previous round pushed a fix commit. Before evaluating review status, \
+             you MUST verify that {reviewer_name} has submitted a NEW review covering the latest commit:\n\
+             1. Run `gh api repos/{repo}/pulls/{pr}/reviews \
+             --jq '{login_filter}'` \
+             to get the timestamp of {reviewer_name}'s most recent review\n\
+             2. Run `gh api repos/{repo}/pulls/{pr}/commits --jq '.[-1].commit.committer.date'` \
+             to get the timestamp of the latest commit\n\
+             3. If {reviewer_name}'s latest review was submitted BEFORE the latest commit \
+             (or no review from {reviewer_name} exists), \
+             {reviewer_name} has not yet re-reviewed the new code. \
+             In this case, print WAITING on the last line and stop.\n\
+             4. Only proceed with the checks below if {reviewer_name}'s latest review \
+             was submitted AFTER the latest commit."
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "Check PR #{pr}:\n\
+        "Check PR #{pr}:{freshness_check}\n\
          1. Run `gh pr view {pr} --json statusCheckRollup` — parse the JSON. \
          CI passes only if the `state` field in the `statusCheckRollup` object is `SUCCESS`\n\
          2. `gh api repos/{repo}/pulls/{pr}/comments` — read inline review comments\n\
@@ -356,7 +389,7 @@ pub fn agent_review_prompt(pr_url: &str, round: u32, project_type: &str) -> Stri
          - Security: injection, path traversal, unvalidated input at system boundaries\n\
          {focus}\n\n\
          Steps:\n\
-         1. Run `gh pr diff {pr_url}` to read the full diff\n\
+         1. Run `gh pr diff '{pr_url}'` to read the full diff\n\
          2. For each changed file, understand the CONTEXT — read surrounding code if needed\n\
          3. Evaluate correctness and safety in priority order: security > logic > quality > style\n\
          4. If everything looks good, print APPROVED on the last line\n\
@@ -387,6 +420,35 @@ pub fn agent_review_fix_prompt(
     format!(
         "The independent reviewer found the following issues in PR {pr_url} \
          (agent review round {round}):\n\n{safe_issue_list}\n\n\
+         Fix each issue, run {validation_cmd}, then commit and push.\n\
+         On the last line of your output, print PR_URL=<PR URL>"
+    )
+}
+
+/// Build prompt: impasse detected — same issues repeated from the previous round.
+///
+/// Tells the implementor that their previous fix did not resolve the flagged issues
+/// and asks them to try a different approach rather than repeating the same strategy.
+pub fn agent_review_intervention_prompt(
+    pr_url: &str,
+    issues: &[String],
+    round: u32,
+    project_type: &str,
+) -> String {
+    let issue_list: String = issues
+        .iter()
+        .enumerate()
+        .map(|(i, issue)| format!("{}. {issue}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let safe_issue_list = wrap_external_data(&issue_list);
+    let validation_cmd = validation_cmd_for_type(project_type);
+    format!(
+        "IMPASSE DETECTED: The previous fix attempt did not resolve the issues in PR {pr_url} \
+         (agent review round {round}). The reviewer flagged the same problems again.\n\n\
+         Re-examine root causes rather than symptoms. Consider a different approach entirely \
+         instead of repeating the same fix strategy.\n\n\
+         Issues that remain unresolved:\n\n{safe_issue_list}\n\n\
          Fix each issue, run {validation_cmd}, then commit and push.\n\
          On the last line of your output, print PR_URL=<PR URL>"
     )
@@ -518,14 +580,76 @@ pub fn extract_review_issues(output: &str) -> Vec<String> {
 }
 
 /// Parse `PR_URL=<url>` from agent output (searches from last line).
+///
+/// Only returns URLs matching the strict GitHub PR format
+/// `https://github.com/{owner}/{repo}/pull/{number}[/...][#{fragment}]`.
+/// This prevents javascript: URI injection (SEC-03) and shell metacharacter
+/// injection (e.g. `$(...)` in path segments) when the URL is embedded in
+/// reviewer prompts that invoke `gh pr diff`.
+///
+/// The fragment (if any) is stripped from the returned URL so it cannot
+/// escape shell quoting in downstream commands.
 pub fn parse_pr_url(output: &str) -> Option<String> {
     for line in output.lines().rev() {
         let line = line.trim();
         if let Some(url) = line.strip_prefix("PR_URL=") {
-            return Some(url.trim().to_string());
+            let url = url.trim();
+            if is_valid_github_pr_url(url) {
+                // Strip fragment and trailing slash before returning.
+                // The fragment is not needed by `gh pr diff` and a malicious
+                // fragment (e.g. `#';cmd;'`) would escape shell quoting when
+                // the URL is embedded in reviewer prompts.
+                let normalized = url.split('#').next().unwrap_or(url).trim_end_matches('/');
+                return Some(normalized.to_string());
+            }
         }
     }
     None
+}
+
+/// Returns `true` only for well-formed GitHub PR URLs.
+///
+/// Accepted:
+///   `https://github.com/{owner}/{repo}/pull/{number}[/extra...][#{fragment}]`
+///
+/// Extra path segments after the PR number (e.g. `/files`, `/commits`) are
+/// allowed as long as they contain only safe slug characters.  This avoids
+/// silently skipping review for PR URLs that GitHub itself generates with
+/// path suffixes.
+///
+/// Rejected: any other scheme, non-GitHub host, shell metacharacters in any
+/// path segment, or non-numeric PR numbers.
+fn is_valid_github_pr_url(url: &str) -> bool {
+    let rest = match url.strip_prefix("https://github.com/") {
+        Some(r) => r,
+        None => return false,
+    };
+    // Strip optional fragment (#discussion_rXXX etc.) before path parsing.
+    let path = rest.split_once('#').map_or(rest, |(p, _)| p);
+    // Trim trailing slashes so that `/pull/42/` normalises to `/pull/42`.
+    let path = path.trim_end_matches('/');
+    let parts: Vec<&str> = path.split('/').collect();
+    // Must have at least: owner / repo / "pull" / number
+    if parts.len() < 4 {
+        return false;
+    }
+    let is_valid_slug = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    };
+    // Validate the mandatory core four segments.
+    let core_valid = is_valid_slug(parts[0]) // owner
+        && is_valid_slug(parts[1]) // repo
+        && parts[2] == "pull"
+        && !parts[3].is_empty()
+        && parts[3].chars().all(|c| c.is_ascii_digit()); // PR number — digits only
+    if !core_valid {
+        return false;
+    }
+    // Any extra path segments (e.g. "files", "commits") must also be safe slugs
+    // so that injected shell metacharacters are rejected even in suffix position.
+    parts[4..].iter().all(|s| is_valid_slug(s))
 }
 
 /// Extract PR number from a GitHub PR URL.
@@ -904,7 +1028,13 @@ mod tests {
 
     #[test]
     fn test_check_existing_pr() {
-        let p = check_existing_pr(10, "/gemini review", "owner/repo");
+        let p = check_existing_pr(
+            10,
+            "/gemini review",
+            "owner/repo",
+            "gemini-code-assist[bot]",
+            false,
+        );
         assert!(p.contains("PR #10"));
         assert!(p.contains("LGTM"));
         assert!(p.contains("PR_URL=https://github.com/owner/repo/pull/10"));
@@ -1090,7 +1220,7 @@ mod tests {
     #[test]
     fn test_check_existing_pr_shell_quoting() {
         // A command containing a single quote must not break single-quoting
-        let p = check_existing_pr(5, "it's a test", "owner/repo");
+        let p = check_existing_pr(5, "it's a test", "owner/repo", "bot[bot]", false);
         assert!(
             p.contains(r"'it'\''s a test'"),
             "single quote must be escaped"
@@ -1126,6 +1256,73 @@ mod tests {
     #[test]
     fn test_parse_pr_url_not_found() {
         assert_eq!(parse_pr_url("no url here"), None);
+    }
+
+    #[test]
+    fn test_parse_pr_url_rejects_javascript_scheme() {
+        // SEC-03: javascript: URIs must be rejected to prevent XSS
+        assert_eq!(
+            parse_pr_url("PR_URL=javascript:alert(document.cookie)"),
+            None
+        );
+        assert_eq!(parse_pr_url("output\nPR_URL=javascript:void(0)"), None);
+    }
+
+    #[test]
+    fn test_parse_pr_url_rejects_shell_metacharacters() {
+        // SEC-03: shell metacharacters in path segments must be rejected to
+        // prevent command injection when the URL is embedded in `gh pr diff`
+        // Extra path segment with command substitution
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/1/$(whoami)"),
+            None
+        );
+        // Non-numeric PR number containing shell special chars
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/1;rm+-rf+/"),
+            None
+        );
+        // http:// (non-GitHub, non-https) must be rejected
+        assert_eq!(
+            parse_pr_url("PR_URL=http://github.com/owner/repo/pull/1"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_url_strips_fragment() {
+        // SEC-03: the fragment must be stripped from the returned URL so that a
+        // malicious fragment (e.g. `#';touch /tmp/pwn;'`) cannot escape shell
+        // quoting when the URL is embedded in `gh pr diff '{pr_url}'`.
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/1#';touch /tmp/pwn;'"),
+            Some("https://github.com/owner/repo/pull/1".to_string()),
+        );
+        // Legitimate discussion fragments are also stripped (not needed by gh cli).
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/42#discussion_r123456"),
+            Some("https://github.com/owner/repo/pull/42".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_url_accepts_path_suffixes() {
+        // Regression: URLs with /files or /commits suffix produced by GitHub must
+        // be accepted — the previous strict 4-segment check silently dropped them,
+        // causing the review loop to be skipped entirely.
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/42/files"),
+            Some("https://github.com/owner/repo/pull/42/files".to_string())
+        );
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/42/commits"),
+            Some("https://github.com/owner/repo/pull/42/commits".to_string())
+        );
+        // Trailing slash must also be accepted.
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/owner/repo/pull/42/"),
+            Some("https://github.com/owner/repo/pull/42".to_string())
+        );
     }
 
     #[test]

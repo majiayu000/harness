@@ -1,0 +1,10 @@
+id: go-01-error
+language: Go
+severity: warning
+message: "Function error return discarded — handle or propagate the error"
+note: "Assign the error to a named variable and check it, or return it to the caller"
+rule:
+  pattern: $X, _ := $CALL($$$ARGS)
+  not:
+    inside:
+      kind: for_statement

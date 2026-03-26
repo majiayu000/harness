@@ -159,7 +159,6 @@ function renderBoard(tasks) {
 
   COLUMNS.forEach(col => {
     const items = grouped[col.key];
-    if (items.length === 0) return;
     const div = document.createElement("div");
     div.className = "column";
     div.innerHTML =
@@ -167,7 +166,11 @@ function renderBoard(tasks) {
         `<span class="column-title">${col.label}</span>` +
         `<span class="column-count">${items.length}</span>` +
       `</div>`;
-    items.forEach(task => div.appendChild(renderCard(task, col.key)));
+    if (items.length === 0) {
+      div.innerHTML += '<p class="empty-state">No tasks</p>';
+    } else {
+      items.forEach(task => div.appendChild(renderCard(task, col.key)));
+    }
     row.appendChild(div);
   });
 
@@ -275,7 +278,8 @@ function renderCard(task, status) {
   if (task.pr_url) {
     const match = task.pr_url.match(/\/pull\/(\d+)/);
     const label = match ? "PR #" + match[1] : "PR";
-    html += `<div class="task-pr"><a href="${escapeHtml(task.pr_url)}" target="_blank" onclick="event.stopPropagation()">${label}</a></div>`;
+    const safeCardUrl = (task.pr_url.startsWith("https://") || task.pr_url.startsWith("http://")) ? escapeHtml(task.pr_url) : "#";
+    html += `<div class="task-pr"><a href="${safeCardUrl}" target="_blank" onclick="event.stopPropagation()">${label}</a></div>`;
   }
 
   if (task.error) {
@@ -345,7 +349,8 @@ function showDetail(task) {
     const label = match ? "PR #" + match[1] : "View PR";
     body += `<div class="detail-section">`;
     body += `<div class="detail-section-title">Pull Request</div>`;
-    body += `<a href="${escapeHtml(task.pr_url)}" target="_blank" class="detail-link">${escapeHtml(label)} \u2197</a>`;
+    const safeUrl = (task.pr_url.startsWith("https://") || task.pr_url.startsWith("http://")) ? escapeHtml(task.pr_url) : "#";
+    body += `<a href="${safeUrl}" target="_blank" class="detail-link">${escapeHtml(label)} \u2197</a>`;
     body += `</div>`;
   }
 
