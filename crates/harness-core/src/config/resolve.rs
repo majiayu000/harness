@@ -42,6 +42,9 @@ pub fn resolve_config(server: &HarnessConfig, project: &ProjectConfig) -> Resolv
         if let Some(cmd) = &proj_review.bot_command {
             review.review_bot_command = cmd.clone();
         }
+        if let Some(name) = &proj_review.reviewer_name {
+            review.reviewer_name = name.clone();
+        }
     }
 
     let mut concurrency = server.concurrency.clone();
@@ -127,6 +130,7 @@ mod tests {
             review: Some(ProjectReviewConfig {
                 enabled: Some(true),
                 bot_command: None,
+                reviewer_name: None,
                 review_wait_secs: None,
                 review_max_rounds: None,
             }),
@@ -149,6 +153,7 @@ mod tests {
             review: Some(ProjectReviewConfig {
                 enabled: Some(true),
                 bot_command: Some("/custom review".to_string()),
+                reviewer_name: None,
                 review_wait_secs: None,
                 review_max_rounds: None,
             }),

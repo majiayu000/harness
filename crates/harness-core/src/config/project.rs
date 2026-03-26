@@ -44,6 +44,10 @@ pub struct ProjectReviewConfig {
     /// Review bot command override (e.g. "/gemini review").
     #[serde(default)]
     pub bot_command: Option<String>,
+    /// Override the GitHub login of the external review bot used in freshness checks.
+    /// Must match the `user.login` field returned by the GitHub reviews API.
+    #[serde(default)]
+    pub reviewer_name: Option<String>,
     /// Override seconds to wait for the review bot before starting the review loop.
     #[serde(default)]
     pub review_wait_secs: Option<u64>,

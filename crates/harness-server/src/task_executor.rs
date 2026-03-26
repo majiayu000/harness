@@ -988,8 +988,16 @@ pub(crate) async fn run_task(
 
     let review_phase_start = Instant::now();
 
-    // Review loop
-    for round in 1..=req.max_rounds {
+    // `prev_fixed` tracks whether a commit was pushed that hasn't been re-reviewed yet.
+    // Starts true if the implementation phase pushed a commit, and is set to true again
+    // whenever a review round produces FIXED (agent commits + pushes). This drives the
+    // freshness check in every round after a fix commit, not just round 1.
+    let mut prev_fixed = agent_pushed_commit;
+
+    // Review loop — WAITING rounds do not consume a numbered round slot so that a slow
+    // review bot cannot exhaust max_rounds before any real review is received.
+    let mut round: u32 = 1;
+    while round <= req.max_rounds {
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let check_req = AgentRequest {
@@ -1000,7 +1008,7 @@ pub(crate) async fn run_task(
                     &review_config.review_bot_command,
                     &slug,
                     &review_config.reviewer_name,
-                    round == 1 && agent_pushed_commit,
+                    prev_fixed,
                 );
                 // Inject capability note — primary enforcement now that --allowedTools
                 // is not passed to the CLI (issue #483).
@@ -1148,12 +1156,18 @@ pub(crate) async fn run_task(
             return Ok(());
         }
 
+        // The agent committed and pushed a fix; mark so the next round requires
+        // re-verification that the review bot has reviewed the new commit.
+        prev_fixed = true;
+
         tracing::info!("PR #{pr_num} not yet approved at round {round}; waiting");
         if round < req.max_rounds {
             waiting_count += 1;
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
             sleep(Duration::from_secs(wait_secs)).await;
         }
+
+        round += 1;
     }
 
     mutate_and_persist(store, task_id, |s| {
