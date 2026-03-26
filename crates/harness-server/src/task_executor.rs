@@ -997,8 +997,14 @@ pub(crate) async fn run_task(
 
     let review_phase_start = Instant::now();
 
-    // Review loop
-    for round in 1..=req.max_rounds {
+    // Review loop — use a manual counter so WAITING responses do not consume a round.
+    // A `for round in 1..=max` loop would increment `round` on every `continue`,
+    // causing WAITING to burn a review slot (issue #550).
+    let mut round: u32 = 1;
+    loop {
+        if round > req.max_rounds {
+            break;
+        }
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let check_req = AgentRequest {
@@ -1084,8 +1090,8 @@ pub(crate) async fn run_task(
         let lgtm = prompts::is_lgtm(&output);
         let waiting = prompts::is_waiting(&output);
 
-        // WAITING means review bot hasn't posted yet (e.g., quota exhausted).
-        // Don't consume a round — just sleep and retry without incrementing.
+        // WAITING means review bot hasn't posted yet — do not consume a round.
+        // `round` is intentionally not incremented here.
         if waiting {
             tracing::info!(
                 round,
@@ -1152,8 +1158,14 @@ pub(crate) async fn run_task(
             return Ok(());
         }
 
-        tracing::info!("PR #{pr_num} not yet approved at round {round}; waiting");
-        if round < req.max_rounds {
+        // Non-WAITING, non-LGTM response consumed this round — advance.
+        round += 1;
+
+        tracing::info!(
+            "PR #{pr_num} not yet approved at round {}; waiting",
+            round - 1
+        );
+        if round <= req.max_rounds {
             waiting_count += 1;
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
             sleep(Duration::from_secs(wait_secs)).await;
