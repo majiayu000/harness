@@ -278,7 +278,8 @@ function renderCard(task, status) {
   if (task.pr_url) {
     const match = task.pr_url.match(/\/pull\/(\d+)/);
     const label = match ? "PR #" + match[1] : "PR";
-    html += `<div class="task-pr"><a href="${escapeHtml(task.pr_url)}" target="_blank" onclick="event.stopPropagation()">${label}</a></div>`;
+    const safeCardUrl = (task.pr_url.startsWith("https://") || task.pr_url.startsWith("http://")) ? escapeHtml(task.pr_url) : "#";
+    html += `<div class="task-pr"><a href="${safeCardUrl}" target="_blank" onclick="event.stopPropagation()">${label}</a></div>`;
   }
 
   if (task.error) {
