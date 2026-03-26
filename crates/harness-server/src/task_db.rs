@@ -80,6 +80,8 @@ pub struct RecoveryResult {
     pub failed: u32,
     /// Tasks that were in `reviewing` / `waiting` / or had a PR and are now `pending` for retry.
     pub requeued: u32,
+    /// Tasks that were `pending` mid-transient-retry at crash time and are now `failed`.
+    pub transient_failed: u32,
 }
 
 pub struct TaskDb {
@@ -161,7 +163,8 @@ impl TaskDb {
     /// - `implementing` / `agent_review` **with a PR** → `pending` (PR exists; safe to continue review)
     /// - `implementing` / `agent_review` **without PR** → `failed` (nothing to resume)
     /// - `reviewing` / `waiting` → `pending` (safe to re-queue; no live agent process)
-    /// - `pending` → unchanged (will be picked up naturally)
+    /// - `pending` with transient-retry error → `failed` (crashed mid-backoff, no PR to resume)
+    /// - `pending` otherwise → unchanged (will be picked up by the re-dispatch loop)
     ///
     /// Diagnostic context is embedded in the `error` field so operators can correlate
     /// recovery events with their original execution state.
@@ -210,16 +213,40 @@ impl TaskDb {
         .await?
         .rows_affected() as u32;
 
+        // Tasks that were mid-transient-retry (status=pending, error starts with
+        // "retrying after transient failure") crashed during the backoff window.
+        // They have no PR yet and no persisted issue/prompt, so they cannot be
+        // re-dispatched. Mark them failed so they don't silently stay pending forever.
+        let transient_failed = sqlx::query(
+            "UPDATE tasks \
+             SET status = 'failed', \
+                 error = 'recovered after restart (was: pending in transient retry): ' \
+                      || COALESCE(error, ''), \
+                 updated_at = datetime('now') \
+             WHERE status = 'pending' \
+               AND error LIKE 'retrying after transient failure%'",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected() as u32;
+
         if requeued_with_pr > 0 {
             tracing::info!(
                 "startup recovery: re-queued {} task(s) that had PRs (was implementing/agent_review)",
                 requeued_with_pr
             );
         }
+        if transient_failed > 0 {
+            tracing::info!(
+                "startup recovery: failed {} task(s) that were pending mid-transient-retry",
+                transient_failed
+            );
+        }
 
         Ok(RecoveryResult {
             failed,
             requeued: requeued_review + requeued_with_pr,
+            transient_failed,
         })
     }
 
