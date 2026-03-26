@@ -506,7 +506,18 @@ function fmtTokens(n) { return n.toLocaleString(); }
 async function fetchTokenUsage() {
   try {
     const resp = await fetch("/api/token-usage", { headers: authHeaders() });
-    if (!resp.ok) return;
+    if (!resp.ok) {
+      let message = `HTTP ${resp.status}`;
+      try {
+        const errorBody = await resp.json();
+        if (errorBody && typeof errorBody.error === "string" && errorBody.error.length > 0) {
+          message = errorBody.error;
+        }
+      } catch {}
+      console.error("token usage fetch failed:", message);
+      renderTokenError(message);
+      return;
+    }
     const data = await resp.json();
     renderTokenMetrics(data);
     renderRequestChart(data.by_hour || {});
@@ -514,7 +525,43 @@ async function fetchTokenUsage() {
     renderTokenDayTable(data.by_day || {});
     renderTokenModelTable(data.by_model || {});
     renderTokenTaskTable(data.task_usage || []);
-  } catch {}
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    console.error("token usage fetch failed:", message);
+    renderTokenError(message);
+  }
+}
+
+function renderTokenError(message) {
+  const metricIds = [
+    "tok-requests",
+    "tok-avg-req",
+    "tok-sessions",
+    "tok-context",
+    "tok-output",
+    "tok-cost",
+  ];
+  metricIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = "ERR";
+  });
+
+  const safe = escapeHtml(message || "token usage unavailable");
+  const chartIds = ["tok-req-chart", "tok-model-chart"];
+  chartIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = `<p class="empty-state">Error: ${safe}</p>`;
+  });
+
+  const tableBodies = {
+    "tok-day-body": 5,
+    "tok-model-body": 5,
+    "tok-task-body": 6,
+  };
+  Object.entries(tableBodies).forEach(([id, cols]) => {
+    const body = document.getElementById(id);
+    if (body) body.innerHTML = `<tr><td colspan="${cols}">Error: ${safe}</td></tr>`;
+  });
 }
 
 function renderTokenMetrics(data) {

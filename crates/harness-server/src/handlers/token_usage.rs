@@ -24,30 +24,59 @@ struct HourModelBucket {
     requests: u64,
 }
 
-fn home_dir() -> PathBuf {
+#[derive(Debug, Clone)]
+struct ParsedUsageRecord {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_create: u64,
+    model: String,
+    day: String,
+    hour: String,
+}
+
+fn home_dir() -> Result<PathBuf, String> {
     std::env::var("HOME")
-        .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .map_err(|_| "HOME is not set; cannot locate token usage source".to_string())
 }
 
 /// GET /api/token-usage — aggregate token usage from Claude CLI session JSONL files.
 ///
 /// Returns hourly request counts, per-model time series, daily totals,
-/// and per-task breakdowns.  Timestamps are taken from each JSONL entry's
+/// and per-task breakdowns. Timestamps are taken from each JSONL entry's
 /// `timestamp` field (ISO-8601) for accurate bucketing.
+///
+/// This endpoint is intentionally strict: malformed source data returns an
+/// explicit error response instead of silently producing partial/empty metrics.
 pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
-    let claude_projects_dir = home_dir().join(".claude").join("projects");
+    let home = match home_dir() {
+        Ok(path) => path,
+        Err(err) => return error_response(err),
+    };
 
+    let claude_projects_dir = home.join(".claude").join("projects");
     if !claude_projects_dir.is_dir() {
-        return (StatusCode::OK, Json(empty_response()));
+        return error_response(format!(
+            "token usage source directory missing: {}",
+            claude_projects_dir.display()
+        ));
     }
 
-    let files = collect_session_files(&claude_projects_dir);
+    let files = match collect_session_files(&claude_projects_dir) {
+        Ok(files) => files,
+        Err(err) => return error_response(err),
+    };
+
+    if files.is_empty() {
+        return error_response(format!(
+            "no token usage JSONL files found under {}",
+            claude_projects_dir.display()
+        ));
+    }
 
     let mut by_day: BTreeMap<String, UsageBucket> = BTreeMap::new();
     let mut by_hour: BTreeMap<String, UsageBucket> = BTreeMap::new();
-    // hour -> model -> tokens/requests
     let mut model_trend: BTreeMap<String, HashMap<String, HourModelBucket>> = BTreeMap::new();
     let mut by_model: HashMap<String, UsageBucket> = HashMap::new();
     let mut totals = UsageBucket::default();
@@ -61,80 +90,73 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
         let task_id = extract_task_id(file);
         let mut sess = UsageBucket::default();
 
-        let Ok(content) = std::fs::read_to_string(file) else {
-            continue;
+        let content = match std::fs::read_to_string(file) {
+            Ok(content) => content,
+            Err(err) => {
+                return error_response(format!(
+                    "failed to read token usage file {}: {err}",
+                    file.display()
+                ));
+            }
         };
 
-        for line in content.lines() {
-            let Ok(entry) = serde_json::from_str::<Value>(line) else {
+        for (idx, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
                 continue;
-            };
-            let Some(usage) = entry.pointer("/message/usage") else {
-                continue;
-            };
-
-            let input = usage["input_tokens"].as_u64().unwrap_or(0);
-            let output = usage["output_tokens"].as_u64().unwrap_or(0);
-            let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-            let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-            let total_ctx = input + cache_read + cache_create;
-
-            let model = entry
-                .pointer("/message/model")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            // model is consumed per-entry above; no session-level tracking needed.
-
-            // Per-entry timestamp for accurate bucketing.
-            let ts = entry["timestamp"].as_str().unwrap_or("");
-            let (day, hour) = parse_timestamp(ts);
-
-            // Hourly request count.
-            if !hour.is_empty() {
-                let hb = by_hour.entry(hour.clone()).or_default();
-                hb.request_count += 1;
-                hb.input_tokens += input;
-                hb.output_tokens += output;
-                hb.cache_read_tokens += cache_read;
-                hb.cache_create_tokens += cache_create;
-
-                // Model trend (hour × model).
-                if !model.is_empty() {
-                    let mb = model_trend
-                        .entry(hour)
-                        .or_default()
-                        .entry(model.clone())
-                        .or_default();
-                    mb.tokens += total_ctx;
-                    mb.requests += 1;
+            }
+            let entry: Value = match serde_json::from_str(line) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    return error_response(format!(
+                        "invalid JSON in {}:{}: {err}",
+                        file.display(),
+                        idx + 1
+                    ));
                 }
-            }
+            };
 
-            // Daily.
-            if !day.is_empty() {
-                let db = by_day.entry(day).or_default();
-                db.request_count += 1;
-                db.input_tokens += input;
-                db.output_tokens += output;
-                db.cache_read_tokens += cache_read;
-                db.cache_create_tokens += cache_create;
-            }
+            let ctx = format!("{}:{}", file.display(), idx + 1);
+            let parsed = match parse_usage_record(&entry, &ctx) {
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
+                Err(err) => return error_response(err),
+            };
 
-            // By model.
-            if !model.is_empty() {
-                let mb = by_model.entry(model).or_default();
-                mb.request_count += 1;
-                mb.input_tokens += input;
-                mb.output_tokens += output;
-                mb.cache_read_tokens += cache_read;
-                mb.cache_create_tokens += cache_create;
-            }
+            let total_ctx = parsed.input + parsed.cache_read + parsed.cache_create;
 
-            sess.input_tokens += input;
-            sess.output_tokens += output;
-            sess.cache_read_tokens += cache_read;
-            sess.cache_create_tokens += cache_create;
+            let hb = by_hour.entry(parsed.hour.clone()).or_default();
+            hb.request_count += 1;
+            hb.input_tokens += parsed.input;
+            hb.output_tokens += parsed.output;
+            hb.cache_read_tokens += parsed.cache_read;
+            hb.cache_create_tokens += parsed.cache_create;
+
+            let mb = model_trend
+                .entry(parsed.hour.clone())
+                .or_default()
+                .entry(parsed.model.clone())
+                .or_default();
+            mb.tokens += total_ctx;
+            mb.requests += 1;
+
+            let db = by_day.entry(parsed.day).or_default();
+            db.request_count += 1;
+            db.input_tokens += parsed.input;
+            db.output_tokens += parsed.output;
+            db.cache_read_tokens += parsed.cache_read;
+            db.cache_create_tokens += parsed.cache_create;
+
+            let by_model_bucket = by_model.entry(parsed.model).or_default();
+            by_model_bucket.request_count += 1;
+            by_model_bucket.input_tokens += parsed.input;
+            by_model_bucket.output_tokens += parsed.output;
+            by_model_bucket.cache_read_tokens += parsed.cache_read;
+            by_model_bucket.cache_create_tokens += parsed.cache_create;
+
+            sess.input_tokens += parsed.input;
+            sess.output_tokens += parsed.output;
+            sess.cache_read_tokens += parsed.cache_read;
+            sess.cache_create_tokens += parsed.cache_create;
             sess.request_count += 1;
         }
 
@@ -152,13 +174,8 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
         accumulate(&mut totals, &sess);
     }
 
-    // Fill session_count for by_model (each file is one session).
-    // Already tracked request_count per model above; session_count
-    // would require a separate pass — skip for now.
-
     let cost = estimate_cost(&totals);
 
-    // Build task_usage with metadata.
     let task_usage_vec: Vec<Value> = {
         let mut items: Vec<_> = task_usage.into_iter().collect();
         items.sort_by(|a, b| {
@@ -174,7 +191,7 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
                 let ctx = usage.input_tokens + usage.cache_read_tokens + usage.cache_create_tokens;
                 serde_json::json!({
                     "task_id": tid,
-                    "repo": task_meta.map(|t| t.repo.as_deref().unwrap_or("")),
+                    "repo": task_meta.and_then(|t| t.repo.clone()),
                     "status": task_meta.map(|t| format!("{:?}", t.status)),
                     "context_tokens": ctx,
                     "output_tokens": usage.output_tokens,
@@ -185,7 +202,6 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
             .collect()
     };
 
-    // Collect all model names for consistent legend ordering.
     let mut all_models: Vec<String> = by_model.keys().cloned().collect();
     all_models.sort_by(|a, b| {
         let ta = by_model[a].input_tokens + by_model[a].cache_read_tokens;
@@ -193,7 +209,6 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
         tb.cmp(&ta)
     });
 
-    // Total context (the real number the user cares about).
     let total_context = totals.input_tokens + totals.cache_read_tokens + totals.cache_create_tokens;
 
     let body = serde_json::json!({
@@ -213,13 +228,59 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
     (StatusCode::OK, Json(body))
 }
 
-fn empty_response() -> Value {
-    serde_json::json!({
-        "by_day": {}, "by_hour": {}, "model_trend": {}, "by_model": {},
-        "models": [], "totals": UsageBucket::default(),
-        "total_context": 0, "total_requests": 0,
-        "estimated_cost_usd": 0.0, "task_usage": [], "session_count": 0,
-    })
+fn error_response(message: String) -> (StatusCode, Json<Value>) {
+    tracing::error!("token_usage: {message}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": message })),
+    )
+}
+
+fn parse_usage_record(entry: &Value, ctx: &str) -> Result<Option<ParsedUsageRecord>, String> {
+    let Some(usage) = entry.pointer("/message/usage") else {
+        return Ok(None);
+    };
+
+    let input = required_u64(usage, "input_tokens", ctx)?;
+    let output = required_u64(usage, "output_tokens", ctx)?;
+    let cache_read = required_u64(usage, "cache_read_input_tokens", ctx)?;
+    let cache_create = required_u64(usage, "cache_creation_input_tokens", ctx)?;
+
+    let model = required_str_at_pointer(entry, "/message/model", ctx)?.to_string();
+    let ts = required_str_field(entry, "timestamp", ctx)?;
+    let (day, hour) = parse_timestamp(ts).map_err(|err| format!("{ctx}: {err}"))?;
+
+    Ok(Some(ParsedUsageRecord {
+        input,
+        output,
+        cache_read,
+        cache_create,
+        model,
+        day,
+        hour,
+    }))
+}
+
+fn required_u64(obj: &Value, key: &str, ctx: &str) -> Result<u64, String> {
+    obj.get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{ctx}: missing or invalid usage field '{key}'"))
+}
+
+fn required_str_field<'a>(obj: &'a Value, key: &str, ctx: &str) -> Result<&'a str, String> {
+    obj.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{ctx}: missing or invalid string field '{key}'"))
+}
+
+fn required_str_at_pointer<'a>(
+    obj: &'a Value,
+    pointer: &str,
+    ctx: &str,
+) -> Result<&'a str, String> {
+    obj.pointer(pointer)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{ctx}: missing or invalid string field at '{pointer}'"))
 }
 
 fn accumulate(dst: &mut UsageBucket, src: &UsageBucket) {
@@ -247,22 +308,37 @@ fn estimate_cost(usage: &UsageBucket) -> f64 {
 }
 
 /// Parse an ISO-8601 timestamp into (YYYY-MM-DD, YYYY-MM-DD HH:00).
-fn parse_timestamp(ts: &str) -> (String, String) {
-    // "2026-03-26T03:05:56.523Z" → day="2026-03-26", hour="2026-03-26 03:00"
+fn parse_timestamp(ts: &str) -> Result<(String, String), String> {
     if ts.len() < 13 {
-        return (String::new(), String::new());
+        return Err(format!("invalid timestamp '{ts}': too short"));
     }
-    let day = ts[..10].to_string();
-    let hour = format!("{} {}:00", &ts[..10], &ts[11..13]);
-    (day, hour)
+    if ts.as_bytes().get(10) != Some(&b'T') {
+        return Err(format!("invalid timestamp '{ts}': missing 'T' separator"));
+    }
+    let day = &ts[..10];
+    let hour = &ts[11..13];
+    if !hour.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("invalid timestamp '{ts}': hour is not numeric"));
+    }
+    Ok((day.to_string(), format!("{day} {hour}:00")))
 }
 
-fn collect_session_files(claude_projects_dir: &Path) -> Vec<PathBuf> {
+fn collect_session_files(claude_projects_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
-    let Ok(entries) = std::fs::read_dir(claude_projects_dir) else {
-        return files;
-    };
-    for entry in entries.flatten() {
+    let entries = std::fs::read_dir(claude_projects_dir).map_err(|err| {
+        format!(
+            "failed to read token usage root directory {}: {err}",
+            claude_projects_dir.display()
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            format!(
+                "failed to iterate token usage root directory {}: {err}",
+                claude_projects_dir.display()
+            )
+        })?;
         let name = entry.file_name();
         if !name.to_string_lossy().contains("harness-workspaces") {
             continue;
@@ -271,32 +347,47 @@ fn collect_session_files(claude_projects_dir: &Path) -> Vec<PathBuf> {
         if !dir.is_dir() {
             continue;
         }
-        collect_jsonl_in_dir(&dir, &mut files);
-        if let Ok(sub_entries) = std::fs::read_dir(&dir) {
-            for sub in sub_entries.flatten() {
-                let sub_path = sub.path();
-                if sub_path.is_dir() {
-                    let subagents_dir = sub_path.join("subagents");
-                    if subagents_dir.is_dir() {
-                        collect_jsonl_in_dir(&subagents_dir, &mut files);
-                    }
+        collect_jsonl_in_dir(&dir, &mut files)?;
+
+        let sub_entries = std::fs::read_dir(&dir)
+            .map_err(|err| format!("failed to read {}: {err}", dir.display()))?;
+        for sub in sub_entries {
+            let sub = sub.map_err(|err| format!("failed to iterate {}: {err}", dir.display()))?;
+            let sub_path = sub.path();
+            if sub_path.is_dir() {
+                let subagents_dir = sub_path.join("subagents");
+                if subagents_dir.is_dir() {
+                    collect_jsonl_in_dir(&subagents_dir, &mut files)?;
                 }
             }
         }
     }
-    files
+
+    Ok(files)
 }
 
-fn collect_jsonl_in_dir(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn collect_jsonl_in_dir(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|err| {
+        format!(
+            "failed to read token usage directory {}: {err}",
+            dir.display()
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            format!(
+                "failed to iterate token usage directory {}: {err}",
+                dir.display()
+            )
+        })?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             out.push(path);
         }
     }
+
+    Ok(())
 }
 
 fn extract_task_id(path: &Path) -> Option<String> {
@@ -322,5 +413,57 @@ fn extract_task_uuid(name: &str) -> Option<String> {
         Some(after[..36].to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_timestamp_rejects_invalid_input() {
+        assert!(parse_timestamp("invalid").is_err());
+        assert!(parse_timestamp("2026-03-26 03:05:56Z").is_err());
+    }
+
+    #[test]
+    fn parse_usage_record_requires_usage_fields() {
+        let entry = serde_json::json!({
+            "timestamp": "2026-03-26T03:05:56.523Z",
+            "message": {
+                "model": "claude-sonnet",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 50
+                }
+            }
+        });
+        let err = parse_usage_record(&entry, "test:1").unwrap_err();
+        assert!(err.contains("cache_creation_input_tokens"));
+    }
+
+    #[test]
+    fn parse_usage_record_accepts_valid_usage_line() {
+        let entry = serde_json::json!({
+            "timestamp": "2026-03-26T03:05:56.523Z",
+            "message": {
+                "model": "claude-sonnet",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 50,
+                    "cache_creation_input_tokens": 10
+                }
+            }
+        });
+
+        let parsed = parse_usage_record(&entry, "test:1").unwrap().unwrap();
+        assert_eq!(parsed.input, 100);
+        assert_eq!(parsed.output, 20);
+        assert_eq!(parsed.cache_read, 50);
+        assert_eq!(parsed.cache_create, 10);
+        assert_eq!(parsed.day, "2026-03-26");
+        assert_eq!(parsed.hour, "2026-03-26 03:00");
     }
 }
