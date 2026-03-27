@@ -89,7 +89,13 @@ impl std::fmt::Display for SandboxMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentsConfig {
+    /// Default agent name. Use `"auto"` to select the first registered agent.
+    #[serde(default = "default_default_agent")]
     pub default_agent: String,
+    /// Optional priority list for complex/critical task routing.
+    /// Example: `["codex", "claude"]`.
+    #[serde(default)]
+    pub complexity_preferred_agents: Vec<String>,
     pub claude: ClaudeAgentConfig,
     pub codex: CodexAgentConfig,
     pub anthropic_api: AnthropicApiConfig,
@@ -143,7 +149,8 @@ impl AgentsConfig {
 impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
-            default_agent: "claude".to_string(),
+            default_agent: default_default_agent(),
+            complexity_preferred_agents: Vec::new(),
             claude: ClaudeAgentConfig::default(),
             codex: CodexAgentConfig::default(),
             anthropic_api: AnthropicApiConfig::default(),
@@ -155,6 +162,10 @@ impl Default for AgentsConfig {
             stream_timeout_secs: default_stream_timeout_secs(),
         }
     }
+}
+
+fn default_default_agent() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,14 +180,12 @@ pub struct AgentReviewConfig {
     /// Command to trigger review bot re-review (e.g. "/gemini review", "/reviewbot run").
     #[serde(default = "default_review_bot_command")]
     pub review_bot_command: String,
-    /// GitHub login of the external review bot used to verify re-reviews after a fix commit.
-    /// Must match the `user.login` field returned by the GitHub reviews API.
-    /// Default: "gemini-code-assist[bot]".
-    #[serde(default = "default_reviewer_name")]
-    pub reviewer_name: String,
     /// Automatically post review_bot_command as a PR comment when a task completes with a PR.
     #[serde(default = "default_review_bot_auto_trigger")]
     pub review_bot_auto_trigger: bool,
+    /// GitHub login of the review bot (used for freshness checks in review loop).
+    #[serde(default = "default_reviewer_name")]
+    pub reviewer_name: String,
 }
 
 impl Default for AgentReviewConfig {
@@ -186,18 +195,18 @@ impl Default for AgentReviewConfig {
             reviewer_agent: String::new(),
             max_rounds: default_max_agent_review_rounds(),
             review_bot_command: default_review_bot_command(),
-            reviewer_name: default_reviewer_name(),
             review_bot_auto_trigger: default_review_bot_auto_trigger(),
+            reviewer_name: default_reviewer_name(),
         }
     }
 }
 
-fn default_review_bot_command() -> String {
-    "/gemini review".to_string()
-}
-
 fn default_reviewer_name() -> String {
     "gemini-code-assist[bot]".to_string()
+}
+
+fn default_review_bot_command() -> String {
+    "/gemini review".to_string()
 }
 
 fn default_review_bot_auto_trigger() -> bool {

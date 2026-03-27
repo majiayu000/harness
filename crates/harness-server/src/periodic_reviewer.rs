@@ -2,7 +2,7 @@ use crate::http::task_routes;
 use crate::http::AppState;
 use crate::task_runner::CreateTaskRequest;
 use chrono::{DateTime, Utc};
-use harness_core::{Decision, Event, EventFilters, ReviewConfig, SessionId};
+use harness_core::{Decision, Event, EventFilters, ReviewConfig, ReviewStrategy, SessionId};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -115,41 +115,88 @@ async fn run_review_tick(
         project_cfg.review_type.as_str(),
     );
 
-    // --- Phase 1: Parallel review by Claude + Codex ---
-    let claude_req = CreateTaskRequest {
+    let review_agent = config
+        .agent
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            state
+                .core
+                .server
+                .agent_registry
+                .resolved_default_agent_name()
+                .map(str::to_string)
+        })
+        .ok_or_else(|| anyhow::anyhow!("no default review agent available"))?;
+    let registered_agents: Vec<String> = state
+        .core
+        .server
+        .agent_registry
+        .list()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let secondary_agent = if config.strategy == ReviewStrategy::Cross {
+        pick_secondary_review_agent(&review_agent, &registered_agents, |agent| {
+            state.core.server.agent_registry.get(agent).is_some()
+        })
+    } else {
+        None
+    };
+    if config.strategy == ReviewStrategy::Cross && secondary_agent.is_none() {
+        tracing::warn!(
+            primary_agent = %review_agent,
+            "scheduler: review.strategy=cross but no secondary reviewer available; degrading to single"
+        );
+    }
+
+    let review_req = CreateTaskRequest {
         prompt: Some(base_prompt.clone()),
-        agent: config.agent.clone(),
+        agent: Some(review_agent.clone()),
         turn_timeout_secs: config.timeout_secs,
         source: Some("periodic_review".to_string()),
         ..CreateTaskRequest::default()
     };
 
-    let has_codex = state.core.server.agent_registry.get("codex").is_some();
-    let codex_req = if has_codex {
-        Some(CreateTaskRequest {
+    let primary_review_id = task_routes::enqueue_task(state, review_req)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to enqueue periodic review: {e}"))?;
+    tracing::info!(
+        task_id = %primary_review_id,
+        agent = %review_agent,
+        strategy = ?config.strategy,
+        "scheduler: primary periodic review enqueued"
+    );
+
+    let secondary_review_id = if let Some(agent) = secondary_agent.clone() {
+        let req = CreateTaskRequest {
             prompt: Some(base_prompt),
-            agent: Some("codex".to_string()),
+            agent: Some(agent.clone()),
             turn_timeout_secs: config.timeout_secs,
             source: Some("periodic_review".to_string()),
             ..CreateTaskRequest::default()
-        })
+        };
+        match task_routes::enqueue_task(state, req).await {
+            Ok(task_id) => {
+                tracing::info!(
+                    task_id = %task_id,
+                    agent = %agent,
+                    "scheduler: secondary periodic review enqueued"
+                );
+                Some(task_id)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    agent = %agent,
+                    error = %err,
+                    "scheduler: failed to enqueue secondary review; continuing with primary only"
+                );
+                None
+            }
+        }
     } else {
-        None
-    };
-
-    let claude_id = task_routes::enqueue_task(state, claude_req)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to enqueue claude review: {e}"))?;
-    tracing::info!(task_id = %claude_id, "scheduler: claude review enqueued");
-
-    let codex_id = if let Some(req) = codex_req {
-        let id = task_routes::enqueue_task(state, req)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to enqueue codex review: {e}"))?;
-        tracing::info!(task_id = %id, "scheduler: codex review enqueued");
-        Some(id)
-    } else {
-        tracing::info!("scheduler: codex not configured, single-model review");
         None
     };
 
@@ -174,57 +221,74 @@ async fn run_review_tick(
         }
     }
 
-    // --- Phase 2: Wait for both, then synthesize ---
+    // Wait for review completion, optionally run synthesis, then persist findings.
     let store = state.core.tasks.clone();
     let review_store = state.observability.review_store.clone();
     let timeout_secs = config.timeout_secs;
-    let state_clone = state.clone();
-    let synth_agent = config.agent.clone();
-    let synth_timeout = config.timeout_secs;
+    let primary_agent_for_synthesis = review_agent.clone();
+    let secondary_agent_name = secondary_agent.clone();
+    let state_for_synthesis = state.clone();
     let handle = tokio::spawn(async move {
-        let claude_output = poll_task_output(&store, &claude_id, timeout_secs).await;
-        let codex_output = match &codex_id {
-            Some(id) => poll_task_output(&store, id, timeout_secs).await,
-            None => None,
-        };
-
+        let primary_output = poll_task_output(&store, &primary_review_id, timeout_secs).await;
         tracing::info!(
-            claude_len = claude_output.as_ref().map(|s| s.len()).unwrap_or(0),
-            codex_len = codex_output.as_ref().map(|s| s.len()).unwrap_or(0),
-            "scheduler: both reviews complete"
+            task_id = %primary_review_id,
+            output_len = primary_output.as_ref().map(|s| s.len()).unwrap_or(0),
+            "scheduler: primary periodic review completed"
         );
 
-        // Synthesize: Claude merges both reviews into final output.
-        let final_output = if let Some(codex_out) = codex_output {
-            let claude_out = claude_output.unwrap_or_default();
-            let synth_prompt =
-                harness_core::prompts::review_synthesis_prompt(&claude_out, &codex_out);
-            let synth_req = CreateTaskRequest {
-                prompt: Some(synth_prompt),
-                agent: synth_agent,
-                turn_timeout_secs: synth_timeout,
-                source: Some("periodic_review".to_string()),
-                ..CreateTaskRequest::default()
-            };
-            match task_routes::enqueue_task(&state_clone, synth_req).await {
-                Ok(synth_id) => {
-                    tracing::info!(task_id = %synth_id, "scheduler: synthesis task enqueued");
-                    poll_task_output(&store, &synth_id, synth_timeout).await
-                }
-                Err(e) => {
-                    tracing::error!("scheduler: failed to enqueue synthesis: {e}");
-                    Some(claude_out)
-                }
-            }
-        } else {
-            claude_output
-        };
-
-        // Persist findings from the final output.
-        let Some(output) = final_output else {
-            tracing::error!(
-                "scheduler: periodic review cycle produced no output — no review output to parse"
+        let mut final_task_id = primary_review_id.clone();
+        let mut final_output = primary_output.clone();
+        if let (Some(secondary_id), Some(secondary_name)) =
+            (secondary_review_id.as_ref(), secondary_agent_name.as_ref())
+        {
+            let secondary_output = poll_task_output(&store, secondary_id, timeout_secs).await;
+            tracing::info!(
+                task_id = %secondary_id,
+                agent = %secondary_name,
+                output_len = secondary_output.as_ref().map(|s| s.len()).unwrap_or(0),
+                "scheduler: secondary periodic review completed"
             );
+
+            if let (Some(primary_text), Some(secondary_text)) =
+                (primary_output.as_ref(), secondary_output.as_ref())
+            {
+                let synthesis_prompt = harness_core::prompts::review_synthesis_prompt_with_agents(
+                    &review_agent,
+                    primary_text,
+                    secondary_name,
+                    secondary_text,
+                );
+                let synth_req = CreateTaskRequest {
+                    prompt: Some(synthesis_prompt),
+                    agent: Some(primary_agent_for_synthesis.clone()),
+                    turn_timeout_secs: timeout_secs,
+                    source: Some("periodic_review".to_string()),
+                    ..CreateTaskRequest::default()
+                };
+                match task_routes::enqueue_task(&state_for_synthesis, synth_req).await {
+                    Ok(synth_id) => {
+                        tracing::info!(
+                            task_id = %synth_id,
+                            agent = %primary_agent_for_synthesis,
+                            "scheduler: synthesis review enqueued"
+                        );
+                        final_task_id = synth_id.clone();
+                        final_output = poll_task_output(&store, &synth_id, timeout_secs).await;
+                    }
+                    Err(err) => {
+                        tracing::warn!("scheduler: failed to enqueue synthesis review: {err}");
+                        final_output = primary_output;
+                    }
+                }
+            } else if primary_output.is_none() {
+                // Primary failed/no output: fall back to secondary output if available.
+                final_task_id = secondary_id.clone();
+                final_output = secondary_output;
+            }
+        }
+
+        let Some(output) = final_output else {
+            tracing::warn!("scheduler: no review output to parse");
             return;
         };
         match crate::review_store::parse_review_output(&output) {
@@ -235,14 +299,14 @@ async fn run_review_tick(
                     "scheduler: periodic review parsed"
                 );
                 if let Some(ref rs) = review_store {
-                    match rs.persist_findings(&claude_id.0, &review.findings).await {
+                    match rs
+                        .persist_findings(&final_task_id.0, &review.findings)
+                        .await
+                    {
                         Ok(n) => {
                             tracing::info!(new_findings = n, "scheduler: review findings persisted")
                         }
-                        Err(e) => tracing::error!(
-                            task_id = %claude_id,
-                            "scheduler: failed to persist findings: {e}"
-                        ),
+                        Err(e) => tracing::warn!("scheduler: failed to persist findings: {e}"),
                     }
                 }
             }
@@ -254,6 +318,20 @@ async fn run_review_tick(
     *poll_handle.lock().await = Some(handle);
 
     Ok(())
+}
+
+fn pick_secondary_review_agent<F>(
+    primary_agent: &str,
+    candidates: &[String],
+    mut is_available: F,
+) -> Option<String>
+where
+    F: FnMut(&str) -> bool,
+{
+    candidates
+        .iter()
+        .find(|agent| agent.as_str() != primary_agent && is_available(agent.as_str()))
+        .cloned()
 }
 
 /// Poll a task until it reaches a terminal state, then extract its output.
@@ -268,7 +346,7 @@ async fn poll_task_output(
     loop {
         sleep(poll_interval).await;
         if start.elapsed() > max_wait {
-            tracing::error!(task_id = %task_id, "scheduler: periodic review cycle produced no output — poll_task_output timed out");
+            tracing::warn!(task_id = %task_id, "poll_task_output: timed out");
             return None;
         }
         let Some(task) = store.get(task_id) else {
@@ -287,7 +365,7 @@ async fn poll_task_output(
             .collect::<Vec<_>>()
             .join("\n");
         if output.is_empty() {
-            tracing::error!(task_id = %task_id, "scheduler: periodic review cycle produced no output — poll_task_output completed with empty output");
+            tracing::warn!(task_id = %task_id, "poll_task_output: completed but no output");
             return None;
         }
         return Some(output);
@@ -307,6 +385,7 @@ mod tests {
         assert!(config.interval_secs.is_none());
         assert_eq!(config.timeout_secs, 900);
         assert!(config.agent.is_none());
+        assert_eq!(config.strategy, ReviewStrategy::Single);
     }
 
     #[test]
@@ -316,14 +395,46 @@ mod tests {
             run_on_startup: true,
             interval_hours: 12,
             interval_secs: None,
-            agent: Some("claude".to_string()),
+            agent: Some("codex".to_string()),
+            strategy: ReviewStrategy::Cross,
             timeout_secs: 600,
         };
         assert!(config.enabled);
         assert!(config.run_on_startup);
         assert_eq!(config.interval_hours, 12);
-        assert_eq!(config.agent.as_deref(), Some("claude"));
+        assert_eq!(config.agent.as_deref(), Some("codex"));
+        assert_eq!(config.strategy, ReviewStrategy::Cross);
         assert_eq!(config.timeout_secs, 600);
+    }
+
+    #[test]
+    fn pick_secondary_review_agent_prefers_claude_for_codex_primary() {
+        let candidates = vec![
+            "codex".to_string(),
+            "claude".to_string(),
+            "anthropic-api".to_string(),
+        ];
+        let agent = pick_secondary_review_agent("codex", &candidates, |name| name == "claude");
+        assert_eq!(agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn pick_secondary_review_agent_prefers_codex_for_claude_primary() {
+        let candidates = vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "anthropic-api".to_string(),
+        ];
+        let agent = pick_secondary_review_agent("claude", &candidates, |name| name == "codex");
+        assert_eq!(agent.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn pick_secondary_review_agent_falls_back_to_anthropic_api() {
+        let candidates = vec!["codex".to_string(), "anthropic-api".to_string()];
+        let agent =
+            pick_secondary_review_agent("codex", &candidates, |name| name == "anthropic-api");
+        assert_eq!(agent.as_deref(), Some("anthropic-api"));
     }
 
     #[test]

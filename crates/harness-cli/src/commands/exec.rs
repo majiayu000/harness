@@ -351,6 +351,7 @@ pub async fn run(
     };
 
     let mut agent_registry = harness_agents::AgentRegistry::new(&config.agents.default_agent);
+    agent_registry.set_complexity_preferences(config.agents.complexity_preferred_agents.clone());
     agent_registry.register(
         "claude",
         Arc::new(
@@ -384,7 +385,12 @@ pub async fn run(
         );
     }
 
-    let selected_agent = agent_registry.get(&agent).ok_or_else(|| {
+    let selected_agent = if agent.eq_ignore_ascii_case("auto") {
+        agent_registry.default_agent()
+    } else {
+        agent_registry.get(&agent)
+    }
+    .ok_or_else(|| {
         anyhow::anyhow!(
             "unknown exec agent `{agent}`; supported values are: {}",
             agent_registry.list().join(", ")

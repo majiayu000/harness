@@ -1173,6 +1173,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .route("/api/dashboard", get(crate::handlers::dashboard::dashboard))
         .route("/api/intake", get(intake_status))
         .route(
+            "/api/token-usage",
+            get(crate::handlers::token_usage::token_usage),
+        )
+        .route(
             "/webhook",
             post(github_webhook).layer(DefaultBodyLimit::max(
                 state.core.server.config.server.max_webhook_body_bytes,

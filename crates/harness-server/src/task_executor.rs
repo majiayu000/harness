@@ -1065,6 +1065,11 @@ pub(crate) async fn run_task(
     // whenever a review round produces FIXED (agent commits + pushes). This drives the
     // freshness check in every round after a fix commit, not just round 1.
     let mut prev_fixed = agent_pushed_commit;
+    let repo_slug = prompts::repo_slug_from_pr_url(pr_url.as_deref());
+
+    // Convergence tracking: detect when issue count stops decreasing.
+    let mut issue_counts: Vec<Option<u32>> = Vec::new();
+    let mut impasse = false;
 
     // Review loop.
     // Use an explicit counter so WAITING responses don't consume a round — `continue`
@@ -1074,27 +1079,19 @@ pub(crate) async fn run_task(
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let check_req = AgentRequest {
-            prompt: {
-                let slug = prompts::repo_slug_from_pr_url(pr_url.as_deref());
-                let base = prompts::check_existing_pr(
-                    pr_num,
-                    &review_config.review_bot_command,
-                    &slug,
-                    &review_config.reviewer_name,
-                    prev_fixed,
-                );
-                // Inject capability note — primary enforcement now that --allowedTools
-                // is not passed to the CLI (issue #483).
-                if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
-                    format!("{note}\n\n{base}")
-                } else {
-                    base
-                }
-            },
+            prompt: prompts::review_prompt(
+                req.issue,
+                pr_num,
+                round,
+                prev_fixed,
+                &review_config.review_bot_command,
+                &review_config.reviewer_name,
+                &repo_slug,
+                impasse,
+            ),
             project_root: project.clone(),
             context: context_items.clone(),
-            execution_phase: Some(ExecutionPhase::Validation),
-            allowed_tools: restricted_tools(CapabilityProfile::ReadOnly)?,
+            execution_phase: Some(ExecutionPhase::Execution),
             env_vars: cargo_env.clone(),
             ..Default::default()
         };
@@ -1160,6 +1157,30 @@ pub(crate) async fn run_task(
 
         let lgtm = prompts::is_lgtm(&output);
         let waiting = prompts::is_waiting(&output);
+        let fixed = !lgtm && !waiting;
+
+        // Track issue count for convergence detection.
+        let current_issues = prompts::parse_issue_count(&output);
+        if !waiting {
+            issue_counts.push(current_issues);
+        }
+
+        // Convergence check: if the last 3 rounds all reported issues and the
+        // count is not decreasing, enter impasse mode (critical-only fixes).
+        if issue_counts.len() >= 3 && !impasse {
+            let tail = &issue_counts[issue_counts.len() - 3..];
+            if let [Some(a), Some(b), Some(c)] = tail {
+                if c >= a && c >= b {
+                    impasse = true;
+                    tracing::warn!(
+                        task_id = %task_id,
+                        round,
+                        issues = %format_args!("[{a}, {b}, {c}]"),
+                        "review loop impasse detected: issue count not decreasing"
+                    );
+                }
+            }
+        }
 
         // WAITING means review bot hasn't posted yet (e.g., quota exhausted).
         // Don't consume a round — just sleep and retry without incrementing.
@@ -1175,10 +1196,11 @@ pub(crate) async fn run_task(
         }
 
         mutate_and_persist(store, task_id, |s| {
+            let result_label = if lgtm { "lgtm" } else { "fixed" };
             s.rounds.push(RoundResult {
                 turn: round,
                 action: "review".into(),
-                result: if lgtm { "lgtm".into() } else { "fixed".into() },
+                result: result_label.into(),
                 detail: None,
             });
         })
@@ -1196,11 +1218,8 @@ pub(crate) async fn run_task(
             },
         );
         ev.detail = Some(format!("pr={pr_num}"));
-        ev.reason = Some(if lgtm {
-            format!("round {round}: lgtm")
-        } else {
-            format!("round {round}: fixed")
-        });
+        let result_label = if lgtm { "lgtm" } else { "fixed" };
+        ev.reason = Some(format!("round {round}: {result_label}"));
         if let Err(e) = events.log(&ev).await {
             tracing::warn!("failed to log pr_review event: {e}");
         }
@@ -1229,11 +1248,10 @@ pub(crate) async fn run_task(
             return Ok(());
         }
 
-        // The agent committed and pushed a fix; mark so the next round requires
-        // re-verification that the review bot has reviewed the new commit.
-        prev_fixed = true;
-
-        tracing::info!("PR #{pr_num} not yet approved at round {round}; waiting");
+        // Track whether this round produced a fix so the next round enforces
+        // freshness checks against new reviewer feedback.
+        prev_fixed = fixed;
+        tracing::info!("PR #{pr_num} fixed at round {round}; waiting for bot re-review");
         if round < max_rounds {
             waiting_count += 1;
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
@@ -1242,15 +1260,39 @@ pub(crate) async fn run_task(
         round += 1;
     }
 
-    mutate_and_persist(store, task_id, |s| {
-        s.status = TaskStatus::Failed;
-        s.turn = max_rounds.saturating_add(1);
-        s.error = Some(format!(
-            "Task did not receive LGTM after {} review rounds.",
-            max_rounds
-        ));
-    })
-    .await?;
+    // Graduated exit: if the last round had few issues remaining, mark as done
+    // with a warning instead of outright failure — the PR is likely mergeable.
+    let last_issue_count = issue_counts.iter().rev().find_map(|c| *c);
+    let graduated = last_issue_count.map_or(false, |n| n <= 2);
+
+    if graduated {
+        tracing::info!(
+            task_id = %task_id,
+            remaining_issues = last_issue_count.unwrap_or(0),
+            "review loop exhausted but few issues remain — marking done with warning"
+        );
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Done;
+            s.turn = max_rounds.saturating_add(1);
+            s.error = Some(format!(
+                "Graduated: LGTM not received after {} rounds but only {} issues remain.",
+                max_rounds,
+                last_issue_count.unwrap_or(0),
+            ));
+        })
+        .await?;
+    } else {
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Failed;
+            s.turn = max_rounds.saturating_add(1);
+            s.error = Some(format!(
+                "Task did not receive LGTM after {} review rounds (last issues: {}).",
+                max_rounds,
+                last_issue_count.map_or("unknown".to_string(), |n| n.to_string()),
+            ));
+        })
+        .await?;
+    }
     tracing::info!(
         task_id = %task_id,
         phase = "reviewing",
@@ -1259,7 +1301,7 @@ pub(crate) async fn run_task(
     );
     tracing::info!(
         task_id = %task_id,
-        status = "failed",
+        status = if graduated { "done" } else { "failed" },
         turns = max_rounds.saturating_add(1),
         pr_url = pr_url.as_deref().unwrap_or(""),
         total_elapsed_secs = task_start.elapsed().as_secs(),

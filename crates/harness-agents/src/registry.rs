@@ -4,34 +4,66 @@ use std::sync::Arc;
 
 pub struct AgentRegistry {
     agents: HashMap<String, Arc<dyn CodeAgent>>,
+    registration_order: Vec<String>,
     default_agent: String,
+    complexity_preferred_agents: Vec<String>,
 }
 
 impl AgentRegistry {
     pub fn new(default_agent: impl Into<String>) -> Self {
         Self {
             agents: HashMap::new(),
+            registration_order: Vec::new(),
             default_agent: default_agent.into(),
+            complexity_preferred_agents: Vec::new(),
         }
     }
 
+    pub fn set_complexity_preferences(&mut self, preferred_agents: Vec<String>) {
+        self.complexity_preferred_agents = preferred_agents
+            .into_iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect();
+    }
+
     pub fn register(&mut self, name: impl Into<String>, agent: Arc<dyn CodeAgent>) {
-        self.agents.insert(name.into(), agent);
+        let name = name.into();
+        if !self.agents.contains_key(&name) {
+            self.registration_order.push(name.clone());
+        }
+        self.agents.insert(name, agent);
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn CodeAgent>> {
         self.agents.get(name).cloned()
     }
 
+    pub fn resolved_default_agent_name(&self) -> Option<&str> {
+        let configured = self.default_agent.trim();
+        if !configured.is_empty()
+            && !configured.eq_ignore_ascii_case("auto")
+            && self.agents.contains_key(configured)
+        {
+            return Some(configured);
+        }
+        self.registration_order
+            .iter()
+            .find(|name| self.agents.contains_key(name.as_str()))
+            .map(String::as_str)
+    }
+
     pub fn default_agent(&self) -> Option<Arc<dyn CodeAgent>> {
-        self.get(&self.default_agent)
+        self.resolved_default_agent_name()
+            .and_then(|name| self.get(name))
     }
 
     pub fn dispatch(&self, task: &TaskClassification) -> harness_core::Result<Arc<dyn CodeAgent>> {
         let preferred = match task.complexity {
-            TaskComplexity::Critical | TaskComplexity::Complex => {
-                self.get("claude").or_else(|| self.get("anthropic-api"))
-            }
+            TaskComplexity::Critical | TaskComplexity::Complex => self
+                .complexity_preferred_agents
+                .iter()
+                .find_map(|name| self.get(name)),
             _ => None,
         };
 
@@ -41,7 +73,7 @@ impl AgentRegistry {
     }
 
     pub fn list(&self) -> Vec<&str> {
-        self.agents.keys().map(|k| k.as_str()).collect()
+        self.registration_order.iter().map(|k| k.as_str()).collect()
     }
 }
 
@@ -147,23 +179,24 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_complex_task_prefers_claude() {
+    fn dispatch_complex_task_prefers_configured_complexity_agent() {
         let mut registry = registry_with_default();
         registry.register(
-            "claude",
+            "worker-x",
             Arc::new(StubAgent {
-                agent_name: "claude",
+                agent_name: "worker-x",
             }),
         );
+        registry.set_complexity_preferences(vec!["worker-x".to_string()]);
 
         let agent = registry
             .dispatch(&classification(TaskComplexity::Complex))
             .unwrap();
-        assert_eq!(agent.name(), "claude");
+        assert_eq!(agent.name(), "worker-x");
     }
 
     #[test]
-    fn dispatch_complex_task_falls_back_to_anthropic_api_when_no_claude() {
+    fn dispatch_complex_task_falls_back_to_default_when_preferred_missing() {
         let mut registry = registry_with_default();
         registry.register(
             "anthropic-api",
@@ -171,22 +204,24 @@ mod tests {
                 agent_name: "anthropic-api",
             }),
         );
+        registry.set_complexity_preferences(vec!["not-registered".to_string()]);
 
         let agent = registry
             .dispatch(&classification(TaskComplexity::Complex))
             .unwrap();
-        assert_eq!(agent.name(), "anthropic-api");
+        assert_eq!(agent.name(), "default-agent");
     }
 
     #[test]
     fn dispatch_simple_task_uses_default_agent() {
         let mut registry = registry_with_default();
         registry.register(
-            "claude",
+            "worker-x",
             Arc::new(StubAgent {
-                agent_name: "claude",
+                agent_name: "worker-x",
             }),
         );
+        registry.set_complexity_preferences(vec!["worker-x".to_string()]);
 
         let agent = registry
             .dispatch(&classification(TaskComplexity::Simple))
@@ -195,51 +230,49 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_critical_task_prefers_claude() {
+    fn dispatch_critical_task_prefers_configured_complexity_agent() {
         let mut registry = registry_with_default();
         registry.register(
-            "claude",
+            "worker-x",
             Arc::new(StubAgent {
-                agent_name: "claude",
+                agent_name: "worker-x",
             }),
         );
+        registry.set_complexity_preferences(vec!["worker-x".to_string()]);
 
         let agent = registry
             .dispatch(&classification(TaskComplexity::Critical))
             .unwrap();
-        assert_eq!(agent.name(), "claude");
+        assert_eq!(agent.name(), "worker-x");
     }
 
     #[test]
-    fn dispatch_critical_task_falls_back_to_anthropic_api_when_no_claude() {
-        let mut registry = registry_with_default();
+    fn auto_default_uses_first_registered_agent() {
+        let mut registry = AgentRegistry::new("auto");
         registry.register(
-            "anthropic-api",
+            "alpha",
             Arc::new(StubAgent {
-                agent_name: "anthropic-api",
+                agent_name: "alpha",
             }),
         );
+        registry.register("beta", Arc::new(StubAgent { agent_name: "beta" }));
 
-        let agent = registry
-            .dispatch(&classification(TaskComplexity::Critical))
-            .unwrap();
-        assert_eq!(agent.name(), "anthropic-api");
+        let agent = registry.default_agent().unwrap();
+        assert_eq!(agent.name(), "alpha");
     }
 
     #[test]
-    fn dispatch_medium_task_uses_default_agent() {
-        let mut registry = registry_with_default();
+    fn unknown_default_falls_back_to_first_registered_agent() {
+        let mut registry = AgentRegistry::new("ghost");
         registry.register(
-            "claude",
+            "alpha",
             Arc::new(StubAgent {
-                agent_name: "claude",
+                agent_name: "alpha",
             }),
         );
 
-        let agent = registry
-            .dispatch(&classification(TaskComplexity::Medium))
-            .unwrap();
-        assert_eq!(agent.name(), "default-agent");
+        let agent = registry.default_agent().unwrap();
+        assert_eq!(agent.name(), "alpha");
     }
 
     #[test]
@@ -264,30 +297,21 @@ mod tests {
         assert_eq!(agent.unwrap().name(), "anthropic-api");
     }
 
-    struct MockAdapter;
+    struct StubAdapter {
+        adapter_name: &'static str,
+    }
 
     #[async_trait::async_trait]
-    impl AgentAdapter for MockAdapter {
+    impl AgentAdapter for StubAdapter {
         fn name(&self) -> &str {
-            "mock"
+            self.adapter_name
         }
 
         async fn start_turn(
             &self,
             _req: TurnRequest,
-            tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            _tx: tokio::sync::mpsc::Sender<AgentEvent>,
         ) -> harness_core::Result<()> {
-            if let Err(e) = tx.send(AgentEvent::TurnStarted).await {
-                tracing::debug!("stream channel closed: {e}");
-            }
-            if let Err(e) = tx
-                .send(AgentEvent::TurnCompleted {
-                    output: "mock done".into(),
-                })
-                .await
-            {
-                tracing::debug!("stream channel closed: {e}");
-            }
             Ok(())
         }
 
@@ -297,58 +321,49 @@ mod tests {
     }
 
     #[test]
-    fn adapter_registry_register_and_get() {
+    fn adapter_registry_register_and_get_roundtrip() {
         let mut registry = AdapterRegistry::new("mock");
-        registry.register("mock", Arc::new(MockAdapter));
-        assert!(registry.get("mock").is_some());
-        assert!(registry.get("missing").is_none());
+        registry.register(
+            "mock",
+            Arc::new(StubAdapter {
+                adapter_name: "mock",
+            }),
+        );
+
+        let adapter = registry.get("mock");
+        assert!(adapter.is_some());
+        assert_eq!(adapter.unwrap().name(), "mock");
     }
 
     #[test]
-    fn adapter_registry_default() {
+    fn adapter_registry_default_adapter_uses_configured_name() {
         let mut registry = AdapterRegistry::new("mock");
-        registry.register("mock", Arc::new(MockAdapter));
-        let adapter = registry.default_adapter().unwrap();
-        assert_eq!(adapter.name(), "mock");
+        registry.register(
+            "mock",
+            Arc::new(StubAdapter {
+                adapter_name: "mock",
+            }),
+        );
+
+        let adapter = registry.default_adapter();
+        assert!(adapter.is_some());
+        assert_eq!(adapter.unwrap().name(), "mock");
     }
 
     #[test]
-    fn adapter_registry_default_returns_none_when_unregistered() {
+    fn adapter_registry_default_adapter_missing_returns_none() {
         let registry = AdapterRegistry::new("missing");
         assert!(registry.default_adapter().is_none());
     }
 
     #[test]
-    fn adapter_registry_list() {
+    fn adapter_registry_list_returns_registered_names() {
         let mut registry = AdapterRegistry::new("a");
-        registry.register("a", Arc::new(MockAdapter));
-        registry.register("b", Arc::new(MockAdapter));
+        registry.register("a", Arc::new(StubAdapter { adapter_name: "a" }));
+        registry.register("b", Arc::new(StubAdapter { adapter_name: "b" }));
+
         let mut names = registry.list();
-        names.sort();
+        names.sort_unstable();
         assert_eq!(names, vec!["a", "b"]);
-    }
-
-    #[tokio::test]
-    async fn mock_adapter_produces_events() {
-        let adapter = MockAdapter;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let req = TurnRequest {
-            prompt: "test".into(),
-            project_root: std::path::PathBuf::from("."),
-            model: None,
-            allowed_tools: vec![],
-            context: vec![],
-            timeout_secs: None,
-        };
-        adapter.start_turn(req, tx).await.unwrap();
-
-        let first = rx.recv().await.unwrap();
-        assert!(matches!(first, AgentEvent::TurnStarted));
-
-        let second = rx.recv().await.unwrap();
-        match second {
-            AgentEvent::TurnCompleted { output } => assert_eq!(output, "mock done"),
-            other => panic!("expected TurnCompleted, got {other:?}"),
-        }
     }
 }

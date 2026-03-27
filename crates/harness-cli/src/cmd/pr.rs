@@ -146,6 +146,7 @@ async fn run_review_loop(
                 "/gemini review",
                 "gemini-code-assist[bot]",
                 &repo,
+                false,
             ),
             project_root: project.clone(),
             ..Default::default()

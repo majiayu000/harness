@@ -11,6 +11,7 @@ pub mod projects;
 pub mod rules;
 pub mod skills;
 pub mod thread;
+pub mod token_usage;
 
 /// Validate a project root path, returning early with an `INTERNAL_ERROR`
 /// response on failure.

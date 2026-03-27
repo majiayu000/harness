@@ -633,7 +633,7 @@ impl TaskStore {
     /// `pr_url`, fetches the current PR state with a per-call timeout:
     /// - MERGED → mark Done  (completion_callback invoked)
     /// - CLOSED → mark Failed (completion_callback invoked so intake sources can
-    ///            remove the issue from their `dispatched` map and allow retry)
+    ///   remove the issue from their `dispatched` map and allow retry)
     /// - OPEN   → leave as Pending
     ///
     /// `gh` CLI failures are treated as transient network errors; the task is left
@@ -2000,8 +2000,8 @@ mod tests {
         );
         assert_eq!(
             phases[1],
-            Some(ExecutionPhase::Validation),
-            "review check turn must use Validation phase"
+            Some(ExecutionPhase::Execution),
+            "review loop turn must use Execution phase (agent needs write access to fix bot comments)"
         );
         Ok(())
     }

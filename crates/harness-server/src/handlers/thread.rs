@@ -110,7 +110,13 @@ pub async fn turn_start(
     input: String,
 ) -> RpcResponse {
     let input = harness_core::prompts::wrap_external_data(&input);
-    let agent_name = state.core.server.config.agents.default_agent.clone();
+    let agent_name = state
+        .core
+        .server
+        .agent_registry
+        .resolved_default_agent_name()
+        .unwrap_or("claude")
+        .to_string();
     let agent_id = harness_core::AgentId::from_str(&agent_name);
     match state
         .core

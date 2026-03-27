@@ -311,6 +311,16 @@ fn default_otel_environment() -> String {
 ///
 /// When enabled, the scheduler spawns an agent review job at the configured interval.
 /// The review is skipped if no new commits have landed since the last review.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewStrategy {
+    /// Run one reviewer task per cycle.
+    #[default]
+    Single,
+    /// Run two reviewer tasks and synthesize into a final report.
+    Cross,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewConfig {
     /// Whether periodic review is enabled. Default: false.
@@ -331,6 +341,9 @@ pub struct ReviewConfig {
     /// Agent to use for the review. Default: None (use the default agent).
     #[serde(default)]
     pub agent: Option<String>,
+    /// Review strategy. `single` runs one reviewer; `cross` runs dual-review + synthesis.
+    #[serde(default)]
+    pub strategy: ReviewStrategy,
     /// Per-turn timeout in seconds for the review agent. Default: 900.
     #[serde(default = "default_review_timeout_secs")]
     pub timeout_secs: u64,
@@ -363,6 +376,7 @@ impl Default for ReviewConfig {
             interval_hours: default_review_interval_hours(),
             interval_secs: None,
             agent: None,
+            strategy: ReviewStrategy::Single,
             timeout_secs: default_review_timeout_secs(),
         }
     }
