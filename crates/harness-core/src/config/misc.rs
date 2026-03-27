@@ -114,6 +114,9 @@ pub struct ValidationConfig {
     /// Maximum number of auto-retry attempts on validation failure.
     #[serde(default = "default_validation_max_retries")]
     pub max_retries: u32,
+    /// Timeout in seconds for the LGTM test gate command. Default: 300.
+    #[serde(default = "default_test_gate_timeout_secs")]
+    pub test_gate_timeout_secs: u64,
 }
 
 fn default_validation_timeout_secs() -> u64 {
@@ -124,6 +127,10 @@ fn default_validation_max_retries() -> u32 {
     2
 }
 
+fn default_test_gate_timeout_secs() -> u64 {
+    300
+}
+
 impl Default for ValidationConfig {
     fn default() -> Self {
         Self {
@@ -131,6 +138,7 @@ impl Default for ValidationConfig {
             pre_push: Vec::new(),
             timeout_secs: default_validation_timeout_secs(),
             max_retries: default_validation_max_retries(),
+            test_gate_timeout_secs: default_test_gate_timeout_secs(),
         }
     }
 }

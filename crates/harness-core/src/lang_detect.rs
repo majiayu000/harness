@@ -109,6 +109,20 @@ fn has_spec_dir(project_root: &Path) -> bool {
     project_root.join("spec").is_dir()
 }
 
+/// Return the primary test command for the project at `root`, or `None` when
+/// the language is unrecognised (`Common`) or has no test commands configured.
+///
+/// Used by the LGTM test gate in the review loop to run tests independently of
+/// the LLM agent, preventing the gaming pattern described in OpenAI's
+/// "Monitoring Reasoning Models for Misbehavior" (Baker et al., 2026).
+pub fn primary_test_command(root: &Path) -> Option<String> {
+    let lang = detect_language(root);
+    if lang == Language::Common {
+        return None;
+    }
+    default_pre_push_commands(lang, root).into_iter().next()
+}
+
 // ── Prompt instruction builder ───────────────────────────────────────────────
 
 /// Generate validation instructions to inject into agent prompts.
@@ -563,6 +577,38 @@ mod tests {
         let dir = tmpdir();
         let cmds = default_pre_push_commands(Language::Ruby, dir.path());
         assert_eq!(cmds, vec!["bundle exec rake test"]);
+    }
+
+    // ── primary_test_command ──────────────────────────────────────────────────
+
+    #[test]
+    fn primary_test_command_rust_workspace() {
+        let dir = tmpdir();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            primary_test_command(dir.path()),
+            Some("cargo test --workspace".to_string())
+        );
+    }
+
+    #[test]
+    fn primary_test_command_rust_non_workspace() {
+        let dir = tmpdir();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"foo\"").unwrap();
+        assert_eq!(
+            primary_test_command(dir.path()),
+            Some("cargo test".to_string())
+        );
+    }
+
+    #[test]
+    fn primary_test_command_unknown_returns_none() {
+        let dir = tmpdir();
+        assert_eq!(primary_test_command(dir.path()), None);
     }
 
     // ── Common ────────────────────────────────────────────────────────────────
