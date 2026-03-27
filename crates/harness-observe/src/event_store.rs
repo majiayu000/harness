@@ -53,13 +53,16 @@ pub struct EventStore {
 impl EventStore {
     pub async fn new(data_dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
+        // Canonicalize after creation to resolve symlinks and ".." components.
+        // Defensive-only: the primary path-traversal boundary is at task_routes.rs.
+        let data_dir = data_dir.canonicalize()?;
         let db_path = data_dir.join("events.db");
         let pool = open_pool(&db_path).await?;
         Migrator::new(&pool, EVENT_MIGRATIONS).run().await?;
 
         let store = Self {
             pool,
-            data_dir: data_dir.to_path_buf(),
+            data_dir,
             otel_pipeline: Mutex::new(None),
             session_renewal_secs: 1800,
         };
@@ -1043,6 +1046,29 @@ mod tests {
         let results = store.query(&EventFilters::default()).await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, recent_event.id);
+        store.close().await;
+        Ok(())
+    }
+
+    /// Verify that constructing an EventStore with a path containing ".." resolves
+    /// to the canonical directory: the DB file must land at the canonical root, not
+    /// inside any intermediate sub-directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn constructor_canonicalizes_path_with_dotdot() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Build a path with a ".." component: <tmp>/sub/../  (resolves to <tmp>/)
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub)?;
+        let traversal_path = sub.join("..");
+
+        let store = EventStore::new(&traversal_path).await?;
+
+        // The DB file must land at the canonical root, not inside "sub/".
+        let canonical_root = dir.path().canonicalize()?;
+        assert!(
+            canonical_root.join("events.db").exists(),
+            "events.db must be at canonical root {canonical_root:?}"
+        );
         store.close().await;
         Ok(())
     }
