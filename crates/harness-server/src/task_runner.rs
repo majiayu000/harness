@@ -120,8 +120,8 @@ pub struct TaskState {
     /// Populated at runtime; not persisted (use `TaskStore::list_children` after restart).
     #[serde(default)]
     pub subtask_ids: Vec<TaskId>,
-    /// Resolved project root for this task. Set at spawn time; not persisted to the database.
-    /// Used by sibling-awareness lookups in `TaskStore::list_siblings`.
+    /// Resolved project root for this task. Set at spawn time and persisted to the database.
+    /// Used by sibling-awareness lookups and exposed via TaskSummary for observability.
     #[serde(skip)]
     pub project_root: Option<PathBuf>,
     /// GitHub issue number if this is an issue-based task. Set at spawn time; not persisted.
@@ -179,6 +179,9 @@ pub struct TaskSummary {
     /// IDs of subtasks spawned by this task during parallel dispatch.
     #[serde(default)]
     pub subtask_ids: Vec<TaskId>,
+    /// Resolved project root path. Persisted to the database for observability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 impl TaskState {
@@ -222,6 +225,10 @@ impl TaskState {
             phase: self.phase.clone(),
             depends_on: self.depends_on.clone(),
             subtask_ids: self.subtask_ids.clone(),
+            project: self
+                .project_root
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
         }
     }
 }
@@ -298,6 +305,30 @@ impl Default for CreateTaskRequest {
             depends_on: Vec::new(),
         }
     }
+}
+
+fn summarize_request_description(req: &CreateTaskRequest) -> Option<String> {
+    req.issue.map(|n| format!("issue #{n}")).or_else(|| {
+        req.prompt.as_ref().map(|p| {
+            let s = p.trim();
+            let cutoff = s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len());
+            if cutoff < s.len() {
+                format!("{}...", &s[..cutoff])
+            } else {
+                s.to_string()
+            }
+        })
+    })
+}
+
+pub(crate) async fn fill_missing_repo_from_project(req: &mut CreateTaskRequest) {
+    if req.repo.is_some() {
+        return;
+    }
+    let Some(project) = req.project.as_deref() else {
+        return;
+    };
+    req.repo = crate::task_executor::detect_repo_slug(project).await;
 }
 
 /// Detect the main git worktree root using a blocking subprocess call.
@@ -412,6 +443,7 @@ const TRANSIENT_PATTERNS: &[&str] = &[
     "at capacity",
     "rate limit",
     "rate_limit",
+    "hit your limit",
     "429",
     "502 Bad Gateway",
     "503 Service",
@@ -425,6 +457,11 @@ const TRANSIENT_PATTERNS: &[&str] = &[
     "ECONNRESET",
     "ETIMEDOUT",
 ];
+
+/// Pattern indicating the CLI account-level usage limit has been reached.
+/// When detected, the global rate-limit circuit breaker is activated to
+/// prevent all other tasks from wasting turns.
+const ACCOUNT_LIMIT_PATTERN: &str = "hit your limit";
 
 /// Maximum number of automatic retries for transient failures.
 const MAX_TRANSIENT_RETRIES: u32 = 2;
@@ -462,6 +499,9 @@ pub struct TaskStore {
     persist_locks: DashMap<TaskId, Arc<Mutex<()>>>,
     /// Per-task broadcast channels for real-time stream forwarding to SSE clients.
     stream_txs: DashMap<TaskId, broadcast::Sender<StreamItem>>,
+    /// Global circuit breaker: when the CLI account-level limit is hit,
+    /// all tasks pause until this instant passes.
+    rate_limit_until: RwLock<Option<tokio::time::Instant>>,
 }
 
 impl TaskStore {
@@ -485,6 +525,7 @@ impl TaskStore {
             db,
             persist_locks,
             stream_txs: DashMap::new(),
+            rate_limit_until: RwLock::new(None),
         });
         Ok(store)
     }
@@ -574,6 +615,44 @@ impl TaskStore {
     /// Remove the task's stream channel after execution completes.
     pub(crate) fn close_task_stream(&self, id: &TaskId) {
         self.stream_txs.remove(id);
+    }
+
+    /// Activate the global rate-limit circuit breaker. All tasks will pause
+    /// before their next agent call until `duration` elapses.
+    pub async fn set_rate_limit(&self, duration: std::time::Duration) {
+        let until = tokio::time::Instant::now() + duration;
+        *self.rate_limit_until.write().await = Some(until);
+        tracing::warn!(
+            pause_secs = duration.as_secs(),
+            "rate-limit circuit breaker activated — all tasks paused"
+        );
+    }
+
+    /// Wait if the global rate-limit circuit breaker is active.
+    /// Returns immediately if no breaker is set or the deadline has passed.
+    pub async fn wait_for_rate_limit(&self) {
+        let deadline = { *self.rate_limit_until.read().await };
+        if let Some(until) = deadline {
+            if tokio::time::Instant::now() < until {
+                let remaining = until - tokio::time::Instant::now();
+                tracing::info!(
+                    remaining_secs = remaining.as_secs(),
+                    "task waiting for rate-limit circuit breaker to clear"
+                );
+                tokio::time::sleep_until(until).await;
+                // Clear the breaker after waking up.
+                *self.rate_limit_until.write().await = None;
+            }
+        }
+    }
+
+    /// Check if the rate-limit circuit breaker is currently active.
+    pub async fn is_rate_limited(&self) -> bool {
+        let deadline = *self.rate_limit_until.read().await;
+        match deadline {
+            Some(until) => tokio::time::Instant::now() < until,
+            None => false,
+        }
     }
 
     /// Persist an artifact captured from agent output during task execution.
@@ -814,10 +893,16 @@ pub async fn spawn_task(
 /// Register a task with Pending status and return its ID immediately, without waiting
 /// for a concurrency permit. Pair with `spawn_preregistered_task` (called from a
 /// background tokio task after `task_queue.acquire()`) to begin execution.
-pub async fn register_pending_task(store: Arc<TaskStore>, source: Option<String>) -> TaskId {
+pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskRequest) -> TaskId {
     let task_id = TaskId::new();
     let mut state = TaskState::new(task_id.clone());
-    state.source = source;
+    state.source = req.source.clone();
+    state.external_id = req.external_id.clone();
+    state.repo = req.repo.clone();
+    state.parent_id = req.parent_task_id.clone();
+    state.depends_on = req.depends_on.clone();
+    state.issue = req.issue;
+    state.description = summarize_request_description(req);
     store.insert(&state).await;
     // Register stream channel now so SSE clients can subscribe before execution begins.
     store.register_task_stream(&task_id);
@@ -870,7 +955,7 @@ async fn spawn_task_with_worktree_detector<F>(
     skills: Arc<RwLock<harness_skills::SkillStore>>,
     events: Arc<harness_observe::EventStore>,
     interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
-    req: CreateTaskRequest,
+    mut req: CreateTaskRequest,
     detect_worktree: F,
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
@@ -919,21 +1004,16 @@ where
         let project_root = crate::handlers::validate_project_root(&raw_project, &home_dir)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        // Populate transient sibling-awareness fields in the in-memory cache.
-        // These are not persisted; they enable list_siblings() lookups during run_task.
-        let description = req.issue.map(|n| format!("issue #{n}")).or_else(|| {
-            req.prompt.as_ref().map(|p| {
-                let s = p.trim();
-                // Use char_indices to find a safe UTF-8 boundary at or before 80 chars.
-                let cutoff = s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len());
-                if cutoff < s.len() {
-                    format!("{}...", &s[..cutoff])
-                } else {
-                    s.to_string()
-                }
-            })
-        });
+        if req.repo.is_none() {
+            req.repo = crate::task_executor::detect_repo_slug(&project_root).await;
+        }
+        let description = summarize_request_description(&req);
         if let Some(mut entry) = store.cache.get_mut(&id) {
+            entry.source = req.source.clone();
+            entry.external_id = req.external_id.clone();
+            entry.repo = req.repo.clone();
+            entry.parent_id = req.parent_task_id.clone();
+            entry.depends_on = req.depends_on.clone();
             entry.project_root = Some(project_root.clone());
             entry.issue = req.issue;
             entry.description = description;
@@ -1072,6 +1152,9 @@ where
         // Retrying inside the spawn means the stream stays open and the task actually re-runs.
         let mut transient_attempts = 0u32;
         let task_result = loop {
+            // Wait if global rate-limit circuit breaker is active (another task hit the limit).
+            store.wait_for_rate_limit().await;
+
             let result = crate::task_executor::run_task(
                 &store,
                 &id,
@@ -1094,7 +1177,17 @@ where
                 {
                     transient_attempts += 1;
                     let reason = e.to_string();
-                    let backoff_secs = 30u64 * (1u64 << (transient_attempts - 1).min(4));
+
+                    // Account-level limit: activate global circuit breaker (60 min pause)
+                    // so all other tasks stop burning turns.
+                    let backoff_secs = if reason.to_lowercase().contains(ACCOUNT_LIMIT_PATTERN) {
+                        let pause = std::time::Duration::from_secs(3600);
+                        store.set_rate_limit(pause).await;
+                        3600u64
+                    } else {
+                        30u64 * (1u64 << (transient_attempts - 1).min(4))
+                    };
+
                     tracing::warn!(
                         task_id = %id.0,
                         attempt = transient_attempts,
@@ -1819,6 +1912,65 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn register_pending_task_keeps_repo_metadata_visible() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let req = CreateTaskRequest {
+            issue: Some(20),
+            source: Some("github".to_string()),
+            external_id: Some("20".to_string()),
+            repo: Some("acme/harness".to_string()),
+            ..Default::default()
+        };
+
+        let task_id = register_pending_task(store.clone(), &req).await;
+        let state = store.get(&task_id).expect("task should exist");
+
+        assert_eq!(state.source.as_deref(), Some("github"));
+        assert_eq!(state.external_id.as_deref(), Some("20"));
+        assert_eq!(state.repo.as_deref(), Some("acme/harness"));
+        assert_eq!(state.description.as_deref(), Some("issue #20"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fill_missing_repo_from_project_detects_origin_remote() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        let init = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()?;
+        assert!(init.status.success(), "git init failed: {:?}", init);
+
+        let remote = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/harness.git",
+            ])
+            .current_dir(dir.path())
+            .output()?;
+        assert!(
+            remote.status.success(),
+            "git remote add failed: {:?}",
+            remote
+        );
+
+        let mut req = CreateTaskRequest {
+            project: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        fill_missing_repo_from_project(&mut req).await;
+
+        assert_eq!(req.repo.as_deref(), Some("acme/harness"));
+        Ok(())
+    }
+
     /// Mock agent that records the `execution_phase` from every call and
     /// returns pre-configured responses in order.
     struct PhaseCapturingAgent {
@@ -2021,6 +2173,9 @@ mod tests {
         assert!(is_transient_error("connection reset by peer"));
         assert!(is_transient_error(
             "stream idle timeout after 300s: zombie connection terminated"
+        ));
+        assert!(is_transient_error(
+            "claude exited with exit status: 1: stderr=[] stdout_tail=[You've hit your limit · resets 3pm (Asia/Shanghai)\n]"
         ));
 
         // Negative cases — permanent errors should not match.

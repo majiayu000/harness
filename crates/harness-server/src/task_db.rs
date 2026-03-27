@@ -3,7 +3,7 @@ use crate::task_runner::{TaskId, TaskState, TaskStatus};
 use harness_core::TaskDbDecodeError;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePool;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Maximum artifact content size in bytes before truncation.
 const ARTIFACT_MAX_BYTES: usize = 65_536;
@@ -66,6 +66,11 @@ static TASK_MIGRATIONS: &[Migration] = &[
         description: "add depends_on column",
         sql: "ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'",
     },
+    Migration {
+        version: 8,
+        description: "add project column for task observability",
+        sql: "ALTER TABLE tasks ADD COLUMN project TEXT",
+    },
 ];
 
 /// A single persisted artifact captured from agent output during task execution.
@@ -104,8 +109,8 @@ impl TaskDb {
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let status = state.status.as_ref();
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, parent_id, created_at, repo, depends_on)
-             VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?)",
+            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?)",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -113,10 +118,13 @@ impl TaskDb {
         .bind(&state.pr_url)
         .bind(&rounds_json)
         .bind(&state.error)
+        .bind(&state.source)
+        .bind(&state.external_id)
         .bind(state.parent_id.as_ref().map(|id| &id.0))
         .bind(&state.created_at)
         .bind(&state.repo)
         .bind(&depends_on_json)
+        .bind(state.project_root.as_ref().map(|p| p.to_string_lossy().into_owned()))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -128,7 +136,7 @@ impl TaskDb {
         let status = state.status.as_ref();
         sqlx::query(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
-                    repo = ?, depends_on = ?, updated_at = datetime('now')
+                    source = ?, external_id = ?, repo = ?, depends_on = ?, project = ?, updated_at = datetime('now')
              WHERE id = ?",
         )
         .bind(status)
@@ -136,8 +144,11 @@ impl TaskDb {
         .bind(&state.pr_url)
         .bind(&rounds_json)
         .bind(&state.error)
+        .bind(&state.source)
+        .bind(&state.external_id)
         .bind(&state.repo)
         .bind(&depends_on_json)
+        .bind(state.project_root.as_ref().map(|p| p.to_string_lossy().into_owned()))
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -146,7 +157,7 @@ impl TaskDb {
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project
              FROM tasks WHERE id = ?",
         )
         .bind(id)
@@ -157,7 +168,7 @@ impl TaskDb {
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project
              FROM tasks ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -238,7 +249,7 @@ impl TaskDb {
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project
              FROM tasks WHERE parent_id = ? ORDER BY created_at DESC",
         )
         .bind(parent_id)
@@ -313,6 +324,7 @@ struct TaskRow {
     created_at: Option<String>,
     repo: Option<String>,
     depends_on: String,
+    project: Option<String>,
 }
 
 impl TaskRow {
@@ -330,6 +342,7 @@ impl TaskRow {
             created_at,
             repo,
             depends_on,
+            project,
         } = self;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
@@ -351,7 +364,7 @@ impl TaskRow {
             parent_id: parent_id.map(TaskId),
             depends_on: serde_json::from_str(&depends_on).unwrap_or_default(),
             subtask_ids: Vec::new(),
-            project_root: None,
+            project_root: project.map(PathBuf::from),
             issue: None,
             description: None,
             created_at,
@@ -383,6 +396,7 @@ mod tests {
             created_at: None,
             repo: None,
             depends_on: "[]".to_string(),
+            project: None,
         }
     }
 
@@ -568,6 +582,24 @@ mod tests {
             .await?
             .expect("task with error should exist");
         assert_eq!(loaded.error.as_deref(), Some("agent panicked"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_and_external_id_roundtrip() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-meta", TaskStatus::Pending);
+        task.source = Some("github".to_string());
+        task.external_id = Some("20".to_string());
+        task.repo = Some("acme/harness".to_string());
+        db.insert(&task).await?;
+
+        let loaded = db.get("task-meta").await?.expect("task should exist");
+        assert_eq!(loaded.source.as_deref(), Some("github"));
+        assert_eq!(loaded.external_id.as_deref(), Some("20"));
+        assert_eq!(loaded.repo.as_deref(), Some("acme/harness"));
         Ok(())
     }
 
