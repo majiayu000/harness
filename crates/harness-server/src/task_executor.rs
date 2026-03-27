@@ -1002,8 +1002,7 @@ pub(crate) async fn run_task(
     let max_waiting_polls = req
         .max_rounds
         .saturating_mul(6)
-        .max(20)
-        .min(MAX_WAITING_POLLS_CAP);
+        .clamp(20, MAX_WAITING_POLLS_CAP);
     tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
     sleep(Duration::from_secs(wait_secs)).await;
 
