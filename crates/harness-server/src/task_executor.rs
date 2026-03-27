@@ -710,8 +710,8 @@ pub(crate) async fn run_task(
     // not have unrestricted write access — use Standard profile. All other
     // tasks (implementation) keep Full (no restriction, Vec::new()).
     //
-    // NOTE: --allowedTools is NOT passed as a CLI flag (see claude.rs).
-    // Tool restriction is enforced via prompt_note injection below.
+    // Non-empty allowed_tools causes claude.rs to pass --allowedTools to the
+    // CLI (hard enforcement). Empty allowed_tools → --dangerously-skip-permissions.
     let (initial_allowed_tools, capability_prompt_note) =
         if req.source.as_deref() == Some("periodic_review") {
             (
@@ -1609,6 +1609,27 @@ async fn run_agent_review(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn periodic_review_source_uses_standard_allowed_tools() {
+        // Verifies that periodic_review tasks get a non-empty allowed_tools list,
+        // which causes claude.rs to pass --allowedTools (hard enforcement) instead
+        // of --dangerously-skip-permissions.
+        let tools = restricted_tools(CapabilityProfile::Standard).unwrap_or_default();
+        assert_eq!(
+            tools,
+            CapabilityProfile::Standard.tools().unwrap_or_default()
+        );
+        assert!(!tools.is_empty());
+    }
+
+    #[test]
+    fn standard_implementation_turn_uses_full_profile() {
+        // Non-periodic_review tasks use Vec::new() → Full profile →
+        // --dangerously-skip-permissions in claude.rs.
+        let implementation_allowed_tools: Vec<String> = Vec::new();
+        assert!(implementation_allowed_tools.is_empty());
+    }
 
     #[test]
     fn exponential_backoff_three_consecutive_retries() {

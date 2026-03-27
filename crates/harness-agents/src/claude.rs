@@ -58,7 +58,6 @@ impl ClaudeCodeAgent {
         let model = self.resolve_model(req);
         let mut base_args = vec![
             OsString::from("-p"),
-            OsString::from("--dangerously-skip-permissions"),
             OsString::from("--output-format"),
             OsString::from("text"),
             OsString::from("--model"),
@@ -66,13 +65,20 @@ impl ClaudeCodeAgent {
             OsString::from("--verbose"),
         ];
 
-        // NOTE: --allowedTools is intentionally NOT passed to Claude CLI.
-        // In Claude CLI 2.1.70, --allowedTools conflicts with
-        // --dangerously-skip-permissions and causes an immediate exit code 1.
-        // Tool restriction is enforced via:
-        //   1. Prompt-level instructions (CapabilityProfile::prompt_note injected
-        //      by the task executor for restricted profiles).
-        //   2. Post-execution validation (validate_tool_usage in tool_isolation.rs).
+        // Hard tool enforcement at the CLI boundary (issue #514):
+        //   Full profile  (allowed_tools empty)     → --dangerously-skip-permissions
+        //   Restricted profile (allowed_tools set)  → --allowedTools <comma-list>
+        //
+        // --allowedTools and --dangerously-skip-permissions are mutually exclusive
+        // in Claude CLI 2.1.70+. Using --allowedTools provides hard enforcement;
+        // the agent cannot call tools outside the list regardless of prompt content.
+        // Post-execution validate_tool_usage() remains as a defense-in-depth layer.
+        if req.uses_dangerously_skip_permissions() {
+            base_args.push(OsString::from("--dangerously-skip-permissions"));
+        } else {
+            base_args.push(OsString::from("--allowedTools"));
+            base_args.push(OsString::from(req.allowed_tools.join(",")));
+        }
 
         if let Some(budget) = req.max_budget_usd {
             base_args.push(OsString::from("--max-budget-usd"));
@@ -225,28 +231,131 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
+    fn args_to_strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect()
+    }
+
     #[test]
-    fn base_args_never_includes_allowed_tools_flag() {
-        // --allowedTools conflicts with --dangerously-skip-permissions in
-        // Claude CLI 2.1.70 (issue #483). Verify it is never emitted.
+    fn base_args_full_profile_uses_dangerously_skip_permissions() {
         let agent = ClaudeCodeAgent::new(
             PathBuf::from("claude"),
             "test-model".to_string(),
             SandboxMode::DangerFullAccess,
         );
         let req = AgentRequest {
-            allowed_tools: vec!["Read".to_string(), "Write".to_string(), "Bash".to_string()],
+            allowed_tools: vec![], // Full profile — no restriction
             ..AgentRequest::default()
         };
-        let args = agent.base_args(&req);
-        let args_str: Vec<String> = args
-            .iter()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
+        let args = args_to_strings(&agent.base_args(&req));
         assert!(
-            !args_str.contains(&"--allowedTools".to_string()),
-            "--allowedTools must not be passed to Claude CLI; got: {args_str:?}"
+            args.contains(&"--dangerously-skip-permissions".to_string()),
+            "Full profile must use --dangerously-skip-permissions; got: {args:?}"
         );
+        assert!(
+            !args.contains(&"--allowedTools".to_string()),
+            "Full profile must NOT use --allowedTools; got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn base_args_standard_profile_uses_allowed_tools_flag() {
+        let agent = ClaudeCodeAgent::new(
+            PathBuf::from("claude"),
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
+        let req = AgentRequest {
+            allowed_tools: vec![
+                "Read".to_string(),
+                "Write".to_string(),
+                "Edit".to_string(),
+                "Bash".to_string(),
+            ],
+            ..AgentRequest::default()
+        };
+        let args = args_to_strings(&agent.base_args(&req));
+        assert!(
+            args.contains(&"--allowedTools".to_string()),
+            "Standard profile must use --allowedTools; got: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--dangerously-skip-permissions".to_string()),
+            "Standard profile must NOT use --dangerously-skip-permissions; got: {args:?}"
+        );
+        let tools_value = args
+            .iter()
+            .skip_while(|a| *a != "--allowedTools")
+            .nth(1)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            tools_value.contains("Read")
+                && tools_value.contains("Write")
+                && tools_value.contains("Edit")
+                && tools_value.contains("Bash"),
+            "allowedTools value must list all Standard tools; got: {tools_value:?}"
+        );
+    }
+
+    #[test]
+    fn base_args_read_only_profile_uses_allowed_tools_flag() {
+        let agent = ClaudeCodeAgent::new(
+            PathBuf::from("claude"),
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
+        let req = AgentRequest {
+            allowed_tools: vec!["Read".to_string(), "Grep".to_string(), "Glob".to_string()],
+            ..AgentRequest::default()
+        };
+        let args = args_to_strings(&agent.base_args(&req));
+        assert!(
+            args.contains(&"--allowedTools".to_string()),
+            "ReadOnly profile must use --allowedTools; got: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--dangerously-skip-permissions".to_string()),
+            "ReadOnly profile must NOT use --dangerously-skip-permissions; got: {args:?}"
+        );
+        let tools_value = args
+            .iter()
+            .skip_while(|a| *a != "--allowedTools")
+            .nth(1)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            tools_value.contains("Read")
+                && tools_value.contains("Grep")
+                && tools_value.contains("Glob"),
+            "allowedTools value must list all ReadOnly tools; got: {tools_value:?}"
+        );
+    }
+
+    #[test]
+    fn base_args_never_contains_both_permission_flags() {
+        let agent = ClaudeCodeAgent::new(
+            PathBuf::from("claude"),
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
+        for (label, allowed_tools) in [
+            ("full", vec![]),
+            ("standard", vec!["Read".to_string(), "Bash".to_string()]),
+        ] {
+            let req = AgentRequest {
+                allowed_tools,
+                ..AgentRequest::default()
+            };
+            let args = args_to_strings(&agent.base_args(&req));
+            let has_skip = args.contains(&"--dangerously-skip-permissions".to_string());
+            let has_allowed = args.contains(&"--allowedTools".to_string());
+            assert!(
+                !(has_skip && has_allowed),
+                "Both --dangerously-skip-permissions and --allowedTools present for {label} profile: {args:?}"
+            );
+        }
     }
 
     #[test]
