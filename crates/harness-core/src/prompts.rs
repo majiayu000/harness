@@ -86,7 +86,9 @@ pub fn triage_prompt(issue: u64) -> PromptParts {
              - PROCEED_WITH_PLAN — non-trivial change that needs an implementation plan first\n\
              - NEEDS_CLARIFICATION — issue is ambiguous; list the specific questions that must be answered\n\
              - SKIP — not worth doing (explain why: duplicate, out of scope, or fundamentally flawed)\n\n\
-             Output format: Write your assessment (2-5 sentences), then on the LAST line print:\n\
+             Output format: Write your assessment (2-5 sentences), then on the second-to-last line print:\n\
+             COMPLEXITY=<low|medium|high> (low=typo/doc fix, medium=single-module change, high=cross-file refactor)\n\
+             Then on the LAST line print:\n\
              TRIAGE=<recommendation>"
         ),
         context: String::new(),
@@ -736,6 +738,39 @@ pub fn parse_issue_count(output: &str) -> Option<u32> {
         }
     }
     None
+}
+
+/// Task complexity assessed during the triage phase.
+///
+/// Used to derive dynamic `max_rounds` and `skip_agent_review` parameters so that
+/// simple tasks don't waste review budget and complex tasks get extra rounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriageComplexity {
+    /// Typo, doc fix, or single-file config change — max_rounds=2, skip agent review.
+    Low,
+    /// Single-module change — max_rounds=4 (current default), full review.
+    Medium,
+    /// Cross-file refactor or new API surface — max_rounds=8, full review.
+    High,
+}
+
+/// Parse `COMPLEXITY=<low|medium|high>` from triage agent output.
+///
+/// Scans all lines (not just the last) so the tag can appear before `TRIAGE=`.
+/// Returns `TriageComplexity::Medium` if the tag is absent or unrecognised
+/// (backward-compatible fallback).
+pub fn parse_complexity(output: &str) -> TriageComplexity {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("COMPLEXITY=") {
+            return match value.trim().to_ascii_lowercase().as_str() {
+                "low" => TriageComplexity::Low,
+                "high" => TriageComplexity::High,
+                _ => TriageComplexity::Medium,
+            };
+        }
+    }
+    TriageComplexity::Medium
 }
 
 /// Triage decision from the Tech Lead evaluation phase.
@@ -1779,5 +1814,61 @@ PR_URL=https://github.com/owner/repo/pull/269";
         let p = agent_review_prompt("https://github.com/owner/repo/pull/42", 1, "mixed");
         assert!(p.contains("Staff Engineer"));
         assert!(p.contains("security > logic > quality > style"));
+    }
+
+    #[test]
+    fn test_parse_complexity_all_variants() {
+        assert_eq!(parse_complexity("COMPLEXITY=low"), TriageComplexity::Low);
+        assert_eq!(
+            parse_complexity("COMPLEXITY=medium"),
+            TriageComplexity::Medium
+        );
+        assert_eq!(parse_complexity("COMPLEXITY=high"), TriageComplexity::High);
+        // Case-insensitive
+        assert_eq!(parse_complexity("COMPLEXITY=LOW"), TriageComplexity::Low);
+        assert_eq!(parse_complexity("COMPLEXITY=HIGH"), TriageComplexity::High);
+    }
+
+    #[test]
+    fn test_parse_complexity_fallback() {
+        // Missing tag → Medium
+        assert_eq!(parse_complexity("TRIAGE=PROCEED"), TriageComplexity::Medium);
+        assert_eq!(parse_complexity(""), TriageComplexity::Medium);
+        // Unknown value → Medium
+        assert_eq!(
+            parse_complexity("COMPLEXITY=extreme"),
+            TriageComplexity::Medium
+        );
+        assert_eq!(parse_complexity("COMPLEXITY="), TriageComplexity::Medium);
+    }
+
+    #[test]
+    fn test_parse_complexity_with_triage_combo() {
+        let output = "This is a simple typo fix.\nCOMPLEXITY=high\nTRIAGE=PROCEED";
+        assert_eq!(parse_complexity(output), TriageComplexity::High);
+        assert_eq!(parse_triage(output), Some(TriageDecision::Proceed));
+    }
+
+    #[test]
+    fn test_triage_prompt_contains_complexity() {
+        let p = triage_prompt(42).to_prompt_string();
+        assert!(
+            p.contains("COMPLEXITY="),
+            "triage prompt must instruct COMPLEXITY= output"
+        );
+        assert!(
+            p.contains("TRIAGE="),
+            "triage prompt must instruct TRIAGE= output"
+        );
+    }
+
+    #[test]
+    fn test_parse_triage_unaffected_by_complexity_line() {
+        // COMPLEXITY= before TRIAGE= must not break parse_triage
+        let output = "Assessment here.\nCOMPLEXITY=low\nTRIAGE=PROCEED";
+        assert_eq!(parse_triage(output), Some(TriageDecision::Proceed));
+
+        let output2 = "Assessment here.\nCOMPLEXITY=high\nTRIAGE=PROCEED_WITH_PLAN";
+        assert_eq!(parse_triage(output2), Some(TriageDecision::ProceedWithPlan));
     }
 }
