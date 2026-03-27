@@ -37,6 +37,17 @@ pub struct AgentRequest {
     pub env_vars: HashMap<String, String>,
 }
 
+impl AgentRequest {
+    /// Returns `true` when no tool restriction is set (Full profile).
+    ///
+    /// When `true`, the CLI adapter should use `--dangerously-skip-permissions`.
+    /// When `false`, the adapter should use `--allowedTools <list>` instead —
+    /// these flags are mutually exclusive in Claude CLI 2.1.70+.
+    pub fn uses_dangerously_skip_permissions(&self) -> bool {
+        self.allowed_tools.is_empty()
+    }
+}
+
 impl Default for AgentRequest {
     fn default() -> Self {
         Self {

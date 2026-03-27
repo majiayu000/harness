@@ -1,8 +1,14 @@
-/// Post-execution validation: scan agent output for tool calls that were not
-/// in the allowed list.
+/// Defense-in-depth post-execution check: scan agent output for tool calls
+/// that were not in the allowed list.
+///
+/// **Primary enforcement** is now at the CLI boundary via `--allowedTools`
+/// (see `claude.rs`). This function is a secondary layer that catches any
+/// tool invocations that appear in the output stream even when the CLI flag
+/// is active — e.g. partial output logged before enforcement, or adapters
+/// that do not support `--allowedTools`.
 ///
 /// Returns the names of any disallowed tools found in the output. An empty
-/// vector means the agent respected its capability profile.
+/// vector means no violation was detected in the output.
 ///
 /// Detection heuristic: look for `<tool_name>` XML tags or JSON `"name":
 /// "ToolName"` patterns that Claude Code typically emits in its output stream.
