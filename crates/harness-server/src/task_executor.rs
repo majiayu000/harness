@@ -402,7 +402,7 @@ async fn run_triage_plan_pipeline(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<(Option<String>, prompts::TriageComplexity)> {
     use crate::task_runner::TaskPhase;
 
     // --- Phase 1: Triage ---
@@ -439,7 +439,8 @@ async fn run_triage_plan_pipeline(
     let decision = prompts::parse_triage(&triage_resp.output).ok_or_else(|| {
         anyhow::anyhow!("triage output unparseable — agent did not produce TRIAGE=<decision>")
     })?;
-    tracing::info!(task_id = %task_id, ?decision, "triage decision");
+    let complexity = prompts::parse_complexity(&triage_resp.output);
+    tracing::info!(task_id = %task_id, ?decision, ?complexity, "triage decision");
 
     match decision {
         prompts::TriageDecision::Skip => {
@@ -462,7 +463,7 @@ async fn run_triage_plan_pipeline(
         }
         prompts::TriageDecision::Proceed => {
             tracing::info!(task_id = %task_id, "triage: PROCEED — skipping plan phase");
-            return Ok(None);
+            return Ok((None, complexity));
         }
         prompts::TriageDecision::ProceedWithPlan => {
             // Fall through to plan phase.
@@ -501,7 +502,7 @@ async fn run_triage_plan_pipeline(
     .await?;
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete");
-    Ok(Some(plan_text))
+    Ok((Some(plan_text), complexity))
 }
 
 pub(crate) async fn run_task(
@@ -549,7 +550,7 @@ pub(crate) async fn run_task(
     // --- Pipeline: Triage → Plan → Implement ---
     // For issue-based tasks without an existing PR, run triage first.
     // Triage decides whether to skip planning or go through a plan phase.
-    let plan_output = if let Some(issue) = req.issue {
+    let (plan_output, triage_complexity) = if let Some(issue) = req.issue {
         // Only triage fresh issues (no existing PR to continue).
         let has_existing_pr = find_existing_pr_for_issue(&project, issue)
             .await
@@ -560,11 +561,25 @@ pub(crate) async fn run_task(
             run_triage_plan_pipeline(agent, store, task_id, issue, &cargo_env, &project, req)
                 .await?
         } else {
-            None
+            (None, prompts::TriageComplexity::Medium)
         }
     } else {
-        None
+        (None, prompts::TriageComplexity::Medium)
     };
+
+    // Derive dynamic parameters from triage complexity.
+    let (effective_max_rounds, skip_agent_review) = match triage_complexity {
+        prompts::TriageComplexity::Low => (2u32, true),
+        prompts::TriageComplexity::Medium => (req.max_rounds, false),
+        prompts::TriageComplexity::High => (8u32, false),
+    };
+    tracing::info!(
+        task_id = %task_id,
+        ?triage_complexity,
+        effective_max_rounds,
+        skip_agent_review,
+        "triage complexity applied"
+    );
 
     // Resume normal flow — update status to Implementing for the main turn.
     update_status(store, task_id, TaskStatus::Implementing, 1).await?;
@@ -996,9 +1011,9 @@ pub(crate) async fn run_task(
         return Ok(());
     };
 
-    // Agent review loop (if enabled and reviewer available)
+    // Agent review loop (if enabled and reviewer available, and not skipped by triage complexity)
     let mut agent_pushed_commit = false;
-    if review_config.enabled {
+    if review_config.enabled && !skip_agent_review {
         if let Some(reviewer) = reviewer {
             tracing::info!(pr_url = %pr_url.as_deref().unwrap_or(""), "starting agent review");
             let (review_ok, pushed) = run_agent_review(
@@ -1054,7 +1069,7 @@ pub(crate) async fn run_task(
     update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
 
     let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
-    let max_rounds = resolved.review_max_rounds.unwrap_or(req.max_rounds);
+    let max_rounds = effective_max_rounds;
     tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
     sleep(Duration::from_secs(wait_secs)).await;
 
