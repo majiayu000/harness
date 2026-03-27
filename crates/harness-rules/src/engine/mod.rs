@@ -765,6 +765,99 @@ impl RuleEngine {
     ) -> ExecPolicyCheckOutput {
         self.exec_policy.check_command(command, options)
     }
+
+    /// Create a [`RuleScanSnapshot`] with cloned guards and rules.
+    ///
+    /// The caller should hold the `RwLock` only long enough to call this
+    /// method, then drop the guard so that concurrent write operations
+    /// (e.g. `rule_load`) are not blocked during the async scan.
+    pub fn snapshot(&self) -> RuleScanSnapshot {
+        RuleScanSnapshot {
+            guards: self.guards.clone(),
+            rules: self.rules.clone(),
+        }
+    }
+}
+
+/// A point-in-time clone of guards and rules needed to run a scan.
+///
+/// Obtain via [`RuleEngine::snapshot`].  Holds only owned data so the engine's
+/// `RwLock` can be released before the (potentially long) async scan executes,
+/// preventing write starvation on concurrent `rule_load` calls.
+pub struct RuleScanSnapshot {
+    guards: Vec<Guard>,
+    rules: Vec<Rule>,
+}
+
+impl RuleScanSnapshot {
+    /// Number of guards captured in this snapshot.
+    pub fn guard_count(&self) -> usize {
+        self.guards.len()
+    }
+
+    /// Scan a project for violations using the snapshotted guards.
+    pub async fn scan(&self, project_root: &Path) -> anyhow::Result<Vec<Violation>> {
+        let mut violations = Vec::new();
+        for guard in &self.guards {
+            let output = tokio::process::Command::new("bash")
+                .arg(&guard.script_path)
+                .arg(project_root)
+                .output()
+                .await?;
+            violations.extend(self.parse_guard_output(&output)?);
+        }
+        Ok(violations)
+    }
+
+    /// Scan specific files using the snapshotted guards.
+    pub async fn scan_files(
+        &self,
+        project_root: &Path,
+        files: &[PathBuf],
+    ) -> anyhow::Result<Vec<Violation>> {
+        let mut violations = Vec::new();
+        for guard in &self.guards {
+            for file in files {
+                let output = tokio::process::Command::new("bash")
+                    .arg(&guard.script_path)
+                    .arg(project_root)
+                    .arg(file)
+                    .output()
+                    .await?;
+                violations.extend(self.parse_guard_output(&output)?);
+            }
+        }
+        Ok(violations)
+    }
+
+    fn parse_guard_output(&self, output: &std::process::Output) -> anyhow::Result<Vec<Violation>> {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut violations = Vec::new();
+
+        for line in stdout.lines() {
+            // Expected format: FILE:LINE:RULE_ID:MESSAGE
+            let parts: Vec<&str> = line.splitn(4, ':').collect();
+            if parts.len() >= 4 {
+                let rule_id = RuleId::from_str(parts[2].trim());
+                let severity = self
+                    .rules
+                    .iter()
+                    .find(|r| r.id == rule_id)
+                    .map(|r| r.severity)
+                    .unwrap_or(Severity::Medium);
+
+                violations.push(Violation {
+                    rule_id,
+                    file: PathBuf::from(parts[0]),
+                    line: parts[1].parse().ok(),
+                    message: parts[3].to_string(),
+                    severity,
+                });
+            }
+        }
+
+        Ok(violations)
+    }
 }
 
 impl Default for RuleEngine {
