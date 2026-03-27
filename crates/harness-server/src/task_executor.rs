@@ -1067,6 +1067,10 @@ pub(crate) async fn run_task(
     let mut prev_fixed = agent_pushed_commit;
     let repo_slug = prompts::repo_slug_from_pr_url(pr_url.as_deref());
 
+    // Convergence tracking: detect when issue count stops decreasing.
+    let mut issue_counts: Vec<Option<u32>> = Vec::new();
+    let mut impasse = false;
+
     // Review loop.
     // Use an explicit counter so WAITING responses don't consume a round — `continue`
     // inside a `for` loop would silently advance the iterator even without a real review.
@@ -1083,6 +1087,7 @@ pub(crate) async fn run_task(
                 &review_config.review_bot_command,
                 &review_config.reviewer_name,
                 &repo_slug,
+                impasse,
             ),
             project_root: project.clone(),
             context: context_items.clone(),
@@ -1153,6 +1158,29 @@ pub(crate) async fn run_task(
         let lgtm = prompts::is_lgtm(&output);
         let waiting = prompts::is_waiting(&output);
         let fixed = !lgtm && !waiting;
+
+        // Track issue count for convergence detection.
+        let current_issues = prompts::parse_issue_count(&output);
+        if !waiting {
+            issue_counts.push(current_issues);
+        }
+
+        // Convergence check: if the last 3 rounds all reported issues and the
+        // count is not decreasing, enter impasse mode (critical-only fixes).
+        if issue_counts.len() >= 3 && !impasse {
+            let tail = &issue_counts[issue_counts.len() - 3..];
+            if let [Some(a), Some(b), Some(c)] = tail {
+                if c >= a && c >= b {
+                    impasse = true;
+                    tracing::warn!(
+                        task_id = %task_id,
+                        round,
+                        issues = %format_args!("[{a}, {b}, {c}]"),
+                        "review loop impasse detected: issue count not decreasing"
+                    );
+                }
+            }
+        }
 
         // WAITING means review bot hasn't posted yet (e.g., quota exhausted).
         // Don't consume a round — just sleep and retry without incrementing.
@@ -1232,15 +1260,39 @@ pub(crate) async fn run_task(
         round += 1;
     }
 
-    mutate_and_persist(store, task_id, |s| {
-        s.status = TaskStatus::Failed;
-        s.turn = max_rounds.saturating_add(1);
-        s.error = Some(format!(
-            "Task did not receive LGTM after {} review rounds.",
-            max_rounds
-        ));
-    })
-    .await?;
+    // Graduated exit: if the last round had few issues remaining, mark as done
+    // with a warning instead of outright failure — the PR is likely mergeable.
+    let last_issue_count = issue_counts.iter().rev().find_map(|c| *c);
+    let graduated = last_issue_count.map_or(false, |n| n <= 2);
+
+    if graduated {
+        tracing::info!(
+            task_id = %task_id,
+            remaining_issues = last_issue_count.unwrap_or(0),
+            "review loop exhausted but few issues remain — marking done with warning"
+        );
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Done;
+            s.turn = max_rounds.saturating_add(1);
+            s.error = Some(format!(
+                "Graduated: LGTM not received after {} rounds but only {} issues remain.",
+                max_rounds,
+                last_issue_count.unwrap_or(0),
+            ));
+        })
+        .await?;
+    } else {
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Failed;
+            s.turn = max_rounds.saturating_add(1);
+            s.error = Some(format!(
+                "Task did not receive LGTM after {} review rounds (last issues: {}).",
+                max_rounds,
+                last_issue_count.map_or("unknown".to_string(), |n| n.to_string()),
+            ));
+        })
+        .await?;
+    }
     tracing::info!(
         task_id = %task_id,
         phase = "reviewing",
@@ -1249,7 +1301,7 @@ pub(crate) async fn run_task(
     );
     tracing::info!(
         task_id = %task_id,
-        status = "failed",
+        status = if graduated { "done" } else { "failed" },
         turns = max_rounds.saturating_add(1),
         pr_url = pr_url.as_deref().unwrap_or(""),
         total_elapsed_secs = task_start.elapsed().as_secs(),

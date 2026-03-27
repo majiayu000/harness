@@ -293,13 +293,18 @@ pub fn review_prompt(
     review_bot_command: &str,
     reviewer_name: &str,
     repo: &str,
+    impasse: bool,
 ) -> String {
     let context = match issue {
         Some(n) => format!("You previously created PR #{pr} for issue #{n}.\n"),
         None => format!("Review PR #{pr}.\n"),
     };
 
-    let severity_guidance = if round <= 2 {
+    let severity_guidance = if impasse {
+        "IMPASSE MODE: Only fix critical severity issues that block merge \
+         (security vulnerabilities, data loss, build failures). \
+         Skip ALL other review comments — they will be addressed in a follow-up PR."
+    } else if round <= 2 {
         "Fix all review comments marked critical, high, or medium severity."
     } else {
         "Fix only critical and high severity issues. \
@@ -351,6 +356,9 @@ pub fn review_prompt(
          6. Otherwise fix the issues, {push_action}, \
          and print FIXED on the last line\
          {freshness_check}\n\n\
+         Output format (always include both lines at the end):\n\
+         - `ISSUES=<number>` — total unresolved review comments before your fixes\n\
+         - Then `LGTM`, `FIXED`, or `WAITING` on the very last line\n\n\
          Constraints:\n\
          - NEVER downgrade dependency versions\n\
          - Do NOT refactor working code for style preferences\n\
@@ -711,6 +719,19 @@ pub fn is_lgtm(output: &str) -> bool {
 /// This means Gemini has not yet re-reviewed after the latest fix commit.
 pub fn is_waiting(output: &str) -> bool {
     last_non_empty_line(output) == Some("WAITING")
+}
+
+/// Extract `ISSUES=N` from agent output (any line). Returns `None` if absent.
+pub fn parse_issue_count(output: &str) -> Option<u32> {
+    for line in output.lines().rev() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("ISSUES=") {
+            if let Ok(n) = rest.trim().parse::<u32>() {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 /// Triage decision from the Tech Lead evaluation phase.
@@ -1083,6 +1104,7 @@ mod tests {
             "/gemini review",
             "gemini-code-assist[bot]",
             "owner/repo",
+            false,
         );
         assert!(p.contains("issue #5"));
         assert!(p.contains("PR #10"));
@@ -1099,6 +1121,7 @@ mod tests {
             "/gemini review",
             "gemini-code-assist[bot]",
             "owner/repo",
+            false,
         );
         assert!(p.contains("PR #10"));
         assert!(!p.contains("issue #")); // no issue reference when None
@@ -1114,6 +1137,7 @@ mod tests {
             "/gemini review",
             "gemini-code-assist[bot]",
             "owner/repo",
+            false,
         );
         assert!(p.contains("Skip medium"));
     }
@@ -1128,6 +1152,7 @@ mod tests {
             "/gemini review",
             "gemini-code-assist[bot]",
             "owner/repo",
+            false,
         );
         assert!(p.contains("/gemini review"));
         let p = review_prompt(
@@ -1138,6 +1163,7 @@ mod tests {
             "/reviewbot run",
             "reviewbot[bot]",
             "owner/repo",
+            false,
         );
         assert!(p.contains("/reviewbot run"));
         assert!(!p.contains("/gemini"));
@@ -1153,6 +1179,7 @@ mod tests {
             "/gemini review",
             "gemini-code-assist[bot]",
             "owner/repo",
+            false,
         );
         assert!(p.contains("/gemini review"));
         let p = review_prompt(
@@ -1163,6 +1190,7 @@ mod tests {
             "/gemini review",
             "gemini-code-assist[bot]",
             "owner/repo",
+            false,
         );
         assert!(p.contains("/gemini review"));
     }
@@ -1177,10 +1205,11 @@ mod tests {
             "/gemini review",
             "gemini-code-assist[bot]",
             "owner/repo",
+            false,
         );
         assert!(p.contains("WAITING"));
         assert!(p.contains("latest review was submitted BEFORE the latest commit"));
-        // Without prev_fixed, no freshness check
+        // Without prev_fixed, no freshness check section
         let p = review_prompt(
             None,
             10,
@@ -1189,8 +1218,9 @@ mod tests {
             "/gemini review",
             "gemini-code-assist[bot]",
             "owner/repo",
+            false,
         );
-        assert!(!p.contains("WAITING"));
+        assert!(!p.contains("latest review was submitted BEFORE the latest commit"));
     }
 
     #[test]
@@ -1203,6 +1233,7 @@ mod tests {
             "/gemini review",
             "gemini-code-assist[bot]",
             "owner/repo",
+            false,
         );
         assert!(p.contains("NEVER downgrade dependency"));
     }
@@ -1217,6 +1248,7 @@ mod tests {
             "/gemini review",
             "gemini-code-assist[bot]",
             "owner/repo",
+            false,
         );
         assert!(p.contains("gemini-code-assist[bot]"));
         assert!(p.contains(".user.login"));
@@ -1229,6 +1261,7 @@ mod tests {
             "/reviewbot run",
             "acme-bot[bot]",
             "owner/repo",
+            false,
         );
         assert!(p2.contains("acme-bot[bot]"));
         assert!(!p2.contains("gemini-code-assist[bot]"));
@@ -1246,11 +1279,31 @@ mod tests {
 
     #[test]
     fn test_review_prompt_shell_quoting() {
-        let p = review_prompt(None, 5, 2, false, "it's a test", "bot[bot]", "owner/repo");
+        let p = review_prompt(None, 5, 2, false, "it's a test", "bot[bot]", "owner/repo", false);
         assert!(
             p.contains(r"'it'\''s a test'"),
             "single quote must be escaped"
         );
+    }
+
+    #[test]
+    fn test_parse_issue_count() {
+        assert_eq!(parse_issue_count("ISSUES=3\nFIXED"), Some(3));
+        assert_eq!(parse_issue_count("ISSUES=0\nLGTM"), Some(0));
+        assert_eq!(parse_issue_count("some output\nISSUES=12\nFIXED"), Some(12));
+        assert_eq!(parse_issue_count("no issues line\nFIXED"), None);
+        assert_eq!(parse_issue_count("ISSUES=abc\nFIXED"), None);
+    }
+
+    #[test]
+    fn test_review_prompt_impasse_mode() {
+        let p = review_prompt(
+            None, 10, 5, false, "/gemini review",
+            "gemini-code-assist[bot]", "owner/repo", true,
+        );
+        assert!(p.contains("IMPASSE MODE"));
+        assert!(p.contains("critical severity"));
+        assert!(!p.contains("Fix all review comments"));
     }
 
     #[test]

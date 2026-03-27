@@ -243,8 +243,10 @@ fn parse_usage_record(entry: &Value, ctx: &str) -> Result<Option<ParsedUsageReco
 
     let input = required_u64(usage, "input_tokens", ctx)?;
     let output = required_u64(usage, "output_tokens", ctx)?;
-    let cache_read = required_u64(usage, "cache_read_input_tokens", ctx)?;
-    let cache_create = required_u64(usage, "cache_creation_input_tokens", ctx)?;
+    // Cache fields are optional — Codex agent and older Claude CLI builds
+    // report all context as input_tokens without a cache breakdown.
+    let cache_read = optional_u64(usage, "cache_read_input_tokens");
+    let cache_create = optional_u64(usage, "cache_creation_input_tokens");
 
     let model = required_str_at_pointer(entry, "/message/model", ctx)?.to_string();
     let ts = required_str_field(entry, "timestamp", ctx)?;
@@ -265,6 +267,10 @@ fn required_u64(obj: &Value, key: &str, ctx: &str) -> Result<u64, String> {
     obj.get(key)
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("{ctx}: missing or invalid usage field '{key}'"))
+}
+
+fn optional_u64(obj: &Value, key: &str) -> u64 {
+    obj.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
 fn required_str_field<'a>(obj: &'a Value, key: &str, ctx: &str) -> Result<&'a str, String> {
@@ -427,20 +433,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_usage_record_requires_usage_fields() {
+    fn parse_usage_record_treats_cache_fields_as_optional() {
         let entry = serde_json::json!({
             "timestamp": "2026-03-26T03:05:56.523Z",
             "message": {
                 "model": "claude-sonnet",
                 "usage": {
                     "input_tokens": 100,
-                    "output_tokens": 20,
-                    "cache_read_input_tokens": 50
+                    "output_tokens": 20
                 }
             }
         });
-        let err = parse_usage_record(&entry, "test:1").unwrap_err();
-        assert!(err.contains("cache_creation_input_tokens"));
+        let parsed = parse_usage_record(&entry, "test:1").unwrap().unwrap();
+        assert_eq!(parsed.cache_read, 0);
+        assert_eq!(parsed.cache_create, 0);
+        assert_eq!(parsed.input, 100);
     }
 
     #[test]
