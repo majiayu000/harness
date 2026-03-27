@@ -1202,7 +1202,6 @@ pub(crate) async fn run_task(
             round - 1
         );
         if round <= req.max_rounds {
-            waiting_count += 1;
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
             sleep(Duration::from_secs(wait_secs)).await;
         }
