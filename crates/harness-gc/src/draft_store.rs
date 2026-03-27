@@ -10,6 +10,9 @@ impl DraftStore {
     pub fn new(data_dir: &Path) -> anyhow::Result<Self> {
         let dir = data_dir.join("drafts");
         std::fs::create_dir_all(&dir)?;
+        // Canonicalize after creation to resolve symlinks and ".." components.
+        // Defensive-only: the primary path-traversal boundary is at task_routes.rs.
+        let dir = dir.canonicalize()?;
         Ok(Self { data_dir: dir })
     }
 
@@ -144,6 +147,33 @@ mod tests {
         let expired = store.expire_stale_drafts(72).unwrap();
         assert_eq!(expired, 0);
         assert!(store.get(&recent_draft.id).unwrap().is_some());
+    }
+
+    /// Verify that constructing a DraftStore with a path containing ".." resolves
+    /// to the canonical directory: draft files must land at the canonical root.
+    #[test]
+    fn constructor_canonicalizes_path_with_dotdot() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Build a path with a ".." component: <tmp>/sub/../  (resolves to <tmp>/)
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub)?;
+        let traversal_path = sub.join("..");
+
+        let store = DraftStore::new(&traversal_path)?;
+
+        // Save a draft and verify it lands at the canonical root/drafts/, not sub/drafts/.
+        let draft = make_draft(DraftStatus::Pending, Utc::now());
+        store.save(&draft)?;
+
+        let canonical_root = dir.path().canonicalize()?;
+        let expected = canonical_root
+            .join("drafts")
+            .join(format!("{}.json", draft.id));
+        assert!(
+            expected.exists(),
+            "draft must be at canonical path {expected:?}"
+        );
+        Ok(())
     }
 
     #[test]
