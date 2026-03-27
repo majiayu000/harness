@@ -46,7 +46,8 @@ impl Drop for TaskTargetDir {
         }
     }
 }
-use tokio::time::{sleep, Duration, Instant};
+use tokio::process::Command as TokioCommand;
+use tokio::time::{sleep, timeout, Duration, Instant};
 
 pub(crate) use helpers::{
     collect_context_items, detect_modified_files, emit_runtime_notification,
@@ -61,6 +62,56 @@ pub(crate) use pr_detection::{
 // PromptBuilder is used internally by pr_detection and re-exported for tests.
 #[cfg(test)]
 pub(crate) use pr_detection::PromptBuilder;
+
+/// Run the project's primary test command as a hard gate before accepting LGTM.
+///
+/// Returns `Ok(())` when tests pass or when no test command is detectable for the
+/// project (soft degradation — unknown project type skips the gate rather than
+/// failing unconditionally).
+///
+/// Returns `Err(output)` containing the combined stdout/stderr when the command
+/// exits non-zero or times out.
+async fn run_test_gate(project_root: &Path, timeout_secs: u64) -> Result<(), String> {
+    let Some(cmd) = lang_detect::primary_test_command(project_root) else {
+        tracing::info!(
+            project = %project_root.display(),
+            "test gate: no test command detected for project, skipping"
+        );
+        return Ok(());
+    };
+
+    tracing::info!(cmd = %cmd, "test gate: running tests before accepting LGTM");
+
+    let child = match TokioCommand::new("sh")
+        .args(["-c", &cmd])
+        .current_dir(project_root)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return Err(format!("test gate: failed to spawn `{cmd}`: {e}")),
+    };
+
+    match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
+        Ok(Ok(out)) if out.status.success() => {
+            tracing::info!(cmd = %cmd, "test gate: tests passed");
+            Ok(())
+        }
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let code = out.status.code().unwrap_or(-1);
+            Err(format!(
+                "Test gate failed (exit {code})\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            ))
+        }
+        Ok(Err(e)) => Err(format!("test gate: `{cmd}` failed to wait: {e}")),
+        Err(_) => Err(format!(
+            "Test gate timed out after {timeout_secs}s (command: `{cmd}`)"
+        )),
+    }
+}
 
 pub(crate) async fn run_turn_lifecycle(
     server: Arc<crate::server::HarnessServer>,
@@ -1091,6 +1142,9 @@ pub(crate) async fn run_task(
     let mut issue_counts: Vec<Option<u32>> = Vec::new();
     let mut impasse = false;
 
+    // Carries test gate failure output from a rejected LGTM into the next review round.
+    let mut pending_test_failure: Option<String> = None;
+
     // Review loop.
     // Use an explicit counter so WAITING responses don't consume a round — `continue`
     // inside a `for` loop would silently advance the iterator even without a real review.
@@ -1098,17 +1152,30 @@ pub(crate) async fn run_task(
     while round <= max_rounds {
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
+        let base_prompt = prompts::review_prompt(
+            req.issue,
+            pr_num,
+            round,
+            prev_fixed,
+            &review_config.review_bot_command,
+            &review_config.reviewer_name,
+            &repo_slug,
+            impasse,
+        );
+        // If the previous LGTM was rejected by the test gate, prepend the failure
+        // output so the agent has context for why re-work is needed.
+        let round_prompt = if let Some(failure) = pending_test_failure.take() {
+            format!(
+                "IMPORTANT: The previous LGTM was rejected because the project's tests failed. \
+                 Fix the test failures before declaring LGTM again.\n\n\
+                 Test output:\n```\n{failure}\n```\n\n{base_prompt}"
+            )
+        } else {
+            base_prompt
+        };
+
         let check_req = AgentRequest {
-            prompt: prompts::review_prompt(
-                req.issue,
-                pr_num,
-                round,
-                prev_fixed,
-                &review_config.review_bot_command,
-                &review_config.reviewer_name,
-                &repo_slug,
-                impasse,
-            ),
+            prompt: round_prompt,
             project_root: project.clone(),
             context: context_items.clone(),
             execution_phase: Some(ExecutionPhase::Execution),
@@ -1248,32 +1315,50 @@ pub(crate) async fn run_task(
         }
 
         if lgtm {
-            tracing::info!("PR #{pr_num} approved at round {round}");
-            mutate_and_persist(store, task_id, |s| {
-                s.status = TaskStatus::Done;
-                s.turn = round.saturating_add(1);
-            })
-            .await?;
-            tracing::info!(
-                task_id = %task_id,
-                phase = "reviewing",
-                elapsed_secs = review_phase_start.elapsed().as_secs(),
-                "phase_completed"
-            );
-            tracing::info!(
-                task_id = %task_id,
-                status = "done",
-                turns = round.saturating_add(1),
-                pr_url = pr_url.as_deref().unwrap_or(""),
-                total_elapsed_secs = task_start.elapsed().as_secs(),
-                "task_completed"
-            );
-            return Ok(());
+            // Hard gate: run the project's tests before accepting LGTM.
+            // This prevents agents from gaming the review by manipulating tests
+            // rather than fixing code (OpenAI "Monitoring Reasoning Models", 2026).
+            match run_test_gate(&project, project_config.validation.test_gate_timeout_secs).await {
+                Ok(()) => {
+                    tracing::info!("PR #{pr_num} approved at round {round}");
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Done;
+                        s.turn = round.saturating_add(1);
+                    })
+                    .await?;
+                    tracing::info!(
+                        task_id = %task_id,
+                        phase = "reviewing",
+                        elapsed_secs = review_phase_start.elapsed().as_secs(),
+                        "phase_completed"
+                    );
+                    tracing::info!(
+                        task_id = %task_id,
+                        status = "done",
+                        turns = round.saturating_add(1),
+                        pr_url = pr_url.as_deref().unwrap_or(""),
+                        total_elapsed_secs = task_start.elapsed().as_secs(),
+                        "task_completed"
+                    );
+                    return Ok(());
+                }
+                Err(output) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        round,
+                        "LGTM rejected: tests failed in test gate, re-entering review round {}",
+                        round.saturating_add(1)
+                    );
+                    pending_test_failure = Some(output);
+                }
+            }
         }
 
         // Track whether this round produced a fix so the next round enforces
         // freshness checks against new reviewer feedback.
-        prev_fixed = fixed;
+        // Also treat a test gate rejection as a "fixed" round — the agent needs
+        // to push a fix and get a fresh review before LGTM can be accepted.
+        prev_fixed = fixed || pending_test_failure.is_some();
         tracing::info!("PR #{pr_num} fixed at round {round}; waiting for bot re-review");
         if round < max_rounds {
             waiting_count += 1;
