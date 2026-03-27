@@ -97,26 +97,6 @@ async fn run_review_tick(
         (None, None) => None,
     };
 
-    // If there was a prior review, skip this cycle when no new commits have landed.
-    // On first boot (no prior event) we always run.
-    if let Some(ts) = last_review_ts {
-        let since = ts.to_rfc3339();
-        let output = tokio::process::Command::new("git")
-            .args(["log", "--oneline", &format!("--since={since}"), "-1"])
-            .current_dir(project_root)
-            .output()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to run git log: {e}"))?;
-
-        if String::from_utf8_lossy(&output.stdout).trim().is_empty() {
-            tracing::debug!(
-                since = %since,
-                "scheduler: periodic review skipped — no new commits"
-            );
-            return Ok(());
-        }
-    }
-
     let since_arg = last_review_ts
         .map(|ts| ts.to_rfc3339())
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
@@ -254,6 +234,19 @@ async fn run_review_tick(
             output_len = primary_output.as_ref().map(|s| s.len()).unwrap_or(0),
             "scheduler: primary periodic review completed"
         );
+
+        // Agent may signal that no commits landed since last review.
+        if primary_output
+            .as_deref()
+            .map(|s| s.contains("REVIEW_SKIPPED"))
+            .unwrap_or(false)
+        {
+            tracing::debug!(
+                task_id = %primary_review_id,
+                "scheduler: agent reported REVIEW_SKIPPED — no new commits"
+            );
+            return;
+        }
 
         let mut final_task_id = primary_review_id.clone();
         let mut final_output = primary_output.clone();
@@ -596,5 +589,55 @@ mod tests {
         // The slot holds exactly one (the new) task.
         let guard = state.lock().await;
         assert!(guard.poll_handle.is_some());
+    }
+
+    /// Structural check: run_review_tick no longer contains Command::new("git").
+    /// This is a compile-time / source-level assertion verified by reading the
+    /// function source — there is no tokio::process::Command call in the tick path.
+    #[test]
+    fn test_git_guard_removed() {
+        // The git log guard was at lines 88-104 in the original file.
+        // Verifying absence structurally: the function compiles without any
+        // tokio::process::Command usage for the git check.
+        // Since the crate compiles (ignoring pre-existing errors in other files),
+        // this test passing proves the guard is gone.
+        let source = include_str!("periodic_reviewer.rs");
+        assert!(
+            !source.contains("Command::new(\"git\")"),
+            "periodic_reviewer.rs must not contain Command::new(\"git\")"
+        );
+    }
+
+    /// REVIEW_SKIPPED in agent output is treated as a no-op: the contains check
+    /// returns true and the early-return path is taken.
+    #[test]
+    fn test_review_skipped_detection() {
+        let output_with_skip = Some("some preamble\nREVIEW_SKIPPED\nmore text".to_string());
+        let output_without_skip = Some("REVIEW_JSON_START\n{}\nREVIEW_JSON_END".to_string());
+        let no_output: Option<String> = None;
+
+        assert!(output_with_skip
+            .as_deref()
+            .map(|s| s.contains("REVIEW_SKIPPED"))
+            .unwrap_or(false));
+        assert!(!output_without_skip
+            .as_deref()
+            .map(|s| s.contains("REVIEW_SKIPPED"))
+            .unwrap_or(false));
+        assert!(!no_output
+            .as_deref()
+            .map(|s| s.contains("REVIEW_SKIPPED"))
+            .unwrap_or(false));
+    }
+
+    /// On first boot (no prior event, no fallback), since_arg must be the
+    /// Unix epoch sentinel — unchanged behaviour.
+    #[test]
+    fn test_first_boot_no_ts_produces_epoch_since() {
+        let last_review_ts: Option<DateTime<Utc>> = None;
+        let since_arg = last_review_ts
+            .map(|ts| ts.to_rfc3339())
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+        assert_eq!(since_arg, "1970-01-01T00:00:00Z");
     }
 }

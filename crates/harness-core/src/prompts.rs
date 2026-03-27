@@ -496,6 +496,9 @@ pub fn periodic_review_prompt(project_root: &str, since: &str, project_type: &st
          Last review: {since}\n\
          Project type: {project_type}\n\n\
          ## Steps\n\n\
+         0. Run `git log --oneline --since=\"{since}\"`. If the output is empty (no commits \
+since last review), output exactly `REVIEW_SKIPPED` on its own line and stop — do not \
+create any issues or output JSON.\n\
          1. Run `git log --oneline --since=\"{since}\"` to see what changed\n\
          2. Run `git diff --stat HEAD~20` (or since last review) to identify changed files\n\
          3. Read the changed files — focus on correctness and safety, not style\n\
