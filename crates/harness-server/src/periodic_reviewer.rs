@@ -602,7 +602,7 @@ mod tests {
         old.abort(); // clean up the long-running task
 
         // The slot holds exactly one (the new) task.
-        let guard = poll_handle.lock().await;
-        assert!(guard.is_some());
+        let guard = state.lock().await;
+        assert!(guard.poll_handle.is_some());
     }
 }

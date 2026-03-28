@@ -321,6 +321,7 @@ fn summarize_request_description(req: &CreateTaskRequest) -> Option<String> {
     })
 }
 
+#[cfg(test)]
 pub(crate) async fn fill_missing_repo_from_project(req: &mut CreateTaskRequest) {
     if req.repo.is_some() {
         return;
