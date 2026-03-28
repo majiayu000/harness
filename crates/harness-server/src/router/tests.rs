@@ -1569,7 +1569,7 @@ async fn exec_plan_survives_simulated_restart() -> anyhow::Result<()> {
     let _lock = crate::test_helpers::HOME_LOCK.lock().await;
     let data_dir = tempfile::tempdir()?;
     let proj_dir = crate::test_helpers::tempdir_in_home("harness-exec-test-")?;
-    let plan_db_path = data_dir.path().join("exec_plans.db");
+    let plan_db_path = harness_core::default_db_path(data_dir.path(), "plans");
     let plan_id_str: String;
 
     // Session 1: create and activate a plan.
@@ -1640,7 +1640,7 @@ async fn exec_plan_status_fallback_to_db_when_not_in_memory() -> anyhow::Result<
     let _lock = crate::test_helpers::HOME_LOCK.lock().await;
     let data_dir = tempfile::tempdir()?;
     let proj_dir = crate::test_helpers::tempdir_in_home("harness-exec-test-")?;
-    let plan_db_path = data_dir.path().join("exec_plans.db");
+    let plan_db_path = harness_core::default_db_path(data_dir.path(), "plans");
 
     // Insert a plan directly into the DB without going through the in-memory HashMap.
     let plan = harness_exec::ExecPlan::from_spec("# Direct DB Insert", proj_dir.path())?;
