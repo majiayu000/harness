@@ -9,3 +9,9 @@ pub mod prompts;
 pub mod shell_safety;
 pub mod tool_isolation;
 pub mod types;
+
+pub use config::misc::OtelExporter;
+pub use types::{
+    AutoFixAttempt, AutoFixReport, Decision, Event, EventFilters, ExternalSignal, RuleId,
+    SessionId, Severity,
+};

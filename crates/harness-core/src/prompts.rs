@@ -1105,7 +1105,7 @@ mod tests {
 
     #[test]
     fn test_prompt_parts_to_prompt_string_with_git() {
-        use crate::config::GitConfig;
+        use crate::config::project::GitConfig;
         let git = GitConfig {
             base_branch: "main".to_string(),
             remote: "origin".to_string(),
