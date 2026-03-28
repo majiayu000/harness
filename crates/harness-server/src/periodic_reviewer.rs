@@ -169,19 +169,13 @@ async fn run_review_tick(
     // poll loop below).  Enqueueing before the check would spawn real agent
     // work on every idle tick, exhausting queue capacity and quota.
 
-    // Sequential acquisition — lock dropped immediately after write; not held
-    // across any await point.
-    review_state.lock().await.fallback_ts = Some(Utc::now());
-
-    let event = Event::new(
-        SessionId::new(),
-        "periodic_review",
-        "scheduler",
-        Decision::Pass,
-    );
-    if let Err(err) = state.observability.events.log(&event).await {
-        tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
-    }
+    // NOTE: the watermark (fallback_ts + periodic_review event) is NOT advanced
+    // here at enqueue time.  Advancing early creates a duplicate-review window:
+    // the agent runs with `--since=<old_watermark>` (no --until bound), so any
+    // commit that arrives between enqueue and execution is reviewed by this agent
+    // AND falls inside the next tick's `--since=<enqueue_time>` window, producing
+    // duplicate issues.  The watermark is advanced inside the async poll task
+    // below, only after the agent confirms new commits exist.
 
     // Sequential acquisition — take the old handle (drop without abort so the
     // previous poller can still run to completion) then release the lock before
@@ -202,6 +196,7 @@ async fn run_review_tick(
     let primary_agent_for_synthesis = review_agent.clone();
     let secondary_agent_name = secondary_agent.clone();
     let state_for_synthesis = state.clone();
+    let fallback_ts_for_poll = fallback_ts.clone();
     let handle = tokio::spawn(async move {
         let primary_output = poll_task_output(&store, &primary_review_id, timeout_secs).await;
         tracing::info!(
@@ -211,12 +206,14 @@ async fn run_review_tick(
         );
 
         // Agent may signal that no commits landed since last review.
-        // Use exact-line matching to avoid false positives when the literal
-        // "REVIEW_SKIPPED" appears inside review JSON (e.g. in a finding title
-        // or description about this very codebase).
+        // Require the ENTIRE output (trimmed) to equal "REVIEW_SKIPPED".
+        // Line-by-line matching is a false positive when the agent quotes the
+        // sentinel in an explanation, code block, or constant reference — in
+        // those cases the agent still produced a real review and the secondary/
+        // synthesis tasks must not be silently dropped.
         if primary_output
             .as_deref()
-            .map(|s| s.lines().any(|line| line.trim() == "REVIEW_SKIPPED"))
+            .map(|s| s.trim() == "REVIEW_SKIPPED")
             .unwrap_or(false)
         {
             tracing::debug!(
@@ -226,8 +223,31 @@ async fn run_review_tick(
             return;
         }
 
-        // Primary confirmed new commits exist — now it is safe to enqueue
-        // the secondary reviewer (Cross strategy only).
+        // Primary confirmed new commits exist — advance the watermark now.
+        // Advancing at enqueue time creates a duplicate-review gap: commits
+        // arriving between enqueue and execution are covered by this agent
+        // (--since has no --until bound) but would also fall inside the next
+        // tick's --since window, producing duplicate issues.  By advancing here
+        // we set the boundary to the agent's execution completion time, ensuring
+        // the next tick's --since is always ≥ all commits this agent reviewed.
+        let review_complete_ts = Utc::now();
+        *fallback_ts_for_poll.lock().await = Some(review_complete_ts);
+        let watermark_event = Event::new(
+            SessionId::new(),
+            "periodic_review",
+            "scheduler",
+            Decision::Pass,
+        );
+        if let Err(err) = state_for_synthesis
+            .observability
+            .events
+            .log(&watermark_event)
+            .await
+        {
+            tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
+        }
+
+        // Now it is safe to enqueue the secondary reviewer (Cross strategy only).
         let secondary_review_id: Option<harness_core::TaskId> = if let Some(agent) =
             secondary_agent_name.as_ref()
         {
@@ -603,39 +623,42 @@ mod tests {
         assert!(guard.poll_handle.is_some());
     }
 
-    /// Structural check: run_review_tick no longer contains Command::new("git").
-    /// This is a compile-time / source-level assertion verified by reading the
-    /// function source — there is no tokio::process::Command call in the tick path.
+    /// Structural check: run_review_tick no longer spawns git as a child process.
+    /// The source file must not contain the forbidden invocation pattern.
     #[test]
     fn test_git_guard_removed() {
-        // The git log guard was at lines 88-104 in the original file.
-        // Verifying absence structurally: the function compiles without any
-        // tokio::process::Command usage for the git check.
-        // Since the crate compiles (ignoring pre-existing errors in other files),
-        // this test passing proves the guard is gone.
+        // The forbidden pattern is split across two literals so that this very
+        // test does not trigger the assertion it is enforcing.
+        let forbidden = ["Command::new(", "\"git\")"].concat();
         let source = include_str!("periodic_reviewer.rs");
         assert!(
-            !source.contains("Command::new(\"git\")"),
-            "periodic_reviewer.rs must not contain Command::new(\"git\")"
+            !source.contains(&forbidden),
+            "periodic_reviewer.rs must not spawn git directly"
         );
     }
 
-    /// REVIEW_SKIPPED in agent output is treated as a no-op only when it appears
-    /// as an exact line (trimmed).  Substring matches inside JSON content must NOT
-    /// trigger the early-return path (false-positive guard).
+    /// REVIEW_SKIPPED is detected only when the ENTIRE output (trimmed) equals
+    /// the sentinel.  Line-by-line matching is too permissive: an agent that
+    /// quotes the sentinel in an explanation or code block would trigger a false
+    /// skip, silently dropping the real review/secondary/synthesis results.
     #[test]
     fn test_review_skipped_detection() {
-        let is_skipped = |s: Option<&str>| {
-            s.map(|s| s.lines().any(|l| l.trim() == "REVIEW_SKIPPED"))
-                .unwrap_or(false)
-        };
+        let is_skipped = |s: Option<&str>| s.map(|s| s.trim() == "REVIEW_SKIPPED").unwrap_or(false);
 
-        // True positive: sentinel on its own line.
-        assert!(is_skipped(Some("some preamble\nREVIEW_SKIPPED\nmore text")));
-        // True positive: sentinel with surrounding whitespace.
+        // True positive: entire output is exactly the sentinel.
+        assert!(is_skipped(Some("REVIEW_SKIPPED")));
+        // True positive: trailing newline stripped by trim.
+        assert!(is_skipped(Some("REVIEW_SKIPPED\n")));
+        // True positive: leading/trailing whitespace stripped by trim.
         assert!(is_skipped(Some("  REVIEW_SKIPPED  ")));
 
-        // False-positive guard: literal appears inside JSON content but not as a standalone line.
+        // False-positive guard: sentinel on its own line but with other content —
+        // the entire output is not the sentinel, so this must NOT trigger.
+        assert!(!is_skipped(Some(
+            "some preamble\nREVIEW_SKIPPED\nmore text"
+        )));
+        assert!(!is_skipped(Some("No commits found.\nREVIEW_SKIPPED")));
+        // False-positive guard: literal appears inside JSON content.
         assert!(!is_skipped(Some(
             r#"{"title":"REVIEW_SKIPPED check removed","action":"LGTM"}"#
         )));
