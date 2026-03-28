@@ -272,6 +272,29 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let dir = expand_tilde(&server.config.server.data_dir);
     let project_root = resolve_project_root(&server.config.server.project_root)?;
     std::fs::create_dir_all(&dir)?;
+    // On Unix, verify that `dir` is a real directory and not a symbolic link.
+    // A low-privileged attacker can pre-create a symlink at the fallback temp
+    // path before a privileged harness process starts, redirecting all
+    // persistent state (tasks.db, threads.db, events, workspaces) to an
+    // attacker-controlled location.  Refusing to operate on a symlink is the
+    // minimal safe response; production deployments must set `data_dir`
+    // explicitly so the fallback path is never reached.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let meta = std::fs::symlink_metadata(&dir)
+            .with_context(|| format!("failed to stat data_dir {:?}", dir))?;
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "data_dir {:?} is a symbolic link; refusing to start to prevent \
+                 potential symlink hijacking. Set an explicit `data_dir` in your \
+                 harness config file.",
+                dir
+            );
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to set 0o700 permissions on data_dir {:?}", dir))?;
+    }
     tracing::debug!(
         data_dir = %dir.display(),
         project_root = %project_root.display(),
