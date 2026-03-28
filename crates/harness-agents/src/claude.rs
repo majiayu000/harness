@@ -67,17 +67,17 @@ impl ClaudeCodeAgent {
 
         // Hard tool enforcement at the CLI boundary (issue #514):
         //   Full profile  (allowed_tools = None)    → --dangerously-skip-permissions
-        //   Restricted profile (allowed_tools set)  → --permission-mode bypass-permissions
+        //   Restricted profile (allowed_tools set)  → --permission-mode bypassPermissions
         //                                              --allowedTools <comma-list>
         //
         // --allowedTools and --dangerously-skip-permissions are mutually exclusive
         // in Claude CLI 2.1.70+. Using --allowedTools provides hard enforcement;
         // the agent cannot call tools outside the list regardless of prompt content.
         //
-        // --permission-mode bypass-permissions is required alongside --allowedTools so
+        // --permission-mode bypassPermissions is required alongside --allowedTools so
         // that non-interactive background tasks (preflight, periodic review, reviewer)
         // do not hang waiting for interactive approval prompts on the first Bash/Edit
-        // call. The two flags are orthogonal: bypass-permissions auto-approves tool
+        // call. The two flags are orthogonal: bypassPermissions auto-approves tool
         // calls within the allowed set; --allowedTools limits what that set is.
         //
         // Post-execution validate_tool_usage() remains as a defense-in-depth layer.
@@ -85,7 +85,7 @@ impl ClaudeCodeAgent {
             base_args.push(OsString::from("--dangerously-skip-permissions"));
         } else {
             base_args.push(OsString::from("--permission-mode"));
-            base_args.push(OsString::from("bypass-permissions"));
+            base_args.push(OsString::from("bypassPermissions"));
             base_args.push(OsString::from("--allowedTools"));
             let tools = req.allowed_tools.as_deref().unwrap_or(&[]);
             base_args.push(OsString::from(tools.join(",")));
@@ -295,6 +295,16 @@ mod tests {
             args.contains(&"--permission-mode".to_string()),
             "Standard profile must use --permission-mode; got: {args:?}"
         );
+        let permission_mode_value = args
+            .iter()
+            .skip_while(|a| *a != "--permission-mode")
+            .nth(1)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            permission_mode_value, "bypassPermissions",
+            "--permission-mode value must be bypassPermissions (camelCase); got: {permission_mode_value:?}"
+        );
         assert!(
             !args.contains(&"--dangerously-skip-permissions".to_string()),
             "Standard profile must NOT use --dangerously-skip-permissions; got: {args:?}"
@@ -361,7 +371,10 @@ mod tests {
         );
         for (label, allowed_tools) in [
             ("full", None),
-            ("standard", Some(vec!["Read".to_string(), "Bash".to_string()])),
+            (
+                "standard",
+                Some(vec!["Read".to_string(), "Bash".to_string()]),
+            ),
         ] {
             let req = AgentRequest {
                 allowed_tools,
