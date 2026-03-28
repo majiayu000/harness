@@ -103,10 +103,32 @@ async fn run_review_tick(
 
     let project_str = project_root.display().to_string();
     let project_cfg = harness_core::config::load_project_config(project_root);
-    let base_prompt = harness_core::prompts::periodic_review_prompt(
+
+    // Run the guard scan on the source repo before spawning the agent.  The
+    // agent runs inside a worktree that may contain nested `.harness/worktrees/`
+    // from previous runs; scanning there inflates violation counts ~3x.
+    let guard_scan_output: Option<String> = {
+        let rules = state.engines.rules.read().await;
+        match rules.scan(project_root).await {
+            Ok(violations) => {
+                let text = format_violations_for_prompt(&violations);
+                Some(text)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "scheduler: guard scan on source repo failed; agent will run guards itself"
+                );
+                None
+            }
+        }
+    };
+
+    let base_prompt = harness_core::prompts::periodic_review_prompt_with_guard_scan(
         &project_str,
         &since_arg,
         project_cfg.review_type.as_str(),
+        guard_scan_output.as_deref(),
     );
 
     let review_agent = config
@@ -363,6 +385,23 @@ async fn run_review_tick(
     review_state.lock().await.poll_handle = Some(handle);
 
     Ok(())
+}
+
+fn format_violations_for_prompt(violations: &[harness_core::Violation]) -> String {
+    if violations.is_empty() {
+        return "No violations found.".to_string();
+    }
+    let lines: Vec<String> = violations
+        .iter()
+        .map(|v| {
+            let loc = match v.line {
+                Some(l) => format!("{}:{l}", v.file.display()),
+                None => v.file.display().to_string(),
+            };
+            format!("[{:?}] {}: {} ({})", v.severity, v.rule_id, v.message, loc)
+        })
+        .collect();
+    format!("{} violation(s):\n{}", violations.len(), lines.join("\n"))
 }
 
 fn pick_secondary_review_agent<F>(
