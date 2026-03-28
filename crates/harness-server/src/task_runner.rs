@@ -521,10 +521,11 @@ impl TaskStore {
     pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
         let db = TaskDb::open(db_path).await?;
         let recovery = db.recover_in_progress().await?;
-        if recovery.failed > 0 {
+        if recovery.failed > 0 || recovery.resumed > 0 {
             tracing::warn!(
-                "startup recovery: marked {} interrupted task(s) as failed (reviewing/waiting states cannot resume after restart)",
-                recovery.failed
+                "startup recovery: {} task(s) failed (no checkpoint), {} task(s) resumed from checkpoint",
+                recovery.failed,
+                recovery.resumed
             );
         }
         let cache = DashMap::new();
@@ -701,6 +702,35 @@ impl TaskStore {
         if let Err(e) = self.db.insert(state).await {
             tracing::error!("task_db insert failed: {e}");
         }
+    }
+
+    /// Write a phase checkpoint for `task_id`. Checkpoint writes are non-fatal:
+    /// callers should log the error rather than failing the task.
+    pub(crate) async fn write_checkpoint(
+        &self,
+        task_id: &TaskId,
+        triage_output: Option<&str>,
+        plan_output: Option<&str>,
+        pr_url: Option<&str>,
+        last_phase: &str,
+    ) -> anyhow::Result<()> {
+        self.db
+            .write_checkpoint(
+                task_id.as_str(),
+                triage_output,
+                plan_output,
+                pr_url,
+                last_phase,
+            )
+            .await
+    }
+
+    /// Load the checkpoint for `task_id`, or `None` if no checkpoint exists.
+    pub(crate) async fn load_checkpoint(
+        &self,
+        task_id: &TaskId,
+    ) -> anyhow::Result<Option<crate::task_db::TaskCheckpoint>> {
+        self.db.load_checkpoint(task_id.as_str()).await
     }
 
     pub(crate) async fn persist(&self, id: &TaskId) -> anyhow::Result<()> {

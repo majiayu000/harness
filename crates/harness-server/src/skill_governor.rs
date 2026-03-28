@@ -194,7 +194,12 @@ mod tests {
             let task_id = register_pending_task(state.core.tasks.clone(), &req).await;
             update_status(&state.core.tasks, &task_id, TaskStatus::Failed, 1).await?;
 
-            let mut event = Event::new(SessionId::new(), "skill_used", "task_runner", Decision::Pass);
+            let mut event = Event::new(
+                SessionId::new(),
+                "skill_used",
+                "task_runner",
+                Decision::Pass,
+            );
             event.detail = Some(format!(
                 "task_id={} skill_id={}",
                 task_id.as_str(),
@@ -219,7 +224,8 @@ mod tests {
     async fn governance_tick_does_not_double_count_without_new_events() -> anyhow::Result<()> {
         let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
         let data_dir = crate::test_helpers::tempdir_in_home("harness-skill-gov-dedup-data-")?;
-        let project_root = crate::test_helpers::tempdir_in_home("harness-skill-gov-dedup-project-")?;
+        let project_root =
+            crate::test_helpers::tempdir_in_home("harness-skill-gov-dedup-project-")?;
         let state = crate::test_helpers::make_test_state_with_project_root(
             data_dir.path(),
             project_root.path(),
@@ -247,7 +253,12 @@ mod tests {
         let task_id = register_pending_task(state.core.tasks.clone(), &req).await;
         update_status(&state.core.tasks, &task_id, TaskStatus::Failed, 1).await?;
 
-        let mut used = Event::new(SessionId::new(), "skill_used", "task_runner", Decision::Pass);
+        let mut used = Event::new(
+            SessionId::new(),
+            "skill_used",
+            "task_runner",
+            Decision::Pass,
+        );
         used.detail = Some(format!(
             "task_id={} skill_id={}",
             task_id.as_str(),

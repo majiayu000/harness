@@ -346,17 +346,15 @@ async fn restart_mixed_recovery_counts() -> anyhow::Result<()> {
     let store = TaskStore::open(&db_path).await?;
 
     let all = store.list_all();
-    let resumed: Vec<_> = all
-        .iter()
-        .filter(|t| matches!(t.status, TaskStatus::Pending))
-        .collect();
-    let failed: Vec<_> = all
-        .iter()
-        .filter(|t| matches!(t.status, TaskStatus::Failed))
-        .collect();
-
-    assert_eq!(resumed.len(), 2, "two tasks should have been resumed");
-    assert_eq!(failed.len(), 2, "two tasks should have been failed");
+    let (resumed_count, failed_count) =
+        all.iter()
+            .fold((0, 0), |(resumed, failed), task| match task.status {
+                TaskStatus::Pending => (resumed + 1, failed),
+                TaskStatus::Failed => (resumed, failed + 1),
+                _ => (resumed, failed),
+            });
+    assert_eq!(resumed_count, 2, "two tasks should have been resumed");
+    assert_eq!(failed_count, 2, "two tasks should have been failed");
 
     Ok(())
 }
