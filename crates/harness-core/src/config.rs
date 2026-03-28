@@ -10,6 +10,7 @@ pub use agents::{
     AgentReviewConfig, AgentsConfig, AnthropicApiConfig, ApprovalPolicy, CapabilityProfile,
     ClaudeAgentConfig, CodexAgentConfig, CodexCloudConfig, SandboxMode,
 };
+pub use dirs::default_db_path;
 pub use intake::{FeishuIntakeConfig, GitHubIntakeConfig, GitHubRepoConfig, IntakeConfig};
 pub use misc::{
     ConcurrencyConfig, GcConfig, ObserveConfig, OtelConfig, OtelExporter, ReviewConfig,

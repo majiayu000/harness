@@ -320,7 +320,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         Some(_) => {}
     }
 
-    let db_path = dir.join("tasks.db");
+    let db_path = harness_core::default_db_path(&dir, "tasks");
     tracing::debug!("task db: {}", db_path.display());
     let tasks = task_runner::TaskStore::open(&db_path).await?;
 
@@ -411,12 +411,15 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         .with_checkpoint(dir.join("gc-checkpoint.json")),
     );
 
-    let thread_db_path = dir.join("threads.db");
+    let thread_db_path = harness_core::default_db_path(&dir, "threads");
     let thread_db = crate::thread_db::ThreadDb::open(&thread_db_path).await?;
-    let plan_db = crate::plan_db::PlanDb::open(&dir.join("plans.db")).await?;
+    let plan_db =
+        crate::plan_db::PlanDb::open(&harness_core::default_db_path(&dir, "plans")).await?;
 
-    let project_registry =
-        crate::project_registry::ProjectRegistry::open(&dir.join("projects.db")).await?;
+    let project_registry = crate::project_registry::ProjectRegistry::open(
+        &harness_core::default_db_path(&dir, "projects"),
+    )
+    .await?;
     // Auto-register the default project from --project-root on startup.
     let default_project = crate::project_registry::Project {
         id: "default".to_string(),
@@ -704,7 +707,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                 password_reset_rate_limit,
             )),
             review_store: {
-                let review_db_path = dir.join("reviews.db");
+                let review_db_path = harness_core::default_db_path(&dir, "reviews");
                 match crate::review_store::ReviewStore::open(&review_db_path).await {
                     Ok(store) => Some(Arc::new(store)),
                     Err(e) => {
