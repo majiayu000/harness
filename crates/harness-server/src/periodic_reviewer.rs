@@ -107,7 +107,13 @@ async fn run_review_tick(
     // Run the guard scan on the source repo before spawning the agent.  The
     // agent runs inside a worktree that may contain nested `.harness/worktrees/`
     // from previous runs; scanning there inflates violation counts ~3x.
-    let guard_scan_output: Option<String> = {
+    //
+    // Only scan repos that have opted in via `.harness/guards`.  The shared
+    // RuleEngine holds guards from all registered projects; scanning an unrelated
+    // repo with those guards produces false positives (mirrors the opt-in check
+    // in rule_enforcer.rs).
+    let guard_scan_output: Option<String> = if project_root.join(".harness").join("guards").is_dir()
+    {
         let rules = state.engines.rules.read().await;
         match rules.scan(project_root).await {
             Ok(violations) => {
@@ -122,6 +128,12 @@ async fn run_review_tick(
                 None
             }
         }
+    } else {
+        tracing::debug!(
+            project_root = %project_root.display(),
+            "scheduler: no .harness/guards directory, skipping pre-scan"
+        );
+        None
     };
 
     let base_prompt = harness_core::prompts::periodic_review_prompt_with_guard_scan(
@@ -387,11 +399,21 @@ async fn run_review_tick(
     Ok(())
 }
 
+/// Maximum number of violations inlined into the prompt.
+///
+/// The full list may contain hundreds of entries; inlining all of them can
+/// exceed OS ARG_MAX or the model's context window before the agent even
+/// starts.  Only the first N are embedded; the total count is always reported
+/// so the agent knows additional findings exist.
+const MAX_INLINE_VIOLATIONS: usize = 20;
+
 fn format_violations_for_prompt(violations: &[harness_core::Violation]) -> String {
     if violations.is_empty() {
         return "No violations found.".to_string();
     }
-    let lines: Vec<String> = violations
+    let total = violations.len();
+    let shown = violations.len().min(MAX_INLINE_VIOLATIONS);
+    let lines: Vec<String> = violations[..shown]
         .iter()
         .map(|v| {
             let loc = match v.line {
@@ -401,7 +423,17 @@ fn format_violations_for_prompt(violations: &[harness_core::Violation]) -> Strin
             format!("[{:?}] {}: {} ({})", v.severity, v.rule_id, v.message, loc)
         })
         .collect();
-    format!("{} violation(s):\n{}", violations.len(), lines.join("\n"))
+    let mut out = format!(
+        "{total} violation(s) (showing {shown}):\n{}",
+        lines.join("\n")
+    );
+    if total > shown {
+        out.push_str(&format!(
+            "\n... and {} more violation(s) not shown. Run guard scripts locally for the full list.",
+            total - shown
+        ));
+    }
+    out
 }
 
 fn pick_secondary_review_agent<F>(
@@ -604,8 +636,36 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    /// Fallback timestamp is updated atomically; verify ReviewState round-trips
-    /// correctly through the single combined mutex.
+    #[test]
+    fn format_violations_truncates_at_max_inline() {
+        use harness_core::{RuleId, Severity, Violation};
+        use std::path::PathBuf;
+
+        let make_v = |i: usize| Violation {
+            rule_id: RuleId::from_str(&format!("RS-{i:02}")),
+            file: PathBuf::from(format!("src/file{i}.rs")),
+            line: Some(i),
+            message: format!("violation {i}"),
+            severity: Severity::Medium,
+        };
+
+        // Exactly at the limit — all shown, no truncation suffix.
+        let at_limit: Vec<_> = (0..MAX_INLINE_VIOLATIONS).map(make_v).collect();
+        let out = format_violations_for_prompt(&at_limit);
+        assert!(out.contains(&format!(
+            "{} violation(s) (showing {})",
+            MAX_INLINE_VIOLATIONS, MAX_INLINE_VIOLATIONS
+        )));
+        assert!(!out.contains("more violation(s) not shown"));
+
+        // One over the limit — truncation suffix must appear.
+        let over_limit: Vec<_> = (0..=MAX_INLINE_VIOLATIONS).map(make_v).collect();
+        let out = format_violations_for_prompt(&over_limit);
+        assert!(out.contains("1 more violation(s) not shown"));
+    }
+
+    /// Fallback is updated atomically before the EventStore write; verify the
+    /// Arc<Mutex<Option<DateTime<Utc>>>> can be written and read correctly.
     #[tokio::test]
     async fn fallback_ts_arc_mutex_roundtrip() {
         let state: Arc<Mutex<ReviewState>> = Arc::new(Mutex::new(ReviewState::default()));
