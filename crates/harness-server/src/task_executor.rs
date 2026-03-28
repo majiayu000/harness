@@ -77,9 +77,18 @@ async fn run_test_gate(
     project_root: &Path,
     custom_cmds: &[String],
     timeout_secs: u64,
+    extra_env: &HashMap<String, String>,
 ) -> Result<(), String> {
     // Prefer explicitly configured pre_push commands; fall back to language detection.
     let cmds: Vec<String> = if !custom_cmds.is_empty() {
+        // Issue 1 fix: validate every custom command against the safety allowlist
+        // before executing. Malicious repos could supply shell-injection payloads
+        // via `.harness/config.toml` validation.pre_push.
+        for cmd in custom_cmds {
+            if let Err(e) = crate::post_validator::validate_command_safety(cmd) {
+                return Err(format!("test gate: command rejected by safety check: {e}"));
+            }
+        }
         custom_cmds.to_vec()
     } else {
         match lang_detect::primary_test_command(project_root) {
@@ -100,6 +109,9 @@ async fn run_test_gate(
         let child = match TokioCommand::new("sh")
             .args(["-c", cmd])
             .current_dir(project_root)
+            // Issue 3 fix: inherit the per-task CARGO_TARGET_DIR so parallel
+            // Rust tasks do not contend on the same build directory (issue #488).
+            .envs(extra_env)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1165,6 +1177,11 @@ pub(crate) async fn run_task(
 
     // Carries test gate failure output from a rejected LGTM into the next review round.
     let mut pending_test_failure: Option<String> = None;
+    // Issue 2 fix: track whether any LGTM was ever rejected by the test gate
+    // without a subsequent clean LGTM+pass. `pending_test_failure.take()` clears
+    // the Option at the start of each round (to avoid re-showing the same output),
+    // but the graduation check must still know a test gate rejection occurred.
+    let mut lgtm_test_gate_rejected = false;
 
     // Review loop.
     // Use an explicit counter so WAITING responses don't consume a round — `continue`
@@ -1349,6 +1366,7 @@ pub(crate) async fn run_task(
                 &project,
                 &project_config.validation.pre_push,
                 project_config.validation.test_gate_timeout_secs,
+                &cargo_env,
             )
             .await
             {
@@ -1382,6 +1400,7 @@ pub(crate) async fn run_task(
                         "LGTM rejected: tests failed in test gate, re-entering review round {}",
                         round.saturating_add(1)
                     );
+                    lgtm_test_gate_rejected = true;
                     pending_test_failure = Some(output);
                 }
             }
@@ -1406,7 +1425,9 @@ pub(crate) async fn run_task(
     // But never graduate when the test gate was still failing on the last round:
     // a PR whose tests consistently fail must not be approved.
     let last_issue_count = issue_counts.iter().rev().find_map(|c| *c);
-    let graduated = last_issue_count.is_some_and(|n| n <= 2) && pending_test_failure.is_none();
+    // Never graduate when a LGTM was rejected by the test gate — the pending_test_failure
+    // Option was already cleared by take() at round start, so we track rejection separately.
+    let graduated = last_issue_count.is_some_and(|n| n <= 2) && !lgtm_test_gate_rejected;
 
     if graduated {
         tracing::info!(
