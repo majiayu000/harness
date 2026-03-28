@@ -21,7 +21,8 @@ async fn make_test_state_with_config_and_registry(
         ThreadManager::new(),
         agent_registry,
     ));
-    let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
+    let tasks =
+        crate::task_runner::TaskStore::open(&harness_core::default_db_path(dir, "tasks")).await?;
     let events = Arc::new(harness_observe::EventStore::new(dir).await?);
     let signal_detector = harness_gc::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
@@ -34,10 +35,13 @@ async fn make_test_state_with_config_and_registry(
         draft_store,
         dir.to_path_buf(),
     ));
-    let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
+    let thread_db =
+        crate::thread_db::ThreadDb::open(&harness_core::default_db_path(dir, "threads")).await?;
     let (notification_tx, _) = tokio::sync::broadcast::channel(64);
-    let _project_svc_tmp =
-        crate::project_registry::ProjectRegistry::open(&dir.join("svc_projects.db")).await?;
+    let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
+        &harness_core::default_db_path(dir, "projects"),
+    )
+    .await?;
     let project_svc =
         crate::services::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
     let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
@@ -1315,7 +1319,8 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         ThreadManager::new(),
         AgentRegistry::new("test"),
     ));
-    let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
+    let tasks =
+        crate::task_runner::TaskStore::open(&harness_core::default_db_path(dir, "tasks")).await?;
     let events = Arc::new(harness_observe::EventStore::new(dir).await?);
     let signal_detector = harness_gc::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
@@ -1328,11 +1333,15 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         draft_store,
         dir.to_path_buf(),
     ));
-    let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
-    let plan_db = crate::plan_db::PlanDb::open(&dir.join("exec_plans.db")).await?;
+    let thread_db =
+        crate::thread_db::ThreadDb::open(&harness_core::default_db_path(dir, "threads")).await?;
+    let plan_db =
+        crate::plan_db::PlanDb::open(&harness_core::default_db_path(dir, "plans")).await?;
     let (notification_tx, _) = tokio::sync::broadcast::channel(64);
-    let _project_svc_tmp =
-        crate::project_registry::ProjectRegistry::open(&dir.join("svc_projects.db")).await?;
+    let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
+        &harness_core::default_db_path(dir, "projects"),
+    )
+    .await?;
     let project_svc =
         crate::services::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
     let task_svc = crate::services::DefaultTaskService::new(tasks.clone());

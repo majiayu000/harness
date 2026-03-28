@@ -242,7 +242,9 @@ mod tests {
             ThreadManager::new(),
             AgentRegistry::new("test"),
         ));
-        let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
+        let tasks =
+            crate::task_runner::TaskStore::open(&harness_core::default_db_path(dir, "tasks"))
+                .await?;
         let events = Arc::new(harness_observe::EventStore::new(dir).await?);
         let signal_detector = harness_gc::SignalDetector::new(
             server.config.gc.signal_thresholds.clone().into(),
@@ -255,12 +257,16 @@ mod tests {
             draft_store,
             dir.to_path_buf(),
         ));
-        let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
+        let thread_db =
+            crate::thread_db::ThreadDb::open(&harness_core::default_db_path(dir, "threads"))
+                .await?;
         let (notification_tx, _) = broadcast::channel(notification_broadcast_capacity);
         let (ws_shutdown_tx, _) = broadcast::channel(1);
 
-        let _project_svc_tmp =
-            crate::project_registry::ProjectRegistry::open(&dir.join("svc_projects.db")).await?;
+        let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
+            &harness_core::default_db_path(dir, "projects"),
+        )
+        .await?;
         let project_svc =
             crate::services::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
         let task_svc = crate::services::DefaultTaskService::new(tasks.clone());

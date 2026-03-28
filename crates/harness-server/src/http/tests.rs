@@ -68,7 +68,7 @@ async fn make_test_state_with(
         thread_manager,
         agent_registry,
     ));
-    let tasks = task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
+    let tasks = task_runner::TaskStore::open(&harness_core::default_db_path(dir, "tasks")).await?;
     let events = Arc::new(harness_observe::EventStore::new(dir).await?);
     let signal_detector = harness_gc::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
@@ -81,9 +81,12 @@ async fn make_test_state_with(
         draft_store,
         dir.to_path_buf(),
     ));
-    let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
-    let _project_svc_tmp =
-        crate::project_registry::ProjectRegistry::open(&dir.join("svc_projects.db")).await?;
+    let thread_db =
+        crate::thread_db::ThreadDb::open(&harness_core::default_db_path(dir, "threads")).await?;
+    let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
+        &harness_core::default_db_path(dir, "projects"),
+    )
+    .await?;
     let project_svc =
         crate::services::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
     let task_svc = crate::services::DefaultTaskService::new(tasks.clone());

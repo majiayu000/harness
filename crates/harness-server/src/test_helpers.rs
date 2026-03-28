@@ -95,7 +95,8 @@ async fn make_state_inner(
         ThreadManager::new(),
         agent_registry,
     ));
-    let tasks = crate::task_runner::TaskStore::open(&dir.join("tasks.db")).await?;
+    let tasks =
+        crate::task_runner::TaskStore::open(&harness_core::default_db_path(dir, "tasks")).await?;
     let events = Arc::new(harness_observe::EventStore::new(dir).await?);
     let signal_detector = harness_gc::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
@@ -108,14 +109,18 @@ async fn make_state_inner(
         draft_store,
         project_root.to_path_buf(),
     ));
-    let thread_db = crate::thread_db::ThreadDb::open(&dir.join("threads.db")).await?;
+    let thread_db =
+        crate::thread_db::ThreadDb::open(&harness_core::default_db_path(dir, "threads")).await?;
     let (notification_tx, _) = tokio::sync::broadcast::channel(64);
     let task_queue = Arc::new(crate::task_queue::TaskQueue::new(&Default::default()));
 
     // Service layer — use concrete defaults backed by the same infrastructure.
     let project_svc = crate::services::DefaultProjectService::new(
         // Tests that don't need a registry still get a lightweight one.
-        crate::project_registry::ProjectRegistry::open(&dir.join("projects.db")).await?,
+        crate::project_registry::ProjectRegistry::open(&harness_core::default_db_path(
+            dir, "projects",
+        ))
+        .await?,
         project_root.to_path_buf(),
     );
     let task_svc = crate::services::DefaultTaskService::new(tasks.clone());

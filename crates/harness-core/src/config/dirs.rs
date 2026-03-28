@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn dirs_data_dir() -> PathBuf {
     match data_local_dir() {
@@ -32,6 +32,15 @@ fn temp_fallback_dir() -> PathBuf {
         })
         .collect();
     std::env::temp_dir().join(format!("harness-{safe}"))
+}
+
+/// Return the canonical path for a named SQLite database file within `dir`.
+///
+/// All stores must construct their paths through this function so that the
+/// file-name convention (`{name}.db`) is enforced in a single place and
+/// divergence between callers is impossible.
+pub fn default_db_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.db"))
 }
 
 fn data_local_dir() -> Option<PathBuf> {
