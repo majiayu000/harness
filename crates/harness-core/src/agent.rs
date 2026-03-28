@@ -21,7 +21,16 @@ pub trait CodeAgent: Send + Sync {
 pub struct AgentRequest {
     pub prompt: String,
     pub project_root: PathBuf,
-    pub allowed_tools: Vec<String>,
+    /// Tool restriction for the agent invocation.
+    ///
+    /// - `None`  → Full profile: no restriction, CLI uses `--dangerously-skip-permissions`.
+    /// - `Some(tools)` → Restricted: CLI uses `--allowedTools <list>`.
+    ///   An explicitly empty `Some(vec![])` means deny-all at the CLI boundary.
+    ///
+    /// This `Option` preserves the distinction between "no restriction configured"
+    /// and "explicitly empty allowlist", preventing an emergency deny-all config
+    /// (`allowed_tools = []`) from being silently promoted to full permissions.
+    pub allowed_tools: Option<Vec<String>>,
     pub model: Option<String>,
     pub max_budget_usd: Option<f64>,
     pub context: Vec<ContextItem>,
@@ -43,8 +52,11 @@ impl AgentRequest {
     /// When `true`, the CLI adapter should use `--dangerously-skip-permissions`.
     /// When `false`, the adapter should use `--allowedTools <list>` instead —
     /// these flags are mutually exclusive in Claude CLI 2.1.70+.
+    ///
+    /// `None` means "no restriction configured" (Full profile).
+    /// `Some(_)` means an explicit allowlist was provided, even if empty (deny-all).
     pub fn uses_dangerously_skip_permissions(&self) -> bool {
-        self.allowed_tools.is_empty()
+        self.allowed_tools.is_none()
     }
 }
 
@@ -53,7 +65,7 @@ impl Default for AgentRequest {
         Self {
             prompt: String::new(),
             project_root: PathBuf::from("."),
-            allowed_tools: Vec::new(),
+            allowed_tools: None,
             model: None,
             max_budget_usd: None,
             context: Vec::new(),
