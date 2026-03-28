@@ -1279,7 +1279,16 @@ mod tests {
 
     #[test]
     fn test_review_prompt_shell_quoting() {
-        let p = review_prompt(None, 5, 2, false, "it's a test", "bot[bot]", "owner/repo", false);
+        let p = review_prompt(
+            None,
+            5,
+            2,
+            false,
+            "it's a test",
+            "bot[bot]",
+            "owner/repo",
+            false,
+        );
         assert!(
             p.contains(r"'it'\''s a test'"),
             "single quote must be escaped"
@@ -1298,8 +1307,14 @@ mod tests {
     #[test]
     fn test_review_prompt_impasse_mode() {
         let p = review_prompt(
-            None, 10, 5, false, "/gemini review",
-            "gemini-code-assist[bot]", "owner/repo", true,
+            None,
+            10,
+            5,
+            false,
+            "/gemini review",
+            "gemini-code-assist[bot]",
+            "owner/repo",
+            true,
         );
         assert!(p.contains("IMPASSE MODE"));
         assert!(p.contains("critical severity"));

@@ -8,6 +8,24 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
+/// Mutable state shared between review ticks.
+///
+/// Both fields are combined into a single `Mutex` to eliminate the RS-01
+/// nested-lock risk that arises from holding two separate mutexes in the same
+/// function.  Every acquisition of this lock is short (no `.await` while
+/// holding it) and sequential — locks are never held concurrently.
+struct ReviewState {
+    /// Local fallback timestamp guards against stale deduplication when the
+    /// EventStore write fails.  Updated atomically after every successful task
+    /// enqueue so the next cycle always sees a fresh lower-bound even if the
+    /// DB is unavailable.
+    fallback_ts: Option<DateTime<Utc>>,
+    /// Handle for the currently active polling task.  The handle is dropped
+    /// (without abort) when a new cycle starts so the old task can still run
+    /// to completion and persist its findings (issue #448).
+    poll_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
 /// Spawn the periodic review loop as a background task.
 ///
 /// If review is disabled in config the loop returns immediately without
@@ -25,27 +43,23 @@ pub fn start(state: Arc<AppState>, config: ReviewConfig) {
 
 async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     let interval = config.effective_interval();
-    // Local fallback timestamp guards against stale deduplication when the
-    // EventStore write fails.  It is updated atomically after every successful
-    // task enqueue so the next cycle always sees a fresh lower-bound even if
-    // the DB is unavailable.
-    let fallback_ts: Arc<Mutex<Option<DateTime<Utc>>>> = Arc::new(Mutex::new(None));
-
-    // Tracks the currently active polling task so it can be cancelled if a new
-    // review cycle starts before the previous one finishes (issue #448).
-    let poll_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    // Single mutex covering both fallback_ts and poll_handle — RS-01 fix.
+    let review_state: Arc<Mutex<ReviewState>> = Arc::new(Mutex::new(ReviewState {
+        fallback_ts: None,
+        poll_handle: None,
+    }));
 
     if config.run_on_startup {
         // Brief delay to let the server fully initialize before the first tick.
         sleep(Duration::from_secs(5)).await;
-        if let Err(err) = run_review_tick(&state, &config, &fallback_ts, &poll_handle).await {
+        if let Err(err) = run_review_tick(&state, &config, &review_state).await {
             tracing::error!("scheduler: periodic review startup tick failed: {err}");
         }
     }
 
     loop {
         sleep(interval).await;
-        if let Err(err) = run_review_tick(&state, &config, &fallback_ts, &poll_handle).await {
+        if let Err(err) = run_review_tick(&state, &config, &review_state).await {
             tracing::error!("scheduler: periodic review tick failed: {err}");
         }
     }
@@ -54,8 +68,7 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
 async fn run_review_tick(
     state: &Arc<AppState>,
     config: &ReviewConfig,
-    fallback_ts: &Arc<Mutex<Option<DateTime<Utc>>>>,
-    poll_handle: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    review_state: &Arc<Mutex<ReviewState>>,
 ) -> anyhow::Result<()> {
     let project_root = &state.core.project_root;
 
@@ -75,7 +88,10 @@ async fn run_review_tick(
     // Merge DB timestamp with local fallback.  The fallback wins when it is
     // more recent — this prevents stale deduplication after an EventStore
     // write failure.
-    let fb = *fallback_ts.lock().await;
+    //
+    // Sequential acquisition — lock is dropped immediately after the copy;
+    // not held across any await point.
+    let fb = review_state.lock().await.fallback_ts;
     let last_review_ts = match (db_last_review_ts, fb) {
         (Some(db), Some(f)) => Some(db.max(f)),
         (Some(db), None) => Some(db),
@@ -200,7 +216,9 @@ async fn run_review_tick(
         None
     };
 
-    *fallback_ts.lock().await = Some(Utc::now());
+    // Sequential acquisition — lock dropped immediately after write; not held
+    // across any await point.
+    review_state.lock().await.fallback_ts = Some(Utc::now());
 
     let event = Event::new(
         SessionId::new(),
@@ -212,9 +230,12 @@ async fn run_review_tick(
         tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
     }
 
+    // Sequential acquisition — take the old handle (drop without abort so the
+    // previous poller can still run to completion) then release the lock before
+    // spawning the new task.
     {
-        let mut guard = poll_handle.lock().await;
-        if guard.take().is_some() {
+        let mut guard = review_state.lock().await;
+        if guard.poll_handle.take().is_some() {
             tracing::debug!(
                 "scheduler: dropped previous review poll handle (task continues to completion)"
             );
@@ -315,7 +336,8 @@ async fn run_review_tick(
             }
         }
     });
-    *poll_handle.lock().await = Some(handle);
+    // Sequential acquisition — lock dropped immediately after storing the handle.
+    review_state.lock().await.poll_handle = Some(handle);
 
     Ok(())
 }
@@ -520,16 +542,19 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    /// Fallback is updated atomically before the EventStore write; verify the
-    /// Arc<Mutex<Option<DateTime<Utc>>>> can be written and read correctly.
+    /// Fallback timestamp is updated atomically; verify ReviewState round-trips
+    /// correctly through the single combined mutex.
     #[tokio::test]
     async fn fallback_ts_arc_mutex_roundtrip() {
-        let fallback_ts: Arc<Mutex<Option<DateTime<Utc>>>> = Arc::new(Mutex::new(None));
-        assert!(fallback_ts.lock().await.is_none());
+        let state: Arc<Mutex<ReviewState>> = Arc::new(Mutex::new(ReviewState {
+            fallback_ts: None,
+            poll_handle: None,
+        }));
+        assert!(state.lock().await.fallback_ts.is_none());
 
         let now = Utc::now();
-        *fallback_ts.lock().await = Some(now);
-        assert_eq!(*fallback_ts.lock().await, Some(now));
+        state.lock().await.fallback_ts = Some(now);
+        assert_eq!(state.lock().await.fallback_ts, Some(now));
     }
 
     /// Verify that replacing a poll_handle drops the old JoinHandle WITHOUT
@@ -541,22 +566,24 @@ mod tests {
     /// This test additionally asserts that the old spawned task is still running.
     #[tokio::test]
     async fn poll_handle_replaced_without_aborting_previous() {
-        let poll_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> =
-            Arc::new(Mutex::new(None));
+        let state: Arc<Mutex<ReviewState>> = Arc::new(Mutex::new(ReviewState {
+            fallback_ts: None,
+            poll_handle: None,
+        }));
 
         // First cycle: spawn a long-running task and store it.
         let first = tokio::spawn(async {
             sleep(Duration::from_secs(3600)).await;
         });
-        *poll_handle.lock().await = Some(first);
+        state.lock().await.poll_handle = Some(first);
 
         // Second cycle: take the old handle (drop without abort) and store a new one.
         let old_handle = {
-            let mut guard = poll_handle.lock().await;
-            guard.take()
+            let mut guard = state.lock().await;
+            guard.poll_handle.take()
         };
         let second = tokio::spawn(async {});
-        *poll_handle.lock().await = Some(second);
+        state.lock().await.poll_handle = Some(second);
 
         // Yield so the runtime can process any pending state changes.
         tokio::task::yield_now().await;
