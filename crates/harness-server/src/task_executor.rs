@@ -475,6 +475,67 @@ fn prepend_constitution(prompt: String, enabled: bool) -> String {
     }
 }
 
+/// Run a plan step for a complex prompt-only task when the planning gate has
+/// forced `TaskPhase::Plan`.
+///
+/// This gives the planning gate real effect: instead of silently skipping
+/// to Implement, the agent produces a plan first, which is then threaded into
+/// the implementation prompt just like issue-based plans.
+async fn run_plan_for_prompt(
+    agent: &dyn CodeAgent,
+    store: &TaskStore,
+    task_id: &TaskId,
+    cargo_env: &HashMap<String, String>,
+    project: &Path,
+    req: &CreateTaskRequest,
+) -> anyhow::Result<(Option<String>, prompts::TriageComplexity)> {
+    use crate::task_runner::TaskPhase;
+
+    let prompt_text = req.prompt.as_deref().unwrap_or_default();
+    tracing::info!(task_id = %task_id, "pipeline: starting plan phase for prompt-only task");
+
+    mutate_and_persist(store, task_id, |state| {
+        state.phase = TaskPhase::Plan;
+    })
+    .await?;
+
+    let plan_prompt = format!(
+        "Before implementing, produce a concise implementation plan for the following task.\n\
+         List the files to change, the approach, and any non-obvious design decisions.\n\
+         Do NOT write code yet — planning only.\n\n\
+         Task:\n{prompt_text}"
+    );
+
+    let plan_req = AgentRequest {
+        prompt: plan_prompt,
+        project_root: project.to_path_buf(),
+        env_vars: cargo_env.clone(),
+        execution_phase: Some(ExecutionPhase::Planning),
+        ..Default::default()
+    };
+
+    let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
+    // Use agent.execute() directly — NOT run_agent_streaming — to avoid the
+    // state side-effects that run_agent_streaming performs: PR_URL extraction,
+    // turn counter mutations, and status updates.  Those side-effects would
+    // corrupt the subsequent implement phase (e.g. consuming call #0 from a
+    // mock/real agent that sets pr_url before the real implementation turn).
+    let plan_resp = tokio::time::timeout(turn_timeout, agent.execute(plan_req))
+        .await
+        .map_err(|_| anyhow::anyhow!("plan phase timed out after {}s", req.turn_timeout_secs))?
+        .map_err(|e| anyhow::anyhow!("plan phase agent error: {e}"))?;
+
+    let plan_text = plan_resp.output.clone();
+    mutate_and_persist(store, task_id, |state| {
+        state.plan_output = Some(plan_text.clone());
+        state.phase = TaskPhase::Implement;
+    })
+    .await?;
+
+    tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete (prompt-only)");
+    Ok((Some(plan_text), prompts::TriageComplexity::Medium))
+}
+
 /// Run triage → plan pipeline for a fresh issue-based task.
 ///
 /// Returns `Some(plan_text)` if the triage decided a plan is needed and the plan
@@ -687,7 +748,18 @@ pub(crate) async fn run_task(
             (None, prompts::TriageComplexity::Medium)
         }
     } else {
-        (None, prompts::TriageComplexity::Medium)
+        // Planning gate (task_runner) may have forced TaskPhase::Plan for a
+        // complex prompt-only task.  Check the stored phase so the gate has
+        // real effect rather than silently falling through to Implement.
+        let forced_plan = store
+            .get(task_id)
+            .map(|s| s.phase == crate::task_runner::TaskPhase::Plan)
+            .unwrap_or(false);
+        if forced_plan && req.issue.is_none() && req.pr.is_none() {
+            run_plan_for_prompt(agent, store, task_id, &cargo_env, &project, req).await?
+        } else {
+            (None, prompts::TriageComplexity::Medium)
+        }
     };
 
     // Derive dynamic parameters from triage complexity.

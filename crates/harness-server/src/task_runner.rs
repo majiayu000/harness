@@ -495,6 +495,13 @@ pub(crate) fn prompt_requires_plan(prompt: &str) -> bool {
     let file_path_count = prompt
         .split_whitespace()
         .filter(|tok| {
+            // Exclude XML/HTML tags — `</foo>` contains '/' but is not a file path.
+            // System prompts wrap user data in `<external_data>...</external_data>`
+            // which would otherwise trigger false positives.
+            let is_xml_tag = tok.starts_with('<');
+            if is_xml_tag {
+                return false;
+            }
             tok.contains('/') || {
                 let lower = tok.to_lowercase();
                 lower.ends_with(".rs")
@@ -806,6 +813,40 @@ impl TaskStore {
         let snapshot = self.cache.get(id).map(|state| state.value().clone());
         if let Some(state) = snapshot {
             self.db.update(&state).await?;
+
+            // Persist a checkpoint to the DB so that recover_in_progress() can
+            // restore the task if the server is killed mid-flight.  Only written
+            // for statuses that can be interrupted (matches recover_in_progress
+            // query predicate).
+            if matches!(
+                state.status,
+                TaskStatus::Implementing
+                    | TaskStatus::AgentReview
+                    | TaskStatus::Reviewing
+                    | TaskStatus::Waiting
+            ) {
+                let cp = crate::checkpoint::TaskCheckpoint::new(
+                    id.as_str(),
+                    &format!("{:?}", state.phase),
+                    state.turn,
+                    state.pr_url.clone(),
+                    None, // branch not tracked in TaskState
+                    state.rounds.len() as u32,
+                );
+                match cp.to_json() {
+                    Ok(json) => {
+                        if let Err(e) = self.db.set_checkpoint_json(id.as_str(), &json).await {
+                            tracing::warn!(
+                                task_id = %id.0,
+                                "checkpoint: failed to write DB checkpoint: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id = %id.0, "checkpoint: serialization failed: {e}");
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -2380,6 +2421,18 @@ mod tests {
     #[test]
     fn prompt_with_two_file_paths_does_not_require_plan() {
         let prompt = "Update src/foo.rs and crates/bar/src/lib.rs to fix X";
+        assert!(!prompt_requires_plan(prompt));
+    }
+
+    #[test]
+    fn xml_closing_tags_are_not_counted_as_file_paths() {
+        // `wrap_external_data` wraps content in <external_data>...</external_data>.
+        // Three `</external_data>` closing tags contain '/' but must NOT trigger
+        // the planning gate — they are markup, not file paths.
+        let prompt = "GC applied files:\n\
+                      <external_data>test-guard.sh</external_data>\n\
+                      Rationale:\n<external_data>test</external_data>\n\
+                      Validation:\n<external_data>test</external_data>";
         assert!(!prompt_requires_plan(prompt));
     }
 }

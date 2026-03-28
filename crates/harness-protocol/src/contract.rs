@@ -134,7 +134,10 @@ impl EvalResult {
 /// Returns `None` when no matching block is found.
 pub(crate) fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
     let open = format!("```{lang}");
-    let start = text.find(&open)?;
+    // Use rfind so that if the model echoes or re-states an earlier block with the same
+    // language tag, we always parse the *last* occurrence — which is where the prompts
+    // place the authoritative result block.
+    let start = text.rfind(&open)?;
     let after_open = start + open.len();
     // Skip the newline immediately after the opening fence.
     let newline_offset = text[after_open..].find('\n')?;
