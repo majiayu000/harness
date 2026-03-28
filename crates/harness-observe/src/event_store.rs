@@ -533,9 +533,10 @@ impl EventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{
-        AutoFixAttempt, AutoFixReport, Decision, Event, EventFilters, ExternalSignal, OtelExporter,
-        RuleId, SessionId, Severity,
+    use harness_core::config::misc::OtelExporter;
+    use harness_core::types::{
+        AutoFixAttempt, AutoFixReport, Decision, Event, EventFilters, ExternalSignal, RuleId,
+        SessionId, Severity,
     };
     use std::path::Path;
 
