@@ -1263,7 +1263,7 @@ pub(crate) async fn run_task(
     // Graduated exit: if the last round had few issues remaining, mark as done
     // with a warning instead of outright failure — the PR is likely mergeable.
     let last_issue_count = issue_counts.iter().rev().find_map(|c| *c);
-    let graduated = last_issue_count.map_or(false, |n| n <= 2);
+    let graduated = last_issue_count.is_some_and(|n| n <= 2);
 
     if graduated {
         tracing::info!(
