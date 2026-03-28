@@ -1069,7 +1069,9 @@ pub(crate) async fn run_task(
     update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
 
     let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
-    let max_rounds = effective_max_rounds;
+    // Project-level override takes precedence over triage-derived rounds so that
+    // per-repo caps (review_max_rounds in harness.toml) are never silently bypassed.
+    let max_rounds = resolved.review_max_rounds.unwrap_or(effective_max_rounds);
     tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
     sleep(Duration::from_secs(wait_secs)).await;
 

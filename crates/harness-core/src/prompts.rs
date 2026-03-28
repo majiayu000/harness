@@ -756,19 +756,26 @@ pub enum TriageComplexity {
 
 /// Parse `COMPLEXITY=<low|medium|high>` from triage agent output.
 ///
-/// Scans all lines (not just the last) so the tag can appear before `TRIAGE=`.
+/// The protocol requires `COMPLEXITY=` to appear on the second-to-last line
+/// (just before `TRIAGE=` on the last line). Only the second-to-last non-empty
+/// line is examined to prevent untrusted issue content (e.g. a line containing
+/// `COMPLEXITY=low` in the issue body) from influencing classification.
+///
 /// Returns `TriageComplexity::Medium` if the tag is absent or unrecognised
 /// (backward-compatible fallback).
 pub fn parse_complexity(output: &str) -> TriageComplexity {
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if let Some(value) = trimmed.strip_prefix("COMPLEXITY=") {
-            return match value.trim().to_ascii_lowercase().as_str() {
-                "low" => TriageComplexity::Low,
-                "high" => TriageComplexity::High,
-                _ => TriageComplexity::Medium,
-            };
-        }
+    let non_empty: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+    // second-to-last line (index len-2); need at least 2 non-empty lines
+    if non_empty.len() < 2 {
+        return TriageComplexity::Medium;
+    }
+    let candidate = non_empty[non_empty.len() - 2].trim();
+    if let Some(value) = candidate.strip_prefix("COMPLEXITY=") {
+        return match value.trim().to_ascii_lowercase().as_str() {
+            "low" => TriageComplexity::Low,
+            "high" => TriageComplexity::High,
+            _ => TriageComplexity::Medium,
+        };
     }
     TriageComplexity::Medium
 }
