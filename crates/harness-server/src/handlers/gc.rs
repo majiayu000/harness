@@ -11,7 +11,7 @@ fn gc_adopt_task_request(
         prompt: Some(prompt),
         project: Some(project_root),
         wait_secs: gc_config.adopt_wait_secs,
-        max_rounds: gc_config.adopt_max_rounds,
+        max_rounds: Some(gc_config.adopt_max_rounds),
         turn_timeout_secs: gc_config.adopt_turn_timeout_secs,
         max_budget_usd: Some(gc_config.budget_per_signal_usd),
         ..Default::default()
@@ -206,7 +206,7 @@ mod tests {
         );
 
         assert_eq!(req.wait_secs, 7);
-        assert_eq!(req.max_rounds, 9);
+        assert_eq!(req.max_rounds, Some(9));
         assert_eq!(req.turn_timeout_secs, 11);
     }
 
@@ -221,7 +221,7 @@ mod tests {
         );
 
         assert_eq!(req.wait_secs, 120);
-        assert_eq!(req.max_rounds, 3);
+        assert_eq!(req.max_rounds, Some(3));
         assert_eq!(req.turn_timeout_secs, 600);
         assert_eq!(req.max_budget_usd, Some(0.5));
     }

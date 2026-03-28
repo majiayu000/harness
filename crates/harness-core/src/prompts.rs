@@ -1825,15 +1825,29 @@ PR_URL=https://github.com/owner/repo/pull/269";
 
     #[test]
     fn test_parse_complexity_all_variants() {
-        assert_eq!(parse_complexity("COMPLEXITY=low"), TriageComplexity::Low);
+        // parse_complexity checks the second-to-last non-empty line, so inputs need >= 2 lines.
+        // Real agent output ends with TRIAGE=<decision> on the last line.
         assert_eq!(
-            parse_complexity("COMPLEXITY=medium"),
+            parse_complexity("COMPLEXITY=low\nTRIAGE=PROCEED"),
+            TriageComplexity::Low
+        );
+        assert_eq!(
+            parse_complexity("COMPLEXITY=medium\nTRIAGE=PROCEED"),
             TriageComplexity::Medium
         );
-        assert_eq!(parse_complexity("COMPLEXITY=high"), TriageComplexity::High);
+        assert_eq!(
+            parse_complexity("COMPLEXITY=high\nTRIAGE=PROCEED"),
+            TriageComplexity::High
+        );
         // Case-insensitive
-        assert_eq!(parse_complexity("COMPLEXITY=LOW"), TriageComplexity::Low);
-        assert_eq!(parse_complexity("COMPLEXITY=HIGH"), TriageComplexity::High);
+        assert_eq!(
+            parse_complexity("COMPLEXITY=LOW\nTRIAGE=PROCEED"),
+            TriageComplexity::Low
+        );
+        assert_eq!(
+            parse_complexity("COMPLEXITY=HIGH\nTRIAGE=PROCEED"),
+            TriageComplexity::High
+        );
     }
 
     #[test]

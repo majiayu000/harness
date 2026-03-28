@@ -364,7 +364,7 @@ pub(super) async fn create_tasks_batch(
             t.agent = req.agent.clone();
             t.project = req.project.clone();
             if let Some(rounds) = req.max_rounds {
-                t.max_rounds = rounds;
+                t.max_rounds = Some(rounds);
             }
             if let Some(timeout) = req.turn_timeout_secs {
                 t.turn_timeout_secs = timeout;
@@ -381,7 +381,7 @@ pub(super) async fn create_tasks_batch(
             t.agent = req.agent.clone();
             t.project = req.project.clone();
             if let Some(rounds) = req.max_rounds {
-                t.max_rounds = rounds;
+                t.max_rounds = Some(rounds);
             }
             if let Some(timeout) = req.turn_timeout_secs {
                 t.turn_timeout_secs = timeout;

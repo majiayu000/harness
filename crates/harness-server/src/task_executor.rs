@@ -568,11 +568,14 @@ pub(crate) async fn run_task(
     };
 
     // Derive dynamic parameters from triage complexity.
-    let (effective_max_rounds, skip_agent_review) = match triage_complexity {
-        prompts::TriageComplexity::Low => (2u32, true),
-        prompts::TriageComplexity::Medium => (req.max_rounds, false),
+    // Triage provides a DEFAULT only — caller's explicit max_rounds always wins (Fix #2).
+    // Low complexity no longer skips agent review to preserve the review gate (Fix #1).
+    let (triage_default_rounds, skip_agent_review) = match triage_complexity {
+        prompts::TriageComplexity::Low => (2u32, false),
+        prompts::TriageComplexity::Medium => (8u32, false),
         prompts::TriageComplexity::High => (8u32, false),
     };
+    let effective_max_rounds = req.max_rounds.unwrap_or(triage_default_rounds);
     tracing::info!(
         task_id = %task_id,
         ?triage_complexity,
