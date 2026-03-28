@@ -321,6 +321,16 @@ fn summarize_request_description(req: &CreateTaskRequest) -> Option<String> {
     })
 }
 
+pub(crate) async fn fill_missing_repo_from_project(req: &mut CreateTaskRequest) {
+    if req.repo.is_some() {
+        return;
+    }
+    let Some(project) = req.project.as_deref() else {
+        return;
+    };
+    req.repo = crate::task_executor::detect_repo_slug(project).await;
+}
+
 /// Detect the main git worktree root using a blocking subprocess call.
 /// Must be called via `tokio::task::spawn_blocking` in async contexts.
 fn detect_main_worktree() -> PathBuf {
