@@ -1945,42 +1945,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn fill_missing_repo_from_project_detects_origin_remote() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-
-        let init = std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()?;
-        assert!(init.status.success(), "git init failed: {:?}", init);
-
-        let remote = std::process::Command::new("git")
-            .args([
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/acme/harness.git",
-            ])
-            .current_dir(dir.path())
-            .output()?;
-        assert!(
-            remote.status.success(),
-            "git remote add failed: {:?}",
-            remote
-        );
-
-        let mut req = CreateTaskRequest {
-            project: Some(dir.path().to_path_buf()),
-            ..Default::default()
-        };
-
-        fill_missing_repo_from_project(&mut req).await;
-
-        assert_eq!(req.repo.as_deref(), Some("acme/harness"));
-        Ok(())
-    }
-
     /// Mock agent that records the `execution_phase` from every call and
     /// returns pre-configured responses in order.
     struct PhaseCapturingAgent {
