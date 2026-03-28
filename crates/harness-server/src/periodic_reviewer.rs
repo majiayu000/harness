@@ -164,35 +164,10 @@ async fn run_review_tick(
         "scheduler: primary periodic review enqueued"
     );
 
-    let secondary_review_id = if let Some(agent) = secondary_agent.clone() {
-        let req = CreateTaskRequest {
-            prompt: Some(base_prompt),
-            agent: Some(agent.clone()),
-            turn_timeout_secs: config.timeout_secs,
-            source: Some("periodic_review".to_string()),
-            ..CreateTaskRequest::default()
-        };
-        match task_routes::enqueue_task(state, req).await {
-            Ok(task_id) => {
-                tracing::info!(
-                    task_id = %task_id,
-                    agent = %agent,
-                    "scheduler: secondary periodic review enqueued"
-                );
-                Some(task_id)
-            }
-            Err(err) => {
-                tracing::warn!(
-                    agent = %agent,
-                    error = %err,
-                    "scheduler: failed to enqueue secondary review; continuing with primary only"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Secondary task is intentionally NOT enqueued here — it is deferred until
+    // the primary confirms new commits exist (REVIEW_SKIPPED check inside the
+    // poll loop below).  Enqueueing before the check would spawn real agent
+    // work on every idle tick, exhausting queue capacity and quota.
 
     // Sequential acquisition — lock dropped immediately after write; not held
     // across any await point.
@@ -236,9 +211,12 @@ async fn run_review_tick(
         );
 
         // Agent may signal that no commits landed since last review.
+        // Use exact-line matching to avoid false positives when the literal
+        // "REVIEW_SKIPPED" appears inside review JSON (e.g. in a finding title
+        // or description about this very codebase).
         if primary_output
             .as_deref()
-            .map(|s| s.contains("REVIEW_SKIPPED"))
+            .map(|s| s.lines().any(|line| line.trim() == "REVIEW_SKIPPED"))
             .unwrap_or(false)
         {
             tracing::debug!(
@@ -247,6 +225,40 @@ async fn run_review_tick(
             );
             return;
         }
+
+        // Primary confirmed new commits exist — now it is safe to enqueue
+        // the secondary reviewer (Cross strategy only).
+        let secondary_review_id: Option<harness_core::TaskId> = if let Some(agent) =
+            secondary_agent_name.as_ref()
+        {
+            let req = CreateTaskRequest {
+                prompt: Some(base_prompt.clone()),
+                agent: Some(agent.clone()),
+                turn_timeout_secs: timeout_secs,
+                source: Some("periodic_review".to_string()),
+                ..CreateTaskRequest::default()
+            };
+            match task_routes::enqueue_task(&state_for_synthesis, req).await {
+                Ok(task_id) => {
+                    tracing::info!(
+                        task_id = %task_id,
+                        agent = %agent,
+                        "scheduler: secondary periodic review enqueued"
+                    );
+                    Some(task_id)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        agent = %agent,
+                        error = %err,
+                        "scheduler: failed to enqueue secondary review; continuing with primary only"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let mut final_task_id = primary_review_id.clone();
         let mut final_output = primary_output.clone();
@@ -608,26 +620,29 @@ mod tests {
         );
     }
 
-    /// REVIEW_SKIPPED in agent output is treated as a no-op: the contains check
-    /// returns true and the early-return path is taken.
+    /// REVIEW_SKIPPED in agent output is treated as a no-op only when it appears
+    /// as an exact line (trimmed).  Substring matches inside JSON content must NOT
+    /// trigger the early-return path (false-positive guard).
     #[test]
     fn test_review_skipped_detection() {
-        let output_with_skip = Some("some preamble\nREVIEW_SKIPPED\nmore text".to_string());
-        let output_without_skip = Some("REVIEW_JSON_START\n{}\nREVIEW_JSON_END".to_string());
-        let no_output: Option<String> = None;
+        let is_skipped = |s: Option<&str>| {
+            s.map(|s| s.lines().any(|l| l.trim() == "REVIEW_SKIPPED"))
+                .unwrap_or(false)
+        };
 
-        assert!(output_with_skip
-            .as_deref()
-            .map(|s| s.contains("REVIEW_SKIPPED"))
-            .unwrap_or(false));
-        assert!(!output_without_skip
-            .as_deref()
-            .map(|s| s.contains("REVIEW_SKIPPED"))
-            .unwrap_or(false));
-        assert!(!no_output
-            .as_deref()
-            .map(|s| s.contains("REVIEW_SKIPPED"))
-            .unwrap_or(false));
+        // True positive: sentinel on its own line.
+        assert!(is_skipped(Some("some preamble\nREVIEW_SKIPPED\nmore text")));
+        // True positive: sentinel with surrounding whitespace.
+        assert!(is_skipped(Some("  REVIEW_SKIPPED  ")));
+
+        // False-positive guard: literal appears inside JSON content but not as a standalone line.
+        assert!(!is_skipped(Some(
+            r#"{"title":"REVIEW_SKIPPED check removed","action":"LGTM"}"#
+        )));
+        // Normal review output: no sentinel.
+        assert!(!is_skipped(Some("REVIEW_JSON_START\n{}\nREVIEW_JSON_END")));
+        // No output at all.
+        assert!(!is_skipped(None));
     }
 
     /// On first boot (no prior event, no fallback), since_arg must be the
