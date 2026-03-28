@@ -163,8 +163,8 @@ impl GcAgent {
 
         for signal in signals.iter().take(self.config.max_drafts_per_run) {
             let base_prompt = build_prompt(signal, project);
-            // Inject capability restriction note — primary enforcement since --allowedTools
-            // is not passed to the CLI (issue #483).
+            // Inject capability restriction note as secondary context alongside
+            // --allowedTools CLI enforcement (issue #514).
             let prompt = if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
                 format!("{note}\n\n{base_prompt}")
             } else {
@@ -175,7 +175,7 @@ impl GcAgent {
                 .execute(AgentRequest {
                     prompt,
                     project_root: project.root.clone(),
-                    allowed_tools: allowed_tools.clone(),
+                    allowed_tools: Some(allowed_tools.clone()),
                     max_budget_usd: Some(self.config.budget_per_signal_usd),
                     ..Default::default()
                 })

@@ -90,8 +90,8 @@ pub async fn run_preflight(
          COMPLEXITY: <simple|medium|complex|critical>"
     );
 
-    // Inject capability restriction note — primary enforcement since --allowedTools
-    // is not passed to the CLI (issue #483).
+    // Inject capability restriction note as secondary context alongside
+    // --allowedTools CLI enforcement (issue #514).
     let prompt = if let Some(note) = CapabilityProfile::ReadOnly.prompt_note() {
         format!("{note}\n\n{prompt}")
     } else {
@@ -100,7 +100,7 @@ pub async fn run_preflight(
     let req = AgentRequest {
         prompt,
         project_root,
-        allowed_tools: CapabilityProfile::ReadOnly.tools().unwrap_or_default(),
+        allowed_tools: CapabilityProfile::ReadOnly.tools(),
         ..Default::default()
     };
 

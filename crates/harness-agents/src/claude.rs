@@ -66,18 +66,29 @@ impl ClaudeCodeAgent {
         ];
 
         // Hard tool enforcement at the CLI boundary (issue #514):
-        //   Full profile  (allowed_tools empty)     → --dangerously-skip-permissions
-        //   Restricted profile (allowed_tools set)  → --allowedTools <comma-list>
+        //   Full profile  (allowed_tools = None)    → --dangerously-skip-permissions
+        //   Restricted profile (allowed_tools set)  → --permission-mode bypass-permissions
+        //                                              --allowedTools <comma-list>
         //
         // --allowedTools and --dangerously-skip-permissions are mutually exclusive
         // in Claude CLI 2.1.70+. Using --allowedTools provides hard enforcement;
         // the agent cannot call tools outside the list regardless of prompt content.
+        //
+        // --permission-mode bypass-permissions is required alongside --allowedTools so
+        // that non-interactive background tasks (preflight, periodic review, reviewer)
+        // do not hang waiting for interactive approval prompts on the first Bash/Edit
+        // call. The two flags are orthogonal: bypass-permissions auto-approves tool
+        // calls within the allowed set; --allowedTools limits what that set is.
+        //
         // Post-execution validate_tool_usage() remains as a defense-in-depth layer.
         if req.uses_dangerously_skip_permissions() {
             base_args.push(OsString::from("--dangerously-skip-permissions"));
         } else {
+            base_args.push(OsString::from("--permission-mode"));
+            base_args.push(OsString::from("bypass-permissions"));
             base_args.push(OsString::from("--allowedTools"));
-            base_args.push(OsString::from(req.allowed_tools.join(",")));
+            let tools = req.allowed_tools.as_deref().unwrap_or(&[]);
+            base_args.push(OsString::from(tools.join(",")));
         }
 
         if let Some(budget) = req.max_budget_usd {
@@ -245,7 +256,7 @@ mod tests {
             SandboxMode::DangerFullAccess,
         );
         let req = AgentRequest {
-            allowed_tools: vec![], // Full profile — no restriction
+            allowed_tools: None, // Full profile — no restriction
             ..AgentRequest::default()
         };
         let args = args_to_strings(&agent.base_args(&req));
@@ -267,18 +278,22 @@ mod tests {
             SandboxMode::DangerFullAccess,
         );
         let req = AgentRequest {
-            allowed_tools: vec![
+            allowed_tools: Some(vec![
                 "Read".to_string(),
                 "Write".to_string(),
                 "Edit".to_string(),
                 "Bash".to_string(),
-            ],
+            ]),
             ..AgentRequest::default()
         };
         let args = args_to_strings(&agent.base_args(&req));
         assert!(
             args.contains(&"--allowedTools".to_string()),
             "Standard profile must use --allowedTools; got: {args:?}"
+        );
+        assert!(
+            args.contains(&"--permission-mode".to_string()),
+            "Standard profile must use --permission-mode; got: {args:?}"
         );
         assert!(
             !args.contains(&"--dangerously-skip-permissions".to_string()),
@@ -307,7 +322,11 @@ mod tests {
             SandboxMode::DangerFullAccess,
         );
         let req = AgentRequest {
-            allowed_tools: vec!["Read".to_string(), "Grep".to_string(), "Glob".to_string()],
+            allowed_tools: Some(vec![
+                "Read".to_string(),
+                "Grep".to_string(),
+                "Glob".to_string(),
+            ]),
             ..AgentRequest::default()
         };
         let args = args_to_strings(&agent.base_args(&req));
@@ -341,8 +360,8 @@ mod tests {
             SandboxMode::DangerFullAccess,
         );
         for (label, allowed_tools) in [
-            ("full", vec![]),
-            ("standard", vec!["Read".to_string(), "Bash".to_string()]),
+            ("full", None),
+            ("standard", Some(vec!["Read".to_string(), "Bash".to_string()])),
         ] {
             let req = AgentRequest {
                 allowed_tools,

@@ -708,18 +708,18 @@ pub(crate) async fn run_task(
 
     // Periodic review tasks need Bash to run guard check commands but should
     // not have unrestricted write access — use Standard profile. All other
-    // tasks (implementation) keep Full (no restriction, Vec::new()).
+    // tasks (implementation) keep Full (None → --dangerously-skip-permissions).
     //
-    // Non-empty allowed_tools causes claude.rs to pass --allowedTools to the
-    // CLI (hard enforcement). Empty allowed_tools → --dangerously-skip-permissions.
-    let (initial_allowed_tools, capability_prompt_note) =
+    // Some(tools) causes claude.rs to pass --allowedTools to the CLI (hard
+    // enforcement). None → --dangerously-skip-permissions (full access).
+    let (initial_allowed_tools, capability_prompt_note): (Option<Vec<String>>, _) =
         if req.source.as_deref() == Some("periodic_review") {
             (
-                restricted_tools(CapabilityProfile::Standard)?,
+                Some(restricted_tools(CapabilityProfile::Standard)?),
                 CapabilityProfile::Standard.prompt_note(),
             )
         } else {
-            (Vec::new(), None)
+            (None, None)
         };
 
     // Prepend capability restriction note so the agent knows which tools are
@@ -775,16 +775,16 @@ pub(crate) async fn run_task(
         .await;
         match raw {
             Ok(Ok(r)) => {
-                // Post-execution tool isolation check. Since --allowedTools is not
-                // passed to the CLI, we scan the output for disallowed tool calls.
-                // Violations feed into the retry loop so the agent gets a chance to
-                // self-correct (fail-closed, not fail-open).
-                let tool_violations = validate_tool_usage(&r.output, &impl_req.allowed_tools);
+                // Post-execution tool isolation check (defense-in-depth alongside
+                // --allowedTools CLI enforcement). Violations feed into the retry loop
+                // so the agent gets a chance to self-correct (fail-closed, not fail-open).
+                let impl_tools = impl_req.allowed_tools.as_deref().unwrap_or(&[]);
+                let tool_violations = validate_tool_usage(&r.output, impl_tools);
                 let violation_err: Option<String> = if !tool_violations.is_empty() {
                     let msg = format!(
                         "Tool isolation violation: agent used disallowed tools: [{}]. Only [{}] are permitted.",
                         tool_violations.join(", "),
-                        impl_req.allowed_tools.join(", ")
+                        impl_tools.join(", ")
                     );
                     tracing::warn!(
                         ?tool_violations,
@@ -1120,7 +1120,7 @@ pub(crate) async fn run_task(
         let resp = tokio::time::timeout(turn_timeout, agent.execute(check_req.clone())).await;
         let resp = match resp {
             Ok(Ok(r)) => {
-                let tool_violations = validate_tool_usage(&r.output, &check_req.allowed_tools);
+                let tool_violations = validate_tool_usage(&r.output, check_req.allowed_tools.as_deref().unwrap_or(&[]));
                 if !tool_violations.is_empty() {
                     let msg = format!(
                         "Tool isolation violation in review check round {round}: agent used disallowed tools: [{}]",
@@ -1378,12 +1378,12 @@ async fn run_agent_review(
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Validation),
-            allowed_tools: vec![
+            allowed_tools: Some(vec![
                 "Read".to_string(),
                 "Grep".to_string(),
                 "Glob".to_string(),
                 "Bash".to_string(),
-            ],
+            ]),
             env_vars: cargo_env.clone(),
             ..Default::default()
         };
@@ -1392,7 +1392,7 @@ async fn run_agent_review(
         let resp = tokio::time::timeout(turn_timeout, reviewer.execute(review_req.clone())).await;
         let resp = match resp {
             Ok(Ok(r)) => {
-                let tool_violations = validate_tool_usage(&r.output, &review_req.allowed_tools);
+                let tool_violations = validate_tool_usage(&r.output, review_req.allowed_tools.as_deref().unwrap_or(&[]));
                 if !tool_violations.is_empty() {
                     let msg = format!(
                         "Tool isolation violation in agent review round {agent_round}: agent used disallowed tools: [{}]",
@@ -1625,10 +1625,10 @@ mod tests {
 
     #[test]
     fn standard_implementation_turn_uses_full_profile() {
-        // Non-periodic_review tasks use Vec::new() → Full profile →
+        // Non-periodic_review tasks use None → Full profile →
         // --dangerously-skip-permissions in claude.rs.
-        let implementation_allowed_tools: Vec<String> = Vec::new();
-        assert!(implementation_allowed_tools.is_empty());
+        let implementation_allowed_tools: Option<Vec<String>> = None;
+        assert!(implementation_allowed_tools.is_none());
     }
 
     #[test]
