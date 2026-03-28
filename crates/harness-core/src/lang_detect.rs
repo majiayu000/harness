@@ -57,6 +57,42 @@ fn detect_ts_package_manager(project_root: &Path) -> &'static str {
     }
 }
 
+/// Returns `true` when `package.json` declares a `"test"` key inside `"scripts"`.
+///
+/// Projects without a test script would exit non-zero on `npm test`, causing
+/// false LGTM rejections at the test gate.
+fn has_ts_test_script(project_root: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(project_root.join("package.json")) else {
+        return false;
+    };
+    // Locate "scripts" then find its opening brace, then scan for "test" within
+    // the scripts object (depth-counting to handle nested braces correctly).
+    let Some(scripts_offset) = content.find("\"scripts\"") else {
+        return false;
+    };
+    let after_key = &content[scripts_offset + "\"scripts\"".len()..];
+    let Some(brace_rel) = after_key.find('{') else {
+        return false;
+    };
+    let scripts_body = &after_key[brace_rel..];
+    let mut depth = 0usize;
+    let mut end = scripts_body.len();
+    for (i, ch) in scripts_body.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    scripts_body[..end].contains("\"test\"")
+}
+
 /// Returns `true` when an ESLint configuration file is present.
 fn has_eslint_config(project_root: &Path) -> bool {
     const NAMES: &[&str] = &[
@@ -222,6 +258,12 @@ pub fn default_pre_push_commands(lang: Language, project_root: &Path) -> Vec<Str
         }
         Language::Go => vec!["go test ./...".to_string()],
         Language::TypeScript => {
+            // Only emit a test command when package.json actually declares a
+            // "scripts.test" entry. Projects without one exit non-zero on
+            // `npm test`, which would cause false LGTM rejections at the gate.
+            if !has_ts_test_script(project_root) {
+                return vec![];
+            }
             let pm = detect_ts_package_manager(project_root);
             vec![format!("{pm} test")]
         }
