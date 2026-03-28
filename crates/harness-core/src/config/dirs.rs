@@ -4,11 +4,34 @@ pub fn dirs_data_dir() -> PathBuf {
     match data_local_dir() {
         Some(path) => path,
         // HOME / LOCALAPPDATA is absent — common in containers and systemd
-        // services without `User=`. Fall back to a deterministic temp path so
-        // startup succeeds. Production deployments should set an explicit
-        // `data_dir` in their config rather than relying on this default.
-        None => std::env::temp_dir().join("harness"),
+        // services without `User=`. Fall back to a per-user temp path so
+        // startup succeeds. The username is included to provide per-user
+        // isolation: separate users or service accounts running harness
+        // without HOME get distinct directories, preventing cross-instance
+        // state collisions and reducing /tmp symlink hijacking risk.
+        //
+        // Production deployments should always set an explicit `data_dir`
+        // in their config rather than relying on this default.
+        None => temp_fallback_dir(),
     }
+}
+
+fn temp_fallback_dir() -> PathBuf {
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "default".to_string());
+    // Keep the directory name filesystem-safe: allow alphanumeric, '-', '_' only.
+    let safe: String = username
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    std::env::temp_dir().join(format!("harness-{safe}"))
 }
 
 fn data_local_dir() -> Option<PathBuf> {
