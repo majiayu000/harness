@@ -63,54 +63,75 @@ pub(crate) use pr_detection::{
 #[cfg(test)]
 pub(crate) use pr_detection::PromptBuilder;
 
-/// Run the project's primary test command as a hard gate before accepting LGTM.
+/// Run the project's test commands as a hard gate before accepting LGTM.
 ///
-/// Returns `Ok(())` when tests pass or when no test command is detectable for the
-/// project (soft degradation — unknown project type skips the gate rather than
-/// failing unconditionally).
+/// When `custom_cmds` is non-empty (from `validation.pre_push` in project config),
+/// those commands are run in order instead of language-detected defaults.
+/// When `custom_cmds` is empty, falls back to language detection.
 ///
-/// Returns `Err(output)` containing the combined stdout/stderr when the command
-/// exits non-zero or times out.
-async fn run_test_gate(project_root: &Path, timeout_secs: u64) -> Result<(), String> {
-    let Some(cmd) = lang_detect::primary_test_command(project_root) else {
-        tracing::info!(
-            project = %project_root.display(),
-            "test gate: no test command detected for project, skipping"
-        );
-        return Ok(());
+/// Returns `Ok(())` when all commands pass or when no test command is detectable
+/// (soft degradation — unknown project type skips rather than hard-fails).
+///
+/// Returns `Err(output)` containing stdout/stderr of the first failing command.
+async fn run_test_gate(
+    project_root: &Path,
+    custom_cmds: &[String],
+    timeout_secs: u64,
+) -> Result<(), String> {
+    // Prefer explicitly configured pre_push commands; fall back to language detection.
+    let cmds: Vec<String> = if !custom_cmds.is_empty() {
+        custom_cmds.to_vec()
+    } else {
+        match lang_detect::primary_test_command(project_root) {
+            Some(cmd) => vec![cmd],
+            None => {
+                tracing::info!(
+                    project = %project_root.display(),
+                    "test gate: no test command detected for project, skipping"
+                );
+                return Ok(());
+            }
+        }
     };
 
-    tracing::info!(cmd = %cmd, "test gate: running tests before accepting LGTM");
+    for cmd in &cmds {
+        tracing::info!(cmd = %cmd, "test gate: running tests before accepting LGTM");
 
-    let child = match TokioCommand::new("sh")
-        .args(["-c", &cmd])
-        .current_dir(project_root)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return Err(format!("test gate: failed to spawn `{cmd}`: {e}")),
-    };
+        let child = match TokioCommand::new("sh")
+            .args(["-c", cmd])
+            .current_dir(project_root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return Err(format!("test gate: failed to spawn `{cmd}`: {e}")),
+        };
 
-    match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
-        Ok(Ok(out)) if out.status.success() => {
-            tracing::info!(cmd = %cmd, "test gate: tests passed");
-            Ok(())
+        match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
+            Ok(Ok(out)) if out.status.success() => {
+                tracing::info!(cmd = %cmd, "test gate: tests passed");
+            }
+            Ok(Ok(out)) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let code = out.status.code().unwrap_or(-1);
+                return Err(format!(
+                    "Test gate failed (exit {code})\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                ));
+            }
+            Ok(Err(e)) => return Err(format!("test gate: `{cmd}` failed to wait: {e}")),
+            Err(_) => {
+                return Err(format!(
+                    "Test gate timed out after {timeout_secs}s (command: `{cmd}`)"
+                ))
+            }
         }
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let code = out.status.code().unwrap_or(-1);
-            Err(format!(
-                "Test gate failed (exit {code})\nstdout:\n{stdout}\nstderr:\n{stderr}"
-            ))
-        }
-        Ok(Err(e)) => Err(format!("test gate: `{cmd}` failed to wait: {e}")),
-        Err(_) => Err(format!(
-            "Test gate timed out after {timeout_secs}s (command: `{cmd}`)"
-        )),
     }
+
+    Ok(())
 }
 
 pub(crate) async fn run_turn_lifecycle(
@@ -1205,11 +1226,13 @@ pub(crate) async fn run_task(
                     return Err(anyhow::anyhow!("{msg}"));
                 }
                 if let Some(val_err) = run_post_execute(&interceptors, &check_req, &r).await {
-                    tracing::warn!(
+                    tracing::error!(
                         round,
                         error = %val_err,
-                        "post-execute validation failed in review check; continuing"
+                        "post-execute validation failed in review check; will re-enter review"
                     );
+                    pending_test_failure =
+                        Some(format!("Post-execution validation failed:\n{val_err}"));
                 }
                 r
             }
@@ -1247,6 +1270,10 @@ pub(crate) async fn run_task(
 
         let lgtm = prompts::is_lgtm(&output);
         let waiting = prompts::is_waiting(&output);
+        // If post-execute validation failed this round, block LGTM acceptance even
+        // if the reviewer approved — the local validator caught an issue that must be
+        // fixed before the PR can be marked done.
+        let lgtm = lgtm && pending_test_failure.is_none();
         let fixed = !lgtm && !waiting;
 
         // Track issue count for convergence detection.
@@ -1318,7 +1345,13 @@ pub(crate) async fn run_task(
             // Hard gate: run the project's tests before accepting LGTM.
             // This prevents agents from gaming the review by manipulating tests
             // rather than fixing code (OpenAI "Monitoring Reasoning Models", 2026).
-            match run_test_gate(&project, project_config.validation.test_gate_timeout_secs).await {
+            match run_test_gate(
+                &project,
+                &project_config.validation.pre_push,
+                project_config.validation.test_gate_timeout_secs,
+            )
+            .await
+            {
                 Ok(()) => {
                     tracing::info!("PR #{pr_num} approved at round {round}");
                     mutate_and_persist(store, task_id, |s| {
@@ -1370,8 +1403,10 @@ pub(crate) async fn run_task(
 
     // Graduated exit: if the last round had few issues remaining, mark as done
     // with a warning instead of outright failure — the PR is likely mergeable.
+    // But never graduate when the test gate was still failing on the last round:
+    // a PR whose tests consistently fail must not be approved.
     let last_issue_count = issue_counts.iter().rev().find_map(|c| *c);
-    let graduated = last_issue_count.is_some_and(|n| n <= 2);
+    let graduated = last_issue_count.is_some_and(|n| n <= 2) && pending_test_failure.is_none();
 
     if graduated {
         tracing::info!(
