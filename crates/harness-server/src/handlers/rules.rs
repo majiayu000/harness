@@ -244,4 +244,68 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Verify that a concurrent write-lock attempt succeeds while `rule_check` is
+    /// scanning (i.e. the read guard is not held across the async scan await).
+    ///
+    /// Without the snapshot fix the read guard would be held for the entire scan
+    /// duration (~500 ms), causing the write to be blocked. With the fix the read
+    /// guard is released before scan, so the writer acquires the lock in <50 ms.
+    #[tokio::test]
+    async fn rule_check_does_not_block_concurrent_writer() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
+        let dir = tempdir_in_home("rule-check-concurrent-write-")?;
+        let state = make_test_state(dir.path()).await?;
+
+        // Guard script that sleeps long enough for the writer to race.
+        let guard_script = dir.path().join("slow-guard.sh");
+        std::fs::write(&guard_script, "#!/usr/bin/env bash\nsleep 0.5\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&guard_script)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&guard_script, perms)?;
+        }
+
+        {
+            let mut rules = state.engines.rules.write().await;
+            rules.register_guard(Guard {
+                id: GuardId::from_str("SLOW-GUARD"),
+                script_path: guard_script,
+                language: Language::Common,
+                rules: vec![],
+            });
+        }
+
+        // Clone the Arc so the write task owns it independently of `state`.
+        let rules_arc = state.engines.rules.clone();
+
+        // Attempt to acquire write lock 50 ms after rule_check starts.
+        // With the fix: read guard released before scan → write acquired immediately.
+        // Without the fix: read guard held across 500 ms scan → write blocked.
+        // Allow 200 ms — well within the fix window but far before scan ends.
+        let write_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::timeout(std::time::Duration::from_millis(200), rules_arc.write())
+                .await
+                .is_ok()
+        });
+
+        rule_check(
+            &state,
+            Some(serde_json::json!(1)),
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+
+        let writer_got_lock = write_task.await?;
+        assert!(
+            writer_got_lock,
+            "concurrent writer should acquire the lock while scan is in progress \
+             (lock-held-across-await regression)"
+        );
+        Ok(())
+    }
 }
