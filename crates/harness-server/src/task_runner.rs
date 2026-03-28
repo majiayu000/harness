@@ -1426,16 +1426,6 @@ mod tests {
     };
     use tokio::time::Duration;
 
-    async fn fill_missing_repo_from_project(req: &mut CreateTaskRequest) {
-        if req.repo.is_some() {
-            return;
-        }
-        let Some(project) = req.project.as_deref() else {
-            return;
-        };
-        req.repo = crate::task_executor::detect_repo_slug(project).await;
-    }
-
     #[tokio::test]
     async fn task_stream_subscribe_and_publish() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
