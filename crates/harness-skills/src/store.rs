@@ -869,8 +869,11 @@ mod tests {
             canary_ratio: 0.0,
             last_scored: Some(Utc::now()),
         };
-        std::fs::write(&sidecar_path, serde_json::to_string(&sidecar).expect("serialize sidecar"))
-            .expect("write sidecar");
+        std::fs::write(
+            &sidecar_path,
+            serde_json::to_string(&sidecar).expect("serialize sidecar"),
+        )
+        .expect("write sidecar");
 
         let mut store = SkillStore::new().with_persist_dir(persist_path);
         store.load_builtin();
@@ -1207,7 +1210,10 @@ mod tests {
                 unknown: 12,
             },
         );
-        assert!(update.is_none(), "unknown-only samples should not change score");
+        assert!(
+            update.is_none(),
+            "unknown-only samples should not change score"
+        );
 
         let skill = store.get(&id).expect("skill should exist");
         assert_eq!(skill.scored_samples, 0);

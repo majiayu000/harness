@@ -892,12 +892,13 @@ pub(crate) async fn run_task(
                 "checkpoint resume: PR exists, skipping implement phase"
             );
             let Some(n) = prompts::extract_pr_number(&pr_str) else {
-                tracing::warn!(
+                tracing::error!(
                     task_id = %task_id,
-                    "checkpoint resume: cannot parse PR number, marking done"
+                    pr_url = %pr_str,
+                    "checkpoint resume: cannot parse PR number, marking failed"
                 );
                 mutate_and_persist(store, task_id, |s| {
-                    s.status = TaskStatus::Done;
+                    s.status = TaskStatus::Failed;
                     s.turn = 1;
                     s.error = Some(format!("checkpoint resume: no PR number in {pr_str}"));
                 })

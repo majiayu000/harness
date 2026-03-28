@@ -34,16 +34,29 @@ fn make_task(id: &str, status: TaskStatus) -> TaskState {
     }
 }
 
+/// Seeds the DB, closes it, then opens a fresh `TaskStore` simulating a restart.
+async fn setup_store<F, Fut>(seed: F) -> anyhow::Result<std::sync::Arc<TaskStore>>
+where
+    F: FnOnce(TaskDb) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join("tasks.db");
+    {
+        let db = TaskDb::open(&db_path).await?;
+        seed(db).await?;
+    }
+    // `tmp` is kept alive by forgetting it — the OS cleans up on process exit.
+    let store = TaskStore::open(&db_path).await?;
+    std::mem::forget(tmp);
+    Ok(store)
+}
+
 /// Restart with no checkpoints: all interrupted tasks (implementing, agent_review,
 /// reviewing, waiting) must become Failed; Pending/Done/Failed are left unchanged.
 #[tokio::test]
 async fn restart_no_checkpoint_fails_interrupted_tasks() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let db_path = tmp.path().join("tasks.db");
-
-    // Session 1: seed interrupted tasks with no checkpoints.
-    {
-        let db = TaskDb::open(&db_path).await?;
+    let store = setup_store(|db| async move {
         db.insert(&make_task("t-impl", TaskStatus::Implementing))
             .await?;
         db.insert(&make_task("t-review", TaskStatus::AgentReview))
@@ -57,10 +70,9 @@ async fn restart_no_checkpoint_fails_interrupted_tasks() -> anyhow::Result<()> {
         db.insert(&make_task("t-done", TaskStatus::Done)).await?;
         db.insert(&make_task("t-failed", TaskStatus::Failed))
             .await?;
-    }
-
-    // Session 2: simulate restart — TaskStore::open calls recover_in_progress internally.
-    let store = TaskStore::open(&db_path).await?;
+        Ok(())
+    })
+    .await?;
 
     // All 4 interrupted tasks with no checkpoint → Failed.
     for id in ["t-impl", "t-review", "t-reviewing", "t-waiting"] {
@@ -104,17 +116,13 @@ async fn restart_no_checkpoint_fails_interrupted_tasks() -> anyhow::Result<()> {
 /// error message referencing the PR URL.
 #[tokio::test]
 async fn restart_with_pr_url_resumes_task() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let db_path = tmp.path().join("tasks.db");
-
-    {
-        let db = TaskDb::open(&db_path).await?;
+    let store = setup_store(|db| async move {
         let mut task = make_task("t-impl-pr", TaskStatus::Implementing);
         task.pr_url = Some("https://github.com/owner/repo/pull/42".to_string());
         db.insert(&task).await?;
-    }
-
-    let store = TaskStore::open(&db_path).await?;
+        Ok(())
+    })
+    .await?;
 
     let task = store
         .get(&CoreTaskId("t-impl-pr".into()))
@@ -145,11 +153,7 @@ async fn restart_with_pr_url_resumes_task() -> anyhow::Result<()> {
 /// Restart with a checkpoint PR URL (checkpoint table, not tasks table): task resumes.
 #[tokio::test]
 async fn restart_with_checkpoint_pr_url_resumes_task() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let db_path = tmp.path().join("tasks.db");
-
-    {
-        let db = TaskDb::open(&db_path).await?;
+    let store = setup_store(|db| async move {
         db.insert(&make_task("t-ck-pr", TaskStatus::AgentReview))
             .await?;
         db.write_checkpoint(
@@ -160,9 +164,9 @@ async fn restart_with_checkpoint_pr_url_resumes_task() -> anyhow::Result<()> {
             "pr_created",
         )
         .await?;
-    }
-
-    let store = TaskStore::open(&db_path).await?;
+        Ok(())
+    })
+    .await?;
 
     let task = store
         .get(&CoreTaskId("t-ck-pr".into()))
@@ -184,11 +188,7 @@ async fn restart_with_checkpoint_pr_url_resumes_task() -> anyhow::Result<()> {
 /// Restart with a plan checkpoint: task resumes to Pending.
 #[tokio::test]
 async fn restart_with_plan_checkpoint_resumes_task() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let db_path = tmp.path().join("tasks.db");
-
-    {
-        let db = TaskDb::open(&db_path).await?;
+    let store = setup_store(|db| async move {
         db.insert(&make_task("t-plan", TaskStatus::Implementing))
             .await?;
         db.write_checkpoint(
@@ -199,9 +199,9 @@ async fn restart_with_plan_checkpoint_resumes_task() -> anyhow::Result<()> {
             "plan_done",
         )
         .await?;
-    }
-
-    let store = TaskStore::open(&db_path).await?;
+        Ok(())
+    })
+    .await?;
 
     let task = store
         .get(&CoreTaskId("t-plan".into()))
@@ -223,11 +223,7 @@ async fn restart_with_plan_checkpoint_resumes_task() -> anyhow::Result<()> {
 /// Restart with a triage-only checkpoint: task resumes to Pending.
 #[tokio::test]
 async fn restart_with_triage_checkpoint_resumes_task() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let db_path = tmp.path().join("tasks.db");
-
-    {
-        let db = TaskDb::open(&db_path).await?;
+    let store = setup_store(|db| async move {
         db.insert(&make_task("t-triage", TaskStatus::Implementing))
             .await?;
         db.write_checkpoint(
@@ -238,9 +234,9 @@ async fn restart_with_triage_checkpoint_resumes_task() -> anyhow::Result<()> {
             "triage_done",
         )
         .await?;
-    }
-
-    let store = TaskStore::open(&db_path).await?;
+        Ok(())
+    })
+    .await?;
 
     let task = store
         .get(&CoreTaskId("t-triage".into()))
@@ -263,21 +259,16 @@ async fn restart_with_triage_checkpoint_resumes_task() -> anyhow::Result<()> {
 /// "retrying after transient failure") must become Failed on restart.
 #[tokio::test]
 async fn restart_transient_retry_task_fails() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let db_path = tmp.path().join("tasks.db");
-
-    {
-        let db = TaskDb::open(&db_path).await?;
+    let store = setup_store(|db| async move {
         let mut task = make_task("t-transient", TaskStatus::Pending);
         task.error = Some("retrying after transient failure (attempt 2)".to_string());
         db.insert(&task).await?;
-
         // Normal pending task (no transient error) must not be affected.
         db.insert(&make_task("t-normal-pending", TaskStatus::Pending))
             .await?;
-    }
-
-    let store = TaskStore::open(&db_path).await?;
+        Ok(())
+    })
+    .await?;
 
     let transient = store
         .get(&CoreTaskId("t-transient".into()))
@@ -313,12 +304,7 @@ async fn restart_transient_retry_task_fails() -> anyhow::Result<()> {
 /// Mixed scenario: some tasks resume, some fail — recovery counts are correct.
 #[tokio::test]
 async fn restart_mixed_recovery_counts() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let db_path = tmp.path().join("tasks.db");
-
-    {
-        let db = TaskDb::open(&db_path).await?;
-
+    let store = setup_store(|db| async move {
         // Will be resumed: has plan checkpoint.
         db.insert(&make_task("t-resumable-plan", TaskStatus::Implementing))
             .await?;
@@ -341,9 +327,9 @@ async fn restart_mixed_recovery_counts() -> anyhow::Result<()> {
             .await?;
         db.insert(&make_task("t-fail-2", TaskStatus::Waiting))
             .await?;
-    }
-
-    let store = TaskStore::open(&db_path).await?;
+        Ok(())
+    })
+    .await?;
 
     let all = store.list_all();
     let (resumed_count, failed_count) =
