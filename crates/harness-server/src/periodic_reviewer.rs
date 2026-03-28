@@ -14,6 +14,7 @@ use tokio::time::sleep;
 /// nested-lock risk that arises from holding two separate mutexes in the same
 /// function.  Every acquisition of this lock is short (no `.await` while
 /// holding it) and sequential — locks are never held concurrently.
+#[derive(Default)]
 struct ReviewState {
     /// Local fallback timestamp guards against stale deduplication when the
     /// EventStore write fails.  Updated atomically after every successful task
@@ -44,10 +45,7 @@ pub fn start(state: Arc<AppState>, config: ReviewConfig) {
 async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     let interval = config.effective_interval();
     // Single mutex covering both fallback_ts and poll_handle — RS-01 fix.
-    let review_state: Arc<Mutex<ReviewState>> = Arc::new(Mutex::new(ReviewState {
-        fallback_ts: None,
-        poll_handle: None,
-    }));
+    let review_state: Arc<Mutex<ReviewState>> = Arc::new(Mutex::new(ReviewState::default()));
 
     if config.run_on_startup {
         // Brief delay to let the server fully initialize before the first tick.
@@ -546,10 +544,7 @@ mod tests {
     /// correctly through the single combined mutex.
     #[tokio::test]
     async fn fallback_ts_arc_mutex_roundtrip() {
-        let state: Arc<Mutex<ReviewState>> = Arc::new(Mutex::new(ReviewState {
-            fallback_ts: None,
-            poll_handle: None,
-        }));
+        let state: Arc<Mutex<ReviewState>> = Arc::new(Mutex::new(ReviewState::default()));
         assert!(state.lock().await.fallback_ts.is_none());
 
         let now = Utc::now();
@@ -566,10 +561,7 @@ mod tests {
     /// This test additionally asserts that the old spawned task is still running.
     #[tokio::test]
     async fn poll_handle_replaced_without_aborting_previous() {
-        let state: Arc<Mutex<ReviewState>> = Arc::new(Mutex::new(ReviewState {
-            fallback_ts: None,
-            poll_handle: None,
-        }));
+        let state: Arc<Mutex<ReviewState>> = Arc::new(Mutex::new(ReviewState::default()));
 
         // First cycle: spawn a long-running task and store it.
         let first = tokio::spawn(async {
