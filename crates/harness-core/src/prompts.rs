@@ -285,6 +285,7 @@ pub fn gc_adopt_prompt(
 /// When `prev_fixed` is true (previous round pushed code), the agent must first
 /// verify that Gemini has submitted a **new** review covering the latest commit
 /// before declaring LGTM. If no new review exists yet, agent outputs WAITING.
+#[allow(clippy::too_many_arguments)]
 pub fn review_prompt(
     issue: Option<u64>,
     pr: u64,
