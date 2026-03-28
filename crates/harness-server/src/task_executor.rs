@@ -1120,7 +1120,10 @@ pub(crate) async fn run_task(
         let resp = tokio::time::timeout(turn_timeout, agent.execute(check_req.clone())).await;
         let resp = match resp {
             Ok(Ok(r)) => {
-                let tool_violations = validate_tool_usage(&r.output, check_req.allowed_tools.as_deref().unwrap_or(&[]));
+                let tool_violations = validate_tool_usage(
+                    &r.output,
+                    check_req.allowed_tools.as_deref().unwrap_or(&[]),
+                );
                 if !tool_violations.is_empty() {
                     let msg = format!(
                         "Tool isolation violation in review check round {round}: agent used disallowed tools: [{}]",
@@ -1392,7 +1395,10 @@ async fn run_agent_review(
         let resp = tokio::time::timeout(turn_timeout, reviewer.execute(review_req.clone())).await;
         let resp = match resp {
             Ok(Ok(r)) => {
-                let tool_violations = validate_tool_usage(&r.output, review_req.allowed_tools.as_deref().unwrap_or(&[]));
+                let tool_violations = validate_tool_usage(
+                    &r.output,
+                    review_req.allowed_tools.as_deref().unwrap_or(&[]),
+                );
                 if !tool_violations.is_empty() {
                     let msg = format!(
                         "Tool isolation violation in agent review round {agent_round}: agent used disallowed tools: [{}]",
