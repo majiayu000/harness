@@ -61,11 +61,15 @@ impl TaskCheckpoint {
     ///
     /// Stale checkpoints indicate the task sat interrupted for too long; the
     /// safe course is to mark it failed rather than attempt a resume.
+    ///
+    /// A negative age (future `saved_at` due to clock skew or corrupt data)
+    /// is treated as invalid and returns `false` to avoid bypassing the
+    /// expiry guard.
     pub fn is_fresh(&self) -> bool {
         let age = Utc::now()
             .signed_duration_since(self.saved_at)
             .num_seconds();
-        age <= CHECKPOINT_MAX_AGE_SECS
+        (0..=CHECKPOINT_MAX_AGE_SECS).contains(&age)
     }
 
     /// Load a checkpoint from the JSON string stored in the database.
@@ -171,6 +175,17 @@ mod tests {
         // Backdate by 3 hours.
         cp.saved_at = Utc::now() - chrono::Duration::hours(3);
         assert!(!cp.is_fresh());
+    }
+
+    #[test]
+    fn future_timestamp_is_not_fresh() {
+        let mut cp = make_checkpoint("task-future");
+        // Advance saved_at by 1 hour into the future (clock skew / corrupt data).
+        cp.saved_at = Utc::now() + chrono::Duration::hours(1);
+        assert!(
+            !cp.is_fresh(),
+            "future saved_at must not be treated as fresh"
+        );
     }
 
     #[test]
