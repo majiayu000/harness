@@ -53,9 +53,12 @@ pub struct EventStore {
 impl EventStore {
     pub async fn new(data_dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
-        // Canonicalize after creation to resolve symlinks and ".." components.
-        // Defensive-only: the primary path-traversal boundary is at task_routes.rs.
-        let data_dir = data_dir.canonicalize()?;
+        // Do NOT canonicalize here: on Windows, std::fs::canonicalize produces
+        // a `\\?\`-prefixed UNC path whose `?` would truncate the SQLite URL
+        // query string (e.g. `sqlite:\\?\C:\...\events.db?mode=rwc` becomes
+        // `sqlite:\\?\C:\...\events.db`), causing the DB open to fail.
+        // The primary path-traversal boundary is at task_routes.rs.
+        let data_dir = data_dir.to_path_buf();
         let db_path = data_dir.join("events.db");
         let pool = open_pool(&db_path).await?;
         Migrator::new(&pool, EVENT_MIGRATIONS).run().await?;
