@@ -273,6 +273,7 @@ async fn enqueue_task_background(
 
     let project_id = canonical_project.to_string_lossy().into_owned();
     req.project = Some(canonical_project);
+    task_runner::fill_missing_repo_from_project(&mut req).await;
 
     let server_config = std::sync::Arc::new(state.core.server.config.clone());
 

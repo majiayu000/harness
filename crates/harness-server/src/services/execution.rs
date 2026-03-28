@@ -247,6 +247,7 @@ impl ExecutionService for DefaultExecutionService {
 
         let project_id = canonical.to_string_lossy().into_owned();
         req.project = Some(canonical);
+        task_runner::fill_missing_repo_from_project(&mut req).await;
 
         let server_config = self.server_config.clone();
 
