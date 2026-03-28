@@ -491,12 +491,46 @@ fn validation_cmd_for_type(project_type: &str) -> &'static str {
 /// using its tools (read files, run commands, `gh issue list`). No pre-chewed
 /// data is stuffed into the prompt — the agent decides what to look at.
 pub fn periodic_review_prompt(project_root: &str, since: &str, project_type: &str) -> String {
+    periodic_review_prompt_with_guard_scan(project_root, since, project_type, None)
+}
+
+/// Build prompt: periodic codebase review, with optional pre-scanned guard results.
+///
+/// When `guard_scan` is `Some`, the guard scan was already run on the source
+/// repo (`project_root`) by the scheduler — the agent must NOT re-run guard
+/// scripts in its worktree, which may contain nested `.harness/worktrees/`
+/// from previous runs that would inflate the violation count ~3x.
+pub fn periodic_review_prompt_with_guard_scan(
+    project_root: &str,
+    since: &str,
+    project_type: &str,
+    guard_scan: Option<&str>,
+) -> String {
     let p1_logic = p1_logic_for_type(project_type);
+
+    let guard_section = match guard_scan {
+        Some(scan_output) => format!(
+            "## Guard Scan Results (pre-scanned on source repo)\n\n\
+             The scheduler already ran guard scripts on `{project_root}` before\n\
+             creating this task. Do NOT re-run guard scripts — the worktree may\n\
+             contain nested workspace directories that inflate results.\n\n\
+             {scan_output}\n\n"
+        ),
+        None => String::new(),
+    };
+
+    let guard_step = if guard_scan.is_some() {
+        "4. Guard scan results are provided above — do NOT re-run guard scripts\n"
+    } else {
+        "4. Run guard scripts if they exist: `bash .vibeguard/run-guards.sh` or similar\n"
+    };
+
     format!(
         "You are a Staff Engineer conducting a periodic health review of this project.\n\n\
          Project: {project_root}\n\
          Last review: {since}\n\
          Project type: {project_type}\n\n\
+         {guard_section}\
          ## Steps\n\n\
          0. Run `git log --oneline --since=\"{since}\"`. If the output is empty (no commits \
 since last review), output exactly `REVIEW_SKIPPED` on its own line and stop — do not \
@@ -504,7 +538,7 @@ create any issues or output JSON.\n\
          1. Run `git log --oneline --since=\"{since}\"` to see what changed\n\
          2. Run `git diff --stat HEAD~20` (or since last review) to identify changed files\n\
          3. Read the changed files — focus on correctness and safety, not style\n\
-         4. Run guard scripts if they exist: `bash .vibeguard/run-guards.sh` or similar\n\
+         {guard_step}\
          5. Check existing issues: `gh issue list --state open --label review` — do NOT duplicate\n\
          6. For P0 (security) and P1 (logic) findings, create GitHub issues with `gh issue create`\n\n\
          ## Priority\n\n\
@@ -1891,5 +1925,39 @@ PR_URL=https://github.com/owner/repo/pull/269";
 
         let output2 = "Assessment here.\nCOMPLEXITY=high\nTRIAGE=PROCEED_WITH_PLAN";
         assert_eq!(parse_triage(output2), Some(TriageDecision::ProceedWithPlan));
+    }
+
+    #[test]
+    fn periodic_review_prompt_without_guard_scan_includes_run_guard_step() {
+        let p = periodic_review_prompt("/repo", "2024-01-01T00:00:00Z", "rust");
+        assert!(p.contains("Run guard scripts if they exist"));
+        assert!(!p.contains("pre-scanned"));
+    }
+
+    #[test]
+    fn periodic_review_prompt_with_guard_scan_embeds_results_and_suppresses_rerun() {
+        let scan = "2 violation(s):\n[Error] RS-03: unwrap (src/lib.rs:10)";
+        let p = periodic_review_prompt_with_guard_scan(
+            "/repo",
+            "2024-01-01T00:00:00Z",
+            "rust",
+            Some(scan),
+        );
+        assert!(p.contains("pre-scanned on source repo"));
+        assert!(p.contains(scan));
+        assert!(p.contains("Do NOT re-run guard scripts"));
+        assert!(!p.contains("Run guard scripts if they exist"));
+    }
+
+    #[test]
+    fn periodic_review_prompt_none_guard_scan_matches_no_arg_variant() {
+        let a = periodic_review_prompt("/repo", "2024-01-01T00:00:00Z", "rust");
+        let b = periodic_review_prompt_with_guard_scan(
+            "/repo",
+            "2024-01-01T00:00:00Z",
+            "rust",
+            None,
+        );
+        assert_eq!(a, b);
     }
 }
