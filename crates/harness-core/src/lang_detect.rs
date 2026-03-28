@@ -480,6 +480,11 @@ mod tests {
     #[test]
     fn typescript_pre_push_npm_when_no_lockfile() {
         let dir = tmpdir();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"echo ok"}}"#,
+        )
+        .unwrap();
         let cmds = default_pre_push_commands(Language::TypeScript, dir.path());
         assert_eq!(cmds, vec!["npm test"]);
     }
@@ -487,6 +492,11 @@ mod tests {
     #[test]
     fn typescript_pre_push_yarn_when_yarn_lock() {
         let dir = tmpdir();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"echo ok"}}"#,
+        )
+        .unwrap();
         fs::write(dir.path().join("yarn.lock"), "").unwrap();
         let cmds = default_pre_push_commands(Language::TypeScript, dir.path());
         assert_eq!(cmds, vec!["yarn test"]);
@@ -495,6 +505,11 @@ mod tests {
     #[test]
     fn typescript_pre_push_pnpm_when_pnpm_lock() {
         let dir = tmpdir();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"echo ok"}}"#,
+        )
+        .unwrap();
         fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
         let cmds = default_pre_push_commands(Language::TypeScript, dir.path());
         assert_eq!(cmds, vec!["pnpm test"]);
