@@ -27,26 +27,9 @@ pub async fn rule_check(
     let project_root = validate_root!(&project_root, id, &state.core.home_dir);
     let file_count = files.as_ref().map_or(0, |paths| paths.len());
 
-    // Acquire the read lock only long enough to validate the request and
-    // snapshot the guards/rules.  Releasing the lock before the async scan
-    // prevents write starvation: concurrent rule_load() calls need a write
-    // lock and would otherwise block for the entire scan duration.
-    let snapshot = {
-        let rules = state.engines.rules.read().await;
-        if let Err(err) = rules.validate_scan_request(files.as_deref()) {
-            tracing::warn!(
-                project_root = %project_root.display(),
-                guard_count = rules.guards().len(),
-                file_count,
-                error = %err,
-                "rule/check rejected before scan"
-            );
-            return RpcResponse::error(id, INTERNAL_ERROR, err.to_string());
-        }
-        rules.snapshot()
-    }; // read lock released here
-
-    // Validate file paths outside the lock — pure path arithmetic, no lock needed.
+    // Validate file paths first — pure path arithmetic, no lock needed.
+    // Rejecting invalid paths before taking the snapshot avoids a full
+    // deep-clone of Vec<Rule> (including description bodies) on bad requests.
     let validated_files = match files {
         Some(f) => {
             let mut validated = Vec::with_capacity(f.len());
@@ -60,6 +43,25 @@ pub async fn rule_check(
         }
         None => None,
     };
+
+    // Acquire the read lock only long enough to validate the request and
+    // snapshot the guards/rules.  Releasing the lock before the async scan
+    // prevents write starvation: concurrent rule_load() calls need a write
+    // lock and would otherwise block for the entire scan duration.
+    let snapshot = {
+        let rules = state.engines.rules.read().await;
+        if let Err(err) = rules.validate_scan_request(validated_files.as_deref()) {
+            tracing::warn!(
+                project_root = %project_root.display(),
+                guard_count = rules.guards().len(),
+                file_count,
+                error = %err,
+                "rule/check rejected before scan"
+            );
+            return RpcResponse::error(id, INTERNAL_ERROR, err.to_string());
+        }
+        rules.snapshot()
+    }; // read lock released here
 
     // Run the async scan without holding the read lock.
     let result = match validated_files {
