@@ -247,8 +247,11 @@ pub struct CreateTaskRequest {
     pub project: Option<PathBuf>,
     #[serde(default = "default_wait")]
     pub wait_secs: u64,
-    #[serde(default = "default_max_rounds")]
-    pub max_rounds: u32,
+    /// Maximum review rounds. When absent, triage complexity provides the default
+    /// (Low=2, Medium=system default, High=8). When explicitly set by the caller,
+    /// this value always wins over triage-derived defaults.
+    #[serde(default)]
+    pub max_rounds: Option<u32>,
     /// Per-turn timeout in seconds; defaults to 3600 (1 hour).
     #[serde(default = "default_turn_timeout")]
     pub turn_timeout_secs: u64,
@@ -292,7 +295,7 @@ impl Default for CreateTaskRequest {
             agent: None,
             project: None,
             wait_secs: default_wait(),
-            max_rounds: default_max_rounds(),
+            max_rounds: None,
             turn_timeout_secs: default_turn_timeout(),
             max_budget_usd: None,
             retry_base_backoff_ms: default_retry_base_backoff_ms(),
@@ -346,9 +349,7 @@ fn detect_main_worktree() -> PathBuf {
 fn default_wait() -> u64 {
     120
 }
-fn default_max_rounds() -> u32 {
-    8
-}
+
 fn default_retry_base_backoff_ms() -> u64 {
     10_000
 }
@@ -1682,7 +1683,7 @@ mod tests {
             agent: None,
             project: Some(dir.path().to_path_buf()),
             wait_secs: 0,
-            max_rounds: 0,
+            max_rounds: Some(0),
             turn_timeout_secs: 30,
             max_budget_usd: None,
             ..Default::default()
@@ -1757,7 +1758,7 @@ mod tests {
             agent: None,
             project: Some(dir.path().to_path_buf()),
             wait_secs: 0,
-            max_rounds: 0,
+            max_rounds: Some(0),
             turn_timeout_secs: 30,
             max_budget_usd: None,
             ..Default::default()
@@ -1844,7 +1845,7 @@ mod tests {
             agent: None,
             project: None,
             wait_secs: 0,
-            max_rounds: 0,
+            max_rounds: Some(0),
             turn_timeout_secs: 30,
             max_budget_usd: None,
             ..Default::default()
@@ -2058,7 +2059,7 @@ mod tests {
             prompt: Some("implement something".into()),
             project: Some(dir.path().to_path_buf()),
             wait_secs: 0,
-            max_rounds: 0,
+            max_rounds: Some(0),
             turn_timeout_secs: 30,
             ..Default::default()
         };
@@ -2115,7 +2116,7 @@ mod tests {
             prompt: Some("implement something".into()),
             project: Some(dir.path().to_path_buf()),
             wait_secs: 0,
-            max_rounds: 1,
+            max_rounds: Some(1),
             turn_timeout_secs: 30,
             ..Default::default()
         };
