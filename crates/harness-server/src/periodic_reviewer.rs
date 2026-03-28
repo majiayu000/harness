@@ -196,7 +196,7 @@ async fn run_review_tick(
     let primary_agent_for_synthesis = review_agent.clone();
     let secondary_agent_name = secondary_agent.clone();
     let state_for_synthesis = state.clone();
-    let fallback_ts_for_poll = fallback_ts.clone();
+    let fallback_ts_for_poll = review_state.clone();
     let handle = tokio::spawn(async move {
         let primary_output = poll_task_output(&store, &primary_review_id, timeout_secs).await;
         tracing::info!(
@@ -231,7 +231,7 @@ async fn run_review_tick(
         // we set the boundary to the agent's execution completion time, ensuring
         // the next tick's --since is always ≥ all commits this agent reviewed.
         let review_complete_ts = Utc::now();
-        *fallback_ts_for_poll.lock().await = Some(review_complete_ts);
+        fallback_ts_for_poll.lock().await.fallback_ts = Some(review_complete_ts);
         let watermark_event = Event::new(
             SessionId::new(),
             "periodic_review",
