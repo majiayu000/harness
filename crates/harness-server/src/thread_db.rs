@@ -1,6 +1,6 @@
-use crate::db::{open_pool, Migration, Migrator};
 use anyhow::Context;
-use harness_core::{Thread, ThreadId, ThreadStatus};
+use harness_core::db::{open_pool, Migration, Migrator};
+use harness_core::{types::Thread, types::ThreadId, types::ThreadStatus};
 use sqlx::sqlite::SqlitePool;
 use std::path::Path;
 

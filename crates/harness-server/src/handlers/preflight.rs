@@ -1,12 +1,12 @@
 use crate::{http::AppState, validate_root};
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
-use harness_core::{
-    AgentRequest, CapabilityProfile, CodeAgent, Event, EventFilters, SessionId, TaskComplexity,
-};
-use harness_protocol::{RpcResponse, INTERNAL_ERROR};
+use harness_core::agent::{AgentRequest, CodeAgent, TaskComplexity};
+use harness_core::config::agents::CapabilityProfile;
+use harness_core::types::{Event, EventFilters, SessionId};
+use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR};
 use harness_rules::engine::RuleEngine;
-use harness_skills::SkillStore;
+use harness_skills::store::SkillStore;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,7 +47,7 @@ pub async fn run_preflight(
     agent: Arc<dyn CodeAgent>,
     skills: Arc<RwLock<SkillStore>>,
     rules: Arc<RwLock<RuleEngine>>,
-    events: Arc<harness_observe::EventStore>,
+    events: Arc<harness_observe::event_store::EventStore>,
     project_root: PathBuf,
     task_description: String,
 ) -> anyhow::Result<PreflightResult> {
@@ -161,7 +161,7 @@ fn parse_preflight_output(output: &str) -> anyhow::Result<ParsedPreflightOutput>
 }
 
 async fn latest_baseline_scan(
-    events: &harness_observe::EventStore,
+    events: &harness_observe::event_store::EventStore,
 ) -> anyhow::Result<BaselineScanSnapshot> {
     let all_events = events
         .query(&EventFilters::default())
@@ -240,10 +240,9 @@ pub async fn preflight(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{
-        AgentRequest, AgentResponse, Capability, CodeAgent, Decision, Result as HarnessResult,
-        StreamItem, TokenUsage,
-    };
+    use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+    use harness_core::error::Result as HarnessResult;
+    use harness_core::types::{Capability, Decision, TokenUsage};
     use tokio::sync::mpsc::Sender;
 
     struct StaticAgent {
@@ -399,7 +398,7 @@ COMPLEXITY: complex"
     #[tokio::test]
     async fn run_preflight_uses_scan_result_from_event_store() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
-        let events = Arc::new(harness_observe::EventStore::new(temp.path()).await?);
+        let events = Arc::new(harness_observe::event_store::EventStore::new(temp.path()).await?);
         let session_id = SessionId::new();
 
         let scan_event = Event::new(
@@ -457,7 +456,7 @@ COMPLEXITY: complex"
             }),
             Arc::new(RwLock::new(SkillStore::new())),
             Arc::new(RwLock::new(RuleEngine::new())),
-            Arc::new(harness_observe::EventStore::new(temp.path()).await?),
+            Arc::new(harness_observe::event_store::EventStore::new(temp.path()).await?),
             temp.path().to_path_buf(),
             "test task".to_string(),
         )
@@ -482,7 +481,7 @@ COMPLEXITY: complex"
             }),
             Arc::new(RwLock::new(SkillStore::new())),
             Arc::new(RwLock::new(RuleEngine::new())),
-            Arc::new(harness_observe::EventStore::new(temp.path()).await?),
+            Arc::new(harness_observe::event_store::EventStore::new(temp.path()).await?),
             temp.path().to_path_buf(),
             "test task".to_string(),
         )

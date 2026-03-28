@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use harness_core::HarnessConfig;
+use harness_core::config::HarnessConfig;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -30,11 +30,11 @@ impl ExecSandboxMode {
         }
     }
 
-    pub fn to_sandbox_mode(self) -> harness_core::SandboxMode {
+    pub fn to_sandbox_mode(self) -> harness_core::config::agents::SandboxMode {
         match self {
-            Self::ReadOnly => harness_core::SandboxMode::ReadOnly,
-            Self::WorkspaceWrite => harness_core::SandboxMode::WorkspaceWrite,
-            Self::DangerFullAccess => harness_core::SandboxMode::DangerFullAccess,
+            Self::ReadOnly => harness_core::config::agents::SandboxMode::ReadOnly,
+            Self::WorkspaceWrite => harness_core::config::agents::SandboxMode::WorkspaceWrite,
+            Self::DangerFullAccess => harness_core::config::agents::SandboxMode::DangerFullAccess,
         }
     }
 }
@@ -343,14 +343,15 @@ pub async fn run(
     enforce_exec_privilege_policy(drop_sudo, unprivileged_user.as_deref())?;
     let runtime_sandbox_mode = sandbox_mode.to_sandbox_mode();
 
-    let req = harness_core::AgentRequest {
+    let req = harness_core::agent::AgentRequest {
         prompt: apply_sandbox_hint(prompt, sandbox_mode),
         project_root: project_root.clone(),
         model,
         ..Default::default()
     };
 
-    let mut agent_registry = harness_agents::AgentRegistry::new(&config.agents.default_agent);
+    let mut agent_registry =
+        harness_agents::registry::AgentRegistry::new(&config.agents.default_agent);
     agent_registry.set_complexity_preferences(config.agents.complexity_preferred_agents.clone());
     agent_registry.register(
         "claude",

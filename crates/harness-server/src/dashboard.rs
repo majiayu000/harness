@@ -11,7 +11,8 @@ pub async fn index(State(state): State<Arc<crate::http::AppState>>) -> impl Into
     // browser client can attach it to fetch requests and the WebSocket URL.
     // The dashboard HTML itself is exempt from auth (it contains no sensitive
     // data), and the individual API endpoints remain protected.
-    let token_script = match crate::http::resolve_api_token(&state.core.server.config.server) {
+    let token_script = match crate::http::auth::resolve_api_token(&state.core.server.config.server)
+    {
         Some(tok) => format!("<script>window.__HARNESS_TOKEN__={:?};</script>", tok),
         None => String::new(),
     };

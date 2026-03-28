@@ -1,5 +1,7 @@
 use crate::quality::{QualityGrader, QualityReport};
-use harness_core::{Decision, Event, Grade, RuleId, Severity, Violation};
+use harness_core::{
+    types::Decision, types::Event, types::Grade, types::RuleId, types::Severity, types::Violation,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -165,7 +167,7 @@ fn build_recommendations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{RuleId, SessionId, Severity};
+    use harness_core::{types::RuleId, types::SessionId, types::Severity};
     use std::path::PathBuf;
 
     fn pass_event() -> Event {

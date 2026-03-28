@@ -1,6 +1,6 @@
 use crate::thread_manager::ThreadManager;
-use harness_agents::AgentRegistry;
-use harness_core::HarnessConfig;
+use harness_agents::registry::AgentRegistry;
+use harness_core::config::HarnessConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 

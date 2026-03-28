@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use harness_core::{AgentAdapter, AgentEvent, TurnRequest};
+use harness_core::{agent::AgentAdapter, agent::AgentEvent, agent::TurnRequest};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
@@ -37,7 +37,7 @@ impl AgentAdapter for ClaudeAdapter {
         &self,
         req: TurnRequest,
         tx: mpsc::Sender<AgentEvent>,
-    ) -> harness_core::Result<()> {
+    ) -> harness_core::error::Result<()> {
         let model = req.model.as_deref().unwrap_or(&self.default_model);
         let mut cmd = Command::new(&self.cli_path);
         cmd.arg("-p")
@@ -60,11 +60,15 @@ impl AgentAdapter for ClaudeAdapter {
         cmd.arg(&req.prompt);
 
         let mut child = cmd.spawn().map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to spawn claude: {e}"))
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to spawn claude: {e}"
+            ))
         })?;
 
         let stdout = child.stdout.take().ok_or_else(|| {
-            harness_core::HarnessError::AgentExecution("no stdout from claude process".into())
+            harness_core::error::HarnessError::AgentExecution(
+                "no stdout from claude process".into(),
+            )
         })?;
 
         // Store child handle for interrupt()
@@ -144,11 +148,11 @@ impl AgentAdapter for ClaudeAdapter {
         Ok(())
     }
 
-    async fn interrupt(&self) -> harness_core::Result<()> {
+    async fn interrupt(&self) -> harness_core::error::Result<()> {
         let mut guard = self.child.lock().await;
         if let Some(ref mut child) = *guard {
             child.kill().await.map_err(|e| {
-                harness_core::HarnessError::AgentExecution(format!(
+                harness_core::error::HarnessError::AgentExecution(format!(
                     "failed to kill claude process: {e}"
                 ))
             })?;
@@ -198,7 +202,7 @@ pub fn parse_stream_json_line(line: &str) -> Option<AgentEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::ApprovalDecision;
+    use harness_core::agent::ApprovalDecision;
 
     #[test]
     fn parse_assistant_message() {

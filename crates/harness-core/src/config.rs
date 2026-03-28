@@ -1,28 +1,15 @@
-mod agents;
-mod dirs;
-mod intake;
-mod misc;
-mod project;
-mod resolve;
-mod server;
+pub mod agents;
+pub mod dirs;
+pub mod intake;
+pub mod misc;
+pub mod project;
+pub mod resolve;
+pub mod server;
 
-pub use agents::{
-    AgentReviewConfig, AgentsConfig, AnthropicApiConfig, ApprovalPolicy, CapabilityProfile,
-    ClaudeAgentConfig, CodexAgentConfig, CodexCloudConfig, SandboxMode,
-};
-pub use dirs::default_db_path;
-pub use intake::{FeishuIntakeConfig, GitHubIntakeConfig, GitHubRepoConfig, IntakeConfig};
-pub use misc::{
-    ConcurrencyConfig, GcConfig, ObserveConfig, OtelConfig, OtelExporter, ReviewConfig,
-    ReviewStrategy, RulesConfig, SignalThresholdsConfig, ValidationConfig, WorkspaceConfig,
-};
-pub use project::{
-    load_project_config, GitConfig, ProjectAgentConfig, ProjectConcurrencyConfig, ProjectConfig,
-    ProjectGcConfig, ProjectReviewConfig,
-};
-pub use resolve::{resolve_config, ResolvedConfig};
-pub use server::{ServerConfig, Transport};
-
+use self::agents::*;
+use self::intake::*;
+use self::misc::*;
+use self::server::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

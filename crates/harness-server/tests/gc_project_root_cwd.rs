@@ -1,5 +1,5 @@
-use harness_agents::AgentRegistry;
-use harness_core::{GuardId, HarnessConfig, Language};
+use harness_agents::registry::AgentRegistry;
+use harness_core::{config::HarnessConfig, types::GuardId, types::Language};
 use harness_server::{
     handlers::gc::gc_run, http::build_app_state, server::HarnessServer,
     thread_manager::ThreadManager,
@@ -70,7 +70,7 @@ async fn gc_run_uses_configured_project_root_across_cwd() -> anyhow::Result<()> 
             return Err(err);
         }
     };
-    let _response = gc_run(&state, Some(serde_json::json!(1))).await;
+    let _response = gc_run(&state, Some(serde_json::json!(1)), None).await;
 
     let scanned_root = std::fs::read_to_string(&capture_file)?;
     assert_eq!(

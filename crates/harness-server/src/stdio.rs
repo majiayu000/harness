@@ -1,6 +1,6 @@
 use crate::http::AppState;
 use crate::router;
-use harness_protocol::{codec, RpcResponse};
+use harness_protocol::{codec, methods::RpcResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
@@ -9,7 +9,7 @@ async fn process_line(state: &AppState, line: &str) -> anyhow::Result<Option<Str
         Ok(req) => router::handle_request(state, req).await,
         Err(e) => Some(RpcResponse::error(
             None,
-            harness_protocol::PARSE_ERROR,
+            harness_protocol::methods::PARSE_ERROR,
             format!("parse error: {e}"),
         )),
     };
@@ -123,9 +123,9 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
-    use harness_agents::AgentRegistry;
-    use harness_core::HarnessConfig;
-    use harness_protocol::{Method, RpcRequest};
+    use harness_agents::registry::AgentRegistry;
+    use harness_core::config::HarnessConfig;
+    use harness_protocol::{methods::Method, methods::RpcRequest};
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -135,32 +135,36 @@ mod tests {
             ThreadManager::new(),
             AgentRegistry::new("test"),
         ));
-        let tasks =
-            crate::task_runner::TaskStore::open(&harness_core::default_db_path(dir, "tasks"))
-                .await?;
-        let events = Arc::new(harness_observe::EventStore::new(dir).await?);
-        let signal_detector = harness_gc::SignalDetector::new(
+        let tasks = crate::task_runner::TaskStore::open(
+            &harness_core::config::dirs::default_db_path(dir, "tasks"),
+        )
+        .await?;
+        let events = Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
+        let signal_detector = harness_gc::signal_detector::SignalDetector::new(
             server.config.gc.signal_thresholds.clone().into(),
-            harness_core::ProjectId::new(),
+            harness_core::types::ProjectId::new(),
         );
-        let draft_store = harness_gc::DraftStore::new(dir)?;
-        let gc_agent = Arc::new(harness_gc::GcAgent::new(
+        let draft_store = harness_gc::draft_store::DraftStore::new(dir)?;
+        let gc_agent = Arc::new(harness_gc::gc_agent::GcAgent::new(
             server.config.gc.clone(),
             signal_detector,
             draft_store,
             dir.to_path_buf(),
         ));
-        let thread_db =
-            crate::thread_db::ThreadDb::open(&harness_core::default_db_path(dir, "threads"))
-                .await?;
-        let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
-            &harness_core::default_db_path(dir, "projects"),
+        let thread_db = crate::thread_db::ThreadDb::open(
+            &harness_core::config::dirs::default_db_path(dir, "threads"),
         )
         .await?;
-        let project_svc =
-            crate::services::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
-        let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
-        let execution_svc = crate::services::DefaultExecutionService::new(
+        let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
+            &harness_core::config::dirs::default_db_path(dir, "projects"),
+        )
+        .await?;
+        let project_svc = crate::services::project::DefaultProjectService::new(
+            _project_svc_tmp,
+            dir.to_path_buf(),
+        );
+        let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+        let execution_svc = crate::services::execution::DefaultExecutionService::new(
             tasks.clone(),
             server.agent_registry.clone(),
             Arc::new(server.config.clone()),
@@ -188,15 +192,17 @@ mod tests {
                 project_registry: None,
             },
             engines: crate::http::EngineServices {
-                skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
+                skills: Arc::new(RwLock::new(harness_skills::store::SkillStore::new())),
                 rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
                 gc_agent,
             },
             observability: crate::http::ObservabilityServices {
                 events,
-                signal_rate_limiter: std::sync::Arc::new(crate::http::SignalRateLimiter::new(100)),
+                signal_rate_limiter: std::sync::Arc::new(
+                    crate::http::rate_limit::SignalRateLimiter::new(100),
+                ),
                 password_reset_rate_limiter: std::sync::Arc::new(
-                    crate::http::PasswordResetRateLimiter::new(5),
+                    crate::http::rate_limit::PasswordResetRateLimiter::new(5),
                 ),
                 review_store: None,
             },
@@ -240,7 +246,7 @@ mod tests {
         let init_out = process_line(&state, &init_line)
             .await?
             .expect("initialize should return a response");
-        let init_resp: harness_protocol::RpcResponse = codec::decode_response(&init_out)?;
+        let init_resp: harness_protocol::methods::RpcResponse = codec::decode_response(&init_out)?;
         assert!(
             init_resp.error.is_none(),
             "initialize failed: {:?}",
@@ -296,7 +302,7 @@ mod tests {
         let out = process_line(&state, &line)
             .await?
             .expect("should return a response");
-        let resp: harness_protocol::RpcResponse = codec::decode_response(&out)?;
+        let resp: harness_protocol::methods::RpcResponse = codec::decode_response(&out)?;
         assert!(
             resp.error.is_none(),
             "thread_start failed: {:?}",
@@ -336,12 +342,13 @@ mod tests {
         let thread_out = process_line(&state, &thread_line)
             .await?
             .expect("thread_start should return a response");
-        let thread_resp: harness_protocol::RpcResponse = codec::decode_response(&thread_out)?;
+        let thread_resp: harness_protocol::methods::RpcResponse =
+            codec::decode_response(&thread_out)?;
         let thread_id_str = thread_resp.result.unwrap()["thread_id"]
             .as_str()
             .unwrap()
             .to_string();
-        let thread_id = harness_core::ThreadId::from_str(&thread_id_str);
+        let thread_id = harness_core::types::ThreadId::from_str(&thread_id_str);
 
         // Drain the thread_start notification.
         let _ = notify_rx.try_recv();
@@ -358,7 +365,7 @@ mod tests {
         let turn_out = process_line(&state, &turn_line)
             .await?
             .expect("turn_start should return a response");
-        let turn_resp: harness_protocol::RpcResponse = codec::decode_response(&turn_out)?;
+        let turn_resp: harness_protocol::methods::RpcResponse = codec::decode_response(&turn_out)?;
         assert!(
             turn_resp.error.is_none(),
             "turn_start failed: {:?}",

@@ -50,11 +50,15 @@ class Harness:
         self,
         base_url: str = "http://127.0.0.1:9800",
         cwd: str | None = None,
+        api_token: str | None = None,
+        headers: dict[str, str] | None = None,
         request_timeout_seconds: float = 15.0,
         rpc_handler: RpcHandler | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.cwd = cwd
+        self.api_token = api_token.strip() if isinstance(api_token, str) else None
+        self.headers = dict(headers) if headers else {}
         self.request_timeout_seconds = request_timeout_seconds
         self._rpc_handler = rpc_handler
         self._next_id = 1
@@ -109,11 +113,14 @@ class Harness:
             "params": params or {},
         }
         body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json", **self.headers}
+        if self.api_token:
+            headers["Authorization"] = f"Bearer {self.api_token}"
         request = urllib.request.Request(
             f"{self.base_url}/rpc",
             data=body,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
 
         try:

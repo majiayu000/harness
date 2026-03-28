@@ -24,12 +24,22 @@ export class RpcTransport {
   private readonly endpoint: string;
   private readonly fetchImpl: FetchLike;
   private readonly requestTimeoutMs: number;
+  private readonly headers: Record<string, string>;
   private nextRequestId: number;
 
   constructor(options: HarnessOptions) {
     this.endpoint = `${normalizeBaseUrl(options.baseUrl)}/rpc`;
     this.fetchImpl = resolveFetch(options.fetch);
     this.requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      ...(options.headers ?? {}),
+    };
+    const token = options.apiToken?.trim();
+    if (token) {
+      headers.authorization = `Bearer ${token}`;
+    }
+    this.headers = headers;
     this.nextRequestId = 1;
   }
 
@@ -44,9 +54,7 @@ export class RpcTransport {
     const responseText = await withTimeout(
       this.fetchImpl(this.endpoint, {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-        },
+        headers: this.headers,
         body: JSON.stringify(payload),
       }).then(async (response) => {
         const body = await response.text();

@@ -1,6 +1,6 @@
 use crate::task_runner::TaskId;
 use dashmap::DashMap;
-use harness_core::config::WorkspaceConfig;
+use harness_core::config::misc::WorkspaceConfig;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
@@ -424,7 +424,7 @@ mod tests {
             ..Default::default()
         };
         let mgr = WorkspaceManager::new(config).expect("new");
-        let task_id = TaskId("test-task-001".to_string());
+        let task_id = harness_core::types::TaskId("test-task-001".to_string());
 
         let ws_path = mgr
             .create_workspace(&task_id, source.path(), "origin", &branch)
@@ -445,7 +445,7 @@ mod tests {
             ..Default::default()
         };
         let mgr = WorkspaceManager::new(config).expect("new");
-        let task_id = TaskId("nonexistent-task".to_string());
+        let task_id = harness_core::types::TaskId("nonexistent-task".to_string());
 
         // Should succeed even though workspace was never created.
         mgr.remove_workspace(&task_id).await.expect("first remove");
@@ -464,7 +464,7 @@ mod tests {
             ..Default::default()
         };
         let mgr = WorkspaceManager::new(config).expect("new");
-        let task_id = TaskId("test-task-002".to_string());
+        let task_id = harness_core::types::TaskId("test-task-002".to_string());
 
         let path1 = mgr
             .create_workspace(&task_id, source.path(), "origin", &branch)
@@ -495,7 +495,7 @@ mod tests {
             ..Default::default()
         };
         let mgr = WorkspaceManager::new(config).expect("new");
-        let task_id = TaskId("test-task-003".to_string());
+        let task_id = harness_core::types::TaskId("test-task-003".to_string());
 
         mgr.create_workspace(&task_id, source.path(), "origin", &branch)
             .await
@@ -521,7 +521,7 @@ mod tests {
             ..Default::default()
         };
         let mgr = WorkspaceManager::new(config).expect("new");
-        let task_id = TaskId("test-task-004".to_string());
+        let task_id = harness_core::types::TaskId("test-task-004".to_string());
 
         let result = mgr
             .create_workspace(&task_id, source.path(), "origin", &branch)
@@ -552,7 +552,7 @@ mod tests {
         let mgr = Arc::new(WorkspaceManager::new(config).expect("new"));
 
         let ids: Vec<TaskId> = (1..=3)
-            .map(|i| TaskId(format!("cleanup-task-{i:03}")))
+            .map(|i| harness_core::types::TaskId(format!("cleanup-task-{i:03}")))
             .collect();
 
         for id in &ids {

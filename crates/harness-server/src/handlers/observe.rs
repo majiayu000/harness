@@ -1,11 +1,11 @@
 use crate::{http::AppState, validate_root};
-use harness_protocol::{RpcResponse, INTERNAL_ERROR};
+use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR};
 use std::path::PathBuf;
 
 pub async fn event_log(
     state: &AppState,
     id: Option<serde_json::Value>,
-    event: harness_core::Event,
+    event: harness_core::types::Event,
 ) -> RpcResponse {
     match state.observability.events.log(&event).await {
         Ok(event_id) => RpcResponse::success(
@@ -19,11 +19,11 @@ pub async fn event_log(
 pub async fn event_query(
     state: &AppState,
     id: Option<serde_json::Value>,
-    filters: harness_core::EventFilters,
+    filters: harness_core::types::EventFilters,
 ) -> RpcResponse {
     // Never expose raw content blobs through the public observability API;
     // content may contain secrets echoed by agent reviewers.
-    let safe_filters = harness_core::EventFilters {
+    let safe_filters = harness_core::types::EventFilters {
         include_content: false,
         ..filters
     };
@@ -67,7 +67,7 @@ pub async fn metrics_collect(
     let evts = match state
         .observability
         .events
-        .query(&harness_core::EventFilters::default())
+        .query(&harness_core::types::EventFilters::default())
         .await
     {
         Ok(e) => e,
@@ -75,7 +75,7 @@ pub async fn metrics_collect(
     };
 
     let violation_count = violations.len();
-    let report = harness_observe::QualityGrader::grade(&evts, violation_count);
+    let report = harness_observe::quality::QualityGrader::grade(&evts, violation_count);
     match serde_json::to_value(&report) {
         Ok(v) => RpcResponse::success(id, v),
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -86,8 +86,10 @@ pub async fn metrics_collect(
 mod tests {
     use super::*;
     use crate::{http::build_app_state, server::HarnessServer, thread_manager::ThreadManager};
-    use harness_agents::AgentRegistry;
-    use harness_core::{EventFilters, GuardId, HarnessConfig, Language};
+    use harness_agents::registry::AgentRegistry;
+    use harness_core::{
+        config::HarnessConfig, types::EventFilters, types::GuardId, types::Language,
+    };
     use harness_rules::engine::Guard;
     use std::path::Path;
     use std::sync::Arc;
@@ -123,12 +125,12 @@ mod tests {
         let data_dir = tempfile::tempdir()?;
         let state = make_test_state(project_root.path(), data_dir.path()).await?;
 
-        let session_id = harness_core::SessionId::new();
-        let event = harness_core::Event::new(
+        let session_id = harness_core::types::SessionId::new();
+        let event = harness_core::types::Event::new(
             session_id.clone(),
             "pre_tool_use",
             "Bash",
-            harness_core::Decision::Pass,
+            harness_core::types::Decision::Pass,
         );
 
         let response = event_log(&state, Some(serde_json::json!(1)), event.clone()).await;
@@ -156,16 +158,16 @@ mod tests {
         let data_dir = tempfile::tempdir()?;
         let state = make_test_state(project_root.path(), data_dir.path()).await?;
 
-        let session_id = harness_core::SessionId::new();
-        let event = harness_core::Event::new(
+        let session_id = harness_core::types::SessionId::new();
+        let event = harness_core::types::Event::new(
             session_id.clone(),
             "post_tool_use",
             "Read",
-            harness_core::Decision::Pass,
+            harness_core::types::Decision::Pass,
         );
         state.observability.events.log(&event).await?;
 
-        let filters = harness_core::EventFilters {
+        let filters = harness_core::types::EventFilters {
             session_id: Some(session_id),
             ..Default::default()
         };
@@ -279,9 +281,9 @@ mod tests {
 pub async fn metrics_query(
     state: &AppState,
     id: Option<serde_json::Value>,
-    filters: harness_core::MetricFilters,
+    filters: harness_core::types::MetricFilters,
 ) -> RpcResponse {
-    let event_filters = harness_core::EventFilters {
+    let event_filters = harness_core::types::EventFilters {
         since: filters.since,
         until: filters.until,
         ..Default::default()
@@ -299,7 +301,7 @@ pub async fn metrics_query(
                         .count()
                 })
                 .unwrap_or(0);
-            let report = harness_observe::QualityGrader::grade(&evts, violation_count);
+            let report = harness_observe::quality::QualityGrader::grade(&evts, violation_count);
             match serde_json::to_value(&report) {
                 Ok(v) => RpcResponse::success(id, v),
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),

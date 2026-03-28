@@ -1,6 +1,7 @@
-use harness_core::{EventFilters, Grade, Project};
-use harness_gc::GcAgent;
-use harness_observe::{EventStore, QualityGrader};
+use harness_core::types::{EventFilters, Grade, Project};
+use harness_gc::gc_agent::GcAgent;
+use harness_observe::event_store::EventStore;
+use harness_observe::quality::QualityGrader;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,7 +18,7 @@ fn unix_now() -> u64 {
 pub struct QualityTrigger {
     events: Arc<EventStore>,
     gc_agent: Arc<GcAgent>,
-    agent_registry: Arc<harness_agents::AgentRegistry>,
+    agent_registry: Arc<harness_agents::registry::AgentRegistry>,
     project_root: PathBuf,
     auto_gc_grades: Vec<Grade>,
     cooldown_secs: u64,
@@ -28,7 +29,7 @@ impl QualityTrigger {
     pub fn new(
         events: Arc<EventStore>,
         gc_agent: Arc<GcAgent>,
-        agent_registry: Arc<harness_agents::AgentRegistry>,
+        agent_registry: Arc<harness_agents::registry::AgentRegistry>,
         project_root: PathBuf,
         auto_gc_grades: Vec<Grade>,
         cooldown_secs: u64,
@@ -113,8 +114,10 @@ impl QualityTrigger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Decision, Event, Grade, SessionId};
-    use harness_gc::{DraftStore, GcAgent, SignalDetector};
+    use harness_core::types::{Decision, Event, Grade, SessionId};
+    use harness_gc::draft_store::DraftStore;
+    use harness_gc::gc_agent::GcAgent;
+    use harness_gc::signal_detector::SignalDetector;
     use std::path::Path;
 
     async fn make_trigger(
@@ -123,10 +126,10 @@ mod tests {
         cooldown_secs: u64,
     ) -> QualityTrigger {
         let events = Arc::new(EventStore::new(dir).await.expect("event store"));
-        let gc_config = harness_core::GcConfig::default();
+        let gc_config = harness_core::config::misc::GcConfig::default();
         let signal_detector = SignalDetector::new(
             gc_config.signal_thresholds.clone().into(),
-            harness_core::ProjectId::new(),
+            harness_core::types::ProjectId::new(),
         );
         let draft_store = DraftStore::new(dir).expect("draft store");
         let gc_agent = Arc::new(GcAgent::new(
@@ -135,7 +138,7 @@ mod tests {
             draft_store,
             dir.to_path_buf(),
         ));
-        let agent_registry = Arc::new(harness_agents::AgentRegistry::new("test"));
+        let agent_registry = Arc::new(harness_agents::registry::AgentRegistry::new("test"));
         QualityTrigger::new(
             events,
             gc_agent,
@@ -244,7 +247,7 @@ mod tests {
 
         let events = trigger
             .events
-            .query(&harness_core::EventFilters {
+            .query(&harness_core::types::EventFilters {
                 hook: Some("quality_grade".to_string()),
                 ..Default::default()
             })

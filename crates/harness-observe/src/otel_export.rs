@@ -1,4 +1,5 @@
-use harness_core::{Decision, Event, OtelConfig, OtelExporter};
+use harness_core::config::misc::{OtelConfig, OtelExporter};
+use harness_core::types::{Decision, Event};
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger, LoggerProvider as _, Severity};
 use opentelemetry::metrics::{Counter, Histogram, MeterProvider as _};
 use opentelemetry::trace::{Span, Tracer, TracerProvider as _};
@@ -476,7 +477,7 @@ fn report_pipeline_error(message: &str, err: impl std::fmt::Display) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Decision, Event, SessionId};
+    use harness_core::{types::Decision, types::Event, types::SessionId};
 
     fn event_with(hook: &str, tool: &str) -> Event {
         Event::new(SessionId::new(), hook, tool, Decision::Pass)

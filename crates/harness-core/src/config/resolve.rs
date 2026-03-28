@@ -1,5 +1,7 @@
+use super::agents::AgentReviewConfig;
+use super::misc::{ConcurrencyConfig, GcConfig};
 use super::project::{ProjectConfig, ReviewType};
-use super::{AgentReviewConfig, ConcurrencyConfig, GcConfig, HarnessConfig};
+use super::HarnessConfig;
 
 /// Effective configuration for a task, merging server defaults with per-project overrides.
 ///

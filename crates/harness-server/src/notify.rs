@@ -1,4 +1,4 @@
-use harness_protocol::{Notification, RpcNotification};
+use harness_protocol::{notifications::Notification, notifications::RpcNotification};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
@@ -46,7 +46,7 @@ fn dropped_notification_count() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{ThreadId, ThreadStatus};
+    use harness_core::{types::ThreadId, types::ThreadStatus};
 
     #[tokio::test]
     async fn emit_sends_to_channel() {

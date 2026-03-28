@@ -1,4 +1,4 @@
-use harness_core::{HarnessError, Item, StreamItem};
+use harness_core::{agent::StreamItem, error::HarnessError, types::Item};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::Sender;
@@ -134,7 +134,7 @@ pub(crate) async fn send_stream_item(
     item: StreamItem,
     agent_name: &str,
     item_label: &'static str,
-) -> harness_core::Result<()> {
+) -> harness_core::error::Result<()> {
     tx.send(item).await.map_err(|err| {
         tracing::error!(
             agent = agent_name,
@@ -160,7 +160,7 @@ pub(crate) async fn stream_child_output(
     tx: &Sender<StreamItem>,
     agent_name: &str,
     idle_timeout: Option<Duration>,
-) -> harness_core::Result<String> {
+) -> harness_core::error::Result<String> {
     let stdout = child
         .stdout
         .take()
@@ -230,7 +230,7 @@ pub(crate) async fn stream_child_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Item, StreamItem};
+    use harness_core::{agent::StreamItem, types::Item};
     use std::time::Duration;
     use tokio::process::Command;
     use tokio::time::timeout;

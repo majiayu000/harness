@@ -1,51 +1,62 @@
-# Use when: disk usage is high or on a weekly cadence to archive old logs, clean worktrees, and scan for code smells. Triggers on: garbage collect, disk usage, clean worktrees, archive logs, code smells
+# Use when: you need to run Harness GC signal detection, review drafts, adopt/reject remediations, and feed lessons back into rules/skills. Triggers on: gc run, gc drafts, gc adopt, gc reject, learn rules, learn skills
 
-<!-- trigger-patterns: garbage collect, disk usage, clean worktrees, archive logs, code smells -->
+<!-- trigger-patterns: gc run, gc drafts, gc adopt, gc reject, learn rules, learn skills -->
 
 ## Trigger
-Use periodically (weekly or when disk usage is high) to archive old logs, clean worktrees, and scan for code smells.
+Use this skill when investigating recurring failures and you want the full GC learning loop:
+signal detection -> draft generation -> review/adopt -> rule/skill extraction.
 
 ## Input
-Project root path. Optionally a date threshold for log archiving (default: 30 days).
+- Project root path.
+- Optional draft id (for adopt/reject).
+- Optional project filter (multi-project runtime).
 
 ## Procedure
-1. **Log archiving**: Find event logs older than threshold in `~/.local/share/harness/events/`. Compress and move to `archive/`. Report bytes freed.
-2. **Worktree cleanup**: List all git worktrees (`git worktree list`). For each stale worktree (no associated open PR, no recent commits), prompt for removal confirmation.
-3. **Code smell scan**: Run static analysis for:
-   - Dead code (functions defined but never called).
-   - TODO/FIXME/HACK comments older than 30 days.
-   - Files exceeding size limits (>800 lines).
-   - Duplicate logic blocks (>10 lines repeated verbatim).
-4. **Dependency audit**: Run `cargo audit` / `npm audit` / `pip audit` as appropriate. Report critical CVEs.
-5. **Temp file cleanup**: Remove `.tmp`, `.bak`, and editor swap files from the project tree.
-6. Report total disk space recovered and remaining smells requiring human attention.
+1. **Run signal detection**
+   - CLI: `harness gc run <project_root>`
+   - RPC: call `gc_run`
+   - Output includes detected signals and generated draft count.
+
+2. **Inspect drafts**
+   - CLI: `harness gc drafts <project_root>`
+   - RPC: call `gc_drafts`
+   - Focus on `pending` drafts and verify rationale + artifact targets.
+
+3. **Decide each draft**
+   - Adopt: `harness gc adopt <project_root> <draft_id>` or RPC `gc_adopt`
+   - Reject: `harness gc reject <project_root> <draft_id> [reason]` or RPC `gc_reject`
+   - Adopt may enqueue an execution task (depending on config and artifact presence).
+
+4. **Extract reusable knowledge**
+   - Rules: call `learn_rules` for the target project root.
+   - Skills: call `learn_skills` for the target project root.
+   - These steps convert adopted remediation artifacts into reusable constraints/capabilities.
+
+5. **Check observability**
+   - Verify `gc_run` / `gc_adopt` / `gc_reject` / `learn_rules` / `learn_skills` / `self_evolution_tick` events in EventStore.
+   - Confirm no silent failures before closing the cycle.
 
 ## Output Format
-```
-# GC Report
+```markdown
+# GC Cycle Report
 
-Date: <timestamp>
-Space freed: <N> MB
+Project: <path>
+Signals detected: <N>
+Drafts generated: <N>
 
-## Log Archive
-- Archived <N> log files (<size>) to archive/
+## Draft Decisions
+- Adopted: <id list>
+- Rejected: <id list with reasons>
 
-## Worktrees
-- Cleaned: <list>
-- Kept (active): <list>
+## Learning Results
+- Rules learned: <N>
+- Skills learned: <N>
 
-## Code Smells
-- <file>:<line> — <smell type>: <description>
-
-## Dependency Audit
-- <package>@<version> — CVE-<ID> (<severity>)
-
-## Temp Files Removed
-- <N> files, <size>
+## Risks / Follow-ups
+- <item>
 ```
 
 ## Constraints
-- Never delete files without reporting what will be deleted first.
-- Worktree removal requires explicit confirmation — do not auto-delete.
-- Do not archive logs from the current day.
-- Report CVEs even if no upgrade path exists.
+- Do not auto-adopt drafts without explicit instruction.
+- Rejections should include concrete reasons for future analysis.
+- If learn step fails, report failure explicitly; do not silently continue.

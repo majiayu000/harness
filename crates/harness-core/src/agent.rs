@@ -9,12 +9,12 @@ use std::path::PathBuf;
 pub trait CodeAgent: Send + Sync {
     fn name(&self) -> &str;
     fn capabilities(&self) -> Vec<Capability>;
-    async fn execute(&self, req: AgentRequest) -> crate::Result<AgentResponse>;
+    async fn execute(&self, req: AgentRequest) -> crate::error::Result<AgentResponse>;
     async fn execute_stream(
         &self,
         req: AgentRequest,
         tx: tokio::sync::mpsc::Sender<StreamItem>,
-    ) -> crate::Result<()>;
+    ) -> crate::error::Result<()>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,15 +177,17 @@ pub trait AgentAdapter: Send + Sync {
         &self,
         req: TurnRequest,
         tx: tokio::sync::mpsc::Sender<AgentEvent>,
-    ) -> crate::Result<()>;
+    ) -> crate::error::Result<()>;
 
     /// Interrupt an in-progress turn.
-    async fn interrupt(&self) -> crate::Result<()>;
+    async fn interrupt(&self) -> crate::error::Result<()>;
 
     /// Append instructions to an active turn (steer).
     /// Returns `Err` with `Unsupported` if the adapter doesn't support steering.
-    async fn steer(&self, _text: String) -> crate::Result<()> {
-        Err(crate::Error::Unsupported("steer not supported".into()))
+    async fn steer(&self, _text: String) -> crate::error::Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "steer not supported".into(),
+        ))
     }
 
     /// Respond to an approval request from the agent.
@@ -194,8 +196,10 @@ pub trait AgentAdapter: Send + Sync {
         &self,
         _id: String,
         _decision: ApprovalDecision,
-    ) -> crate::Result<()> {
-        Err(crate::Error::Unsupported("approval not supported".into()))
+    ) -> crate::error::Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "approval not supported".into(),
+        ))
     }
 }
 

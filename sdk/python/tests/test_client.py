@@ -1,5 +1,6 @@
 import unittest
 from typing import Any
+from unittest import mock
 
 try:
     from harness_sdk import Harness, HarnessRpcError
@@ -142,6 +143,39 @@ class HarnessSdkTests(unittest.TestCase):
 
         with self.assertRaises(HarnessRpcError):
             harness.resume_thread("missing-thread")
+
+    def test_start_thread_sends_bearer_token_header_when_configured(self) -> None:
+        captured_headers: dict[str, str] = {}
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"jsonrpc":"2.0","id":1,"result":{"thread_id":"thread-auth"}}'
+
+        def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+            del timeout
+            captured_headers.update(dict(request.header_items()))
+            return FakeResponse()
+
+        harness = Harness(
+            base_url="http://127.0.0.1:9800",
+            cwd="/repo",
+            api_token="token-123",
+            headers={"X-Test-Header": "enabled"},
+        )
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            thread = harness.start_thread()
+
+        normalized = {k.lower(): v for k, v in captured_headers.items()}
+        self.assertEqual(thread.id, "thread-auth")
+        self.assertEqual(normalized.get("authorization"), "Bearer token-123")
+        self.assertEqual(normalized.get("x-test-header"), "enabled")
 
 
 if __name__ == "__main__":

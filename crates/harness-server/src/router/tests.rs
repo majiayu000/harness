@@ -5,9 +5,9 @@ use crate::{
     test_helpers::{make_test_state, make_test_state_with_registry},
     thread_manager::ThreadManager,
 };
-use harness_agents::AgentRegistry;
-use harness_core::HarnessConfig;
-use harness_protocol::{Method, RpcRequest, INTERNAL_ERROR};
+use harness_agents::registry::AgentRegistry;
+use harness_core::config::HarnessConfig;
+use harness_protocol::{methods::Method, methods::RpcRequest, methods::INTERNAL_ERROR};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -21,31 +21,35 @@ async fn make_test_state_with_config_and_registry(
         ThreadManager::new(),
         agent_registry,
     ));
-    let tasks =
-        crate::task_runner::TaskStore::open(&harness_core::default_db_path(dir, "tasks")).await?;
-    let events = Arc::new(harness_observe::EventStore::new(dir).await?);
-    let signal_detector = harness_gc::SignalDetector::new(
+    let tasks = crate::task_runner::TaskStore::open(&harness_core::config::dirs::default_db_path(
+        dir, "tasks",
+    ))
+    .await?;
+    let events = Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
+    let signal_detector = harness_gc::signal_detector::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
-        harness_core::ProjectId::new(),
+        harness_core::types::ProjectId::new(),
     );
-    let draft_store = harness_gc::DraftStore::new(dir)?;
-    let gc_agent = Arc::new(harness_gc::GcAgent::new(
+    let draft_store = harness_gc::draft_store::DraftStore::new(dir)?;
+    let gc_agent = Arc::new(harness_gc::gc_agent::GcAgent::new(
         server.config.gc.clone(),
         signal_detector,
         draft_store,
         dir.to_path_buf(),
     ));
-    let thread_db =
-        crate::thread_db::ThreadDb::open(&harness_core::default_db_path(dir, "threads")).await?;
+    let thread_db = crate::thread_db::ThreadDb::open(&harness_core::config::dirs::default_db_path(
+        dir, "threads",
+    ))
+    .await?;
     let (notification_tx, _) = tokio::sync::broadcast::channel(64);
     let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
-        &harness_core::default_db_path(dir, "projects"),
+        &harness_core::config::dirs::default_db_path(dir, "projects"),
     )
     .await?;
     let project_svc =
-        crate::services::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
-    let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
-    let execution_svc = crate::services::DefaultExecutionService::new(
+        crate::services::project::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
+    let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+    let execution_svc = crate::services::execution::DefaultExecutionService::new(
         tasks.clone(),
         server.agent_registry.clone(),
         Arc::new(server.config.clone()),
@@ -72,15 +76,17 @@ async fn make_test_state_with_config_and_registry(
             project_registry: None,
         },
         engines: crate::http::EngineServices {
-            skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
+            skills: Arc::new(RwLock::new(harness_skills::store::SkillStore::new())),
             rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
             gc_agent,
         },
         observability: crate::http::ObservabilityServices {
             events,
-            signal_rate_limiter: std::sync::Arc::new(crate::http::SignalRateLimiter::new(100)),
+            signal_rate_limiter: std::sync::Arc::new(
+                crate::http::rate_limit::SignalRateLimiter::new(100),
+            ),
             password_reset_rate_limiter: std::sync::Arc::new(
-                crate::http::PasswordResetRateLimiter::new(5),
+                crate::http::rate_limit::PasswordResetRateLimiter::new(5),
             ),
             review_store: None,
         },
@@ -180,7 +186,7 @@ async fn initialize_then_initialized_succeeds() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn gc_adopt_response_includes_task_id() -> anyhow::Result<()> {
-    use harness_core::{
+    use harness_core::types::{
         Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId, RemediationType, Signal,
         SignalType,
     };
@@ -220,23 +226,19 @@ async fn gc_adopt_response_includes_task_id() -> anyhow::Result<()> {
         .await
         .expect("expected response for request with id");
 
+    let err = resp
+        .error
+        .ok_or_else(|| anyhow::anyhow!("expected error when default agent is missing"))?;
+    assert_eq!(
+        err.code,
+        harness_protocol::methods::INTERNAL_ERROR,
+        "gc_adopt should fail fast when auto_pr is enabled but no default agent exists"
+    );
     assert!(
-        resp.error.is_none(),
-        "expected success, got error: {:?}",
-        resp.error
-    );
-    let result = resp
-        .result
-        .ok_or_else(|| anyhow::anyhow!("missing result"))?;
-    assert_eq!(
-        result["adopted"],
-        serde_json::json!(true),
-        "adopted must be true"
-    );
-    assert_eq!(
-        result["task_id"],
-        serde_json::json!(null),
-        "task_id should be null when no agent is registered"
+        err.message
+            .contains("auto_pr requires a registered default agent"),
+        "unexpected error message: {}",
+        err.message
     );
     Ok(())
 }
@@ -244,31 +246,31 @@ async fn gc_adopt_response_includes_task_id() -> anyhow::Result<()> {
 struct MockAgent;
 
 #[async_trait::async_trait]
-impl harness_core::CodeAgent for MockAgent {
+impl harness_core::agent::CodeAgent for MockAgent {
     fn name(&self) -> &str {
         "mock"
     }
-    fn capabilities(&self) -> Vec<harness_core::Capability> {
+    fn capabilities(&self) -> Vec<harness_core::types::Capability> {
         vec![]
     }
     async fn execute(
         &self,
-        _req: harness_core::AgentRequest,
-    ) -> harness_core::Result<harness_core::AgentResponse> {
-        Ok(harness_core::AgentResponse {
+        _req: harness_core::agent::AgentRequest,
+    ) -> harness_core::error::Result<harness_core::agent::AgentResponse> {
+        Ok(harness_core::agent::AgentResponse {
             output: "LGTM".to_string(),
             stderr: String::new(),
             items: vec![],
-            token_usage: harness_core::TokenUsage::default(),
+            token_usage: harness_core::types::TokenUsage::default(),
             model: "mock".to_string(),
             exit_code: Some(0),
         })
     }
     async fn execute_stream(
         &self,
-        _req: harness_core::AgentRequest,
-        _tx: tokio::sync::mpsc::Sender<harness_core::StreamItem>,
-    ) -> harness_core::Result<()> {
+        _req: harness_core::agent::AgentRequest,
+        _tx: tokio::sync::mpsc::Sender<harness_core::agent::StreamItem>,
+    ) -> harness_core::error::Result<()> {
         Ok(())
     }
 }
@@ -286,30 +288,30 @@ impl NonLgtmAgent {
 }
 
 #[async_trait::async_trait]
-impl harness_core::CodeAgent for NonLgtmAgent {
+impl harness_core::agent::CodeAgent for NonLgtmAgent {
     fn name(&self) -> &str {
         "non-lgtm"
     }
 
-    fn capabilities(&self) -> Vec<harness_core::Capability> {
+    fn capabilities(&self) -> Vec<harness_core::types::Capability> {
         vec![]
     }
 
     async fn execute(
         &self,
-        _req: harness_core::AgentRequest,
-    ) -> harness_core::Result<harness_core::AgentResponse> {
+        _req: harness_core::agent::AgentRequest,
+    ) -> harness_core::error::Result<harness_core::agent::AgentResponse> {
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let output = if call == 0 {
             "Implemented\nPR_URL=https://github.com/example/repo/pull/123".to_string()
         } else {
             "Needs follow-up\nFIXED".to_string()
         };
-        Ok(harness_core::AgentResponse {
+        Ok(harness_core::agent::AgentResponse {
             output,
             stderr: String::new(),
             items: vec![],
-            token_usage: harness_core::TokenUsage::default(),
+            token_usage: harness_core::types::TokenUsage::default(),
             model: "mock".to_string(),
             exit_code: Some(0),
         })
@@ -317,9 +319,9 @@ impl harness_core::CodeAgent for NonLgtmAgent {
 
     async fn execute_stream(
         &self,
-        _req: harness_core::AgentRequest,
-        tx: tokio::sync::mpsc::Sender<harness_core::StreamItem>,
-    ) -> harness_core::Result<()> {
+        _req: harness_core::agent::AgentRequest,
+        tx: tokio::sync::mpsc::Sender<harness_core::agent::StreamItem>,
+    ) -> harness_core::error::Result<()> {
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let output = if call == 0 {
             "Implemented\nPR_URL=https://github.com/example/repo/pull/123\n"
@@ -327,7 +329,7 @@ impl harness_core::CodeAgent for NonLgtmAgent {
             "Needs follow-up\nFIXED\n"
         };
         if tx
-            .send(harness_core::StreamItem::MessageDelta {
+            .send(harness_core::agent::StreamItem::MessageDelta {
                 text: output.to_string(),
             })
             .await
@@ -336,7 +338,7 @@ impl harness_core::CodeAgent for NonLgtmAgent {
             return Ok(());
         }
         // Receiver may have dropped; ignore send error for Done sentinel.
-        tx.send(harness_core::StreamItem::Done).await.ok();
+        tx.send(harness_core::agent::StreamItem::Done).await.ok();
         Ok(())
     }
 }
@@ -347,7 +349,7 @@ async fn wait_for_terminal_task(
 ) -> anyhow::Result<crate::task_runner::TaskState> {
     use tokio::time::{sleep, Duration};
 
-    let tid = crate::task_runner::TaskId(task_id.to_string());
+    let tid = harness_core::types::TaskId(task_id.to_string());
     for _ in 0..120 {
         if let Some(task) = state.core.tasks.get(&tid) {
             if matches!(
@@ -374,19 +376,19 @@ async fn run_gc_adopt_and_wait_for_failure_turn(max_rounds: u32) -> anyhow::Resu
     registry.register("mock", Arc::new(NonLgtmAgent::new()));
     let state = make_test_state_with_config_and_registry(dir.path(), config, registry).await?;
 
-    let draft_id = harness_core::DraftId::new();
-    let signal = harness_core::Signal::new(
-        harness_core::SignalType::RepeatedWarn,
-        harness_core::ProjectId::new(),
+    let draft_id = harness_core::types::DraftId::new();
+    let signal = harness_core::types::Signal::new(
+        harness_core::types::SignalType::RepeatedWarn,
+        harness_core::types::ProjectId::new(),
         serde_json::json!("test signal"),
-        harness_core::RemediationType::Guard,
+        harness_core::types::RemediationType::Guard,
     );
-    let draft = harness_core::Draft {
+    let draft = harness_core::types::Draft {
         id: draft_id.clone(),
-        status: harness_core::DraftStatus::Pending,
+        status: harness_core::types::DraftStatus::Pending,
         signal,
-        artifacts: vec![harness_core::Artifact {
-            artifact_type: harness_core::ArtifactType::Guard,
+        artifacts: vec![harness_core::types::Artifact {
+            artifact_type: harness_core::types::ArtifactType::Guard,
             target_path: std::path::PathBuf::from("test-guard.sh"),
             content: "#!/bin/bash\necho ok".to_string(),
         }],
@@ -429,7 +431,7 @@ async fn run_gc_adopt_and_wait_for_failure_turn(max_rounds: u32) -> anyhow::Resu
 
 #[tokio::test]
 async fn gc_adopt_spawns_task_when_agent_registered() -> anyhow::Result<()> {
-    use harness_core::{
+    use harness_core::types::{
         Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId, RemediationType, Signal,
         SignalType,
     };
@@ -488,7 +490,7 @@ async fn gc_adopt_spawns_task_when_agent_registered() -> anyhow::Result<()> {
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("task_id should be a string"))?;
     assert!(!task_id.is_empty(), "task_id should be non-empty");
-    let tid = crate::task_runner::TaskId(task_id.to_string());
+    let tid = harness_core::types::TaskId(task_id.to_string());
     let task = state.core.tasks.get(&tid);
     assert!(task.is_some(), "task should exist in the task store");
     Ok(())
@@ -557,7 +559,7 @@ async fn rule_check_returns_warning_when_no_guards_loaded() -> anyhow::Result<()
     let events = state
         .observability
         .events
-        .query(&harness_core::EventFilters {
+        .query(&harness_core::types::EventFilters {
             hook: Some("rule_scan".to_string()),
             ..Default::default()
         })
@@ -574,22 +576,22 @@ async fn metrics_query_counts_rule_violations_from_events() -> anyhow::Result<()
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
 
-    let session_id = harness_core::SessionId::new();
+    let session_id = harness_core::types::SessionId::new();
     // The metrics_query handler scopes violation counts by the latest
     // rule_scan session, so we must log a rule_scan summary event first.
-    let scan_event = harness_core::Event::new(
+    let scan_event = harness_core::types::Event::new(
         session_id.clone(),
         "rule_scan",
         "RuleEngine",
-        harness_core::Decision::Block,
+        harness_core::types::Decision::Block,
     );
     state.observability.events.log(&scan_event).await?;
     for _ in 0..5 {
-        let event = harness_core::Event::new(
+        let event = harness_core::types::Event::new(
             session_id.clone(),
             "rule_check",
             "SEC-01",
-            harness_core::Decision::Block,
+            harness_core::types::Decision::Block,
         );
         state.observability.events.log(&event).await?;
     }
@@ -598,7 +600,7 @@ async fn metrics_query_counts_rule_violations_from_events() -> anyhow::Result<()
         jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(1)),
         method: Method::MetricsQuery {
-            filters: harness_core::MetricFilters::default(),
+            filters: harness_core::types::MetricFilters::default(),
         },
     };
     let resp = handle_request(&state, req)
@@ -626,19 +628,19 @@ async fn metrics_query_sees_violations_written_via_handler_entry() -> anyhow::Re
     let project_root = dir.path().join("project");
     std::fs::create_dir_all(&project_root)?;
     let violations = vec![
-        harness_core::Violation {
-            rule_id: harness_core::RuleId::from_str("SEC-01"),
+        harness_core::types::Violation {
+            rule_id: harness_core::types::RuleId::from_str("SEC-01"),
             file: std::path::PathBuf::from("src/lib.rs"),
             line: Some(7),
             message: "critical issue".to_string(),
-            severity: harness_core::Severity::Critical,
+            severity: harness_core::types::Severity::Critical,
         },
-        harness_core::Violation {
-            rule_id: harness_core::RuleId::from_str("U-01"),
+        harness_core::types::Violation {
+            rule_id: harness_core::types::RuleId::from_str("U-01"),
             file: std::path::PathBuf::from("src/main.rs"),
             line: None,
             message: "style issue".to_string(),
-            severity: harness_core::Severity::Low,
+            severity: harness_core::types::Severity::Low,
         },
     ];
     state
@@ -651,7 +653,7 @@ async fn metrics_query_sees_violations_written_via_handler_entry() -> anyhow::Re
         jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(1)),
         method: Method::MetricsQuery {
-            filters: harness_core::MetricFilters::default(),
+            filters: harness_core::types::MetricFilters::default(),
         },
     };
     let resp = handle_request(&state, req)
@@ -673,7 +675,7 @@ async fn metrics_query_sees_violations_written_via_handler_entry() -> anyhow::Re
     let events = state
         .observability
         .events
-        .query(&harness_core::EventFilters::default())
+        .query(&harness_core::types::EventFilters::default())
         .await?;
     let latest_scan = events
         .iter()
@@ -731,12 +733,12 @@ async fn thread_start_persists_to_db() -> anyhow::Result<()> {
 async fn event_log_then_query_roundtrip() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
-    let session_id = harness_core::SessionId::new();
-    let event = harness_core::Event::new(
+    let session_id = harness_core::types::SessionId::new();
+    let event = harness_core::types::Event::new(
         session_id.clone(),
         "pre_tool_use",
         "Edit",
-        harness_core::Decision::Pass,
+        harness_core::types::Decision::Pass,
     );
 
     // Log the event via EventLog RPC
@@ -769,7 +771,7 @@ async fn event_log_then_query_roundtrip() -> anyhow::Result<()> {
         jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(2)),
         method: Method::EventQuery {
-            filters: harness_core::EventFilters {
+            filters: harness_core::types::EventFilters {
                 session_id: Some(session_id),
                 ..Default::default()
             },
@@ -813,7 +815,10 @@ async fn pre_init_request_rejected() -> anyhow::Result<()> {
         .await
         .expect("should return error response");
     assert!(resp.error.is_some(), "pre-init request should be rejected");
-    assert_eq!(resp.error.unwrap().code, harness_protocol::NOT_INITIALIZED);
+    assert_eq!(
+        resp.error.unwrap().code,
+        harness_protocol::methods::NOT_INITIALIZED
+    );
     Ok(())
 }
 
@@ -855,7 +860,10 @@ async fn initialized_without_initialize_rejected() -> anyhow::Result<()> {
         resp.error.is_some(),
         "initialized without initialize should be rejected"
     );
-    assert_eq!(resp.error.unwrap().code, harness_protocol::INVALID_REQUEST);
+    assert_eq!(
+        resp.error.unwrap().code,
+        harness_protocol::methods::INVALID_REQUEST
+    );
     Ok(())
 }
 
@@ -908,12 +916,12 @@ async fn handshake_unlocks_methods() -> anyhow::Result<()> {
 async fn event_log_records_event() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
-    let session_id = harness_core::SessionId::new();
-    let event = harness_core::Event::new(
+    let session_id = harness_core::types::SessionId::new();
+    let event = harness_core::types::Event::new(
         session_id,
         "test_hook",
         "TestTool",
-        harness_core::Decision::Pass,
+        harness_core::types::Decision::Pass,
     );
 
     let req = RpcRequest {
@@ -942,12 +950,12 @@ async fn event_log_records_event() -> anyhow::Result<()> {
 async fn event_query_returns_logged_events() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
-    let session_id = harness_core::SessionId::new();
-    let event = harness_core::Event::new(
+    let session_id = harness_core::types::SessionId::new();
+    let event = harness_core::types::Event::new(
         session_id,
         "probe_hook",
         "ProbeTarget",
-        harness_core::Decision::Pass,
+        harness_core::types::Decision::Pass,
     );
     state.observability.events.log(&event).await?;
 
@@ -955,7 +963,7 @@ async fn event_query_returns_logged_events() -> anyhow::Result<()> {
         jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(1)),
         method: Method::EventQuery {
-            filters: harness_core::EventFilters {
+            filters: harness_core::types::EventFilters {
                 hook: Some("probe_hook".to_string()),
                 ..Default::default()
             },
@@ -1008,7 +1016,7 @@ async fn skill_create_and_get() -> anyhow::Result<()> {
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing id"))?
         .to_string();
-    let skill_id = harness_core::SkillId::from_str(&skill_id_str);
+    let skill_id = harness_core::types::SkillId::from_str(&skill_id_str);
 
     let get_req = RpcRequest {
         jsonrpc: "2.0".to_string(),
@@ -1089,7 +1097,7 @@ async fn skill_delete_removes_skill() -> anyhow::Result<()> {
         .as_str()
         .unwrap()
         .to_string();
-    let skill_id = harness_core::SkillId::from_str(&skill_id_str);
+    let skill_id = harness_core::types::SkillId::from_str(&skill_id_str);
 
     let delete_req = RpcRequest {
         jsonrpc: "2.0".to_string(),
@@ -1118,7 +1126,7 @@ async fn thread_resume_errors_for_unknown_thread() -> anyhow::Result<()> {
         jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(1)),
         method: Method::ThreadResume {
-            thread_id: harness_core::ThreadId::new(),
+            thread_id: harness_core::types::ThreadId::new(),
         },
     };
     let resp = handle_request(&state, req)
@@ -1140,7 +1148,7 @@ async fn thread_fork_errors_for_unknown_thread() -> anyhow::Result<()> {
         jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(1)),
         method: Method::ThreadFork {
-            thread_id: harness_core::ThreadId::new(),
+            thread_id: harness_core::types::ThreadId::new(),
             from_turn: None,
         },
     };
@@ -1163,7 +1171,7 @@ async fn thread_compact_errors_for_unknown_thread() -> anyhow::Result<()> {
         jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(1)),
         method: Method::ThreadCompact {
-            thread_id: harness_core::ThreadId::new(),
+            thread_id: harness_core::types::ThreadId::new(),
         },
     };
     let resp = handle_request(&state, req)
@@ -1185,7 +1193,7 @@ async fn turn_steer_returns_not_found_for_unknown_turn() -> anyhow::Result<()> {
         jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(1)),
         method: Method::TurnSteer {
-            turn_id: harness_core::TurnId::new(),
+            turn_id: harness_core::types::TurnId::new(),
             instruction: "redirect here".to_string(),
         },
     };
@@ -1198,7 +1206,7 @@ async fn turn_steer_returns_not_found_for_unknown_turn() -> anyhow::Result<()> {
     );
     assert_eq!(
         resp.error.unwrap().code,
-        harness_protocol::NOT_FOUND,
+        harness_protocol::methods::NOT_FOUND,
         "should return NOT_FOUND for unknown turn"
     );
     Ok(())
@@ -1319,33 +1327,38 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         ThreadManager::new(),
         AgentRegistry::new("test"),
     ));
-    let tasks =
-        crate::task_runner::TaskStore::open(&harness_core::default_db_path(dir, "tasks")).await?;
-    let events = Arc::new(harness_observe::EventStore::new(dir).await?);
-    let signal_detector = harness_gc::SignalDetector::new(
+    let tasks = crate::task_runner::TaskStore::open(&harness_core::config::dirs::default_db_path(
+        dir, "tasks",
+    ))
+    .await?;
+    let events = Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
+    let signal_detector = harness_gc::signal_detector::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
-        harness_core::ProjectId::new(),
+        harness_core::types::ProjectId::new(),
     );
-    let draft_store = harness_gc::DraftStore::new(dir)?;
-    let gc_agent = Arc::new(harness_gc::GcAgent::new(
+    let draft_store = harness_gc::draft_store::DraftStore::new(dir)?;
+    let gc_agent = Arc::new(harness_gc::gc_agent::GcAgent::new(
         server.config.gc.clone(),
         signal_detector,
         draft_store,
         dir.to_path_buf(),
     ));
-    let thread_db =
-        crate::thread_db::ThreadDb::open(&harness_core::default_db_path(dir, "threads")).await?;
+    let thread_db = crate::thread_db::ThreadDb::open(&harness_core::config::dirs::default_db_path(
+        dir, "threads",
+    ))
+    .await?;
     let plan_db =
-        crate::plan_db::PlanDb::open(&harness_core::default_db_path(dir, "plans")).await?;
+        crate::plan_db::PlanDb::open(&harness_core::config::dirs::default_db_path(dir, "plans"))
+            .await?;
     let (notification_tx, _) = tokio::sync::broadcast::channel(64);
     let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
-        &harness_core::default_db_path(dir, "projects"),
+        &harness_core::config::dirs::default_db_path(dir, "projects"),
     )
     .await?;
     let project_svc =
-        crate::services::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
-    let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
-    let execution_svc = crate::services::DefaultExecutionService::new(
+        crate::services::project::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
+    let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+    let execution_svc = crate::services::execution::DefaultExecutionService::new(
         tasks.clone(),
         server.agent_registry.clone(),
         Arc::new(server.config.clone()),
@@ -1372,15 +1385,17 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             project_registry: None,
         },
         engines: crate::http::EngineServices {
-            skills: Arc::new(RwLock::new(harness_skills::SkillStore::new())),
+            skills: Arc::new(RwLock::new(harness_skills::store::SkillStore::new())),
             rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
             gc_agent,
         },
         observability: crate::http::ObservabilityServices {
             events,
-            signal_rate_limiter: std::sync::Arc::new(crate::http::SignalRateLimiter::new(100)),
+            signal_rate_limiter: std::sync::Arc::new(
+                crate::http::rate_limit::SignalRateLimiter::new(100),
+            ),
             password_reset_rate_limiter: std::sync::Arc::new(
-                crate::http::PasswordResetRateLimiter::new(5),
+                crate::http::rate_limit::PasswordResetRateLimiter::new(5),
             ),
             review_store: None,
         },
@@ -1440,7 +1455,7 @@ async fn exec_plan_init_persists_to_db() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("plan_id not a string"))?
         .to_string();
 
-    let plan_id = harness_core::ExecPlanId(plan_id_str);
+    let plan_id = harness_core::types::ExecPlanId(plan_id_str);
     let db = state.core.plan_db.as_ref().unwrap();
     let stored = db
         .get(&plan_id)
@@ -1484,7 +1499,7 @@ async fn exec_plan_status_reads_plan_from_memory() -> anyhow::Result<()> {
         jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(2)),
         method: Method::ExecPlanStatus {
-            plan_id: harness_core::ExecPlanId(plan_id_str),
+            plan_id: harness_core::types::ExecPlanId(plan_id_str),
         },
     };
     let status_resp = handle_request(&state, status_req)
@@ -1532,7 +1547,7 @@ async fn exec_plan_update_persists_status_change() -> anyhow::Result<()> {
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("plan_id not a string"))?
         .to_string();
-    let plan_id = harness_core::ExecPlanId(plan_id_str);
+    let plan_id = harness_core::types::ExecPlanId(plan_id_str);
 
     let update_req = RpcRequest {
         jsonrpc: "2.0".to_string(),
@@ -1560,7 +1575,7 @@ async fn exec_plan_update_persists_status_change() -> anyhow::Result<()> {
         .get(&plan_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("plan should be in DB"))?;
-    assert_eq!(stored.status, harness_core::ExecPlanStatus::Active);
+    assert_eq!(stored.status, harness_core::types::ExecPlanStatus::Active);
     Ok(())
 }
 
@@ -1569,7 +1584,7 @@ async fn exec_plan_survives_simulated_restart() -> anyhow::Result<()> {
     let _lock = crate::test_helpers::HOME_LOCK.lock().await;
     let data_dir = tempfile::tempdir()?;
     let proj_dir = crate::test_helpers::tempdir_in_home("harness-exec-test-")?;
-    let plan_db_path = harness_core::default_db_path(data_dir.path(), "plans");
+    let plan_db_path = harness_core::config::dirs::default_db_path(data_dir.path(), "plans");
     let plan_id_str: String;
 
     // Session 1: create and activate a plan.
@@ -1602,7 +1617,7 @@ async fn exec_plan_survives_simulated_restart() -> anyhow::Result<()> {
             jsonrpc: "2.0".to_string(),
             id: Some(serde_json::json!(2)),
             method: Method::ExecPlanUpdate {
-                plan_id: harness_core::ExecPlanId(plan_id_str.clone()),
+                plan_id: harness_core::types::ExecPlanId(plan_id_str.clone()),
                 updates: serde_json::json!({ "action": "activate" }),
             },
         };
@@ -1625,12 +1640,15 @@ async fn exec_plan_survives_simulated_restart() -> anyhow::Result<()> {
             map.insert(plan.id.clone(), plan);
         }
 
-        let pid = harness_core::ExecPlanId(plan_id_str.clone());
+        let pid = harness_core::types::ExecPlanId(plan_id_str.clone());
         let recovered = map
             .get(&pid)
             .ok_or_else(|| anyhow::anyhow!("plan should survive restart"))?;
         assert_eq!(recovered.purpose, "Restart Test");
-        assert_eq!(recovered.status, harness_core::ExecPlanStatus::Active);
+        assert_eq!(
+            recovered.status,
+            harness_core::types::ExecPlanStatus::Active
+        );
     }
     Ok(())
 }
@@ -1640,10 +1658,10 @@ async fn exec_plan_status_fallback_to_db_when_not_in_memory() -> anyhow::Result<
     let _lock = crate::test_helpers::HOME_LOCK.lock().await;
     let data_dir = tempfile::tempdir()?;
     let proj_dir = crate::test_helpers::tempdir_in_home("harness-exec-test-")?;
-    let plan_db_path = harness_core::default_db_path(data_dir.path(), "plans");
+    let plan_db_path = harness_core::config::dirs::default_db_path(data_dir.path(), "plans");
 
     // Insert a plan directly into the DB without going through the in-memory HashMap.
-    let plan = harness_exec::ExecPlan::from_spec("# Direct DB Insert", proj_dir.path())?;
+    let plan = harness_exec::plan::ExecPlan::from_spec("# Direct DB Insert", proj_dir.path())?;
     let plan_id = plan.id.clone();
     {
         let db = crate::plan_db::PlanDb::open(&plan_db_path).await?;

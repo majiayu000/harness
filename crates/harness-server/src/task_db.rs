@@ -1,6 +1,6 @@
-use crate::db::{open_pool, Migration, Migrator};
-use crate::task_runner::{TaskId, TaskState, TaskStatus};
-use harness_core::TaskDbDecodeError;
+use crate::task_runner::{TaskState, TaskStatus};
+use harness_core::db::{open_pool, Migration, Migrator};
+use harness_core::error::TaskDbDecodeError;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePool;
 use std::path::{Path, PathBuf};
@@ -351,9 +351,15 @@ impl TaskRow {
                 source,
             }
         })?;
+        let decoded_depends_on = serde_json::from_str(&depends_on).map_err(|source| {
+            TaskDbDecodeError::DependsOnDeserialize {
+                task_id: id.clone(),
+                source,
+            }
+        })?;
 
         Ok(TaskState {
-            id: TaskId(id),
+            id: harness_core::types::TaskId(id),
             status: status.parse::<TaskStatus>()?,
             turn: turn as u32,
             pr_url,
@@ -361,8 +367,8 @@ impl TaskRow {
             error,
             source,
             external_id,
-            parent_id: parent_id.map(TaskId),
-            depends_on: serde_json::from_str(&depends_on).unwrap_or_default(),
+            parent_id: parent_id.map(harness_core::types::TaskId),
+            depends_on: decoded_depends_on,
             subtask_ids: Vec::new(),
             project_root: project.map(PathBuf::from),
             issue: None,
@@ -379,10 +385,10 @@ impl TaskRow {
 #[cfg(test)]
 mod tests {
     use super::{TaskDb, TaskRow};
-    use crate::task_runner::{RoundResult, TaskId, TaskState, TaskStatus};
-    use harness_core::TaskDbDecodeError;
+    use crate::task_runner::{RoundResult, TaskState, TaskStatus};
+    use harness_core::error::TaskDbDecodeError;
 
-    fn build_task_row(rounds: &str) -> TaskRow {
+    fn build_task_row(rounds: &str, depends_on: &str) -> TaskRow {
         TaskRow {
             id: "task-1".to_string(),
             status: "pending".to_string(),
@@ -395,14 +401,14 @@ mod tests {
             parent_id: None,
             created_at: None,
             repo: None,
-            depends_on: "[]".to_string(),
+            depends_on: depends_on.to_string(),
             project: None,
         }
     }
 
     #[test]
     fn invalid_rounds_json_returns_distinguishable_error() {
-        let err = build_task_row("{not-json")
+        let err = build_task_row("{not-json", "[]")
             .try_into_task_state()
             .expect_err("invalid rounds JSON should return error");
         let decode_error = err
@@ -412,6 +418,21 @@ mod tests {
         assert!(matches!(
             decode_error,
             TaskDbDecodeError::RoundsDeserialize { task_id, .. } if task_id == "task-1"
+        ));
+    }
+
+    #[test]
+    fn invalid_depends_on_json_returns_distinguishable_error() {
+        let err = build_task_row("[]", "{not-json")
+            .try_into_task_state()
+            .expect_err("invalid depends_on JSON should return error");
+        let decode_error = err
+            .downcast_ref::<TaskDbDecodeError>()
+            .expect("error should expose task-db decode type");
+
+        assert!(matches!(
+            decode_error,
+            TaskDbDecodeError::DependsOnDeserialize { task_id, .. } if task_id == "task-1"
         ));
     }
 
@@ -438,9 +459,39 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn get_returns_error_when_depends_on_json_is_corrupted() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        sqlx::query(
+            "INSERT INTO tasks (id, status, turn, rounds, depends_on) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("task-corrupted-deps")
+        .bind("pending")
+        .bind(1_i64)
+        .bind("[]")
+        .bind("{not-json")
+        .execute(&db.pool)
+        .await?;
+
+        let err = db
+            .get("task-corrupted-deps")
+            .await
+            .expect_err("corrupted depends_on should return an error");
+        let decode_error = err
+            .downcast_ref::<TaskDbDecodeError>()
+            .expect("error should expose task-db decode type");
+        assert!(matches!(
+            decode_error,
+            TaskDbDecodeError::DependsOnDeserialize { task_id, .. } if task_id == "task-corrupted-deps"
+        ));
+        Ok(())
+    }
+
     fn make_task(id: &str, status: TaskStatus) -> TaskState {
         TaskState {
-            id: TaskId(id.to_string()),
+            id: harness_core::types::TaskId(id.to_string()),
             status,
             turn: 0,
             pr_url: None,
@@ -632,11 +683,11 @@ mod tests {
         db.insert(&parent).await?;
 
         let mut child1 = make_task("child-1", TaskStatus::Pending);
-        child1.parent_id = Some(TaskId("parent-1".to_string()));
+        child1.parent_id = Some(harness_core::types::TaskId("parent-1".to_string()));
         db.insert(&child1).await?;
 
         let mut child2 = make_task("child-2", TaskStatus::Done);
-        child2.parent_id = Some(TaskId("parent-1".to_string()));
+        child2.parent_id = Some(harness_core::types::TaskId("parent-1".to_string()));
         db.insert(&child2).await?;
 
         // Unrelated task.

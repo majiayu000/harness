@@ -39,6 +39,8 @@ export interface HarnessOptions {
   baseUrl?: string;
   cwd?: string;
   fetch?: FetchLike;
+  apiToken?: string;
+  headers?: Record<string, string>;
   requestTimeoutMs?: number;
   defaultPollIntervalMs?: number;
   defaultRunTimeoutMs?: number;

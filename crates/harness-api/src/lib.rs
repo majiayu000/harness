@@ -11,18 +11,10 @@
 //! - [`sandbox`] — sandboxing types and `wrap_command`
 //! - [`exec`] — execution plan types for spec-driven workflows
 
-pub mod core {
-    pub use harness_core::*;
-}
+pub mod core {}
 
-pub mod protocol {
-    pub use harness_protocol::*;
-}
+pub mod protocol {}
 
-pub mod sandbox {
-    pub use harness_sandbox::*;
-}
+pub mod sandbox {}
 
-pub mod exec {
-    pub use harness_exec::*;
-}
+pub mod exec {}

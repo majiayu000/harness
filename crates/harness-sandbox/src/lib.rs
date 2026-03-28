@@ -1,4 +1,5 @@
-use harness_core::{SandboxError, SandboxMode};
+use harness_core::config::agents::SandboxMode;
+use harness_core::error::SandboxError;
 use std::ffi::OsString;
 use std::fs;
 #[cfg(unix)]

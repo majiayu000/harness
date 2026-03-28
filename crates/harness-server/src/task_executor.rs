@@ -1,16 +1,21 @@
-mod helpers;
-mod pr_detection;
+pub(crate) mod helpers;
+pub(crate) mod pr_detection;
 
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
+use anyhow::Context;
+use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+use harness_core::config::agents::CapabilityProfile;
+use harness_core::error::HarnessError;
+use harness_core::interceptor::ToolUseEvent;
 use harness_core::tool_isolation::validate_tool_usage;
-use harness_core::{
-    config::load_project_config, interceptor::ToolUseEvent, lang_detect, prompts, AgentRequest,
-    AgentResponse, CapabilityProfile, CodeAgent, ContextItem, Event, ExecutionPhase, HarnessError,
-    Item, SessionId, StreamItem, ThreadId, TokenUsage, TurnId, TurnStatus,
+use harness_core::types::{
+    ContextItem, Decision, Event, ExecutionPhase, Item, SessionId, ThreadId, TokenUsage, TurnId,
+    TurnStatus,
 };
-use harness_protocol::{Notification, RpcNotification};
+use harness_core::{config::project::load_project_config, lang_detect, prompts};
+use harness_protocol::{notifications::Notification, notifications::RpcNotification};
 use std::collections::HashMap;
 
 /// Extract tool list from a capability profile, returning an error if the
@@ -25,6 +30,17 @@ fn restricted_tools(profile: CapabilityProfile) -> anyhow::Result<Vec<String>> {
         )
     })
 }
+use helpers::{
+    collect_context_items, detect_modified_files, emit_runtime_notification,
+    inject_skills_into_prompt, mark_turn_failed, matched_skills_for_prompt, persist_runtime_thread,
+    process_stream_item, run_on_error, run_post_execute, run_post_tool_use, run_pre_execute,
+    truncate_validation_error, update_status,
+};
+#[cfg(test)]
+use pr_detection::{
+    build_fix_ci_prompt, parse_harness_mention_command, HarnessMentionCommand, PromptBuilder,
+};
+use pr_detection::{detect_repo_slug, find_existing_pr_for_issue};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -48,20 +64,6 @@ impl Drop for TaskTargetDir {
 }
 use tokio::process::Command as TokioCommand;
 use tokio::time::{sleep, timeout, Duration, Instant};
-
-pub(crate) use helpers::{
-    collect_context_items, detect_modified_files, emit_runtime_notification,
-    inject_skills_into_prompt, mark_turn_failed, persist_runtime_thread, process_stream_item,
-    run_on_error, run_post_execute, run_post_tool_use, run_pre_execute, truncate_validation_error,
-    update_status,
-};
-pub(crate) use pr_detection::{
-    build_fix_ci_prompt, build_pr_approved_prompt, build_pr_rework_prompt, detect_repo_slug,
-    find_existing_pr_for_issue, parse_harness_mention_command, HarnessMentionCommand,
-};
-// PromptBuilder is used internally by pr_detection and re-exported for tests.
-#[cfg(test)]
-pub(crate) use pr_detection::PromptBuilder;
 
 /// Run the project's test commands as a hard gate before accepting LGTM.
 ///
@@ -173,7 +175,7 @@ pub(crate) async fn run_turn_lifecycle(
         if let Err(e) = server.thread_manager.add_item(
             &thread_id,
             &turn_id,
-            harness_core::Item::Error {
+            harness_core::types::Item::Error {
                 code: -1,
                 message: msg.clone(),
             },
@@ -203,7 +205,7 @@ pub(crate) async fn run_turn_lifecycle(
     let (stream_tx, mut stream_rx) = mpsc::channel(128);
     let mut execution = std::pin::pin!(agent.execute_stream(req, stream_tx));
     let mut stream_closed = false;
-    let mut execution_result: Option<harness_core::Result<()>> = None;
+    let mut execution_result: Option<harness_core::error::Result<()>> = None;
     let mut last_activity = Instant::now();
 
     'outer: while execution_result.is_none() || !stream_closed {
@@ -251,7 +253,7 @@ pub(crate) async fn run_turn_lifecycle(
     }
 
     match execution_result.unwrap_or_else(|| {
-        Err(harness_core::HarnessError::AgentExecution(
+        Err(harness_core::error::HarnessError::AgentExecution(
             "turn execution ended without agent result".to_string(),
         ))
     }) {
@@ -276,7 +278,7 @@ pub(crate) async fn run_turn_lifecycle(
             if let Err(e) = server.thread_manager.add_item(
                 &thread_id,
                 &turn_id,
-                harness_core::Item::Error {
+                harness_core::types::Item::Error {
                     code: -1,
                     message: error_msg.clone(),
                 },
@@ -334,10 +336,10 @@ async fn persist_artifact(
     store: &TaskStore,
     task_id: &TaskId,
     turn: u32,
-    item: &harness_core::Item,
+    item: &harness_core::types::Item,
 ) {
     let (artifact_type, content) = match item {
-        harness_core::Item::ShellCommand {
+        harness_core::types::Item::ShellCommand {
             command,
             exit_code,
             stdout,
@@ -352,7 +354,7 @@ async fn persist_artifact(
             .to_string();
             ("shell_command", c)
         }
-        harness_core::Item::FileEdit {
+        harness_core::types::Item::FileEdit {
             path,
             before,
             after,
@@ -365,7 +367,7 @@ async fn persist_artifact(
             .to_string();
             ("file_edit", c)
         }
-        harness_core::Item::ToolCall {
+        harness_core::types::Item::ToolCall {
             name,
             input,
             output,
@@ -397,10 +399,10 @@ async fn run_agent_streaming(
     task_id: &TaskId,
     store: &TaskStore,
     turn: u32,
-) -> harness_core::Result<AgentResponse> {
+) -> harness_core::error::Result<AgentResponse> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamItem>(128);
     let mut exec = std::pin::pin!(agent.execute_stream(req, tx));
-    let mut exec_result: Option<harness_core::Result<()>> = None;
+    let mut exec_result: Option<harness_core::error::Result<()>> = None;
     let mut channel_closed = false;
     let mut output = String::new();
     let mut token_usage = TokenUsage::default();
@@ -505,7 +507,7 @@ async fn run_triage_plan_pipeline(
         ..Default::default()
     };
 
-    let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
+    let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
     let triage_resp = tokio::time::timeout(
         turn_timeout,
         run_agent_streaming(agent, triage_req, task_id, store, 0),
@@ -594,12 +596,12 @@ pub(crate) async fn run_task(
     task_id: &TaskId,
     agent: &dyn CodeAgent,
     reviewer: Option<&dyn CodeAgent>,
-    skills: Arc<RwLock<harness_skills::SkillStore>>,
-    events: Arc<harness_observe::EventStore>,
+    skills: Arc<RwLock<harness_skills::store::SkillStore>>,
+    events: Arc<harness_observe::event_store::EventStore>,
     interceptors: Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
     req: &CreateTaskRequest,
     project: PathBuf,
-    server_config: &harness_core::HarnessConfig,
+    server_config: &harness_core::config::HarnessConfig,
 ) -> anyhow::Result<()> {
     let task_start = Instant::now();
 
@@ -623,8 +625,14 @@ pub(crate) async fn run_task(
     // the exit path (success, validation failure, timeout, or review exhaustion).
     let _task_target_guard = TaskTargetDir(task_target);
 
-    let project_config = load_project_config(&project);
-    let resolved = harness_core::config::resolve_config(server_config, &project_config);
+    let project_config = load_project_config(&project).with_context(|| {
+        format!(
+            "failed to load project config for task {} at {}",
+            task_id.as_str(),
+            project.display()
+        )
+    })?;
+    let resolved = harness_core::config::resolve::resolve_config(server_config, &project_config);
     let review_config = &resolved.review;
     let git = Some(&project_config.git);
     let repo_slug = detect_repo_slug(&project)
@@ -779,16 +787,34 @@ pub(crate) async fn run_task(
     // Since harness uses single-turn `claude -p`, context items are not visible
     // to the agent — we must embed skill content in the prompt string itself.
     // Also records usage for any matched skills via record_use().
+    let matched_skills = matched_skills_for_prompt(&skills, &first_prompt).await;
     let skill_additions = inject_skills_into_prompt(&skills, &first_prompt).await;
     let first_prompt = if skill_additions.is_empty() {
         first_prompt
     } else {
         first_prompt + &skill_additions
     };
+    for (skill_id, skill_name) in matched_skills {
+        let mut skill_event = Event::new(
+            SessionId::new(),
+            "skill_used",
+            "task_runner",
+            Decision::Pass,
+        );
+        skill_event.reason = Some(skill_name);
+        skill_event.detail = Some(format!(
+            "task_id={} skill_id={}",
+            task_id.as_str(),
+            skill_id.as_str()
+        ));
+        if let Err(err) = events.log(&skill_event).await {
+            tracing::warn!(error = %err, "failed to log skill_used event");
+        }
+    }
 
     let context_items = collect_context_items(&skills, &project, &first_prompt).await;
 
-    let turn_timeout = Duration::from_secs(req.turn_timeout_secs);
+    let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
 
     // Periodic review tasks need Bash to run guard check commands but should
     // not have unrestricted write access — use Standard profile. All other
@@ -1073,7 +1099,7 @@ pub(crate) async fn run_task(
         SessionId::new(),
         "task_implement",
         "task_runner",
-        harness_core::Decision::Complete,
+        harness_core::types::Decision::Complete,
     );
     ev.detail = pr_num.map(|n| format!("pr={n}"));
     if let Err(e) = events.log(&ev).await {
@@ -1346,9 +1372,9 @@ pub(crate) async fn run_task(
             "pr_review",
             "task_runner",
             if lgtm {
-                harness_core::Decision::Complete
+                harness_core::types::Decision::Complete
             } else {
-                harness_core::Decision::Warn
+                harness_core::types::Decision::Warn
             },
         );
         ev.detail = Some(format!("pr={pr_num}"));
@@ -1489,14 +1515,14 @@ async fn run_agent_review(
     task_id: &TaskId,
     agent: &dyn CodeAgent,
     reviewer: &dyn CodeAgent,
-    review_config: &harness_core::AgentReviewConfig,
+    review_config: &harness_core::config::agents::AgentReviewConfig,
     context_items: &[ContextItem],
     project: &Path,
     interceptors: &[Arc<dyn harness_core::interceptor::TurnInterceptor>],
     turn_timeout: Duration,
     pr_url: &str,
     project_type: &str,
-    events: &harness_observe::EventStore,
+    events: &harness_observe::event_store::EventStore,
     cargo_env: &HashMap<String, String>,
 ) -> anyhow::Result<(bool, bool)> {
     let max_rounds = review_config.max_rounds;
@@ -1616,9 +1642,9 @@ async fn run_agent_review(
             "agent_review",
             "task_runner",
             if approved {
-                harness_core::Decision::Complete
+                harness_core::types::Decision::Complete
             } else {
-                harness_core::Decision::Warn
+                harness_core::types::Decision::Warn
             },
         );
         ev.detail = Some(format!("pr={pr_url}"));

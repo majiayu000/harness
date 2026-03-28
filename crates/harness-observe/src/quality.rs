@@ -1,4 +1,4 @@
-use harness_core::{Decision, Event, Grade};
+use harness_core::{types::Decision, types::Event, types::Grade};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,7 +72,7 @@ impl QualityGrader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Decision, Event, Grade, SessionId};
+    use harness_core::{types::Decision, types::Event, types::Grade, types::SessionId};
 
     fn pass_event() -> Event {
         Event::new(SessionId::new(), "pre_tool_use", "Edit", Decision::Pass)

@@ -2,7 +2,10 @@ use crate::http::task_routes;
 use crate::http::AppState;
 use crate::task_runner::CreateTaskRequest;
 use chrono::{DateTime, Utc};
-use harness_core::{Decision, Event, EventFilters, ReviewConfig, ReviewStrategy, SessionId};
+use harness_core::{
+    config::misc::ReviewConfig, config::misc::ReviewStrategy, types::Decision, types::Event,
+    types::EventFilters, types::SessionId,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -47,12 +50,46 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // Single mutex covering both fallback_ts and poll_handle — RS-01 fix.
     let review_state: Arc<Mutex<ReviewState>> = Arc::new(Mutex::new(ReviewState::default()));
 
-    if config.run_on_startup {
-        // Brief delay to let the server fully initialize before the first tick.
-        sleep(Duration::from_secs(5)).await;
-        if let Err(err) = run_review_tick(&state, &config, &review_state).await {
-            tracing::error!("scheduler: periodic review startup tick failed: {err}");
+    // Brief delay to let the server fully initialize before checking.
+    sleep(Duration::from_secs(5)).await;
+
+    // On startup, check how long since the last review (from DB watermark).
+    // If overdue, trigger immediately instead of waiting a full interval.
+    let initial_delay = match last_review_timestamp(&state).await {
+        Some(last_ts) => {
+            let elapsed = Utc::now().signed_duration_since(last_ts);
+            let interval_chrono = chrono::Duration::from_std(interval)
+                .unwrap_or_else(|_| chrono::Duration::hours(24));
+            if elapsed >= interval_chrono {
+                tracing::info!(
+                    last_review = %last_ts,
+                    elapsed_hours = elapsed.num_hours(),
+                    "scheduler: periodic review overdue, triggering now"
+                );
+                Duration::from_secs(0)
+            } else {
+                let remaining = (interval_chrono - elapsed).to_std().unwrap_or(interval);
+                tracing::info!(
+                    last_review = %last_ts,
+                    next_in_secs = remaining.as_secs(),
+                    "scheduler: periodic review not yet due, sleeping"
+                );
+                remaining
+            }
         }
+        None => {
+            tracing::info!("scheduler: no prior periodic review found, triggering now");
+            Duration::from_secs(0)
+        }
+    };
+
+    if !initial_delay.is_zero() {
+        sleep(initial_delay).await;
+    }
+
+    // First tick (may be immediate if overdue).
+    if let Err(err) = run_review_tick(&state, &config, &review_state).await {
+        tracing::error!("scheduler: periodic review tick failed: {err}");
     }
 
     loop {
@@ -61,6 +98,20 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
             tracing::error!("scheduler: periodic review tick failed: {err}");
         }
     }
+}
+
+/// Query the most recent periodic_review watermark from the EventStore.
+async fn last_review_timestamp(state: &Arc<AppState>) -> Option<DateTime<Utc>> {
+    let events = state
+        .observability
+        .events
+        .query(&EventFilters {
+            hook: Some("periodic_review".to_string()),
+            ..EventFilters::default()
+        })
+        .await
+        .ok()?;
+    events.iter().map(|e| e.ts).max()
 }
 
 async fn run_review_tick(
@@ -102,7 +153,8 @@ async fn run_review_tick(
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
     let project_str = project_root.display().to_string();
-    let project_cfg = harness_core::config::load_project_config(project_root);
+    let project_cfg = harness_core::config::project::load_project_config(project_root)
+        .map_err(|e| anyhow::anyhow!("failed to load periodic review config: {e}"))?;
 
     // Run the guard scan on the source repo before spawning the agent.  The
     // agent runs inside a worktree that may contain nested `.harness/worktrees/`
@@ -282,7 +334,7 @@ async fn run_review_tick(
         }
 
         // Now it is safe to enqueue the secondary reviewer (Cross strategy only).
-        let secondary_review_id: Option<harness_core::TaskId> = if let Some(agent) =
+        let secondary_review_id: Option<harness_core::types::TaskId> = if let Some(agent) =
             secondary_agent_name.as_ref()
         {
             let req = CreateTaskRequest {
@@ -407,7 +459,7 @@ async fn run_review_tick(
 /// so the agent knows additional findings exist.
 const MAX_INLINE_VIOLATIONS: usize = 20;
 
-fn format_violations_for_prompt(violations: &[harness_core::Violation]) -> String {
+fn format_violations_for_prompt(violations: &[harness_core::types::Violation]) -> String {
     if violations.is_empty() {
         return "No violations found.".to_string();
     }
@@ -453,11 +505,15 @@ where
 /// Poll a task until it reaches a terminal state, then extract its output.
 async fn poll_task_output(
     store: &crate::task_runner::TaskStore,
-    task_id: &harness_core::TaskId,
+    task_id: &harness_core::types::TaskId,
     timeout_secs: u64,
 ) -> Option<String> {
     let poll_interval = Duration::from_secs(15);
-    let max_wait = Duration::from_secs(timeout_secs + 120);
+    let max_wait = if timeout_secs == 0 {
+        Duration::from_secs(999_999)
+    } else {
+        Duration::from_secs(timeout_secs + 120)
+    };
     let start = tokio::time::Instant::now();
     loop {
         sleep(poll_interval).await;
@@ -638,7 +694,7 @@ mod tests {
 
     #[test]
     fn format_violations_truncates_at_max_inline() {
-        use harness_core::{RuleId, Severity, Violation};
+        use harness_core::{types::RuleId, types::Severity, types::Violation};
         use std::path::PathBuf;
 
         let make_v = |i: usize| Violation {

@@ -92,21 +92,22 @@ pub async fn list_projects(
 
     match registry.list().await {
         Ok(projects) => {
-            let with_counts: Vec<serde_json::Value> = projects
-                .into_iter()
-                .map(|p| {
-                    let mut v = match serde_json::to_value(&p) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!("projects: failed to serialize project: {e}");
-                            serde_json::Value::default()
-                        }
-                    };
-                    // task_count is best-effort; tasks do not store project_id
-                    v["task_count"] = json!(0);
-                    v
-                })
-                .collect();
+            let mut with_counts: Vec<serde_json::Value> = Vec::with_capacity(projects.len());
+            for p in projects {
+                let mut v = match serde_json::to_value(&p) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!("projects: failed to serialize project: {e}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": "failed to serialize project listing"})),
+                        );
+                    }
+                };
+                // task_count is best-effort; tasks do not store project_id
+                v["task_count"] = json!(0);
+                with_counts.push(v);
+            }
             (StatusCode::OK, Json(json!(with_counts)))
         }
         Err(e) => (
@@ -161,5 +162,59 @@ pub async fn delete_project(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{http::build_app_state, server::HarnessServer, thread_manager::ThreadManager};
+    use harness_agents::registry::AgentRegistry;
+    use harness_core::config::HarnessConfig;
+
+    async fn make_test_state(
+        project_root: &std::path::Path,
+        data_dir: &std::path::Path,
+    ) -> anyhow::Result<Arc<AppState>> {
+        let mut config = HarnessConfig::default();
+        config.server.project_root = project_root.to_path_buf();
+        config.server.data_dir = data_dir.to_path_buf();
+        let server = Arc::new(HarnessServer::new(
+            config,
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        ));
+        Ok(Arc::new(build_app_state(server).await?))
+    }
+
+    #[tokio::test]
+    async fn list_projects_includes_task_count_and_project_identity() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let project_root = crate::test_helpers::tempdir_in_home("projects-handler-root-")?;
+        let data_dir = tempfile::tempdir()?;
+        let state = make_test_state(project_root.path(), data_dir.path()).await?;
+
+        let (status, Json(body)) = list_projects(State(state)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let projects = body
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("expected project list array"))?;
+        assert!(
+            !projects.is_empty(),
+            "startup should auto-register at least the default project"
+        );
+        for project in projects {
+            assert!(
+                project.get("id").is_some(),
+                "project entry must include id: {project}"
+            );
+            assert!(
+                project.get("root").is_some(),
+                "project entry must include root: {project}"
+            );
+            assert_eq!(project.get("task_count"), Some(&json!(0)));
+        }
+        Ok(())
     }
 }

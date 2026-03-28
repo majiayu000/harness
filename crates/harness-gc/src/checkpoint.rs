@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use harness_core::Event;
+use harness_core::types::Event;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing;
@@ -76,7 +76,7 @@ pub fn filter_events_since(events: &[Event], since: Option<DateTime<Utc>>) -> &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Decision, Event, SessionId};
+    use harness_core::{types::Decision, types::Event, types::SessionId};
 
     fn make_event(ts: DateTime<Utc>) -> Event {
         let mut e = Event::new(SessionId::new(), "hook", "tool", Decision::Pass);

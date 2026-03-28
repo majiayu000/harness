@@ -1,9 +1,8 @@
 use crate::task_runner::{TaskId, TaskStatus, TaskStore};
-use harness_core::{
-    interceptor::{ToolUseEvent, TurnInterceptor},
-    AgentRequest, AgentResponse, ContextItem, Decision, StreamItem, ThreadId, TurnId, TurnStatus,
-};
-use harness_protocol::{Notification, RpcNotification};
+use harness_core::agent::{AgentRequest, AgentResponse, StreamItem};
+use harness_core::interceptor::{ToolUseEvent, TurnInterceptor};
+use harness_core::types::{ContextItem, Decision, SkillId, ThreadId, TurnId, TurnStatus};
+use harness_protocol::{notifications::Notification, notifications::RpcNotification};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -102,24 +101,22 @@ pub(crate) async fn run_post_tool_use(
 /// or `project_root` is not inside a git repository.
 pub(crate) async fn detect_modified_files(project_root: &Path) -> Vec<std::path::PathBuf> {
     let output = tokio::process::Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "-z"])
         .current_dir(project_root)
         .output()
         .await;
     match output {
-        Ok(out) => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                if line.len() < 4 {
-                    return None;
-                }
-                if line[..2].contains('D') {
-                    return None;
-                }
-                Some(std::path::PathBuf::from(line[3..].trim()))
-            })
-            .collect(),
+        Ok(out) => {
+            if !out.status.success() {
+                tracing::debug!(
+                    project_root = %project_root.display(),
+                    status = ?out.status.code(),
+                    "detect_modified_files: git status failed"
+                );
+                return Vec::new();
+            }
+            parse_porcelain_z_paths(&out.stdout)
+        }
         Err(e) => {
             tracing::debug!(
                 error = %e,
@@ -129,6 +126,44 @@ pub(crate) async fn detect_modified_files(project_root: &Path) -> Vec<std::path:
             Vec::new()
         }
     }
+}
+
+fn parse_porcelain_z_paths(stdout: &[u8]) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    let mut records = stdout.split(|b| *b == 0).filter(|r| !r.is_empty());
+    while let Some(record) = records.next() {
+        if record.len() < 3 {
+            continue;
+        }
+
+        let x = record[0] as char;
+        let y = record[1] as char;
+        let is_rename_or_copy = matches!(x, 'R' | 'C');
+
+        if x == 'D' || y == 'D' {
+            if is_rename_or_copy {
+                let _ = records.next();
+            }
+            continue;
+        }
+
+        let mut path_bytes = &record[3..];
+        if is_rename_or_copy {
+            if let Some(new_path) = records.next() {
+                path_bytes = new_path;
+            } else {
+                continue;
+            }
+        }
+
+        if path_bytes.is_empty() {
+            continue;
+        }
+        paths.push(std::path::PathBuf::from(
+            String::from_utf8_lossy(path_bytes).into_owned(),
+        ));
+    }
+    paths
 }
 
 pub(crate) fn emit_runtime_notification(
@@ -223,7 +258,7 @@ pub(crate) async fn process_stream_item(
             if let Err(err) = server.thread_manager.add_item(
                 thread_id,
                 turn_id,
-                harness_core::Item::Error { code: -1, message },
+                harness_core::types::Item::Error { code: -1, message },
             ) {
                 tracing::warn!("failed to append stream error item to turn: {err}");
             } else {
@@ -264,7 +299,7 @@ pub(crate) async fn mark_turn_failed(
         Notification::TurnCompleted {
             turn_id: turn_id.clone(),
             status: TurnStatus::Failed,
-            token_usage: harness_core::TokenUsage::default(),
+            token_usage: harness_core::types::TokenUsage::default(),
         },
     );
     tracing::error!("turn failed: {error}");
@@ -283,7 +318,7 @@ pub(crate) async fn update_status(
 /// trigger patterns plus any cascading AGENTS.md content found under
 /// `project_root`.
 pub(crate) async fn collect_context_items(
-    skills: &RwLock<harness_skills::SkillStore>,
+    skills: &RwLock<harness_skills::store::SkillStore>,
     project_root: &Path,
     prompt: &str,
 ) -> Vec<ContextItem> {
@@ -305,6 +340,20 @@ pub(crate) async fn collect_context_items(
     items
 }
 
+/// Return all skills whose trigger patterns match `prompt`, including their IDs
+/// and names for observability/event logging.
+pub(crate) async fn matched_skills_for_prompt(
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    prompt: &str,
+) -> Vec<(SkillId, String)> {
+    let guard = skills.read().await;
+    guard
+        .match_prompt(prompt)
+        .into_iter()
+        .map(|s| (s.id.clone(), s.name.clone()))
+        .collect()
+}
+
 /// Match skills against the prompt, record usage for each match, and return a
 /// string to append directly to the agent prompt.
 ///
@@ -322,7 +371,7 @@ pub(crate) async fn collect_context_items(
 /// only if there are matched skills to record usage for. Never holds both locks
 /// simultaneously.
 pub(crate) async fn inject_skills_into_prompt(
-    skills: &RwLock<harness_skills::SkillStore>,
+    skills: &RwLock<harness_skills::store::SkillStore>,
     prompt: &str,
 ) -> String {
     // Early return when the store is empty — avoids acquiring locks unnecessarily.
@@ -336,7 +385,7 @@ pub(crate) async fn inject_skills_into_prompt(
     // Read phase: collect all needed data while holding read lock minimally.
     let (matched_data, all_skills) = {
         let guard = skills.read().await;
-        let matched: Vec<(harness_core::SkillId, String, String)> = guard
+        let matched: Vec<(harness_core::types::SkillId, String, String)> = guard
             .match_prompt(prompt)
             .into_iter()
             .map(|s| (s.id.clone(), s.name.clone(), s.content.clone()))
@@ -375,12 +424,11 @@ pub(crate) async fn inject_skills_into_prompt(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use harness_core::{
-        interceptor::{
-            InterceptResult, PostExecuteResult, PostToolUseResult, ToolUseEvent, TurnInterceptor,
-        },
-        AgentRequest, AgentResponse, Decision, TokenUsage,
+    use harness_core::agent::{AgentRequest, AgentResponse};
+    use harness_core::interceptor::{
+        InterceptResult, PostExecuteResult, PostToolUseResult, ToolUseEvent, TurnInterceptor,
     };
+    use harness_core::types::{Decision, TokenUsage};
     use std::sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
@@ -770,8 +818,8 @@ mod tests {
 
     // ── inject_skills_into_prompt ─────────────────────────────────────────────
 
-    fn make_skill_store_with_review() -> harness_skills::SkillStore {
-        let mut store = harness_skills::SkillStore::new();
+    fn make_skill_store_with_review() -> harness_skills::store::SkillStore {
+        let mut store = harness_skills::store::SkillStore::new();
         store.create(
             "review".to_string(),
             "# Review\n<!-- trigger-patterns: code review -->\nReview code carefully.".to_string(),
@@ -790,6 +838,18 @@ mod tests {
         assert!(
             result.contains("review"),
             "listing must include skill names"
+        );
+    }
+
+    #[tokio::test]
+    async fn matched_skills_returns_id_and_name_for_matches() {
+        let skills = RwLock::new(make_skill_store_with_review());
+        let matched = matched_skills_for_prompt(&skills, "please do a code review").await;
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].1, "review");
+        assert!(
+            !matched[0].0.as_str().is_empty(),
+            "matched skill id should not be empty"
         );
     }
 
@@ -851,7 +911,7 @@ mod tests {
 
     #[tokio::test]
     async fn inject_skills_empty_store_returns_empty_string() {
-        let skills = RwLock::new(harness_skills::SkillStore::new());
+        let skills = RwLock::new(harness_skills::store::SkillStore::new());
         let result = inject_skills_into_prompt(&skills, "any prompt").await;
         assert!(
             result.is_empty(),
@@ -872,5 +932,32 @@ mod tests {
         let result = truncate_validation_error(&input, 50);
         assert!(result.starts_with(&"x".repeat(50)));
         assert!(result.contains("(output truncated, 200 chars total)"));
+    }
+
+    #[test]
+    fn parse_porcelain_z_paths_uses_rename_destination() {
+        let raw = b"R  old.txt\0new.txt\0";
+        let paths = parse_porcelain_z_paths(raw);
+        assert_eq!(paths, vec![std::path::PathBuf::from("new.txt")]);
+    }
+
+    #[test]
+    fn parse_porcelain_z_paths_ignores_deletions() {
+        let raw = b"D  gone.txt\0";
+        let paths = parse_porcelain_z_paths(raw);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn parse_porcelain_z_paths_keeps_modified_and_untracked() {
+        let raw = b" M src/lib.rs\0?? new_file.rs\0";
+        let paths = parse_porcelain_z_paths(raw);
+        assert_eq!(
+            paths,
+            vec![
+                std::path::PathBuf::from("src/lib.rs"),
+                std::path::PathBuf::from("new_file.rs")
+            ]
+        );
     }
 }

@@ -1,10 +1,9 @@
 use std::fmt;
 
 use async_trait::async_trait;
-use harness_core::{
-    AgentRequest, AgentResponse, AnthropicApiConfig, Capability, CodeAgent, Item, StreamItem,
-    TokenUsage,
-};
+use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+use harness_core::config::agents::AnthropicApiConfig;
+use harness_core::types::{Capability, Item, TokenUsage};
 use serde::{Deserialize, Serialize};
 
 pub struct AnthropicApiAgent {
@@ -100,7 +99,7 @@ impl CodeAgent for AnthropicApiAgent {
         vec![Capability::Read]
     }
 
-    async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+    async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         let body = self.build_request(&req);
 
         let resp = self
@@ -113,19 +112,23 @@ impl CodeAgent for AnthropicApiAgent {
             .send()
             .await
             .map_err(|e| {
-                harness_core::HarnessError::AgentExecution(format!("API request failed: {e}"))
+                harness_core::error::HarnessError::AgentExecution(format!(
+                    "API request failed: {e}"
+                ))
             })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(harness_core::HarnessError::AgentExecution(format!(
+            return Err(harness_core::error::HarnessError::AgentExecution(format!(
                 "API returned {status}: {text}"
             )));
         }
 
         let data: MessagesResponse = resp.json().await.map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to parse response: {e}"))
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to parse response: {e}"
+            ))
         })?;
 
         let output = data
@@ -154,7 +157,7 @@ impl CodeAgent for AnthropicApiAgent {
         &self,
         req: AgentRequest,
         tx: tokio::sync::mpsc::Sender<StreamItem>,
-    ) -> harness_core::Result<()> {
+    ) -> harness_core::error::Result<()> {
         let resp = self.execute(req).await?;
         crate::streaming::send_stream_item(
             &tx,

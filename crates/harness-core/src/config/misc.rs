@@ -1,4 +1,4 @@
-use crate::Grade;
+use crate::types::Grade;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -1,12 +1,12 @@
 mod common;
 
 use async_trait::async_trait;
-use harness_agents::AgentRegistry;
-use harness_core::{
-    AgentRequest, AgentResponse, Capability, CodeAgent, HarnessConfig, HarnessError, Item,
-    StreamItem, ThreadId, ThreadStatus, TokenUsage, TurnStatus,
-};
-use harness_protocol::Notification;
+use harness_agents::registry::AgentRegistry;
+use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+use harness_core::config::HarnessConfig;
+use harness_core::error::HarnessError;
+use harness_core::types::{Capability, Item, ThreadId, ThreadStatus, TokenUsage, TurnStatus};
+use harness_protocol::notifications::Notification;
 use harness_server::{
     handlers::thread::{thread_start, turn_start},
     http::build_app_state,
@@ -57,7 +57,7 @@ impl CodeAgent for MockAgent {
         vec![Capability::Read]
     }
 
-    async fn execute(&self, _req: AgentRequest) -> harness_core::Result<AgentResponse> {
+    async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         Ok(AgentResponse {
             output: "ok".to_string(),
             stderr: String::new(),
@@ -72,7 +72,7 @@ impl CodeAgent for MockAgent {
         &self,
         _req: AgentRequest,
         tx: Sender<StreamItem>,
-    ) -> harness_core::Result<()> {
+    ) -> harness_core::error::Result<()> {
         match self.mode {
             MockMode::Complete => {
                 tx.send(StreamItem::ItemCompleted {

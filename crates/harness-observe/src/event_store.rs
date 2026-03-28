@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
+use harness_core::config::misc::OtelConfig;
 use harness_core::db::{open_pool, Migration, Migrator};
-use harness_core::{
+use harness_core::types::{
     AutoFixReport, Decision, Event, EventFilters, EventId, ExternalSignal, ExternalSignalId, Grade,
-    OtelConfig, SessionId, Severity, Violation,
+    SessionId, Severity, Violation,
 };
 use sqlx::sqlite::SqlitePool;
 use std::path::{Path, PathBuf};

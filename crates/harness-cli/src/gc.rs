@@ -1,11 +1,20 @@
-use harness_core::{Draft, DraftId, DraftStatus, EventFilters, GcConfig, Project, ProjectId};
+use harness_core::{
+    config::misc::GcConfig,
+    types::{Draft, DraftId, DraftStatus, EventFilters, Project, ProjectId},
+};
+use harness_gc::draft_store::DraftStore;
+use harness_gc::gc_agent::GcAgent;
+use harness_gc::signal_detector::SignalDetector;
 use harness_gc::signal_detector::SignalThresholds as GcThresholds;
-use harness_gc::{DraftStore, GcAgent, SignalDetector};
-use harness_observe::EventStore;
+use harness_observe::event_store::EventStore;
+use std::sync::Arc;
 
 use crate::commands::GcCommand;
 
-pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> anyhow::Result<()> {
+pub async fn run_gc(
+    cmd: GcCommand,
+    config: &harness_core::config::HarnessConfig,
+) -> anyhow::Result<()> {
     let data_dir = &config.server.data_dir;
 
     match cmd {
@@ -14,7 +23,17 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
                 Some(p) => p,
                 None => std::env::current_dir()?,
             };
-            let project = Project::from_path(project_root);
+            let project_id = project_id_from_root(&project_root);
+            let project = Project {
+                id: project_id.clone(),
+                root: project_root.clone(),
+                languages: Vec::new(),
+                name: project_root
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+            };
 
             let event_store = EventStore::with_policies_and_otel(
                 data_dir,
@@ -24,10 +43,11 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
             )
             .await?;
             let events = event_store.query(&EventFilters::default()).await?;
+            let external_signals = event_store.query_external_signals(None)?;
             event_store.shutdown().await;
 
             let thresholds = map_thresholds(&config.gc.signal_thresholds);
-            let signal_detector = SignalDetector::new(thresholds, project.id.clone());
+            let signal_detector = SignalDetector::new(thresholds, project_id);
             let gc_config = map_gc_config(&config.gc);
             let draft_store = DraftStore::new(data_dir)?;
             let gc_agent = GcAgent::new(
@@ -37,14 +57,17 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
                 project.root.clone(),
             );
 
-            let claude = harness_agents::claude::ClaudeCodeAgent::new(
-                config.agents.claude.cli_path.clone(),
-                config.agents.claude.default_model.clone(),
-                config.agents.sandbox_mode,
-            )
-            .with_stream_timeout(config.agents.stream_timeout_secs);
+            let agent_registry = build_agent_registry(config);
+            let agent = agent_registry.default_agent().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no default agent registered; available agents: {}",
+                    agent_registry.list().join(", ")
+                )
+            })?;
 
-            let report = gc_agent.run(&project, &events, &[], &claude).await?;
+            let report = gc_agent
+                .run_with_external(&project, &events, &[], &external_signals, agent.as_ref())
+                .await?;
             println!("Signals detected: {}", report.signals.len());
             println!("Drafts generated: {}", report.drafts_generated);
             for e in &report.errors {
@@ -64,12 +87,19 @@ pub async fn run_gc(cmd: GcCommand, config: &harness_core::HarnessConfig) -> any
             println!("  rejected: {rejected}");
         }
 
-        GcCommand::Drafts { .. } => {
+        GcCommand::Drafts { project } => {
             let draft_store = DraftStore::new(data_dir)?;
             let drafts = draft_store.list()?;
+            let project_filter = project.as_ref().map(|p| project_id_from_root(p));
             let pending: Vec<_> = drafts
                 .iter()
-                .filter(|d| matches!(d.status, DraftStatus::Pending))
+                .filter(|d| {
+                    matches!(d.status, DraftStatus::Pending)
+                        && project_filter
+                            .as_ref()
+                            .map(|pid| d.signal.project_id == *pid)
+                            .unwrap_or(true)
+                })
                 .collect();
             if pending.is_empty() {
                 println!("No pending drafts");
@@ -108,19 +138,69 @@ fn make_agent_for_draft_ops(
     project_root: &std::path::Path,
 ) -> anyhow::Result<GcAgent> {
     let draft_store = DraftStore::new(data_dir)?;
+    let project_id = project_id_from_root(project_root);
     Ok(GcAgent::new(
         GcConfig::default(),
-        SignalDetector::new(GcThresholds::default(), ProjectId::new()),
+        SignalDetector::new(GcThresholds::default(), project_id),
         draft_store,
         project_root.to_path_buf(),
     ))
+}
+
+fn build_agent_registry(
+    config: &harness_core::config::HarnessConfig,
+) -> harness_agents::registry::AgentRegistry {
+    let mut registry = harness_agents::registry::AgentRegistry::new(&config.agents.default_agent);
+    registry.set_complexity_preferences(config.agents.complexity_preferred_agents.clone());
+    registry.register(
+        "claude",
+        Arc::new(
+            harness_agents::claude::ClaudeCodeAgent::new(
+                config.agents.claude.cli_path.clone(),
+                config.agents.claude.default_model.clone(),
+                config.agents.sandbox_mode,
+            )
+            .with_stream_timeout(config.agents.stream_timeout_secs),
+        ),
+    );
+    registry.register(
+        "codex",
+        Arc::new(
+            harness_agents::codex::CodexAgent::from_config(
+                config.agents.codex.clone(),
+                config.agents.sandbox_mode,
+            )
+            .with_stream_timeout(config.agents.stream_timeout_secs),
+        ),
+    );
+    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+        registry.register(
+            "anthropic-api",
+            Arc::new(
+                harness_agents::anthropic_api::AnthropicApiAgent::from_config(
+                    api_key,
+                    &config.agents.anthropic_api,
+                ),
+            ),
+        );
+    }
+    registry
+}
+
+fn project_id_from_root(project_root: &std::path::Path) -> ProjectId {
+    ProjectId::from_str(
+        project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("default"),
+    )
 }
 
 fn count_by_status(drafts: &[Draft], status: DraftStatus) -> usize {
     drafts.iter().filter(|d| d.status == status).count()
 }
 
-fn map_thresholds(t: &harness_core::SignalThresholdsConfig) -> GcThresholds {
+fn map_thresholds(t: &harness_core::config::misc::SignalThresholdsConfig) -> GcThresholds {
     GcThresholds {
         repeated_warn_min: t.repeated_warn_min,
         chronic_block_min: t.chronic_block_min,
@@ -132,6 +212,6 @@ fn map_thresholds(t: &harness_core::SignalThresholdsConfig) -> GcThresholds {
     }
 }
 
-fn map_gc_config(c: &harness_core::GcConfig) -> GcConfig {
+fn map_gc_config(c: &harness_core::config::misc::GcConfig) -> GcConfig {
     c.clone()
 }

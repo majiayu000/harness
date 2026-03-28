@@ -1,7 +1,7 @@
 use crate::{http::AppState, task_runner::TaskStatus};
 use axum::{extract::State, http::StatusCode, Json};
-use harness_core::EventFilters;
-use harness_observe::QualityGrader;
+use harness_core::types::EventFilters;
+use harness_observe::quality::QualityGrader;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -119,8 +119,8 @@ mod tests {
     use super::*;
     use crate::{http::build_app_state, server::HarnessServer, thread_manager::ThreadManager};
     use axum::{body::to_bytes, routing::get, Router};
-    use harness_agents::AgentRegistry;
-    use harness_core::HarnessConfig;
+    use harness_agents::registry::AgentRegistry;
+    use harness_core::config::HarnessConfig;
     use std::sync::Arc;
 
     async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {

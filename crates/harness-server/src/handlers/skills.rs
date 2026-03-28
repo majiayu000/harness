@@ -1,6 +1,6 @@
 use crate::http::AppState;
-use harness_core::SkillId;
-use harness_protocol::{RpcResponse, INTERNAL_ERROR, NOT_FOUND};
+use harness_core::types::SkillId;
+use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR, methods::NOT_FOUND};
 
 pub async fn skill_create(
     state: &AppState,

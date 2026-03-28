@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use harness_core::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest};
+use harness_core::{
+    agent::AgentAdapter, agent::AgentEvent, agent::ApprovalDecision, agent::TurnRequest,
+};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,7 +54,7 @@ impl CodexAdapter {
         state: &mut AdapterState,
         method: &str,
         params: serde_json::Value,
-    ) -> harness_core::Result<u64> {
+    ) -> harness_core::error::Result<u64> {
         let id = state.next_request_id();
         let request = json!({
             "jsonrpc": "2.0",
@@ -62,45 +64,58 @@ impl CodexAdapter {
         });
 
         let stdin = state.stdin.as_mut().ok_or_else(|| {
-            harness_core::HarnessError::AgentExecution("codex stdin not available".into())
+            harness_core::error::HarnessError::AgentExecution("codex stdin not available".into())
         })?;
 
         let mut line = serde_json::to_string(&request).map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to serialize request: {e}"))
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to serialize request: {e}"
+            ))
         })?;
         line.push('\n');
 
         stdin.write_all(line.as_bytes()).await.map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to write to codex: {e}"))
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to write to codex: {e}"
+            ))
         })?;
         stdin.flush().await.map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to flush codex stdin: {e}"))
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to flush codex stdin: {e}"
+            ))
         })?;
 
         Ok(id)
     }
 
     /// Send a JSON-RPC notification (no id, no response expected).
-    async fn send_notification(state: &mut AdapterState, method: &str) -> harness_core::Result<()> {
+    async fn send_notification(
+        state: &mut AdapterState,
+        method: &str,
+    ) -> harness_core::error::Result<()> {
         let notification = json!({
             "jsonrpc": "2.0",
             "method": method,
         });
 
         let stdin = state.stdin.as_mut().ok_or_else(|| {
-            harness_core::HarnessError::AgentExecution("codex stdin not available".into())
+            harness_core::error::HarnessError::AgentExecution("codex stdin not available".into())
         })?;
 
         let mut line = serde_json::to_string(&notification).map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to serialize: {e}"))
+            harness_core::error::HarnessError::AgentExecution(format!("failed to serialize: {e}"))
         })?;
         line.push('\n');
 
         stdin.write_all(line.as_bytes()).await.map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to write to codex: {e}"))
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to write to codex: {e}"
+            ))
         })?;
         stdin.flush().await.map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to flush codex stdin: {e}"))
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to flush codex stdin: {e}"
+            ))
         })?;
         Ok(())
     }
@@ -116,7 +131,7 @@ impl AgentAdapter for CodexAdapter {
         &self,
         req: TurnRequest,
         tx: mpsc::Sender<AgentEvent>,
-    ) -> harness_core::Result<()> {
+    ) -> harness_core::error::Result<()> {
         let mut state = self.state.lock().await;
 
         // Spawn codex if not already running
@@ -130,12 +145,14 @@ impl AgentAdapter for CodexAdapter {
             crate::strip_claude_env(&mut cmd);
 
             let mut child = cmd.spawn().map_err(|e| {
-                harness_core::HarnessError::AgentExecution(format!("failed to spawn codex: {e}"))
+                harness_core::error::HarnessError::AgentExecution(format!(
+                    "failed to spawn codex: {e}"
+                ))
             })?;
 
             state.stdin = child.stdin.take();
             let stdout = child.stdout.take().ok_or_else(|| {
-                harness_core::HarnessError::AgentExecution("no stdout from codex".into())
+                harness_core::error::HarnessError::AgentExecution("no stdout from codex".into())
             })?;
             state.child = Some(child);
 
@@ -201,7 +218,7 @@ impl AgentAdapter for CodexAdapter {
         Ok(())
     }
 
-    async fn interrupt(&self) -> harness_core::Result<()> {
+    async fn interrupt(&self) -> harness_core::error::Result<()> {
         let mut state = self.state.lock().await;
         if state.stdin.is_some() {
             // Try graceful interrupt first
@@ -215,7 +232,7 @@ impl AgentAdapter for CodexAdapter {
         Ok(())
     }
 
-    async fn steer(&self, text: String) -> harness_core::Result<()> {
+    async fn steer(&self, text: String) -> harness_core::error::Result<()> {
         let mut state = self.state.lock().await;
         Self::send_request(&mut state, "turn/steer", json!({ "text": text })).await?;
         Ok(())
@@ -225,7 +242,7 @@ impl AgentAdapter for CodexAdapter {
         &self,
         id: String,
         decision: ApprovalDecision,
-    ) -> harness_core::Result<()> {
+    ) -> harness_core::error::Result<()> {
         let mut state = self.state.lock().await;
         let decision_value = match decision {
             ApprovalDecision::Accept => json!({ "decision": "accept" }),
@@ -235,7 +252,7 @@ impl AgentAdapter for CodexAdapter {
         };
 
         let stdin = state.stdin.as_mut().ok_or_else(|| {
-            harness_core::HarnessError::AgentExecution("codex stdin not available".into())
+            harness_core::error::HarnessError::AgentExecution("codex stdin not available".into())
         })?;
 
         // Approval response uses the original request id
@@ -246,15 +263,19 @@ impl AgentAdapter for CodexAdapter {
         });
 
         let mut line = serde_json::to_string(&response).map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to serialize: {e}"))
+            harness_core::error::HarnessError::AgentExecution(format!("failed to serialize: {e}"))
         })?;
         line.push('\n');
 
         stdin.write_all(line.as_bytes()).await.map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to write to codex: {e}"))
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to write to codex: {e}"
+            ))
         })?;
         stdin.flush().await.map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to flush codex stdin: {e}"))
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to flush codex stdin: {e}"
+            ))
         })?;
         Ok(())
     }

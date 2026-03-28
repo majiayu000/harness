@@ -1,5 +1,5 @@
-use harness_agents::AgentRegistry;
-use harness_core::HarnessConfig;
+use harness_agents::registry::AgentRegistry;
+use harness_core::config::HarnessConfig;
 use harness_rules::exec_policy::{ExecDecision, MatchOptions};
 use harness_server::{http::build_app_state, server::HarnessServer, thread_manager::ThreadManager};
 use std::sync::Arc;

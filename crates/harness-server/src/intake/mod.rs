@@ -304,7 +304,7 @@ async fn run_repo_sprint(
     for skip in &plan.skip {
         let ext_id = skip.issue.to_string();
         if let Some((source, _)) = issue_map.get(&ext_id) {
-            let skip_id = TaskId(format!("skip-{ext_id}"));
+            let skip_id = harness_core::types::TaskId(format!("skip-{ext_id}"));
             if let Err(e) = source.mark_dispatched(&ext_id, &skip_id).await {
                 tracing::warn!(external_id = %ext_id, "intake: failed to mark skipped: {e}");
             }
@@ -384,7 +384,7 @@ async fn run_repo_sprint(
                 continue;
             };
 
-            let placeholder_id = TaskId(format!("pending-{ext_id}"));
+            let placeholder_id = harness_core::types::TaskId(format!("pending-{ext_id}"));
             if let Err(e) = source.mark_dispatched(&ext_id, &placeholder_id).await {
                 tracing::warn!(external_id = %ext_id, "intake: mark_dispatched failed: {e}");
                 completed.insert(issue_num);
@@ -545,7 +545,7 @@ async fn poll_task_output(
 /// issue from the `dispatched` map) operates on the live poller's in-memory
 /// state rather than a detached clone.
 pub fn build_orchestrator(
-    config: &harness_core::IntakeConfig,
+    config: &harness_core::config::intake::IntakeConfig,
     data_dir: Option<&std::path::Path>,
     feishu_intake: Option<Arc<feishu::FeishuIntake>>,
     github_sources: Vec<Arc<dyn IntakeSource>>,
@@ -769,15 +769,15 @@ mod tests {
 
     #[test]
     fn build_orchestrator_with_no_config_returns_empty_orchestrator() {
-        let config = harness_core::IntakeConfig::default();
+        let config = harness_core::config::intake::IntakeConfig::default();
         let orchestrator = build_orchestrator(&config, None, None, vec![]);
         assert!(orchestrator.sources.is_empty());
     }
 
     #[test]
     fn build_orchestrator_with_disabled_github_returns_empty() {
-        let mut config = harness_core::IntakeConfig::default();
-        config.github = Some(harness_core::GitHubIntakeConfig {
+        let mut config = harness_core::config::intake::IntakeConfig::default();
+        config.github = Some(harness_core::config::intake::GitHubIntakeConfig {
             enabled: false,
             repo: "owner/repo".to_string(),
             ..Default::default()
@@ -788,8 +788,8 @@ mod tests {
 
     #[test]
     fn build_orchestrator_with_enabled_github_registers_source() {
-        let mut config = harness_core::IntakeConfig::default();
-        config.github = Some(harness_core::GitHubIntakeConfig {
+        let mut config = harness_core::config::intake::IntakeConfig::default();
+        config.github = Some(harness_core::config::intake::GitHubIntakeConfig {
             enabled: true,
             repo: "owner/repo".to_string(),
             label: "harness".to_string(),

@@ -7,8 +7,6 @@ pub mod codex_adapter;
 pub mod registry;
 mod streaming;
 
-pub use registry::{AdapterRegistry, AgentRegistry};
-
 /// Remove all `CLAUDE`-prefixed environment variables from a command to prevent
 /// nested Claude Code detection (SIGTRAP).
 pub(crate) fn strip_claude_env(cmd: &mut tokio::process::Command) {

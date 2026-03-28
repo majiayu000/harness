@@ -2,7 +2,7 @@
 
 use crate::task_runner::{TaskId, TaskState, TaskStore};
 use async_trait::async_trait;
-use harness_core::StreamItem;
+use harness_core::agent::StreamItem;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -98,7 +98,7 @@ mod tests {
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
         let svc = DefaultTaskService::new(store.clone());
 
-        let id = TaskId("test-task".to_string());
+        let id = harness_core::types::TaskId("test-task".to_string());
         let mut state = crate::task_runner::TaskState {
             id: id.clone(),
             status: TaskStatus::Pending,
@@ -135,8 +135,8 @@ mod tests {
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
         let svc = DefaultTaskService::new(store.clone());
 
-        let parent_id = TaskId("parent".to_string());
-        let child_id = TaskId("child".to_string());
+        let parent_id = harness_core::types::TaskId("parent".to_string());
+        let child_id = harness_core::types::TaskId("child".to_string());
 
         let parent_state = crate::task_runner::TaskState {
             id: parent_id.clone(),
@@ -196,7 +196,7 @@ mod tests {
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
         let svc = DefaultTaskService::new(store.clone());
 
-        let id = TaskId("stream-task".to_string());
+        let id = harness_core::types::TaskId("stream-task".to_string());
 
         // No stream registered yet.
         assert!(svc.subscribe_stream(&id).is_none());

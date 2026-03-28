@@ -25,6 +25,18 @@ const result = await thread.run("Summarize the repository", {
 console.log(result.status, result.output);
 ```
 
+### Authenticated server
+
+When the server is configured with `api_token`, pass `apiToken`:
+
+```ts
+const harness = new Harness({
+  baseUrl: "http://127.0.0.1:9800",
+  cwd: "/repo",
+  apiToken: process.env.HARNESS_API_TOKEN,
+});
+```
+
 ### Stream events explicitly
 
 ```ts

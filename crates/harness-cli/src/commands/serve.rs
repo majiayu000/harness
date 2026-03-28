@@ -1,5 +1,5 @@
 use anyhow::Result;
-use harness_core::HarnessConfig;
+use harness_core::config::HarnessConfig;
 use harness_server::project_registry::validate_project_root;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,7 +38,7 @@ pub async fn run(
         || config.agents.review.reviewer_agent == "claude";
     if cfg!(target_os = "macos")
         && claude_in_use
-        && config.agents.sandbox_mode != harness_core::SandboxMode::DangerFullAccess
+        && config.agents.sandbox_mode != harness_core::config::agents::SandboxMode::DangerFullAccess
     {
         anyhow::bail!(
             "sandbox_mode = {:?} is not supported on macOS — \
@@ -128,7 +128,8 @@ pub async fn run(
     }
 
     let thread_manager = harness_server::thread_manager::ThreadManager::new();
-    let mut agent_registry = harness_agents::AgentRegistry::new(&serve_config.agents.default_agent);
+    let mut agent_registry =
+        harness_agents::registry::AgentRegistry::new(&serve_config.agents.default_agent);
     agent_registry
         .set_complexity_preferences(serve_config.agents.complexity_preferred_agents.clone());
     let mut claude_agent = harness_agents::claude::ClaudeCodeAgent::new(
@@ -170,16 +171,17 @@ pub async fn run(
     server.startup_projects = parsed_projects;
 
     let effective_transport = match transport.as_deref() {
-        Some("stdio") => harness_core::Transport::Stdio,
-        Some("http") => harness_core::Transport::Http,
-        Some("web_socket") => harness_core::Transport::WebSocket,
+        Some("stdio") => harness_core::config::server::Transport::Stdio,
+        Some("http") => harness_core::config::server::Transport::Http,
+        Some("web_socket") => harness_core::config::server::Transport::WebSocket,
         Some(other) => anyhow::bail!("unknown transport: {other}"),
         None => serve_config.server.transport,
     };
 
     match effective_transport {
-        harness_core::Transport::Stdio => server.serve_stdio().await?,
-        harness_core::Transport::Http | harness_core::Transport::WebSocket => {
+        harness_core::config::server::Transport::Stdio => server.serve_stdio().await?,
+        harness_core::config::server::Transport::Http
+        | harness_core::config::server::Transport::WebSocket => {
             let addr = if let Some(p) = port {
                 format!("127.0.0.1:{p}").parse()?
             } else {

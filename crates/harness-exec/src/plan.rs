@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use harness_core::db::DbEntity;
-use harness_core::{ExecPlanId, ExecPlanStatus};
+use harness_core::{types::ExecPlanId, types::ExecPlanStatus};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

@@ -1,9 +1,10 @@
 use async_trait::async_trait;
-use harness_core::{
-    interceptor::{InterceptResult, PostToolUseResult, ToolUseEvent, TurnInterceptor},
-    AgentRequest, Decision, Event, SessionId,
+use harness_core::agent::AgentRequest;
+use harness_core::interceptor::{
+    InterceptResult, PostToolUseResult, ToolUseEvent, TurnInterceptor,
 };
-use harness_observe::EventStore;
+use harness_core::types::{Decision, Event, SessionId};
+use harness_observe::event_store::EventStore;
 use harness_rules::engine::RuleEngine;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -209,7 +210,7 @@ impl TurnInterceptor for HookEnforcer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{EventFilters, GuardId, Language};
+    use harness_core::{types::EventFilters, types::GuardId, types::Language};
     use harness_rules::engine::{Guard, RuleEngine};
     use tempfile::tempdir;
 

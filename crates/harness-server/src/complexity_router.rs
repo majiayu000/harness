@@ -1,4 +1,4 @@
-use harness_core::{TaskClassification, TaskComplexity};
+use harness_core::{agent::TaskClassification, agent::TaskComplexity};
 
 /// Count file paths referenced in a prompt by looking for tokens that contain
 /// a dot followed by a known source-file extension.
@@ -65,7 +65,7 @@ pub fn classify(prompt: &str, issue: Option<u64>, pr: Option<u64>) -> TaskClassi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::TaskComplexity;
+    use harness_core::agent::TaskComplexity;
 
     #[test]
     fn simple_prompt_no_files() {

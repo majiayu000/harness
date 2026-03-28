@@ -1,4 +1,4 @@
-use crate::db::{Db, DbEntity};
+use harness_core::db::{Db, DbEntity};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -17,7 +17,10 @@ pub struct GitHubIssuesPoller {
 }
 
 impl GitHubIssuesPoller {
-    pub fn new(repo_config: &harness_core::GitHubRepoConfig, data_dir: Option<&Path>) -> Self {
+    pub fn new(
+        repo_config: &harness_core::config::intake::GitHubRepoConfig,
+        data_dir: Option<&Path>,
+    ) -> Self {
         let repo_slug = repo_config.repo.replace('/', "_");
         let persist_path = data_dir.map(|d| d.join(format!("github_dispatched_{repo_slug}.json")));
         let dispatched = Self::load_dispatched(persist_path.as_deref());
@@ -57,7 +60,7 @@ impl GitHubIssuesPoller {
         };
         let dm = DashMap::new();
         for (k, v) in map {
-            dm.insert(k, TaskId(v));
+            dm.insert(k, harness_core::types::TaskId(v));
         }
         dm
     }
@@ -243,7 +246,10 @@ mod tests {
     fn make_dispatched(ids: &[&str]) -> DashMap<String, TaskId> {
         let map = DashMap::new();
         for id in ids {
-            map.insert(id.to_string(), TaskId(format!("task-{id}")));
+            map.insert(
+                id.to_string(),
+                harness_core::types::TaskId(format!("task-{id}")),
+            );
         }
         map
     }
@@ -351,7 +357,7 @@ mod tests {
 
     #[test]
     fn github_issues_poller_name_is_github() {
-        let repo_cfg = harness_core::GitHubRepoConfig {
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
             repo: "owner/repo".to_string(),
             label: "harness".to_string(),
             project_root: None,

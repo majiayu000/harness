@@ -1,5 +1,5 @@
 use harness_agents::claude::ClaudeCodeAgent;
-use harness_core::{prompts, AgentRequest, CodeAgent, HarnessConfig};
+use harness_core::{agent::AgentRequest, agent::CodeAgent, config::HarnessConfig, prompts};
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
 

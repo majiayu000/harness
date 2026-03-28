@@ -1,8 +1,6 @@
 use async_trait::async_trait;
-use harness_core::{
-    interceptor::{InterceptResult, TurnInterceptor},
-    AgentRequest,
-};
+use harness_core::agent::AgentRequest;
+use harness_core::interceptor::{InterceptResult, TurnInterceptor};
 
 /// Minimum prompt length required to allow execution.
 const MIN_PROMPT_LEN: usize = 10;
@@ -115,7 +113,7 @@ impl TurnInterceptor for ContractValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{AgentRequest, Decision};
+    use harness_core::{agent::AgentRequest, types::Decision};
     use std::path::PathBuf;
 
     fn make_req(prompt: &str) -> AgentRequest {

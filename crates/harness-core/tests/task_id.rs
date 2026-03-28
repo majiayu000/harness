@@ -1,4 +1,4 @@
-use harness_core::TaskId;
+use harness_core::types::TaskId;
 
 #[test]
 fn task_id_new_is_unique() {

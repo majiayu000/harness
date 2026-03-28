@@ -2,9 +2,10 @@ use crate::streaming::{
     filter_agent_stderr, log_captured_stderr, send_stream_item, stream_child_output,
 };
 use async_trait::async_trait;
-use harness_core::SandboxMode;
+use harness_core::config::agents::SandboxMode;
 use harness_core::{
-    AgentRequest, AgentResponse, Capability, CodeAgent, ReasoningBudget, StreamItem, TokenUsage,
+    agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, agent::StreamItem,
+    types::Capability, types::ReasoningBudget, types::TokenUsage,
 };
 use harness_sandbox::{wrap_command, SandboxSpec};
 use std::ffi::OsString;
@@ -111,14 +112,14 @@ impl CodeAgent for ClaudeCodeAgent {
         vec![Capability::Read, Capability::Write, Capability::Execute]
     }
 
-    async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+    async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         let model = self.resolve_model(&req).to_string();
         let base_args = self.base_args(&req);
 
         let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
         let wrapped_command =
             wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
-                harness_core::HarnessError::AgentExecution(format!(
+                harness_core::error::HarnessError::AgentExecution(format!(
                     "sandbox setup failed for claude: {error}"
                 ))
             })?;
@@ -141,10 +142,12 @@ impl CodeAgent for ClaudeCodeAgent {
         cmd.envs(&req.env_vars);
 
         let child = cmd.spawn().map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
+            harness_core::error::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
         })?;
         let output = child.wait_with_output().await.map_err(|e| {
-            harness_core::HarnessError::AgentExecution(format!("failed to wait for claude: {e}"))
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to wait for claude: {e}"
+            ))
         })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -164,7 +167,7 @@ impl CodeAgent for ClaudeCodeAgent {
             } else {
                 stdout.clone()
             };
-            return Err(harness_core::HarnessError::AgentExecution(format!(
+            return Err(harness_core::error::HarnessError::AgentExecution(format!(
                 "claude exited with {}: stderr=[{}] stdout_tail=[{}]",
                 output.status, stderr, stdout_tail
             )));
@@ -184,12 +187,12 @@ impl CodeAgent for ClaudeCodeAgent {
         &self,
         req: AgentRequest,
         tx: tokio::sync::mpsc::Sender<StreamItem>,
-    ) -> harness_core::Result<()> {
+    ) -> harness_core::error::Result<()> {
         let base_args = self.base_args(&req);
         let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
         let wrapped_command =
             wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
-                harness_core::HarnessError::AgentExecution(format!(
+                harness_core::error::HarnessError::AgentExecution(format!(
                     "sandbox setup failed for claude: {error}"
                 ))
             })?;
@@ -205,7 +208,9 @@ impl CodeAgent for ClaudeCodeAgent {
         cmd.envs(&req.env_vars);
 
         let mut child = cmd.spawn().map_err(|error| {
-            harness_core::HarnessError::AgentExecution(format!("failed to run claude: {error}"))
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to run claude: {error}"
+            ))
         })?;
 
         if let Some(stderr) = child.stderr.take() {
@@ -237,7 +242,7 @@ impl CodeAgent for ClaudeCodeAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{ExecutionPhase, Item, ReasoningBudget};
+    use harness_core::{types::ExecutionPhase, types::Item, types::ReasoningBudget};
     use std::fs;
     use std::time::Duration;
     use tokio::time::timeout;

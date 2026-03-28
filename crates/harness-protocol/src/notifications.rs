@@ -1,4 +1,4 @@
-use harness_core::{Item, ThreadId, ThreadStatus, TokenUsage, TurnId, TurnStatus};
+use harness_core::types::{Item, ThreadId, ThreadStatus, TokenUsage, TurnId, TurnStatus};
 use serde::{Deserialize, Serialize};
 
 /// Server-to-client streaming notifications.

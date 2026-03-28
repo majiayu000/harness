@@ -270,7 +270,7 @@ TASK:
    - pub fn compute_trends(events, period_days) -> Vec<ComplianceTrend>
 
 3. Add pub mod health; pub mod stats; to crates/harness-observe/src/lib.rs
-   Add pub use health::HealthReport; pub use stats::{HookStats, ComplianceTrend};
+   Reference these types through module paths: health::HealthReport, stats::HookStats, stats::ComplianceTrend.
 
 4. Add to crates/harness-protocol/src/methods.rs:
    HealthCheck { project_root: PathBuf }

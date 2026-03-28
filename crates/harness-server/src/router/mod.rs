@@ -10,7 +10,7 @@
 
 use crate::handlers;
 use crate::http::AppState;
-use harness_protocol::{Method, RpcRequest, RpcResponse};
+use harness_protocol::{methods::Method, methods::RpcRequest, methods::RpcResponse};
 
 /// Route a JSON-RPC request to the appropriate handler.
 pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResponse> {
@@ -24,7 +24,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         _ if !state.notifications.initialized.load(Ordering::Relaxed) => {
             return Some(RpcResponse::error(
                 id,
-                harness_protocol::NOT_INITIALIZED,
+                harness_protocol::methods::NOT_INITIALIZED,
                 "Server not initialized. Send 'initialize' first.",
             ));
         }
@@ -37,7 +37,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
             if state.notifications.initialized.load(Ordering::Relaxed) {
                 return Some(RpcResponse::error(
                     id,
-                    harness_protocol::INVALID_REQUEST,
+                    harness_protocol::methods::INVALID_REQUEST,
                     "Server already initialized.",
                 ));
             }
@@ -51,7 +51,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
             if !state.notifications.initializing.load(Ordering::Relaxed) {
                 return Some(RpcResponse::error(
                     id,
-                    harness_protocol::INVALID_REQUEST,
+                    harness_protocol::methods::INVALID_REQUEST,
                     "Send 'initialize' before 'initialized'.",
                 ));
             }
@@ -133,9 +133,11 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         } => Some(handlers::rules::rule_check(state, id, project_root, files).await),
 
         // === GC ===
-        Method::GcRun { project_id: _ } => Some(handlers::gc::gc_run(state, id).await),
+        Method::GcRun { project_id } => Some(handlers::gc::gc_run(state, id, project_id).await),
         Method::GcStatus => Some(handlers::gc::gc_status(state, id).await),
-        Method::GcDrafts { project_id: _ } => Some(handlers::gc::gc_drafts(state, id).await),
+        Method::GcDrafts { project_id } => {
+            Some(handlers::gc::gc_drafts(state, id, project_id).await)
+        }
         Method::GcAdopt { draft_id } => Some(handlers::gc::gc_adopt(state, id, draft_id).await),
         Method::GcReject { draft_id, reason } => {
             Some(handlers::gc::gc_reject(state, id, draft_id, reason).await)

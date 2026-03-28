@@ -40,8 +40,8 @@ impl Drop for HomeGuard {
 }
 
 use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
-use harness_agents::AgentRegistry;
-use harness_core::HarnessConfig;
+use harness_agents::registry::AgentRegistry;
+use harness_core::config::HarnessConfig;
 
 /// Create a temp directory under a writable base path without mutating
 /// global state (`HOME` env var).  Tries `$HOME` first; falls back to
@@ -95,36 +95,40 @@ async fn make_state_inner(
         ThreadManager::new(),
         agent_registry,
     ));
-    let tasks =
-        crate::task_runner::TaskStore::open(&harness_core::default_db_path(dir, "tasks")).await?;
-    let events = Arc::new(harness_observe::EventStore::new(dir).await?);
-    let signal_detector = harness_gc::SignalDetector::new(
+    let tasks = crate::task_runner::TaskStore::open(&harness_core::config::dirs::default_db_path(
+        dir, "tasks",
+    ))
+    .await?;
+    let events = Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
+    let signal_detector = harness_gc::signal_detector::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
-        harness_core::ProjectId::new(),
+        harness_core::types::ProjectId::new(),
     );
-    let draft_store = harness_gc::DraftStore::new(dir)?;
-    let gc_agent = Arc::new(harness_gc::GcAgent::new(
+    let draft_store = harness_gc::draft_store::DraftStore::new(dir)?;
+    let gc_agent = Arc::new(harness_gc::gc_agent::GcAgent::new(
         server.config.gc.clone(),
         signal_detector,
         draft_store,
         project_root.to_path_buf(),
     ));
-    let thread_db =
-        crate::thread_db::ThreadDb::open(&harness_core::default_db_path(dir, "threads")).await?;
+    let thread_db = crate::thread_db::ThreadDb::open(&harness_core::config::dirs::default_db_path(
+        dir, "threads",
+    ))
+    .await?;
     let (notification_tx, _) = tokio::sync::broadcast::channel(64);
     let task_queue = Arc::new(crate::task_queue::TaskQueue::new(&Default::default()));
 
     // Service layer — use concrete defaults backed by the same infrastructure.
-    let project_svc = crate::services::DefaultProjectService::new(
+    let project_svc = crate::services::project::DefaultProjectService::new(
         // Tests that don't need a registry still get a lightweight one.
-        crate::project_registry::ProjectRegistry::open(&harness_core::default_db_path(
-            dir, "projects",
-        ))
+        crate::project_registry::ProjectRegistry::open(
+            &harness_core::config::dirs::default_db_path(dir, "projects"),
+        )
         .await?,
         project_root.to_path_buf(),
     );
-    let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
-    let execution_svc = crate::services::DefaultExecutionService::new(
+    let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+    let execution_svc = crate::services::execution::DefaultExecutionService::new(
         tasks.clone(),
         server.agent_registry.clone(),
         Arc::new(server.config.clone()),
@@ -158,8 +162,10 @@ async fn make_state_inner(
         },
         observability: crate::http::ObservabilityServices {
             events,
-            signal_rate_limiter: Arc::new(crate::http::SignalRateLimiter::new(100)),
-            password_reset_rate_limiter: Arc::new(crate::http::PasswordResetRateLimiter::new(5)),
+            signal_rate_limiter: Arc::new(crate::http::rate_limit::SignalRateLimiter::new(100)),
+            password_reset_rate_limiter: Arc::new(
+                crate::http::rate_limit::PasswordResetRateLimiter::new(5),
+            ),
             review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {

@@ -1,9 +1,8 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
-use harness_core::{
-    interceptor::{InterceptResult, TurnInterceptor},
-    AgentRequest, Severity,
-};
+use harness_core::agent::AgentRequest;
+use harness_core::interceptor::{InterceptResult, TurnInterceptor};
+use harness_core::types::Severity;
 use harness_rules::engine::RuleEngine;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +13,8 @@ use tokio::sync::RwLock;
 /// On every `pre_execute` call the enforcer scans the project root using all
 /// registered guards.  Critical violations block the turn; high-severity
 /// violations produce a warning that is injected into the prompt context.
-/// When no guards are registered the enforcer passes through silently.
+/// Rule enforcement only applies to projects that opt in via
+/// `{project_root}/.harness/guards`.
 pub struct RuleEnforcer {
     rules: Arc<RwLock<RuleEngine>>,
     /// Per-workspace violation count from the previous scan, used to compute deltas.
@@ -39,16 +39,12 @@ impl TurnInterceptor for RuleEnforcer {
     async fn pre_execute(&self, req: &AgentRequest) -> InterceptResult {
         let engine = self.rules.read().await;
 
-        // Nothing to enforce without guards.
-        if engine.guards().is_empty() {
-            return InterceptResult::pass();
-        }
-
         // Only enforce rules on projects that have opted in by providing their
         // own `.harness/guards` directory.  Guards loaded at startup are scoped
         // to the projects they belong to; scanning unrelated projects produces
         // false positives (e.g. SEC-02 on test constants in external repos).
-        if !req.project_root.join(".harness").join("guards").is_dir() {
+        let guard_dir = req.project_root.join(".harness").join("guards");
+        if !guard_dir.is_dir() {
             tracing::debug!(
                 project_root = %req.project_root.display(),
                 "rule_enforcer: project has no .harness/guards, skipping enforcement"
@@ -56,15 +52,27 @@ impl TurnInterceptor for RuleEnforcer {
             return InterceptResult::pass();
         }
 
+        // Opted-in project but no registered guards is a hard configuration error.
+        if engine.guards().is_empty() {
+            tracing::error!(
+                project_root = %req.project_root.display(),
+                guard_dir = %guard_dir.display(),
+                "rule_enforcer: project opted in but no guards are registered"
+            );
+            return InterceptResult::block(
+                "rule_enforcer: no guards registered for opted-in project".to_string(),
+            );
+        }
+
         let violations = match engine.scan(&req.project_root).await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     error = %e,
                     project_root = %req.project_root.display(),
-                    "rule_enforcer: scan failed, skipping enforcement"
+                    "rule_enforcer: scan failed on opted-in project"
                 );
-                return InterceptResult::pass();
+                return InterceptResult::block(format!("rule_enforcer: scan failed: {e}"));
             }
         };
 
@@ -151,7 +159,7 @@ impl TurnInterceptor for RuleEnforcer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{AgentRequest, Decision, GuardId, Language};
+    use harness_core::{agent::AgentRequest, types::Decision, types::GuardId, types::Language};
     use harness_rules::engine::{Guard, RuleEngine};
 
     fn make_req(project_root: &std::path::Path) -> AgentRequest {
@@ -206,10 +214,10 @@ mod tests {
             // Load a rule so the engine can resolve severity from the guard output.
             let mut engine = rules.write().await;
             engine.add_rule(harness_rules::engine::Rule {
-                id: harness_core::RuleId::from_str("SEC-01"),
+                id: harness_core::types::RuleId::from_str("SEC-01"),
                 title: "SQL injection".to_string(),
                 severity: Severity::Critical,
-                category: harness_core::Category::Security,
+                category: harness_core::types::Category::Security,
                 paths: vec![],
                 description: String::new(),
                 fix_pattern: None,
@@ -242,10 +250,10 @@ mod tests {
         {
             let mut engine = rules.write().await;
             engine.add_rule(harness_rules::engine::Rule {
-                id: harness_core::RuleId::from_str("SEC-04"),
+                id: harness_core::types::RuleId::from_str("SEC-04"),
                 title: "Unprotected API".to_string(),
                 severity: Severity::High,
-                category: harness_core::Category::Security,
+                category: harness_core::types::Category::Security,
                 paths: vec![],
                 description: String::new(),
                 fix_pattern: None,
@@ -273,10 +281,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocks_when_opted_in_project_has_no_registered_guards() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join(".harness").join("guards"))?;
+
+        let engine = Arc::new(RwLock::new(RuleEngine::new()));
+        let enforcer = RuleEnforcer::new(engine);
+        let result = enforcer.pre_execute(&make_req(&project)).await;
+        assert_eq!(result.decision, Decision::Block);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("no guards registered"),
+            "expected config error reason, got: {:?}",
+            result.reason
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blocks_when_scan_fails_on_opted_in_project() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join(".harness").join("guards"))?;
+
+        let mut engine = RuleEngine::new();
+        engine.register_guard(Guard {
+            id: GuardId::from_str("BROKEN-GUARD"),
+            script_path: std::path::PathBuf::from("broken\0guard.sh"),
+            language: Language::Common,
+            rules: vec![],
+        });
+        let enforcer = RuleEnforcer::new(Arc::new(RwLock::new(engine)));
+
+        let result = enforcer.pre_execute(&make_req(&project)).await;
+        assert_eq!(result.decision, Decision::Block);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("scan failed"),
+            "expected scan failure reason, got: {:?}",
+            result.reason
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn passes_when_guard_emits_no_violations() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let project = dir.path().join("project");
-        std::fs::create_dir_all(&project)?;
+        std::fs::create_dir_all(project.join(".harness").join("guards"))?;
 
         // Guard that emits nothing.
         let script = dir.path().join("noop.sh");
@@ -315,16 +374,16 @@ mod tests {
     async fn passes_on_medium_violation() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let project = dir.path().join("project");
-        std::fs::create_dir_all(&project)?;
+        std::fs::create_dir_all(project.join(".harness").join("guards"))?;
 
         let rules = engine_with_guard(dir.path(), "U-16", "medium")?;
         {
             let mut engine = rules.write().await;
             engine.add_rule(harness_rules::engine::Rule {
-                id: harness_core::RuleId::from_str("U-16"),
+                id: harness_core::types::RuleId::from_str("U-16"),
                 title: "File size".to_string(),
                 severity: Severity::Medium,
-                category: harness_core::Category::Style,
+                category: harness_core::types::Category::Style,
                 paths: vec![],
                 description: String::new(),
                 fix_pattern: None,

@@ -1,4 +1,4 @@
-use crate::Language;
+use crate::types::Language;
 use std::path::Path;
 
 /// Detect the primary language/toolchain of a project from well-known indicator files.

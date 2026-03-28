@@ -1,4 +1,4 @@
-use crate::task_executor::{
+use crate::task_executor::pr_detection::{
     build_fix_ci_prompt, build_pr_approved_prompt, build_pr_rework_prompt,
     parse_harness_mention_command, HarnessMentionCommand,
 };

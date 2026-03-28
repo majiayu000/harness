@@ -430,7 +430,7 @@ If no new commits have landed since the last review, the cycle is skipped.
 
 ## Scheduled Background Systems
 
-Harness runs three background schedulers automatically when the server starts:
+Harness runs four background schedulers automatically when the server starts:
 
 ### 1. Periodic Review (`[review]`)
 
@@ -470,6 +470,19 @@ Frequency adapts to code quality:
 | D (<60) | 1 hour | Critical issues, aggressive scanning |
 
 Scans for violation signals → generates remediation drafts → optionally adopts fixes.
+
+### 4. Self-Evolution Tick (always on)
+
+Every 24 hours, Harness runs a learning cycle for the configured project:
+- Calls `learn_rules` to extract reusable guard/rule patterns from adopted drafts
+- Calls `learn_skills` to extract reusable execution skills from adopted drafts
+- Scores skill outcomes from recent `skill_used` events and task status, then updates
+  `governance_status` (`active` / `watch` / `quarantine` / `retired`) with canary gating
+- Persists summary events as:
+  - `self_evolution_tick` (rules learned / skills learned / skills scored)
+  - `skill_governance_tick` (status distribution and transitions)
+
+This is independent of manual GC commands: you can still run `gc_run`, `gc_adopt`, and `learn_*` on demand.
 
 ## GC Learn Pipeline (Self-Improving Rules)
 
@@ -589,6 +602,7 @@ RuleEngine / SkillStore (permanently prevents recurrence)
 - **Timing:** Run `gc_run` after accumulating 50+ tasks for meaningful signals. Running too early produces noise.
 - **learn_rules is synchronous:** It blocks until the agent finishes. If other tasks are running, the agent may queue — consider running learn when the server is idle.
 - **Manual review:** Always inspect draft content before adopting. Draft quality depends on agent capability and available context.
+- **Auto learning:** Even without manual `learn_*` calls, scheduler ticks will run periodic self-evolution and log results in `self_evolution_tick`.
 
 ## CLI Commands
 

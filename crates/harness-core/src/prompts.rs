@@ -1,6 +1,6 @@
 //! Prompt templates and output parsers shared across CLI and HTTP entries.
 
-use crate::config::GitConfig;
+use crate::config::project::GitConfig;
 
 /// A prompt decomposed into its static, semi-static, and dynamic layers.
 ///

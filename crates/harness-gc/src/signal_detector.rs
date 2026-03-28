@@ -1,4 +1,4 @@
-use harness_core::{
+use harness_core::types::{
     Decision, Event, ExternalSignal, ProjectId, RemediationType, Signal, SignalType, Violation,
 };
 use serde::{Deserialize, Serialize};
@@ -29,8 +29,8 @@ impl Default for SignalThresholds {
     }
 }
 
-impl From<harness_core::config::SignalThresholdsConfig> for SignalThresholds {
-    fn from(t: harness_core::config::SignalThresholdsConfig) -> Self {
+impl From<harness_core::config::misc::SignalThresholdsConfig> for SignalThresholds {
+    fn from(t: harness_core::config::misc::SignalThresholdsConfig) -> Self {
         Self {
             repeated_warn_min: t.repeated_warn_min,
             chronic_block_min: t.chronic_block_min,
@@ -333,7 +333,7 @@ impl SignalDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{
+    use harness_core::types::{
         Decision, Event, ExternalSignal, ProjectId, SessionId, Severity, SignalType, Violation,
     };
     use std::path::PathBuf;
@@ -449,7 +449,7 @@ mod tests {
         let det = detector();
         let violations: Vec<Violation> = (0..5)
             .map(|_| Violation {
-                rule_id: harness_core::RuleId::from_str("SEC-01"),
+                rule_id: harness_core::types::RuleId::from_str("SEC-01"),
                 file: PathBuf::from("/src/lib.rs"),
                 line: Some(1),
                 message: "issue".to_string(),
@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn signal_thresholds_from_config_maps_all_fields() {
-        let config = harness_core::config::SignalThresholdsConfig {
+        let config = harness_core::config::misc::SignalThresholdsConfig {
             repeated_warn_min: 3,
             chronic_block_min: 2,
             hot_file_edits_min: 7,
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn detector_uses_custom_thresholds_from_config() {
         // Build detector from a config with lower thresholds than default
-        let config = harness_core::config::SignalThresholdsConfig {
+        let config = harness_core::config::misc::SignalThresholdsConfig {
             repeated_warn_min: 2,
             chronic_block_min: 2,
             hot_file_edits_min: 2,

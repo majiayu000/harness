@@ -26,9 +26,9 @@ macro_rules! validate_root {
         match $crate::handlers::validate_project_root($path, $home) {
             Ok(p) => p,
             Err(e) => {
-                return harness_protocol::RpcResponse::error(
+                return harness_protocol::methods::RpcResponse::error(
                     $id,
-                    harness_protocol::INTERNAL_ERROR,
+                    harness_protocol::methods::INTERNAL_ERROR,
                     e,
                 )
             }

@@ -12,6 +12,7 @@ interface RecordedCall {
   url: string;
   method: string;
   params: Record<string, unknown>;
+  headers: Record<string, string>;
 }
 
 function createMockFetch(
@@ -38,7 +39,12 @@ function createMockFetch(
         id: number;
       };
 
-      calls.push({ url, method: payload.method, params: payload.params });
+      calls.push({
+        url,
+        method: payload.method,
+        params: payload.params,
+        headers: init.headers,
+      });
       const result = handler(payload.method, payload.params);
       const envelope = {
         jsonrpc: "2.0",
@@ -292,4 +298,23 @@ test("raises HarnessRpcError when server returns JSON-RPC error", async () => {
     assert.equal(error.code, -32001);
     return true;
   });
+});
+
+test("adds bearer token header when apiToken is configured", async () => {
+  const mock = createMockFetch((method) => {
+    if (method === "thread/start") {
+      return { result: { thread_id: "thread-auth" } };
+    }
+    return { result: {} };
+  });
+
+  const harness = new Harness({
+    fetch: mock.fetch,
+    cwd: "/repo",
+    apiToken: "token-123",
+  });
+  await harness.startThread();
+
+  assert.equal(mock.calls.length, 1);
+  assert.equal(mock.calls[0]?.headers.authorization, "Bearer token-123");
 });

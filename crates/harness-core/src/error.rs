@@ -1,3 +1,4 @@
+use crate::config::agents::SandboxMode;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -71,7 +72,7 @@ pub enum HarnessError {
 pub enum SandboxError {
     #[error("sandbox mode `{mode}` is unsupported on `{platform}`")]
     UnsupportedPlatform {
-        mode: crate::SandboxMode,
+        mode: SandboxMode,
         platform: &'static str,
     },
     #[error("sandbox tool not found: {0}")]
@@ -81,7 +82,7 @@ pub enum SandboxError {
     #[error("sandbox helper `{helper}` does not support mode `{mode}`")]
     InvalidHelperMode {
         helper: &'static str,
-        mode: crate::SandboxMode,
+        mode: SandboxMode,
     },
 }
 
@@ -89,6 +90,12 @@ pub enum SandboxError {
 pub enum TaskDbDecodeError {
     #[error("failed to deserialize rounds for task `{task_id}`")]
     RoundsDeserialize {
+        task_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to deserialize depends_on for task `{task_id}`")]
+    DependsOnDeserialize {
         task_id: String,
         #[source]
         source: serde_json::Error,

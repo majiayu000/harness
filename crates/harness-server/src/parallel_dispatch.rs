@@ -1,6 +1,8 @@
 use crate::task_runner::TaskId;
 use crate::workspace::WorkspaceManager;
-use harness_core::{AgentRequest, AgentResponse, CodeAgent, ContextItem};
+use harness_core::{
+    agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, types::ContextItem,
+};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -183,7 +185,7 @@ pub async fn run_parallel_subtasks(
     let mut sub_ids: Vec<Option<TaskId>> = Vec::with_capacity(count);
 
     for (i, spec) in subtasks.into_iter().enumerate() {
-        let sub_id = TaskId(format!("{}-p{i}", task_id.0));
+        let sub_id = harness_core::types::TaskId(format!("{}-p{i}", task_id.0));
         match workspace_mgr
             .create_workspace(&sub_id, source_repo, remote, base_branch)
             .await

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -144,18 +145,73 @@ pub struct ProjectConfig {
 
 /// Load project config from `{project_root}/.harness/config.toml`.
 ///
-/// Returns `ProjectConfig::default()` if the file does not exist or cannot
-/// be parsed, so the caller never needs to handle an error.
-pub fn load_project_config(project_root: &Path) -> ProjectConfig {
+/// Returns `ProjectConfig::default()` when the file is absent.
+/// Returns an error when the file exists but cannot be read or parsed.
+pub fn load_project_config(project_root: &Path) -> anyhow::Result<ProjectConfig> {
     let path = project_root.join(".harness").join("config.toml");
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return ProjectConfig::default();
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ProjectConfig::default()),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("failed to read project config at {}", path.display()));
+        }
     };
-    toml::from_str(&contents).unwrap_or_else(|e| {
-        eprintln!(
-            "warning: failed to parse project config at {}: {e}",
-            path.display()
+    toml::from_str(&contents)
+        .with_context(|| format!("failed to parse project config at {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_project_config_returns_default_when_file_missing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = load_project_config(dir.path())?;
+        assert_eq!(config.git.base_branch, "main");
+        assert_eq!(config.git.remote, "origin");
+        assert_eq!(config.review_type, ReviewType::Mixed);
+        Ok(())
+    }
+
+    #[test]
+    fn load_project_config_returns_error_on_parse_failure() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let harness_dir = dir.path().join(".harness");
+        std::fs::create_dir_all(&harness_dir)?;
+        std::fs::write(harness_dir.join("config.toml"), "git = [")?;
+
+        let err = load_project_config(dir.path()).expect_err("invalid toml should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to parse project config"),
+            "unexpected error: {msg}"
         );
-        ProjectConfig::default()
-    })
+        Ok(())
+    }
+
+    #[test]
+    fn load_project_config_reads_valid_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let harness_dir = dir.path().join(".harness");
+        std::fs::create_dir_all(&harness_dir)?;
+        std::fs::write(
+            harness_dir.join("config.toml"),
+            r#"
+[git]
+base_branch = "develop"
+remote = "upstream"
+branch_prefix = "featx/"
+
+review_type = "rust"
+"#,
+        )?;
+
+        let config = load_project_config(dir.path())?;
+        assert_eq!(config.git.base_branch, "develop");
+        assert_eq!(config.git.remote, "upstream");
+        assert_eq!(config.git.branch_prefix, "featx/");
+        Ok(())
+    }
 }

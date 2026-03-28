@@ -10,11 +10,13 @@ mod common;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use harness_agents::AgentRegistry;
-use harness_core::{
-    AgentRequest, AgentResponse, Artifact, ArtifactType, Capability, CodeAgent, Draft, DraftId,
-    DraftStatus, HarnessConfig, HarnessError, ProjectId, RemediationType, Signal, SignalType,
-    StreamItem, TokenUsage,
+use harness_agents::registry::AgentRegistry;
+use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+use harness_core::config::HarnessConfig;
+use harness_core::error::HarnessError;
+use harness_core::types::{
+    Artifact, ArtifactType, Capability, Draft, DraftId, DraftStatus, ProjectId, RemediationType,
+    Signal, SignalType, TokenUsage,
 };
 use harness_server::{
     handlers::gc::gc_adopt, http::build_app_state, server::HarnessServer,
@@ -40,7 +42,7 @@ impl CodeAgent for MockPrAgent {
         vec![Capability::Read, Capability::Write]
     }
 
-    async fn execute(&self, _req: AgentRequest) -> harness_core::Result<AgentResponse> {
+    async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         Ok(AgentResponse {
             output: "Created branch gc/test-draft.\nPR_URL=https://github.com/owner/repo/pull/99"
                 .to_string(),
@@ -56,7 +58,7 @@ impl CodeAgent for MockPrAgent {
         &self,
         req: AgentRequest,
         tx: Sender<StreamItem>,
-    ) -> harness_core::Result<()> {
+    ) -> harness_core::error::Result<()> {
         let resp = self.execute(req).await?;
         tx.send(StreamItem::MessageDelta { text: resp.output })
             .await
@@ -92,6 +94,23 @@ async fn make_state_with_auto_pr(
     let mut registry = AgentRegistry::new("mock-pr");
     registry.register("mock-pr", Arc::new(MockPrAgent));
 
+    let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+    build_app_state(server).await
+}
+
+async fn make_state_without_default_agent(
+    root: &Path,
+) -> anyhow::Result<harness_server::http::AppState> {
+    let project_root = root.join("project");
+    std::fs::create_dir_all(&project_root)?;
+
+    let mut config = HarnessConfig::default();
+    config.server.data_dir = root.join("server-data");
+    config.server.project_root = project_root;
+    config.agents.default_agent = "missing".to_string();
+    config.gc.auto_pr = true;
+
+    let registry = AgentRegistry::new("missing");
     let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
     build_app_state(server).await
 }
@@ -195,7 +214,10 @@ async fn gc_adopt_unknown_draft_returns_not_found() -> anyhow::Result<()> {
     let resp = gc_adopt(&state, Some(serde_json::json!(1)), unknown_id).await;
 
     assert!(resp.error.is_some(), "expected error for unknown draft");
-    assert_eq!(resp.error.unwrap().code, harness_protocol::NOT_FOUND);
+    assert_eq!(
+        resp.error.unwrap().code,
+        harness_protocol::methods::NOT_FOUND
+    );
 
     Ok(())
 }
@@ -256,6 +278,39 @@ async fn gc_adopt_auto_pr_true_dispatches_task() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// gc_adopt with auto_pr=true fails before adopt when no default agent is registered.
+#[tokio::test]
+async fn gc_adopt_auto_pr_requires_default_agent() -> anyhow::Result<()> {
+    let sandbox = common::tempdir_in_home("gc-adopt-no-default-agent-")?;
+    let state = make_state_without_default_agent(sandbox.path()).await?;
+
+    let artifact_rel = std::path::PathBuf::from(".harness/drafts/test-guard.sh");
+    let draft = make_draft(&artifact_rel, "#!/usr/bin/env bash\necho 'guard'");
+    state.engines.gc_agent.draft_store().save(&draft)?;
+
+    let draft_id = draft.id.clone();
+    let resp = gc_adopt(&state, Some(serde_json::json!(1)), draft_id.clone()).await;
+    assert!(resp.error.is_some(), "expected error when default agent is missing");
+
+    let stored = state
+        .engines
+        .gc_agent
+        .draft_store()
+        .get(&draft_id)?
+        .expect("draft should exist");
+    assert_eq!(stored.status, DraftStatus::Pending);
+    assert!(
+        !state
+            .core
+            .project_root
+            .join(".harness/drafts/test-guard.sh")
+            .exists(),
+        "artifact file should not be written when preflight fails"
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Capturing agent — records project_root from AgentRequest (issue #78 regression guard).
 // ---------------------------------------------------------------------------
@@ -274,7 +329,7 @@ impl CodeAgent for CapturingAgent {
         vec![Capability::Read, Capability::Write]
     }
 
-    async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+    async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         *self.captured_root.lock().unwrap() = Some(req.project_root.clone());
         Ok(AgentResponse {
             output: String::new(),
@@ -290,7 +345,7 @@ impl CodeAgent for CapturingAgent {
         &self,
         req: AgentRequest,
         tx: Sender<StreamItem>,
-    ) -> harness_core::Result<()> {
+    ) -> harness_core::error::Result<()> {
         *self.captured_root.lock().unwrap() = Some(req.project_root.clone());
         tx.send(StreamItem::MessageDelta {
             text: String::new(),
@@ -356,7 +411,7 @@ async fn gc_adopt_task_uses_appstate_project_root() -> anyhow::Result<()> {
         .and_then(|r| r.get("task_id"))
         .expect("result must have task_id field");
     assert!(!task_id_val.is_null(), "task_id should be set");
-    let task_id = harness_server::task_runner::TaskId(
+    let task_id = harness_core::types::TaskId(
         task_id_val
             .as_str()
             .expect("task_id should be a string")

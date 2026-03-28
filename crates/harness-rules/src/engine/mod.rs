@@ -1,8 +1,9 @@
 use crate::exec_policy::{
-    ExecPolicy, ExecPolicyCheckOutput, ExecPolicyParser, MatchOptions, RequirementsToml,
+    parser::ExecPolicyParser, requirements::RequirementsToml, ExecPolicy, ExecPolicyCheckOutput,
+    MatchOptions,
 };
 use anyhow::Context;
-use harness_core::{
+use harness_core::types::{
     AutoFixAttempt, AutoFixReport, Category, GuardId, Language, RuleId, Severity, Violation,
 };
 use regex::Regex;

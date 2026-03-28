@@ -1,6 +1,6 @@
 use anyhow::Context;
-use harness_agents::{claude::ClaudeCodeAgent, codex::CodexAgent, AgentRegistry};
-use harness_core::{prompts, AgentRequest, HarnessConfig, ThreadId};
+use harness_agents::{claude::ClaudeCodeAgent, codex::CodexAgent, registry::AgentRegistry};
+use harness_core::{agent::AgentRequest, config::HarnessConfig, prompts, types::ThreadId};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;

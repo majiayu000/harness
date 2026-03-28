@@ -1,4 +1,4 @@
-use harness_core::{Decision, Event, Grade};
+use harness_core::{types::Decision, types::Event, types::Grade};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -206,7 +206,7 @@ pub fn compute_rule_trends(events: &[Event], period_days: u32) -> Vec<RuleTrend>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Decision, Event, SessionId};
+    use harness_core::{types::Decision, types::Event, types::SessionId};
 
     fn make_event(hook: &str, decision: Decision) -> Event {
         Event::new(SessionId::new(), hook, "Edit", decision)

@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use harness_core::{
-    interceptor::{InterceptResult, PostExecuteResult, TurnInterceptor},
-    prompts, AgentRequest, AgentResponse, ValidationConfig,
-};
+use harness_core::agent::{AgentRequest, AgentResponse};
+use harness_core::config::misc::ValidationConfig;
+use harness_core::interceptor::{InterceptResult, PostExecuteResult, TurnInterceptor};
+use harness_core::prompts;
 use std::path::Path;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
@@ -299,7 +299,10 @@ impl TurnInterceptor for PostExecutionValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{AgentRequest, AgentResponse, TokenUsage, ValidationConfig};
+    use harness_core::{
+        agent::AgentRequest, agent::AgentResponse, config::misc::ValidationConfig,
+        types::TokenUsage,
+    };
     use std::path::PathBuf;
 
     fn make_req(project_root: PathBuf) -> AgentRequest {
@@ -389,7 +392,7 @@ mod tests {
         let v = PostExecutionValidator::new(ValidationConfig::default());
         let req = make_req(dir.path().to_path_buf());
         let result = v.pre_execute(&req).await;
-        assert_eq!(result.decision, harness_core::Decision::Pass);
+        assert_eq!(result.decision, harness_core::types::Decision::Pass);
     }
 
     #[test]

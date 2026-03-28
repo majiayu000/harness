@@ -1,4 +1,4 @@
-use harness_core::{RemediationType, SignalType};
+use harness_core::{types::RemediationType, types::SignalType};
 
 /// Map signal types to their recommended remediation artifact types.
 pub fn recommended_remediation(signal_type: SignalType) -> RemediationType {

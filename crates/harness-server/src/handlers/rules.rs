@@ -1,5 +1,5 @@
 use crate::{http::AppState, validate_root};
-use harness_protocol::{RpcResponse, INTERNAL_ERROR};
+use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR};
 use std::path::PathBuf;
 
 pub async fn rule_load(
@@ -104,8 +104,8 @@ pub async fn rule_check(
 #[cfg(test)]
 mod tests {
     use super::rule_check;
-    use harness_core::{EventFilters, GuardId, Language};
-    use harness_protocol::INTERNAL_ERROR;
+    use harness_core::{types::EventFilters, types::GuardId, types::Language};
+    use harness_protocol::methods::INTERNAL_ERROR;
     use harness_rules::engine::{Guard, WARN_EMPTY_SCAN_INPUT, WARN_NO_GUARDS_REGISTERED};
     use std::path::PathBuf;
 

@@ -15,10 +15,10 @@
 | App Server (Thread/Turn/Item) | 55% | Core methods routed, Thread+Task persisted to SQLite | Missing: real streaming, approval flow, full WS handshake |
 | GC Agent | 60% | Signal detection + draft lifecycle + adopt pipeline | Missing: auto PR creation, artifact parsing, incremental scanning |
 | Taste Invariants | 65% | 83 rules deployed, QualityGrader 4-axis scoring | Missing: auto-fix, guard script library, real-time hook integration |
-| Improvement Cycles | 35% | ExecPlan Markdown serialization, MEMORY.md via remem | Missing: ExecPlan DB persistence, skill usage stats, auto-trigger |
+| Improvement Cycles | 58% | ExecPlan + MEMORY.md + skill usage telemetry + periodic self-evolution tick + skill governance scoring | Missing: effect attribution dashboard, configurable policy orchestration |
 | Feedback Loops | 40% | EventStore (JSONL), QualityGrader, GC signal detection | Missing: EventLog/EventQuery routing, external signals, telemetry export |
 | Multi-Agent Coordination | 25% | AgentRegistry multi-agent routing, async task spawn | Missing: true parallel dispatch, TaskClassification use, agent isolation |
-| Skill System | 50% | 4-layer discovery, CRUD CLI, trigger_patterns field | Missing: auto-injection, persistence, routing, trigger_patterns parsing |
+| Skill System | 78% | 4-layer discovery, persistence, CRUD routing, auto-injection, trigger_patterns parsing, outcome-driven governance state | Missing: impact attribution dashboard and manual override workflow |
 
 ## Dimension Details
 
@@ -93,20 +93,22 @@
 
 **Effort to close**: ~1 week — guard script development + hook injection
 
-### 5. Improvement Cycles — Capability Evolution Tracking (35%)
+### 5. Improvement Cycles — Capability Evolution Tracking (58%)
 
 **What we have:**
 - ExecPlan (`harness-exec`) implements full plan management: purpose/milestones/steps/decision_log/surprises/validation
 - ExecPlan supports Markdown serialization/deserialization (cross-session resume)
 - `harness plan init/status` CLI commands
 - MEMORY.md system (via remem MCP) tracks project decision history
+- Skill usage persistence (`usage_count`/`last_used`) with runtime `skill_used` telemetry
+- Scheduler-level self-evolution tick periodically runs `learn_rules` + `learn_skills`
 
 **What's missing:**
 1. **ExecPlan not persisted to DB**: Only saved as markdown files in CWD, can't list all plans via API or filter by project
-2. **No capability evolution tracking**: OpenAI tracks "which skill used how many times, with what effect"; our Skill system has no usage stats
+2. **Capability effect attribution is incomplete**: usage is tracked, but we still lack per-skill success/failure impact views
 3. **No document freshness checking**: No mechanism to detect stale rules/skills (OpenAI has "freshness score")
 4. **ExecPlanUpdate not implemented**: Protocol method exists but router returns METHOD_NOT_FOUND
-5. **No automatic improvement triggers**: Can't auto-trigger GC → fix → ExecPlan update based on quality scores
+5. **Automatic triggers are partial**: periodic self-evolution exists, but not yet policy-driven by quality thresholds or cross-project scheduling
 
 **Effort to close**: ~2 weeks — ExecPlan SQLite storage + skill usage stats + auto-trigger logic
 
@@ -145,7 +147,7 @@
 
 **Effort to close**: ~2-3 weeks — task decomposition logic + parallel spawn + agent isolation mechanism
 
-### 8. Skill System — Team Knowledge Accumulation (50%)
+### 8. Skill System — Team Knowledge Accumulation (78%)
 
 **What we have:**
 - `harness-skills` crate with 4-layer discovery: repo(.harness/skills/) → user(~/.harness/skills/) → admin(/etc/harness/) → system
@@ -154,16 +156,16 @@
 - Deduplication: same-name skills keep highest priority by location (repo > user > admin > system)
 - CLI: `harness skill list/create/delete`
 - Protocol: `SkillCreate/SkillList/SkillGet/SkillDelete` methods declared
+- Matched skills auto-inject into agent prompt/context, and usage is persisted
+- Server and CLI both load persisted skills from disk on startup
 
 **What's missing:**
-1. **Skills not auto-injected into agent context**: `AgentRequest.context: Vec<ContextItem>` has `ContextItem::Skill` variant, but no code queries SkillStore and injects matching skills when building AgentRequest
-2. **SkillStore not persisted**: `create()` adds to in-memory Vec, lost on process exit (no file write, no DB)
-3. **Skill methods not routed**: SkillCreate/SkillList all return METHOD_NOT_FOUND
-4. **trigger_patterns always empty**: load_from_dir loads skills with `trigger_patterns: Vec::new()`, so match_context always returns empty
-5. **No skill versioning**: version field fixed at "1.0.0", no change tracking
-6. **GC-generated skills not registered**: GcAgent Skill artifacts written to `.harness/drafts/`, adopt `fs::write` to target_path, not registered in SkillStore
+1. **No operator-facing attribution dashboard**: per-skill score/state exists in data model, but there is no dedicated dashboard/CLI view for trend analysis.
+2. **Governance policy is not configurable**: score windows, thresholds, and canary ratio are hardcoded (not per project / environment).
+3. **No manual override workflow**: maintainers cannot explicitly pin/unretire a skill via dedicated API or policy layer.
+4. **Versioning remains lightweight**: basic version field exists, but no migration/change-history workflow.
 
-**Effort to close**: ~1 week — persistence + auto-injection + trigger_patterns parsing
+**Effort to close**: ~4-6 days — observability surface + configurable policy + manual overrides
 
 ## Highest-ROI Improvements (by effort/impact ratio)
 

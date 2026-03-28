@@ -1,4 +1,4 @@
-use harness_protocol::{RpcResponse, INTERNAL_ERROR};
+use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR};
 
 pub async fn task_classify(
     id: Option<serde_json::Value>,

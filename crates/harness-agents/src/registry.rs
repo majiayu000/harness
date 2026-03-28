@@ -1,4 +1,7 @@
-use harness_core::{AgentAdapter, CodeAgent, HarnessError, TaskClassification, TaskComplexity};
+use harness_core::{
+    agent::AgentAdapter, agent::CodeAgent, agent::TaskClassification, agent::TaskComplexity,
+    error::HarnessError,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -58,7 +61,10 @@ impl AgentRegistry {
             .and_then(|name| self.get(name))
     }
 
-    pub fn dispatch(&self, task: &TaskClassification) -> harness_core::Result<Arc<dyn CodeAgent>> {
+    pub fn dispatch(
+        &self,
+        task: &TaskClassification,
+    ) -> harness_core::error::Result<Arc<dyn CodeAgent>> {
         let preferred = match task.complexity {
             TaskComplexity::Critical | TaskComplexity::Complex => self
                 .complexity_preferred_agents
@@ -115,8 +121,9 @@ impl AdapterRegistry {
 mod tests {
     use super::*;
     use harness_core::{
-        AgentEvent, AgentRequest, AgentResponse, Capability, CodeAgent, StreamItem,
-        TaskClassification, TaskComplexity, TokenUsage, TurnRequest,
+        agent::AgentEvent, agent::AgentRequest, agent::AgentResponse, agent::CodeAgent,
+        agent::StreamItem, agent::TaskClassification, agent::TaskComplexity, agent::TurnRequest,
+        types::Capability, types::TokenUsage,
     };
 
     struct StubAgent {
@@ -133,7 +140,7 @@ mod tests {
             vec![]
         }
 
-        async fn execute(&self, _req: AgentRequest) -> harness_core::Result<AgentResponse> {
+        async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
             Ok(AgentResponse {
                 output: String::new(),
                 stderr: String::new(),
@@ -153,7 +160,7 @@ mod tests {
             &self,
             _req: AgentRequest,
             _tx: tokio::sync::mpsc::Sender<StreamItem>,
-        ) -> harness_core::Result<()> {
+        ) -> harness_core::error::Result<()> {
             Ok(())
         }
     }
@@ -311,11 +318,11 @@ mod tests {
             &self,
             _req: TurnRequest,
             _tx: tokio::sync::mpsc::Sender<AgentEvent>,
-        ) -> harness_core::Result<()> {
+        ) -> harness_core::error::Result<()> {
             Ok(())
         }
 
-        async fn interrupt(&self) -> harness_core::Result<()> {
+        async fn interrupt(&self) -> harness_core::error::Result<()> {
             Ok(())
         }
     }

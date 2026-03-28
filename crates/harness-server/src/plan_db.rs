@@ -1,6 +1,6 @@
-use crate::db::Db;
-use harness_core::{ExecPlanId, ExecPlanStatus};
-use harness_exec::ExecPlan;
+use harness_core::db::Db;
+use harness_core::{types::ExecPlanId, types::ExecPlanStatus};
+use harness_exec::plan::ExecPlan;
 use std::path::Path;
 
 pub struct PlanDb {
@@ -128,7 +128,7 @@ impl PlanDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::ExecPlanStatus;
+    use harness_core::types::ExecPlanStatus;
 
     #[tokio::test]
     async fn plan_db_roundtrip() -> anyhow::Result<()> {

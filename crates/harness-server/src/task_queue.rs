@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use harness_core::config::ConcurrencyConfig;
+use harness_core::config::misc::ConcurrencyConfig;
 use serde::Serialize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

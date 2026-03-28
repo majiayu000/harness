@@ -1,6 +1,6 @@
 use crate::plan::{ExecPlan, Milestone, Step, ValidationCriteria};
 use chrono::Utc;
-use harness_core::{ExecPlanId, ExecPlanStatus};
+use harness_core::{types::ExecPlanId, types::ExecPlanStatus};
 use std::path::PathBuf;
 
 pub fn to_markdown(plan: &ExecPlan) -> String {

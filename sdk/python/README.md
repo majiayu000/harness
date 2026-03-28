@@ -24,6 +24,18 @@ result = thread.run(
 print(result.status, result.output)
 ```
 
+### Authenticated server
+
+When the server is configured with `api_token`, pass `api_token`:
+
+```python
+harness = Harness(
+    base_url="http://127.0.0.1:9800",
+    cwd="/repo",
+    api_token="your-token",
+)
+```
+
 ### Stream events explicitly
 
 ```python

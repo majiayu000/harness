@@ -11,7 +11,7 @@ use crate::task_runner::{TaskId, TaskStatus};
 
 /// Feishu (飞书) Bot intake — webhook-driven task creation from chat messages.
 pub struct FeishuIntake {
-    pub(crate) config: harness_core::FeishuIntakeConfig,
+    pub(crate) config: harness_core::config::intake::FeishuIntakeConfig,
     http: reqwest::Client,
     /// message_id → task_id, for deduplication and on_task_complete lookup.
     dispatched: DashMap<String, TaskId>,
@@ -25,7 +25,7 @@ struct TokenResponse {
 }
 
 impl FeishuIntake {
-    pub fn new(config: harness_core::FeishuIntakeConfig) -> Self {
+    pub fn new(config: harness_core::config::intake::FeishuIntakeConfig) -> Self {
         Self {
             config,
             http: reqwest::Client::new(),
@@ -181,7 +181,7 @@ impl IntakeSource for FeishuIntake {
 ///
 /// Returns true if no verification_token is configured (open mode) or if the token matches.
 fn verify_feishu_token(
-    config: &harness_core::FeishuIntakeConfig,
+    config: &harness_core::config::intake::FeishuIntakeConfig,
     payload: &serde_json::Value,
 ) -> bool {
     let Some(expected) = &config.verification_token else {
@@ -338,8 +338,8 @@ pub async fn feishu_webhook(
 mod tests {
     use super::*;
 
-    fn make_feishu_config() -> harness_core::FeishuIntakeConfig {
-        harness_core::FeishuIntakeConfig {
+    fn make_feishu_config() -> harness_core::config::intake::FeishuIntakeConfig {
+        harness_core::config::intake::FeishuIntakeConfig {
             enabled: true,
             app_id: None,
             app_secret: None,

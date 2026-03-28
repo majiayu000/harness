@@ -1,13 +1,15 @@
 use crate::task_db::TaskDb;
 use dashmap::DashMap;
-pub use harness_core::TaskId;
-use harness_core::{CodeAgent, Decision, Event, SessionId, StreamItem};
+use harness_core::agent::{CodeAgent, StreamItem};
+use harness_core::types::{Decision, Event, SessionId, TaskId as CoreTaskId};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
+
+pub type TaskId = CoreTaskId;
 
 /// Broadcast channel capacity for per-task stream events.
 /// When the buffer is full, the oldest events are dropped for lagging receivers.
@@ -331,7 +333,7 @@ pub(crate) async fn fill_missing_repo_from_project(req: &mut CreateTaskRequest) 
     let Some(project) = req.project.as_deref() else {
         return;
     };
-    req.repo = crate::task_executor::detect_repo_slug(project).await;
+    req.repo = crate::task_executor::pr_detection::detect_repo_slug(project).await;
 }
 
 /// Detect the main git worktree root using a blocking subprocess call.
@@ -371,6 +373,16 @@ fn default_turn_timeout() -> u64 {
     // regularly exceed the previous 10-minute default when running CI checks,
     // building dependencies from source, or iterating on review feedback.
     3600
+}
+
+/// Convert a user-facing timeout value to a Duration.
+/// `0` means "no timeout" and maps to ~277 hours (effectively unlimited).
+pub(crate) fn effective_turn_timeout(secs: u64) -> tokio::time::Duration {
+    if secs == 0 {
+        tokio::time::Duration::from_secs(999_999)
+    } else {
+        tokio::time::Duration::from_secs(secs)
+    }
 }
 fn default_stall_timeout() -> u64 {
     300
@@ -422,7 +434,7 @@ pub(crate) async fn resolve_canonical_project(project: Option<PathBuf>) -> anyho
 }
 
 async fn log_task_failure_event(
-    events: &harness_observe::EventStore,
+    events: &harness_observe::event_store::EventStore,
     task_id: &TaskId,
     reason: &str,
 ) {
@@ -478,7 +490,7 @@ fn is_transient_error(reason: &str) -> bool {
 /// Record a task failure, marking the task as failed.
 async fn record_task_failure(
     store: &TaskStore,
-    events: &harness_observe::EventStore,
+    events: &harness_observe::event_store::EventStore,
     task_id: &TaskId,
     reason: String,
 ) {
@@ -863,9 +875,9 @@ pub async fn spawn_task(
     store: Arc<TaskStore>,
     agent: Arc<dyn CodeAgent>,
     reviewer: Option<Arc<dyn CodeAgent>>,
-    server_config: std::sync::Arc<harness_core::HarnessConfig>,
-    skills: Arc<RwLock<harness_skills::SkillStore>>,
-    events: Arc<harness_observe::EventStore>,
+    server_config: std::sync::Arc<harness_core::config::HarnessConfig>,
+    skills: Arc<RwLock<harness_skills::store::SkillStore>>,
+    events: Arc<harness_observe::event_store::EventStore>,
     interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     req: CreateTaskRequest,
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
@@ -919,9 +931,9 @@ pub async fn spawn_preregistered_task(
     store: Arc<TaskStore>,
     agent: Arc<dyn CodeAgent>,
     reviewer: Option<Arc<dyn CodeAgent>>,
-    server_config: std::sync::Arc<harness_core::HarnessConfig>,
-    skills: Arc<RwLock<harness_skills::SkillStore>>,
-    events: Arc<harness_observe::EventStore>,
+    server_config: std::sync::Arc<harness_core::config::HarnessConfig>,
+    skills: Arc<RwLock<harness_skills::store::SkillStore>>,
+    events: Arc<harness_observe::event_store::EventStore>,
     interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     req: CreateTaskRequest,
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
@@ -952,9 +964,9 @@ async fn spawn_task_with_worktree_detector<F>(
     store: Arc<TaskStore>,
     agent: Arc<dyn CodeAgent>,
     reviewer: Option<Arc<dyn CodeAgent>>,
-    server_config: std::sync::Arc<harness_core::HarnessConfig>,
-    skills: Arc<RwLock<harness_skills::SkillStore>>,
-    events: Arc<harness_observe::EventStore>,
+    server_config: std::sync::Arc<harness_core::config::HarnessConfig>,
+    skills: Arc<RwLock<harness_skills::store::SkillStore>>,
+    events: Arc<harness_observe::event_store::EventStore>,
     interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     mut req: CreateTaskRequest,
     detect_worktree: F,
@@ -1006,7 +1018,7 @@ where
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         if req.repo.is_none() {
-            req.repo = crate::task_executor::detect_repo_slug(&project_root).await;
+            req.repo = crate::task_executor::pr_detection::detect_repo_slug(&project_root).await;
         }
         let description = summarize_request_description(&req);
         if let Some(mut entry) = store.cache.get_mut(&id) {
@@ -1029,7 +1041,8 @@ where
         );
         let is_complex = matches!(
             classification.complexity,
-            harness_core::TaskComplexity::Complex | harness_core::TaskComplexity::Critical
+            harness_core::agent::TaskComplexity::Complex
+                | harness_core::agent::TaskComplexity::Critical
         );
         let is_review = req.source.as_deref() == Some("periodic_review");
         if req.issue.is_none() && req.pr.is_none() && is_complex && !is_review {
@@ -1065,27 +1078,35 @@ where
                             })
                             .collect();
                     }
-                    let project_config = harness_core::config::load_project_config(&project_root);
+                    let project_config = harness_core::config::project::load_project_config(
+                        &project_root,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to load project config for {}: {e}",
+                            project_root.display()
+                        )
+                    })?;
                     let remote = project_config.git.remote.clone();
                     let base_branch = project_config.git.base_branch.clone();
 
                     // Register subtask IDs in the parent before dispatch.
                     let sub_ids: Vec<TaskId> = (0..subtask_specs.len())
-                        .map(|i| TaskId(format!("{}-p{i}", id.0)))
+                        .map(|i| harness_core::types::TaskId(format!("{}-p{i}", id.0)))
                         .collect();
                     mutate_and_persist(&store, &id, |s| {
                         s.subtask_ids = sub_ids.clone();
                     })
                     .await?;
 
-                    let context_items = crate::task_executor::collect_context_items(
+                    let context_items = crate::task_executor::helpers::collect_context_items(
                         &skills,
                         &project_root,
                         req.prompt.as_deref().unwrap_or_default(),
                     )
                     .await;
 
-                    let turn_timeout = tokio::time::Duration::from_secs(req.turn_timeout_secs);
+                    let turn_timeout = effective_turn_timeout(req.turn_timeout_secs);
                     let results = crate::parallel_dispatch::run_parallel_subtasks(
                         &id,
                         agent.clone(),
@@ -1137,7 +1158,13 @@ where
 
         // If workspace isolation is configured, create a per-task git worktree.
         let run_project = if let Some(ref wmgr) = workspace_mgr {
-            let project_config = harness_core::config::load_project_config(&project_root);
+            let project_config = harness_core::config::project::load_project_config(&project_root)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to load project config for {}: {e}",
+                        project_root.display()
+                    )
+                })?;
             wmgr.create_workspace(
                 &id,
                 &project_root,
@@ -1421,17 +1448,15 @@ pub fn check_awaiting_deps(store: &TaskStore) -> Vec<TaskId> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use harness_core::{
-        AgentRequest, AgentResponse, Capability, ContextItem, EventFilters, ExecutionPhase,
-        StreamItem, TokenUsage,
-    };
+    use harness_core::agent::{AgentRequest, AgentResponse, StreamItem};
+    use harness_core::types::{Capability, ContextItem, EventFilters, ExecutionPhase, TokenUsage};
     use tokio::time::Duration;
 
     #[tokio::test]
     async fn task_stream_subscribe_and_publish() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
-        let id = TaskId("stream-test".to_string());
+        let id = harness_core::types::TaskId("stream-test".to_string());
 
         // No stream registered yet.
         assert!(
@@ -1470,7 +1495,7 @@ mod tests {
     async fn task_stream_backpressure_drops_oldest_on_lag() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
-        let id = TaskId("backpressure-test".to_string());
+        let id = harness_core::types::TaskId("backpressure-test".to_string());
 
         store.register_task_stream(&id);
         let mut rx = store
@@ -1502,21 +1527,23 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
 
-        let parent_id = TaskId("parent-task".to_string());
+        let parent_id = harness_core::types::TaskId("parent-task".to_string());
         let parent = TaskState::new(parent_id.clone());
         store.insert(&parent).await;
 
-        let mut child1 = TaskState::new(TaskId("child-1".to_string()));
+        let mut child1 = TaskState::new(harness_core::types::TaskId("child-1".to_string()));
         child1.parent_id = Some(parent_id.clone());
         store.insert(&child1).await;
 
-        let mut child2 = TaskState::new(TaskId("child-2".to_string()));
+        let mut child2 = TaskState::new(harness_core::types::TaskId("child-2".to_string()));
         child2.parent_id = Some(parent_id.clone());
         store.insert(&child2).await;
 
         // Unrelated task.
         store
-            .insert(&TaskState::new(TaskId("other".to_string())))
+            .insert(&TaskState::new(harness_core::types::TaskId(
+                "other".to_string(),
+            )))
             .await;
 
         let children = store.list_children(&parent_id);
@@ -1525,7 +1552,8 @@ mod tests {
             .iter()
             .all(|c| c.parent_id.as_ref() == Some(&parent_id)));
 
-        let no_children = store.list_children(&TaskId("nonexistent".to_string()));
+        let no_children =
+            store.list_children(&harness_core::types::TaskId("nonexistent".to_string()));
         assert!(no_children.is_empty());
         Ok(())
     }
@@ -1549,14 +1577,14 @@ mod tests {
         let project = PathBuf::from("/repo/project");
         let other_project = PathBuf::from("/repo/other");
 
-        let current_id = TaskId("current".to_string());
+        let current_id = harness_core::types::TaskId("current".to_string());
         let mut current = TaskState::new(current_id.clone());
         current.project_root = Some(project.clone());
         current.status = TaskStatus::Implementing;
         store.insert(&current).await;
 
         // Sibling on same project in Implementing status.
-        let mut sibling1 = TaskState::new(TaskId("sibling-1".to_string()));
+        let mut sibling1 = TaskState::new(harness_core::types::TaskId("sibling-1".to_string()));
         sibling1.project_root = Some(project.clone());
         sibling1.status = TaskStatus::Implementing;
         sibling1.issue = Some(77);
@@ -1564,19 +1592,19 @@ mod tests {
         store.insert(&sibling1).await;
 
         // Sibling on same project in Pending status.
-        let mut sibling2 = TaskState::new(TaskId("sibling-2".to_string()));
+        let mut sibling2 = TaskState::new(harness_core::types::TaskId("sibling-2".to_string()));
         sibling2.project_root = Some(project.clone());
         sibling2.status = TaskStatus::Pending;
         store.insert(&sibling2).await;
 
         // Task on a different project — must not appear.
-        let mut other = TaskState::new(TaskId("other-project".to_string()));
+        let mut other = TaskState::new(harness_core::types::TaskId("other-project".to_string()));
         other.project_root = Some(other_project.clone());
         other.status = TaskStatus::Implementing;
         store.insert(&other).await;
 
         // Done task on same project — must not appear.
-        let mut done = TaskState::new(TaskId("done-task".to_string()));
+        let mut done = TaskState::new(harness_core::types::TaskId("done-task".to_string()));
         done.project_root = Some(project.clone());
         done.status = TaskStatus::Done;
         store.insert(&done).await;
@@ -1616,7 +1644,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl harness_core::CodeAgent for CapturingAgent {
+    impl harness_core::agent::CodeAgent for CapturingAgent {
         fn name(&self) -> &str {
             "capturing-mock"
         }
@@ -1625,7 +1653,7 @@ mod tests {
             vec![]
         }
 
-        async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+        async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
             let mut guard = self.captured.lock().await;
             if guard.is_empty() {
                 *guard = req.context.clone();
@@ -1649,7 +1677,7 @@ mod tests {
             &self,
             req: AgentRequest,
             _tx: tokio::sync::mpsc::Sender<StreamItem>,
-        ) -> harness_core::Result<()> {
+        ) -> harness_core::error::Result<()> {
             // Mirror execute(): capture context on first call so tests that
             // verify skill injection work whether execute or execute_stream is called.
             let mut guard = self.captured.lock().await;
@@ -1666,7 +1694,7 @@ mod tests {
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
 
-        let mut skill_store = harness_skills::SkillStore::new();
+        let mut skill_store = harness_skills::store::SkillStore::new();
         skill_store.create(
             "test-skill".to_string(),
             "<!-- trigger-patterns: test task -->\ndo something useful".to_string(),
@@ -1689,7 +1717,7 @@ mod tests {
             ..Default::default()
         };
 
-        let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
+        let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
         let queue = crate::task_queue::TaskQueue::unbounded();
         let permit = queue.acquire("test").await?;
         spawn_task(
@@ -1744,9 +1772,9 @@ mod tests {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
-        let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
+        let skills = Arc::new(RwLock::new(harness_skills::store::SkillStore::new()));
         let agent = CapturingAgent::new();
-        let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
+        let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
 
         let interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>> =
             vec![Arc::new(BlockingInterceptor)];
@@ -1834,9 +1862,9 @@ mod tests {
             .prefix("harness-test-")
             .tempdir_in(&home)?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
-        let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
+        let skills = Arc::new(RwLock::new(harness_skills::store::SkillStore::new()));
         let agent = CapturingAgent::new();
-        let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
+        let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
 
         let req = CreateTaskRequest {
             prompt: Some("panic path".into()),
@@ -1966,7 +1994,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl harness_core::CodeAgent for PhaseCapturingAgent {
+    impl harness_core::agent::CodeAgent for PhaseCapturingAgent {
         fn name(&self) -> &str {
             "phase-capturing-mock"
         }
@@ -1975,7 +2003,7 @@ mod tests {
             vec![]
         }
 
-        async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+        async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
             self.phases.lock().await.push(req.execution_phase);
             let output = self.next_response().await;
             Ok(AgentResponse {
@@ -1992,7 +2020,7 @@ mod tests {
             &self,
             req: AgentRequest,
             tx: tokio::sync::mpsc::Sender<StreamItem>,
-        ) -> harness_core::Result<()> {
+        ) -> harness_core::error::Result<()> {
             self.phases.lock().await.push(req.execution_phase);
             let output = self.next_response().await;
             if !output.is_empty() {
@@ -2012,8 +2040,8 @@ mod tests {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
-        let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
-        let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
+        let skills = Arc::new(RwLock::new(harness_skills::store::SkillStore::new()));
+        let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
 
         // Agent returns empty output (no PR URL) → task completes after implementation.
         let agent = PhaseCapturingAgent::new(vec![String::new()]);
@@ -2065,8 +2093,8 @@ mod tests {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
-        let skills = Arc::new(RwLock::new(harness_skills::SkillStore::new()));
-        let events = Arc::new(harness_observe::EventStore::new(dir.path()).await?);
+        let skills = Arc::new(RwLock::new(harness_skills::store::SkillStore::new()));
+        let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
 
         // Call 1 (execute_stream): return a PR URL to trigger the review loop.
         // Call 2 (execute): return LGTM to complete the review loop.

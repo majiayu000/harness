@@ -1,5 +1,5 @@
 use anyhow::Context;
-use harness_core::SessionId;
+use harness_core::types::SessionId;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 

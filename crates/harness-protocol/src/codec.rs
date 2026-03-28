@@ -1,4 +1,5 @@
-use crate::{RpcNotification, RpcRequest, RpcResponse};
+use crate::methods::{RpcRequest, RpcResponse};
+use crate::notifications::RpcNotification;
 use serde_json;
 
 /// Encode a response to a JSON line (for stdio transport).
@@ -24,7 +25,7 @@ pub fn decode_response(line: &str) -> Result<RpcResponse, serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Method, RpcRequest, RpcResponse};
+    use crate::methods::{Method, RpcRequest, RpcResponse};
     use std::path::PathBuf;
 
     #[test]
@@ -181,8 +182,8 @@ mod tests {
 
     #[test]
     fn notification_serializes_slash_style() -> anyhow::Result<()> {
-        use crate::{Notification, RpcNotification};
-        use harness_core::{ThreadId, TurnId};
+        use crate::notifications::{Notification, RpcNotification};
+        use harness_core::{types::ThreadId, types::TurnId};
 
         let notif = RpcNotification::new(Notification::TurnStarted {
             thread_id: ThreadId::new(),
@@ -193,7 +194,7 @@ mod tests {
 
         let notif = RpcNotification::new(Notification::ThreadStatusChanged {
             thread_id: ThreadId::new(),
-            status: harness_core::ThreadStatus::Active,
+            status: harness_core::types::ThreadStatus::Active,
         });
         let json = serde_json::to_string(&notif)?;
         assert!(

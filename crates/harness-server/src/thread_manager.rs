@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use harness_core::{
-    AgentId, Item, Thread, ThreadId, ThreadStatus, TokenUsage, Turn, TurnId, TurnStatus,
+    types::AgentId, types::Item, types::Thread, types::ThreadId, types::ThreadStatus,
+    types::TokenUsage, types::Turn, types::TurnId, types::TurnStatus,
 };
 use tokio::task::JoinHandle;
 use tracing;
@@ -101,11 +102,10 @@ impl ThreadManager {
         thread_id: &ThreadId,
         input: String,
         agent_id: AgentId,
-    ) -> harness_core::Result<TurnId> {
-        let mut thread = self
-            .threads
-            .get_mut(thread_id.as_str())
-            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(thread_id.to_string()))?;
+    ) -> harness_core::error::Result<TurnId> {
+        let mut thread = self.threads.get_mut(thread_id.as_str()).ok_or_else(|| {
+            harness_core::error::HarnessError::ThreadNotFound(thread_id.to_string())
+        })?;
 
         thread.status = ThreadStatus::Active;
 
@@ -135,11 +135,10 @@ impl ThreadManager {
         thread_id: &ThreadId,
         turn_id: &TurnId,
         target_status: TurnStatus,
-    ) -> harness_core::Result<Option<TokenUsage>> {
-        let mut thread = self
-            .threads
-            .get_mut(thread_id.as_str())
-            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(thread_id.to_string()))?;
+    ) -> harness_core::error::Result<Option<TokenUsage>> {
+        let mut thread = self.threads.get_mut(thread_id.as_str()).ok_or_else(|| {
+            harness_core::error::HarnessError::ThreadNotFound(thread_id.to_string())
+        })?;
 
         let transitioned_usage =
             if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
@@ -167,7 +166,7 @@ impl ThreadManager {
         &self,
         thread_id: &ThreadId,
         turn_id: &TurnId,
-    ) -> harness_core::Result<Option<TokenUsage>> {
+    ) -> harness_core::error::Result<Option<TokenUsage>> {
         self.transition_turn(thread_id, turn_id, TurnStatus::Completed)
     }
 
@@ -175,7 +174,7 @@ impl ThreadManager {
         &self,
         thread_id: &ThreadId,
         turn_id: &TurnId,
-    ) -> harness_core::Result<Option<TokenUsage>> {
+    ) -> harness_core::error::Result<Option<TokenUsage>> {
         self.transition_turn(thread_id, turn_id, TurnStatus::Failed)
     }
 
@@ -183,7 +182,7 @@ impl ThreadManager {
         &self,
         thread_id: &ThreadId,
         turn_id: &TurnId,
-    ) -> harness_core::Result<Option<TokenUsage>> {
+    ) -> harness_core::error::Result<Option<TokenUsage>> {
         self.abort_turn_task(turn_id);
         self.transition_turn(thread_id, turn_id, TurnStatus::Cancelled)
     }
@@ -193,11 +192,10 @@ impl ThreadManager {
         thread_id: &ThreadId,
         turn_id: &TurnId,
         item: Item,
-    ) -> harness_core::Result<()> {
-        let mut thread = self
-            .threads
-            .get_mut(thread_id.as_str())
-            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(thread_id.to_string()))?;
+    ) -> harness_core::error::Result<()> {
+        let mut thread = self.threads.get_mut(thread_id.as_str()).ok_or_else(|| {
+            harness_core::error::HarnessError::ThreadNotFound(thread_id.to_string())
+        })?;
 
         if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
             turn.items.push(item);
@@ -211,11 +209,10 @@ impl ThreadManager {
         thread_id: &ThreadId,
         turn_id: &TurnId,
         usage: TokenUsage,
-    ) -> harness_core::Result<bool> {
-        let mut thread = self
-            .threads
-            .get_mut(thread_id.as_str())
-            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(thread_id.to_string()))?;
+    ) -> harness_core::error::Result<bool> {
+        let mut thread = self.threads.get_mut(thread_id.as_str()).ok_or_else(|| {
+            harness_core::error::HarnessError::ThreadNotFound(thread_id.to_string())
+        })?;
 
         let mut updated = false;
         if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
@@ -244,7 +241,7 @@ impl ThreadManager {
         thread_id: &ThreadId,
         turn_id: &TurnId,
         message: String,
-    ) -> harness_core::Result<Option<TokenUsage>> {
+    ) -> harness_core::error::Result<Option<TokenUsage>> {
         if let Err(e) = self.add_item(thread_id, turn_id, Item::Error { code: -1, message }) {
             tracing::warn!("thread manager: failed to add error item for turn {turn_id}: {e}");
         }
@@ -284,11 +281,10 @@ impl ThreadManager {
         thread_id: &ThreadId,
         turn_id: &TurnId,
         instruction: String,
-    ) -> harness_core::Result<()> {
-        let mut thread = self
-            .threads
-            .get_mut(thread_id.as_str())
-            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(thread_id.to_string()))?;
+    ) -> harness_core::error::Result<()> {
+        let mut thread = self.threads.get_mut(thread_id.as_str()).ok_or_else(|| {
+            harness_core::error::HarnessError::ThreadNotFound(thread_id.to_string())
+        })?;
 
         if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
             turn.items.push(Item::UserMessage {
@@ -300,11 +296,11 @@ impl ThreadManager {
     }
 
     /// Resume an archived thread back to Idle.
-    pub fn resume_thread(&self, id: &ThreadId) -> harness_core::Result<()> {
+    pub fn resume_thread(&self, id: &ThreadId) -> harness_core::error::Result<()> {
         let mut thread = self
             .threads
             .get_mut(id.as_str())
-            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(id.to_string()))?;
+            .ok_or_else(|| harness_core::error::HarnessError::ThreadNotFound(id.to_string()))?;
 
         thread.status = ThreadStatus::Idle;
         thread.updated_at = chrono::Utc::now();
@@ -316,7 +312,7 @@ impl ThreadManager {
         &self,
         id: &ThreadId,
         from_turn: Option<&TurnId>,
-    ) -> harness_core::Result<ThreadId> {
+    ) -> harness_core::error::Result<ThreadId> {
         // Clone eagerly and drop the read guard before any subsequent write to
         // `self.threads`.  DashMap shards reads with a RwLock: holding a read
         // Ref while calling `insert` on a key that hashes to the same shard
@@ -324,7 +320,7 @@ impl ThreadManager {
         let mut new_thread = self
             .threads
             .get(id.as_str())
-            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(id.to_string()))?
+            .ok_or_else(|| harness_core::error::HarnessError::ThreadNotFound(id.to_string()))?
             .clone();
         new_thread.id = ThreadId::new();
         new_thread.status = ThreadStatus::Idle;
@@ -353,14 +349,14 @@ impl ThreadManager {
     }
 
     /// Compact a thread by clearing items from all completed turns.
-    pub fn compact_thread(&self, id: &ThreadId) -> harness_core::Result<()> {
+    pub fn compact_thread(&self, id: &ThreadId) -> harness_core::error::Result<()> {
         let mut thread = self
             .threads
             .get_mut(id.as_str())
-            .ok_or_else(|| harness_core::HarnessError::ThreadNotFound(id.to_string()))?;
+            .ok_or_else(|| harness_core::error::HarnessError::ThreadNotFound(id.to_string()))?;
 
         for turn in &mut thread.turns {
-            if matches!(turn.status, harness_core::TurnStatus::Completed) {
+            if matches!(turn.status, harness_core::types::TurnStatus::Completed) {
                 turn.items.clear();
             }
         }
@@ -378,7 +374,7 @@ impl Default for ThreadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{AgentId, Item, TokenUsage, TurnStatus};
+    use harness_core::{types::AgentId, types::Item, types::TokenUsage, types::TurnStatus};
     use std::path::PathBuf;
 
     #[test]
@@ -552,7 +548,7 @@ mod tests {
     fn find_thread_for_turn_returns_none_for_missing_turn() {
         let tm = ThreadManager::new();
         let _thread_id = tm.start_thread(PathBuf::from("/tmp"));
-        let fake_turn = harness_core::TurnId::from_str("no-such-turn");
+        let fake_turn = harness_core::types::TurnId::from_str("no-such-turn");
         assert!(tm.find_thread_for_turn(&fake_turn).is_none());
     }
 
@@ -638,13 +634,13 @@ mod tests {
         tm.threads_cache()
             .get_mut(thread_id.as_str())
             .ok_or_else(|| anyhow::anyhow!("thread missing before archive"))?
-            .status = harness_core::ThreadStatus::Archived;
+            .status = harness_core::types::ThreadStatus::Archived;
 
         {
             let pre = tm
                 .get_thread(&thread_id)
                 .ok_or_else(|| anyhow::anyhow!("thread missing"))?;
-            assert_eq!(pre.status, harness_core::ThreadStatus::Archived);
+            assert_eq!(pre.status, harness_core::types::ThreadStatus::Archived);
         }
 
         tm.resume_thread(&thread_id)?;
@@ -652,7 +648,7 @@ mod tests {
         let thread = tm
             .get_thread(&thread_id)
             .ok_or_else(|| anyhow::anyhow!("thread missing after resume"))?;
-        assert_eq!(thread.status, harness_core::ThreadStatus::Idle);
+        assert_eq!(thread.status, harness_core::types::ThreadStatus::Idle);
         Ok(())
     }
 
@@ -667,7 +663,7 @@ mod tests {
             .get_thread(&fork_id)
             .ok_or_else(|| anyhow::anyhow!("fork missing"))?;
         assert_eq!(fork.turns.len(), 1);
-        assert_eq!(fork.status, harness_core::ThreadStatus::Idle);
+        assert_eq!(fork.status, harness_core::types::ThreadStatus::Idle);
         assert!(
             fork.turns.iter().all(|t| t.thread_id == fork_id),
             "all inherited turns must reference the fork's thread_id"

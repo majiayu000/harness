@@ -1,7 +1,7 @@
 use crate::{http::AppState, validate_root};
-use harness_core::{EventFilters, Violation};
+use harness_core::{types::EventFilters, types::Violation};
 use harness_observe::{health::generate_health_report, stats};
-use harness_protocol::{RpcResponse, INTERNAL_ERROR};
+use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR};
 use std::path::PathBuf;
 
 pub async fn health_check(
@@ -54,8 +54,8 @@ pub async fn health_check(
 mod tests {
     use super::*;
     use crate::{http::build_app_state, server::HarnessServer, thread_manager::ThreadManager};
-    use harness_agents::AgentRegistry;
-    use harness_core::{GuardId, HarnessConfig, Language};
+    use harness_agents::registry::AgentRegistry;
+    use harness_core::{config::HarnessConfig, types::GuardId, types::Language};
     use harness_rules::engine::Guard;
     use std::path::Path;
     use std::sync::Arc;
@@ -151,7 +151,7 @@ mod tests {
         let events = state
             .observability
             .events
-            .query(&harness_core::EventFilters {
+            .query(&harness_core::types::EventFilters {
                 hook: Some("rule_scan".to_string()),
                 ..Default::default()
             })

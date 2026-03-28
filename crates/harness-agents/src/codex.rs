@@ -3,11 +3,10 @@ use crate::streaming::{
     filter_agent_stderr, log_captured_stderr, send_stream_item, stream_child_output,
 };
 use async_trait::async_trait;
-use harness_core::SandboxMode;
-use harness_core::{
-    AgentRequest, AgentResponse, Capability, CodeAgent, CodexAgentConfig, CodexCloudConfig,
-    StreamItem, TokenUsage,
-};
+use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+use harness_core::config::agents::SandboxMode;
+use harness_core::config::agents::{CodexAgentConfig, CodexCloudConfig};
+use harness_core::types::{Capability, TokenUsage};
 use harness_sandbox::{wrap_command, SandboxSpec};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -51,7 +50,7 @@ impl CodexAgent {
         self
     }
 
-    async fn run_setup_phase(&self, project_root: &Path) -> harness_core::Result<()> {
+    async fn run_setup_phase(&self, project_root: &Path) -> harness_core::error::Result<()> {
         cloud_setup::run_setup_phase(&self.cloud, project_root).await
     }
 
@@ -84,14 +83,14 @@ impl CodeAgent for CodexAgent {
         vec![Capability::Read, Capability::Write, Capability::Execute]
     }
 
-    async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+    async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         self.run_setup_phase(&req.project_root).await?;
 
         let base_args = self.base_args(&req);
         let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
         let wrapped_command =
             wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
-                harness_core::HarnessError::AgentExecution(format!(
+                harness_core::error::HarnessError::AgentExecution(format!(
                     "sandbox setup failed for codex: {error}"
                 ))
             })?;
@@ -113,10 +112,12 @@ impl CodeAgent for CodexAgent {
         }
 
         let child = cmd.spawn().map_err(|err| {
-            harness_core::HarnessError::AgentExecution(format!("failed to run codex: {err}"))
+            harness_core::error::HarnessError::AgentExecution(format!("failed to run codex: {err}"))
         })?;
         let output = child.wait_with_output().await.map_err(|err| {
-            harness_core::HarnessError::AgentExecution(format!("failed to wait for codex: {err}"))
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to wait for codex: {err}"
+            ))
         })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -130,12 +131,12 @@ impl CodeAgent for CodexAgent {
                 || stderr_lower.contains("payment required")
                 || stderr_lower.contains("insufficient available balance")
             {
-                return Err(harness_core::HarnessError::QuotaExhausted(format!(
+                return Err(harness_core::error::HarnessError::QuotaExhausted(format!(
                     "codex quota exhausted (exit {}): {stderr}",
                     output.status
                 )));
             }
-            return Err(harness_core::HarnessError::AgentExecution(format!(
+            return Err(harness_core::error::HarnessError::AgentExecution(format!(
                 "codex exited with {}: {stderr}",
                 output.status
             )));
@@ -155,14 +156,14 @@ impl CodeAgent for CodexAgent {
         &self,
         req: AgentRequest,
         tx: tokio::sync::mpsc::Sender<StreamItem>,
-    ) -> harness_core::Result<()> {
+    ) -> harness_core::error::Result<()> {
         self.run_setup_phase(&req.project_root).await?;
 
         let base_args = self.base_args(&req);
         let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
         let wrapped_command =
             wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
-                harness_core::HarnessError::AgentExecution(format!(
+                harness_core::error::HarnessError::AgentExecution(format!(
                     "sandbox setup failed for codex: {error}"
                 ))
             })?;
@@ -184,7 +185,9 @@ impl CodeAgent for CodexAgent {
         }
 
         let mut child = cmd.spawn().map_err(|error| {
-            harness_core::HarnessError::AgentExecution(format!("failed to run codex: {error}"))
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to run codex: {error}"
+            ))
         })?;
 
         if let Some(stderr) = child.stderr.take() {
@@ -214,7 +217,7 @@ fn codex_sandbox_mode(mode: SandboxMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::Item;
+    use harness_core::types::Item;
     use std::fs;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;

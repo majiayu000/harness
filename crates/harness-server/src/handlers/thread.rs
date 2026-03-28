@@ -1,6 +1,8 @@
 use crate::{http::AppState, validate_root};
-use harness_core::{ThreadId, ThreadStatus, TurnStatus};
-use harness_protocol::{Notification, RpcResponse, INTERNAL_ERROR, NOT_FOUND};
+use harness_core::{types::ThreadId, types::ThreadStatus, types::TurnStatus};
+use harness_protocol::{
+    methods::RpcResponse, methods::INTERNAL_ERROR, methods::NOT_FOUND, notifications::Notification,
+};
 use std::path::PathBuf;
 
 /// Persist an existing thread to the optional ThreadDb after a mutation.
@@ -117,7 +119,7 @@ pub async fn turn_start(
         .resolved_default_agent_name()
         .unwrap_or("claude")
         .to_string();
-    let agent_id = harness_core::AgentId::from_str(&agent_name);
+    let agent_id = harness_core::types::AgentId::from_str(&agent_name);
     match state
         .core
         .server
@@ -176,7 +178,7 @@ pub async fn turn_start(
 pub async fn turn_cancel(
     state: &AppState,
     id: Option<serde_json::Value>,
-    turn_id: harness_core::TurnId,
+    turn_id: harness_core::types::TurnId,
 ) -> RpcResponse {
     match state
         .core
@@ -216,7 +218,7 @@ pub async fn turn_cancel(
 pub async fn turn_status(
     state: &AppState,
     id: Option<serde_json::Value>,
-    turn_id: harness_core::TurnId,
+    turn_id: harness_core::types::TurnId,
 ) -> RpcResponse {
     match state
         .core
@@ -245,7 +247,7 @@ pub async fn turn_status(
 pub async fn turn_steer(
     state: &AppState,
     id: Option<serde_json::Value>,
-    turn_id: harness_core::TurnId,
+    turn_id: harness_core::types::TurnId,
     instruction: String,
 ) -> RpcResponse {
     let instruction = harness_core::prompts::wrap_external_data(&instruction);
@@ -291,7 +293,7 @@ pub async fn thread_fork(
     state: &AppState,
     id: Option<serde_json::Value>,
     thread_id: ThreadId,
-    from_turn: Option<harness_core::TurnId>,
+    from_turn: Option<harness_core::types::TurnId>,
 ) -> RpcResponse {
     match state
         .core

@@ -10,9 +10,9 @@ use crate::{
     workspace::WorkspaceManager,
 };
 use async_trait::async_trait;
-use harness_agents::AgentRegistry;
-use harness_core::{interceptor::TurnInterceptor, HarnessConfig};
-use harness_skills::SkillStore;
+use harness_agents::registry::AgentRegistry;
+use harness_core::{config::HarnessConfig, interceptor::TurnInterceptor};
+use harness_skills::store::SkillStore;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -64,7 +64,7 @@ pub struct DefaultExecutionService {
     agent_registry: Arc<AgentRegistry>,
     server_config: Arc<HarnessConfig>,
     skills: Arc<RwLock<SkillStore>>,
-    events: Arc<harness_observe::EventStore>,
+    events: Arc<harness_observe::event_store::EventStore>,
     interceptors: Vec<Arc<dyn TurnInterceptor>>,
     workspace_mgr: Option<Arc<WorkspaceManager>>,
     task_queue: Arc<TaskQueue>,
@@ -80,7 +80,7 @@ impl DefaultExecutionService {
         agent_registry: Arc<AgentRegistry>,
         server_config: Arc<HarnessConfig>,
         skills: Arc<RwLock<SkillStore>>,
-        events: Arc<harness_observe::EventStore>,
+        events: Arc<harness_observe::event_store::EventStore>,
         interceptors: Vec<Arc<dyn TurnInterceptor>>,
         workspace_mgr: Option<Arc<WorkspaceManager>>,
         task_queue: Arc<TaskQueue>,
@@ -160,7 +160,7 @@ impl DefaultExecutionService {
     fn select_agent(
         &self,
         req: &CreateTaskRequest,
-    ) -> Result<Arc<dyn harness_core::CodeAgent>, EnqueueTaskError> {
+    ) -> Result<Arc<dyn harness_core::agent::CodeAgent>, EnqueueTaskError> {
         if let Some(name) = &req.agent {
             self.agent_registry.get(name).ok_or_else(|| {
                 EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
@@ -331,7 +331,7 @@ mod tests {
     impl ExecutionService for AlwaysSucceedExecutionService {
         async fn enqueue(&self, _req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError> {
             self.called.store(true, Ordering::SeqCst);
-            Ok(TaskId("mock-task".to_string()))
+            Ok(harness_core::types::TaskId("mock-task".to_string()))
         }
 
         async fn enqueue_background(
@@ -339,7 +339,7 @@ mod tests {
             _req: CreateTaskRequest,
         ) -> Result<TaskId, EnqueueTaskError> {
             self.called.store(true, Ordering::SeqCst);
-            Ok(TaskId("mock-bg-task".to_string()))
+            Ok(harness_core::types::TaskId("mock-bg-task".to_string()))
         }
     }
 
@@ -468,13 +468,19 @@ mod tests {
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
-    async fn make_event_store_noop() -> Arc<harness_observe::EventStore> {
+    async fn make_event_store_noop() -> Arc<harness_observe::event_store::EventStore> {
         let dir = tempfile::tempdir().unwrap();
-        Arc::new(harness_observe::EventStore::new(dir.path()).await.unwrap())
+        Arc::new(
+            harness_observe::event_store::EventStore::new(dir.path())
+                .await
+                .unwrap(),
+        )
     }
 
     fn make_task_queue() -> Arc<TaskQueue> {
-        Arc::new(TaskQueue::new(&harness_core::ConcurrencyConfig::default()))
+        Arc::new(TaskQueue::new(
+            &harness_core::config::misc::ConcurrencyConfig::default(),
+        ))
     }
 
     async fn make_minimal_svc(

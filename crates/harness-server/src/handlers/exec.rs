@@ -1,6 +1,6 @@
 use crate::{http::AppState, validate_root};
-use harness_core::ExecPlanId;
-use harness_protocol::{RpcResponse, INTERNAL_ERROR, NOT_FOUND};
+use harness_core::types::ExecPlanId;
+use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR, methods::NOT_FOUND};
 use std::path::PathBuf;
 
 pub async fn exec_plan_init(
@@ -10,7 +10,7 @@ pub async fn exec_plan_init(
     project_root: PathBuf,
 ) -> RpcResponse {
     let project_root = validate_root!(&project_root, id, &state.core.home_dir);
-    match harness_exec::ExecPlan::from_spec(&spec, &project_root) {
+    match harness_exec::plan::ExecPlan::from_spec(&spec, &project_root) {
         Ok(plan) => {
             let plan_id = plan.id.clone();
             let db = match &state.core.plan_db {

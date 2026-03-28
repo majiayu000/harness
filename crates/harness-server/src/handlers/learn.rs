@@ -1,6 +1,9 @@
 use crate::{http::AppState, validate_root};
-use harness_core::{AgentRequest, Category, DraftStatus, RuleId, Severity};
-use harness_protocol::{RpcResponse, INTERNAL_ERROR};
+use harness_core::{
+    agent::AgentRequest,
+    types::{Category, Decision, DraftStatus, Event, EventFilters, ProjectId, RuleId, SessionId, Severity},
+};
+use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR};
 use harness_rules::engine::Rule;
 use std::path::PathBuf;
 
@@ -10,13 +13,21 @@ pub async fn learn_rules(
     project_root: PathBuf,
 ) -> RpcResponse {
     let project_root = validate_root!(&project_root, id, &state.core.home_dir);
+    let target_project_id = project_id_from_root(&project_root);
 
-    let draft_contents = match collect_adopted_draft_contents(state) {
+    let draft_contents = match collect_adopted_draft_contents(state, &target_project_id, "learn_rules").await {
         Ok(d) => d,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
     };
 
     if draft_contents.is_empty() {
+        log_learn_event(
+            state,
+            "learn_rules",
+            Decision::Complete,
+            Some(format!("project_id={} rules=0", target_project_id)),
+        )
+        .await;
         return RpcResponse::success(id, serde_json::json!({ "rules_learned": 0, "rules": [] }));
     }
 
@@ -46,6 +57,17 @@ pub async fn learn_rules(
             engine.add_rule(rule.clone());
         }
     }
+    log_learn_event(
+        state,
+        "learn_rules",
+        if count == 0 {
+            Decision::Warn
+        } else {
+            Decision::Complete
+        },
+        Some(format!("project_id={} rules={count}", target_project_id)),
+    )
+    .await;
 
     match serde_json::to_value(&rules) {
         Ok(v) => RpcResponse::success(
@@ -62,13 +84,21 @@ pub async fn learn_skills(
     project_root: PathBuf,
 ) -> RpcResponse {
     let project_root = validate_root!(&project_root, id, &state.core.home_dir);
+    let target_project_id = project_id_from_root(&project_root);
 
-    let draft_contents = match collect_adopted_draft_contents(state) {
+    let draft_contents = match collect_adopted_draft_contents(state, &target_project_id, "learn_skills").await {
         Ok(d) => d,
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
     };
 
     if draft_contents.is_empty() {
+        log_learn_event(
+            state,
+            "learn_skills",
+            Decision::Complete,
+            Some(format!("project_id={} skills=0", target_project_id)),
+        )
+        .await;
         return RpcResponse::success(id, serde_json::json!({ "skills_learned": 0, "skills": [] }));
     }
 
@@ -105,6 +135,17 @@ pub async fn learn_skills(
     }
 
     let count = created.len();
+    log_learn_event(
+        state,
+        "learn_skills",
+        if count == 0 {
+            Decision::Warn
+        } else {
+            Decision::Complete
+        },
+        Some(format!("project_id={} skills={count}", target_project_id)),
+    )
+    .await;
 
     match serde_json::to_value(&created) {
         Ok(v) => RpcResponse::success(
@@ -135,11 +176,51 @@ fn validate_skill_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn collect_adopted_draft_contents(state: &AppState) -> Result<Vec<String>, String> {
+fn project_id_from_root(project_root: &std::path::Path) -> ProjectId {
+    ProjectId::from_str(
+        project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("default"),
+    )
+}
+
+async fn log_learn_event(state: &AppState, hook: &str, decision: Decision, detail: Option<String>) {
+    let mut event = Event::new(SessionId::new(), hook, "learn_handler", decision);
+    event.detail = detail;
+    if let Err(e) = state.observability.events.log(&event).await {
+        tracing::warn!(hook, error = %e, "failed to log learn event");
+    }
+}
+
+async fn collect_adopted_draft_contents(
+    state: &AppState,
+    project_id: &ProjectId,
+    learn_hook: &str,
+) -> Result<Vec<String>, String> {
+    let last_learn_ts = state
+        .observability
+        .events
+        .query(&EventFilters {
+            hook: Some(learn_hook.to_string()),
+            decision: Some(Decision::Complete),
+            ..EventFilters::default()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|event| event.ts)
+        .max();
     let drafts = state.engines.gc_agent.drafts().map_err(|e| e.to_string())?;
     let contents = drafts
         .iter()
-        .filter(|d| d.status == DraftStatus::Adopted)
+        .filter(|d| {
+            d.status == DraftStatus::Adopted
+                && d.signal.project_id == *project_id
+                && last_learn_ts
+                    .map(|ts| d.generated_at > ts)
+                    .unwrap_or(true)
+        })
         .flat_map(|d| d.artifacts.iter().map(|a| a.content.clone()))
         .collect();
     Ok(contents)
@@ -293,7 +374,7 @@ fn detect_category(id: &str) -> Category {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{Category, RuleId, Severity};
+    use harness_core::{types::Category, types::RuleId, types::Severity};
 
     #[test]
     fn parse_rules_extracts_single_rule() {

@@ -5,7 +5,7 @@ use axum::{
     extract::DefaultBodyLimit,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    middleware::{self, Next},
+    middleware::{self},
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
@@ -14,114 +14,15 @@ use axum::{
     Json, Router,
 };
 use dashmap::DashMap;
-use harness_protocol::{RpcNotification, RpcRequest};
+use harness_protocol::{methods::RpcRequest, notifications::RpcNotification};
 use serde_json::json;
-use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use subtle::ConstantTimeEq;
+use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
-/// Per-identifier rate limiter for `POST /auth/reset-password`.
-///
-/// Uses a 1-hour rolling window per email address to prevent brute-force
-/// and enumeration attacks on the password reset flow.
-///
-/// Memory is bounded: at most `max_tracked_keys` identifiers are tracked at
-/// once; expired timestamps are evicted lazily on each access.
-pub struct PasswordResetRateLimiter {
-    timestamps: Mutex<HashMap<String, VecDeque<Instant>>>,
-    max_per_hour: usize,
-    max_tracked_keys: usize,
-}
-
-impl PasswordResetRateLimiter {
-    const WINDOW: std::time::Duration = std::time::Duration::from_secs(3600);
-
-    pub fn new(max_per_hour: u32) -> Self {
-        Self {
-            timestamps: Mutex::new(HashMap::new()),
-            max_per_hour: max_per_hour as usize,
-            max_tracked_keys: 100_000,
-        }
-    }
-
-    #[cfg(test)]
-    fn new_with_cap(max_per_hour: u32, max_tracked_keys: usize) -> Self {
-        Self {
-            timestamps: Mutex::new(HashMap::new()),
-            max_per_hour: max_per_hour as usize,
-            max_tracked_keys,
-        }
-    }
-
-    /// Returns `true` if the request is within the rate limit and increments the counter.
-    pub fn check_and_increment(&self, identifier: &str) -> bool {
-        let mut map = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
-        let now = Instant::now();
-
-        // Evict timestamps outside the rolling window for this identifier.
-        if let Some(entry) = map.get_mut(identifier) {
-            while let Some(&front) = entry.front() {
-                if now.duration_since(front) >= Self::WINDOW {
-                    entry.pop_front();
-                } else {
-                    break;
-                }
-            }
-            if entry.is_empty() {
-                map.remove(identifier);
-            }
-        }
-
-        // Reject new identifiers when map is at capacity (memory-DoS guard).
-        if !map.contains_key(identifier) && map.len() >= self.max_tracked_keys {
-            return false;
-        }
-
-        let entry = map.entry(identifier.to_string()).or_default();
-        if entry.len() < self.max_per_hour {
-            entry.push_back(now);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// Per-source rate limiter for `POST /signals` ingestion.
-pub struct SignalRateLimiter {
-    counts: Mutex<HashMap<String, (u32, Instant)>>,
-    max_per_minute: u32,
-}
-
-impl SignalRateLimiter {
-    pub fn new(max_per_minute: u32) -> Self {
-        Self {
-            counts: Mutex::new(HashMap::new()),
-            max_per_minute,
-        }
-    }
-
-    /// Returns `true` if the request is within the rate limit and increments the counter.
-    pub fn check_and_increment(&self, source: &str) -> bool {
-        let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        let now = Instant::now();
-        let entry = counts.entry(source.to_string()).or_insert((0, now));
-        if now.duration_since(entry.1) >= std::time::Duration::from_secs(60) {
-            *entry = (1, now);
-            true
-        } else if entry.0 < self.max_per_minute {
-            entry.0 += 1;
-            true
-        } else {
-            false
-        }
-    }
-}
-
+pub(crate) mod auth;
+pub(crate) mod rate_limit;
 pub(crate) mod task_routes;
 
 /// Core services: thread/task management and persistence.
@@ -136,22 +37,22 @@ pub struct CoreServices {
     pub plan_db: Option<crate::plan_db::PlanDb>,
     /// In-memory plan cache hydrated from `plan_db` on startup.
     /// Write-through: every mutation must also persist via `plan_db`.
-    pub plan_cache: Arc<DashMap<String, harness_exec::ExecPlan>>,
+    pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
     pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
 }
 
 /// Engine services: skills, rules, and garbage collection.
 pub struct EngineServices {
-    pub skills: Arc<RwLock<harness_skills::SkillStore>>,
+    pub skills: Arc<RwLock<harness_skills::store::SkillStore>>,
     pub rules: Arc<RwLock<harness_rules::engine::RuleEngine>>,
-    pub gc_agent: Arc<harness_gc::GcAgent>,
+    pub gc_agent: Arc<harness_gc::gc_agent::GcAgent>,
 }
 
 /// Observability services: event store and telemetry.
 pub struct ObservabilityServices {
-    pub events: Arc<harness_observe::EventStore>,
-    pub signal_rate_limiter: Arc<SignalRateLimiter>,
-    pub password_reset_rate_limiter: Arc<PasswordResetRateLimiter>,
+    pub events: Arc<harness_observe::event_store::EventStore>,
+    pub signal_rate_limiter: Arc<rate_limit::SignalRateLimiter>,
+    pub password_reset_rate_limiter: Arc<rate_limit::PasswordResetRateLimiter>,
     pub review_store: Option<Arc<crate::review_store::ReviewStore>>,
 }
 
@@ -208,11 +109,11 @@ pub struct AppState {
     // its dependencies; the fields above are preserved for handlers that have
     // not yet been migrated to the service interfaces.
     /// Project registry operations and default-root lookup.
-    pub project_svc: Arc<dyn crate::services::ProjectService>,
+    pub project_svc: Arc<dyn crate::services::project::ProjectService>,
     /// Task lifecycle queries and stream subscriptions.
-    pub task_svc: Arc<dyn crate::services::TaskService>,
+    pub task_svc: Arc<dyn crate::services::task::TaskService>,
     /// Task enqueue: project resolution, agent dispatch, concurrency, workspace.
-    pub execution_svc: Arc<dyn crate::services::ExecutionService>,
+    pub execution_svc: Arc<dyn crate::services::execution::ExecutionService>,
 }
 
 impl AppState {
@@ -320,7 +221,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         Some(_) => {}
     }
 
-    let db_path = harness_core::default_db_path(&dir, "tasks");
+    let db_path = harness_core::config::dirs::default_db_path(&dir, "tasks");
     tracing::debug!("task db: {}", db_path.display());
     let tasks = task_runner::TaskStore::open(&db_path).await?;
 
@@ -382,7 +283,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         .context("failed to load configured rules.requirements_path")?;
 
     let events = Arc::new(
-        harness_observe::EventStore::with_policies_and_otel(
+        harness_observe::event_store::EventStore::with_policies_and_otel(
             &dir,
             server.config.observe.session_renewal_secs,
             server.config.observe.log_retention_days,
@@ -391,18 +292,18 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         .await?,
     );
 
-    let signal_detector = harness_gc::SignalDetector::new(
+    let signal_detector = harness_gc::signal_detector::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
-        harness_core::ProjectId::from_str(
+        harness_core::types::ProjectId::from_str(
             project_root
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("default"),
         ),
     );
-    let draft_store = harness_gc::DraftStore::new(&dir)?;
+    let draft_store = harness_gc::draft_store::DraftStore::new(&dir)?;
     let gc_agent = Arc::new(
-        harness_gc::GcAgent::new(
+        harness_gc::gc_agent::GcAgent::new(
             server.config.gc.clone(),
             signal_detector,
             draft_store,
@@ -411,13 +312,14 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         .with_checkpoint(dir.join("gc-checkpoint.json")),
     );
 
-    let thread_db_path = harness_core::default_db_path(&dir, "threads");
+    let thread_db_path = harness_core::config::dirs::default_db_path(&dir, "threads");
     let thread_db = crate::thread_db::ThreadDb::open(&thread_db_path).await?;
     let plan_db =
-        crate::plan_db::PlanDb::open(&harness_core::default_db_path(&dir, "plans")).await?;
+        crate::plan_db::PlanDb::open(&harness_core::config::dirs::default_db_path(&dir, "plans"))
+            .await?;
 
     let project_registry = crate::project_registry::ProjectRegistry::open(
-        &harness_core::default_db_path(&dir, "projects"),
+        &harness_core::config::dirs::default_db_path(&dir, "projects"),
     )
     .await?;
     // Auto-register the default project from --project-root on startup.
@@ -473,7 +375,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     }
 
     // Load persisted plans into the in-memory plan cache
-    let plan_cache: Arc<DashMap<String, harness_exec::ExecPlan>> = Arc::new(DashMap::new());
+    let plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>> = Arc::new(DashMap::new());
     match plan_db.list().await {
         Ok(plans) => {
             let count = plans.len();
@@ -487,7 +389,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         Err(e) => tracing::warn!("plan cache: failed to load plans on startup: {e}"),
     }
 
-    let mut skill_store = harness_skills::SkillStore::new()
+    let mut skill_store = harness_skills::store::SkillStore::new()
         .with_persist_dir(dir.join("skills"))
         .with_discovery(&project_root);
     skill_store.load_builtin();
@@ -641,10 +543,12 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         )),
     ];
 
-    let project_svc =
-        crate::services::DefaultProjectService::new(project_registry.clone(), project_root.clone());
-    let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
-    let execution_svc = crate::services::DefaultExecutionService::new(
+    let project_svc = crate::services::project::DefaultProjectService::new(
+        project_registry.clone(),
+        project_root.clone(),
+    );
+    let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+    let execution_svc = crate::services::execution::DefaultExecutionService::new(
         tasks.clone(),
         server.agent_registry.clone(),
         Arc::new(server.config.clone()),
@@ -702,12 +606,12 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         },
         observability: ObservabilityServices {
             events,
-            signal_rate_limiter: Arc::new(SignalRateLimiter::new(signal_rate_limit)),
-            password_reset_rate_limiter: Arc::new(PasswordResetRateLimiter::new(
+            signal_rate_limiter: Arc::new(rate_limit::SignalRateLimiter::new(signal_rate_limit)),
+            password_reset_rate_limiter: Arc::new(rate_limit::PasswordResetRateLimiter::new(
                 password_reset_rate_limit,
             )),
             review_store: {
-                let review_db_path = harness_core::default_db_path(&dir, "reviews");
+                let review_db_path = harness_core::config::dirs::default_db_path(&dir, "reviews");
                 match crate::review_store::ReviewStore::open(&review_db_path).await {
                     Ok(store) => Some(Arc::new(store)),
                     Err(e) => {
@@ -747,7 +651,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 fn build_completion_callback(
     feishu_intake: &Option<Arc<crate::intake::feishu::FeishuIntake>>,
     github_pollers: &[(String, Arc<dyn crate::intake::IntakeSource>)],
-    review_config: harness_core::AgentReviewConfig,
+    review_config: harness_core::config::agents::AgentReviewConfig,
     quality_trigger: Option<Arc<crate::quality_trigger::QualityTrigger>>,
 ) -> Option<task_runner::CompletionCallback> {
     let mut sources: std::collections::HashMap<String, Arc<dyn crate::intake::IntakeSource>> =
@@ -922,12 +826,12 @@ async fn post_review_bot_comment(
 /// 2. Otherwise, auto-select the first registered agent that isn't the implementor.
 /// 3. If none found, return None (agent review will be skipped).
 pub(crate) fn resolve_reviewer(
-    registry: &harness_agents::AgentRegistry,
-    config: &harness_core::AgentReviewConfig,
+    registry: &harness_agents::registry::AgentRegistry,
+    config: &harness_core::config::agents::AgentReviewConfig,
     implementor_name: &str,
 ) -> (
-    Option<Arc<dyn harness_core::CodeAgent>>,
-    harness_core::AgentReviewConfig,
+    Option<Arc<dyn harness_core::agent::CodeAgent>>,
+    harness_core::config::agents::AgentReviewConfig,
 ) {
     if !config.enabled {
         return (None, config.clone());
@@ -1142,7 +1046,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         let events = state
             .observability
             .events
-            .query(&harness_core::EventFilters::default())
+            .query(&harness_core::types::EventFilters::default())
             .await
             .unwrap_or_default();
         // Use violations from the most recent scan (identified by the latest rule_scan session_id)
@@ -1223,7 +1127,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .route("/auth/reset-password", post(password_reset))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            api_auth_middleware,
+            auth::api_auth_middleware,
         ))
         .with_state(state.clone());
 
@@ -1263,123 +1167,6 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!("received Ctrl+C"),
         _ = terminate => tracing::info!("received SIGTERM"),
-    }
-}
-
-/// Resolve the effective API token from server config or `HARNESS_API_TOKEN` env var.
-///
-/// Filters empty strings *before* the env-var fallback so that an explicit
-/// `api_token = ""` in server.toml does not shadow `HARNESS_API_TOKEN`.
-pub(crate) fn resolve_api_token(config: &harness_core::ServerConfig) -> Option<String> {
-    config
-        .api_token
-        .as_deref()
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_owned())
-        .or_else(|| {
-            std::env::var("HARNESS_API_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-        })
-}
-
-/// Bearer token authentication middleware.
-///
-/// Exempts `/health`, `/webhook`, `/webhook/feishu`, and `/signals` (which
-/// have their own HMAC-based protection).  All other endpoints require an
-/// `Authorization: Bearer <token>` header when `api_token` is configured.
-/// When no token is configured the middleware is a no-op (backward compat).
-/// Decode `%XX` percent-encoded sequences in a query-parameter value.
-///
-/// `encodeURIComponent` in JavaScript encodes all reserved characters, so the
-/// raw query string value must be decoded before constant-time comparison with
-/// the stored token.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut result: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                result.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        result.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&result).into_owned()
-}
-
-async fn api_auth_middleware(
-    State(state): State<Arc<AppState>>,
-    req: axum::extract::Request,
-    next: Next,
-) -> Response {
-    let path = req.uri().path();
-    // Exempt paths that carry their own authentication or must stay public.
-    // /health, /webhook*, and /signals have their own protection or must stay
-    // fully public.  /favicon.ico is a static asset with no sensitive data.
-    // The dashboard HTML (/) is NOT exempt: it embeds the API token as a JS
-    // variable, so it must only be served to callers who already know the token.
-    // Browsers access the dashboard via /?token=<tok> since they cannot set
-    // Authorization headers on a navigation request.
-    if matches!(
-        path,
-        "/health"
-            | "/webhook"
-            | "/webhook/feishu"
-            | "/signals"
-            | "/favicon.ico"
-            | "/auth/reset-password"
-    ) {
-        return next.run(req).await;
-    }
-
-    // Browser clients cannot set Authorization headers on WebSocket upgrades or
-    // on top-level navigation requests (/).  Accept a ?token= query parameter
-    // as a fallback for these two paths; percent-decode it because the JS
-    // client always calls encodeURIComponent() before appending to the URL.
-    let query_token: Option<String> = if path == "/ws" || path == "/" {
-        req.uri().query().and_then(|q| {
-            q.split('&')
-                .find_map(|kv| kv.strip_prefix("token=").map(percent_decode))
-        })
-    } else {
-        None
-    };
-
-    let Some(expected) = resolve_api_token(&state.core.server.config.server) else {
-        // No token configured — skip auth for backward compatibility.
-        return next.run(req).await;
-    };
-
-    let header_token = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(str::to_string);
-
-    // Accept either the Authorization header token or the query-param token.
-    let provided = header_token.or(query_token);
-
-    let authorized = provided
-        .as_deref()
-        .map(|tok| tok.as_bytes().ct_eq(expected.as_bytes()).into())
-        .unwrap_or(false);
-
-    if authorized {
-        next.run(req).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "unauthorized"})),
-        )
-            .into_response()
     }
 }
 
@@ -1516,10 +1303,10 @@ async fn github_webhook(
                 "task_id": task_id.0,
             })),
         ),
-        Err(crate::services::EnqueueTaskError::BadRequest(error)) => {
+        Err(crate::services::execution::EnqueueTaskError::BadRequest(error)) => {
             (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
         }
-        Err(crate::services::EnqueueTaskError::Internal(error)) => (
+        Err(crate::services::execution::EnqueueTaskError::Internal(error)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": error })),
         ),
@@ -1538,7 +1325,7 @@ async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<task_runner:
 }
 
 async fn get_task(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    match state.core.tasks.get(&task_runner::TaskId(id)) {
+    match state.core.tasks.get(&harness_core::types::TaskId(id)) {
         Some(task) => Json(task).into_response(),
         None => (
             StatusCode::NOT_FOUND,
@@ -1553,7 +1340,7 @@ async fn get_task_artifacts(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    let task_id = task_runner::TaskId(id);
+    let task_id = harness_core::types::TaskId(id);
     if state.core.tasks.get(&task_id).is_none() {
         return (
             StatusCode::NOT_FOUND,
@@ -1578,7 +1365,7 @@ async fn get_task_artifacts(
 /// (channel closed). If the receiver lags, a synthetic "lag" event is emitted
 /// noting how many events were dropped; streaming then continues.
 async fn stream_task_sse(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let task_id = task_runner::TaskId(id);
+    let task_id = harness_core::types::TaskId(id);
 
     let rx = match state.core.tasks.subscribe_task_stream(&task_id) {
         Some(rx) => rx,
@@ -1708,12 +1495,12 @@ async fn intake_status(State(state): State<Arc<AppState>>) -> Json<serde_json::V
 struct IngestSignalRequest {
     source: String,
     #[serde(default)]
-    severity: Option<harness_core::Severity>,
+    severity: Option<harness_core::types::Severity>,
     payload: serde_json::Value,
 }
 
 /// Infer severity from a GitHub webhook payload: CI failure → High, changes_requested → Medium.
-fn infer_github_severity(payload: &serde_json::Value) -> Option<harness_core::Severity> {
+fn infer_github_severity(payload: &serde_json::Value) -> Option<harness_core::types::Severity> {
     if let Some(obj) = payload.as_object() {
         // check_run completed with failure
         if let (Some(action), Some(check_run)) = (
@@ -1726,7 +1513,7 @@ fn infer_github_severity(payload: &serde_json::Value) -> Option<harness_core::Se
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if conclusion == "failure" {
-                    return Some(harness_core::Severity::High);
+                    return Some(harness_core::types::Severity::High);
                 }
             }
         }
@@ -1734,7 +1521,7 @@ fn infer_github_severity(payload: &serde_json::Value) -> Option<harness_core::Se
         if let Some(review) = obj.get("review") {
             let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("");
             if state.eq_ignore_ascii_case("changes_requested") {
-                return Some(harness_core::Severity::Medium);
+                return Some(harness_core::types::Severity::Medium);
             }
         }
     }
@@ -1810,14 +1597,14 @@ async fn ingest_signal(
 
     let severity = req.severity.unwrap_or_else(|| {
         if req.source == "github" {
-            infer_github_severity(&req.payload).unwrap_or(harness_core::Severity::Low)
+            infer_github_severity(&req.payload).unwrap_or(harness_core::types::Severity::Low)
         } else {
-            harness_core::Severity::Low
+            harness_core::types::Severity::Low
         }
     });
 
     let signal =
-        harness_core::ExternalSignal::new(req.source.clone(), severity, req.payload.clone());
+        harness_core::types::ExternalSignal::new(req.source.clone(), severity, req.payload.clone());
     let signal_id = signal.id.clone();
 
     if let Err(e) = state.observability.events.log_external_signal(&signal) {
@@ -1912,8 +1699,11 @@ mod startup_tests {
         test_helpers::{HomeGuard, HOME_LOCK},
         thread_manager::ThreadManager,
     };
-    use harness_agents::AgentRegistry;
-    use harness_core::{EventFilters, HarnessConfig, RuleId, Severity, SkillLocation, Violation};
+    use harness_agents::registry::AgentRegistry;
+    use harness_core::{
+        config::HarnessConfig, types::EventFilters, types::RuleId, types::Severity,
+        types::SkillLocation, types::Violation,
+    };
     use std::sync::Arc;
 
     #[tokio::test]
@@ -2118,87 +1908,6 @@ mod startup_tests {
         Ok(())
         // _env_guard dropped here → HOME restored unconditionally
         // _lock dropped here → next test may proceed
-    }
-}
-
-#[cfg(test)]
-mod password_reset_rate_limiter_tests {
-    use super::PasswordResetRateLimiter;
-
-    #[test]
-    fn allows_requests_within_limit() {
-        let limiter = PasswordResetRateLimiter::new(3);
-        assert!(limiter.check_and_increment("user@example.com"));
-        assert!(limiter.check_and_increment("user@example.com"));
-        assert!(limiter.check_and_increment("user@example.com"));
-    }
-
-    #[test]
-    fn blocks_after_limit_exceeded() {
-        let limiter = PasswordResetRateLimiter::new(2);
-        assert!(limiter.check_and_increment("a@example.com"));
-        assert!(limiter.check_and_increment("a@example.com"));
-        assert!(!limiter.check_and_increment("a@example.com"));
-    }
-
-    #[test]
-    fn limits_are_per_identifier() {
-        let limiter = PasswordResetRateLimiter::new(1);
-        assert!(limiter.check_and_increment("alice@example.com"));
-        assert!(!limiter.check_and_increment("alice@example.com"));
-        // Different email is independent
-        assert!(limiter.check_and_increment("bob@example.com"));
-    }
-
-    #[test]
-    fn rejects_new_identifiers_when_key_cap_reached() {
-        // Cap at 2 tracked identifiers to test the memory-DoS guard.
-        let limiter = PasswordResetRateLimiter::new_with_cap(10, 2);
-        assert!(limiter.check_and_increment("a@example.com"));
-        assert!(limiter.check_and_increment("b@example.com"));
-        // Third unique identifier is rejected because cap is reached.
-        assert!(!limiter.check_and_increment("c@example.com"));
-        // Already-tracked identifiers still work.
-        assert!(limiter.check_and_increment("a@example.com"));
-    }
-}
-
-#[cfg(test)]
-mod auth_tests {
-    use super::percent_decode;
-
-    #[test]
-    fn percent_decode_plain_text_unchanged() {
-        assert_eq!(percent_decode("mytoken123"), "mytoken123");
-    }
-
-    #[test]
-    fn percent_decode_slash_encoded() {
-        assert_eq!(percent_decode("tok%2Fwith%2Fslashes"), "tok/with/slashes");
-    }
-
-    #[test]
-    fn percent_decode_equals_and_plus() {
-        assert_eq!(percent_decode("base64%3D%3D"), "base64==");
-        assert_eq!(percent_decode("a%2Bb"), "a+b");
-    }
-
-    #[test]
-    fn percent_decode_percent_encoded_percent() {
-        assert_eq!(percent_decode("100%25"), "100%");
-    }
-
-    #[test]
-    fn percent_decode_incomplete_sequence_passed_through() {
-        // Trailing % with fewer than 2 hex digits must not panic.
-        assert_eq!(percent_decode("abc%2"), "abc%2");
-        assert_eq!(percent_decode("abc%"), "abc%");
-    }
-
-    #[test]
-    fn percent_decode_invalid_hex_passed_through() {
-        // Non-hex digits after % must be passed through unchanged.
-        assert_eq!(percent_decode("abc%ZZdef"), "abc%ZZdef");
     }
 }
 

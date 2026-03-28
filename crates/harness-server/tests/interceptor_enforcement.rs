@@ -1,8 +1,6 @@
-use harness_core::{
-    interceptor::{InterceptResult, ToolUseEvent, TurnInterceptor},
-    Decision, EventFilters, SessionId,
-};
-use harness_observe::EventStore;
+use harness_core::interceptor::{InterceptResult, ToolUseEvent, TurnInterceptor};
+use harness_core::types::{Decision, EventFilters, SessionId};
+use harness_observe::event_store::EventStore;
 use harness_rules::engine::{Guard, RuleEngine};
 use harness_server::hook_enforcer::HookEnforcer;
 use std::path::PathBuf;
@@ -57,9 +55,9 @@ fn make_engine_with_guard(guard_dir: &std::path::Path) -> Arc<RwLock<RuleEngine>
     }
     let mut engine = RuleEngine::new();
     engine.register_guard(Guard {
-        id: harness_core::GuardId::from_str("ENF-TEST-GUARD"),
+        id: harness_core::types::GuardId::from_str("ENF-TEST-GUARD"),
         script_path: script,
-        language: harness_core::Language::Common,
+        language: harness_core::types::Language::Common,
         rules: vec![],
     });
     Arc::new(RwLock::new(engine))
@@ -123,7 +121,7 @@ async fn pre_execute_block_rejects_the_turn() -> anyhow::Result<()> {
     // separately test a blocking interceptor via InterceptResult::block().
     let enforcer = HookEnforcer::new(rules, event_store, true);
 
-    let req = harness_core::AgentRequest {
+    let req = harness_core::agent::AgentRequest {
         prompt: "do something".to_string(),
         project_root: dir.path().to_path_buf(),
         ..Default::default()

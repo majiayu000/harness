@@ -1,6 +1,6 @@
 use crate::{http::AppState, validate_root};
-use harness_core::{AgentRequest, CodeAgent};
-use harness_protocol::{RpcResponse, INTERNAL_ERROR};
+use harness_core::{agent::AgentRequest, agent::CodeAgent};
+use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -193,10 +193,9 @@ fn extract_tagged(output: &str, tag: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{
-        AgentRequest, AgentResponse, Capability, CodeAgent, Result as HarnessResult, StreamItem,
-        TokenUsage,
-    };
+    use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+    use harness_core::error::Result as HarnessResult;
+    use harness_core::types::{Capability, TokenUsage};
     use tokio::sync::mpsc::Sender;
 
     struct PrimaryMock;

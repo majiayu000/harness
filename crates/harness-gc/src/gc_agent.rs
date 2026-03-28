@@ -4,9 +4,11 @@ use crate::remediation::signal_priority;
 use crate::signal_detector::SignalDetector;
 use anyhow::Context;
 use chrono::Utc;
-use harness_core::{
-    AgentRequest, Artifact, ArtifactType, CapabilityProfile, CodeAgent, Draft, DraftId,
-    DraftStatus, GcConfig, Project, RemediationType, Signal, SignalType,
+use harness_core::agent::{AgentRequest, CodeAgent};
+use harness_core::config::{agents::CapabilityProfile, misc::GcConfig};
+use harness_core::types::{
+    Artifact, ArtifactType, Draft, DraftId, DraftStatus, ExternalSignal, Project, RemediationType,
+    Signal, SignalType,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
@@ -121,8 +123,21 @@ impl GcAgent {
     pub async fn run(
         &self,
         project: &Project,
-        events: &[harness_core::Event],
-        violations: &[harness_core::Violation],
+        events: &[harness_core::types::Event],
+        violations: &[harness_core::types::Violation],
+        agent: &dyn CodeAgent,
+    ) -> anyhow::Result<GcReport> {
+        self.run_with_external(project, events, violations, &[], agent)
+            .await
+    }
+
+    /// Run a GC cycle with optional external signals merged into detection.
+    pub async fn run_with_external(
+        &self,
+        project: &Project,
+        events: &[harness_core::types::Event],
+        violations: &[harness_core::types::Violation],
+        external_signals: &[ExternalSignal],
         agent: &dyn CodeAgent,
     ) -> anyhow::Result<GcReport> {
         // 0. Expire stale drafts before generating new ones.
@@ -147,6 +162,9 @@ impl GcAgent {
         // persisted into `events` yet, fall back to the old detector.
         if !violations.is_empty() && !events.iter().any(|e| e.hook == "rule_check") {
             signals.extend(self.signal_detector.from_violations(violations));
+        }
+        if !external_signals.is_empty() {
+            signals.extend(self.signal_detector.detect_from_external(external_signals));
         }
 
         // 2. Prioritize.
@@ -410,7 +428,12 @@ fn parse_artifacts(output: &str, signal: &Signal) -> Vec<Artifact> {
     };
 
     let code_artifacts = extract_code_block_artifacts(output, artifact_type);
-    let diff_artifacts = extract_diff_artifacts(output, artifact_type);
+    let code_paths: std::collections::HashSet<String> = code_artifacts
+        .iter()
+        .map(|a| a.target_path.to_string_lossy().into_owned())
+        .collect();
+    let diff_artifacts =
+        extract_diff_artifacts(output, artifact_type, signal.id.as_str(), &code_paths);
 
     // Merge: code blocks take precedence over diffs for the same path
     let mut seen = std::collections::HashSet::new();
@@ -478,10 +501,16 @@ fn extract_code_block_artifacts(output: &str, artifact_type: ArtifactType) -> Ve
 ///
 /// Matches `--- a/path` / `+++ b/path` headers and collects all following
 /// hunk lines (`@@` and context/add/remove lines).
-fn extract_diff_artifacts(output: &str, artifact_type: ArtifactType) -> Vec<Artifact> {
+fn extract_diff_artifacts(
+    output: &str,
+    artifact_type: ArtifactType,
+    signal_id: &str,
+    code_paths: &std::collections::HashSet<String>,
+) -> Vec<Artifact> {
     let mut artifacts = Vec::new();
     let lines: Vec<&str> = output.lines().collect();
     let mut i = 0;
+    let mut diff_idx: usize = 0;
 
     while i < lines.len() {
         if lines[i].starts_with("--- ") && i + 1 < lines.len() && lines[i + 1].starts_with("+++ ") {
@@ -493,6 +522,10 @@ fn extract_diff_artifacts(output: &str, artifact_type: ArtifactType) -> Vec<Arti
                 .trim();
 
             if !raw_path.is_empty() && raw_path != "/dev/null" && is_valid_file_path(raw_path) {
+                if code_paths.contains(raw_path) {
+                    i += 2;
+                    continue;
+                }
                 let start = i;
                 let mut end = i + 2;
                 // Collect hunk lines; stop at the next diff header
@@ -505,9 +538,11 @@ fn extract_diff_artifacts(output: &str, artifact_type: ArtifactType) -> Vec<Arti
                     }
                     end += 1;
                 }
+                diff_idx = diff_idx.saturating_add(1);
+                let patch_name = format!("{signal_id}-{diff_idx}.patch");
                 artifacts.push(Artifact {
                     artifact_type,
-                    target_path: std::path::PathBuf::from(raw_path),
+                    target_path: std::path::PathBuf::from(".harness/drafts").join(patch_name),
                     content: lines[start..end].join("\n"),
                 });
                 i = end;
@@ -529,7 +564,7 @@ fn is_valid_file_path(s: &str) -> bool {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use harness_core::{
+    use harness_core::types::{
         Artifact, ArtifactType, Draft, DraftStatus, ProjectId, RemediationType, Signal, SignalType,
     };
 
@@ -707,7 +742,13 @@ mod tests {
             +fn bar() {}\n";
         let artifacts = parse_artifacts(output, &signal);
         assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].target_path.to_string_lossy(), "src/lib.rs");
+        assert!(
+            artifacts[0]
+                .target_path
+                .to_string_lossy()
+                .starts_with(".harness/drafts/")
+        );
+        assert!(artifacts[0].target_path.to_string_lossy().ends_with(".patch"));
         assert!(artifacts[0].content.contains("+++ b/src/lib.rs"));
     }
 
@@ -731,8 +772,8 @@ mod tests {
             .iter()
             .map(|a| a.target_path.to_string_lossy().into_owned())
             .collect();
-        assert!(paths.contains(&"a.rs".to_string()));
-        assert!(paths.contains(&"b.rs".to_string()));
+        assert!(paths.iter().all(|p| p.starts_with(".harness/drafts/")));
+        assert!(paths.iter().all(|p| p.ends_with(".patch")));
     }
 
     #[test]

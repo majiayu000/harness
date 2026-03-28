@@ -1,4 +1,4 @@
-use harness_core::{CodexCloudConfig, HarnessError};
+use harness_core::{config::agents::CodexCloudConfig, error::HarnessError};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,7 +57,7 @@ fn setup_cache_stamp_path(cloud: &CodexCloudConfig, project_root: &Path) -> Path
 fn setup_cache_is_fresh(
     cloud: &CodexCloudConfig,
     project_root: &Path,
-) -> harness_core::Result<bool> {
+) -> harness_core::error::Result<bool> {
     if cloud.cache_ttl_hours == 0 {
         return Ok(false);
     }
@@ -91,7 +91,7 @@ fn setup_cache_is_fresh(
 fn write_setup_cache_stamp(
     cloud: &CodexCloudConfig,
     project_root: &Path,
-) -> harness_core::Result<()> {
+) -> harness_core::error::Result<()> {
     if cloud.cache_ttl_hours == 0 {
         return Ok(());
     }
@@ -140,7 +140,7 @@ fn apply_setup_environment(cmd: &mut Command, cloud: &CodexCloudConfig) {
 pub(crate) async fn run_setup_phase(
     cloud: &CodexCloudConfig,
     project_root: &Path,
-) -> harness_core::Result<()> {
+) -> harness_core::error::Result<()> {
     if !cloud.enabled || cloud.setup_commands.is_empty() {
         return Ok(());
     }

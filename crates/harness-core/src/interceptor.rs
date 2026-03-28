@@ -1,4 +1,5 @@
-use crate::{AgentRequest, AgentResponse, Decision, SessionId};
+use crate::agent::{AgentRequest, AgentResponse};
+use crate::types::{Decision, SessionId};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 

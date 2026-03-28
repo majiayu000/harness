@@ -1,5 +1,5 @@
 use chrono::Utc;
-use harness_core::{Draft, DraftId, DraftStatus};
+use harness_core::{types::Draft, types::DraftId, types::DraftStatus};
 use std::path::{Path, PathBuf};
 
 pub struct DraftStore {
@@ -87,7 +87,7 @@ impl DraftStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{
+    use harness_core::types::{
         Artifact, ArtifactType, Draft, DraftId, DraftStatus, ProjectId, RemediationType, Signal,
         SignalType,
     };

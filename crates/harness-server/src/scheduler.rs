@@ -1,5 +1,5 @@
 use crate::http::AppState;
-use harness_core::{EventFilters, Grade};
+use harness_core::{types::EventFilters, types::Grade};
 use harness_observe::health::generate_health_report;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,6 +8,7 @@ use tokio::time::sleep;
 pub struct Scheduler {
     pub gc_interval: Duration,
     pub health_interval: Duration,
+    pub self_evolution_interval: Duration,
 }
 
 impl Scheduler {
@@ -15,6 +16,7 @@ impl Scheduler {
         Self {
             gc_interval: grade.recommended_gc_interval(),
             health_interval: Duration::from_secs(24 * 3600),
+            self_evolution_interval: Duration::from_secs(24 * 3600),
         }
     }
 
@@ -25,7 +27,7 @@ impl Scheduler {
             loop {
                 sleep(gc_interval).await;
                 tracing::info!("scheduler: triggering periodic GC run");
-                crate::handlers::gc::gc_run(&gc_state, None).await;
+                crate::handlers::gc::gc_run(&gc_state, None, None).await;
             }
         });
 
@@ -41,6 +43,7 @@ impl Scheduler {
         });
 
         let review_config = state.core.server.config.review.clone();
+        crate::self_evolution::start(state.clone(), self.self_evolution_interval);
         crate::periodic_reviewer::start(state, review_config);
     }
 
@@ -82,7 +85,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::{EventFilters, Grade, GuardId, Language};
+    use harness_core::{types::EventFilters, types::Grade, types::GuardId, types::Language};
     use harness_rules::engine::Guard;
 
     async fn make_test_state(
@@ -107,6 +110,7 @@ mod tests {
         let s = Scheduler::from_grade(Grade::D);
         assert_eq!(s.gc_interval, Duration::from_secs(3600));
         assert_eq!(s.health_interval, Duration::from_secs(24 * 3600));
+        assert_eq!(s.self_evolution_interval, Duration::from_secs(24 * 3600));
     }
 
     #[test]
@@ -114,6 +118,7 @@ mod tests {
         let s = Scheduler::from_grade(Grade::A);
         assert_eq!(s.gc_interval, Duration::from_secs(7 * 24 * 3600));
         assert_eq!(s.health_interval, Duration::from_secs(24 * 3600));
+        assert_eq!(s.self_evolution_interval, Duration::from_secs(24 * 3600));
     }
 
     #[test]

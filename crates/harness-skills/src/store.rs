@@ -1,8 +1,18 @@
 use chrono::{DateTime, Utc};
-use harness_core::{SkillId, SkillLocation};
+use harness_core::{types::SkillId, types::SkillLocation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillGovernanceStatus {
+    #[default]
+    Active,
+    Watch,
+    Quarantine,
+    Retired,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
@@ -18,13 +28,83 @@ pub struct Skill {
     pub content_hash: String,
     pub usage_count: u64,
     pub last_used: Option<DateTime<Utc>>,
+    /// EMA score in [0,1], where higher means better observed outcomes.
+    pub quality_score: f64,
+    /// Number of scored outcome samples accumulated for this skill.
+    pub scored_samples: u64,
+    /// Governance state that controls automatic injection.
+    pub governance_status: SkillGovernanceStatus,
+    /// Fraction of prompts allowed when in quarantine (0.0-1.0).
+    pub canary_ratio: f64,
+    /// Last time the governance score was refreshed.
+    pub last_scored: Option<DateTime<Utc>>,
 }
 
 /// Sidecar data persisted alongside skill files.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SkillUsage {
     usage_count: u64,
     last_used: Option<DateTime<Utc>>,
+    #[serde(default = "default_quality_score")]
+    quality_score: f64,
+    #[serde(default)]
+    scored_samples: u64,
+    #[serde(default)]
+    governance_status: SkillGovernanceStatus,
+    #[serde(default = "default_canary_ratio")]
+    canary_ratio: f64,
+    #[serde(default)]
+    last_scored: Option<DateTime<Utc>>,
+}
+
+impl Default for SkillUsage {
+    fn default() -> Self {
+        Self {
+            usage_count: 0,
+            last_used: None,
+            quality_score: default_quality_score(),
+            scored_samples: 0,
+            governance_status: SkillGovernanceStatus::Active,
+            canary_ratio: default_canary_ratio(),
+            last_scored: None,
+        }
+    }
+}
+
+fn default_quality_score() -> f64 {
+    0.5
+}
+
+fn default_canary_ratio() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SkillGovernanceInput {
+    pub success: u64,
+    pub fail: u64,
+    pub unknown: u64,
+}
+
+impl SkillGovernanceInput {
+    pub fn total(self) -> u64 {
+        self.success + self.fail + self.unknown
+    }
+
+    /// Samples with known outcomes that are safe to score.
+    pub fn scored_total(self) -> u64 {
+        self.success + self.fail
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillGovernanceUpdate {
+    pub name: String,
+    pub previous_status: SkillGovernanceStatus,
+    pub current_status: SkillGovernanceStatus,
+    pub quality_score: f64,
+    pub scored_samples: u64,
+    pub canary_ratio: f64,
 }
 
 pub struct SkillStore {
@@ -49,28 +129,27 @@ impl SkillStore {
     /// Record that a skill was used: increments its counter, updates `last_used`,
     /// and persists a sidecar `.usage.json` alongside the skill file when possible.
     pub fn record_use(&mut self, id: &SkillId) {
-        let (name, count, last_used) = {
+        let (name, sidecar) = {
             let Some(skill) = self.skills.iter_mut().find(|s| s.id == *id) else {
                 return;
             };
             skill.usage_count += 1;
             skill.last_used = Some(Utc::now());
-            (skill.name.clone(), skill.usage_count, skill.last_used)
+            (
+                skill.name.clone(),
+                SkillUsage {
+                    usage_count: skill.usage_count,
+                    last_used: skill.last_used,
+                    quality_score: skill.quality_score,
+                    scored_samples: skill.scored_samples,
+                    governance_status: skill.governance_status,
+                    canary_ratio: skill.canary_ratio,
+                    last_scored: skill.last_scored,
+                },
+            )
         };
         if let Some(dir) = self.skill_dirs.get(&name) {
-            let path = dir.join(format!("{}.usage.json", name));
-            let usage = SkillUsage {
-                usage_count: count,
-                last_used,
-            };
-            match serde_json::to_string(&usage) {
-                Ok(json) => {
-                    if let Err(e) = std::fs::write(&path, json) {
-                        tracing::warn!("failed to persist usage for skill \'{}\': {e}", name);
-                    }
-                }
-                Err(e) => tracing::warn!("failed to serialize usage for skill \'{}\': {e}", name),
-            }
+            persist_usage_sidecar(dir, &name, &sidecar);
         }
     }
 
@@ -175,6 +254,11 @@ impl SkillStore {
                         content_hash: hash,
                         usage_count: usage.usage_count,
                         last_used: usage.last_used,
+                        quality_score: usage.quality_score,
+                        scored_samples: usage.scored_samples,
+                        governance_status: usage.governance_status,
+                        canary_ratio: usage.canary_ratio,
+                        last_scored: usage.last_scored,
                     });
                 }
             }
@@ -192,8 +276,64 @@ impl SkillStore {
                         .trigger_patterns
                         .iter()
                         .any(|p| prompt_lower.contains(&p.to_lowercase()))
+                    && allows_auto_injection(skill, prompt)
             })
             .collect()
+    }
+
+    /// Apply an outcome summary to a skill and update governance state.
+    ///
+    /// Score is updated with an EMA to avoid sharp oscillation.
+    pub fn apply_governance_outcome(
+        &mut self,
+        id: &SkillId,
+        input: SkillGovernanceInput,
+    ) -> Option<SkillGovernanceUpdate> {
+        let scored_total = input.scored_total();
+        if scored_total == 0 {
+            return None;
+        }
+        let idx = self.skills.iter().position(|s| s.id == *id)?;
+        let skill = &mut self.skills[idx];
+        let previous_status = skill.governance_status;
+
+        // Unknown outcomes are ignored for scoring to avoid penalizing in-flight tasks.
+        let total = scored_total as f64;
+        let raw = (input.success as f64 - 0.7 * input.fail as f64) / total;
+        let target = ((raw + 1.0) / 2.0).clamp(0.0, 1.0);
+        skill.quality_score = (skill.quality_score * 0.8 + target * 0.2).clamp(0.0, 1.0);
+        skill.scored_samples = skill.scored_samples.saturating_add(scored_total);
+        skill.last_scored = Some(Utc::now());
+
+        skill.governance_status =
+            decide_governance_status(skill.quality_score, skill.scored_samples);
+        skill.canary_ratio = match skill.governance_status {
+            SkillGovernanceStatus::Active | SkillGovernanceStatus::Watch => 1.0,
+            SkillGovernanceStatus::Quarantine => 0.1,
+            SkillGovernanceStatus::Retired => 0.0,
+        };
+
+        if let Some(dir) = self.skill_dirs.get(&skill.name) {
+            let sidecar = SkillUsage {
+                usage_count: skill.usage_count,
+                last_used: skill.last_used,
+                quality_score: skill.quality_score,
+                scored_samples: skill.scored_samples,
+                governance_status: skill.governance_status,
+                canary_ratio: skill.canary_ratio,
+                last_scored: skill.last_scored,
+            };
+            persist_usage_sidecar(dir, &skill.name, &sidecar);
+        }
+
+        Some(SkillGovernanceUpdate {
+            name: skill.name.clone(),
+            previous_status,
+            current_status: skill.governance_status,
+            quality_score: skill.quality_score,
+            scored_samples: skill.scored_samples,
+            canary_ratio: skill.canary_ratio,
+        })
     }
 
     pub fn match_context(&self, file_path: Option<&Path>, language: Option<&str>) -> Vec<&Skill> {
@@ -264,6 +404,11 @@ impl SkillStore {
             content_hash,
             usage_count: 0,
             last_used: None,
+            quality_score: default_quality_score(),
+            scored_samples: 0,
+            governance_status: SkillGovernanceStatus::Active,
+            canary_ratio: default_canary_ratio(),
+            last_scored: None,
         };
         self.skills.push(skill);
         let skill_ref = match self.skills.last() {
@@ -377,6 +522,12 @@ impl SkillStore {
         ];
         for (name, content) in builtins {
             if self.get_by_name(name).is_none() {
+                let usage = if let Some(dir) = &self.persist_dir {
+                    self.skill_dirs.insert(name.to_string(), dir.clone());
+                    load_usage_sidecar(dir, name)
+                } else {
+                    SkillUsage::default()
+                };
                 self.skills.push(Skill {
                     id: SkillId::from_str(name),
                     name: name.to_string(),
@@ -393,8 +544,13 @@ impl SkillStore {
                     author: "system".to_string(),
                     location: SkillLocation::System,
                     content_hash: compute_content_hash(content),
-                    usage_count: 0,
-                    last_used: None,
+                    usage_count: usage.usage_count,
+                    last_used: usage.last_used,
+                    quality_score: usage.quality_score,
+                    scored_samples: usage.scored_samples,
+                    governance_status: usage.governance_status,
+                    canary_ratio: usage.canary_ratio,
+                    last_scored: usage.last_scored,
                 });
             }
         }
@@ -466,6 +622,60 @@ fn parse_trigger_patterns(content: &str) -> Vec<String> {
     Vec::new()
 }
 
+fn decide_governance_status(score: f64, samples: u64) -> SkillGovernanceStatus {
+    if samples >= 30 && score < 0.30 {
+        SkillGovernanceStatus::Retired
+    } else if samples >= 10 && score < 0.45 {
+        SkillGovernanceStatus::Quarantine
+    } else if score < 0.60 {
+        SkillGovernanceStatus::Watch
+    } else {
+        SkillGovernanceStatus::Active
+    }
+}
+
+fn allows_auto_injection(skill: &Skill, prompt: &str) -> bool {
+    match skill.governance_status {
+        SkillGovernanceStatus::Active | SkillGovernanceStatus::Watch => true,
+        SkillGovernanceStatus::Quarantine => {
+            skill.canary_ratio > 0.0 && in_canary_bucket(&skill.id, prompt, skill.canary_ratio)
+        }
+        SkillGovernanceStatus::Retired => false,
+    }
+}
+
+fn in_canary_bucket(skill_id: &SkillId, prompt: &str, ratio: f64) -> bool {
+    if ratio <= 0.0 {
+        return false;
+    }
+    if ratio >= 1.0 {
+        return true;
+    }
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    skill_id.as_str().hash(&mut hasher);
+    prompt.hash(&mut hasher);
+    let bucket = hasher.finish() % 10_000;
+    let threshold = (ratio.clamp(0.0, 1.0) * 10_000.0).round() as u64;
+    bucket < threshold
+}
+
+fn persist_usage_sidecar(dir: &Path, skill_name: &str, usage: &SkillUsage) {
+    let path = dir.join(format!("{}.usage.json", skill_name));
+    match serde_json::to_string(usage) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!("failed to persist usage for skill \'{}\': {e}", skill_name);
+            }
+        }
+        Err(e) => tracing::warn!(
+            "failed to serialize usage for skill \'{}\': {e}",
+            skill_name
+        ),
+    }
+}
+
 fn load_usage_sidecar(dir: &Path, skill_name: &str) -> SkillUsage {
     let path = dir.join(format!("{}.usage.json", skill_name));
     if !path.exists() {
@@ -503,6 +713,11 @@ mod tests {
             content_hash: compute_content_hash("content"),
             usage_count: 0,
             last_used: None,
+            quality_score: default_quality_score(),
+            scored_samples: 0,
+            governance_status: SkillGovernanceStatus::Active,
+            canary_ratio: default_canary_ratio(),
+            last_scored: None,
         }
     }
 
@@ -641,6 +856,33 @@ mod tests {
     }
 
     #[test]
+    fn load_builtin_restores_sidecar_governance_from_persist_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist_path = dir.path().to_path_buf();
+        let sidecar_path = persist_path.join("review.usage.json");
+        let sidecar = SkillUsage {
+            usage_count: 7,
+            last_used: Some(Utc::now()),
+            quality_score: 0.2,
+            scored_samples: 40,
+            governance_status: SkillGovernanceStatus::Retired,
+            canary_ratio: 0.0,
+            last_scored: Some(Utc::now()),
+        };
+        std::fs::write(&sidecar_path, serde_json::to_string(&sidecar).expect("serialize sidecar"))
+            .expect("write sidecar");
+
+        let mut store = SkillStore::new().with_persist_dir(persist_path);
+        store.load_builtin();
+        let review = store
+            .get_by_name("review")
+            .expect("builtin review skill should exist");
+        assert_eq!(review.usage_count, 7);
+        assert_eq!(review.governance_status, SkillGovernanceStatus::Retired);
+        assert_eq!(review.scored_samples, 40);
+    }
+
+    #[test]
     fn get_by_name_returns_correct_skill() {
         let mut store = SkillStore::new();
         store.load_builtin();
@@ -699,6 +941,11 @@ mod tests {
             content_hash: compute_content_hash(""),
             usage_count: 0,
             last_used: None,
+            quality_score: default_quality_score(),
+            scored_samples: 0,
+            governance_status: SkillGovernanceStatus::Active,
+            canary_ratio: default_canary_ratio(),
+            last_scored: None,
         });
         let matches = store.match_prompt("please do a code review of this PR");
         assert_eq!(matches.len(), 1);
@@ -720,6 +967,11 @@ mod tests {
             content_hash: compute_content_hash(""),
             usage_count: 0,
             last_used: None,
+            quality_score: default_quality_score(),
+            scored_samples: 0,
+            governance_status: SkillGovernanceStatus::Active,
+            canary_ratio: default_canary_ratio(),
+            last_scored: None,
         });
         let matches = store.match_prompt("I have a BUILD ERROR in my project");
         assert_eq!(matches.len(), 1);
@@ -753,6 +1005,11 @@ mod tests {
             content_hash: compute_content_hash(""),
             usage_count: 0,
             last_used: None,
+            quality_score: default_quality_score(),
+            scored_samples: 0,
+            governance_status: SkillGovernanceStatus::Active,
+            canary_ratio: default_canary_ratio(),
+            last_scored: None,
         });
         let matches = store.match_prompt("implement feature X");
         assert!(matches.is_empty());
@@ -880,6 +1137,8 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
         assert_eq!(data.usage_count, 1);
         assert!(data.last_used.is_some());
+        assert_eq!(data.governance_status, SkillGovernanceStatus::Active);
+        assert!(data.quality_score > 0.0);
     }
 
     #[test]
@@ -888,6 +1147,8 @@ mod tests {
         let usage = load_usage_sidecar(tmp.path(), "nonexistent");
         assert_eq!(usage.usage_count, 0);
         assert!(usage.last_used.is_none());
+        assert_eq!(usage.governance_status, SkillGovernanceStatus::Active);
+        assert_eq!(usage.canary_ratio, 1.0);
     }
 
     #[test]
@@ -897,11 +1158,85 @@ mod tests {
         let stored = SkillUsage {
             usage_count: 42,
             last_used: Some(chrono::Utc::now()),
+            ..Default::default()
         };
         std::fs::write(&sidecar, serde_json::to_string(&stored).unwrap()).unwrap();
         let loaded = load_usage_sidecar(tmp.path(), "myskill");
         assert_eq!(loaded.usage_count, 42);
         assert!(loaded.last_used.is_some());
+    }
+
+    #[test]
+    fn governance_update_can_quarantine_skill() {
+        let mut store = SkillStore::new();
+        store.create(
+            "review-skill".to_string(),
+            "# review\n<!-- trigger-patterns: review -->".to_string(),
+        );
+        let id = store.list()[0].id.clone();
+
+        let update = store
+            .apply_governance_outcome(
+                &id,
+                SkillGovernanceInput {
+                    success: 0,
+                    fail: 20,
+                    unknown: 0,
+                },
+            )
+            .expect("governance update should exist");
+        assert_eq!(update.current_status, SkillGovernanceStatus::Quarantine);
+        assert_eq!(update.canary_ratio, 0.1);
+        assert!(update.quality_score < 0.45);
+    }
+
+    #[test]
+    fn governance_update_ignores_unknown_only_samples() {
+        let mut store = SkillStore::new();
+        store.create(
+            "unknown-skill".to_string(),
+            "# unknown\n<!-- trigger-patterns: unknown -->".to_string(),
+        );
+        let id = store.list()[0].id.clone();
+
+        let update = store.apply_governance_outcome(
+            &id,
+            SkillGovernanceInput {
+                success: 0,
+                fail: 0,
+                unknown: 12,
+            },
+        );
+        assert!(update.is_none(), "unknown-only samples should not change score");
+
+        let skill = store.get(&id).expect("skill should exist");
+        assert_eq!(skill.scored_samples, 0);
+        assert_eq!(skill.quality_score, default_quality_score());
+    }
+
+    #[test]
+    fn retired_skill_is_not_auto_injected() {
+        let mut store = SkillStore::new();
+        store.skills.push(Skill {
+            id: SkillId::new(),
+            name: "retired-review".to_string(),
+            description: "review code".to_string(),
+            content: String::new(),
+            trigger_patterns: vec!["code review".to_string()],
+            version: "1.0.0".to_string(),
+            author: "system".to_string(),
+            location: SkillLocation::System,
+            content_hash: compute_content_hash(""),
+            usage_count: 0,
+            last_used: None,
+            quality_score: 0.2,
+            scored_samples: 100,
+            governance_status: SkillGovernanceStatus::Retired,
+            canary_ratio: 0.0,
+            last_scored: Some(Utc::now()),
+        });
+        let matches = store.match_prompt("please do a code review of this PR");
+        assert!(matches.is_empty(), "retired skill should not auto-inject");
     }
 
     #[test]

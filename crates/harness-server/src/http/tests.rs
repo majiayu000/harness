@@ -2,7 +2,10 @@ use super::*;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Request;
-use harness_core::{AgentRequest, AgentResponse, Capability, CodeAgent, StreamItem, TokenUsage};
+use harness_core::{
+    agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, agent::StreamItem,
+    types::Capability, types::TokenUsage,
+};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::sync::Arc;
@@ -31,7 +34,7 @@ impl CodeAgent for CapturingAgent {
         vec![]
     }
 
-    async fn execute(&self, req: AgentRequest) -> harness_core::Result<AgentResponse> {
+    async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         self.prompts.lock().await.push(req.prompt);
         Ok(AgentResponse {
             output: String::new(),
@@ -52,15 +55,15 @@ impl CodeAgent for CapturingAgent {
         &self,
         _req: AgentRequest,
         _tx: tokio::sync::mpsc::Sender<StreamItem>,
-    ) -> harness_core::Result<()> {
+    ) -> harness_core::error::Result<()> {
         Ok(())
     }
 }
 
 async fn make_test_state_with(
     dir: &std::path::Path,
-    config: harness_core::HarnessConfig,
-    agent_registry: harness_agents::AgentRegistry,
+    config: harness_core::config::HarnessConfig,
+    agent_registry: harness_agents::registry::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
     let thread_manager = crate::thread_manager::ThreadManager::new();
     let server = Arc::new(crate::server::HarnessServer::new(
@@ -68,29 +71,33 @@ async fn make_test_state_with(
         thread_manager,
         agent_registry,
     ));
-    let tasks = task_runner::TaskStore::open(&harness_core::default_db_path(dir, "tasks")).await?;
-    let events = Arc::new(harness_observe::EventStore::new(dir).await?);
-    let signal_detector = harness_gc::SignalDetector::new(
+    let tasks =
+        task_runner::TaskStore::open(&harness_core::config::dirs::default_db_path(dir, "tasks"))
+            .await?;
+    let events = Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
+    let signal_detector = harness_gc::signal_detector::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
-        harness_core::ProjectId::new(),
+        harness_core::types::ProjectId::new(),
     );
-    let draft_store = harness_gc::DraftStore::new(dir)?;
-    let gc_agent = Arc::new(harness_gc::GcAgent::new(
+    let draft_store = harness_gc::draft_store::DraftStore::new(dir)?;
+    let gc_agent = Arc::new(harness_gc::gc_agent::GcAgent::new(
         server.config.gc.clone(),
         signal_detector,
         draft_store,
         dir.to_path_buf(),
     ));
-    let thread_db =
-        crate::thread_db::ThreadDb::open(&harness_core::default_db_path(dir, "threads")).await?;
+    let thread_db = crate::thread_db::ThreadDb::open(&harness_core::config::dirs::default_db_path(
+        dir, "threads",
+    ))
+    .await?;
     let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
-        &harness_core::default_db_path(dir, "projects"),
+        &harness_core::config::dirs::default_db_path(dir, "projects"),
     )
     .await?;
     let project_svc =
-        crate::services::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
-    let task_svc = crate::services::DefaultTaskService::new(tasks.clone());
-    let execution_svc = crate::services::DefaultExecutionService::new(
+        crate::services::project::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
+    let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+    let execution_svc = crate::services::execution::DefaultExecutionService::new(
         tasks.clone(),
         server.agent_registry.clone(),
         Arc::new(server.config.clone()),
@@ -117,7 +124,9 @@ async fn make_test_state_with(
             project_registry: None,
         },
         engines: crate::http::EngineServices {
-            skills: Arc::new(tokio::sync::RwLock::new(harness_skills::SkillStore::new())),
+            skills: Arc::new(tokio::sync::RwLock::new(
+                harness_skills::store::SkillStore::new(),
+            )),
             rules: Arc::new(tokio::sync::RwLock::new(
                 harness_rules::engine::RuleEngine::new(),
             )),
@@ -125,8 +134,10 @@ async fn make_test_state_with(
         },
         observability: crate::http::ObservabilityServices {
             events,
-            signal_rate_limiter: Arc::new(crate::http::SignalRateLimiter::new(100)),
-            password_reset_rate_limiter: Arc::new(crate::http::PasswordResetRateLimiter::new(5)),
+            signal_rate_limiter: Arc::new(crate::http::rate_limit::SignalRateLimiter::new(100)),
+            password_reset_rate_limiter: Arc::new(
+                crate::http::rate_limit::PasswordResetRateLimiter::new(5),
+            ),
             review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
@@ -157,8 +168,8 @@ async fn make_test_state_with(
 async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>> {
     make_test_state_with(
         dir,
-        harness_core::HarnessConfig::default(),
-        harness_agents::AgentRegistry::new("test"),
+        harness_core::config::HarnessConfig::default(),
+        harness_agents::registry::AgentRegistry::new("test"),
     )
     .await
 }
@@ -167,11 +178,11 @@ async fn make_test_state_with_agent(
     dir: &std::path::Path,
     webhook_secret: Option<&str>,
 ) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
-    let mut config = harness_core::HarnessConfig::default();
+    let mut config = harness_core::config::HarnessConfig::default();
     config.server.github_webhook_secret = webhook_secret.map(ToString::to_string);
 
     let capturing = CapturingAgent::new();
-    let mut registry = harness_agents::AgentRegistry::new("test");
+    let mut registry = harness_agents::registry::AgentRegistry::new("test");
     registry.register("test", capturing.clone());
 
     let state = make_test_state_with(dir, config, registry).await?;
@@ -737,8 +748,8 @@ async fn intake_status_dashboard_always_enabled() -> anyhow::Result<()> {
 #[tokio::test]
 async fn intake_status_shows_github_repo_when_configured() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut config = harness_core::HarnessConfig::default();
-    config.intake.github = Some(harness_core::GitHubIntakeConfig {
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
         enabled: true,
         repo: "owner/myrepo".to_string(),
         label: "harness".to_string(),
@@ -748,7 +759,7 @@ async fn intake_status_shows_github_repo_when_configured() -> anyhow::Result<()>
     let state = make_test_state_with(
         dir.path(),
         config,
-        harness_agents::AgentRegistry::new("test"),
+        harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
     let app = intake_app(state);
@@ -798,7 +809,7 @@ fn authed_app(state: Arc<AppState>) -> Router {
         .route("/tasks", get(list_tasks))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            api_auth_middleware,
+            auth::api_auth_middleware,
         ))
         .with_state(state)
 }
@@ -806,12 +817,12 @@ fn authed_app(state: Arc<AppState>) -> Router {
 #[tokio::test]
 async fn dashboard_requires_auth_when_token_configured() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut config = harness_core::HarnessConfig::default();
+    let mut config = harness_core::config::HarnessConfig::default();
     config.server.api_token = Some("secret123".to_string());
     let state = make_test_state_with(
         dir.path(),
         config,
-        harness_agents::AgentRegistry::new("test"),
+        harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
     let app = authed_app(state);
@@ -827,12 +838,12 @@ async fn dashboard_requires_auth_when_token_configured() -> anyhow::Result<()> {
 #[tokio::test]
 async fn dashboard_accessible_via_query_param_token() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut config = harness_core::HarnessConfig::default();
+    let mut config = harness_core::config::HarnessConfig::default();
     config.server.api_token = Some("secret123".to_string());
     let state = make_test_state_with(
         dir.path(),
         config,
-        harness_agents::AgentRegistry::new("test"),
+        harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
     let app = authed_app(state);
@@ -852,13 +863,13 @@ async fn dashboard_accessible_via_query_param_token() -> anyhow::Result<()> {
 #[tokio::test]
 async fn dashboard_query_param_token_percent_decoded() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut config = harness_core::HarnessConfig::default();
+    let mut config = harness_core::config::HarnessConfig::default();
     // Token contains characters that encodeURIComponent would encode.
     config.server.api_token = Some("tok/en=val+end".to_string());
     let state = make_test_state_with(
         dir.path(),
         config,
-        harness_agents::AgentRegistry::new("test"),
+        harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
     let app = authed_app(state);
@@ -1024,7 +1035,7 @@ impl CodeAgent for DispatchCapturingAgent {
         vec![]
     }
 
-    async fn execute(&self, _req: AgentRequest) -> harness_core::Result<AgentResponse> {
+    async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         self.was_invoked
             .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(AgentResponse {
@@ -1046,7 +1057,7 @@ impl CodeAgent for DispatchCapturingAgent {
         &self,
         _req: AgentRequest,
         _tx: tokio::sync::mpsc::Sender<StreamItem>,
-    ) -> harness_core::Result<()> {
+    ) -> harness_core::error::Result<()> {
         self.was_invoked
             .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -1064,11 +1075,16 @@ async fn make_test_state_with_dispatch_agents(
 )> {
     let (default_agent, default_invoked) = DispatchCapturingAgent::new("test");
     let (claude_agent, claude_invoked) = DispatchCapturingAgent::new("claude");
-    let mut registry = harness_agents::AgentRegistry::new("test");
+    let mut registry = harness_agents::registry::AgentRegistry::new("test");
     registry.set_complexity_preferences(vec!["claude".to_string()]);
     registry.register("test", default_agent);
     registry.register("claude", claude_agent);
-    let state = make_test_state_with(dir, harness_core::HarnessConfig::default(), registry).await?;
+    let state = make_test_state_with(
+        dir,
+        harness_core::config::HarnessConfig::default(),
+        registry,
+    )
+    .await?;
     Ok((state, default_invoked, claude_invoked))
 }
 

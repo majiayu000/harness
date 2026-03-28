@@ -1,4 +1,4 @@
-use harness_core::{
+use harness_core::types::{
     DraftId, Event, EventFilters, ExecPlanId, MetricFilters, ProjectId, SkillId, ThreadId, TurnId,
 };
 use serde::{de, Deserialize, Deserializer, Serialize};
