@@ -290,7 +290,10 @@ async fn gc_adopt_auto_pr_requires_default_agent() -> anyhow::Result<()> {
 
     let draft_id = draft.id.clone();
     let resp = gc_adopt(&state, Some(serde_json::json!(1)), draft_id.clone()).await;
-    assert!(resp.error.is_some(), "expected error when default agent is missing");
+    assert!(
+        resp.error.is_some(),
+        "expected error when default agent is missing"
+    );
 
     let stored = state
         .engines

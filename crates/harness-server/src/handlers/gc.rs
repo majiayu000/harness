@@ -307,30 +307,31 @@ pub async fn gc_adopt(
                     serde_json::json!({ "adopted": true, "task_id": null }),
                 );
             }
-            let dispatch_result = if let Some((agent, reviewer, req, project_id)) = task_dispatch_plan {
-                match state.concurrency.task_queue.acquire(&project_id).await {
-                    Ok(permit) => {
-                        let tid = crate::task_runner::spawn_task(
-                            state.core.tasks.clone(),
-                            agent,
-                            reviewer,
-                            std::sync::Arc::new(state.core.server.config.clone()),
-                            state.engines.skills.clone(),
-                            state.observability.events.clone(),
-                            state.interceptors.clone(),
-                            req,
-                            state.concurrency.workspace_mgr.clone(),
-                            permit,
-                            None,
-                        )
-                        .await;
-                        Ok(Some(tid.0))
+            let dispatch_result =
+                if let Some((agent, reviewer, req, project_id)) = task_dispatch_plan {
+                    match state.concurrency.task_queue.acquire(&project_id).await {
+                        Ok(permit) => {
+                            let tid = crate::task_runner::spawn_task(
+                                state.core.tasks.clone(),
+                                agent,
+                                reviewer,
+                                std::sync::Arc::new(state.core.server.config.clone()),
+                                state.engines.skills.clone(),
+                                state.observability.events.clone(),
+                                state.interceptors.clone(),
+                                req,
+                                state.concurrency.workspace_mgr.clone(),
+                                permit,
+                                None,
+                            )
+                            .await;
+                            Ok(Some(tid.0))
+                        }
+                        Err(e) => Err(format!("task queue full: {e}")),
                     }
-                    Err(e) => Err(format!("task queue full: {e}")),
-                }
-            } else {
-                Ok(None)
-            };
+                } else {
+                    Ok(None)
+                };
 
             let (task_id, dispatch_error) = match dispatch_result {
                 Ok(task_id) => (task_id, None),
