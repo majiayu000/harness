@@ -511,6 +511,7 @@ async fn run_plan_for_prompt(
         project_root: project.to_path_buf(),
         env_vars: cargo_env.clone(),
         execution_phase: Some(ExecutionPhase::Planning),
+        allowed_tools: Some(restricted_tools(CapabilityProfile::ReadOnly)?),
         ..Default::default()
     };
 
@@ -2105,6 +2106,19 @@ mod tests {
                                                           // Should back up to byte 2 (1 full "é").
         assert!(result.starts_with("é"));
         assert!(result.contains("(output truncated,"));
+    }
+
+    #[test]
+    fn prompt_plan_phase_uses_readonly_profile() {
+        // run_plan_for_prompt must restrict to ReadOnly tools so the planning
+        // phase cannot write or edit files — it is analysis-only.
+        let tools = restricted_tools(CapabilityProfile::ReadOnly).unwrap();
+        assert!(tools.contains(&"Read".to_string()));
+        assert!(tools.contains(&"Grep".to_string()));
+        assert!(tools.contains(&"Glob".to_string()));
+        assert!(!tools.contains(&"Write".to_string()));
+        assert!(!tools.contains(&"Edit".to_string()));
+        assert!(!tools.contains(&"Bash".to_string()));
     }
 
     #[test]
