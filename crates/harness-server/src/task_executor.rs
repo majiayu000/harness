@@ -579,7 +579,6 @@ async fn run_triage_plan_pipeline(
             "Read".to_string(),
             "Grep".to_string(),
             "Glob".to_string(),
-            "Bash".to_string(),
         ]),
         ..Default::default()
     };

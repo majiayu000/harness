@@ -68,7 +68,20 @@ impl CodexAgent {
 
         args.push(OsString::from("-C"));
         args.push(req.project_root.as_os_str().to_os_string());
-        args.push(OsString::from(req.prompt.clone()));
+
+        // Codex CLI has no --allowedTools flag, so inject the restriction into the
+        // prompt text to enforce the same tool boundary at the model level.
+        let prompt = if let Some(tools) = &req.allowed_tools {
+            let note = format!(
+                "Tool restriction: you may ONLY use the following tools: {}. \
+                 Do NOT call any other tool.\n\n",
+                tools.join(", ")
+            );
+            format!("{note}{}", req.prompt)
+        } else {
+            req.prompt.clone()
+        };
+        args.push(OsString::from(prompt));
         args
     }
 }
