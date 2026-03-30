@@ -322,6 +322,10 @@ function showDetail(task) {
   if (task.source) body += `<span class="source-badge source-badge-${escapeHtml(task.source)}">${escapeHtml(task.source)}</span>`;
   if (task.repo) body += `<span class="repo-badge">${escapeHtml(task.repo)}</span>`;
   if (task.phase && task.phase !== "implement") body += `<span class="phase-badge">${escapeHtml(task.phase)}</span>`;
+  const ACTIVE_STATUSES = ["pending", "awaiting_deps", "implementing", "agent_review", "waiting", "reviewing"];
+  if (ACTIVE_STATUSES.includes(status)) {
+    body += `<button class="cancel-btn" data-task-id="${escapeHtml(task.id || "")}">Cancel</button>`;
+  }
   body += `</div>`;
 
   body += `<table class="detail-table">`;
@@ -362,6 +366,27 @@ function showDetail(task) {
   }
 
   document.getElementById("detail-body").innerHTML = body;
+
+  const cancelBtn = document.querySelector(".cancel-btn[data-task-id]");
+  if (cancelBtn) {
+    cancelBtn.addEventListener("click", async () => {
+      const taskId = cancelBtn.dataset.taskId;
+      if (!confirm(`Cancel task ${taskId}?`)) return;
+      try {
+        const resp = await fetch(`/tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST" });
+        if (!resp.ok) {
+          const body = await resp.json().catch(() => ({}));
+          alert(`Cancel failed: ${body.error || resp.status}`);
+          return;
+        }
+        closeDetail();
+        fetchTasks();
+      } catch (e) {
+        alert(`Cancel failed: ${e}`);
+      }
+    });
+  }
+
   panel.classList.add("detail-panel-open");
   document.body.style.overflow = "hidden";
 }

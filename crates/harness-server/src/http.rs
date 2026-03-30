@@ -1087,6 +1087,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .route("/tasks", get(list_tasks))
         .route("/tasks/batch", post(task_routes::create_tasks_batch))
         .route("/tasks/{id}", get(get_task))
+        .route("/tasks/{id}/cancel", post(task_routes::cancel_task))
         .route("/tasks/{id}/artifacts", get(get_task_artifacts))
         .route("/tasks/{id}/stream", get(stream_task_sse))
         .route(
