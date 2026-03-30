@@ -94,6 +94,7 @@ pub enum EvalResult {
     Pass { criteria_ids: Vec<String> },
     /// Some criteria passed; others failed — another implement round is needed.
     Partial {
+        #[serde(default)]
         passed: Vec<String>,
         failed: Vec<CriterionFailure>,
     },
@@ -248,6 +249,24 @@ failed:
 outcome: partial
 passed:
   - c1
+failed:
+  - id: c2
+    reason: "LLM judge found drift"
+```
+"#;
+        let result = EvalResult::from_markdown(md)?;
+        assert!(!result.is_pass());
+        assert_eq!(result.failed_ids(), vec!["c2"]);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_eval_result_partial_without_passed_field() -> anyhow::Result<()> {
+        // LLM may follow the prompt example and omit `passed` for partial outcomes.
+        // `#[serde(default)]` on the field must prevent deserialization failure.
+        let md = r#"
+```eval-result
+outcome: partial
 failed:
   - id: c2
     reason: "LLM judge found drift"
