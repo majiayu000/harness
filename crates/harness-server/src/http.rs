@@ -874,7 +874,7 @@ pub(crate) fn resolve_reviewer(
 /// - `.../pull/42`
 /// - `.../pull/42/files`
 /// - `.../pull/42#discussion_r...`
-fn parse_pr_num_from_url(url: &str) -> Option<u64> {
+pub(crate) fn parse_pr_num_from_url(url: &str) -> Option<u64> {
     // Strip fragment first, then query string
     let url = url.split('#').next().unwrap_or(url);
     let url = url.split('?').next().unwrap_or(url);
