@@ -289,14 +289,44 @@ impl TaskDb {
                         row.status
                     )
                 };
-                sqlx::query(
-                    "UPDATE tasks SET status = 'pending', error = ?, updated_at = datetime('now') \
-                     WHERE id = ?",
-                )
-                .bind(&reason)
-                .bind(&row.id)
-                .execute(&self.pool)
-                .await?;
+
+                // If task_pr_url was absent or unparseable but ck_pr_url is valid,
+                // write the effective URL back to tasks.pr_url so that re-dispatch
+                // (http.rs) and validate_recovered_tasks() (task_runner.rs) — which
+                // both filter on pr_url.is_some() — can actually see the PR.
+                let task_pr_url_valid = row
+                    .task_pr_url
+                    .as_deref()
+                    .map(|u| parse_pr_num_from_url(u).is_some())
+                    .unwrap_or(false);
+                let needs_pr_url_writeback = !task_pr_url_valid && effective_pr_url.is_some();
+
+                if needs_pr_url_writeback {
+                    sqlx::query(
+                        "UPDATE tasks SET status = 'pending', pr_url = ?, error = ?, \
+                         updated_at = datetime('now') WHERE id = ?",
+                    )
+                    .bind(effective_pr_url)
+                    .bind(&reason)
+                    .bind(&row.id)
+                    .execute(&self.pool)
+                    .await?;
+                    tracing::info!(
+                        task_id = %row.id,
+                        was = %row.status,
+                        pr_url = ?effective_pr_url,
+                        "startup recovery: wrote back pr_url from checkpoint"
+                    );
+                } else {
+                    sqlx::query(
+                        "UPDATE tasks SET status = 'pending', error = ?, updated_at = datetime('now') \
+                         WHERE id = ?",
+                    )
+                    .bind(&reason)
+                    .bind(&row.id)
+                    .execute(&self.pool)
+                    .await?;
+                }
                 result.resumed += 1;
                 tracing::info!(
                     task_id = %row.id,
