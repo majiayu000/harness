@@ -273,14 +273,13 @@ failed:
 ```
 "#;
         let result = EvalResult::from_markdown(md)?;
-        if let EvalResult::Partial { passed, failed } = result {
-            assert!(passed.is_empty());
-            assert_eq!(failed.len(), 1);
-            assert_eq!(failed[0].id, "c2");
-            assert_eq!(failed[0].reason, "LLM judge found drift");
-        } else {
+        let EvalResult::Partial { passed, failed } = result else {
             panic!("Expected EvalResult::Partial, got {:?}", result);
-        }
+        };
+        assert!(passed.is_empty());
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, "c2");
+        assert_eq!(failed[0].reason, "LLM judge found drift");
         Ok(())
     }
 
