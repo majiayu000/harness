@@ -756,6 +756,11 @@ pub(crate) async fn run_task(
             .map(|s| s.phase == crate::task_runner::TaskPhase::Plan)
             .unwrap_or(false);
         if forced_plan && req.issue.is_none() && req.pr.is_none() {
+            // Set to Implementing BEFORE the plan phase so that a crash during planning
+            // leaves the task in 'implementing' status. The startup recovery code will catch
+            // it and fail-close it (no pr_url → mark failed), rather than leaving it stuck
+            // as a plain 'pending' that is never re-dispatched.
+            update_status(store, task_id, TaskStatus::Implementing, 1).await?;
             run_plan_for_prompt(agent, store, task_id, &cargo_env, &project, req).await?
         } else {
             (None, prompts::TriageComplexity::Medium)

@@ -936,11 +936,33 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     let pr_num = match parse_pr_num_from_url(pr_url) {
                         Some(n) => n,
                         None => {
-                            tracing::warn!(
+                            // pr_url is present but unparseable (empty, corrupted, or
+                            // non-standard).  Simply returning would leave the task stuck in
+                            // 'pending' forever — fail-close it instead so operators can see
+                            // it and the re-dispatch filter never picks it up again.
+                            tracing::error!(
                                 task_id = ?task.id,
                                 pr_url,
-                                "startup recovery: cannot parse PR number from URL, skipping"
+                                "startup recovery: cannot parse PR number from URL — marking task failed"
                             );
+                            let bad_url = pr_url.to_owned();
+                            if let Err(e) = task_runner::mutate_and_persist(
+                                &state.core.tasks,
+                                &task.id,
+                                move |s| {
+                                    s.status = task_runner::TaskStatus::Failed;
+                                    s.error = Some(format!(
+                                        "startup recovery: unparseable pr_url: {bad_url}"
+                                    ));
+                                },
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    "startup recovery: failed to persist failed status: {e}"
+                                );
+                            }
                             return;
                         }
                     };
