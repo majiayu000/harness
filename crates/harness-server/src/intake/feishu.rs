@@ -149,6 +149,7 @@ impl IntakeSource for FeishuIntake {
                 "Task failed: {}",
                 result.error.as_deref().unwrap_or("unknown error")
             ),
+            TaskStatus::Cancelled => return Ok(()),
             _ => return Ok(()),
         };
 
@@ -161,7 +162,10 @@ impl IntakeSource for FeishuIntake {
             }
         }
 
-        if matches!(result.status, TaskStatus::Done | TaskStatus::Failed) {
+        if matches!(
+            result.status,
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
             self.dispatched.remove(external_id);
             self.chat_ids.remove(external_id);
         }

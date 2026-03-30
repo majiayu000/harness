@@ -52,6 +52,7 @@ pub enum TaskStatus {
     Reviewing,
     Done,
     Failed,
+    Cancelled,
 }
 
 impl AsRef<str> for TaskStatus {
@@ -65,6 +66,7 @@ impl AsRef<str> for TaskStatus {
             TaskStatus::Reviewing => "reviewing",
             TaskStatus::Done => "done",
             TaskStatus::Failed => "failed",
+            TaskStatus::Cancelled => "cancelled",
         }
     }
 }
@@ -82,6 +84,7 @@ impl std::str::FromStr for TaskStatus {
             "reviewing" => Ok(TaskStatus::Reviewing),
             "done" => Ok(TaskStatus::Done),
             "failed" => Ok(TaskStatus::Failed),
+            "cancelled" => Ok(TaskStatus::Cancelled),
             _ => anyhow::bail!("unknown task status `{s}`"),
         }
     }
@@ -512,6 +515,8 @@ pub struct TaskStore {
     persist_locks: DashMap<TaskId, Arc<Mutex<()>>>,
     /// Per-task broadcast channels for real-time stream forwarding to SSE clients.
     stream_txs: DashMap<TaskId, broadcast::Sender<StreamItem>>,
+    /// Per-task abort handles for cooperative cancellation via Tokio task abort.
+    abort_handles: DashMap<TaskId, tokio::task::AbortHandle>,
     /// Global circuit breaker: when the CLI account-level limit is hit,
     /// all tasks pause until this instant passes.
     rate_limit_until: RwLock<Option<tokio::time::Instant>>,
@@ -539,6 +544,7 @@ impl TaskStore {
             db,
             persist_locks,
             stream_txs: DashMap::new(),
+            abort_handles: DashMap::new(),
             rate_limit_until: RwLock::new(None),
         });
         Ok(store)
@@ -629,6 +635,29 @@ impl TaskStore {
     /// Remove the task's stream channel after execution completes.
     pub(crate) fn close_task_stream(&self, id: &TaskId) {
         self.stream_txs.remove(id);
+    }
+
+    /// Store the abort handle for a running task so it can be cancelled later.
+    pub(crate) fn store_abort_handle(&self, id: &TaskId, handle: tokio::task::AbortHandle) {
+        self.abort_handles.insert(id.clone(), handle);
+    }
+
+    /// Remove and discard the abort handle when the task finishes normally.
+    pub(crate) fn remove_abort_handle(&self, id: &TaskId) {
+        self.abort_handles.remove(id);
+    }
+
+    /// Abort the running task's Tokio future, if one is registered.
+    /// The `kill_on_drop(true)` flag on child processes ensures the CLI subprocess
+    /// is also killed when the future is dropped after abort.
+    /// Returns `true` if an abort handle was found and triggered.
+    pub fn abort_task(&self, id: &TaskId) -> bool {
+        if let Some(handle) = self.abort_handles.get(id) {
+            handle.abort();
+            true
+        } else {
+            false
+        }
     }
 
     /// Activate the global rate-limit circuit breaker. All tasks will pause
@@ -1031,6 +1060,10 @@ where
     let id_watcher = id.clone();
     let interceptors = Arc::new(interceptors);
     let detect_worktree = Arc::new(detect_worktree);
+    // Clones used to store the abort handle after the main future is spawned
+    // (store and id are moved into the spawn closure).
+    let store_for_abort = store.clone();
+    let id_for_abort = id.clone();
 
     let handle = tokio::spawn(async move {
         // Hold both permits for the task's lifetime so that the group serialisation
@@ -1295,6 +1328,11 @@ where
         task_result
     });
 
+    // Store abort handle before the watcher consumes the JoinHandle, so the
+    // cancel endpoint can abort the task's Tokio future (which also kills the
+    // child process via kill_on_drop(true)).
+    store_for_abort.store_abort_handle(&id_for_abort, handle.abort_handle());
+
     tokio::spawn(async move {
         match handle.await {
             Ok(Ok(())) => {}
@@ -1302,12 +1340,18 @@ where
                 record_task_failure(&store_watcher, &events_watcher, &id_watcher, e.to_string())
                     .await;
             }
+            Err(join_err) if join_err.is_cancelled() => {
+                // abort() was called by the cancel endpoint; status already set to
+                // Cancelled before abort() was called — do not overwrite with Failed.
+                tracing::info!("task {id_watcher:?} cancelled via abort");
+            }
             Err(join_err) => {
-                tracing::error!("task {id_watcher:?} panicked or was cancelled: {join_err}");
+                tracing::error!("task {id_watcher:?} panicked: {join_err}");
                 let reason = format!("task failed unexpectedly: {join_err}");
                 record_task_failure(&store_watcher, &events_watcher, &id_watcher, reason).await;
             }
         }
+        store_watcher.remove_abort_handle(&id_watcher);
         // Close the stream channel so SSE clients receive EOF.
         store_watcher.close_task_stream(&id_watcher);
         if let Some(cb) = completion_callback {

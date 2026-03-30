@@ -495,6 +495,59 @@ pub(super) async fn create_task(
     }
 }
 
+/// POST /tasks/{id}/cancel — abort a running task.
+///
+/// Sets task status to `Cancelled` then aborts the Tokio future (which kills
+/// the child CLI process via `kill_on_drop(true)`).  Returns 409 if the task
+/// is already in a terminal state.
+pub(super) async fn cancel_task(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use task_runner::TaskStatus;
+
+    let task_id = harness_core::types::TaskId(id);
+
+    let task = match state.core.tasks.get(&task_id) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "task not found" })),
+            );
+        }
+    };
+
+    if matches!(
+        task.status,
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "task already in terminal state" })),
+        );
+    }
+
+    // Persist Cancelled status before aborting the future so the watcher sees
+    // it and skips the record_task_failure path.
+    if let Err(e) = task_runner::mutate_and_persist(&state.core.tasks, &task_id, |s| {
+        s.status = TaskStatus::Cancelled;
+    })
+    .await
+    {
+        tracing::error!("cancel_task: failed to persist Cancelled for {task_id:?}: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "failed to persist cancellation" })),
+        );
+    }
+
+    // abort() is a no-op if the task already finished — safe to call unconditionally.
+    state.core.tasks.abort_task(&task_id);
+
+    (StatusCode::OK, Json(json!({ "status": "cancelled" })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
