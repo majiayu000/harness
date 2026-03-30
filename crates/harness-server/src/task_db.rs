@@ -71,6 +71,18 @@ static TASK_MIGRATIONS: &[Migration] = &[
         description: "add project column for task observability",
         sql: "ALTER TABLE tasks ADD COLUMN project TEXT",
     },
+    Migration {
+        version: 9,
+        description: "create task_checkpoints table for phase recovery",
+        sql: "CREATE TABLE IF NOT EXISTS task_checkpoints (
+            task_id       TEXT PRIMARY KEY,
+            triage_output TEXT,
+            plan_output   TEXT,
+            pr_url        TEXT,
+            last_phase    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        )",
+    },
 ];
 
 /// A single persisted artifact captured from agent output during task execution.
@@ -83,13 +95,45 @@ pub struct TaskArtifact {
     pub created_at: String,
 }
 
+/// Persisted phase checkpoint for a task, used to resume after server restart.
+///
+/// A single row per task (upsert semantics). Each field is populated once the
+/// corresponding phase completes; earlier fields are preserved on subsequent writes.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TaskCheckpoint {
+    pub task_id: String,
+    /// Non-null once the Triage phase has completed.
+    pub triage_output: Option<String>,
+    /// Non-null once the Plan phase has completed.
+    pub plan_output: Option<String>,
+    /// Non-null once a PR has been created (most critical for duplicate-PR prevention).
+    pub pr_url: Option<String>,
+    /// Last completed phase: `triage_done` | `plan_done` | `pr_created`.
+    pub last_phase: String,
+    pub updated_at: String,
+}
+
 /// Result of [`TaskDb::recover_in_progress`].
 #[derive(Debug, Default)]
 pub struct RecoveryResult {
     /// Tasks that were in interrupted states and are now `failed`.
     pub failed: u32,
+    /// Tasks that were in interrupted states and have checkpoints — now `pending` for resume.
+    pub resumed: u32,
     /// Tasks that were `pending` mid-transient-retry at crash time and are now `failed`.
     pub transient_failed: u32,
+}
+
+/// Row returned by the checkpoint JOIN query inside [`TaskDb::recover_in_progress`].
+#[derive(sqlx::FromRow)]
+struct RecoveryRow {
+    id: String,
+    status: String,
+    turn: i64,
+    task_pr_url: Option<String>,
+    triage_output: Option<String>,
+    plan_output: Option<String>,
+    ck_pr_url: Option<String>,
 }
 
 pub struct TaskDb {
@@ -178,30 +222,98 @@ impl TaskDb {
 
     /// Recovery on server restart.
     ///
-    /// - interrupted states (`implementing`, `agent_review`, `reviewing`, `waiting`) → `failed`
-    ///   (agent process died mid-flight; no safe resume path)
-    /// - `pending` with transient-retry error → `failed` (crashed mid-backoff, no PR to resume)
-    /// - `pending` otherwise → unchanged (will be picked up by the re-dispatch loop)
+    /// For each interrupted task (`implementing`, `agent_review`, `reviewing`, `waiting`),
+    /// checks the `task_checkpoints` table and the existing `tasks.pr_url` column to
+    /// decide between resuming and failing:
     ///
-    /// Diagnostic context is embedded in the `error` field so operators can correlate
-    /// recovery events with their original execution state.
+    /// - Has PR (tasks.pr_url or checkpoint.pr_url) → `pending`, `resumed += 1`
+    ///   (executor will skip implement and jump to agent review)
+    /// - Has plan checkpoint → `pending`, `resumed += 1`
+    ///   (executor will use saved plan, skip triage/plan pipeline)
+    /// - Has triage checkpoint only → `pending`, `resumed += 1`
+    ///   (executor will re-run from plan phase)
+    /// - No checkpoint → `failed`, `failed += 1`
+    ///   (existing fail-closed behavior, no safe resume point)
     ///
-    /// Returns a [`RecoveryResult`] with counts for failed outcomes.
+    /// Tasks in `AwaitingDeps` are left unchanged — `check_awaiting_deps()` handles them.
+    /// `pending` tasks in transient-retry are failed (crashed during backoff, cannot re-dispatch).
+    ///
+    /// Returns a [`RecoveryResult`] with counts for each outcome.
     pub async fn recover_in_progress(&self) -> anyhow::Result<RecoveryResult> {
-        // Interrupted tasks cannot be resumed safely after restart without a fresh
-        // agent invocation, so mark them failed with diagnostic context.
-        let failed = sqlx::query(
-            "UPDATE tasks \
-             SET status = 'failed', \
-                 error = 'recovered after restart (was: ' || status \
-                      || ', round: ' || turn \
-                      || ', pr: ' || COALESCE(pr_url, 'none') || ')', \
-                 updated_at = datetime('now') \
-             WHERE status IN ('implementing', 'agent_review', 'reviewing', 'waiting')",
+        // Collect all interrupted tasks with their checkpoint data via LEFT JOIN.
+        let rows = sqlx::query_as::<_, RecoveryRow>(
+            "SELECT t.id, t.status, t.turn, t.pr_url AS task_pr_url,
+                    c.triage_output, c.plan_output, c.pr_url AS ck_pr_url
+             FROM tasks t
+             LEFT JOIN task_checkpoints c ON t.id = c.task_id
+             WHERE t.status IN ('implementing', 'agent_review', 'reviewing', 'waiting')",
         )
-        .execute(&self.pool)
-        .await?
-        .rows_affected() as u32;
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut result = RecoveryResult::default();
+
+        for row in rows {
+            let has_pr = row.task_pr_url.is_some() || row.ck_pr_url.is_some();
+            let has_plan = row.plan_output.is_some();
+            let has_triage = row.triage_output.is_some();
+
+            if has_pr || has_plan || has_triage {
+                // Resume: set back to pending with a diagnostic error field.
+                let reason = if has_pr {
+                    format!(
+                        "resumed after restart (was: {}, pr: {})",
+                        row.status,
+                        row.task_pr_url
+                            .as_deref()
+                            .or(row.ck_pr_url.as_deref())
+                            .unwrap_or("checkpoint")
+                    )
+                } else if has_plan {
+                    format!(
+                        "resumed after restart (was: {}, plan checkpoint)",
+                        row.status
+                    )
+                } else {
+                    format!(
+                        "resumed after restart (was: {}, triage checkpoint)",
+                        row.status
+                    )
+                };
+                sqlx::query(
+                    "UPDATE tasks SET status = 'pending', error = ?, updated_at = datetime('now') \
+                     WHERE id = ?",
+                )
+                .bind(&reason)
+                .bind(&row.id)
+                .execute(&self.pool)
+                .await?;
+                result.resumed += 1;
+                tracing::info!(
+                    task_id = %row.id,
+                    was = %row.status,
+                    reason = %reason,
+                    "startup recovery: resumed task"
+                );
+            } else {
+                // Fail: no checkpoint, no safe resume point.
+                let err = format!(
+                    "recovered after restart (was: {}, round: {}, pr: {})",
+                    row.status,
+                    row.turn,
+                    row.task_pr_url.as_deref().unwrap_or("none")
+                );
+                sqlx::query(
+                    "UPDATE tasks SET status = 'failed', error = ?, updated_at = datetime('now') \
+                     WHERE id = ?",
+                )
+                .bind(&err)
+                .bind(&row.id)
+                .execute(&self.pool)
+                .await?;
+                result.failed += 1;
+            }
+        }
 
         // Tasks that were mid-transient-retry (status=pending, error starts with
         // "retrying after transient failure") crashed during the backoff window.
@@ -226,11 +338,55 @@ impl TaskDb {
                 transient_failed
             );
         }
+        result.transient_failed = transient_failed;
 
-        Ok(RecoveryResult {
-            failed,
-            transient_failed,
-        })
+        Ok(result)
+    }
+
+    /// Upsert a phase checkpoint for the given task.
+    ///
+    /// Each call advances `last_phase` and updates `updated_at`. Previously saved fields
+    /// (`triage_output`, `plan_output`, `pr_url`) are preserved via `COALESCE` when the
+    /// incoming value is `NULL`, so callers only need to pass the newly available field.
+    pub async fn write_checkpoint(
+        &self,
+        task_id: &str,
+        triage_output: Option<&str>,
+        plan_output: Option<&str>,
+        pr_url: Option<&str>,
+        last_phase: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO task_checkpoints \
+                 (task_id, triage_output, plan_output, pr_url, last_phase, updated_at) \
+             VALUES (?, ?, ?, ?, ?, datetime('now')) \
+             ON CONFLICT(task_id) DO UPDATE SET \
+                 triage_output = COALESCE(excluded.triage_output, task_checkpoints.triage_output), \
+                 plan_output   = COALESCE(excluded.plan_output,   task_checkpoints.plan_output), \
+                 pr_url        = COALESCE(excluded.pr_url,        task_checkpoints.pr_url), \
+                 last_phase    = excluded.last_phase, \
+                 updated_at    = excluded.updated_at",
+        )
+        .bind(task_id)
+        .bind(triage_output)
+        .bind(plan_output)
+        .bind(pr_url)
+        .bind(last_phase)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load the checkpoint for `task_id`, or `None` if no checkpoint exists.
+    pub async fn load_checkpoint(&self, task_id: &str) -> anyhow::Result<Option<TaskCheckpoint>> {
+        let row = sqlx::query_as::<_, TaskCheckpoint>(
+            "SELECT task_id, triage_output, plan_output, pr_url, last_phase, updated_at \
+             FROM task_checkpoints WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     /// Return the `pr_url` of the most recently completed Done task that has one, or `None`.
@@ -708,16 +864,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_in_progress_marks_all_interrupted_as_failed() -> anyhow::Result<()> {
+    async fn recover_no_checkpoint_marks_failed() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
 
         db.insert(&make_task("t-pending", TaskStatus::Pending))
             .await?;
-        // implementing WITHOUT PR → should fail
+        // All four interrupted statuses, no checkpoint → should all fail
         db.insert(&make_task("t-implementing", TaskStatus::Implementing))
             .await?;
-        // agent_review WITHOUT PR → should fail
         db.insert(&make_task("t-agent-review", TaskStatus::AgentReview))
             .await?;
         db.insert(&make_task("t-reviewing", TaskStatus::Reviewing))
@@ -731,8 +886,9 @@ mod tests {
         let result = db.recover_in_progress().await?;
         assert_eq!(
             result.failed, 4,
-            "implementing + agent_review + reviewing + waiting should all be failed"
+            "implementing + agent_review + reviewing + waiting without checkpoints should fail"
         );
+        assert_eq!(result.resumed, 0);
         assert_eq!(result.transient_failed, 0);
 
         // pending stays pending, no error set
@@ -740,7 +896,7 @@ mod tests {
         assert!(matches!(pending.status, TaskStatus::Pending));
         assert!(pending.error.is_none());
 
-        // implementing (no PR) → failed with diagnostic info
+        // implementing (no checkpoint, no PR) → failed with diagnostic info
         let implementing = db
             .get("t-implementing")
             .await?
@@ -753,7 +909,7 @@ mod tests {
         );
         assert!(err.contains("round:"), "error should contain round info");
 
-        // agent_review (no PR) → failed with diagnostic info
+        // agent_review (no checkpoint, no PR) → failed
         let agent_review = db
             .get("t-agent-review")
             .await?
@@ -765,16 +921,16 @@ mod tests {
             .unwrap_or("")
             .contains("was: agent_review"));
 
-        // reviewing → failed with diagnostic info
+        // reviewing → failed
         let reviewing = db.get("t-reviewing").await?.expect("should exist");
         assert!(matches!(reviewing.status, TaskStatus::Failed));
-        let err = reviewing.error.as_deref().unwrap_or("");
-        assert!(
-            err.contains("was: reviewing"),
-            "error should note original status"
-        );
+        assert!(reviewing
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("was: reviewing"));
 
-        // waiting → failed with diagnostic info
+        // waiting → failed
         let waiting = db.get("t-waiting").await?.expect("should exist");
         assert!(matches!(waiting.status, TaskStatus::Failed));
         assert!(waiting
@@ -793,55 +949,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_marks_tasks_with_pr_as_failed() -> anyhow::Result<()> {
+    async fn recover_with_tasks_pr_url_resumes_pending() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
 
-        // implementing WITH PR → should fail
+        // implementing WITH tasks.pr_url → resumed (not failed)
         let mut with_pr = make_task("t-impl-pr", TaskStatus::Implementing);
         with_pr.pr_url = Some("https://github.com/owner/repo/pull/42".to_string());
         db.insert(&with_pr).await?;
 
-        // agent_review WITH PR → should fail
+        // agent_review WITH tasks.pr_url → resumed
         let mut review_pr = make_task("t-review-pr", TaskStatus::AgentReview);
         review_pr.pr_url = Some("https://github.com/owner/repo/pull/43".to_string());
         db.insert(&review_pr).await?;
 
-        // implementing WITHOUT PR → should fail
+        // implementing WITHOUT PR and no checkpoint → still failed
         db.insert(&make_task("t-impl-no-pr", TaskStatus::Implementing))
             .await?;
 
         let result = db.recover_in_progress().await?;
-        assert_eq!(result.failed, 3, "all interrupted tasks should fail");
+        assert_eq!(result.resumed, 2, "tasks with pr_url should be resumed");
+        assert_eq!(
+            result.failed, 1,
+            "task without pr_url or checkpoint should fail"
+        );
         assert_eq!(result.transient_failed, 0);
 
-        // Verify: implementing with PR → failed
+        // Verify: implementing with PR → pending (resumed)
         let impl_pr = db
             .get("t-impl-pr")
             .await?
             .ok_or_else(|| anyhow::anyhow!("t-impl-pr should exist"))?;
         assert!(
-            matches!(impl_pr.status, TaskStatus::Failed),
-            "implementing with PR should be marked failed"
+            matches!(impl_pr.status, TaskStatus::Pending),
+            "implementing with PR should be resumed to pending"
+        );
+        assert!(
+            impl_pr.pr_url.as_deref() == Some("https://github.com/owner/repo/pull/42"),
+            "pr_url should be preserved"
         );
         let err = impl_pr.error.as_deref().unwrap_or("");
         assert!(
-            err.contains("was: implementing"),
-            "should contain original status"
+            err.contains("resumed after restart"),
+            "error should note resumption"
         );
-        assert!(
-            err.contains("pull/42"),
-            "should preserve PR URL in error context"
-        );
+        assert!(err.contains("pull/42"), "should reference PR URL");
 
-        // Verify: agent_review with PR → failed
+        // Verify: agent_review with PR → pending (resumed)
         let review = db
             .get("t-review-pr")
             .await?
             .ok_or_else(|| anyhow::anyhow!("t-review-pr should exist"))?;
         assert!(
-            matches!(review.status, TaskStatus::Failed),
-            "agent_review with PR should be marked failed"
+            matches!(review.status, TaskStatus::Pending),
+            "agent_review with PR should be resumed to pending"
         );
 
         // Verify: implementing without PR → failed
@@ -850,6 +1011,177 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow::anyhow!("t-impl-no-pr should exist"))?;
         assert!(matches!(no_pr.status, TaskStatus::Failed));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_with_plan_checkpoint_resumes_pending() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        // Task interrupted at implementing stage, plan was completed and checkpointed
+        db.insert(&make_task("t-impl-plan", TaskStatus::Implementing))
+            .await?;
+        db.write_checkpoint(
+            "t-impl-plan",
+            None,
+            Some("## Plan\nStep 1: do X"),
+            None,
+            "plan_done",
+        )
+        .await?;
+
+        let result = db.recover_in_progress().await?;
+        assert_eq!(result.resumed, 1);
+        assert_eq!(result.failed, 0);
+
+        let task = db
+            .get("t-impl-plan")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("t-impl-plan should exist"))?;
+        assert!(matches!(task.status, TaskStatus::Pending));
+        assert!(
+            task.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("plan checkpoint"),
+            "error should mention plan checkpoint"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_write_and_load_roundtrip() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        // No checkpoint yet → None
+        assert!(db.load_checkpoint("task-1").await?.is_none());
+
+        // Write triage checkpoint
+        db.write_checkpoint(
+            "task-1",
+            Some("triage output here"),
+            None,
+            None,
+            "triage_done",
+        )
+        .await?;
+
+        let ck = db
+            .load_checkpoint("task-1")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("checkpoint should exist"))?;
+        assert_eq!(ck.task_id, "task-1");
+        assert_eq!(ck.triage_output.as_deref(), Some("triage output here"));
+        assert!(ck.plan_output.is_none());
+        assert!(ck.pr_url.is_none());
+        assert_eq!(ck.last_phase, "triage_done");
+
+        // Advance to plan checkpoint — triage_output preserved via COALESCE
+        db.write_checkpoint("task-1", None, Some("plan text"), None, "plan_done")
+            .await?;
+
+        let ck = db
+            .load_checkpoint("task-1")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("checkpoint should exist after plan write"))?;
+        assert_eq!(
+            ck.triage_output.as_deref(),
+            Some("triage output here"),
+            "triage preserved"
+        );
+        assert_eq!(ck.plan_output.as_deref(), Some("plan text"));
+        assert!(ck.pr_url.is_none());
+        assert_eq!(ck.last_phase, "plan_done");
+
+        // Advance to pr_created — all previous fields preserved
+        db.write_checkpoint(
+            "task-1",
+            None,
+            None,
+            Some("https://github.com/o/r/pull/5"),
+            "pr_created",
+        )
+        .await?;
+
+        let ck = db
+            .load_checkpoint("task-1")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("checkpoint should exist after pr write"))?;
+        assert_eq!(
+            ck.triage_output.as_deref(),
+            Some("triage output here"),
+            "triage preserved"
+        );
+        assert_eq!(
+            ck.plan_output.as_deref(),
+            Some("plan text"),
+            "plan preserved"
+        );
+        assert_eq!(ck.pr_url.as_deref(), Some("https://github.com/o/r/pull/5"));
+        assert_eq!(ck.last_phase, "pr_created");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_upsert_replaces_last_phase() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.write_checkpoint("task-x", Some("triage"), None, None, "triage_done")
+            .await?;
+        db.write_checkpoint("task-x", None, Some("plan"), None, "plan_done")
+            .await?;
+
+        let ck = db
+            .load_checkpoint("task-x")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("checkpoint for task-x should exist"))?;
+        assert_eq!(
+            ck.last_phase, "plan_done",
+            "last_phase should advance to plan_done"
+        );
+        assert_eq!(
+            ck.triage_output.as_deref(),
+            Some("triage"),
+            "triage preserved"
+        );
+        assert_eq!(ck.plan_output.as_deref(), Some("plan"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_result_separates_resumed_from_failed() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        // Will be resumed: has a plan checkpoint
+        db.insert(&make_task("t-resumable", TaskStatus::Implementing))
+            .await?;
+        db.write_checkpoint("t-resumable", None, Some("plan output"), None, "plan_done")
+            .await?;
+
+        // Will be failed: no checkpoint, no PR
+        db.insert(&make_task("t-no-checkpoint", TaskStatus::Reviewing))
+            .await?;
+
+        // Will be resumed: has PR in tasks table
+        let mut with_pr = make_task("t-has-pr", TaskStatus::AgentReview);
+        with_pr.pr_url = Some("https://github.com/o/r/pull/99".to_string());
+        db.insert(&with_pr).await?;
+
+        let result = db.recover_in_progress().await?;
+        assert_eq!(
+            result.resumed, 2,
+            "t-resumable and t-has-pr should be resumed"
+        );
+        assert_eq!(result.failed, 1, "t-no-checkpoint should fail");
+        assert_eq!(result.transient_failed, 0);
 
         Ok(())
     }

@@ -521,6 +521,12 @@ async fn run_triage_plan_pipeline(
         state.triage_output = Some(triage_text.clone());
     })
     .await?;
+    if let Err(e) = store
+        .write_checkpoint(task_id, Some(&triage_text), None, None, "triage_done")
+        .await
+    {
+        tracing::warn!(task_id = %task_id, "failed to write triage checkpoint: {e}");
+    }
 
     let decision = prompts::parse_triage(&triage_resp.output).ok_or_else(|| {
         anyhow::anyhow!("triage output unparseable — agent did not produce TRIAGE=<decision>")
@@ -586,6 +592,12 @@ async fn run_triage_plan_pipeline(
         state.phase = TaskPhase::Implement;
     })
     .await?;
+    if let Err(e) = store
+        .write_checkpoint(task_id, None, Some(&plan_text), None, "plan_done")
+        .await
+    {
+        tracing::warn!(task_id = %task_id, "failed to write plan checkpoint: {e}");
+    }
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete");
     Ok((Some(plan_text), complexity))
@@ -639,10 +651,29 @@ pub(crate) async fn run_task(
         .await
         .unwrap_or_else(|| "{owner}/{repo}".to_string());
 
+    // --- Checkpoint-based resume detection ---
+    // Load checkpoint and task state to determine if we can skip phases.
+    // This is the duplicate-PR prevention gate: if the task already has a PR,
+    // we skip triage/plan/implement and jump directly to agent review.
+    let checkpoint = store.load_checkpoint(task_id).await.unwrap_or(None);
+    let resumed_pr_url: Option<String> = store
+        .get(task_id)
+        .and_then(|t| t.pr_url)
+        .or_else(|| checkpoint.as_ref().and_then(|c| c.pr_url.clone()));
+    let resumed_plan: Option<String> = checkpoint.and_then(|c| c.plan_output);
+
     // --- Pipeline: Triage → Plan → Implement ---
     // For issue-based tasks without an existing PR, run triage first.
     // Triage decides whether to skip planning or go through a plan phase.
-    let (plan_output, triage_complexity) = if let Some(issue) = req.issue {
+    // Checkpoint overrides: if a plan was saved, skip the pipeline entirely.
+    let (plan_output, triage_complexity) = if resumed_pr_url.is_some() {
+        // PR already exists — skip triage/plan entirely.
+        (None, prompts::TriageComplexity::Medium)
+    } else if let Some(plan) = resumed_plan {
+        // Plan checkpoint found — use saved plan, skip triage/plan pipeline.
+        tracing::info!(task_id = %task_id, "checkpoint resume: using saved plan, skipping triage/plan");
+        (Some(plan), prompts::TriageComplexity::Medium)
+    } else if let Some(issue) = req.issue {
         // Only triage fresh issues (no existing PR to continue).
         let has_existing_pr = find_existing_pr_for_issue(&project, issue)
             .await
@@ -678,7 +709,6 @@ pub(crate) async fn run_task(
 
     // Resume normal flow — update status to Implementing for the main turn.
     update_status(store, task_id, TaskStatus::Implementing, 1).await?;
-    let impl_phase_start = Instant::now();
 
     let first_prompt = if let Some(issue) = req.issue {
         let base = match find_existing_pr_for_issue(&project, issue).await {
@@ -852,208 +882,215 @@ pub(crate) async fn run_task(
         tracing::error!(task_id = %task_id, "run_task: prompt is empty — agent will fail");
     }
 
-    let initial_req = AgentRequest {
-        prompt: first_prompt,
-        project_root: project.clone(),
-        context: context_items.clone(),
-        max_budget_usd: req.max_budget_usd,
-        execution_phase: Some(ExecutionPhase::Planning),
-        allowed_tools: initial_allowed_tools,
-        env_vars: cargo_env.clone(),
-        ..Default::default()
-    };
+    // Duplicate-PR prevention guard: if checkpoint shows PR already created, skip the
+    // implement agent entirely to avoid opening a second PR on resume.
+    let (pr_url, pr_num): (Option<String>, u64) = 'implement: {
+        if let Some(pr_str) = resumed_pr_url {
+            tracing::info!(
+                task_id = %task_id,
+                pr_url = %pr_str,
+                "checkpoint resume: PR exists, skipping implement phase"
+            );
+            let Some(n) = prompts::extract_pr_number(&pr_str) else {
+                tracing::error!(
+                    task_id = %task_id,
+                    pr_url = %pr_str,
+                    "checkpoint resume: cannot parse PR number, marking failed"
+                );
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Failed;
+                    s.turn = 1;
+                    s.error = Some(format!("checkpoint resume: no PR number in {pr_str}"));
+                })
+                .await?;
+                return Ok(());
+            };
+            mutate_and_persist(store, task_id, |s| {
+                s.pr_url = Some(pr_str.clone());
+                s.rounds.push(RoundResult {
+                    turn: 1,
+                    action: "implement".into(),
+                    result: "resumed_checkpoint".into(),
+                    detail: None,
+                });
+            })
+            .await?;
+            break 'implement (Some(pr_str), n);
+        }
 
-    // Run pre_execute interceptors; Block aborts the task.
-    let first_req = run_pre_execute(&interceptors, initial_req).await?;
+        let impl_phase_start = Instant::now();
 
-    // Execute implementation turn with post-execution validation and auto-retry.
-    // Use the largest max_retries declared by any interceptor.
-    // A single interceptor returning 0 should not suppress retries for others.
-    let max_validation_retries: u32 = interceptors
-        .iter()
-        .filter_map(|i| i.max_validation_retries())
-        .max()
-        .unwrap_or(2);
-    let mut validation_attempt = 0u32;
-    let mut impl_req = first_req.clone();
+        let initial_req = AgentRequest {
+            prompt: first_prompt,
+            project_root: project.clone(),
+            context: context_items.clone(),
+            max_budget_usd: req.max_budget_usd,
+            execution_phase: Some(ExecutionPhase::Planning),
+            allowed_tools: initial_allowed_tools,
+            env_vars: cargo_env.clone(),
+            ..Default::default()
+        };
 
-    let resp = loop {
-        let raw = tokio::time::timeout(
-            turn_timeout,
-            run_agent_streaming(agent, impl_req.clone(), task_id, store, 1),
-        )
-        .await;
-        match raw {
-            Ok(Ok(r)) => {
-                // Post-execution tool isolation check (defense-in-depth alongside
-                // --allowedTools CLI enforcement). Violations feed into the retry loop
-                // so the agent gets a chance to self-correct (fail-closed, not fail-open).
-                let impl_tools = impl_req.allowed_tools.as_deref().unwrap_or(&[]);
-                let tool_violations = validate_tool_usage(&r.output, impl_tools);
-                let violation_err: Option<String> = if !tool_violations.is_empty() {
-                    let msg = format!(
+        // Run pre_execute interceptors; Block aborts the task.
+        let first_req = run_pre_execute(&interceptors, initial_req).await?;
+
+        // Execute implementation turn with post-execution validation and auto-retry.
+        // Use the largest max_retries declared by any interceptor.
+        // A single interceptor returning 0 should not suppress retries for others.
+        let max_validation_retries: u32 = interceptors
+            .iter()
+            .filter_map(|i| i.max_validation_retries())
+            .max()
+            .unwrap_or(2);
+        let mut validation_attempt = 0u32;
+        let mut impl_req = first_req.clone();
+
+        let resp = loop {
+            let raw = tokio::time::timeout(
+                turn_timeout,
+                run_agent_streaming(agent, impl_req.clone(), task_id, store, 1),
+            )
+            .await;
+            match raw {
+                Ok(Ok(r)) => {
+                    // Post-execution tool isolation check (defense-in-depth alongside
+                    // --allowedTools CLI enforcement). Violations feed into the retry loop
+                    // so the agent gets a chance to self-correct (fail-closed, not fail-open).
+                    let impl_tools = impl_req.allowed_tools.as_deref().unwrap_or(&[]);
+                    let tool_violations = validate_tool_usage(&r.output, impl_tools);
+                    let violation_err: Option<String> = if !tool_violations.is_empty() {
+                        let msg = format!(
                         "Tool isolation violation: agent used disallowed tools: [{}]. Only [{}] are permitted.",
                         tool_violations.join(", "),
                         impl_tools.join(", ")
                     );
-                    tracing::warn!(
-                        ?tool_violations,
-                        "implementation turn: agent used tools outside allowed list"
-                    );
-                    Some(msg)
-                } else {
-                    None
-                };
-                // PreToolUse / PostToolUse hook injection point:
-                // detect files written during this turn and fire post_tool_use hooks.
-                let hook_err = {
-                    let modified = detect_modified_files(&project).await;
-                    if modified.is_empty() {
-                        None
-                    } else {
-                        let hook_event = ToolUseEvent {
-                            tool_name: "file_write".to_string(),
-                            affected_files: modified,
-                            session_id: None,
-                        };
-                        run_post_tool_use(&interceptors, &hook_event, &project).await
-                    }
-                };
-                let post_err = run_post_execute(&interceptors, &impl_req, &r).await;
-                let combined_err = violation_err.or(hook_err).or(post_err);
-                if let Some(err) = combined_err {
-                    if validation_attempt < max_validation_retries {
-                        validation_attempt += 1;
-                        let backoff_ms = compute_backoff_ms(
-                            req.retry_base_backoff_ms,
-                            req.retry_max_backoff_ms,
-                            validation_attempt,
-                        );
                         tracing::warn!(
-                            attempt = validation_attempt,
-                            max = max_validation_retries,
-                            backoff_ms,
-                            error = %err,
-                            "post-execution validation failed; backing off before retry"
+                            ?tool_violations,
+                            "implementation turn: agent used tools outside allowed list"
                         );
-                        let truncated = truncate_validation_error(&err, 2000);
-                        impl_req.prompt = format!(
-                            "{}\n\nPost-execution validation failed (attempt {}/{}):\n{}",
-                            first_req.prompt, validation_attempt, max_validation_retries, truncated
-                        );
-                        sleep(Duration::from_millis(backoff_ms)).await;
-                        continue;
+                        Some(msg)
                     } else {
-                        tracing::error!(
-                            max = max_validation_retries,
-                            error = %err,
-                            "post-execution validation failed after max retries; aborting task"
-                        );
-                        run_on_error(&interceptors, &impl_req, &err).await;
-                        return Err(anyhow::anyhow!(
-                            "Post-execution validation failed after {} attempts: {}",
-                            max_validation_retries,
-                            err
-                        ));
+                        None
+                    };
+                    // PreToolUse / PostToolUse hook injection point:
+                    // detect files written during this turn and fire post_tool_use hooks.
+                    let hook_err = {
+                        let modified = detect_modified_files(&project).await;
+                        if modified.is_empty() {
+                            None
+                        } else {
+                            let hook_event = ToolUseEvent {
+                                tool_name: "file_write".to_string(),
+                                affected_files: modified,
+                                session_id: None,
+                            };
+                            run_post_tool_use(&interceptors, &hook_event, &project).await
+                        }
+                    };
+                    let post_err = run_post_execute(&interceptors, &impl_req, &r).await;
+                    let combined_err = violation_err.or(hook_err).or(post_err);
+                    if let Some(err) = combined_err {
+                        if validation_attempt < max_validation_retries {
+                            validation_attempt += 1;
+                            let backoff_ms = compute_backoff_ms(
+                                req.retry_base_backoff_ms,
+                                req.retry_max_backoff_ms,
+                                validation_attempt,
+                            );
+                            tracing::warn!(
+                                attempt = validation_attempt,
+                                max = max_validation_retries,
+                                backoff_ms,
+                                error = %err,
+                                "post-execution validation failed; backing off before retry"
+                            );
+                            let truncated = truncate_validation_error(&err, 2000);
+                            impl_req.prompt = format!(
+                                "{}\n\nPost-execution validation failed (attempt {}/{}):\n{}",
+                                first_req.prompt,
+                                validation_attempt,
+                                max_validation_retries,
+                                truncated
+                            );
+                            sleep(Duration::from_millis(backoff_ms)).await;
+                            continue;
+                        } else {
+                            tracing::error!(
+                                max = max_validation_retries,
+                                error = %err,
+                                "post-execution validation failed after max retries; aborting task"
+                            );
+                            run_on_error(&interceptors, &impl_req, &err).await;
+                            return Err(anyhow::anyhow!(
+                                "Post-execution validation failed after {} attempts: {}",
+                                max_validation_retries,
+                                err
+                            ));
+                        }
                     }
+                    break r;
                 }
-                break r;
+                Ok(Err(e)) => {
+                    run_on_error(&interceptors, &impl_req, &e.to_string()).await;
+                    return Err(e.into());
+                }
+                Err(_) => {
+                    let msg = format!(
+                        "Implementation turn timed out after {}s",
+                        turn_timeout.as_secs()
+                    );
+                    run_on_error(&interceptors, &impl_req, &msg).await;
+                    return Err(anyhow::anyhow!("{msg}"));
+                }
             }
-            Ok(Err(e)) => {
-                run_on_error(&interceptors, &impl_req, &e.to_string()).await;
-                return Err(e.into());
-            }
-            Err(_) => {
-                let msg = format!(
-                    "Implementation turn timed out after {}s",
-                    turn_timeout.as_secs()
-                );
-                run_on_error(&interceptors, &impl_req, &msg).await;
-                return Err(anyhow::anyhow!("{msg}"));
-            }
-        }
-    };
+        };
 
-    let AgentResponse {
-        output,
-        stderr,
-        token_usage: impl_token_usage,
-        ..
-    } = resp;
+        let AgentResponse {
+            output,
+            stderr,
+            token_usage: impl_token_usage,
+            ..
+        } = resp;
 
-    tracing::info!(
-        task_id = %task_id,
-        phase = "implementing",
-        elapsed_secs = impl_phase_start.elapsed().as_secs(),
-        "phase_completed"
-    );
-    {
-        let preview: String = output.chars().take(200).collect();
         tracing::info!(
             task_id = %task_id,
-            output_chars = output.len(),
-            preview = %preview,
-            input_tokens = impl_token_usage.input_tokens,
-            output_tokens = impl_token_usage.output_tokens,
-            "agent_output_summary"
+            phase = "implementing",
+            elapsed_secs = impl_phase_start.elapsed().as_secs(),
+            "phase_completed"
         );
-    }
-
-    if !stderr.is_empty() {
-        tracing::warn!(stderr = %stderr, "agent stderr during implementation");
-    }
-
-    // Review-only tasks produce a report, not a PR.
-    // Persist the output and return immediately — no PR parsing or review loop.
-    let is_review_task = store.get(task_id).is_some_and(|s| {
-        matches!(
-            s.source.as_deref(),
-            Some("periodic_review") | Some("sprint_planner")
-        )
-    });
-
-    if is_review_task {
-        mutate_and_persist(store, task_id, |s| {
-            s.status = TaskStatus::Done;
-            s.turn = 1;
-            s.rounds.push(RoundResult {
-                turn: 1,
-                action: "review".into(),
-                result: "completed".into(),
-                detail: if output.is_empty() {
-                    None
-                } else {
-                    Some(output.clone())
-                },
-            });
-        })
-        .await?;
-        tracing::info!(
-            task_id = %task_id,
-            status = "done",
-            turns = 1,
-            pr_url = tracing::field::Empty,
-            total_elapsed_secs = task_start.elapsed().as_secs(),
-            "task_completed"
-        );
-        return Ok(());
-    }
-
-    let (pr_url, pr_num) = match parse_implementation_outcome(&output) {
-        ImplementationOutcome::PlanIssue(plan_issue) => {
-            tracing::error!(
+        {
+            let preview: String = output.chars().take(200).collect();
+            tracing::info!(
                 task_id = %task_id,
-                plan_issue = %plan_issue,
-                "implementation returned PLAN_ISSUE; marking task failed"
+                output_chars = output.len(),
+                preview = %preview,
+                input_tokens = impl_token_usage.input_tokens,
+                output_tokens = impl_token_usage.output_tokens,
+                "agent_output_summary"
             );
+        }
+
+        if !stderr.is_empty() {
+            tracing::warn!(stderr = %stderr, "agent stderr during implementation");
+        }
+
+        // Review-only tasks produce a report, not a PR.
+        // Persist the output and return immediately — no PR parsing or review loop.
+        let is_review_task = store.get(task_id).is_some_and(|s| {
+            matches!(
+                s.source.as_deref(),
+                Some("periodic_review") | Some("sprint_planner")
+            )
+        });
+
+        if is_review_task {
             mutate_and_persist(store, task_id, |s| {
-                s.status = TaskStatus::Failed;
-                s.turn = 2;
-                s.error = Some(plan_issue.clone());
+                s.status = TaskStatus::Done;
+                s.turn = 1;
                 s.rounds.push(RoundResult {
                     turn: 1,
-                    action: "implement".into(),
-                    result: "plan_issue".into(),
+                    action: "review".into(),
+                    result: "completed".into(),
                     detail: if output.is_empty() {
                         None
                     } else {
@@ -1064,65 +1101,113 @@ pub(crate) async fn run_task(
             .await?;
             tracing::info!(
                 task_id = %task_id,
-                status = "failed",
-                turns = 2,
+                status = "done",
+                turns = 1,
                 pr_url = tracing::field::Empty,
                 total_elapsed_secs = task_start.elapsed().as_secs(),
                 "task_completed"
             );
             return Ok(());
         }
-        ImplementationOutcome::ParsedPr { pr_url, pr_num } => (pr_url, pr_num),
-    };
 
-    mutate_and_persist(store, task_id, |s| {
-        s.pr_url = pr_url.clone();
-        s.rounds.push(RoundResult {
-            turn: 1,
-            action: "implement".into(),
-            result: if pr_num.is_some() {
-                "pr_created".into()
-            } else {
-                "no_pr".into()
-            },
-            detail: if output.is_empty() {
-                None
-            } else {
-                Some(output.clone())
-            },
-        });
-    })
-    .await?;
+        let (pr_url, pr_num) = match parse_implementation_outcome(&output) {
+            ImplementationOutcome::PlanIssue(plan_issue) => {
+                tracing::error!(
+                    task_id = %task_id,
+                    plan_issue = %plan_issue,
+                    "implementation returned PLAN_ISSUE; marking task failed"
+                );
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Failed;
+                    s.turn = 2;
+                    s.error = Some(plan_issue.clone());
+                    s.rounds.push(RoundResult {
+                        turn: 1,
+                        action: "implement".into(),
+                        result: "plan_issue".into(),
+                        detail: if output.is_empty() {
+                            None
+                        } else {
+                            Some(output.clone())
+                        },
+                    });
+                })
+                .await?;
+                tracing::info!(
+                    task_id = %task_id,
+                    status = "failed",
+                    turns = 2,
+                    pr_url = tracing::field::Empty,
+                    total_elapsed_secs = task_start.elapsed().as_secs(),
+                    "task_completed"
+                );
+                return Ok(());
+            }
+            ImplementationOutcome::ParsedPr { pr_url, pr_num } => (pr_url, pr_num),
+        };
 
-    // Log implementation event
-    let mut ev = Event::new(
-        SessionId::new(),
-        "task_implement",
-        "task_runner",
-        harness_core::types::Decision::Complete,
-    );
-    ev.detail = pr_num.map(|n| format!("pr={n}"));
-    if let Err(e) = events.log(&ev).await {
-        tracing::warn!("failed to log task_implement event: {e}");
-    }
-
-    let Some(pr_num) = pr_num else {
-        tracing::warn!("no PR number found in agent output; skipping review");
         mutate_and_persist(store, task_id, |s| {
-            s.status = TaskStatus::Done;
-            s.turn = 2;
+            s.pr_url = pr_url.clone();
+            s.rounds.push(RoundResult {
+                turn: 1,
+                action: "implement".into(),
+                result: if pr_num.is_some() {
+                    "pr_created".into()
+                } else {
+                    "no_pr".into()
+                },
+                detail: if output.is_empty() {
+                    None
+                } else {
+                    Some(output.clone())
+                },
+            });
         })
         .await?;
-        tracing::info!(
-            task_id = %task_id,
-            status = "done",
-            turns = 2,
-            pr_url = tracing::field::Empty,
-            total_elapsed_secs = task_start.elapsed().as_secs(),
-            "task_completed"
+
+        // Write PR checkpoint immediately after pr_url is persisted.
+        // This is the most critical checkpoint — it prevents duplicate PR creation on resume.
+        if let Some(pr_url_str) = pr_url.as_deref() {
+            if let Err(e) = store
+                .write_checkpoint(task_id, None, None, Some(pr_url_str), "pr_created")
+                .await
+            {
+                tracing::warn!(task_id = %task_id, "failed to write pr checkpoint: {e}");
+            }
+        }
+
+        // Log implementation event
+        let mut ev = Event::new(
+            SessionId::new(),
+            "task_implement",
+            "task_runner",
+            harness_core::types::Decision::Complete,
         );
-        return Ok(());
-    };
+        ev.detail = pr_num.map(|n| format!("pr={n}"));
+        if let Err(e) = events.log(&ev).await {
+            tracing::warn!("failed to log task_implement event: {e}");
+        }
+
+        let Some(pr_num) = pr_num else {
+            tracing::warn!("no PR number found in agent output; skipping review");
+            mutate_and_persist(store, task_id, |s| {
+                s.status = TaskStatus::Done;
+                s.turn = 2;
+            })
+            .await?;
+            tracing::info!(
+                task_id = %task_id,
+                status = "done",
+                turns = 2,
+                pr_url = tracing::field::Empty,
+                total_elapsed_secs = task_start.elapsed().as_secs(),
+                "task_completed"
+            );
+            return Ok(());
+        };
+
+        (pr_url, pr_num)
+    }; // end 'implement
 
     // Agent review loop (if enabled and reviewer available, and not skipped by triage complexity)
     let mut agent_pushed_commit = false;
