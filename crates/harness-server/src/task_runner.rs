@@ -828,13 +828,7 @@ impl TaskStore {
                 let phase_str = format!("{:?}", state.phase);
                 if let Err(e) = self
                     .db
-                    .write_checkpoint(
-                        id.as_str(),
-                        None,
-                        None,
-                        state.pr_url.as_deref(),
-                        &phase_str,
-                    )
+                    .write_checkpoint(id.as_str(), None, None, state.pr_url.as_deref(), &phase_str)
                     .await
                 {
                     tracing::warn!(
