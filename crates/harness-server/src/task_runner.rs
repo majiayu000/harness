@@ -1107,8 +1107,11 @@ where
             harness_core::agent::TaskComplexity::Complex
                 | harness_core::agent::TaskComplexity::Critical
         );
-        let is_review = req.source.as_deref() == Some("periodic_review");
-        if req.issue.is_none() && req.pr.is_none() && is_complex && !is_review {
+        let is_excluded_source = matches!(
+            req.source.as_deref(),
+            Some("periodic_review") | Some("sprint_planner")
+        );
+        if req.issue.is_none() && req.pr.is_none() && is_complex && !is_excluded_source {
             if let Some(ref wmgr) = workspace_mgr {
                 let mut subtask_specs =
                     crate::parallel_dispatch::decompose(req.prompt.as_deref().unwrap_or_default());

@@ -575,6 +575,12 @@ async fn run_triage_plan_pipeline(
         project_root: project.to_path_buf(),
         env_vars: cargo_env.clone(),
         execution_phase: Some(ExecutionPhase::Planning),
+        allowed_tools: Some(vec![
+            "Read".to_string(),
+            "Grep".to_string(),
+            "Glob".to_string(),
+            "Bash".to_string(),
+        ]),
         ..Default::default()
     };
 
