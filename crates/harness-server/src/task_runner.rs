@@ -825,26 +825,22 @@ impl TaskStore {
                     | TaskStatus::Reviewing
                     | TaskStatus::Waiting
             ) {
-                let cp = crate::checkpoint::TaskCheckpoint::new(
-                    id.as_str(),
-                    &format!("{:?}", state.phase),
-                    state.turn,
-                    state.pr_url.clone(),
-                    None, // branch not tracked in TaskState
-                    state.rounds.len() as u32,
-                );
-                match cp.to_json() {
-                    Ok(json) => {
-                        if let Err(e) = self.db.set_checkpoint_json(id.as_str(), &json).await {
-                            tracing::warn!(
-                                task_id = %id.0,
-                                "checkpoint: failed to write DB checkpoint: {e}"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(task_id = %id.0, "checkpoint: serialization failed: {e}");
-                    }
+                let phase_str = format!("{:?}", state.phase);
+                if let Err(e) = self
+                    .db
+                    .write_checkpoint(
+                        id.as_str(),
+                        None,
+                        None,
+                        state.pr_url.as_deref(),
+                        &phase_str,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        task_id = %id.0,
+                        "checkpoint: failed to write DB checkpoint: {e}"
+                    );
                 }
             }
         }
@@ -2406,7 +2402,7 @@ mod tests {
 
     #[test]
     fn long_prompt_over_200_words_requires_plan() {
-        let words: Vec<&str> = std::iter::repeat("word").take(201).collect();
+        let words: Vec<&str> = std::iter::repeat_n("word", 201).collect();
         let prompt = words.join(" ");
         assert!(prompt_requires_plan(&prompt));
     }
