@@ -930,15 +930,17 @@ pub(crate) async fn run_task(
     //
     // Some(tools) causes claude.rs to pass --allowedTools to the CLI (hard
     // enforcement). None → --dangerously-skip-permissions (full access).
-    let (initial_allowed_tools, capability_prompt_note): (Option<Vec<String>>, _) =
-        if req.source.as_deref() == Some("periodic_review") {
-            (
-                Some(restricted_tools(CapabilityProfile::Standard)?),
-                CapabilityProfile::Standard.prompt_note(),
-            )
-        } else {
-            (None, None)
-        };
+    let (initial_allowed_tools, capability_prompt_note): (Option<Vec<String>>, _) = if matches!(
+        req.source.as_deref(),
+        Some("periodic_review") | Some("sprint_planner")
+    ) {
+        (
+            Some(restricted_tools(CapabilityProfile::Standard)?),
+            CapabilityProfile::Standard.prompt_note(),
+        )
+    } else {
+        (None, None)
+    };
 
     // Prepend capability restriction note so the agent knows which tools are
     // permitted. This is the primary enforcement path now that --allowedTools

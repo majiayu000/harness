@@ -1289,7 +1289,12 @@ where
         // Planning gate: complex prompt-only tasks must go through the Plan phase
         // before implementation to reduce drift.
         // Heuristic: prompt longer than 200 words OR containing 3+ file path tokens.
-        if req.issue.is_none() && req.pr.is_none() {
+        // sprint_planner is excluded: its prompt contains owner/repo slugs (which
+        // contain '/') that would always trigger the file-path heuristic, and
+        // sprint_planner has its own single-round execution path that must not be
+        // interrupted by a spurious Plan phase.
+        let is_sprint_planner = matches!(req.source.as_deref(), Some("sprint_planner"));
+        if req.issue.is_none() && req.pr.is_none() && !is_sprint_planner {
             if let Some(ref prompt) = req.prompt {
                 if prompt_requires_plan(prompt) {
                     mutate_and_persist(&store, &id, |s| {
