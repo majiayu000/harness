@@ -1,3 +1,4 @@
+use crate::http::parse_pr_num_from_url;
 use crate::task_runner::{TaskState, TaskStatus};
 use harness_core::db::{open_pool, Migration, Migrator};
 use harness_core::error::TaskDbDecodeError;
@@ -254,7 +255,10 @@ impl TaskDb {
         let mut result = RecoveryResult::default();
 
         for row in rows {
-            let has_pr = row.task_pr_url.is_some() || row.ck_pr_url.is_some();
+            let effective_pr_url = row.task_pr_url.as_deref().or(row.ck_pr_url.as_deref());
+            let has_pr = effective_pr_url
+                .map(|url| parse_pr_num_from_url(url).is_some())
+                .unwrap_or(false);
             let has_plan = row.plan_output.is_some();
             let has_triage = row.triage_output.is_some();
 
@@ -264,10 +268,7 @@ impl TaskDb {
                     format!(
                         "resumed after restart (was: {}, pr: {})",
                         row.status,
-                        row.task_pr_url
-                            .as_deref()
-                            .or(row.ck_pr_url.as_deref())
-                            .unwrap_or("checkpoint")
+                        effective_pr_url.unwrap_or("checkpoint")
                     )
                 } else if has_plan {
                     format!(
@@ -1182,6 +1183,34 @@ mod tests {
         );
         assert_eq!(result.failed, 1, "t-no-checkpoint should fail");
         assert_eq!(result.transient_failed, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_with_corrupted_pr_url_marks_failed() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        // Corrupted pr_url (empty string) — not parseable as a PR number.
+        let mut bad_pr = make_task("t-bad-pr", TaskStatus::Implementing);
+        bad_pr.pr_url = Some(String::new());
+        db.insert(&bad_pr).await?;
+
+        // Also test a non-empty but invalid URL.
+        let mut bad_pr2 = make_task("t-bad-pr2", TaskStatus::AgentReview);
+        bad_pr2.pr_url = Some("not-a-pr-url".to_string());
+        db.insert(&bad_pr2).await?;
+
+        let result = db.recover_in_progress().await?;
+        assert_eq!(
+            result.resumed, 0,
+            "no tasks should be resumed with unparseable pr_url"
+        );
+        assert_eq!(
+            result.failed, 2,
+            "both tasks with invalid pr_url should be failed"
+        );
 
         Ok(())
     }
