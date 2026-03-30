@@ -55,11 +55,19 @@ impl CodexAgent {
     }
 
     fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
+        // When allowed_tools is set (restricted profile), enforce read-only sandbox
+        // regardless of the configured default. Codex uses OS-level sandbox modes
+        // rather than --allowedTools flags, so this is the enforcement mechanism.
+        let effective_sandbox = if req.allowed_tools.is_some() {
+            "read-only"
+        } else {
+            codex_sandbox_mode(self.sandbox_mode)
+        };
         let mut args = vec![
             OsString::from("exec"),
             OsString::from("--skip-git-repo-check"),
             OsString::from("-s"),
-            OsString::from(codex_sandbox_mode(self.sandbox_mode)),
+            OsString::from(effective_sandbox),
         ];
 
         if self.cloud.enabled {
