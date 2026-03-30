@@ -1,4 +1,5 @@
 pub mod codec;
+pub mod contract;
 pub mod methods;
 pub mod notifications;
 

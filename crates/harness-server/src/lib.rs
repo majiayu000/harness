@@ -9,6 +9,7 @@
     clippy::unnecessary_to_owned
 )]
 
+pub mod checkpoint;
 pub mod circuit_breaker;
 pub mod complexity_router;
 pub mod contract_validator;

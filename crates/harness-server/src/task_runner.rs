@@ -482,6 +482,41 @@ const ACCOUNT_LIMIT_PATTERN: &str = "hit your limit";
 /// Maximum number of automatic retries for transient failures.
 const MAX_TRANSIENT_RETRIES: u32 = 2;
 
+/// Return `true` when a free-text prompt is complex enough to require a Plan phase
+/// before implementation.
+///
+/// Heuristic: prompt longer than 200 words OR contains 3 or more file-path-like
+/// tokens (sequences containing `/` or ending in a recognised source extension).
+pub(crate) fn prompt_requires_plan(prompt: &str) -> bool {
+    let word_count = prompt.split_whitespace().count();
+    if word_count > 200 {
+        return true;
+    }
+    let file_path_count = prompt
+        .split_whitespace()
+        .filter(|tok| {
+            // Exclude XML/HTML tags — `</foo>` contains '/' but is not a file path.
+            // System prompts wrap user data in `<external_data>...</external_data>`
+            // which would otherwise trigger false positives.
+            let is_xml_tag = tok.starts_with('<');
+            if is_xml_tag {
+                return false;
+            }
+            tok.contains('/') || {
+                let lower = tok.to_lowercase();
+                lower.ends_with(".rs")
+                    || lower.ends_with(".ts")
+                    || lower.ends_with(".tsx")
+                    || lower.ends_with(".go")
+                    || lower.ends_with(".py")
+                    || lower.ends_with(".toml")
+                    || lower.ends_with(".json")
+            }
+        })
+        .count();
+    file_path_count >= 3
+}
+
 /// Check if an error message indicates a transient failure that may succeed on retry.
 fn is_transient_error(reason: &str) -> bool {
     let lower = reason.to_lowercase();
@@ -526,11 +561,16 @@ impl TaskStore {
     pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
         let db = TaskDb::open(db_path).await?;
         let recovery = db.recover_in_progress().await?;
-        if recovery.failed > 0 || recovery.resumed > 0 {
-            tracing::warn!(
-                "startup recovery: {} task(s) failed (no checkpoint), {} task(s) resumed from checkpoint",
-                recovery.failed,
+        if recovery.resumed > 0 {
+            tracing::info!(
+                "startup recovery: resumed {} task(s) from checkpoint",
                 recovery.resumed
+            );
+        }
+        if recovery.failed > 0 {
+            tracing::warn!(
+                "startup recovery: marked {} interrupted task(s) as failed (no fresh checkpoint)",
+                recovery.failed
             );
         }
         let cache = DashMap::new();
@@ -773,6 +813,30 @@ impl TaskStore {
         let snapshot = self.cache.get(id).map(|state| state.value().clone());
         if let Some(state) = snapshot {
             self.db.update(&state).await?;
+
+            // Persist a checkpoint to the DB so that recover_in_progress() can
+            // restore the task if the server is killed mid-flight.  Only written
+            // for statuses that can be interrupted (matches recover_in_progress
+            // query predicate).
+            if matches!(
+                state.status,
+                TaskStatus::Implementing
+                    | TaskStatus::AgentReview
+                    | TaskStatus::Reviewing
+                    | TaskStatus::Waiting
+            ) {
+                let phase_str = format!("{:?}", state.phase);
+                if let Err(e) = self
+                    .db
+                    .write_checkpoint(id.as_str(), None, None, state.pr_url.as_deref(), &phase_str)
+                    .await
+                {
+                    tracing::warn!(
+                        task_id = %id.0,
+                        "checkpoint: failed to write DB checkpoint: {e}"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1215,6 +1279,26 @@ where
                     })
                     .await?;
                     return Ok(());
+                }
+            }
+        }
+
+        // Planning gate: complex prompt-only tasks must go through the Plan phase
+        // before implementation to reduce drift.
+        // Heuristic: prompt longer than 200 words OR containing 3+ file path tokens.
+        if req.issue.is_none() && req.pr.is_none() {
+            if let Some(ref prompt) = req.prompt {
+                if prompt_requires_plan(prompt) {
+                    mutate_and_persist(&store, &id, |s| {
+                        if s.phase == TaskPhase::Implement {
+                            s.phase = TaskPhase::Plan;
+                        }
+                    })
+                    .await?;
+                    tracing::info!(
+                        task_id = %id.0,
+                        "planning gate: complex prompt — forcing Plan phase before Implement"
+                    );
                 }
             }
         }
@@ -2300,5 +2384,45 @@ mod tests {
         assert!(parse_pr_url("https://github.com/acme/myrepo").is_none());
         assert!(parse_pr_url("not-a-url").is_none());
         assert!(parse_pr_url("https://github.com/acme/myrepo/issues/1").is_none());
+    }
+
+    // --- planning gate ---
+
+    #[test]
+    fn short_prompt_does_not_require_plan() {
+        let prompt = "Fix the typo in README.md";
+        assert!(!prompt_requires_plan(prompt));
+    }
+
+    #[test]
+    fn long_prompt_over_200_words_requires_plan() {
+        let words: Vec<&str> = std::iter::repeat_n("word", 201).collect();
+        let prompt = words.join(" ");
+        assert!(prompt_requires_plan(&prompt));
+    }
+
+    #[test]
+    fn prompt_with_three_file_paths_requires_plan() {
+        let prompt =
+            "Update src/foo.rs and crates/bar/src/lib.rs and crates/baz/src/main.rs to fix X";
+        assert!(prompt_requires_plan(prompt));
+    }
+
+    #[test]
+    fn prompt_with_two_file_paths_does_not_require_plan() {
+        let prompt = "Update src/foo.rs and crates/bar/src/lib.rs to fix X";
+        assert!(!prompt_requires_plan(prompt));
+    }
+
+    #[test]
+    fn xml_closing_tags_are_not_counted_as_file_paths() {
+        // `wrap_external_data` wraps content in <external_data>...</external_data>.
+        // Three `</external_data>` closing tags contain '/' but must NOT trigger
+        // the planning gate — they are markup, not file paths.
+        let prompt = "GC applied files:\n\
+                      <external_data>test-guard.sh</external_data>\n\
+                      Rationale:\n<external_data>test</external_data>\n\
+                      Validation:\n<external_data>test</external_data>";
+        assert!(!prompt_requires_plan(prompt));
     }
 }

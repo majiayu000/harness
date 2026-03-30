@@ -875,8 +875,9 @@ pub(crate) fn resolve_reviewer(
 /// - `.../pull/42/files`
 /// - `.../pull/42#discussion_r...`
 fn parse_pr_num_from_url(url: &str) -> Option<u64> {
-    // Strip fragment first
+    // Strip fragment first, then query string
     let url = url.split('#').next().unwrap_or(url);
+    let url = url.split('?').next().unwrap_or(url);
     // Walk path segments looking for "pull", then parse the segment that follows
     let mut parts = url.split('/');
     while let Some(seg) = parts.next() {
@@ -936,11 +937,42 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     let pr_num = match parse_pr_num_from_url(pr_url) {
                         Some(n) => n,
                         None => {
-                            tracing::warn!(
+                            // pr_url is present but unparseable (empty, corrupted, or
+                            // non-standard).  Simply returning would leave the task stuck in
+                            // 'pending' forever — fail-close it instead so operators can see
+                            // it and the re-dispatch filter never picks it up again.
+                            tracing::error!(
                                 task_id = ?task.id,
                                 pr_url,
-                                "startup recovery: cannot parse PR number from URL, skipping"
+                                "startup recovery: cannot parse PR number from URL — marking task failed"
                             );
+                            let bad_url = pr_url.to_owned();
+                            if let Err(e) = task_runner::mutate_and_persist(
+                                &state.core.tasks,
+                                &task.id,
+                                move |s| {
+                                    s.status = task_runner::TaskStatus::Failed;
+                                    s.error = Some(format!(
+                                        "startup recovery: unparseable pr_url: {bad_url}"
+                                    ));
+                                },
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    "startup recovery: failed to persist failed status: {e}"
+                                );
+                            }
+                            // Fire completion callback so intake sources (e.g. GitHub Issues
+                            // poller) remove this task from their `dispatched` map. Without
+                            // this the issue stays marked as dispatched forever and will never
+                            // be re-queued, causing a silent production deadlock.
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
                             return;
                         }
                     };
