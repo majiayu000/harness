@@ -517,6 +517,10 @@ pub(crate) fn prompt_requires_plan(prompt: &str) -> bool {
     file_path_count >= 3
 }
 
+fn is_non_decomposable_prompt_source(source: Option<&str>) -> bool {
+    matches!(source, Some("periodic_review") | Some("sprint_planner"))
+}
+
 /// Check if an error message indicates a transient failure that may succeed on retry.
 fn is_transient_error(reason: &str) -> bool {
     let lower = reason.to_lowercase();
@@ -1171,11 +1175,8 @@ where
             harness_core::agent::TaskComplexity::Complex
                 | harness_core::agent::TaskComplexity::Critical
         );
-        let is_review = matches!(
-            req.source.as_deref(),
-            Some("periodic_review") | Some("sprint_planner")
-        );
-        if req.issue.is_none() && req.pr.is_none() && is_complex && !is_review {
+        let is_non_decomposable_source = is_non_decomposable_prompt_source(req.source.as_deref());
+        if req.issue.is_none() && req.pr.is_none() && is_complex && !is_non_decomposable_source {
             if let Some(ref wmgr) = workspace_mgr {
                 let mut subtask_specs =
                     crate::parallel_dispatch::decompose(req.prompt.as_deref().unwrap_or_default());
@@ -1289,12 +1290,10 @@ where
         // Planning gate: complex prompt-only tasks must go through the Plan phase
         // before implementation to reduce drift.
         // Heuristic: prompt longer than 200 words OR containing 3+ file path tokens.
-        // sprint_planner is excluded: its prompt contains owner/repo slugs (which
-        // contain '/') that would always trigger the file-path heuristic, and
-        // sprint_planner has its own single-round execution path that must not be
-        // interrupted by a spurious Plan phase.
-        let is_sprint_planner = matches!(req.source.as_deref(), Some("sprint_planner"));
-        if req.issue.is_none() && req.pr.is_none() && !is_sprint_planner {
+        if req.issue.is_none()
+            && req.pr.is_none()
+            && !is_non_decomposable_prompt_source(req.source.as_deref())
+        {
             if let Some(ref prompt) = req.prompt {
                 if prompt_requires_plan(prompt) {
                     mutate_and_persist(&store, &id, |s| {
@@ -2432,5 +2431,13 @@ mod tests {
                       Rationale:\n<external_data>test</external_data>\n\
                       Validation:\n<external_data>test</external_data>";
         assert!(!prompt_requires_plan(prompt));
+    }
+
+    #[test]
+    fn non_decomposable_source_list_includes_periodic_and_sprint() {
+        assert!(is_non_decomposable_prompt_source(Some("periodic_review")));
+        assert!(is_non_decomposable_prompt_source(Some("sprint_planner")));
+        assert!(!is_non_decomposable_prompt_source(Some("github")));
+        assert!(!is_non_decomposable_prompt_source(None));
     }
 }

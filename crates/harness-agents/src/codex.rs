@@ -55,19 +55,11 @@ impl CodexAgent {
     }
 
     fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
-        // When allowed_tools is set (restricted profile), enforce read-only sandbox
-        // regardless of the configured default. Codex uses OS-level sandbox modes
-        // rather than --allowedTools flags, so this is the enforcement mechanism.
-        let effective_sandbox = if req.allowed_tools.is_some() {
-            "read-only"
-        } else {
-            codex_sandbox_mode(self.sandbox_mode)
-        };
         let mut args = vec![
             OsString::from("exec"),
             OsString::from("--skip-git-repo-check"),
             OsString::from("-s"),
-            OsString::from(effective_sandbox),
+            OsString::from(codex_sandbox_mode(self.sandbox_mode)),
         ];
 
         if self.cloud.enabled {
@@ -724,5 +716,45 @@ printf 'third\n'
             codex_sandbox_mode(SandboxMode::DangerFullAccess),
             "danger-full-access"
         );
+    }
+
+    #[test]
+    fn allowed_tools_does_not_override_configured_workspace_write_sandbox() {
+        let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
+        let request = AgentRequest {
+            prompt: "ping".to_string(),
+            project_root: PathBuf::from("/tmp/project"),
+            allowed_tools: Some(vec!["Read".to_string(), "Grep".to_string()]),
+            ..Default::default()
+        };
+
+        let args: Vec<String> = agent
+            .base_args(&request)
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect();
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["-s", "workspace-write"]));
+    }
+
+    #[test]
+    fn deny_all_allowed_tools_keeps_configured_sandbox_mode() {
+        let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::DangerFullAccess);
+        let request = AgentRequest {
+            prompt: "ping".to_string(),
+            project_root: PathBuf::from("/tmp/project"),
+            allowed_tools: Some(vec![]),
+            ..Default::default()
+        };
+
+        let args: Vec<String> = agent
+            .base_args(&request)
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect();
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["-s", "danger-full-access"]));
     }
 }
