@@ -255,10 +255,18 @@ impl TaskDb {
         let mut result = RecoveryResult::default();
 
         for row in rows {
-            let effective_pr_url = row.task_pr_url.as_deref().or(row.ck_pr_url.as_deref());
-            let has_pr = effective_pr_url
-                .and_then(parse_pr_num_from_url)
-                .is_some();
+            // Fall back to ck_pr_url only when task_pr_url is absent *or* unparseable,
+            // so a corrupted task_pr_url does not mask a valid checkpoint URL.
+            let effective_pr_url = row
+                .task_pr_url
+                .as_deref()
+                .filter(|u| parse_pr_num_from_url(u).is_some())
+                .or_else(|| {
+                    row.ck_pr_url
+                        .as_deref()
+                        .filter(|u| parse_pr_num_from_url(u).is_some())
+                });
+            let has_pr = effective_pr_url.is_some();
             let has_plan = row.plan_output.is_some();
             let has_triage = row.triage_output.is_some();
 
