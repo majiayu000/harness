@@ -113,11 +113,14 @@ mod tests {
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn rpc_error_codes_are_negative() {
-        assert!(crate::PARSE_ERROR < 0);
-        assert!(crate::INVALID_REQUEST < 0);
-        assert!(crate::METHOD_NOT_FOUND < 0);
-        assert!(crate::INVALID_PARAMS < 0);
-        assert!(crate::INTERNAL_ERROR < 0);
+        use crate::methods::{
+            INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
+        };
+        assert!(PARSE_ERROR < 0);
+        assert!(INVALID_REQUEST < 0);
+        assert!(METHOD_NOT_FOUND < 0);
+        assert!(INVALID_PARAMS < 0);
+        assert!(INTERNAL_ERROR < 0);
     }
 
     #[test]

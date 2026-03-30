@@ -742,13 +742,14 @@ mod tests {
             +fn bar() {}\n";
         let artifacts = parse_artifacts(output, &signal);
         assert_eq!(artifacts.len(), 1);
-        assert!(
-            artifacts[0]
-                .target_path
-                .to_string_lossy()
-                .starts_with(".harness/drafts/")
-        );
-        assert!(artifacts[0].target_path.to_string_lossy().ends_with(".patch"));
+        assert!(artifacts[0]
+            .target_path
+            .to_string_lossy()
+            .starts_with(".harness/drafts/"));
+        assert!(artifacts[0]
+            .target_path
+            .to_string_lossy()
+            .ends_with(".patch"));
         assert!(artifacts[0].content.contains("+++ b/src/lib.rs"));
     }
 

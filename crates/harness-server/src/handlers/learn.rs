@@ -1,7 +1,10 @@
 use crate::{http::AppState, validate_root};
 use harness_core::{
     agent::AgentRequest,
-    types::{Category, Decision, DraftStatus, Event, EventFilters, ProjectId, RuleId, SessionId, Severity},
+    types::{
+        Category, Decision, DraftStatus, Event, EventFilters, ProjectId, RuleId, SessionId,
+        Severity,
+    },
 };
 use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR};
 use harness_rules::engine::Rule;
@@ -15,10 +18,11 @@ pub async fn learn_rules(
     let project_root = validate_root!(&project_root, id, &state.core.home_dir);
     let target_project_id = project_id_from_root(&project_root);
 
-    let draft_contents = match collect_adopted_draft_contents(state, &target_project_id, "learn_rules").await {
-        Ok(d) => d,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-    };
+    let draft_contents =
+        match collect_adopted_draft_contents(state, &target_project_id, "learn_rules").await {
+            Ok(d) => d,
+            Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+        };
 
     if draft_contents.is_empty() {
         log_learn_event(
@@ -86,10 +90,11 @@ pub async fn learn_skills(
     let project_root = validate_root!(&project_root, id, &state.core.home_dir);
     let target_project_id = project_id_from_root(&project_root);
 
-    let draft_contents = match collect_adopted_draft_contents(state, &target_project_id, "learn_skills").await {
-        Ok(d) => d,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-    };
+    let draft_contents =
+        match collect_adopted_draft_contents(state, &target_project_id, "learn_skills").await {
+            Ok(d) => d,
+            Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+        };
 
     if draft_contents.is_empty() {
         log_learn_event(
@@ -217,9 +222,7 @@ async fn collect_adopted_draft_contents(
         .filter(|d| {
             d.status == DraftStatus::Adopted
                 && d.signal.project_id == *project_id
-                && last_learn_ts
-                    .map(|ts| d.generated_at > ts)
-                    .unwrap_or(true)
+                && last_learn_ts.map(|ts| d.generated_at > ts).unwrap_or(true)
         })
         .flat_map(|d| d.artifacts.iter().map(|a| a.content.clone()))
         .collect();

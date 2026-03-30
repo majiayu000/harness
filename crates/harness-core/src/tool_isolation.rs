@@ -68,7 +68,7 @@ pub fn validate_tool_usage(output: &str, allowed_tools: &[String]) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CapabilityProfile;
+    use crate::config::agents::CapabilityProfile;
 
     // --- CapabilityProfile resolution tests ---
 
@@ -106,7 +106,7 @@ mod tests {
         assert!(
             CapabilityProfile::Standard
                 .prompt_note()
-                .is_some_and(|n| n.contains("Read")
+                .is_some_and(|n: &str| n.contains("Read")
                     && n.contains("Write")
                     && n.contains("Edit")
                     && n.contains("Bash")),
@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn explicit_allowed_tools_overrides_profile() {
-        use crate::config::AgentsConfig;
+        use crate::config::agents::AgentsConfig;
         let cfg = AgentsConfig {
             capability_profile: CapabilityProfile::ReadOnly,
             allowed_tools: Some(vec!["Bash".to_string()]),
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn profile_used_when_no_explicit_tools() {
-        use crate::config::AgentsConfig;
+        use crate::config::agents::AgentsConfig;
         let cfg = AgentsConfig {
             capability_profile: CapabilityProfile::Standard,
             ..Default::default()
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn full_profile_no_explicit_tools_returns_none() {
-        use crate::config::AgentsConfig;
+        use crate::config::agents::AgentsConfig;
         let cfg = AgentsConfig::default(); // Full profile, no allowed_tools
         assert!(cfg.resolve_allowed_tools().is_none());
     }
