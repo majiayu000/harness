@@ -45,6 +45,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
+/// Read-only tools permitted during the planning phase.
+/// Bash is intentionally excluded to prevent any file modification via shell redirection.
+const PLAN_PHASE_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
+
+/// Tools permitted during the agent review (validation) phase.
+/// Bash is included for read-only shell commands such as `gh pr diff`.
+const REVIEW_PHASE_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Bash"];
+
 /// RAII guard that removes the per-task Cargo target directory on drop.
 /// This ensures cleanup regardless of how `run_task` exits (success, error,
 /// or timeout), preventing disk exhaustion from accumulated build artifacts.
@@ -570,7 +578,7 @@ async fn run_triage_plan_pipeline(
     .await?;
 
     let plan_prompt = prompts::plan_prompt(issue, &triage_resp.output).to_prompt_string();
-    let plan_allowed_tools = vec!["Read".to_string(), "Grep".to_string(), "Glob".to_string()];
+    let plan_allowed_tools: Vec<String> = PLAN_PHASE_TOOLS.iter().map(|s| s.to_string()).collect();
     let plan_req = AgentRequest {
         prompt: plan_prompt,
         project_root: project.to_path_buf(),
@@ -1653,12 +1661,7 @@ async fn run_agent_review(
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::Validation),
-            allowed_tools: Some(vec![
-                "Read".to_string(),
-                "Grep".to_string(),
-                "Glob".to_string(),
-                "Bash".to_string(),
-            ]),
+            allowed_tools: Some(REVIEW_PHASE_TOOLS.iter().map(|s| s.to_string()).collect()),
             env_vars: cargo_env.clone(),
             ..Default::default()
         };
