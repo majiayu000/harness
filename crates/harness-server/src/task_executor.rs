@@ -570,16 +570,13 @@ async fn run_triage_plan_pipeline(
     .await?;
 
     let plan_prompt = prompts::plan_prompt(issue, &triage_resp.output).to_prompt_string();
+    let plan_allowed_tools = vec!["Read".to_string(), "Grep".to_string(), "Glob".to_string()];
     let plan_req = AgentRequest {
         prompt: plan_prompt,
         project_root: project.to_path_buf(),
         env_vars: cargo_env.clone(),
         execution_phase: Some(ExecutionPhase::Planning),
-        allowed_tools: Some(vec![
-            "Read".to_string(),
-            "Grep".to_string(),
-            "Glob".to_string(),
-        ]),
+        allowed_tools: Some(plan_allowed_tools.clone()),
         ..Default::default()
     };
 
@@ -590,6 +587,24 @@ async fn run_triage_plan_pipeline(
     .await
     .map_err(|_| anyhow::anyhow!("plan phase timed out after {}s", req.turn_timeout_secs))?
     .map_err(|e| anyhow::anyhow!("plan phase agent error: {e}"))?;
+
+    // Post-execution tool isolation check (fail-closed). For Codex the --allowedTools
+    // flag does not exist, so allowed_tools is only a prompt-level soft constraint.
+    // Validating the output here enforces the read-only plan boundary for all backends.
+    let plan_tool_violations = validate_tool_usage(&plan_resp.output, &plan_allowed_tools);
+    if !plan_tool_violations.is_empty() {
+        let msg = format!(
+            "Plan phase tool isolation violation: agent used disallowed tools: [{}]. \
+             Only read-only tools [{}] are permitted during planning.",
+            plan_tool_violations.join(", "),
+            plan_allowed_tools.join(", ")
+        );
+        tracing::warn!(
+            ?plan_tool_violations,
+            "plan phase: agent used tools outside allowed list"
+        );
+        return Err(anyhow::anyhow!("{msg}"));
+    }
 
     let plan_text = plan_resp.output.clone();
     mutate_and_persist(store, task_id, |state| {
