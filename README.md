@@ -74,6 +74,32 @@ cd harness
 cargo build
 ```
 
+### Rust API Facade
+
+For Rust consumers inside the repository or embedded integrations, `harness-api`
+provides a stable import surface over the lower-level crates:
+
+```rust
+use std::path::Path;
+
+use harness_api::core::SessionId;
+use harness_api::exec::plan::ExecPlan;
+use harness_api::protocol::INTERNAL_ERROR;
+use harness_api::sandbox::SandboxSpec;
+
+let _session = SessionId::new();
+let _plan = ExecPlan::from_spec("# Demo", Path::new(".")).expect("plan");
+let _sandbox = SandboxSpec::new(
+    harness_api::core::config::agents::SandboxMode::ReadOnly,
+    ".",
+);
+let _code = INTERNAL_ERROR;
+```
+
+The facade groups the stable parts of `harness-core`, `harness-protocol`,
+`harness-sandbox`, and `harness-exec` under one crate without forcing callers to
+track internal crate layout changes.
+
 ### Run
 
 **HTTP server:**
