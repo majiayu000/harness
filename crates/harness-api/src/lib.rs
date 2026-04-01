@@ -10,10 +10,10 @@
 //! use std::path::Path;
 //!
 //! use harness_api::core::SessionId;
-//! use harness_api::exec::plan::ExecPlan;
+//! use harness_api::exec::ExecPlan;
 //!
 //! let _session = SessionId::new();
-//! let _plan = ExecPlan::from_spec("# Demo", Path::new(".")).unwrap();
+//! let _plan = ExecPlan::from_spec("# Demo", Path::new(".")).expect("plan");
 //! ```
 //!
 //! # Modules
@@ -95,12 +95,13 @@ pub mod protocol {
 }
 
 pub mod sandbox {
+    pub use harness_core::config::agents::SandboxMode;
     pub use harness_sandbox::{wrap_command, SandboxEngine, SandboxSpec, WrappedCommand};
 }
 
 pub mod exec {
     pub use harness_exec::markdown;
-    pub use harness_exec::plan;
+    pub use harness_exec::plan::{self, ExecPlan};
 }
 
 #[cfg(test)]
@@ -130,14 +131,14 @@ mod tests {
 
     #[test]
     fn sandbox_facade_exposes_types() {
-        let spec = sandbox::SandboxSpec::new(core::config::agents::SandboxMode::ReadOnly, ".");
+        let spec = sandbox::SandboxSpec::new(sandbox::SandboxMode::ReadOnly, ".");
         assert!(spec.project_root.is_absolute());
         assert_eq!(sandbox::SandboxEngine::None, sandbox::SandboxEngine::None);
     }
 
     #[test]
     fn exec_facade_exposes_plan_api() {
-        let plan = exec::plan::ExecPlan::from_spec("# Demo", Path::new(".")).expect("plan");
+        let plan = exec::ExecPlan::from_spec("# Demo", Path::new(".")).expect("plan");
         assert_eq!(plan.purpose, "Demo");
     }
 
