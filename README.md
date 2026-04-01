@@ -77,7 +77,7 @@ cargo build
 ### Rust API Facade
 
 For Rust consumers inside the repository or embedded integrations, `harness-api`
-provides a stable import surface over the lower-level crates:
+provides a curated stable import surface over the lower-level crates:
 
 ```rust
 use std::path::Path;
