@@ -83,16 +83,13 @@ provides a curated stable import surface over the lower-level crates:
 use std::path::Path;
 
 use harness_api::core::SessionId;
-use harness_api::exec::plan::ExecPlan;
+use harness_api::exec::ExecPlan;
 use harness_api::protocol::INTERNAL_ERROR;
-use harness_api::sandbox::SandboxSpec;
+use harness_api::sandbox::{SandboxMode, SandboxSpec};
 
 let _session = SessionId::new();
 let _plan = ExecPlan::from_spec("# Demo", Path::new(".")).expect("plan");
-let _sandbox = SandboxSpec::new(
-    harness_api::core::config::agents::SandboxMode::ReadOnly,
-    ".",
-);
+let _sandbox = SandboxSpec::new(SandboxMode::ReadOnly, ".");
 let _code = INTERNAL_ERROR;
 ```
 
