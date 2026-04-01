@@ -1,8 +1,8 @@
 //! Stable public API surface for Harness.
 //!
 //! This crate provides a single import point for consumers of the Harness
-//! ecosystem. It re-exports stable interfaces from the underlying crates,
-//! shielding consumers from internal reorganization.
+//! ecosystem. It curates a stable subset of interfaces from the underlying
+//! crates, shielding consumers from internal reorganization.
 //!
 //! # Example
 //!
@@ -23,10 +23,60 @@
 //! - [`sandbox`] — sandboxing types and `wrap_command`
 //! - [`exec`] — execution plan types for spec-driven workflows
 pub mod core {
-    pub use harness_core::agent;
-    pub use harness_core::config;
-    pub use harness_core::error;
-    pub use harness_core::types;
+    //! Curated stable exports from `harness-core`.
+
+    pub mod agent {
+        pub use harness_core::agent::{
+            AgentAdapter, AgentEvent, AgentRequest, AgentResponse, ApprovalDecision, CodeAgent,
+            StreamItem, TaskClassification, TaskComplexity, TurnRequest,
+        };
+    }
+
+    pub mod config {
+        pub mod agents {
+            pub use harness_core::config::agents::{
+                AgentReviewConfig, AgentsConfig, AnthropicApiConfig, ApprovalPolicy,
+                CapabilityProfile, ClaudeAgentConfig, CodexAgentConfig, CodexCloudConfig,
+                SandboxMode,
+            };
+        }
+
+        pub mod intake {
+            pub use harness_core::config::intake::{
+                FeishuIntakeConfig, GitHubIntakeConfig, GitHubRepoConfig, IntakeConfig,
+            };
+        }
+
+        pub mod misc {
+            pub use harness_core::config::misc::{
+                ConcurrencyConfig, GcConfig, ObserveConfig, OtelConfig, OtelExporter, ReviewConfig,
+                ReviewStrategy, RulesConfig, SignalThresholdsConfig, ValidationConfig,
+                WorkspaceConfig,
+            };
+        }
+
+        pub mod server {
+            pub use harness_core::config::server::{ServerConfig, Transport};
+        }
+
+        pub use harness_core::config::{HarnessConfig, ProjectEntry};
+    }
+
+    pub mod error {
+        pub use harness_core::error::{
+            Error, HarnessError, Result, SandboxError, TaskDbDecodeError,
+        };
+    }
+
+    pub mod types {
+        pub use harness_core::types::{
+            AgentId, AutoFixAttempt, AutoFixReport, Capability, ContextItem, Decision, Event,
+            EventFilters, ExecPlanId, ExecPlanStatus, ExecutionPhase, ExternalSignal, Grade, Item,
+            Language, ReasoningBudget, RuleId, SessionId, Severity, SkillId, TaskId, ThreadId,
+            TokenUsage, TurnId, Violation,
+        };
+    }
+
     pub use harness_core::{
         AutoFixAttempt, AutoFixReport, Decision, Event, EventFilters, ExternalSignal, OtelExporter,
         RuleId, SessionId, Severity,
@@ -60,12 +110,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn core_facade_exposes_common_types() {
+    fn core_facade_exposes_curated_common_types() {
         let id = core::SessionId::new();
         assert!(!id.as_str().is_empty());
 
         let _mode = core::config::agents::SandboxMode::ReadOnly;
-        let _severity = core::Severity::High;
+        let _severity = core::types::Severity::High;
+        let _capability = core::types::Capability::Read;
     }
 
     #[test]
@@ -88,5 +139,17 @@ mod tests {
     fn exec_facade_exposes_plan_api() {
         let plan = exec::plan::ExecPlan::from_spec("# Demo", Path::new(".")).expect("plan");
         assert_eq!(plan.purpose, "Demo");
+    }
+
+    #[test]
+    fn core_facade_supports_agent_consumer_paths() {
+        fn accept_result(_: core::error::Result<()>) {}
+        fn accept_capability(_: core::types::Capability) {}
+
+        accept_result(Ok(()));
+        accept_capability(core::types::Capability::Execute);
+
+        let request = core::agent::AgentRequest::default();
+        assert!(request.uses_dangerously_skip_permissions());
     }
 }
