@@ -119,8 +119,13 @@ pub async fn claim_task_for_runtime_host(
         .claim_task(&host_id, tasks, lease_secs, req.project.as_deref())
     {
         Ok(Some(claim)) => {
-            if let Err(response) = persist_runtime_state(&state).await {
-                return response;
+            if let Err((_, Json(error_body))) = persist_runtime_state(&state).await {
+                tracing::error!(
+                    host_id = %host_id,
+                    task_id = %claim.task_id,
+                    error = %error_body["error"].as_str().unwrap_or("unknown persistence error"),
+                    "runtime claim persisted in memory but runtime state persistence failed"
+                );
             }
             (
                 StatusCode::OK,
