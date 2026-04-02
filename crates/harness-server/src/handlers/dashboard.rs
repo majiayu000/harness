@@ -97,8 +97,35 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         },
     };
 
+    let runtime_hosts: Vec<Value> = state
+        .runtime_hosts
+        .list_hosts()
+        .into_iter()
+        .map(|host| {
+            let watched_projects = state
+                .runtime_project_cache
+                .get_host_cache(&host.id)
+                .map(|snapshot| snapshot.project_count)
+                .unwrap_or(0);
+            json!({
+                "id": host.id,
+                "display_name": host.display_name,
+                "capabilities": host.capabilities,
+                "online": host.online,
+                "last_heartbeat_at": host.last_heartbeat_at,
+                "watched_projects": watched_projects,
+            })
+        })
+        .collect();
+    let runtime_hosts_total = runtime_hosts.len() as u64;
+    let runtime_hosts_online = runtime_hosts
+        .iter()
+        .filter(|host| host["online"].as_bool().unwrap_or(false))
+        .count() as u64;
+
     let body = json!({
         "projects": projects,
+        "runtime_hosts": runtime_hosts,
         "global": {
             "running": tq.running_count(),
             "queued": tq.queued_count(),
@@ -108,6 +135,8 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
             "failed": global_failed,
             "latest_pr": latest_pr,
             "grade": grade,
+            "runtime_hosts_total": runtime_hosts_total,
+            "runtime_hosts_online": runtime_hosts_online,
         }
     });
 
@@ -165,6 +194,12 @@ mod tests {
         assert!(global.get("uptime_secs").is_some());
         assert!(global.get("done").is_some());
         assert!(global.get("failed").is_some());
+        assert!(global.get("runtime_hosts_total").is_some());
+        assert!(global.get("runtime_hosts_online").is_some());
+        assert!(body
+            .get("runtime_hosts")
+            .and_then(|v| v.as_array())
+            .is_some());
 
         Ok(())
     }

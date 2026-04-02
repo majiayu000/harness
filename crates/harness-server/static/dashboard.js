@@ -63,6 +63,15 @@ async function fetchIntake() {
   } catch {}
 }
 
+async function fetchDashboardSummary() {
+  try {
+    const resp = await fetch("/api/dashboard", { headers: authHeaders() });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    renderRuntimeHosts(data.runtime_hosts || []);
+  } catch {}
+}
+
 // --- Metrics ---
 
 function updateMetrics(tasks) {
@@ -130,6 +139,30 @@ function renderIntakeChannels(channels) {
       (detail ? `<div class="channel-detail">${escapeHtml(detail)}</div>` : "") +
       `<div class="channel-status">${enabled ? "enabled" : "disabled"}</div>` +
       `<div class="channel-active">${escapeHtml(String(ch.active))} active</div>`;
+    grid.appendChild(card);
+  });
+}
+
+function renderRuntimeHosts(hosts) {
+  const grid = document.getElementById("runtime-host-grid");
+  if (!grid) return;
+  grid.innerHTML = "";
+  if (!hosts.length) {
+    grid.innerHTML = '<p class="empty-state">No runtime hosts registered</p>';
+    return;
+  }
+  hosts.forEach((host) => {
+    const online = Boolean(host.online);
+    const card = document.createElement("div");
+    card.className = "channel-card" + (online ? " channel-card-enabled" : " channel-card-disabled");
+    const caps = Array.isArray(host.capabilities) ? host.capabilities.join(", ") : "";
+    const watched = Number(host.watched_projects || 0);
+    const heartbeat = relativeTime(host.last_heartbeat_at) || "unknown";
+    card.innerHTML =
+      `<div class="channel-name">${escapeHtml(host.display_name || host.id || "runtime-host")}</div>` +
+      `<div class="channel-detail">${escapeHtml(caps || "no capabilities")}</div>` +
+      `<div class="channel-status">${online ? "online" : "offline"}</div>` +
+      `<div class="channel-active">${escapeHtml(String(watched))} watched \u00b7 ${escapeHtml(heartbeat)}</div>`;
     grid.appendChild(card);
   });
 }
@@ -767,6 +800,7 @@ function init() {
   initTabs();
   fetchTasks();
   fetchIntake();
+  fetchDashboardSummary();
   fetchTokenUsage();
   connectWebSocket();
   initForm();
@@ -776,6 +810,7 @@ function init() {
   });
   pollTimer = setInterval(fetchTasks, POLL_INTERVAL_MS);
   setInterval(fetchIntake, POLL_INTERVAL_MS);
+  setInterval(fetchDashboardSummary, POLL_INTERVAL_MS);
   setInterval(fetchTokenUsage, POLL_INTERVAL_MS);
 }
 

@@ -29,6 +29,11 @@ pub mod quality_trigger;
 pub mod review_store;
 pub mod router;
 pub mod rule_enforcer;
+pub mod runtime_hosts;
+pub mod runtime_hosts_state;
+pub mod runtime_project_cache;
+pub mod runtime_project_cache_state;
+pub mod runtime_state_store;
 pub mod scheduler;
 pub mod self_evolution;
 pub mod server;
@@ -48,3 +53,9 @@ pub mod workspace;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
+
+#[cfg(test)]
+mod runtime_hosts_tests;
+
+#[cfg(test)]
+mod runtime_state_store_tests;

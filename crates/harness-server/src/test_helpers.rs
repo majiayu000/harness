@@ -154,6 +154,7 @@ async fn make_state_inner(
             plan_db: None,
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             project_registry: None,
+            runtime_state_store: None,
         },
         engines: crate::http::EngineServices {
             skills: Default::default(),
@@ -172,6 +173,10 @@ async fn make_state_inner(
             task_queue,
             workspace_mgr: None,
         },
+        runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
+        runtime_project_cache: Arc::new(
+            crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
+        ),
         notifications: crate::http::NotificationServices {
             notification_tx,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),
