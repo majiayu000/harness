@@ -212,7 +212,45 @@ mod tests {
     use super::*;
     use harness_core::{types::EventFilters, types::GuardId, types::Language};
     use harness_rules::engine::{Guard, RuleEngine};
+    use std::ffi::OsString;
     use tempfile::tempdir;
+    use tokio::sync::Mutex;
+
+    static CI_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    struct CiEnvGuard {
+        previous: Option<OsString>,
+    }
+
+    impl Drop for CiEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => {
+                    // SAFETY: tests run in a single process; caller serializes with CI_ENV_LOCK.
+                    unsafe { std::env::set_var("CI", value) };
+                }
+                None => {
+                    // SAFETY: tests run in a single process; caller serializes with CI_ENV_LOCK.
+                    unsafe { std::env::remove_var("CI") };
+                }
+            }
+        }
+    }
+
+    fn with_ci_env(value: Option<&str>) -> CiEnvGuard {
+        let previous = std::env::var_os("CI");
+        match value {
+            Some(v) => {
+                // SAFETY: tests run in a single process; caller serializes with CI_ENV_LOCK.
+                unsafe { std::env::set_var("CI", v) };
+            }
+            None => {
+                // SAFETY: tests run in a single process; caller serializes with CI_ENV_LOCK.
+                unsafe { std::env::remove_var("CI") };
+            }
+        }
+        CiEnvGuard { previous }
+    }
 
     async fn make_event_store(dir: &Path) -> Arc<EventStore> {
         Arc::new(EventStore::new(dir).await.unwrap())
@@ -250,6 +288,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_tool_use_returns_violations_when_guard_fires() -> anyhow::Result<()> {
+        let _env_lock = CI_ENV_LOCK.lock().await;
+        let _ci_guard = with_ci_env(None);
         let dir = tempdir()?;
         let events = make_event_store(dir.path()).await;
         let rules = make_engine_with_guard(dir.path(), "U-16", "medium");
@@ -277,6 +317,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_tool_use_disabled_passes_through() -> anyhow::Result<()> {
+        let _env_lock = CI_ENV_LOCK.lock().await;
+        let _ci_guard = with_ci_env(None);
         let dir = tempdir()?;
         let events = make_event_store(dir.path()).await;
         let rules = make_engine_with_guard(dir.path(), "U-16", "medium");
@@ -299,6 +341,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_tool_use_empty_files_returns_clean() -> anyhow::Result<()> {
+        let _env_lock = CI_ENV_LOCK.lock().await;
+        let _ci_guard = with_ci_env(None);
         let dir = tempdir()?;
         let events = make_event_store(dir.path()).await;
         let rules = make_engine_with_guard(dir.path(), "U-16", "medium");
@@ -316,6 +360,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_tool_use_logs_event_to_store() -> anyhow::Result<()> {
+        let _env_lock = CI_ENV_LOCK.lock().await;
+        let _ci_guard = with_ci_env(None);
         let dir = tempdir()?;
         let event_store = Arc::new(EventStore::new(dir.path()).await?);
         let rules = make_engine_with_guard(dir.path(), "U-16", "medium");
@@ -346,6 +392,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_tool_use_no_guards_passes_through() -> anyhow::Result<()> {
+        let _env_lock = CI_ENV_LOCK.lock().await;
+        let _ci_guard = with_ci_env(None);
         let dir = tempdir()?;
         let events = make_event_store(dir.path()).await;
         let rules = Arc::new(RwLock::new(RuleEngine::new()));
@@ -376,6 +424,8 @@ mod tests {
 
     #[tokio::test]
     async fn circuit_breaker_opens_after_repeated_blocks() -> anyhow::Result<()> {
+        let _env_lock = CI_ENV_LOCK.lock().await;
+        let _ci_guard = with_ci_env(None);
         let dir = tempdir()?;
         let events = make_event_store(dir.path()).await;
         let rules = make_engine_with_guard(dir.path(), "U-16", "medium");
@@ -413,6 +463,8 @@ mod tests {
 
     #[tokio::test]
     async fn ci_env_skips_enforcement() -> anyhow::Result<()> {
+        let _env_lock = CI_ENV_LOCK.lock().await;
+        let _ci_guard = with_ci_env(Some("true"));
         let dir = tempdir()?;
         let events = make_event_store(dir.path()).await;
         let rules = make_engine_with_guard(dir.path(), "U-16", "medium");
@@ -426,10 +478,7 @@ mod tests {
             session_id: None,
         };
 
-        // SAFETY: test process only; env mutation isolated by unique var name.
-        unsafe { std::env::set_var("CI", "true") };
         let result = enforcer.post_tool_use(&event, &project).await;
-        unsafe { std::env::remove_var("CI") };
 
         assert!(
             result.violation_feedback.is_none(),
