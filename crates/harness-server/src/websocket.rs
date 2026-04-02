@@ -302,6 +302,7 @@ mod tests {
                 plan_db: None,
                 plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
                 project_registry: None,
+                runtime_state_store: None,
             },
             engines: crate::http::EngineServices {
                 skills: Arc::new(RwLock::new(harness_skills::store::SkillStore::new())),
@@ -322,6 +323,10 @@ mod tests {
                 task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
                 workspace_mgr: None,
             },
+            runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
+            runtime_project_cache: Arc::new(
+                crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
+            ),
             notifications: crate::http::NotificationServices {
                 notification_tx,
                 notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),

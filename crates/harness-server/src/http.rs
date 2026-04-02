@@ -39,6 +39,7 @@ pub struct CoreServices {
     /// Write-through: every mutation must also persist via `plan_db`.
     pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
     pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
+    pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
 }
 
 /// Engine services: skills, rules, and garbage collection.
@@ -100,6 +101,8 @@ pub struct AppState {
     pub engines: EngineServices,
     pub observability: ObservabilityServices,
     pub concurrency: ConcurrencyServices,
+    pub runtime_hosts: Arc<crate::runtime_hosts::RuntimeHostManager>,
+    pub runtime_project_cache: Arc<crate::runtime_project_cache::RuntimeProjectCacheManager>,
     pub notifications: NotificationServices,
     pub intake: IntakeServices,
     pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
@@ -133,6 +136,15 @@ impl AppState {
             );
         }
         dropped_total
+    }
+
+    pub async fn persist_runtime_state(&self) -> anyhow::Result<()> {
+        let Some(store) = self.core.runtime_state_store.as_ref() else {
+            return Ok(());
+        };
+        let (hosts, leases) = self.runtime_hosts.snapshot_state();
+        let project_caches = self.runtime_project_cache.snapshot_state();
+        store.persist_snapshot(hosts, leases, project_caches).await
     }
 }
 fn resolve_project_root(configured_root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
@@ -583,6 +595,43 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         });
     }
 
+    let runtime_hosts = Arc::new(crate::runtime_hosts::RuntimeHostManager::new());
+    let runtime_project_cache =
+        Arc::new(crate::runtime_project_cache::RuntimeProjectCacheManager::new());
+    let runtime_state_store = {
+        let runtime_state_db_path =
+            harness_core::config::dirs::default_db_path(&dir, "runtime_state");
+        match crate::runtime_state_store::RuntimeStateStore::open(&runtime_state_db_path).await {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!(
+                    path = %runtime_state_db_path.display(),
+                    "runtime state store init failed, runtime host state will not persist: {e}"
+                );
+                None
+            }
+        }
+    };
+    if let Some(store) = runtime_state_store.as_ref() {
+        match store.load_snapshot().await {
+            Ok(Some(snapshot)) => {
+                let restored_hosts = runtime_hosts.restore_state(snapshot.hosts, snapshot.leases);
+                let restored_project_caches =
+                    runtime_project_cache.restore_state(snapshot.project_caches);
+                tracing::info!(
+                    restored_hosts = restored_hosts.0,
+                    restored_leases = restored_hosts.1,
+                    restored_project_caches,
+                    "runtime state restored from persistent snapshot"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("failed to load runtime state snapshot on startup: {e}");
+            }
+        }
+    }
+
     let signal_rate_limit = server.config.server.signal_rate_limit_per_minute;
     let password_reset_rate_limit = server.config.server.password_reset_rate_limit_per_hour;
     let home_dir = std::env::var("HOME")
@@ -598,6 +647,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             plan_db: Some(plan_db),
             plan_cache,
             project_registry: Some(project_registry),
+            runtime_state_store,
         },
         engines: EngineServices {
             skills: skills_arc,
@@ -627,6 +677,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             task_queue,
             workspace_mgr,
         },
+        runtime_hosts,
+        runtime_project_cache,
         notifications: NotificationServices {
             notification_tx: broadcast::channel(notification_broadcast_capacity).0,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),
@@ -1135,6 +1187,34 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .route("/projects/queue-stats", get(project_queue_stats))
         .route("/api/dashboard", get(crate::handlers::dashboard::dashboard))
         .route("/api/intake", get(intake_status))
+        .route(
+            "/api/runtime-hosts",
+            get(crate::handlers::runtime_hosts::list_runtime_hosts),
+        )
+        .route(
+            "/api/runtime-hosts/register",
+            post(crate::handlers::runtime_hosts::register_runtime_host),
+        )
+        .route(
+            "/api/runtime-hosts/{host_id}/heartbeat",
+            post(crate::handlers::runtime_hosts::heartbeat_runtime_host),
+        )
+        .route(
+            "/api/runtime-hosts/{host_id}/deregister",
+            post(crate::handlers::runtime_hosts::deregister_runtime_host),
+        )
+        .route(
+            "/api/runtime-hosts/{host_id}/tasks/claim",
+            post(crate::handlers::runtime_hosts::claim_task_for_runtime_host),
+        )
+        .route(
+            "/api/runtime-hosts/{host_id}/projects",
+            get(crate::handlers::runtime_project_cache::list_runtime_host_projects),
+        )
+        .route(
+            "/api/runtime-hosts/{host_id}/projects/sync",
+            post(crate::handlers::runtime_project_cache::sync_runtime_host_projects),
+        )
         .route(
             "/api/token-usage",
             get(crate::handlers::token_usage::token_usage),

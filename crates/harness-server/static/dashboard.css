@@ -161,6 +161,18 @@ body {
   letter-spacing: -0.02em;
 }
 
+.section-subtitle {
+  margin: 1rem 0 0.55rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.runtime-hosts-section {
+  margin-top: 0.35rem;
+}
+
 .board {
   margin-top: 1rem;
 }

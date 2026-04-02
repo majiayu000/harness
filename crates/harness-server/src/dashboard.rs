@@ -86,6 +86,10 @@ pub async fn index(State(state): State<Arc<crate::http::AppState>>) -> impl Into
 <div id="tab-channels" class="tab-panel">
   <div id="pipeline-row" class="pipeline-row"></div>
   <div id="channel-grid" class="channel-grid"></div>
+  <div class="runtime-hosts-section">
+    <h3 class="section-subtitle">Runtime Hosts</h3>
+    <div id="runtime-host-grid" class="channel-grid"></div>
+  </div>
 </div>
 
 <div id="tab-submit" class="tab-panel">
