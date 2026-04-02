@@ -1,5 +1,5 @@
 use crate::task_runner::{TaskId, TaskStatus};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use dashmap::{mapref::entry::Entry, DashMap};
 use serde::Serialize;
 use std::{
@@ -34,6 +34,28 @@ pub struct TaskClaimResult {
     pub task_id: TaskId,
     pub lease_expires_at: String,
 }
+
+#[derive(Debug, Clone)]
+pub enum ClaimTaskError {
+    HostNotRegistered(String),
+    LeaseTtlOutOfRange(i64),
+}
+
+impl std::fmt::Display for ClaimTaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HostNotRegistered(host_id) => {
+                write!(f, "runtime host '{host_id}' is not registered")
+            }
+            Self::LeaseTtlOutOfRange(ttl) => write!(
+                f,
+                "lease_secs value {ttl} is too large to compute a valid expiration timestamp"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClaimTaskError {}
 
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeHostRecord {
@@ -155,13 +177,13 @@ impl RuntimeHostManager {
         mut candidates: Vec<ClaimCandidate>,
         lease_secs: Option<i64>,
         project_filter: Option<&str>,
-    ) -> anyhow::Result<Option<TaskClaimResult>> {
+    ) -> Result<Option<TaskClaimResult>, ClaimTaskError> {
         // Hold a read reference during claim so concurrent deregister() cannot
         // remove the host between membership check and lease insertion.
         let host_guard = self
             .hosts
             .get(host_id)
-            .ok_or_else(|| anyhow::anyhow!("runtime host '{host_id}' is not registered"))?;
+            .ok_or_else(|| ClaimTaskError::HostNotRegistered(host_id.to_string()))?;
 
         let now = Utc::now();
         self.cleanup_expired_leases(now);
@@ -176,7 +198,11 @@ impl RuntimeHostManager {
         for candidate in candidates {
             match self.leases.entry(candidate.task_id.clone()) {
                 Entry::Vacant(v) => {
-                    let expires_at = now + Duration::seconds(ttl);
+                    let lease_duration = chrono::TimeDelta::try_seconds(ttl)
+                        .ok_or(ClaimTaskError::LeaseTtlOutOfRange(ttl))?;
+                    let expires_at = now
+                        .checked_add_signed(lease_duration)
+                        .ok_or(ClaimTaskError::LeaseTtlOutOfRange(ttl))?;
                     v.insert(TaskLease {
                         host_id: host_id.to_string(),
                         expires_at,

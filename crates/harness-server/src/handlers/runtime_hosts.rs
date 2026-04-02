@@ -1,5 +1,5 @@
 use crate::http::AppState;
-use crate::runtime_hosts::ClaimCandidate;
+use crate::runtime_hosts::{ClaimCandidate, ClaimTaskError};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -142,10 +142,16 @@ pub async fn claim_task_for_runtime_host(
             }
             (StatusCode::OK, Json(json!({ "claimed": false })))
         }
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": e.to_string() })),
-        ),
+        Err(e) => match e {
+            ClaimTaskError::HostNotRegistered(_) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": e.to_string() })),
+            ),
+            ClaimTaskError::LeaseTtlOutOfRange(_) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            ),
+        },
     }
 }
 
