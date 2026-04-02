@@ -115,9 +115,7 @@ async fn resolve_project_token(
 }
 
 fn validate_allowed_root(state: &AppState, root: &std::path::Path) -> Result<(), String> {
-    if let Err(msg) = validate_project_root(root) {
-        return Err(msg);
-    }
+    validate_project_root(root)?;
     let allowed = &state.core.server.config.server.allowed_project_roots;
     if !allowed.is_empty() && !allowed.iter().any(|base| root.starts_with(base)) {
         return Err("project root is not under an allowed base directory".to_string());
