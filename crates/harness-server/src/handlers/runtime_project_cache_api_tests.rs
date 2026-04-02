@@ -15,6 +15,10 @@ fn runtime_project_cache_app(state: Arc<crate::http::AppState>) -> Router {
             post(runtime_hosts::register_runtime_host),
         )
         .route(
+            "/api/runtime-hosts/{host_id}/deregister",
+            post(runtime_hosts::deregister_runtime_host),
+        )
+        .route(
             "/api/runtime-hosts/{host_id}/projects",
             get(runtime_project_cache::list_runtime_host_projects),
         )
@@ -162,5 +166,82 @@ async fn sync_by_project_id_resolves_registry_root() -> anyhow::Result<()> {
             .to_bytes(),
     )?;
     assert_eq!(json["projects"][0]["project_id"], "demo");
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_after_deregister_does_not_recreate_cache() -> anyhow::Result<()> {
+    let data_dir = tempfile::tempdir()?;
+    let project_dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(project_dir.path().join(".git"))?;
+
+    let state = Arc::new(crate::test_helpers::make_test_state(data_dir.path()).await?);
+    let app = runtime_project_cache_app(state.clone());
+
+    let register = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"host_id": "host-a"}).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(register.status(), StatusCode::OK);
+
+    let initial_sync = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/host-a/projects/sync")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "projects": [{"project": project_dir.path().to_string_lossy()}]
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(initial_sync.status(), StatusCode::OK);
+
+    let deregister = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/host-a/deregister")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(deregister.status(), StatusCode::OK);
+    assert!(state
+        .runtime_project_cache
+        .get_host_cache("host-a")
+        .is_none());
+
+    let stale_sync = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/host-a/projects/sync")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "projects": [{"project": project_dir.path().to_string_lossy()}]
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(stale_sync.status(), StatusCode::NOT_FOUND);
+    assert!(state
+        .runtime_project_cache
+        .get_host_cache("host-a")
+        .is_none());
     Ok(())
 }

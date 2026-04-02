@@ -19,7 +19,7 @@ use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 
 pub(crate) mod auth;
 pub(crate) mod rate_limit;
@@ -103,6 +103,8 @@ pub struct AppState {
     pub concurrency: ConcurrencyServices,
     pub runtime_hosts: Arc<crate::runtime_hosts::RuntimeHostManager>,
     pub runtime_project_cache: Arc<crate::runtime_project_cache::RuntimeProjectCacheManager>,
+    /// Serializes runtime snapshot writes to avoid out-of-order persistence.
+    pub runtime_state_persist_lock: Mutex<()>,
     pub notifications: NotificationServices,
     pub intake: IntakeServices,
     pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
@@ -139,6 +141,7 @@ impl AppState {
     }
 
     pub async fn persist_runtime_state(&self) -> anyhow::Result<()> {
+        let _guard = self.runtime_state_persist_lock.lock().await;
         let Some(store) = self.core.runtime_state_store.as_ref() else {
             return Ok(());
         };
@@ -679,6 +682,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         },
         runtime_hosts,
         runtime_project_cache,
+        runtime_state_persist_lock: Mutex::new(()),
         notifications: NotificationServices {
             notification_tx: broadcast::channel(notification_broadcast_capacity).0,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),
