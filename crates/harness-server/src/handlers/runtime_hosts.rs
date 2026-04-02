@@ -57,12 +57,7 @@ pub async fn heartbeat_runtime_host(
     Path(host_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.runtime_hosts.heartbeat(&host_id) {
-        Ok(host) => {
-            if let Err(response) = persist_runtime_state(&state).await {
-                return response;
-            }
-            (StatusCode::OK, Json(json!({ "host": host })))
-        }
+        Ok(host) => (StatusCode::OK, Json(json!({ "host": host }))),
         Err(e) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": e.to_string() })),
@@ -98,6 +93,7 @@ pub async fn claim_task_for_runtime_host(
         .tasks
         .list_all()
         .into_iter()
+        .filter(|task| task.status.as_ref() == "pending")
         .map(|task| ClaimCandidate {
             task_id: task.id,
             status: task.status,
@@ -106,7 +102,18 @@ pub async fn claim_task_for_runtime_host(
         })
         .collect();
 
-    let lease_secs = req.lease_secs.map(|s| s as i64);
+    let lease_secs = match req.lease_secs {
+        Some(value) => match i64::try_from(value) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "lease_secs must be <= i64::MAX" })),
+                )
+            }
+        },
+        None => None,
+    };
     match state
         .runtime_hosts
         .claim_task(&host_id, tasks, lease_secs, req.project.as_deref())
