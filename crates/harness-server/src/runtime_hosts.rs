@@ -128,11 +128,12 @@ impl RuntimeHostManager {
         lease_secs: Option<i64>,
         project_filter: Option<&str>,
     ) -> anyhow::Result<Option<TaskClaimResult>> {
-        if !self.hosts.contains_key(host_id) {
-            return Err(anyhow::anyhow!(
-                "runtime host '{host_id}' is not registered"
-            ));
-        }
+        // Hold a read reference during claim so concurrent deregister() cannot
+        // remove the host between membership check and lease insertion.
+        let host_guard = self
+            .hosts
+            .get(host_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime host '{host_id}' is not registered"))?;
 
         let now = Utc::now();
         self.cleanup_expired_leases(now);
@@ -152,6 +153,7 @@ impl RuntimeHostManager {
                         host_id: host_id.to_string(),
                         expires_at,
                     });
+                    drop(host_guard);
                     return Ok(Some(TaskClaimResult {
                         task_id: candidate.task_id,
                         lease_expires_at: expires_at.to_rfc3339(),
@@ -160,6 +162,7 @@ impl RuntimeHostManager {
                 Entry::Occupied(_) => continue,
             }
         }
+        drop(host_guard);
         Ok(None)
     }
 
