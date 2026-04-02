@@ -54,6 +54,7 @@ fn deregister_releases_owned_leases() -> anyhow::Result<()> {
     let first = manager.claim_task("host-a", candidates.clone(), Some(30), None)?;
     assert!(first.is_some());
     assert!(manager.deregister("host-a"));
+    assert!(manager.host_leases.get("host-a").is_none());
 
     let second = manager.claim_task("host-b", candidates, Some(30), None)?;
     assert!(second.is_some());

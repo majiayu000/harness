@@ -2,6 +2,11 @@ use crate::task_runner::{TaskId, TaskStatus};
 use chrono::{DateTime, Duration, Utc};
 use dashmap::{mapref::entry::Entry, DashMap};
 use serde::Serialize;
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::{BinaryHeap, HashSet},
+    sync::Mutex,
+};
 
 pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 60;
 pub const DEFAULT_LEASE_SECS: i64 = 60;
@@ -45,9 +50,31 @@ pub(crate) struct TaskLease {
     pub(crate) expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct LeaseExpiry {
+    pub(crate) expires_at: DateTime<Utc>,
+    pub(crate) task_id: TaskId,
+}
+
+impl Ord for LeaseExpiry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.expires_at
+            .cmp(&other.expires_at)
+            .then_with(|| self.task_id.0.cmp(&other.task_id.0))
+    }
+}
+
+impl PartialOrd for LeaseExpiry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 pub struct RuntimeHostManager {
     pub(crate) hosts: DashMap<String, RuntimeHostRecord>,
     pub(crate) leases: DashMap<TaskId, TaskLease>,
+    pub(crate) host_leases: DashMap<String, HashSet<TaskId>>,
+    pub(crate) lease_expirations: Mutex<BinaryHeap<Reverse<LeaseExpiry>>>,
     pub(crate) heartbeat_timeout_secs: i64,
     default_lease_secs: i64,
 }
@@ -61,6 +88,8 @@ impl RuntimeHostManager {
         Self {
             hosts: DashMap::new(),
             leases: DashMap::new(),
+            host_leases: DashMap::new(),
+            lease_expirations: Mutex::new(BinaryHeap::new()),
             heartbeat_timeout_secs,
             default_lease_secs,
         }
@@ -97,13 +126,12 @@ impl RuntimeHostManager {
     pub fn deregister(&self, host_id: &str) -> bool {
         let removed = self.hosts.remove(host_id).is_some();
         if removed {
-            let to_remove: Vec<TaskId> = self
-                .leases
-                .iter()
-                .filter(|e| e.value().host_id == host_id)
-                .map(|e| e.key().clone())
-                .collect();
-            for task_id in to_remove {
+            let lease_ids = self
+                .host_leases
+                .remove(host_id)
+                .map(|(_, ids)| ids)
+                .unwrap_or_default();
+            for task_id in lease_ids {
                 self.leases.remove(&task_id);
             }
         }
@@ -153,6 +181,7 @@ impl RuntimeHostManager {
                         host_id: host_id.to_string(),
                         expires_at,
                     });
+                    self.index_lease(host_id, candidate.task_id.clone(), expires_at);
                     drop(host_guard);
                     return Ok(Some(TaskClaimResult {
                         task_id: candidate.task_id,
@@ -167,14 +196,57 @@ impl RuntimeHostManager {
     }
 
     fn cleanup_expired_leases(&self, now: DateTime<Utc>) {
-        let expired: Vec<TaskId> = self
-            .leases
-            .iter()
-            .filter(|entry| entry.value().expires_at <= now)
-            .map(|entry| entry.key().clone())
-            .collect();
-        for task_id in expired {
-            self.leases.remove(&task_id);
+        loop {
+            let next = {
+                let mut heap = self
+                    .lease_expirations
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                match heap.peek() {
+                    Some(Reverse(expiry)) if expiry.expires_at <= now => {
+                        heap.pop().map(|Reverse(item)| item)
+                    }
+                    _ => None,
+                }
+            };
+            let Some(expiry) = next else {
+                break;
+            };
+            let should_remove = self
+                .leases
+                .get(&expiry.task_id)
+                .map(|lease| lease.expires_at <= now && lease.expires_at == expiry.expires_at)
+                .unwrap_or(false);
+            if should_remove {
+                self.remove_lease(&expiry.task_id);
+            }
+        }
+    }
+
+    pub(crate) fn index_lease(&self, host_id: &str, task_id: TaskId, expires_at: DateTime<Utc>) {
+        self.host_leases
+            .entry(host_id.to_string())
+            .or_default()
+            .insert(task_id.clone());
+        self.lease_expirations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(Reverse(LeaseExpiry {
+                expires_at,
+                task_id,
+            }));
+    }
+
+    fn remove_lease(&self, task_id: &TaskId) {
+        let Some((_, lease)) = self.leases.remove(task_id) else {
+            return;
+        };
+        if let Some(mut owned_ids) = self.host_leases.get_mut(&lease.host_id) {
+            owned_ids.remove(task_id);
+            if owned_ids.is_empty() {
+                drop(owned_ids);
+                self.host_leases.remove(&lease.host_id);
+            }
         }
     }
 

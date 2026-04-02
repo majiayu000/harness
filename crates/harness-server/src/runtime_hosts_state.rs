@@ -57,6 +57,11 @@ impl RuntimeHostManager {
     ) -> (usize, usize) {
         self.hosts.clear();
         self.leases.clear();
+        self.host_leases.clear();
+        self.lease_expirations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
 
         for host in hosts {
             self.hosts.insert(
@@ -80,12 +85,13 @@ impl RuntimeHostManager {
                 continue;
             }
             self.leases.insert(
-                lease.task_id,
+                lease.task_id.clone(),
                 TaskLease {
-                    host_id: lease.host_id,
+                    host_id: lease.host_id.clone(),
                     expires_at: lease.expires_at,
                 },
             );
+            self.index_lease(&lease.host_id, lease.task_id, lease.expires_at);
         }
         (self.hosts.len(), self.leases.len())
     }
