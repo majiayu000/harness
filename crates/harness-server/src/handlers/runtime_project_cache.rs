@@ -73,6 +73,14 @@ pub async fn sync_runtime_host_projects(
         });
     }
 
+    // Keep a read guard while writing cache to prevent concurrent deregister()
+    // from deleting the host between validation and cache sync.
+    let Some(_host_guard) = state.runtime_hosts.hosts.get(&host_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "runtime host not found"})),
+        );
+    };
     let snapshot = state
         .runtime_project_cache
         .sync_host_projects(&host_id, inputs);
@@ -83,11 +91,7 @@ pub async fn sync_runtime_host_projects(
 }
 
 fn host_exists(state: &AppState, host_id: &str) -> bool {
-    state
-        .runtime_hosts
-        .list_hosts()
-        .into_iter()
-        .any(|host| host.id == host_id)
+    state.runtime_hosts.hosts.contains_key(host_id)
 }
 
 async fn resolve_project_token(

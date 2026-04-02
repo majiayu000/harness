@@ -177,6 +177,7 @@ async fn make_state_inner(
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
         ),
+        runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         notifications: crate::http::NotificationServices {
             notification_tx,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),

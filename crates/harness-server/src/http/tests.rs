@@ -9,6 +9,7 @@ use harness_core::{
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 
@@ -149,6 +150,7 @@ async fn make_test_state_with(
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
         ),
+        runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         notifications: crate::http::NotificationServices {
             notification_tx: tokio::sync::broadcast::channel(32).0,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),
@@ -177,6 +179,31 @@ async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>>
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await
+}
+
+#[tokio::test]
+async fn persist_runtime_state_is_serialized() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let lock_guard = state.runtime_state_persist_lock.lock().await;
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let state_for_task = state.clone();
+    let persist_task = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        state_for_task.persist_runtime_state().await
+    });
+
+    started_rx.await?;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !persist_task.is_finished(),
+        "persist_runtime_state should wait for the in-flight persist lock"
+    );
+
+    drop(lock_guard);
+    tokio::time::timeout(Duration::from_secs(1), persist_task).await???;
+    Ok(())
 }
 
 async fn make_test_state_with_agent(
