@@ -1,5 +1,7 @@
 use super::{resolve_reviewer, AppState};
-use crate::{services::execution::EnqueueTaskError, task_runner};
+use crate::{
+    project_registry::check_allowed_roots, services::execution::EnqueueTaskError, task_runner,
+};
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 use serde_json::json;
@@ -62,16 +64,11 @@ pub(crate) async fn enqueue_task(
     // Enforce allowed_project_roots allowlist on the resolved canonical path so
     // callers cannot bypass it by supplying a real directory path directly
     // instead of registering the project first.
-    let allowed = &state.core.server.config.server.allowed_project_roots;
-    if !allowed.is_empty()
-        && !allowed
-            .iter()
-            .any(|base| canonical_project.starts_with(base))
-    {
-        return Err(EnqueueTaskError::BadRequest(
-            "project root is not under an allowed base directory".to_string(),
-        ));
-    }
+    check_allowed_roots(
+        &canonical_project,
+        &state.core.server.config.server.allowed_project_roots,
+    )
+    .map_err(EnqueueTaskError::BadRequest)?;
 
     let project_id = canonical_project.to_string_lossy().into_owned();
     req.project = Some(canonical_project);
@@ -260,16 +257,11 @@ async fn enqueue_task_background(
         .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
 
     // Enforce allowed_project_roots allowlist (same guard as enqueue_task).
-    let allowed = &state.core.server.config.server.allowed_project_roots;
-    if !allowed.is_empty()
-        && !allowed
-            .iter()
-            .any(|base| canonical_project.starts_with(base))
-    {
-        return Err(EnqueueTaskError::BadRequest(
-            "project root is not under an allowed base directory".to_string(),
-        ));
-    }
+    check_allowed_roots(
+        &canonical_project,
+        &state.core.server.config.server.allowed_project_roots,
+    )
+    .map_err(EnqueueTaskError::BadRequest)?;
 
     let project_id = canonical_project.to_string_lossy().into_owned();
     req.project = Some(canonical_project);
