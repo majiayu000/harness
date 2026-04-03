@@ -105,6 +105,11 @@ pub struct AppState {
     pub runtime_project_cache: Arc<crate::runtime_project_cache::RuntimeProjectCacheManager>,
     /// Serializes runtime snapshot writes to avoid out-of-order persistence.
     pub runtime_state_persist_lock: Mutex<()>,
+    /// Set when a runtime-state persist fails; the next successful
+    /// `persist_runtime_state` call clears it.  Handlers that find no
+    /// in-memory mutation (e.g. idempotent deregister retry) still trigger a
+    /// persist when this flag is set, converging durable state.
+    pub runtime_state_dirty: AtomicBool,
     pub notifications: NotificationServices,
     pub intake: IntakeServices,
     pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
@@ -147,7 +152,24 @@ impl AppState {
         };
         let (hosts, leases) = self.runtime_hosts.snapshot_state();
         let project_caches = self.runtime_project_cache.snapshot_state();
-        store.persist_snapshot(hosts, leases, project_caches).await
+        match store.persist_snapshot(hosts, leases, project_caches).await {
+            Ok(()) => {
+                self.runtime_state_dirty.store(false, Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                self.runtime_state_dirty.store(true, Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+
+    /// Returns `true` when a previous persist failed and durable state may be
+    /// stale.  Handlers that skip their own mutation (e.g. idempotent
+    /// deregister retry returning NOT_FOUND) should check this and re-persist
+    /// to converge.
+    pub fn is_runtime_state_dirty(&self) -> bool {
+        self.runtime_state_dirty.load(Ordering::Acquire)
     }
 }
 fn resolve_project_root(configured_root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
@@ -683,6 +705,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         runtime_hosts,
         runtime_project_cache,
         runtime_state_persist_lock: Mutex::new(()),
+            runtime_state_dirty: AtomicBool::new(false),
         notifications: NotificationServices {
             notification_tx: broadcast::channel(notification_broadcast_capacity).0,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),

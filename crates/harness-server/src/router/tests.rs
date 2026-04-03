@@ -100,6 +100,7 @@ async fn make_test_state_with_config_and_registry(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
         ),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
+            runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
         notifications: crate::http::NotificationServices {
             notification_tx,
             notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1415,6 +1416,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
         ),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
+            runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
         notifications: crate::http::NotificationServices {
             notification_tx,
             notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
