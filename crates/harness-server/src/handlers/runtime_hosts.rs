@@ -57,7 +57,21 @@ pub async fn heartbeat_runtime_host(
     Path(host_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.runtime_hosts.heartbeat(&host_id) {
-        Ok(host) => (StatusCode::OK, Json(json!({ "host": host }))),
+        Ok(host) => {
+            // Heartbeat is intentionally not persisted (transient data, self-healing
+            // after restart).  However if a prior mutation left the dirty flag, piggyback
+            // on this frequent call to converge durable state.
+            if state.is_runtime_state_dirty() {
+                if let Err(e) = state.persist_runtime_state().await {
+                    tracing::warn!(
+                        host_id = %host_id,
+                        error = %e,
+                        "opportunistic dirty-state flush on heartbeat failed; will retry next heartbeat"
+                    );
+                }
+            }
+            (StatusCode::OK, Json(json!({ "host": host })))
+        }
         Err(e) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": e.to_string() })),
@@ -76,6 +90,13 @@ pub async fn deregister_runtime_host(
         }
         (StatusCode::OK, Json(json!({ "deregistered": true })))
     } else {
+        // Host already gone from memory (idempotent retry).  If a prior
+        // deregister mutated memory but failed to persist, converge now.
+        if state.is_runtime_state_dirty() {
+            if let Err(response) = persist_runtime_state(&state).await {
+                return response;
+            }
+        }
         (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "runtime host not found" })),
