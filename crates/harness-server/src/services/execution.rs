@@ -4,7 +4,7 @@
 use crate::{
     complexity_router,
     http::resolve_reviewer,
-    project_registry::ProjectRegistry,
+    project_registry::{check_allowed_roots, ProjectRegistry},
     task_queue::TaskQueue,
     task_runner::{self, CompletionCallback, CreateTaskRequest, TaskId, TaskStore},
     workspace::WorkspaceManager,
@@ -143,17 +143,8 @@ impl DefaultExecutionService {
 
     /// Check the resolved canonical project against `allowed_project_roots`.
     fn check_allowed_roots(&self, canonical: &std::path::Path) -> Result<(), EnqueueTaskError> {
-        if !self.allowed_project_roots.is_empty()
-            && !self
-                .allowed_project_roots
-                .iter()
-                .any(|base| canonical.starts_with(base))
-        {
-            return Err(EnqueueTaskError::BadRequest(
-                "project root is not under an allowed base directory".to_string(),
-            ));
-        }
-        Ok(())
+        check_allowed_roots(canonical, &self.allowed_project_roots)
+            .map_err(EnqueueTaskError::BadRequest)
     }
 
     /// Select the agent for this request (explicit name or complexity-routed).
@@ -447,12 +438,15 @@ mod tests {
 
     #[tokio::test]
     async fn check_allowed_roots_permits_inside_root() -> anyhow::Result<()> {
+        let base_dir = tempfile::tempdir()?;
+        let project_dir = base_dir.path().join("project");
+        std::fs::create_dir_all(&project_dir)?;
         let dir = tempfile::tempdir()?;
         let store = TaskStore::open(&dir.path().join("t.db")).await?;
-        let allowed = vec![PathBuf::from("/allowed/base")];
+        let allowed = vec![base_dir.path().to_path_buf()];
         let svc = make_svc_with_allowed_roots(store, allowed).await;
-        let inside = PathBuf::from("/allowed/base/project");
-        assert!(svc.check_allowed_roots(&inside).is_ok());
+        let canonical_project = project_dir.canonicalize()?;
+        assert!(svc.check_allowed_roots(&canonical_project).is_ok());
         Ok(())
     }
 

@@ -77,6 +77,29 @@ impl ProjectRegistry {
     }
 }
 
+/// Check that `canonical_root` falls under at least one of the
+/// `allowed_project_roots`.  Each allowlist entry is canonicalized before the
+/// prefix check so that relative paths and symlinks in the config don't cause
+/// false 403s.  Returns `Ok(())` when the allowlist is empty (i.e. no
+/// restriction configured).
+pub fn check_allowed_roots(
+    canonical_root: &std::path::Path,
+    allowed: &[std::path::PathBuf],
+) -> Result<(), String> {
+    if allowed.is_empty() {
+        return Ok(());
+    }
+    let matched = allowed.iter().any(|base| {
+        base.canonicalize()
+            .map(|canon_base| canonical_root.starts_with(&canon_base))
+            .unwrap_or(false)
+    });
+    if !matched {
+        return Err("project root is not under an allowed base directory".to_string());
+    }
+    Ok(())
+}
+
 /// Validate that a path is an existing directory and a git repository.
 pub fn validate_project_root(root: &std::path::Path) -> Result<(), String> {
     if !root.is_dir() {
