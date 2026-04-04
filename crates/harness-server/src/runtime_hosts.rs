@@ -97,6 +97,7 @@ pub struct RuntimeHostManager {
     pub(crate) leases: DashMap<TaskId, TaskLease>,
     pub(crate) host_leases: DashMap<String, HashSet<TaskId>>,
     pub(crate) lease_expirations: Mutex<BinaryHeap<Reverse<LeaseExpiry>>>,
+    lease_mutation_lock: Mutex<()>,
     pub(crate) heartbeat_timeout_secs: i64,
     default_lease_secs: i64,
 }
@@ -112,6 +113,7 @@ impl RuntimeHostManager {
             leases: DashMap::new(),
             host_leases: DashMap::new(),
             lease_expirations: Mutex::new(BinaryHeap::new()),
+            lease_mutation_lock: Mutex::new(()),
             heartbeat_timeout_secs,
             default_lease_secs,
         }
@@ -148,6 +150,10 @@ impl RuntimeHostManager {
     pub fn deregister(&self, host_id: &str) -> bool {
         let removed = self.hosts.remove(host_id).is_some();
         if removed {
+            let _lease_guard = self
+                .lease_mutation_lock
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             let lease_ids = self
                 .host_leases
                 .remove(host_id)
@@ -156,6 +162,7 @@ impl RuntimeHostManager {
             for task_id in lease_ids {
                 self.leases.remove(&task_id);
             }
+            self.rebuild_lease_expirations();
         }
         removed
     }
@@ -186,7 +193,6 @@ impl RuntimeHostManager {
             .ok_or_else(|| ClaimTaskError::HostNotRegistered(host_id.to_string()))?;
 
         let now = Utc::now();
-        self.cleanup_expired_leases(now);
         candidates.retain(|c| c.status.as_ref() == "pending" && project_matches(c, project_filter));
         candidates.sort_by(|a, b| {
             a.created_at
@@ -195,30 +201,43 @@ impl RuntimeHostManager {
         });
 
         let ttl = lease_secs.unwrap_or(self.default_lease_secs).max(0);
+        let _lease_guard = self
+            .lease_mutation_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.cleanup_expired_leases(now);
         for candidate in candidates {
-            match self.leases.entry(candidate.task_id.clone()) {
-                Entry::Vacant(v) => {
-                    let lease_duration = chrono::TimeDelta::try_seconds(ttl)
-                        .ok_or(ClaimTaskError::LeaseTtlOutOfRange(ttl))?;
-                    let expires_at = now
-                        .checked_add_signed(lease_duration)
-                        .ok_or(ClaimTaskError::LeaseTtlOutOfRange(ttl))?;
-                    v.insert(TaskLease {
-                        host_id: host_id.to_string(),
-                        expires_at,
-                    });
-                    self.index_lease(host_id, candidate.task_id.clone(), expires_at);
-                    drop(host_guard);
-                    return Ok(Some(TaskClaimResult {
-                        task_id: candidate.task_id,
-                        lease_expires_at: expires_at.to_rfc3339(),
-                    }));
-                }
-                Entry::Occupied(_) => continue,
+            if let Some(claim) =
+                self.try_claim_task_id_locked(host_id, &candidate.task_id, ttl, now)?
+            {
+                drop(host_guard);
+                return Ok(Some(claim));
             }
         }
         drop(host_guard);
         Ok(None)
+    }
+
+    pub fn claim_task_id(
+        &self,
+        host_id: &str,
+        task_id: &TaskId,
+        lease_secs: Option<i64>,
+    ) -> Result<Option<TaskClaimResult>, ClaimTaskError> {
+        let host_guard = self
+            .hosts
+            .get(host_id)
+            .ok_or_else(|| ClaimTaskError::HostNotRegistered(host_id.to_string()))?;
+        let now = Utc::now();
+        let ttl = lease_secs.unwrap_or(self.default_lease_secs).max(0);
+        let _lease_guard = self
+            .lease_mutation_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.cleanup_expired_leases(now);
+        let claim = self.try_claim_task_id_locked(host_id, task_id, ttl, now)?;
+        drop(host_guard);
+        Ok(claim)
     }
 
     fn cleanup_expired_leases(&self, now: DateTime<Utc>) {
@@ -274,6 +293,48 @@ impl RuntimeHostManager {
                 self.host_leases.remove(&lease.host_id);
             }
         }
+    }
+
+    fn try_claim_task_id_locked(
+        &self,
+        host_id: &str,
+        task_id: &TaskId,
+        ttl: i64,
+        now: DateTime<Utc>,
+    ) -> Result<Option<TaskClaimResult>, ClaimTaskError> {
+        match self.leases.entry(task_id.clone()) {
+            Entry::Vacant(v) => {
+                let lease_duration = chrono::TimeDelta::try_seconds(ttl)
+                    .ok_or(ClaimTaskError::LeaseTtlOutOfRange(ttl))?;
+                let expires_at = now
+                    .checked_add_signed(lease_duration)
+                    .ok_or(ClaimTaskError::LeaseTtlOutOfRange(ttl))?;
+                v.insert(TaskLease {
+                    host_id: host_id.to_string(),
+                    expires_at,
+                });
+                self.index_lease(host_id, task_id.clone(), expires_at);
+                Ok(Some(TaskClaimResult {
+                    task_id: task_id.clone(),
+                    lease_expires_at: expires_at.to_rfc3339(),
+                }))
+            }
+            Entry::Occupied(_) => Ok(None),
+        }
+    }
+
+    fn rebuild_lease_expirations(&self) {
+        let mut rebuilt = BinaryHeap::new();
+        for entry in self.leases.iter() {
+            rebuilt.push(Reverse(LeaseExpiry {
+                expires_at: entry.value().expires_at,
+                task_id: entry.key().clone(),
+            }));
+        }
+        *self
+            .lease_expirations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = rebuilt;
     }
 
     fn to_info(&self, record: &RuntimeHostRecord, now: DateTime<Utc>) -> RuntimeHostInfo {
