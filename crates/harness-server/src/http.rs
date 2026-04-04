@@ -705,7 +705,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         runtime_hosts,
         runtime_project_cache,
         runtime_state_persist_lock: Mutex::new(()),
-            runtime_state_dirty: AtomicBool::new(false),
+        runtime_state_dirty: AtomicBool::new(false),
         notifications: NotificationServices {
             notification_tx: broadcast::channel(notification_broadcast_capacity).0,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),

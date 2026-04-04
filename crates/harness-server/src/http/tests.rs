@@ -151,7 +151,7 @@ async fn make_test_state_with(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
         ),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
-            runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
+        runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
         notifications: crate::http::NotificationServices {
             notification_tx: tokio::sync::broadcast::channel(32).0,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),
