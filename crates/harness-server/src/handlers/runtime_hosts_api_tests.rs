@@ -151,6 +151,103 @@ async fn claim_endpoint_blocks_double_claim() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn claim_endpoint_honors_project_filter() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+
+    let project_a = dir.path().join("project-a");
+    let project_b = dir.path().join("project-b");
+
+    let task_a = crate::task_runner::TaskState {
+        id: crate::task_runner::TaskId::new(),
+        status: crate::task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(project_a),
+        issue: None,
+        repo: None,
+        description: Some("pending task a".to_string()),
+        created_at: Some("2026-04-02T00:00:00Z".to_string()),
+        phase: crate::task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+    };
+    let task_b = crate::task_runner::TaskState {
+        id: crate::task_runner::TaskId::new(),
+        status: crate::task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(project_b.clone()),
+        issue: None,
+        repo: None,
+        description: Some("pending task b".to_string()),
+        created_at: Some("2026-04-02T00:00:01Z".to_string()),
+        phase: crate::task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+    };
+    let task_b_id = task_b.id.clone();
+
+    state.core.tasks.insert(&task_a).await;
+    state.core.tasks.insert(&task_b).await;
+
+    let app = runtime_hosts_app(state);
+
+    let register = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "host_id": "host-a" }).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(register.status(), axum::http::StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/host-a/tasks/claim")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "lease_secs": 30,
+                        "project": project_b.to_string_lossy(),
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &http_body_util::BodyExt::collect(response.into_body())
+            .await?
+            .to_bytes(),
+    )?;
+    assert_eq!(json["claimed"], true);
+    assert_eq!(json["task_id"], task_b_id.to_string());
+    Ok(())
+}
+
+#[tokio::test]
 async fn claim_endpoint_rejects_out_of_range_lease_secs() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);

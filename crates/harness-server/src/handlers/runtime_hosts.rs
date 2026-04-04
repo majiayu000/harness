@@ -116,6 +116,12 @@ pub async fn claim_task_for_runtime_host(
         );
     }
 
+    let project_filter = req
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
     let mut tasks: Vec<ClaimCandidate> = state
         .core
         .tasks
@@ -127,6 +133,10 @@ pub async fn claim_task_for_runtime_host(
             status: task.status,
             created_at: task.created_at,
             project: task.project_root.map(|p| p.to_string_lossy().into_owned()),
+        })
+        .filter(|candidate| match project_filter {
+            Some(filter) => candidate.project.as_deref() == Some(filter),
+            None => true,
         })
         .collect();
     tasks.sort_by(|a, b| {

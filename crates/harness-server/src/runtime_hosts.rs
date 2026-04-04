@@ -148,12 +148,12 @@ impl RuntimeHostManager {
     }
 
     pub fn deregister(&self, host_id: &str) -> bool {
+        let _lease_guard = self
+            .lease_mutation_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let removed = self.hosts.remove(host_id).is_some();
         if removed {
-            let _lease_guard = self
-                .lease_mutation_lock
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
             let lease_ids = self
                 .host_leases
                 .remove(host_id)
@@ -185,13 +185,6 @@ impl RuntimeHostManager {
         lease_secs: Option<i64>,
         project_filter: Option<&str>,
     ) -> Result<Option<TaskClaimResult>, ClaimTaskError> {
-        // Hold a read reference during claim so concurrent deregister() cannot
-        // remove the host between membership check and lease insertion.
-        let host_guard = self
-            .hosts
-            .get(host_id)
-            .ok_or_else(|| ClaimTaskError::HostNotRegistered(host_id.to_string()))?;
-
         let now = Utc::now();
         candidates.retain(|c| c.status.as_ref() == "pending" && project_matches(c, project_filter));
         candidates.sort_by(|a, b| {
@@ -205,16 +198,17 @@ impl RuntimeHostManager {
             .lease_mutation_lock
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        if !self.hosts.contains_key(host_id) {
+            return Err(ClaimTaskError::HostNotRegistered(host_id.to_string()));
+        }
         self.cleanup_expired_leases(now);
         for candidate in candidates {
             if let Some(claim) =
                 self.try_claim_task_id_locked(host_id, &candidate.task_id, ttl, now)?
             {
-                drop(host_guard);
                 return Ok(Some(claim));
             }
         }
-        drop(host_guard);
         Ok(None)
     }
 
@@ -224,20 +218,17 @@ impl RuntimeHostManager {
         task_id: &TaskId,
         lease_secs: Option<i64>,
     ) -> Result<Option<TaskClaimResult>, ClaimTaskError> {
-        let host_guard = self
-            .hosts
-            .get(host_id)
-            .ok_or_else(|| ClaimTaskError::HostNotRegistered(host_id.to_string()))?;
         let now = Utc::now();
         let ttl = lease_secs.unwrap_or(self.default_lease_secs).max(0);
         let _lease_guard = self
             .lease_mutation_lock
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        if !self.hosts.contains_key(host_id) {
+            return Err(ClaimTaskError::HostNotRegistered(host_id.to_string()));
+        }
         self.cleanup_expired_leases(now);
-        let claim = self.try_claim_task_id_locked(host_id, task_id, ttl, now)?;
-        drop(host_guard);
-        Ok(claim)
+        self.try_claim_task_id_locked(host_id, task_id, ttl, now)
     }
 
     fn cleanup_expired_leases(&self, now: DateTime<Utc>) {
@@ -347,6 +338,13 @@ impl RuntimeHostManager {
             last_heartbeat_at: record.last_heartbeat_at.to_rfc3339(),
             online,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_lease_mutation_lock_for_test(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lease_mutation_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 }
 

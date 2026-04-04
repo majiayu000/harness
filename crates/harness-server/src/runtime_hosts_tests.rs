@@ -1,5 +1,13 @@
 use crate::runtime_hosts::{ClaimCandidate, RuntimeHostManager};
 use crate::task_runner::{TaskId, TaskStatus};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Barrier,
+    },
+    thread,
+    time::Duration,
+};
 
 fn candidate(task_id: TaskId, created_at: &str) -> ClaimCandidate {
     ClaimCandidate {
@@ -88,4 +96,36 @@ fn deregister_compacts_lease_expiry_heap() -> anyhow::Result<()> {
         0
     );
     Ok(())
+}
+
+#[test]
+fn deregister_waits_for_lease_lock_before_removing_host() {
+    let manager = Arc::new(RuntimeHostManager::with_timeouts(60, 30));
+    manager.register("host-a".to_string(), None, vec![]);
+
+    let lease_guard = manager.hold_lease_mutation_lock_for_test();
+    let barrier = Arc::new(Barrier::new(2));
+    let finished = Arc::new(AtomicBool::new(false));
+
+    let manager_for_thread = Arc::clone(&manager);
+    let barrier_for_thread = Arc::clone(&barrier);
+    let finished_for_thread = Arc::clone(&finished);
+    let join = thread::spawn(move || {
+        barrier_for_thread.wait();
+        manager_for_thread.deregister("host-a");
+        finished_for_thread.store(true, Ordering::SeqCst);
+    });
+
+    barrier.wait();
+
+    for _ in 0..25 {
+        assert!(manager.hosts.contains_key("host-a"));
+        assert!(!finished.load(Ordering::SeqCst));
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    drop(lease_guard);
+    join.join().unwrap();
+
+    assert!(!manager.hosts.contains_key("host-a"));
 }
