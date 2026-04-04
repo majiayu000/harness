@@ -253,6 +253,19 @@ mod tests {
             .collect()
     }
 
+    async fn wait_for_path(path: &std::path::Path, timeout_duration: Duration) -> bool {
+        timeout(timeout_duration, async {
+            loop {
+                if path.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     #[test]
     fn base_args_full_profile_uses_dangerously_skip_permissions() {
         let agent = ClaudeCodeAgent::new(
@@ -627,12 +640,14 @@ printf 'second\n'
     #[tokio::test]
     async fn execute_stream_timeout_drop_does_not_leave_hanging_process() {
         let dir = tempfile::tempdir().expect("create tempdir");
+        let started_marker = dir.path().join("timeout-started.txt");
         let marker = dir.path().join("timeout-marker.txt");
         let script = dir.path().join("mock-claude-timeout.sh");
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\nset -eu\nsleep 5\necho reached > \"{}\"\n",
+                "#!/bin/sh\nset -eu\necho started > \"{}\"\nsleep 5\necho reached > \"{}\"\n",
+                started_marker.display(),
                 marker.display()
             ),
         )
@@ -658,18 +673,27 @@ printf 'second\n'
             ..AgentRequest::default()
         };
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let handle = tokio::spawn(async move { agent.execute_stream(request, tx).await });
 
-        let timed = timeout(
-            Duration::from_millis(500),
-            agent.execute_stream(request, tx),
-        )
-        .await;
-        assert!(timed.is_err(), "expected timeout on long-running stream");
+        if !wait_for_path(&started_marker, Duration::from_secs(10)).await {
+            let outcome = timeout(Duration::from_secs(1), handle).await;
+            panic!("stream process did not stay alive long enough to observe startup: {outcome:?}");
+        }
+
+        handle.abort();
+        let join_err = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("aborted execute_stream task should resolve")
+            .expect_err("aborted execute_stream task should not return successfully");
+        assert!(
+            join_err.is_cancelled(),
+            "expected cancelled join error after abort, got: {join_err}"
+        );
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             !marker.exists(),
-            "process should be killed when stream future is dropped on timeout"
+            "process should be killed when stream future is dropped"
         );
     }
 }
