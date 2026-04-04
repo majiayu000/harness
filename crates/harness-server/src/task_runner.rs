@@ -606,6 +606,19 @@ impl TaskStore {
         self.cache.iter().map(|e| e.value().clone()).collect()
     }
 
+    /// Run `f` only if the task still exists and is live-`pending`.
+    ///
+    /// Holding the mutable cache guard across `f` prevents a concurrent status
+    /// transition from changing this task out of `pending` between the check
+    /// and a follow-up side effect such as runtime-host lease insertion.
+    pub(crate) fn with_task_if_pending<R>(&self, id: &TaskId, f: impl FnOnce() -> R) -> Option<R> {
+        let entry = self.cache.get_mut(id)?;
+        if !matches!(entry.status, TaskStatus::Pending) {
+            return None;
+        }
+        Some(f())
+    }
+
     /// Return the `pr_url` of the most recently created Done task, ordered by `created_at DESC`
     /// from the database (stable ordering, unlike the in-memory DashMap cache).
     pub async fn latest_done_pr_url(&self) -> Option<String> {

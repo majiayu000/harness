@@ -109,7 +109,14 @@ pub async fn claim_task_for_runtime_host(
     Path(host_id): Path<String>,
     Json(req): Json<ClaimTaskRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let tasks = state
+    if !state.runtime_hosts.hosts.contains_key(&host_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("runtime host '{host_id}' is not registered") })),
+        );
+    }
+
+    let mut tasks: Vec<ClaimCandidate> = state
         .core
         .tasks
         .list_all()
@@ -122,6 +129,11 @@ pub async fn claim_task_for_runtime_host(
             project: task.project_root.map(|p| p.to_string_lossy().into_owned()),
         })
         .collect();
+    tasks.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.task_id.as_str().cmp(b.task_id.as_str()))
+    });
 
     let lease_secs = match req.lease_secs {
         Some(value) => match i64::try_from(value) {
@@ -135,44 +147,59 @@ pub async fn claim_task_for_runtime_host(
         },
         None => None,
     };
-    match state
-        .runtime_hosts
-        .claim_task(&host_id, tasks, lease_secs, req.project.as_deref())
-    {
-        Ok(Some(claim)) => {
-            if let Err((_, Json(error_body))) = persist_runtime_state(&state).await {
-                tracing::error!(
-                    host_id = %host_id,
-                    task_id = %claim.task_id,
-                    error = %error_body["error"].as_str().unwrap_or("unknown persistence error"),
-                    "runtime claim persisted in memory but runtime state persistence failed"
+
+    for candidate in tasks {
+        let live_claim = state
+            .core
+            .tasks
+            .with_task_if_pending(&candidate.task_id, || {
+                state
+                    .runtime_hosts
+                    .claim_task_id(&host_id, &candidate.task_id, lease_secs)
+            });
+        let Some(claim_result) = live_claim else {
+            continue;
+        };
+        match claim_result {
+            Ok(Some(claim)) => {
+                if let Err((_, Json(error_body))) = persist_runtime_state(&state).await {
+                    tracing::error!(
+                        host_id = %host_id,
+                        task_id = %claim.task_id,
+                        error = %error_body["error"].as_str().unwrap_or("unknown persistence error"),
+                        "runtime claim persisted in memory but runtime state persistence failed"
+                    );
+                }
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "claimed": true,
+                        "task_id": claim.task_id,
+                        "lease_expires_at": claim.lease_expires_at
+                    })),
                 );
             }
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "claimed": true,
-                    "task_id": claim.task_id,
-                    "lease_expires_at": claim.lease_expires_at
-                })),
-            )
+            Ok(None) => continue,
+            Err(e) => return claim_task_error_response(e),
         }
-        Ok(None) => {
-            if let Err(response) = persist_runtime_state(&state).await {
-                return response;
-            }
-            (StatusCode::OK, Json(json!({ "claimed": false })))
-        }
-        Err(e) => match e {
-            ClaimTaskError::HostNotRegistered(_) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": e.to_string() })),
-            ),
-            ClaimTaskError::LeaseTtlOutOfRange(_) => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": e.to_string() })),
-            ),
-        },
+    }
+
+    if let Err(response) = persist_runtime_state(&state).await {
+        return response;
+    }
+    (StatusCode::OK, Json(json!({ "claimed": false })))
+}
+
+fn claim_task_error_response(e: ClaimTaskError) -> (StatusCode, Json<serde_json::Value>) {
+    match e {
+        ClaimTaskError::HostNotRegistered(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        ),
+        ClaimTaskError::LeaseTtlOutOfRange(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        ),
     }
 }
 

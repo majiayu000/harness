@@ -60,3 +60,32 @@ fn deregister_releases_owned_leases() -> anyhow::Result<()> {
     assert!(second.is_some());
     Ok(())
 }
+
+#[test]
+fn deregister_compacts_lease_expiry_heap() -> anyhow::Result<()> {
+    let manager = RuntimeHostManager::with_timeouts(60, 300);
+    manager.register("host-a".to_string(), None, vec![]);
+
+    let task_id = TaskId::new();
+    let first = manager.claim_task_id("host-a", &task_id, Some(300))?;
+    assert!(first.is_some());
+    assert_eq!(
+        manager
+            .lease_expirations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len(),
+        1
+    );
+
+    assert!(manager.deregister("host-a"));
+    assert_eq!(
+        manager
+            .lease_expirations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len(),
+        0
+    );
+    Ok(())
+}
