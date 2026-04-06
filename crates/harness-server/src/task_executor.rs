@@ -195,6 +195,33 @@ pub(crate) async fn run_turn_lifecycle(
         return;
     };
 
+    // RAII guard: ensures the adapter is deregistered when the turn scope exits,
+    // even if the task is cancelled before reaching the end of this function.
+    struct AdapterGuard {
+        server: Arc<crate::server::HarnessServer>,
+        turn_id: TurnId,
+    }
+    impl Drop for AdapterGuard {
+        fn drop(&mut self) {
+            self.server
+                .thread_manager
+                .deregister_active_adapter(&self.turn_id);
+        }
+    }
+
+    // Register adapter for this turn if one is configured for this agent name.
+    // Enables turn/steer and turn/respond_approval to reach the live process.
+    // Gracefully no-ops when no adapter is registered (adapter_registry is empty by default).
+    let _adapter_guard = server.adapter_registry.get(&agent_name).map(|adapter_arc| {
+        server
+            .thread_manager
+            .register_active_adapter(&turn_id, adapter_arc.clone());
+        AdapterGuard {
+            server: server.clone(),
+            turn_id: turn_id.clone(),
+        }
+    });
+
     let req = AgentRequest {
         prompt,
         project_root,

@@ -262,11 +262,44 @@ pub async fn turn_steer(
                 .core
                 .server
                 .thread_manager
-                .steer_turn(&thread_id, &turn_id, instruction)
+                .steer_active_turn(&thread_id, &turn_id, instruction)
+                .await
             {
                 Ok(()) => {
                     persist_thread(state, &thread_id).await;
                     RpcResponse::success(id, serde_json::json!({ "steered": true }))
+                }
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+        None => RpcResponse::error(id, NOT_FOUND, "turn not found in any thread"),
+    }
+}
+
+pub async fn turn_respond_approval(
+    state: &AppState,
+    id: Option<serde_json::Value>,
+    turn_id: harness_core::types::TurnId,
+    request_id: String,
+    decision: harness_core::agent::ApprovalDecision,
+) -> RpcResponse {
+    match state
+        .core
+        .server
+        .thread_manager
+        .find_thread_for_turn(&turn_id)
+    {
+        Some(thread_id) => {
+            match state
+                .core
+                .server
+                .thread_manager
+                .respond_approval_on_turn(&turn_id, request_id, decision)
+                .await
+            {
+                Ok(()) => {
+                    persist_thread(state, &thread_id).await;
+                    RpcResponse::success(id, serde_json::json!({ "responded": true }))
                 }
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
             }

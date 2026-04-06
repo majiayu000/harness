@@ -59,3 +59,6 @@ mod runtime_hosts_tests;
 
 #[cfg(test)]
 mod runtime_state_store_tests;
+
+#[cfg(test)]
+mod thread_manager_tests;
