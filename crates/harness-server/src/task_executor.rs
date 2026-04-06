@@ -1508,15 +1508,29 @@ pub(crate) async fn run_task(
 
         // WAITING means review bot hasn't posted yet (e.g., quota exhausted).
         // Don't consume a round — just sleep and retry without incrementing.
+        // Cap consecutive waits to prevent infinite loops when the bot never responds.
+        const MAX_CONSECUTIVE_WAITS: u32 = 10;
         if waiting {
-            tracing::info!(
-                round,
-                "PR #{pr_num} review bot has not responded yet; sleeping without consuming round"
-            );
-            waiting_count += 1;
-            update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
-            sleep(Duration::from_secs(wait_secs)).await;
-            continue;
+            if waiting_count >= MAX_CONSECUTIVE_WAITS {
+                tracing::warn!(
+                    round,
+                    waiting_count,
+                    "PR #{pr_num} review bot has not responded after {MAX_CONSECUTIVE_WAITS} waits; \
+                     consuming a round to prevent infinite loop"
+                );
+                round += 1;
+                waiting_count = 0;
+            } else {
+                tracing::info!(
+                    round,
+                    waiting_count,
+                    "PR #{pr_num} review bot has not responded yet; sleeping without consuming round"
+                );
+                waiting_count += 1;
+                update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
+                sleep(Duration::from_secs(wait_secs)).await;
+                continue;
+            }
         }
 
         mutate_and_persist(store, task_id, |s| {
