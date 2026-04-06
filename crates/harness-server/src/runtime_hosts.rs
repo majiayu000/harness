@@ -187,11 +187,7 @@ impl RuntimeHostManager {
         let now = Utc::now();
         self.host_leases.get(host_id).map_or(0, |set| {
             set.iter()
-                .filter(|task_id| {
-                    self.leases
-                        .get(task_id)
-                        .map_or(false, |l| l.expires_at > now)
-                })
+                .filter(|task_id| self.leases.get(task_id).is_some_and(|l| l.expires_at > now))
                 .count()
         })
     }
