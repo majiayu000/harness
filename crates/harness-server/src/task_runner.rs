@@ -3,6 +3,7 @@ use dashmap::DashMap;
 use harness_core::agent::{CodeAgent, StreamItem};
 use harness_core::types::{Decision, Event, SessionId, TaskId as CoreTaskId};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -548,6 +549,22 @@ async fn record_task_failure(
 }
 
 /// In-memory cache + SQLite persistence.
+/// Per-project done/failed task counts derived from the in-memory cache.
+#[derive(Debug, Default, Clone)]
+pub struct ProjectCounts {
+    pub done: u64,
+    pub failed: u64,
+}
+
+/// Combined global and per-project done/failed counts produced by a single
+/// cache scan, avoiding both full task cloning and double iteration.
+#[derive(Debug)]
+pub struct DashboardCounts {
+    pub global_done: u64,
+    pub global_failed: u64,
+    pub by_project: HashMap<String, ProjectCounts>,
+}
+
 pub struct TaskStore {
     pub(crate) cache: DashMap<TaskId, TaskState>,
     db: TaskDb,
@@ -631,6 +648,29 @@ impl TaskStore {
         }
     }
 
+    /// Return the `pr_url` of the most recent Done task for a specific project root path.
+    pub async fn latest_done_pr_url_by_project(&self, project: &str) -> Option<String> {
+        match self.db.latest_done_pr_url_by_project(project).await {
+            Ok(url) => url,
+            Err(e) => {
+                tracing::warn!("failed to query latest done PR URL for project {project}: {e}");
+                None
+            }
+        }
+    }
+
+    /// Fetch the latest done PR URL for every project in a single DB query.
+    /// Returns a map from project root path string to PR URL.
+    pub async fn latest_done_pr_urls_all_projects(&self) -> HashMap<String, String> {
+        match self.db.latest_done_pr_urls_all_projects().await {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!("failed to bulk-query latest done PR URLs: {e}");
+                HashMap::new()
+            }
+        }
+    }
+
     /// Return all active (Pending or Implementing) tasks on the same project, excluding `exclude_id`.
     ///
     /// Used by `run_task` to build sibling-awareness context before starting implementation,
@@ -653,6 +693,35 @@ impl TaskStore {
             })
             .map(|e| e.value().clone())
             .collect()
+    }
+
+    /// Compute global and per-project done/failed counts via SQL aggregation.
+    ///
+    /// Delegates to `TaskDb` so the count scales with the database engine rather
+    /// than requiring an O(N) scan of the in-memory cache, which grows unboundedly
+    /// as tasks accumulate. Uses the `idx_tasks_project_status_updated` index.
+    pub async fn count_for_dashboard(&self) -> DashboardCounts {
+        match self.db.count_done_failed_by_project().await {
+            Ok((global_done, global_failed, rows)) => {
+                let by_project = rows
+                    .into_iter()
+                    .map(|(project, done, failed)| (project, ProjectCounts { done, failed }))
+                    .collect();
+                DashboardCounts {
+                    global_done,
+                    global_failed,
+                    by_project,
+                }
+            }
+            Err(e) => {
+                tracing::warn!("count_for_dashboard: SQL aggregation failed: {e}");
+                DashboardCounts {
+                    global_done: 0,
+                    global_failed: 0,
+                    by_project: HashMap::new(),
+                }
+            }
+        }
     }
 
     /// Return all cached tasks whose `parent_id` matches the given ID.
@@ -2452,5 +2521,66 @@ mod tests {
         assert!(is_non_decomposable_prompt_source(Some("sprint_planner")));
         assert!(!is_non_decomposable_prompt_source(Some("github")));
         assert!(!is_non_decomposable_prompt_source(None));
+    }
+
+    #[tokio::test]
+    async fn count_by_project_empty() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        assert!(store.count_for_dashboard().await.by_project.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_by_project_none_root_excluded() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let mut task = TaskState::new(harness_core::types::TaskId("no-root".to_string()));
+        task.status = TaskStatus::Done;
+        // project_root stays None
+        store.insert(&task).await;
+
+        assert!(
+            store.count_for_dashboard().await.by_project.is_empty(),
+            "tasks with no project_root must not appear in per-project counts"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_by_project_groups_correctly() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let root_a = std::path::PathBuf::from("/projects/alpha");
+        let root_b = std::path::PathBuf::from("/projects/beta");
+
+        for (id, root, status) in [
+            ("a1", &root_a, TaskStatus::Done),
+            ("a2", &root_a, TaskStatus::Done),
+            ("a3", &root_a, TaskStatus::Failed),
+            ("b1", &root_b, TaskStatus::Done),
+            ("b2", &root_b, TaskStatus::Failed),
+            ("b3", &root_b, TaskStatus::Failed),
+        ] {
+            let mut task = TaskState::new(harness_core::types::TaskId(id.to_string()));
+            task.status = status;
+            task.project_root = Some(root.clone());
+            store.insert(&task).await;
+        }
+
+        let counts = store.count_for_dashboard().await.by_project;
+        let key_a = root_a.to_string_lossy().into_owned();
+        let key_b = root_b.to_string_lossy().into_owned();
+
+        assert!(counts.contains_key(&key_a), "alpha counts missing");
+        assert_eq!(counts[&key_a].done, 2, "alpha done");
+        assert_eq!(counts[&key_a].failed, 1, "alpha failed");
+
+        assert!(counts.contains_key(&key_b), "beta counts missing");
+        assert_eq!(counts[&key_b].done, 1, "beta done");
+        assert_eq!(counts[&key_b].failed, 2, "beta failed");
+        Ok(())
     }
 }

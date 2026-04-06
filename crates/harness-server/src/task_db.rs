@@ -4,6 +4,7 @@ use harness_core::db::{open_pool, Migration, Migrator};
 use harness_core::error::TaskDbDecodeError;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePool;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Maximum artifact content size in bytes before truncation.
@@ -83,6 +84,12 @@ static TASK_MIGRATIONS: &[Migration] = &[
             last_phase    TEXT NOT NULL,
             updated_at    TEXT NOT NULL
         )",
+    },
+    Migration {
+        version: 10,
+        description: "add index on tasks(project, status, updated_at) for dashboard queries",
+        sql: "CREATE INDEX IF NOT EXISTS idx_tasks_project_status_updated \
+              ON tasks(project, status, updated_at DESC)",
     },
 ];
 
@@ -439,6 +446,74 @@ impl TaskDb {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.and_then(|(pr_url,)| pr_url))
+    }
+
+    /// Return the `pr_url` of the most recent Done task for the given project root path.
+    pub async fn latest_done_pr_url_by_project(
+        &self,
+        project: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT pr_url FROM tasks \
+             WHERE status = 'done' AND pr_url IS NOT NULL AND project = ?1 \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(project)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(pr_url,)| pr_url))
+    }
+
+    /// Return the latest done PR URL for every project that has one, in a single query.
+    /// The map key is the project root path string; the value is the PR URL.
+    pub async fn latest_done_pr_urls_all_projects(
+        &self,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT project, pr_url FROM (\
+               SELECT project, pr_url, \
+                      ROW_NUMBER() OVER (PARTITION BY project ORDER BY updated_at DESC) AS rn \
+               FROM tasks \
+               WHERE status = 'done' AND pr_url IS NOT NULL AND project IS NOT NULL\
+             ) WHERE rn = 1",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Count done/failed tasks globally and per project via SQL aggregation.
+    ///
+    /// Returns `(global_done, global_failed, per_project_rows)` where each row is
+    /// `(project_key, done_count, failed_count)`. Tasks with no project are counted
+    /// in the global totals only. Uses the `idx_tasks_project_status_updated` index.
+    pub async fn count_done_failed_by_project(
+        &self,
+    ) -> anyhow::Result<(u64, u64, Vec<(String, u64, u64)>)> {
+        let global: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(CASE WHEN status = 'done' THEN 1 END), \
+                    COUNT(CASE WHEN status = 'failed' THEN 1 END) \
+             FROM tasks WHERE status IN ('done', 'failed')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT project, \
+                    COUNT(CASE WHEN status = 'done' THEN 1 END), \
+                    COUNT(CASE WHEN status = 'failed' THEN 1 END) \
+             FROM tasks \
+             WHERE status IN ('done', 'failed') AND project IS NOT NULL \
+             GROUP BY project",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let by_project = rows
+            .into_iter()
+            .map(|(p, d, f)| (p, d as u64, f as u64))
+            .collect();
+        Ok((global.0 as u64, global.1 as u64, by_project))
     }
 
     /// Return all tasks whose `parent_id` matches the given parent task ID.
