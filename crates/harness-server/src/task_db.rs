@@ -482,6 +482,40 @@ impl TaskDb {
         Ok(rows.into_iter().collect())
     }
 
+    /// Count done/failed tasks globally and per project via SQL aggregation.
+    ///
+    /// Returns `(global_done, global_failed, per_project_rows)` where each row is
+    /// `(project_key, done_count, failed_count)`. Tasks with no project are counted
+    /// in the global totals only. Uses the `idx_tasks_project_status_updated` index.
+    pub async fn count_done_failed_by_project(
+        &self,
+    ) -> anyhow::Result<(u64, u64, Vec<(String, u64, u64)>)> {
+        let global: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(CASE WHEN status = 'done' THEN 1 END), \
+                    COUNT(CASE WHEN status = 'failed' THEN 1 END) \
+             FROM tasks WHERE status IN ('done', 'failed')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT project, \
+                    COUNT(CASE WHEN status = 'done' THEN 1 END), \
+                    COUNT(CASE WHEN status = 'failed' THEN 1 END) \
+             FROM tasks \
+             WHERE status IN ('done', 'failed') AND project IS NOT NULL \
+             GROUP BY project",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let by_project = rows
+            .into_iter()
+            .map(|(p, d, f)| (p, d as u64, f as u64))
+            .collect();
+        Ok((global.0 as u64, global.1 as u64, by_project))
+    }
+
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(

@@ -695,42 +695,32 @@ impl TaskStore {
             .collect()
     }
 
-    /// Compute global and per-project done/failed counts in a single cache pass
-    /// without cloning any `TaskState`. Replaces the combination of `list_all()`
-    /// (which clones every task including `rounds` history) and `count_by_project()`.
-    pub fn count_for_dashboard(&self) -> DashboardCounts {
-        let mut global_done: u64 = 0;
-        let mut global_failed: u64 = 0;
-        let mut by_project: HashMap<String, ProjectCounts> = HashMap::new();
-        for entry in self.cache.iter() {
-            let task = entry.value();
-            let is_done = matches!(task.status, TaskStatus::Done);
-            let is_failed = matches!(task.status, TaskStatus::Failed);
-            if is_done {
-                global_done += 1;
-            } else if is_failed {
-                global_failed += 1;
-            } else {
-                continue;
-            }
-            if let Some(root) = &task.project_root {
-                let key_cow = root.to_string_lossy();
-                let counts = if let Some(c) = by_project.get_mut(key_cow.as_ref()) {
-                    c
-                } else {
-                    by_project.entry(key_cow.into_owned()).or_default()
-                };
-                if is_done {
-                    counts.done += 1;
-                } else {
-                    counts.failed += 1;
+    /// Compute global and per-project done/failed counts via SQL aggregation.
+    ///
+    /// Delegates to `TaskDb` so the count scales with the database engine rather
+    /// than requiring an O(N) scan of the in-memory cache, which grows unboundedly
+    /// as tasks accumulate. Uses the `idx_tasks_project_status_updated` index.
+    pub async fn count_for_dashboard(&self) -> DashboardCounts {
+        match self.db.count_done_failed_by_project().await {
+            Ok((global_done, global_failed, rows)) => {
+                let by_project = rows
+                    .into_iter()
+                    .map(|(project, done, failed)| (project, ProjectCounts { done, failed }))
+                    .collect();
+                DashboardCounts {
+                    global_done,
+                    global_failed,
+                    by_project,
                 }
             }
-        }
-        DashboardCounts {
-            global_done,
-            global_failed,
-            by_project,
+            Err(e) => {
+                tracing::warn!("count_for_dashboard: SQL aggregation failed: {e}");
+                DashboardCounts {
+                    global_done: 0,
+                    global_failed: 0,
+                    by_project: HashMap::new(),
+                }
+            }
         }
     }
 
@@ -2537,7 +2527,7 @@ mod tests {
     async fn count_by_project_empty() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
-        assert!(store.count_for_dashboard().by_project.is_empty());
+        assert!(store.count_for_dashboard().await.by_project.is_empty());
         Ok(())
     }
 
@@ -2552,7 +2542,7 @@ mod tests {
         store.insert(&task).await;
 
         assert!(
-            store.count_for_dashboard().by_project.is_empty(),
+            store.count_for_dashboard().await.by_project.is_empty(),
             "tasks with no project_root must not appear in per-project counts"
         );
         Ok(())
@@ -2580,7 +2570,7 @@ mod tests {
             store.insert(&task).await;
         }
 
-        let counts = store.count_for_dashboard().by_project;
+        let counts = store.count_for_dashboard().await.by_project;
         let key_a = root_a.to_string_lossy().into_owned();
         let key_b = root_b.to_string_lossy().into_owned();
 

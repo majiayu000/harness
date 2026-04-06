@@ -29,7 +29,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         global_done,
         global_failed,
         by_project: project_counts,
-    } = state.core.tasks.count_for_dashboard();
+    } = state.core.tasks.count_for_dashboard().await;
 
     // Most recent completed task with a PR URL, queried from the DB which is
     // ordered by updated_at DESC — reflects completion time, not creation time.
