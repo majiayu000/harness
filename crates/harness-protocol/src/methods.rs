@@ -97,6 +97,16 @@ pub enum Method {
     SkillDelete {
         skill_id: SkillId,
     },
+    /// Return governance fields for a single skill.
+    SkillGovernanceView {
+        skill_id: SkillId,
+    },
+    /// Return parsed status transitions from `skill_governance_tick` events.
+    SkillGovernanceHistory {
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        limit: Option<usize>,
+    },
 
     // === Rule engine ===
     RuleLoad {
@@ -320,6 +330,8 @@ impl Method {
             Self::AgentList => "agent/list",
             Self::Preflight { .. } => "preflight",
             Self::CrossReview { .. } => "cross_review",
+            Self::SkillGovernanceView { .. } => "skill/governance/view",
+            Self::SkillGovernanceHistory { .. } => "skill/governance/history",
         }
     }
 }
