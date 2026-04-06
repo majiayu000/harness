@@ -191,7 +191,7 @@ pub struct TaskSummary {
 }
 
 impl TaskState {
-    fn new(id: TaskId) -> Self {
+    pub(crate) fn new(id: TaskId) -> Self {
         Self {
             id,
             status: TaskStatus::Pending,
@@ -538,6 +538,11 @@ async fn record_task_failure(
     reason: String,
 ) {
     log_task_failure_event(events, task_id, &reason).await;
+    store.log_event(crate::event_replay::TaskEvent::Failed {
+        task_id: task_id.0.clone(),
+        ts: crate::event_replay::now_ts(),
+        reason: reason.clone(),
+    });
     if let Err(e) = mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Failed;
         s.error = Some(reason);
@@ -576,11 +581,26 @@ pub struct TaskStore {
     /// Global circuit breaker: when the CLI account-level limit is hit,
     /// all tasks pause until this instant passes.
     rate_limit_until: RwLock<Option<tokio::time::Instant>>,
+    /// Append-only JSONL event log for crash recovery. `None` if the file
+    /// could not be opened (best-effort; server still starts without it).
+    pub(crate) event_log: Option<Arc<crate::event_replay::TaskEventLog>>,
 }
 
 impl TaskStore {
     pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
         let db = TaskDb::open(db_path).await?;
+
+        // 1. Event replay: runs BEFORE recover_in_progress so event-sourced
+        //    data (pr_url, terminal status) wins over checkpoint data.
+        let event_log_path = db_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("task-events.jsonl");
+        if let Err(e) = crate::event_replay::replay_and_recover(&db, &event_log_path).await {
+            tracing::warn!("startup: event replay failed (non-fatal): {e}");
+        }
+
+        // 2. Legacy checkpoint-based recovery as fallback.
         let recovery = db.recover_in_progress().await?;
         if recovery.resumed > 0 {
             tracing::info!(
@@ -594,6 +614,22 @@ impl TaskStore {
                 recovery.failed
             );
         }
+
+        // 3. Open the event log for appending during this server session.
+        let event_log = match crate::event_replay::TaskEventLog::open(&event_log_path) {
+            Ok(log) => {
+                tracing::debug!("task event log: {}", event_log_path.display());
+                Some(Arc::new(log))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "failed to open task event log at {}: {e}",
+                    event_log_path.display()
+                );
+                None
+            }
+        };
+
         let cache = DashMap::new();
         let persist_locks = DashMap::new();
         for task in db.list().await? {
@@ -607,6 +643,7 @@ impl TaskStore {
             stream_txs: DashMap::new(),
             abort_handles: DashMap::new(),
             rate_limit_until: RwLock::new(None),
+            event_log,
         });
         Ok(store)
     }
@@ -849,6 +886,13 @@ impl TaskStore {
         self.db.list_artifacts(&task_id.0).await
     }
 
+    /// Append a [`TaskEvent`] to the event log. No-op when the log is not open.
+    pub(crate) fn log_event(&self, event: crate::event_replay::TaskEvent) {
+        if let Some(ref log) = self.event_log {
+            log.append(&event);
+        }
+    }
+
     pub(crate) async fn insert(&self, state: &TaskState) {
         self.persist_locks
             .entry(state.id.clone())
@@ -857,6 +901,10 @@ impl TaskStore {
         if let Err(e) = self.db.insert(state).await {
             tracing::error!("task_db insert failed: {e}");
         }
+        self.log_event(crate::event_replay::TaskEvent::Created {
+            task_id: state.id.0.clone(),
+            ts: crate::event_replay::now_ts(),
+        });
     }
 
     /// Write a phase checkpoint for `task_id`. Checkpoint writes are non-fatal:
@@ -1547,11 +1595,19 @@ pub(crate) async fn update_status(
     status: TaskStatus,
     turn: u32,
 ) -> anyhow::Result<()> {
+    let status_str = status.as_ref().to_string();
     mutate_and_persist(store, task_id, |s| {
         s.status = status;
         s.turn = turn;
     })
-    .await
+    .await?;
+    store.log_event(crate::event_replay::TaskEvent::StatusChanged {
+        task_id: task_id.0.clone(),
+        ts: crate::event_replay::now_ts(),
+        status: status_str,
+        turn,
+    });
+    Ok(())
 }
 
 /// Mutate a task in the cache then persist to SQLite.

@@ -228,6 +228,58 @@ impl TaskDb {
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 
+    /// Return `true` if a task row with the given ID exists in the database.
+    pub async fn exists_by_id(&self, id: &str) -> anyhow::Result<bool> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT id FROM tasks WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
+    /// Apply event-replayed state to a task row.
+    ///
+    /// Called during startup, **before** `recover_in_progress()`, so that
+    /// event-sourced data takes precedence over checkpoint data.
+    ///
+    /// - If `terminal_status` is `Some`, the task's status is overwritten
+    ///   (only while the row is still in an interrupted state).
+    /// - If `pr_url` is `Some` and the row's `pr_url` is currently `NULL`,
+    ///   the value is written back so `recover_in_progress()` can resume the task.
+    pub async fn apply_replayed_state(
+        &self,
+        task_id: &str,
+        pr_url: Option<&str>,
+        terminal_status: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if let Some(status) = terminal_status {
+            // Overwrite to terminal status; only touches tasks still in interrupted states
+            // so we never downgrade a task that already reached Done/Failed in the DB.
+            sqlx::query(
+                "UPDATE tasks SET status = ?, pr_url = COALESCE(?, pr_url), \
+                 updated_at = datetime('now') \
+                 WHERE id = ? \
+                 AND status IN ('implementing', 'agent_review', 'reviewing', 'waiting')",
+            )
+            .bind(status)
+            .bind(pr_url)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
+        } else if let Some(url) = pr_url {
+            // Write pr_url back only when the DB row currently has no pr_url.
+            sqlx::query(
+                "UPDATE tasks SET pr_url = ? \
+                 WHERE id = ? AND pr_url IS NULL",
+            )
+            .bind(url)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Recovery on server restart.
     ///
     /// For each interrupted task (`implementing`, `agent_review`, `reviewing`, `waiting`),

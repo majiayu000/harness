@@ -1271,6 +1271,15 @@ pub(crate) async fn run_task(
         })
         .await?;
 
+        // Emit PrDetected event so crash recovery can reconstruct pr_url.
+        if let Some(pr_url_str) = pr_url.as_deref() {
+            store.log_event(crate::event_replay::TaskEvent::PrDetected {
+                task_id: task_id.0.clone(),
+                ts: crate::event_replay::now_ts(),
+                pr_url: pr_url_str.to_string(),
+            });
+        }
+
         // Write PR checkpoint immediately after pr_url is persisted.
         // This is the most critical checkpoint — it prevents duplicate PR creation on resume.
         if let Some(pr_url_str) = pr_url.as_deref() {
@@ -1560,8 +1569,8 @@ pub(crate) async fn run_task(
             }
         }
 
+        let result_label = if lgtm { "lgtm" } else { "fixed" };
         mutate_and_persist(store, task_id, |s| {
-            let result_label = if lgtm { "lgtm" } else { "fixed" };
             s.rounds.push(RoundResult {
                 turn: round,
                 action: "review".into(),
@@ -1570,6 +1579,14 @@ pub(crate) async fn run_task(
             });
         })
         .await?;
+
+        // Emit RoundCompleted for crash recovery.
+        store.log_event(crate::event_replay::TaskEvent::RoundCompleted {
+            task_id: task_id.0.clone(),
+            ts: crate::event_replay::now_ts(),
+            round,
+            result: result_label.to_string(),
+        });
 
         // Log pr_review event for observability and GC signal detection.
         let mut ev = Event::new(

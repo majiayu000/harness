@@ -15,6 +15,7 @@ pub mod complexity_router;
 pub mod contract_validator;
 pub mod dashboard;
 pub mod db;
+pub mod event_replay;
 pub mod handlers;
 pub mod hook_enforcer;
 pub mod http;
