@@ -136,8 +136,9 @@ fn parse_transition_line(
     u64,
     f64,
 )> {
-    // Split at ": " to get skill name and remainder
-    let (name, rest) = line.split_once(": ")?;
+    // Split at the last ": " to get skill name and remainder; rsplit handles skill
+    // names that themselves contain ": " (e.g. "category: my-skill").
+    let (name, rest) = line.rsplit_once(": ")?;
     // rest: "OldStatus -> NewStatus (score=X, samples=Y, canary=Z)"
     let (statuses, params) = rest.split_once(" (")?;
     let params = params.strip_suffix(')')?;
@@ -247,9 +248,8 @@ pub async fn skill_governance_history(
         }
     }
 
-    // Events are already returned in ascending ts order by the store; sort within each event
-    // is not needed since all transitions from one event share the same tick_ts.
-    transitions.sort_by_key(|t| t.tick_ts);
+    // Events are returned in ascending ts order by the store; transitions are collected
+    // in that same order, so the vector is already sorted — no explicit sort needed.
 
     match serde_json::to_value(&transitions) {
         Ok(v) => RpcResponse::success(id, v),
