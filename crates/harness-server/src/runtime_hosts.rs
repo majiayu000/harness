@@ -185,11 +185,18 @@ impl RuntimeHostManager {
     /// cross-check each task ID against the `leases` map and filter by `expires_at`.
     pub fn active_lease_count(&self, host_id: &str) -> usize {
         let now = Utc::now();
-        self.host_leases.get(host_id).map_or(0, |set| {
-            set.iter()
-                .filter(|task_id| self.leases.get(task_id).is_some_and(|l| l.expires_at > now))
-                .count()
-        })
+        // Collect task IDs into a Vec before dropping the host_leases shard lock.
+        // Holding a host_leases Ref while acquiring leases shard locks would
+        // invert the lock order used in claim_task_id (leases → host_leases),
+        // risking deadlock under concurrent dashboard + claim calls.
+        let task_ids: Vec<TaskId> = self
+            .host_leases
+            .get(host_id)
+            .map_or_else(Vec::new, |set| set.iter().cloned().collect());
+        task_ids
+            .iter()
+            .filter(|task_id| self.leases.get(task_id).is_some_and(|l| l.expires_at > now))
+            .count()
     }
 
     pub fn claim_task(
