@@ -112,6 +112,8 @@ pub enum Method {
         until: Option<chrono::DateTime<chrono::Utc>>,
         limit: Option<usize>,
     },
+    /// Return all skills classified as Dormant or Stale, sorted by staleness.
+    SkillStale,
 
     // === Rule engine ===
     RuleLoad {
@@ -338,6 +340,7 @@ impl Method {
             Self::CrossReview { .. } => "cross_review",
             Self::SkillGovernanceView { .. } => "skill/governance/view",
             Self::SkillGovernanceHistory { .. } => "skill/governance/history",
+            Self::SkillStale => "skill/stale",
         }
     }
 }

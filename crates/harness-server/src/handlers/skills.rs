@@ -1,6 +1,7 @@
 use crate::http::AppState;
 use harness_core::types::{EventFilters, SkillId};
 use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR, methods::NOT_FOUND};
+use harness_skills::freshness::FreshnessClass;
 use harness_skills::store::SkillGovernanceStatus;
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +83,7 @@ struct GovernanceView {
     scored_samples: u64,
     canary_ratio: f64,
     last_scored: Option<chrono::DateTime<chrono::Utc>>,
+    freshness: FreshnessClass,
 }
 
 pub async fn skill_governance_view(
@@ -100,6 +102,7 @@ pub async fn skill_governance_view(
                 scored_samples: skill.scored_samples,
                 canary_ratio: skill.canary_ratio,
                 last_scored: skill.last_scored,
+                freshness: skill.classify_freshness(),
             };
             match serde_json::to_value(&view) {
                 Ok(v) => RpcResponse::success(id, v),
@@ -107,6 +110,37 @@ pub async fn skill_governance_view(
             }
         }
         None => RpcResponse::error(id, NOT_FOUND, "skill not found"),
+    }
+}
+
+/// Flat projection returned by the `skill/stale` endpoint.
+#[derive(Debug, Serialize)]
+struct StaleEntry {
+    skill_id: SkillId,
+    name: String,
+    freshness: FreshnessClass,
+    last_used: Option<chrono::DateTime<chrono::Utc>>,
+    usage_count: u64,
+    scored_samples: u64,
+}
+
+pub async fn skill_stale(state: &AppState, id: Option<serde_json::Value>) -> RpcResponse {
+    let skills = state.engines.skills.read().await;
+    let entries: Vec<StaleEntry> = skills
+        .list_stale()
+        .into_iter()
+        .map(|(s, freshness)| StaleEntry {
+            skill_id: s.id.clone(),
+            name: s.name.clone(),
+            freshness,
+            last_used: s.last_used,
+            usage_count: s.usage_count,
+            scored_samples: s.scored_samples,
+        })
+        .collect();
+    match serde_json::to_value(&entries) {
+        Ok(v) => RpcResponse::success(id, v),
+        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     }
 }
 

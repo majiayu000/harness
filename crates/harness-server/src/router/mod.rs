@@ -125,6 +125,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
             until,
             limit,
         } => Some(handlers::skills::skill_governance_history(state, id, since, until, limit).await),
+        Method::SkillStale => Some(handlers::skills::skill_stale(state, id).await),
 
         // === Events / Metrics ===
         Method::EventLog { event } => Some(handlers::observe::event_log(state, id, event).await),
