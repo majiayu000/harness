@@ -129,3 +129,36 @@ fn deregister_waits_for_lease_lock_before_removing_host() {
 
     assert!(!manager.hosts.contains_key("host-a"));
 }
+
+#[test]
+fn active_lease_count_before_claim() {
+    let manager = RuntimeHostManager::with_timeouts(60, 30);
+    manager.register("host-a".to_string(), None, vec![]);
+    assert_eq!(manager.active_lease_count("host-a"), 0);
+}
+
+#[test]
+fn active_lease_count_after_claim() -> anyhow::Result<()> {
+    let manager = RuntimeHostManager::with_timeouts(60, 30);
+    manager.register("host-a".to_string(), None, vec![]);
+
+    let task_id = TaskId::new();
+    let result = manager.claim_task_id("host-a", &task_id, Some(60))?;
+    assert!(result.is_some());
+    assert_eq!(manager.active_lease_count("host-a"), 1);
+    Ok(())
+}
+
+#[test]
+fn active_lease_count_after_deregister() -> anyhow::Result<()> {
+    let manager = RuntimeHostManager::with_timeouts(60, 30);
+    manager.register("host-a".to_string(), None, vec![]);
+
+    let task_id = TaskId::new();
+    manager.claim_task_id("host-a", &task_id, Some(60))?;
+    assert_eq!(manager.active_lease_count("host-a"), 1);
+
+    manager.deregister("host-a");
+    assert_eq!(manager.active_lease_count("host-a"), 0);
+    Ok(())
+}

@@ -178,6 +178,11 @@ impl RuntimeHostManager {
         hosts
     }
 
+    /// Return the number of active leases currently held by `host_id`.
+    pub fn active_lease_count(&self, host_id: &str) -> usize {
+        self.host_leases.get(host_id).map_or(0, |set| set.len())
+    }
+
     pub fn claim_task(
         &self,
         host_id: &str,

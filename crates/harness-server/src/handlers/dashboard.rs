@@ -12,11 +12,11 @@ pub(crate) static SERVER_START: std::sync::OnceLock<std::time::Instant> =
 
 /// GET /api/dashboard — JSON summary of all registered projects and global concurrency.
 ///
-/// Per-project entries include only live queue stats (running/queued) because
-/// `TaskState` carries no `project_root` field, making per-project historical
-/// counts (done/failed) and per-project PR/grade unavailable without a schema
-/// change. Global metrics (done, failed, latest_pr, grade, uptime) are reported
-/// in the top-level `global` object where they accurately reflect all tasks.
+/// Per-project entries include live queue stats (running/queued) plus historical
+/// done/failed counts from the in-memory cache (keyed by `TaskState.project_root`)
+/// and the latest PR URL for the project. Per-host entries include active lease
+/// count and assignment pressure (active_leases / max(watched_projects, 1)).
+/// Global metrics (done, failed, latest_pr, grade, uptime) aggregate all tasks.
 pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
     let start = SERVER_START.get_or_init(std::time::Instant::now);
     let uptime_secs = start.elapsed().as_secs();
@@ -68,9 +68,10 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         }
     };
 
+    // Per-project done/failed counts from in-memory cache (keyed by project_root path).
+    let project_counts = state.core.tasks.count_by_project();
+
     // Build per-project entries from the registry.
-    // Only live queue stats are included; done/failed/latest_pr/grade are not
-    // available per-project (TaskState has no project_root field).
     let projects: Vec<Value> = match state.core.project_registry.as_ref() {
         None => vec![],
         Some(registry) => match registry.list().await {
@@ -78,22 +79,30 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                 tracing::warn!("dashboard: failed to list projects: {e}");
                 vec![]
             }
-            Ok(projects) => projects
-                .into_iter()
-                .map(|p| {
+            Ok(projects) => {
+                let mut entries = Vec::with_capacity(projects.len());
+                for p in projects {
                     // Task queue keys are canonical project root paths as strings.
                     let key = p.root.to_string_lossy().into_owned();
                     let qs = tq.project_stats(&key);
-                    json!({
+                    let counts = project_counts.get(&key);
+                    let done = counts.map_or(0, |c| c.done);
+                    let failed = counts.map_or(0, |c| c.failed);
+                    let latest_pr = state.core.tasks.latest_done_pr_url_by_project(&key).await;
+                    entries.push(json!({
                         "id": p.id,
                         "root": p.root,
                         "tasks": {
                             "running": qs.running,
                             "queued": qs.queued,
+                            "done": done,
+                            "failed": failed,
                         },
-                    })
-                })
-                .collect(),
+                        "latest_pr": latest_pr,
+                    }));
+                }
+                entries
+            }
         },
     };
 
@@ -107,6 +116,9 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                 .get_host_cache(&host.id)
                 .map(|snapshot| snapshot.project_count)
                 .unwrap_or(0);
+            let active_leases = state.runtime_hosts.active_lease_count(&host.id);
+            let assignment_pressure =
+                (active_leases as f64 / watched_projects.max(1) as f64).min(1.0);
             json!({
                 "id": host.id,
                 "display_name": host.display_name,
@@ -114,6 +126,8 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                 "online": host.online,
                 "last_heartbeat_at": host.last_heartbeat_at,
                 "watched_projects": watched_projects,
+                "active_leases": active_leases,
+                "assignment_pressure": assignment_pressure,
             })
         })
         .collect();
@@ -234,6 +248,48 @@ mod tests {
             "uptime_secs must be a number"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dashboard_host_assignment_pressure_zero_when_idle() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-dashboard-")?;
+        let state = make_test_state(dir.path()).await?;
+
+        // Register a host with no leases.
+        state
+            .runtime_hosts
+            .register("idle-host".to_string(), None, vec![]);
+
+        let state = Arc::new(state);
+        let app = Router::new()
+            .route("/api/dashboard", get(dashboard))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/api/dashboard")
+            .body(axum::body::Body::empty())?;
+
+        let resp = tower::ServiceExt::oneshot(app, req).await?;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+        let hosts = body["runtime_hosts"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("runtime_hosts must be an array"))?;
+        let host = hosts
+            .iter()
+            .find(|h| h["id"] == "idle-host")
+            .ok_or_else(|| anyhow::anyhow!("idle-host not found in runtime_hosts"))?;
+        assert_eq!(
+            host["active_leases"], 0,
+            "idle host must have 0 active_leases"
+        );
+        assert_eq!(
+            host["assignment_pressure"], 0.0,
+            "idle host must have 0.0 assignment_pressure"
+        );
         Ok(())
     }
 }

@@ -441,6 +441,22 @@ impl TaskDb {
         Ok(row.and_then(|(pr_url,)| pr_url))
     }
 
+    /// Return the `pr_url` of the most recent Done task for the given project root path.
+    pub async fn latest_done_pr_url_by_project(
+        &self,
+        project: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT pr_url FROM tasks \
+             WHERE status = 'done' AND pr_url IS NOT NULL AND project = ?1 \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(project)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(pr_url,)| pr_url))
+    }
+
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
