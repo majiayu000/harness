@@ -262,7 +262,7 @@ pub async fn turn_steer(
                 .core
                 .server
                 .thread_manager
-                .steer_active_turn(&turn_id, instruction)
+                .steer_active_turn(&thread_id, &turn_id, instruction)
                 .await
             {
                 Ok(()) => {

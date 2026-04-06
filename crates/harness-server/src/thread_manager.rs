@@ -389,41 +389,39 @@ impl ThreadManager {
     /// Append a steering instruction to the turn's item list, then forward the
     /// instruction to the live adapter if one is registered for this turn.
     ///
-    /// Adapter errors are logged and swallowed — state mutation is authoritative.
-    /// Returns `Err` when the turn is not in Running state.
+    /// Adapter errors are propagated to the caller. State mutation only occurs
+    /// after a successful adapter call. Returns `Err` when the turn is not in
+    /// Running state or when no active adapter is registered.
     pub async fn steer_active_turn(
         &self,
+        thread_id: &ThreadId,
         turn_id: &TurnId,
         instruction: String,
     ) -> harness_core::error::Result<()> {
-        // Find thread for state mutation.
-        let thread_id = match self.find_thread_for_turn(turn_id) {
-            Some(id) => id,
-            None => return Ok(()), // Turn not found in any thread.
-        };
-
         // Only append steering instructions to running turns.
-        if !self.is_turn_running(&thread_id, turn_id) {
+        if !self.is_turn_running(thread_id, turn_id) {
             return Err(harness_core::error::HarnessError::Unsupported(format!(
                 "turn {turn_id} is not in Running state"
             )));
         }
-
-        // Persist instruction in thread state regardless of adapter status.
-        self.steer_turn(&thread_id, turn_id, instruction.clone())?;
 
         // Clone Arc out of DashMap before async call to avoid holding the ref.
         let adapter = self
             .running_adapters
             .get(turn_id.as_str())
             .map(|r| r.value().clone());
-        if let Some(adapter) = adapter {
-            if let Err(e) = adapter.steer(instruction).await {
-                tracing::warn!(turn_id = %turn_id, "adapter steer failed: {e}");
-            }
-        }
 
-        Ok(())
+        match adapter {
+            Some(adapter) => {
+                // Call adapter first; only mutate state on success.
+                adapter.steer(instruction.clone()).await?;
+                self.steer_turn(thread_id, turn_id, instruction)?;
+                Ok(())
+            }
+            None => Err(harness_core::error::HarnessError::Unsupported(format!(
+                "no active adapter registered for turn {turn_id}"
+            ))),
+        }
     }
 
     /// Update the `approved` field of an `ApprovalRequest` item in the turn,

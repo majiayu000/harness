@@ -548,7 +548,7 @@ async fn steer_active_turn_delegates_to_registered_adapter() -> anyhow::Result<(
         }),
     );
 
-    tm.steer_active_turn(&turn_id, "redirect".to_string())
+    tm.steer_active_turn(&thread_id, &turn_id, "redirect".to_string())
         .await?;
     assert!(
         called.load(Ordering::SeqCst),
@@ -563,8 +563,10 @@ async fn steer_active_turn_no_adapter_returns_ok() -> anyhow::Result<()> {
     let thread_id = tm.start_thread(PathBuf::from("/tmp"));
     let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
     // No adapter registered.
-    let result = tm.steer_active_turn(&turn_id, "steer".to_string()).await;
-    assert!(result.is_ok(), "steer with no adapter must return Ok");
+    let result = tm
+        .steer_active_turn(&thread_id, &turn_id, "steer".to_string())
+        .await;
+    assert!(result.is_err(), "steer with no adapter must return Err");
     Ok(())
 }
 
@@ -601,7 +603,13 @@ async fn steer_active_turn_after_deregister_is_noop() -> anyhow::Result<()> {
     );
     tm.deregister_active_adapter(&turn_id);
 
-    tm.steer_active_turn(&turn_id, "steer".to_string()).await?;
+    let result = tm
+        .steer_active_turn(&thread_id, &turn_id, "steer".to_string())
+        .await;
+    assert!(
+        result.is_err(),
+        "steer after deregister must return Err (no active adapter)"
+    );
     assert!(
         !called.load(Ordering::SeqCst),
         "adapter must not be called after deregister"
