@@ -11,11 +11,16 @@ pub async fn skill_create(
     content: String,
 ) -> RpcResponse {
     // Reject names that could traverse outside the skills directory when used as a filename.
-    if name.contains('/') || name.contains('\\') || name.contains("..") || name.is_empty() {
+    if name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.is_empty()
+        || name.chars().any(|c| c.is_control())
+    {
         return RpcResponse::error(
             id,
             INTERNAL_ERROR,
-            "skill name must not contain path separators or '..'",
+            "skill name must not contain path separators, '..', or control characters",
         );
     }
     let mut skills = state.engines.skills.write().await;
