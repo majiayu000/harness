@@ -287,11 +287,21 @@ pub async fn turn_respond_approval(
         .core
         .server
         .thread_manager
-        .respond_approval_on_turn(&turn_id, request_id, decision)
-        .await
+        .find_thread_for_turn(&turn_id)
     {
-        Ok(()) => RpcResponse::success(id, serde_json::json!({ "responded": true })),
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Some(_thread_id) => {
+            match state
+                .core
+                .server
+                .thread_manager
+                .respond_approval_on_turn(&turn_id, request_id, decision)
+                .await
+            {
+                Ok(()) => RpcResponse::success(id, serde_json::json!({ "responded": true })),
+                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+            }
+        }
+        None => RpcResponse::error(id, NOT_FOUND, "turn not found in any thread"),
     }
 }
 
