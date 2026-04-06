@@ -694,33 +694,6 @@ impl TaskStore {
             .collect()
     }
 
-    /// Return per-project done/failed counts derived from the in-memory cache.
-    ///
-    /// Tasks with `project_root: None` are excluded — they contribute only to
-    /// global counts (already tracked in the handler). The map key is the
-    /// canonical project root path as a string (matching `TaskQueue` project keys).
-    pub fn count_by_project(&self) -> HashMap<String, ProjectCounts> {
-        let mut map: HashMap<String, ProjectCounts> = HashMap::new();
-        for entry in self.cache.iter() {
-            let task = entry.value();
-            let Some(root) = &task.project_root else {
-                continue;
-            };
-            let key_cow = root.to_string_lossy();
-            let counts = if let Some(c) = map.get_mut(key_cow.as_ref()) {
-                c
-            } else {
-                map.entry(key_cow.into_owned()).or_default()
-            };
-            match task.status {
-                TaskStatus::Done => counts.done += 1,
-                TaskStatus::Failed => counts.failed += 1,
-                _ => {}
-            }
-        }
-        map
-    }
-
     /// Compute global and per-project done/failed counts in a single cache pass
     /// without cloning any `TaskState`. Replaces the combination of `list_all()`
     /// (which clones every task including `rounds` history) and `count_by_project()`.
@@ -2563,7 +2536,7 @@ mod tests {
     async fn count_by_project_empty() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
-        assert!(store.count_by_project().is_empty());
+        assert!(store.count_for_dashboard().by_project.is_empty());
         Ok(())
     }
 
@@ -2578,7 +2551,7 @@ mod tests {
         store.insert(&task).await;
 
         assert!(
-            store.count_by_project().is_empty(),
+            store.count_for_dashboard().by_project.is_empty(),
             "tasks with no project_root must not appear in per-project counts"
         );
         Ok(())
@@ -2606,7 +2579,7 @@ mod tests {
             store.insert(&task).await;
         }
 
-        let counts = store.count_by_project();
+        let counts = store.count_for_dashboard().by_project;
         let key_a = root_a.to_string_lossy().into_owned();
         let key_b = root_b.to_string_lossy().into_owned();
 
