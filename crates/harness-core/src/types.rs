@@ -217,6 +217,8 @@ pub enum Item {
         output: Option<serde_json::Value>,
     },
     ApprovalRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         action: String,
         approved: Option<bool>,
     },

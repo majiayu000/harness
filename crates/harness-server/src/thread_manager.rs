@@ -390,7 +390,7 @@ impl ThreadManager {
     /// instruction to the live adapter if one is registered for this turn.
     ///
     /// Adapter errors are logged and swallowed — state mutation is authoritative.
-    /// Returns `Ok(())` when no adapter is registered (turn may have just completed).
+    /// Returns `Err` when the turn is not in Running state.
     pub async fn steer_active_turn(
         &self,
         turn_id: &TurnId,
@@ -399,8 +399,15 @@ impl ThreadManager {
         // Find thread for state mutation.
         let thread_id = match self.find_thread_for_turn(turn_id) {
             Some(id) => id,
-            None => return Ok(()), // Turn not found — may have completed.
+            None => return Ok(()), // Turn not found in any thread.
         };
+
+        // Only append steering instructions to running turns.
+        if !self.is_turn_running(&thread_id, turn_id) {
+            return Err(harness_core::error::HarnessError::Unsupported(format!(
+                "turn {turn_id} is not in Running state"
+            )));
+        }
 
         // Persist instruction in thread state regardless of adapter status.
         self.steer_turn(&thread_id, turn_id, instruction.clone())?;
@@ -419,7 +426,39 @@ impl ThreadManager {
         Ok(())
     }
 
-    /// Forward an approval response to the live adapter for the given turn.
+    /// Update the `approved` field of an `ApprovalRequest` item in the turn,
+    /// matching by the stored request `id`.
+    fn set_approval_status(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        request_id: &str,
+        approved: bool,
+    ) -> harness_core::error::Result<()> {
+        let mut thread = self.threads.get_mut(thread_id.as_str()).ok_or_else(|| {
+            harness_core::error::HarnessError::ThreadNotFound(thread_id.to_string())
+        })?;
+        if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
+            for item in &mut turn.items {
+                if let Item::ApprovalRequest {
+                    id: Some(id),
+                    approved: status,
+                    ..
+                } = item
+                {
+                    if id == request_id {
+                        *status = Some(approved);
+                        break;
+                    }
+                }
+            }
+        }
+        thread.updated_at = chrono::Utc::now();
+        Ok(())
+    }
+
+    /// Forward an approval response to the live adapter for the given turn
+    /// and update the corresponding `ApprovalRequest` item in thread state.
     ///
     /// Returns `Err` when no adapter is registered or when the adapter rejects
     /// the call (e.g. `Unsupported` for Claude-backed turns).
@@ -434,7 +473,24 @@ impl ThreadManager {
             .get(turn_id.as_str())
             .map(|r| r.value().clone());
         match adapter {
-            Some(adapter) => adapter.respond_approval(request_id, decision).await,
+            Some(adapter) => {
+                adapter
+                    .respond_approval(request_id.clone(), decision.clone())
+                    .await?;
+                // Update thread state to reflect the decision.
+                if let Some(thread_id) = self.find_thread_for_turn(turn_id) {
+                    let approved = matches!(decision, ApprovalDecision::Accept);
+                    if let Err(e) =
+                        self.set_approval_status(&thread_id, turn_id, &request_id, approved)
+                    {
+                        tracing::warn!(
+                            turn_id = %turn_id,
+                            "failed to update approval status in thread state: {e}"
+                        );
+                    }
+                }
+                Ok(())
+            }
             None => Err(harness_core::error::HarnessError::Unsupported(format!(
                 "no active adapter registered for turn {turn_id}"
             ))),

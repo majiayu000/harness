@@ -280,6 +280,7 @@ pub(crate) async fn process_stream_item(
                 thread_id,
                 turn_id,
                 harness_core::types::Item::ApprovalRequest {
+                    id: Some(id.clone()),
                     action: command.clone(),
                     approved: None,
                 },

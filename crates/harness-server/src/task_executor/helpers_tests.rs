@@ -578,6 +578,7 @@ async fn process_stream_item_approval_request_appends_item_and_emits_notificatio
             harness_core::types::Item::ApprovalRequest {
                 action,
                 approved: None,
+                ..
             } if action == "rm -rf /tmp/test"
         )
     });
