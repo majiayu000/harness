@@ -4,6 +4,7 @@ use harness_core::db::{open_pool, Migration, Migrator};
 use harness_core::error::TaskDbDecodeError;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePool;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Maximum artifact content size in bytes before truncation.
@@ -455,6 +456,24 @@ impl TaskDb {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.and_then(|(pr_url,)| pr_url))
+    }
+
+    /// Return the latest done PR URL for every project that has one, in a single query.
+    /// The map key is the project root path string; the value is the PR URL.
+    pub async fn latest_done_pr_urls_all_projects(
+        &self,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT project, pr_url FROM (\
+               SELECT project, pr_url, \
+                      ROW_NUMBER() OVER (PARTITION BY project ORDER BY updated_at DESC) AS rn \
+               FROM tasks \
+               WHERE status = 'done' AND pr_url IS NOT NULL AND project IS NOT NULL\
+             ) WHERE rn = 1",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Return all tasks whose `parent_id` matches the given parent task ID.

@@ -650,6 +650,18 @@ impl TaskStore {
         }
     }
 
+    /// Fetch the latest done PR URL for every project in a single DB query.
+    /// Returns a map from project root path string to PR URL.
+    pub async fn latest_done_pr_urls_all_projects(&self) -> HashMap<String, String> {
+        match self.db.latest_done_pr_urls_all_projects().await {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!("failed to bulk-query latest done PR URLs: {e}");
+                HashMap::new()
+            }
+        }
+    }
+
     /// Return all active (Pending or Implementing) tasks on the same project, excluding `exclude_id`.
     ///
     /// Used by `run_task` to build sibling-awareness context before starting implementation,
@@ -686,8 +698,12 @@ impl TaskStore {
             let Some(root) = &task.project_root else {
                 continue;
             };
-            let key = root.to_string_lossy().into_owned();
-            let counts = map.entry(key).or_default();
+            let key_cow = root.to_string_lossy();
+            let counts = if let Some(c) = map.get_mut(key_cow.as_ref()) {
+                c
+            } else {
+                map.entry(key_cow.into_owned()).or_default()
+            };
             match task.status {
                 TaskStatus::Done => counts.done += 1,
                 TaskStatus::Failed => counts.failed += 1,

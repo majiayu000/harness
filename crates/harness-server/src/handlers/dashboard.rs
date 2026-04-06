@@ -71,6 +71,9 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     // Per-project done/failed counts from in-memory cache (keyed by project_root path).
     let project_counts = state.core.tasks.count_by_project();
 
+    // Fetch latest PR URLs for all projects in one bulk query to avoid N+1.
+    let project_pr_urls = state.core.tasks.latest_done_pr_urls_all_projects().await;
+
     // Build per-project entries from the registry.
     let projects: Vec<Value> = match state.core.project_registry.as_ref() {
         None => vec![],
@@ -88,7 +91,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                     let counts = project_counts.get(&key);
                     let done = counts.map_or(0, |c| c.done);
                     let failed = counts.map_or(0, |c| c.failed);
-                    let latest_pr = state.core.tasks.latest_done_pr_url_by_project(&key).await;
+                    let latest_pr = project_pr_urls.get(&key);
                     entries.push(json!({
                         "id": p.id,
                         "root": p.root,
