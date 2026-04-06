@@ -172,13 +172,11 @@ fn parse_transition_line(
 }
 
 fn parse_governance_status(s: &str) -> Option<SkillGovernanceStatus> {
-    match s {
-        "Active" => Some(SkillGovernanceStatus::Active),
-        "Watch" => Some(SkillGovernanceStatus::Watch),
-        "Quarantine" => Some(SkillGovernanceStatus::Quarantine),
-        "Retired" => Some(SkillGovernanceStatus::Retired),
-        _ => None,
-    }
+    // The governor formats status via {:?} (PascalCase, e.g. "Active").
+    // The enum uses #[serde(rename_all = "snake_case")], so lowercasing lets us
+    // reuse the existing Deserialize impl — new variants are handled automatically.
+    let json_str = format!("\"{}\"", s.to_ascii_lowercase());
+    serde_json::from_str(&json_str).ok()
 }
 
 pub async fn skill_governance_history(
@@ -198,7 +196,9 @@ pub async fn skill_governance_history(
             include_content: true,
             since,
             until,
-            limit,
+            // Do not forward `limit` to the event query: a single event can contain
+            // multiple transitions, so capping events does not cap transitions correctly.
+            // We apply the limit to the transitions vector after collection instead.
             ..EventFilters::default()
         })
         .await
@@ -248,8 +248,12 @@ pub async fn skill_governance_history(
         }
     }
 
-    // Events are returned in ascending ts order by the store; transitions are collected
-    // in that same order, so the vector is already sorted — no explicit sort needed.
+    // Events come from the store in ascending ts order. Reverse so that the most
+    // recent transitions appear first, then honour the caller's limit.
+    transitions.reverse();
+    if let Some(n) = limit {
+        transitions.truncate(n);
+    }
 
     match serde_json::to_value(&transitions) {
         Ok(v) => RpcResponse::success(id, v),
@@ -424,8 +428,10 @@ mod tests {
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
         let result = resp.result.expect("result should be present");
         let arr = result.as_array().expect("result should be array");
-        // limit=3 means at most 3 tick events are fetched, each with 1 transition
+        // limit=3 caps the transitions vector; 5 events × 1 transition → 3 returned
         assert_eq!(arr.len(), 3);
+        // most recent first: skill-4 was inserted last
+        assert_eq!(arr[0]["skill_name"], "skill-4");
         Ok(())
     }
 }
