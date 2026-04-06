@@ -195,6 +195,16 @@ pub(crate) async fn run_turn_lifecycle(
         return;
     };
 
+    // Register adapter for this turn if one is configured for this agent name.
+    // Enables turn/steer and turn/respond_approval to reach the live process.
+    // Gracefully no-ops when no adapter is registered (adapter_registry is empty by default).
+    let adapter = server.adapter_registry.get(&agent_name);
+    if let Some(ref adapter_arc) = adapter {
+        server
+            .thread_manager
+            .register_active_adapter(&turn_id, adapter_arc.clone());
+    }
+
     let req = AgentRequest {
         prompt,
         project_root,
@@ -299,6 +309,9 @@ pub(crate) async fn run_turn_lifecycle(
             .await;
         }
     }
+
+    // Deregister the adapter now that the turn has completed or failed.
+    server.thread_manager.deregister_active_adapter(&turn_id);
 }
 
 /// Compute exponential backoff: `min(base_ms * 2^(attempt-1), max_ms)`.

@@ -98,6 +98,13 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
             turn_id,
             instruction,
         } => Some(handlers::thread::turn_steer(state, id, turn_id, instruction).await),
+        Method::TurnRespondApproval {
+            turn_id,
+            request_id,
+            decision,
+        } => Some(
+            handlers::thread::turn_respond_approval(state, id, turn_id, request_id, decision).await,
+        ),
 
         // === Skills ===
         Method::SkillCreate { name, content } => {

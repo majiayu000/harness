@@ -93,6 +93,7 @@ pub enum StreamItem {
     ItemCompleted { item: Item },
     TokenUsage { usage: TokenUsage },
     Error { message: String },
+    ApprovalRequest { id: String, command: String },
     Done,
 }
 

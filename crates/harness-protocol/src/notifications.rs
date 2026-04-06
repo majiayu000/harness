@@ -32,6 +32,12 @@ pub enum Notification {
         thread_id: ThreadId,
         status: ThreadStatus,
     },
+    #[serde(rename = "turn/approval_request")]
+    ApprovalRequest {
+        turn_id: TurnId,
+        request_id: String,
+        command: String,
+    },
 }
 
 /// Notification envelope (no id field per JSON-RPC 2.0 spec).

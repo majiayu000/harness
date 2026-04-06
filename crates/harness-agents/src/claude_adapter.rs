@@ -159,6 +159,32 @@ impl AgentAdapter for ClaudeAdapter {
         }
         Ok(())
     }
+
+    async fn steer(&self, _text: String) -> harness_core::error::Result<()> {
+        // Claude CLI is a one-shot process launched with `-p`.  It has no open
+        // stdin channel for mid-turn injection, so live steering is not possible
+        // without process restart.  Future interactive-mode support would require
+        // a different spawning strategy.
+        Err(harness_core::error::HarnessError::Unsupported(
+            "Claude CLI does not support live steering: it is a one-shot process \
+             launched with -p and has no stdin channel for mid-turn injection"
+                .into(),
+        ))
+    }
+
+    async fn respond_approval(
+        &self,
+        _id: String,
+        _decision: harness_core::agent::ApprovalDecision,
+    ) -> harness_core::error::Result<()> {
+        // Claude CLI runs with --dangerously-skip-permissions and auto-approves
+        // all tool calls.  There is no approval gate protocol to respond to.
+        Err(harness_core::error::HarnessError::Unsupported(
+            "Claude CLI does not support approval responses: it runs with \
+             --dangerously-skip-permissions and cannot receive mid-turn input"
+                .into(),
+        ))
+    }
 }
 
 /// Parse a single line of Claude Code `--output-format stream-json` output.
@@ -286,22 +312,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn steer_returns_unsupported() {
+    async fn steer_returns_unsupported_with_claude_cli_message() {
         let adapter = ClaudeAdapter::new(PathBuf::from("claude"), "test-model".into());
         let err = adapter
             .steer("redirect".into())
             .await
             .expect_err("steer should return Unsupported");
-        assert!(err.to_string().contains("unsupported"));
+        assert!(
+            err.to_string().contains("Claude CLI does not support"),
+            "error must name the Claude CLI limitation, got: {err}"
+        );
     }
 
     #[tokio::test]
-    async fn respond_approval_returns_unsupported() {
+    async fn respond_approval_returns_unsupported_with_claude_cli_message() {
         let adapter = ClaudeAdapter::new(PathBuf::from("claude"), "test-model".into());
         let err = adapter
             .respond_approval("req-1".into(), ApprovalDecision::Accept)
             .await
             .expect_err("respond_approval should return Unsupported");
-        assert!(err.to_string().contains("unsupported"));
+        assert!(
+            err.to_string().contains("Claude CLI does not support"),
+            "error must name the Claude CLI limitation, got: {err}"
+        );
     }
 }

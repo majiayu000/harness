@@ -66,6 +66,11 @@ pub enum Method {
     TurnStatus {
         turn_id: TurnId,
     },
+    TurnRespondApproval {
+        turn_id: TurnId,
+        request_id: String,
+        decision: harness_core::agent::ApprovalDecision,
+    },
 
     // === GC Agent ===
     GcRun {
@@ -294,6 +299,7 @@ impl Method {
             Self::TurnSteer { .. } => "turn/steer",
             Self::TurnCancel { .. } => "turn/cancel",
             Self::TurnStatus { .. } => "turn/status",
+            Self::TurnRespondApproval { .. } => "turn/respond_approval",
             Self::GcRun { .. } => "gc/run",
             Self::GcStatus => "gc/status",
             Self::GcDrafts { .. } => "gc/drafts",
