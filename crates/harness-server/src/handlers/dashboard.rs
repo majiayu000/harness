@@ -1,4 +1,4 @@
-use crate::{http::AppState, task_runner::TaskStatus};
+use crate::{http::AppState, task_runner::DashboardCounts};
 use axum::{extract::State, http::StatusCode, Json};
 use harness_core::types::EventFilters;
 use harness_observe::quality::QualityGrader;
@@ -23,16 +23,13 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
 
     let tq = &state.concurrency.task_queue;
 
-    // Global done/failed counts from the in-memory cache (all projects combined).
-    let all_tasks = state.core.tasks.list_all();
-    let global_done: u64 = all_tasks
-        .iter()
-        .filter(|t| matches!(t.status, TaskStatus::Done))
-        .count() as u64;
-    let global_failed: u64 = all_tasks
-        .iter()
-        .filter(|t| matches!(t.status, TaskStatus::Failed))
-        .count() as u64;
+    // Global and per-project done/failed counts from in-memory cache in one pass,
+    // avoiding both full TaskState cloning and double iteration.
+    let DashboardCounts {
+        global_done,
+        global_failed,
+        by_project: project_counts,
+    } = state.core.tasks.count_for_dashboard();
 
     // Most recent completed task with a PR URL, queried from the DB which is
     // ordered by updated_at DESC — reflects completion time, not creation time.
@@ -67,9 +64,6 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
             None
         }
     };
-
-    // Per-project done/failed counts from in-memory cache (keyed by project_root path).
-    let project_counts = state.core.tasks.count_by_project();
 
     // Fetch latest PR URLs for all projects in one bulk query to avoid N+1.
     let project_pr_urls = state.core.tasks.latest_done_pr_urls_all_projects().await;

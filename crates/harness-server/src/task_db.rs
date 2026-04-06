@@ -85,6 +85,12 @@ static TASK_MIGRATIONS: &[Migration] = &[
             updated_at    TEXT NOT NULL
         )",
     },
+    Migration {
+        version: 10,
+        description: "add index on tasks(project, status, updated_at) for dashboard queries",
+        sql: "CREATE INDEX IF NOT EXISTS idx_tasks_project_status_updated \
+              ON tasks(project, status, updated_at DESC)",
+    },
 ];
 
 /// A single persisted artifact captured from agent output during task execution.

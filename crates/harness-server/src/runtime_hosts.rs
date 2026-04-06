@@ -178,9 +178,22 @@ impl RuntimeHostManager {
         hosts
     }
 
-    /// Return the number of active leases currently held by `host_id`.
+    /// Return the number of non-expired leases currently held by `host_id`.
+    ///
+    /// Expired leases are only purged from `host_leases` when `claim_task` runs, so
+    /// reading `set.len()` directly can return a stale (inflated) count. Instead,
+    /// cross-check each task ID against the `leases` map and filter by `expires_at`.
     pub fn active_lease_count(&self, host_id: &str) -> usize {
-        self.host_leases.get(host_id).map_or(0, |set| set.len())
+        let now = Utc::now();
+        self.host_leases.get(host_id).map_or(0, |set| {
+            set.iter()
+                .filter(|task_id| {
+                    self.leases
+                        .get(task_id)
+                        .map_or(false, |l| l.expires_at > now)
+                })
+                .count()
+        })
     }
 
     pub fn claim_task(

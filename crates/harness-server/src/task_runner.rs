@@ -556,6 +556,14 @@ pub struct ProjectCounts {
     pub failed: u64,
 }
 
+/// Combined global and per-project done/failed counts produced by a single
+/// cache scan, avoiding both full task cloning and double iteration.
+pub struct DashboardCounts {
+    pub global_done: u64,
+    pub global_failed: u64,
+    pub by_project: HashMap<String, ProjectCounts>,
+}
+
 pub struct TaskStore {
     pub(crate) cache: DashMap<TaskId, TaskState>,
     db: TaskDb,
@@ -711,6 +719,45 @@ impl TaskStore {
             }
         }
         map
+    }
+
+    /// Compute global and per-project done/failed counts in a single cache pass
+    /// without cloning any `TaskState`. Replaces the combination of `list_all()`
+    /// (which clones every task including `rounds` history) and `count_by_project()`.
+    pub fn count_for_dashboard(&self) -> DashboardCounts {
+        let mut global_done: u64 = 0;
+        let mut global_failed: u64 = 0;
+        let mut by_project: HashMap<String, ProjectCounts> = HashMap::new();
+        for entry in self.cache.iter() {
+            let task = entry.value();
+            let is_done = matches!(task.status, TaskStatus::Done);
+            let is_failed = matches!(task.status, TaskStatus::Failed);
+            if is_done {
+                global_done += 1;
+            } else if is_failed {
+                global_failed += 1;
+            } else {
+                continue;
+            }
+            if let Some(root) = &task.project_root {
+                let key_cow = root.to_string_lossy();
+                let counts = if let Some(c) = by_project.get_mut(key_cow.as_ref()) {
+                    c
+                } else {
+                    by_project.entry(key_cow.into_owned()).or_default()
+                };
+                if is_done {
+                    counts.done += 1;
+                } else {
+                    counts.failed += 1;
+                }
+            }
+        }
+        DashboardCounts {
+            global_done,
+            global_failed,
+            by_project,
+        }
     }
 
     /// Return all cached tasks whose `parent_id` matches the given ID.
