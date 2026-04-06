@@ -558,6 +558,7 @@ pub struct ProjectCounts {
 
 /// Combined global and per-project done/failed counts produced by a single
 /// cache scan, avoiding both full task cloning and double iteration.
+#[derive(Debug)]
 pub struct DashboardCounts {
     pub global_done: u64,
     pub global_failed: u64,
