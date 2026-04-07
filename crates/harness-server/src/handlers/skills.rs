@@ -125,19 +125,21 @@ struct StaleEntry {
 }
 
 pub async fn skill_stale(state: &AppState, id: Option<serde_json::Value>) -> RpcResponse {
-    let skills = state.engines.skills.read().await;
-    let entries: Vec<StaleEntry> = skills
-        .list_stale()
-        .into_iter()
-        .map(|(s, freshness)| StaleEntry {
-            skill_id: s.id.clone(),
-            name: s.name.clone(),
-            freshness,
-            last_used: s.last_used,
-            usage_count: s.usage_count,
-            scored_samples: s.scored_samples,
-        })
-        .collect();
+    let entries: Vec<StaleEntry> = {
+        let skills = state.engines.skills.read().await;
+        skills
+            .list_stale()
+            .into_iter()
+            .map(|(s, freshness)| StaleEntry {
+                skill_id: s.id.clone(),
+                name: s.name.clone(),
+                freshness,
+                last_used: s.last_used,
+                usage_count: s.usage_count,
+                scored_samples: s.scored_samples,
+            })
+            .collect()
+    };
     match serde_json::to_value(&entries) {
         Ok(v) => RpcResponse::success(id, v),
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),

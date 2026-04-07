@@ -40,11 +40,13 @@ impl Skill {
             return FreshnessClass::Stale;
         };
         let age = Utc::now() - last_used;
-        if age.num_days() <= FRESH_DAYS {
+        if age <= chrono::Duration::days(FRESH_DAYS) {
             FreshnessClass::Fresh
-        } else if age.num_days() <= ACTIVE_DAYS {
+        } else if age <= chrono::Duration::days(ACTIVE_DAYS) {
             FreshnessClass::Active
-        } else if age.num_days() <= DORMANT_DAYS && self.scored_samples >= MIN_SAMPLES_DORMANT {
+        } else if age <= chrono::Duration::days(DORMANT_DAYS)
+            && self.scored_samples >= MIN_SAMPLES_DORMANT
+        {
             FreshnessClass::Dormant
         } else {
             FreshnessClass::Stale
@@ -97,7 +99,10 @@ mod tests {
 
     #[test]
     fn used_7_days_ago_is_fresh_boundary_inclusive() {
-        let skill = make_skill_with(Some(days_ago(7)), 0);
+        // Use N days minus 1 second so the age is just inside the boundary even
+        // accounting for time elapsed between skill construction and the check.
+        let last_used = Utc::now() - chrono::Duration::days(7) + chrono::Duration::seconds(1);
+        let skill = make_skill_with(Some(last_used), 0);
         assert_eq!(skill.classify_freshness(), FreshnessClass::Fresh);
     }
 
@@ -109,7 +114,8 @@ mod tests {
 
     #[test]
     fn used_30_days_ago_is_active_boundary_inclusive() {
-        let skill = make_skill_with(Some(days_ago(30)), 0);
+        let last_used = Utc::now() - chrono::Duration::days(30) + chrono::Duration::seconds(1);
+        let skill = make_skill_with(Some(last_used), 0);
         assert_eq!(skill.classify_freshness(), FreshnessClass::Active);
     }
 
