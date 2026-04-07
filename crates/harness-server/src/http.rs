@@ -544,6 +544,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         &github_pollers,
         server.config.agents.review.clone(),
         Some(quality_trigger),
+        server.config.server.github_token.clone(),
     );
 
     // Validate recovered pending tasks in the background so startup is not blocked
@@ -732,6 +733,7 @@ fn build_completion_callback(
     github_pollers: &[(String, Arc<dyn crate::intake::IntakeSource>)],
     review_config: harness_core::config::agents::AgentReviewConfig,
     quality_trigger: Option<Arc<crate::quality_trigger::QualityTrigger>>,
+    config_github_token: Option<String>,
 ) -> Option<task_runner::CompletionCallback> {
     let mut sources: std::collections::HashMap<String, Arc<dyn crate::intake::IntakeSource>> =
         std::collections::HashMap::new();
@@ -757,6 +759,7 @@ fn build_completion_callback(
         let sources = sources.clone();
         let review_config = review_config.clone();
         let quality_trigger = quality_trigger.clone();
+        let github_token = config_github_token.clone();
         Box::pin(async move {
             // Grade recent events and auto-trigger GC if quality is poor.
             if let Some(qt) = quality_trigger {
@@ -770,8 +773,12 @@ fn build_completion_callback(
                         if let Some((owner, repo, pr_num)) =
                             harness_core::prompts::parse_github_pr_url(pr_url)
                         {
-                            match std::env::var("GITHUB_TOKEN") {
-                                Ok(token) if !token.is_empty() => {
+                            let resolved_token = github_token
+                                .clone()
+                                .or_else(|| std::env::var("GITHUB_TOKEN").ok())
+                                .filter(|t| !t.is_empty());
+                            match resolved_token {
+                                Some(token) => {
                                     if let Err(e) = post_review_bot_comment(
                                         &owner,
                                         &repo,

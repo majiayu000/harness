@@ -55,6 +55,12 @@ pub struct ServerConfig {
     /// Default: true.
     #[serde(default = "default_constitution_enabled")]
     pub constitution_enabled: bool,
+    /// GitHub personal access token for review bot auto-trigger.
+    ///
+    /// Used to post comments on PRs (e.g. `@gemini-code-assist review`).
+    /// Falls back to `GITHUB_TOKEN` env var when not configured.
+    #[serde(default)]
+    pub github_token: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -75,6 +81,7 @@ impl Default for ServerConfig {
             signal_rate_limit_per_minute: default_signal_rate_limit_per_minute(),
             password_reset_rate_limit_per_hour: default_password_reset_rate_limit_per_hour(),
             constitution_enabled: true,
+            github_token: None,
         }
     }
 }
