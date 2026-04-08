@@ -47,6 +47,7 @@ impl AgentAdapter for ClaudeAdapter {
             .arg("--model")
             .arg(model)
             .arg("--verbose")
+            .arg("--no-session-persistence")
             .current_dir(&req.project_root)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

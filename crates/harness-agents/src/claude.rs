@@ -67,6 +67,7 @@ impl ClaudeCodeAgent {
             OsString::from("--model"),
             OsString::from(model),
             OsString::from("--verbose"),
+            OsString::from("--no-session-persistence"),
         ];
 
         // Hard tool enforcement at the CLI boundary (issue #514):
@@ -289,6 +290,32 @@ mod tests {
         })
         .await
         .is_ok()
+    }
+
+    #[test]
+    fn base_args_always_includes_no_session_persistence() {
+        let agent = ClaudeCodeAgent::new(
+            PathBuf::from("claude"),
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
+        for (label, allowed_tools) in [
+            ("full", None),
+            (
+                "standard",
+                Some(vec!["Read".to_string(), "Bash".to_string()]),
+            ),
+        ] {
+            let req = AgentRequest {
+                allowed_tools,
+                ..AgentRequest::default()
+            };
+            let args = args_to_strings(&agent.base_args(&req));
+            assert!(
+                args.contains(&"--no-session-persistence".to_string()),
+                "--no-session-persistence must be present for {label} profile; got: {args:?}"
+            );
+        }
     }
 
     #[test]
