@@ -48,6 +48,7 @@ impl AgentAdapter for ClaudeAdapter {
             .arg(model)
             .arg("--verbose")
             .current_dir(&req.project_root)
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
@@ -57,13 +58,22 @@ impl AgentAdapter for ClaudeAdapter {
             cmd.arg("--allowedTools").arg(req.allowed_tools.join(","));
         }
 
-        cmd.arg(&req.prompt);
+        // Prompt piped via stdin — do not append as positional argument.
 
         let mut child = cmd.spawn().map_err(|e| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to spawn claude: {e}"
             ))
         })?;
+
+        // Pipe prompt via stdin to avoid argument-length issues with large prompts.
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            if let Err(e) = stdin.write_all(req.prompt.as_bytes()).await {
+                tracing::warn!("failed to write prompt to claude adapter stdin: {e}");
+            }
+            drop(stdin);
+        }
 
         let stdout = child.stdout.take().ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(

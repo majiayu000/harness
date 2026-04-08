@@ -662,6 +662,10 @@ fn in_canary_bucket(skill_id: &SkillId, prompt: &str, ratio: f64) -> bool {
 }
 
 fn persist_usage_sidecar(dir: &Path, skill_name: &str, usage: &SkillUsage) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!("failed to create usage dir {}: {e}", dir.display());
+        return;
+    }
     let path = dir.join(format!("{}.usage.json", skill_name));
     match serde_json::to_string(usage) {
         Ok(json) => {

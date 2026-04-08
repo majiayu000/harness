@@ -55,6 +55,9 @@ impl ClaudeCodeAgent {
         req.model.as_deref().unwrap_or(&self.default_model)
     }
 
+    /// Build CLI arguments for the Claude Code agent. The prompt is NOT included
+    /// in the args — callers must pipe it via stdin to avoid argument-length and
+    /// shell-escaping issues with large prompts.
     fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
         let model = self.resolve_model(req);
         let mut base_args = vec![
@@ -97,7 +100,8 @@ impl ClaudeCodeAgent {
             base_args.push(OsString::from(budget.to_string()));
         }
 
-        base_args.push(OsString::from(req.prompt.clone()));
+        // Prompt is piped via stdin — do NOT append it as a positional argument.
+        // Claude CLI `-p` reads from stdin when no positional prompt is given.
         base_args
     }
 }
@@ -114,6 +118,7 @@ impl CodeAgent for ClaudeCodeAgent {
 
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         let model = self.resolve_model(&req).to_string();
+        let prompt = req.prompt.clone();
         let base_args = self.base_args(&req);
 
         let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
@@ -134,16 +139,26 @@ impl CodeAgent for ClaudeCodeAgent {
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         crate::strip_claude_env(&mut cmd);
         cmd.envs(&req.env_vars);
 
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             harness_core::error::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
         })?;
+
+        // Pipe prompt via stdin to avoid argument-length limits with large prompts.
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                tracing::warn!("failed to write prompt to claude stdin: {e}");
+            }
+            drop(stdin); // Close stdin so the CLI knows input is complete.
+        }
+
         let output = child.wait_with_output().await.map_err(|e| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to wait for claude: {e}"
@@ -188,6 +203,7 @@ impl CodeAgent for ClaudeCodeAgent {
         req: AgentRequest,
         tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
+        let prompt = req.prompt.clone();
         let base_args = self.base_args(&req);
         let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
         let wrapped_command =
@@ -200,7 +216,7 @@ impl CodeAgent for ClaudeCodeAgent {
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -212,6 +228,15 @@ impl CodeAgent for ClaudeCodeAgent {
                 "failed to run claude: {error}"
             ))
         })?;
+
+        // Pipe prompt via stdin to avoid argument-length limits with large prompts.
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                tracing::warn!("failed to write prompt to claude stdin: {e}");
+            }
+            drop(stdin);
+        }
 
         if let Some(stderr) = child.stderr.take() {
             let agent = self.name().to_string();
