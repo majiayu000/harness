@@ -66,44 +66,51 @@ pub struct ServerConfig {
 
 impl fmt::Debug for ServerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Exhaustive destructure: compiler error if a new field is added but omitted here.
+        let Self {
+            transport,
+            http_addr,
+            data_dir,
+            project_root,
+            github_webhook_secret,
+            notification_broadcast_capacity,
+            notification_lag_log_every,
+            ws_heartbeat_interval_secs,
+            trusted_proxies,
+            api_token,
+            allowed_project_roots,
+            max_webhook_body_bytes,
+            signal_rate_limit_per_minute,
+            password_reset_rate_limit_per_hour,
+            constitution_enabled,
+            github_token,
+        } = self;
         f.debug_struct("ServerConfig")
-            .field("transport", &self.transport)
-            .field("http_addr", &self.http_addr)
-            .field("data_dir", &self.data_dir)
-            .field("project_root", &self.project_root)
+            .field("transport", transport)
+            .field("http_addr", http_addr)
+            .field("data_dir", data_dir)
+            .field("project_root", project_root)
             .field(
                 "github_webhook_secret",
-                &self.github_webhook_secret.as_ref().map(|_| "[REDACTED]"),
+                &github_webhook_secret.as_ref().map(|_| "[REDACTED]"),
             )
             .field(
                 "notification_broadcast_capacity",
-                &self.notification_broadcast_capacity,
+                notification_broadcast_capacity,
             )
-            .field(
-                "notification_lag_log_every",
-                &self.notification_lag_log_every,
-            )
-            .field(
-                "ws_heartbeat_interval_secs",
-                &self.ws_heartbeat_interval_secs,
-            )
-            .field("trusted_proxies", &self.trusted_proxies)
-            .field("api_token", &self.api_token.as_ref().map(|_| "[REDACTED]"))
-            .field("allowed_project_roots", &self.allowed_project_roots)
-            .field("max_webhook_body_bytes", &self.max_webhook_body_bytes)
-            .field(
-                "signal_rate_limit_per_minute",
-                &self.signal_rate_limit_per_minute,
-            )
+            .field("notification_lag_log_every", notification_lag_log_every)
+            .field("ws_heartbeat_interval_secs", ws_heartbeat_interval_secs)
+            .field("trusted_proxies", trusted_proxies)
+            .field("api_token", &api_token.as_ref().map(|_| "[REDACTED]"))
+            .field("allowed_project_roots", allowed_project_roots)
+            .field("max_webhook_body_bytes", max_webhook_body_bytes)
+            .field("signal_rate_limit_per_minute", signal_rate_limit_per_minute)
             .field(
                 "password_reset_rate_limit_per_hour",
-                &self.password_reset_rate_limit_per_hour,
+                password_reset_rate_limit_per_hour,
             )
-            .field("constitution_enabled", &self.constitution_enabled)
-            .field(
-                "github_token",
-                &self.github_token.as_ref().map(|_| "[REDACTED]"),
-            )
+            .field("constitution_enabled", constitution_enabled)
+            .field("github_token", &github_token.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
 }
