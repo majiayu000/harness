@@ -457,6 +457,31 @@ async fn run_review_tick(
                                             finding.description,
                                             finding.action
                                         );
+                                        // Claim before enqueue: atomically mark this
+                                        // finding as "pending" so concurrent pollers
+                                        // see task_id IS NOT NULL and skip it.  Only
+                                        // if the claim succeeds do we enqueue a task,
+                                        // preventing orphaned tasks on race loss.
+                                        match rs
+                                            .try_claim_finding(&finding.rule_id, &finding.file)
+                                            .await
+                                        {
+                                            Ok(false) => {
+                                                tracing::debug!(
+                                                    finding_id = %finding.id,
+                                                    "scheduler: finding already claimed by concurrent poller, skipping"
+                                                );
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    finding_id = %finding.id,
+                                                    "scheduler: failed to claim finding: {e}"
+                                                );
+                                                continue;
+                                            }
+                                            Ok(true) => {} // won the claim
+                                        }
                                         let req = CreateTaskRequest {
                                             prompt: Some(prompt),
                                             source: Some("auto-fix".into()),
@@ -467,37 +492,39 @@ async fn run_review_tick(
                                         {
                                             Ok(fix_task_id) => {
                                                 match rs
-                                                    .mark_task_spawned(&finding.id, &fix_task_id.0)
+                                                    .confirm_task_spawned(
+                                                        &finding.rule_id,
+                                                        &finding.file,
+                                                        &fix_task_id.0,
+                                                    )
                                                     .await
                                                 {
-                                                    Ok(true) => {
+                                                    Ok(()) => {
                                                         tracing::info!(
                                                             finding_id = %finding.id,
                                                             task_id = %fix_task_id,
                                                             "scheduler: auto-fix task spawned"
                                                         );
                                                     }
-                                                    Ok(false) => {
-                                                        // Another concurrent poller already
-                                                        // recorded a task for this finding
-                                                        // (task_id was no longer NULL).
-                                                        // The newly enqueued task is orphaned;
-                                                        // log a warning so operators can clean up.
-                                                        tracing::warn!(
-                                                            finding_id = %finding.id,
-                                                            orphaned_task_id = %fix_task_id,
-                                                            "scheduler: finding already has a task (concurrent spawn detected), new task orphaned"
-                                                        );
-                                                    }
                                                     Err(e) => {
                                                         tracing::warn!(
                                                             finding_id = %finding.id,
-                                                            "scheduler: failed to mark task spawned: {e}"
+                                                            "scheduler: failed to confirm task spawn: {e}"
                                                         );
                                                     }
                                                 }
                                             }
                                             Err(e) => {
+                                                // Release the claim so the next cycle can retry.
+                                                if let Err(re) = rs
+                                                    .release_claim(&finding.rule_id, &finding.file)
+                                                    .await
+                                                {
+                                                    tracing::warn!(
+                                                        finding_id = %finding.id,
+                                                        "scheduler: failed to release claim after enqueue failure: {re}"
+                                                    );
+                                                }
                                                 tracing::warn!(
                                                     finding_id = %finding.id,
                                                     "scheduler: failed to spawn fix task: {e}"

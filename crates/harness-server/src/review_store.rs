@@ -236,23 +236,65 @@ impl ReviewStore {
         Ok(Self::rows_to_findings(rows))
     }
 
-    /// Record the task_id of the auto-spawned fix task for a finding.
+    /// Atomically claim a finding for auto-spawn by setting task_id to "pending".
     ///
-    /// Uses `AND task_id IS NULL` as an optimistic lock so concurrent pollers
-    /// cannot double-write: the first caller wins and subsequent callers get
-    /// `Ok(false)` without overwriting the already-recorded task.
+    /// Uses `(rule_id, file)` — the globally unique index columns — instead of
+    /// the non-globally-unique `id` field (PK is `(review_id, id)`, so two
+    /// different reviews can share the same `id` value).  Filtering by `id`
+    /// alone could stamp multiple unrelated findings with the same task_id.
     ///
     /// The `review_id` filter is intentionally absent: `persist_findings` may
-    /// reassign the finding to a newer `review_id` between `list_spawnable_findings`
-    /// and this call, which would cause 0 rows affected and leave `task_id` NULL.
-    pub async fn mark_task_spawned(&self, finding_id: &str, task_id: &str) -> anyhow::Result<bool> {
-        let result =
-            sqlx::query("UPDATE review_findings SET task_id = ? WHERE id = ? AND task_id IS NULL")
-                .bind(task_id)
-                .bind(finding_id)
-                .execute(&self.pool)
-                .await?;
+    /// reassign the finding to a newer `review_id` between
+    /// `list_spawnable_findings` and this call; the unique `(rule_id, file)`
+    /// pair is stable regardless of which review_id the row carries.
+    ///
+    /// Returns `true` if this caller won the claim, `false` if already claimed.
+    pub async fn try_claim_finding(&self, rule_id: &str, file: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE review_findings SET task_id = 'pending' \
+             WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id IS NULL",
+        )
+        .bind(rule_id)
+        .bind(file)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Confirm a pending claim by replacing the "pending" sentinel with the
+    /// real task_id after a successful enqueue.
+    pub async fn confirm_task_spawned(
+        &self,
+        rule_id: &str,
+        file: &str,
+        task_id: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE review_findings SET task_id = ? \
+             WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id = 'pending'",
+        )
+        .bind(task_id)
+        .bind(rule_id)
+        .bind(file)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Release a pending claim by resetting task_id to NULL.
+    ///
+    /// Called when task enqueue fails after a successful `try_claim_finding`,
+    /// allowing the next poll cycle to retry spawning for this finding.
+    pub async fn release_claim(&self, rule_id: &str, file: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE review_findings SET task_id = NULL \
+             WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id = 'pending'",
+        )
+        .bind(rule_id)
+        .bind(file)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     fn rows_to_findings(rows: Vec<FindingRow>) -> Vec<ReviewFinding> {
@@ -438,28 +480,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mark_task_spawned() -> anyhow::Result<()> {
+    async fn test_claim_confirm_roundtrip() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         let findings = vec![make_finding("F001", "RS-03", "src/lib.rs", "P1")];
         store.persist_findings("rev-1", &findings).await?;
 
+        // First claim wins.
         assert!(
-            store.mark_task_spawned("F001", "task-abc").await?,
-            "first call must succeed"
+            store.try_claim_finding("RS-03", "src/lib.rs").await?,
+            "first claim must succeed"
         );
-        // Second call with same finding must return false (optimistic lock).
+        // Concurrent poller claim must lose (task_id is 'pending').
         assert!(
-            !store.mark_task_spawned("F001", "task-xyz").await?,
-            "duplicate call must return false"
+            !store.try_claim_finding("RS-03", "src/lib.rs").await?,
+            "duplicate claim must return false"
         );
+        // Confirm with real task_id.
+        store
+            .confirm_task_spawned("RS-03", "src/lib.rs", "task-abc")
+            .await?;
 
         let spawnable = store
             .list_spawnable_findings("rev-1", &["P1", "P2"])
             .await?;
         assert!(
             spawnable.is_empty(),
-            "finding with task_id must not be returned"
+            "confirmed finding must not be returned"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_release_claim_allows_retry() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        let findings = vec![make_finding("F001", "RS-03", "src/lib.rs", "P1")];
+        store.persist_findings("rev-1", &findings).await?;
+
+        // Claim, then release (simulates enqueue failure).
+        assert!(store.try_claim_finding("RS-03", "src/lib.rs").await?);
+        store.release_claim("RS-03", "src/lib.rs").await?;
+
+        // Must be claimable again after release.
+        assert!(
+            store.try_claim_finding("RS-03", "src/lib.rs").await?,
+            "finding must be claimable after release"
         );
         Ok(())
     }
@@ -496,7 +562,8 @@ mod tests {
             make_finding("F2", "R2", "b.rs", "P2"),
         ];
         store.persist_findings("rev-1", &findings).await?;
-        store.mark_task_spawned("F1", "task-111").await?;
+        store.try_claim_finding("R1", "a.rs").await?;
+        store.confirm_task_spawned("R1", "a.rs", "task-111").await?;
 
         let spawnable = store
             .list_spawnable_findings("rev-1", &["P1", "P2"])
@@ -532,9 +599,12 @@ mod tests {
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         let finding = make_finding("F1", "RS-03", "src/lib.rs", "P1");
 
-        // First review: persist, spawn task.
+        // First review: persist, claim and confirm task.
         store.persist_findings("rev-1", &[finding.clone()]).await?;
-        store.mark_task_spawned("F1", "task-orig").await?;
+        store.try_claim_finding("RS-03", "src/lib.rs").await?;
+        store
+            .confirm_task_spawned("RS-03", "src/lib.rs", "task-orig")
+            .await?;
 
         // Second review: same rule_id+file triggers UPDATE (recurring finding),
         // review_id changes to rev-2 but task_id must be preserved.
@@ -554,13 +624,11 @@ mod tests {
 
     /// Regression test for the TOCTOU race: `persist_findings` changes the
     /// finding's `review_id` *after* `list_spawnable_findings` but *before*
-    /// `mark_task_spawned`.  The old code filtered by `review_id` in the UPDATE,
-    /// so 0 rows were affected and `task_id` was left NULL, allowing a duplicate
-    /// task to be spawned on the next cycle.  The fixed code filters by `id`
-    /// only, so the update succeeds regardless of which `review_id` the row now
-    /// carries.
+    /// `try_claim_finding`.  The old code filtered by `id` (non-globally-unique)
+    /// or `review_id` in the UPDATE; the fixed code filters by `(rule_id, file)`
+    /// which is stable regardless of which `review_id` the row carries.
     #[tokio::test]
-    async fn test_mark_task_spawned_survives_review_id_change() -> anyhow::Result<()> {
+    async fn test_claim_survives_review_id_change() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         let finding = make_finding("F1", "RS-03", "src/lib.rs", "P1");
@@ -568,15 +636,16 @@ mod tests {
         // Simulate: list_spawnable_findings returned F1 under rev-1.
         store.persist_findings("rev-1", &[finding.clone()]).await?;
 
-        // Simulate race: persist_findings runs with rev-2 BEFORE mark_task_spawned.
+        // Simulate race: persist_findings runs with rev-2 BEFORE try_claim_finding.
         let finding2 = make_finding("F1", "RS-03", "src/lib.rs", "P1");
         store.persist_findings("rev-2", &[finding2]).await?;
 
-        // mark_task_spawned must succeed even though the row now has review_id="rev-2".
-        let marked = store
-            .mark_task_spawned("F1", "task-from-rev1-poller")
+        // try_claim_finding must succeed even though the row now has review_id="rev-2".
+        let claimed = store.try_claim_finding("RS-03", "src/lib.rs").await?;
+        assert!(claimed, "must succeed even after review_id changed");
+        store
+            .confirm_task_spawned("RS-03", "src/lib.rs", "task-from-rev1-poller")
             .await?;
-        assert!(marked, "must succeed even after review_id changed");
 
         // F1 must no longer appear in spawnable list for rev-2.
         let spawnable = store
