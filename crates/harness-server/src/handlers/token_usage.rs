@@ -58,23 +58,42 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
     let claude_projects_dir = home.join(".claude").join("projects");
 
     // When --no-session-persistence is active, Claude Code does not write
-    // session JSONL files to disk. Distinguish two absence cases:
+    // session JSONL files to disk. Distinguish three cases:
     //
-    //   1. Projects directory absent entirely — potentially a misconfiguration
+    //   1. Projects directory absent (NotFound) — potentially a misconfiguration
     //      (wrong $HOME, deleted directory, path regression). Emit a warning
     //      so operators can detect it in logs, and include a diagnostic field
     //      in the response so callers can distinguish from genuine empty usage.
     //
     //   2. Directory present but no JSONL files — the expected steady-state
     //      when --no-session-persistence is active. Silently return empty.
-    if !claude_projects_dir.is_dir() {
-        tracing::warn!(
-            path = %claude_projects_dir.display(),
-            "token_usage: session projects directory not found; \
-             possible misconfiguration (wrong $HOME, deleted directory, \
-             or path regression) — returning empty metrics"
-        );
-        return missing_dir_response();
+    //
+    //   3. Metadata error other than NotFound (e.g. permission denied) — this
+    //      is a real OS-level failure that must surface as an error, not be
+    //      silently treated as "directory absent".
+    match std::fs::metadata(&claude_projects_dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return error_response(format!(
+                "token usage path is not a directory: {}",
+                claude_projects_dir.display()
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                path = %claude_projects_dir.display(),
+                "token_usage: session projects directory not found; \
+                 possible misconfiguration (wrong $HOME, deleted directory, \
+                 or path regression) — returning empty metrics"
+            );
+            return missing_dir_response();
+        }
+        Err(e) => {
+            return error_response(format!(
+                "cannot access token usage directory {}: {e}",
+                claude_projects_dir.display()
+            ));
+        }
     }
 
     let files = match collect_session_files(&claude_projects_dir) {

@@ -580,10 +580,14 @@ async function fetchTokenUsage() {
     }
     const data = await resp.json();
     if (data.source_dir_missing) {
-      console.warn(
-        "token_usage: session directory (~/.claude/projects) not found — " +
-        "check $HOME configuration or expected when using --no-session-persistence"
-      );
+      const chart = document.getElementById("tok-req-chart");
+      if (chart) {
+        chart.innerHTML =
+          '<p class="empty-state" style="color:#f59e0b">' +
+          "⚠ Session directory (~/.claude/projects) not found — " +
+          "check $HOME configuration, or expected when using --no-session-persistence" +
+          "</p>";
+      }
     }
     renderTokenMetrics(data);
     renderRequestChart(data.by_hour || {});
