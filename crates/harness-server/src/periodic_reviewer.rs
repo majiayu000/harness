@@ -434,7 +434,73 @@ async fn run_review_tick(
                         .await
                     {
                         Ok(n) => {
-                            tracing::info!(new_findings = n, "scheduler: review findings persisted")
+                            tracing::info!(
+                                new_findings = n,
+                                "scheduler: review findings persisted"
+                            );
+                            // Auto-spawn fix tasks for P1/P2 open findings that have
+                            // no existing task yet (task_id IS NULL = dedup guard).
+                            // P0 excluded: critical issues require human judgment.
+                            // P3 excluded: informational only, too low priority.
+                            match rs
+                                .list_spawnable_findings(&final_task_id.0, &["P1", "P2"])
+                                .await
+                            {
+                                Ok(spawnable) => {
+                                    for finding in spawnable {
+                                        let prompt = format!(
+                                            "Fix finding '{}' ({}, {}:{}): {}\n\nRequired action: {}",
+                                            finding.title,
+                                            finding.rule_id,
+                                            finding.file,
+                                            finding.line,
+                                            finding.description,
+                                            finding.action
+                                        );
+                                        let req = CreateTaskRequest {
+                                            prompt: Some(prompt),
+                                            source: Some("auto-fix".into()),
+                                            ..CreateTaskRequest::default()
+                                        };
+                                        match task_routes::enqueue_task(&state_for_synthesis, req)
+                                            .await
+                                        {
+                                            Ok(fix_task_id) => {
+                                                if let Err(e) = rs
+                                                    .mark_task_spawned(
+                                                        &final_task_id.0,
+                                                        &finding.id,
+                                                        &fix_task_id.0,
+                                                    )
+                                                    .await
+                                                {
+                                                    tracing::warn!(
+                                                        finding_id = %finding.id,
+                                                        "scheduler: failed to mark task spawned: {e}"
+                                                    );
+                                                } else {
+                                                    tracing::info!(
+                                                        finding_id = %finding.id,
+                                                        task_id = %fix_task_id,
+                                                        "scheduler: auto-fix task spawned"
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    finding_id = %finding.id,
+                                                    "scheduler: failed to spawn fix task: {e}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "scheduler: failed to list spawnable findings: {e}"
+                                    );
+                                }
+                            }
                         }
                         Err(e) => tracing::warn!("scheduler: failed to persist findings: {e}"),
                     }

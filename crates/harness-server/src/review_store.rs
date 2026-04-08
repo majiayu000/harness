@@ -14,6 +14,7 @@ type FindingRow = (
     String,
     String,
     String,
+    Option<String>,
 );
 
 /// A single finding from a periodic review.
@@ -30,6 +31,9 @@ pub struct ReviewFinding {
     pub title: String,
     pub description: String,
     pub action: String,
+    /// Task ID of the auto-spawned fix task, if any.
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 /// Summary scores from a review run.
@@ -74,11 +78,26 @@ impl ReviewStore {
                 action      TEXT NOT NULL,
                 status      TEXT NOT NULL DEFAULT 'open',
                 created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                task_id     TEXT,
                 PRIMARY KEY (review_id, id)
             )",
         )
         .execute(&pool)
         .await?;
+        // Migrate existing databases: add task_id column if absent.
+        // PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk).
+        let columns: Vec<(i32, String, String, i32, Option<String>, i32)> =
+            sqlx::query_as("PRAGMA table_info(review_findings)")
+                .fetch_all(&pool)
+                .await?;
+        let has_task_id = columns
+            .iter()
+            .any(|(_, name, _, _, _, _)| name == "task_id");
+        if !has_task_id {
+            sqlx::query("ALTER TABLE review_findings ADD COLUMN task_id TEXT")
+                .execute(&pool)
+                .await?;
+        }
         // Remove duplicate (rule_id, file, status) rows that may exist from
         // before this unique index was introduced; keep the most recent row per group.
         sqlx::query(
@@ -170,7 +189,7 @@ impl ReviewStore {
     pub async fn list_open(&self) -> anyhow::Result<Vec<ReviewFinding>> {
         let rows: Vec<FindingRow> = sqlx::query_as(
             "SELECT id, rule_id, priority, impact, confidence, effort, \
-                    file, line, title, description, action \
+                    file, line, title, description, action, task_id \
              FROM review_findings WHERE status = 'open' \
              ORDER BY \
                CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 \
@@ -180,8 +199,61 @@ impl ReviewStore {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
+        Ok(Self::rows_to_findings(rows))
+    }
+
+    /// List open findings eligible for auto-spawn: matching the given priorities,
+    /// status='open', and no existing task_id (dedup guard).
+    ///
+    /// P0 is excluded intentionally: critical issues require human judgment;
+    /// auto-fix could cause high blast-radius changes.
+    /// P3 is excluded intentionally: informational only, too low priority.
+    pub async fn list_spawnable_findings(
+        &self,
+        review_id: &str,
+        priorities: &[&str],
+    ) -> anyhow::Result<Vec<ReviewFinding>> {
+        if priorities.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders = priorities
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, rule_id, priority, impact, confidence, effort, \
+                    file, line, title, description, action, task_id \
+             FROM review_findings \
+             WHERE review_id = ? AND priority IN ({placeholders}) \
+               AND status = 'open' AND task_id IS NULL"
+        );
+        let mut query = sqlx::query_as::<_, FindingRow>(&sql).bind(review_id.to_owned());
+        for p in priorities {
+            query = query.bind(p.to_string());
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(Self::rows_to_findings(rows))
+    }
+
+    /// Record the task_id of the auto-spawned fix task for a finding.
+    pub async fn mark_task_spawned(
+        &self,
+        review_id: &str,
+        finding_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE review_findings SET task_id = ? WHERE review_id = ? AND id = ?")
+            .bind(task_id)
+            .bind(review_id)
+            .bind(finding_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    fn rows_to_findings(rows: Vec<FindingRow>) -> Vec<ReviewFinding> {
+        rows.into_iter()
             .map(
                 |(
                     id,
@@ -195,6 +267,7 @@ impl ReviewStore {
                     title,
                     description,
                     action,
+                    task_id,
                 )| {
                     ReviewFinding {
                         id,
@@ -208,10 +281,11 @@ impl ReviewStore {
                         title,
                         description,
                         action,
+                        task_id,
                     }
                 },
             )
-            .collect())
+            .collect()
     }
 }
 
@@ -318,6 +392,7 @@ mod tests {
             title: "unwrap in prod".into(),
             description: "panic risk".into(),
             action: "use ?".into(),
+            task_id: None,
         };
         let findings = vec![finding];
 
@@ -342,6 +417,130 @@ mod tests {
         Ok(())
     }
 
+    fn make_finding(id: &str, rule_id: &str, file: &str, priority: &str) -> ReviewFinding {
+        ReviewFinding {
+            id: id.into(),
+            rule_id: rule_id.into(),
+            priority: priority.into(),
+            impact: 3,
+            confidence: 5,
+            effort: 2,
+            file: file.into(),
+            line: 10,
+            title: format!("finding {id}"),
+            description: "desc".into(),
+            action: "fix it".into(),
+            task_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mark_task_spawned() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        let findings = vec![make_finding("F001", "RS-03", "src/lib.rs", "P1")];
+        store.persist_findings("rev-1", &findings).await?;
+
+        store.mark_task_spawned("rev-1", "F001", "task-abc").await?;
+
+        let spawnable = store
+            .list_spawnable_findings("rev-1", &["P1", "P2"])
+            .await?;
+        assert!(
+            spawnable.is_empty(),
+            "finding with task_id must not be returned"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_spawnable_findings_filters_priority() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        let findings = vec![
+            make_finding("F0", "R0", "a.rs", "P0"),
+            make_finding("F1", "R1", "b.rs", "P1"),
+            make_finding("F2", "R2", "c.rs", "P2"),
+            make_finding("F3", "R3", "d.rs", "P3"),
+        ];
+        store.persist_findings("rev-1", &findings).await?;
+
+        let spawnable = store
+            .list_spawnable_findings("rev-1", &["P1", "P2"])
+            .await?;
+        let ids: Vec<&str> = spawnable.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains(&"F1"), "P1 must be returned");
+        assert!(ids.contains(&"F2"), "P2 must be returned");
+        assert!(!ids.contains(&"F0"), "P0 must be excluded");
+        assert!(!ids.contains(&"F3"), "P3 must be excluded");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_spawnable_findings_skips_already_spawned() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        let findings = vec![
+            make_finding("F1", "R1", "a.rs", "P1"),
+            make_finding("F2", "R2", "b.rs", "P2"),
+        ];
+        store.persist_findings("rev-1", &findings).await?;
+        store.mark_task_spawned("rev-1", "F1", "task-111").await?;
+
+        let spawnable = store
+            .list_spawnable_findings("rev-1", &["P1", "P2"])
+            .await?;
+        assert_eq!(spawnable.len(), 1);
+        assert_eq!(spawnable[0].id, "F2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_spawnable_findings_skips_closed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        let findings = vec![make_finding("F1", "R1", "a.rs", "P1")];
+        store.persist_findings("rev-1", &findings).await?;
+        sqlx::query("UPDATE review_findings SET status = 'resolved' WHERE id = 'F1'")
+            .execute(&store.pool)
+            .await?;
+
+        let spawnable = store
+            .list_spawnable_findings("rev-1", &["P1", "P2"])
+            .await?;
+        assert!(
+            spawnable.is_empty(),
+            "resolved findings must not be returned"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_dedup_across_reviews_preserves_task_id() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        let finding = make_finding("F1", "RS-03", "src/lib.rs", "P1");
+
+        // First review: persist, spawn task.
+        store.persist_findings("rev-1", &[finding.clone()]).await?;
+        store.mark_task_spawned("rev-1", "F1", "task-orig").await?;
+
+        // Second review: same rule_id+file triggers UPDATE (recurring finding),
+        // review_id changes to rev-2 but task_id must be preserved.
+        let finding2 = make_finding("F1", "RS-03", "src/lib.rs", "P1");
+        store.persist_findings("rev-2", &[finding2]).await?;
+
+        // task_id IS NOT NULL so it must not appear in spawnable list.
+        let spawnable = store
+            .list_spawnable_findings("rev-2", &["P1", "P2"])
+            .await?;
+        assert!(
+            spawnable.is_empty(),
+            "recurring finding with task_id must not be re-spawned"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn store_persist_and_list() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -359,6 +558,7 @@ mod tests {
             title: "unwrap in prod".into(),
             description: "panic risk".into(),
             action: "use ?".into(),
+            task_id: None,
         }];
 
         let inserted = store.persist_findings("rev-1", &findings).await?;
