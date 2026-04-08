@@ -207,8 +207,16 @@ mod tests {
         let config = ServerConfig::default();
         let debug_output = format!("{config:?}");
         assert!(
-            debug_output.contains("None"),
-            "absent secrets should show as None"
+            debug_output.contains("github_webhook_secret: None"),
+            "absent github_webhook_secret should show as None"
+        );
+        assert!(
+            debug_output.contains("api_token: None"),
+            "absent api_token should show as None"
+        );
+        assert!(
+            debug_output.contains("github_token: None"),
+            "absent github_token should show as None"
         );
     }
 }
