@@ -237,19 +237,22 @@ impl ReviewStore {
     }
 
     /// Record the task_id of the auto-spawned fix task for a finding.
-    pub async fn mark_task_spawned(
-        &self,
-        review_id: &str,
-        finding_id: &str,
-        task_id: &str,
-    ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE review_findings SET task_id = ? WHERE review_id = ? AND id = ?")
-            .bind(task_id)
-            .bind(review_id)
-            .bind(finding_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    ///
+    /// Uses `AND task_id IS NULL` as an optimistic lock so concurrent pollers
+    /// cannot double-write: the first caller wins and subsequent callers get
+    /// `Ok(false)` without overwriting the already-recorded task.
+    ///
+    /// The `review_id` filter is intentionally absent: `persist_findings` may
+    /// reassign the finding to a newer `review_id` between `list_spawnable_findings`
+    /// and this call, which would cause 0 rows affected and leave `task_id` NULL.
+    pub async fn mark_task_spawned(&self, finding_id: &str, task_id: &str) -> anyhow::Result<bool> {
+        let result =
+            sqlx::query("UPDATE review_findings SET task_id = ? WHERE id = ? AND task_id IS NULL")
+                .bind(task_id)
+                .bind(finding_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     fn rows_to_findings(rows: Vec<FindingRow>) -> Vec<ReviewFinding> {
@@ -441,7 +444,15 @@ mod tests {
         let findings = vec![make_finding("F001", "RS-03", "src/lib.rs", "P1")];
         store.persist_findings("rev-1", &findings).await?;
 
-        store.mark_task_spawned("rev-1", "F001", "task-abc").await?;
+        assert!(
+            store.mark_task_spawned("F001", "task-abc").await?,
+            "first call must succeed"
+        );
+        // Second call with same finding must return false (optimistic lock).
+        assert!(
+            !store.mark_task_spawned("F001", "task-xyz").await?,
+            "duplicate call must return false"
+        );
 
         let spawnable = store
             .list_spawnable_findings("rev-1", &["P1", "P2"])
@@ -485,7 +496,7 @@ mod tests {
             make_finding("F2", "R2", "b.rs", "P2"),
         ];
         store.persist_findings("rev-1", &findings).await?;
-        store.mark_task_spawned("rev-1", "F1", "task-111").await?;
+        store.mark_task_spawned("F1", "task-111").await?;
 
         let spawnable = store
             .list_spawnable_findings("rev-1", &["P1", "P2"])
@@ -523,7 +534,7 @@ mod tests {
 
         // First review: persist, spawn task.
         store.persist_findings("rev-1", &[finding.clone()]).await?;
-        store.mark_task_spawned("rev-1", "F1", "task-orig").await?;
+        store.mark_task_spawned("F1", "task-orig").await?;
 
         // Second review: same rule_id+file triggers UPDATE (recurring finding),
         // review_id changes to rev-2 but task_id must be preserved.
@@ -537,6 +548,43 @@ mod tests {
         assert!(
             spawnable.is_empty(),
             "recurring finding with task_id must not be re-spawned"
+        );
+        Ok(())
+    }
+
+    /// Regression test for the TOCTOU race: `persist_findings` changes the
+    /// finding's `review_id` *after* `list_spawnable_findings` but *before*
+    /// `mark_task_spawned`.  The old code filtered by `review_id` in the UPDATE,
+    /// so 0 rows were affected and `task_id` was left NULL, allowing a duplicate
+    /// task to be spawned on the next cycle.  The fixed code filters by `id`
+    /// only, so the update succeeds regardless of which `review_id` the row now
+    /// carries.
+    #[tokio::test]
+    async fn test_mark_task_spawned_survives_review_id_change() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        let finding = make_finding("F1", "RS-03", "src/lib.rs", "P1");
+
+        // Simulate: list_spawnable_findings returned F1 under rev-1.
+        store.persist_findings("rev-1", &[finding.clone()]).await?;
+
+        // Simulate race: persist_findings runs with rev-2 BEFORE mark_task_spawned.
+        let finding2 = make_finding("F1", "RS-03", "src/lib.rs", "P1");
+        store.persist_findings("rev-2", &[finding2]).await?;
+
+        // mark_task_spawned must succeed even though the row now has review_id="rev-2".
+        let marked = store
+            .mark_task_spawned("F1", "task-from-rev1-poller")
+            .await?;
+        assert!(marked, "must succeed even after review_id changed");
+
+        // F1 must no longer appear in spawnable list for rev-2.
+        let spawnable = store
+            .list_spawnable_findings("rev-2", &["P1", "P2"])
+            .await?;
+        assert!(
+            spawnable.is_empty(),
+            "finding with task_id must not be re-spawned after review_id change"
         );
         Ok(())
     }

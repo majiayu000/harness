@@ -466,24 +466,35 @@ async fn run_review_tick(
                                             .await
                                         {
                                             Ok(fix_task_id) => {
-                                                if let Err(e) = rs
-                                                    .mark_task_spawned(
-                                                        &final_task_id.0,
-                                                        &finding.id,
-                                                        &fix_task_id.0,
-                                                    )
+                                                match rs
+                                                    .mark_task_spawned(&finding.id, &fix_task_id.0)
                                                     .await
                                                 {
-                                                    tracing::warn!(
-                                                        finding_id = %finding.id,
-                                                        "scheduler: failed to mark task spawned: {e}"
-                                                    );
-                                                } else {
-                                                    tracing::info!(
-                                                        finding_id = %finding.id,
-                                                        task_id = %fix_task_id,
-                                                        "scheduler: auto-fix task spawned"
-                                                    );
+                                                    Ok(true) => {
+                                                        tracing::info!(
+                                                            finding_id = %finding.id,
+                                                            task_id = %fix_task_id,
+                                                            "scheduler: auto-fix task spawned"
+                                                        );
+                                                    }
+                                                    Ok(false) => {
+                                                        // Another concurrent poller already
+                                                        // recorded a task for this finding
+                                                        // (task_id was no longer NULL).
+                                                        // The newly enqueued task is orphaned;
+                                                        // log a warning so operators can clean up.
+                                                        tracing::warn!(
+                                                            finding_id = %finding.id,
+                                                            orphaned_task_id = %fix_task_id,
+                                                            "scheduler: finding already has a task (concurrent spawn detected), new task orphaned"
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            finding_id = %finding.id,
+                                                            "scheduler: failed to mark task spawned: {e}"
+                                                        );
+                                                    }
                                                 }
                                             }
                                             Err(e) => {
