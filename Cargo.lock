@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "harness-agents"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1111,7 +1111,7 @@ dependencies = [
 
 [[package]]
 name = "harness-api"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "harness-core",
  "harness-exec",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "harness-cli"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "harness-core"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "harness-exec"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1176,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "harness-gc"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "harness-observe"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "harness-protocol"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "harness-rules"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1250,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "harness-sandbox"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "harness-core",
  "tempfile",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "harness-server"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1296,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "harness-skills"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "anyhow",
  "chrono",

@@ -56,11 +56,13 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
     };
 
     let claude_projects_dir = home.join(".claude").join("projects");
+
+    // When --no-session-persistence is active, Claude Code does not write
+    // session JSONL files to disk, so the projects directory may be absent or
+    // empty. Return empty (zeroed) metrics rather than a 500 error so that
+    // callers receive a valid response in stateless agent environments.
     if !claude_projects_dir.is_dir() {
-        return error_response(format!(
-            "token usage source directory missing: {}",
-            claude_projects_dir.display()
-        ));
+        return empty_usage_response();
     }
 
     let files = match collect_session_files(&claude_projects_dir) {
@@ -69,10 +71,7 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
     };
 
     if files.is_empty() {
-        return error_response(format!(
-            "no token usage JSONL files found under {}",
-            claude_projects_dir.display()
-        ));
+        return empty_usage_response();
     }
 
     let mut by_day: BTreeMap<String, UsageBucket> = BTreeMap::new();
@@ -234,6 +233,28 @@ fn error_response(message: String) -> (StatusCode, Json<Value>) {
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({ "error": message })),
     )
+}
+
+/// Return zeroed metrics with 200 OK when no session files are available.
+///
+/// This is the correct response when `--no-session-persistence` is active:
+/// agents do not write JSONL files, so an absent or empty projects directory
+/// is expected, not an error.
+fn empty_usage_response() -> (StatusCode, Json<Value>) {
+    let body = serde_json::json!({
+        "by_day": {},
+        "by_hour": {},
+        "model_trend": {},
+        "by_model": {},
+        "models": [],
+        "totals": UsageBucket::default(),
+        "total_context": 0,
+        "total_requests": 0,
+        "estimated_cost_usd": 0.0,
+        "task_usage": [],
+        "session_count": 0,
+    });
+    (StatusCode::OK, Json(body))
 }
 
 fn parse_usage_record(entry: &Value, ctx: &str) -> Result<Option<ParsedUsageRecord>, String> {
