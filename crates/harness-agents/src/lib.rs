@@ -7,6 +7,25 @@ pub mod codex_adapter;
 pub mod registry;
 mod streaming;
 
+/// Probe whether the Claude CLI at `cli_path` supports `--no-session-persistence`.
+///
+/// Runs `cli_path --help` once and checks the combined stdout/stderr output.
+/// Returns `false` on any spawn or read error so that agents on older CLI builds
+/// degrade gracefully (flag omitted) rather than failing every spawn with
+/// "unknown option --no-session-persistence".
+pub(crate) fn probe_no_session_persistence(cli_path: &std::path::Path) -> bool {
+    std::process::Command::new(cli_path)
+        .arg("--help")
+        .output()
+        .map(|out| {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            stdout.contains("--no-session-persistence")
+                || stderr.contains("--no-session-persistence")
+        })
+        .unwrap_or(false)
+}
+
 /// Remove all `CLAUDE`-prefixed environment variables from a command to prevent
 /// nested Claude Code detection (SIGTRAP).
 pub(crate) fn strip_claude_env(cmd: &mut tokio::process::Command) {

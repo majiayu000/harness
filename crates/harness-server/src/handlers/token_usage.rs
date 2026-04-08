@@ -58,11 +58,23 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
     let claude_projects_dir = home.join(".claude").join("projects");
 
     // When --no-session-persistence is active, Claude Code does not write
-    // session JSONL files to disk, so the projects directory may be absent or
-    // empty. Return empty (zeroed) metrics rather than a 500 error so that
-    // callers receive a valid response in stateless agent environments.
+    // session JSONL files to disk. Distinguish two absence cases:
+    //
+    //   1. Projects directory absent entirely — potentially a misconfiguration
+    //      (wrong $HOME, deleted directory, path regression). Emit a warning
+    //      so operators can detect it in logs, and include a diagnostic field
+    //      in the response so callers can distinguish from genuine empty usage.
+    //
+    //   2. Directory present but no JSONL files — the expected steady-state
+    //      when --no-session-persistence is active. Silently return empty.
     if !claude_projects_dir.is_dir() {
-        return empty_usage_response();
+        tracing::warn!(
+            path = %claude_projects_dir.display(),
+            "token_usage: session projects directory not found; \
+             possible misconfiguration (wrong $HOME, deleted directory, \
+             or path regression) — returning empty metrics"
+        );
+        return missing_dir_response();
     }
 
     let files = match collect_session_files(&claude_projects_dir) {
@@ -233,6 +245,30 @@ fn error_response(message: String) -> (StatusCode, Json<Value>) {
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({ "error": message })),
     )
+}
+
+/// Return zeroed metrics with 200 OK when the projects directory is missing.
+///
+/// Unlike `empty_usage_response`, this includes `"source_dir_missing": true`
+/// so callers and monitoring can distinguish "directory absent" (potentially a
+/// misconfiguration) from "directory present but no sessions yet" (expected
+/// in --no-session-persistence environments).
+fn missing_dir_response() -> (StatusCode, Json<Value>) {
+    let body = serde_json::json!({
+        "by_day": {},
+        "by_hour": {},
+        "model_trend": {},
+        "by_model": {},
+        "models": [],
+        "totals": UsageBucket::default(),
+        "total_context": 0,
+        "total_requests": 0,
+        "estimated_cost_usd": 0.0,
+        "task_usage": [],
+        "session_count": 0,
+        "source_dir_missing": true,
+    });
+    (StatusCode::OK, Json(body))
 }
 
 /// Return zeroed metrics with 200 OK when no session files are available.

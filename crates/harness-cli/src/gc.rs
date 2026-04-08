@@ -160,6 +160,7 @@ fn build_agent_registry(
                 config.agents.claude.default_model.clone(),
                 config.agents.sandbox_mode,
             )
+            .with_no_session_persistence_probe()
             .with_stream_timeout(config.agents.stream_timeout_secs),
         ),
     );

@@ -23,6 +23,10 @@ pub struct ClaudeCodeAgent {
     /// Maximum seconds of idle silence on the output stream before the
     /// subprocess is declared a zombie and terminated. `None` = no timeout.
     pub stream_timeout_secs: Option<u64>,
+    /// Whether the CLI binary supports `--no-session-persistence`. Probed once
+    /// at construction via `--help`; older builds that lack the flag will skip
+    /// it rather than failing every agent spawn with "unknown option".
+    pub no_session_persistence: bool,
 }
 
 impl ClaudeCodeAgent {
@@ -33,7 +37,18 @@ impl ClaudeCodeAgent {
             sandbox_mode,
             reasoning_budget: None,
             stream_timeout_secs: Some(1800),
+            // Probe is opt-in via `with_no_session_persistence_probe()` so that
+            // tests using mock scripts are not affected by the subprocess spawn.
+            no_session_persistence: false,
         }
+    }
+
+    /// Probe the CLI binary once for `--no-session-persistence` support and
+    /// cache the result. Call this from production code paths after `new()`
+    /// to enable the flag when the binary supports it.
+    pub fn with_no_session_persistence_probe(mut self) -> Self {
+        self.no_session_persistence = crate::probe_no_session_persistence(&self.cli_path);
+        self
     }
 
     /// Attach a ReasoningBudget for per-phase model selection.
@@ -67,8 +82,11 @@ impl ClaudeCodeAgent {
             OsString::from("--model"),
             OsString::from(model),
             OsString::from("--verbose"),
-            OsString::from("--no-session-persistence"),
         ];
+
+        if self.no_session_persistence {
+            base_args.push(OsString::from("--no-session-persistence"));
+        }
 
         // Hard tool enforcement at the CLI boundary (issue #514):
         //   Full profile  (allowed_tools = None)    → --dangerously-skip-permissions
@@ -293,12 +311,16 @@ mod tests {
     }
 
     #[test]
-    fn base_args_always_includes_no_session_persistence() {
-        let agent = ClaudeCodeAgent::new(
+    fn base_args_includes_no_session_persistence_when_supported() {
+        let mut agent = ClaudeCodeAgent::new(
             PathBuf::from("claude"),
             "test-model".to_string(),
             SandboxMode::DangerFullAccess,
         );
+        // Force the flag on regardless of what the probe found in the test
+        // environment — the test is validating arg construction logic, not
+        // CLI version detection.
+        agent.no_session_persistence = true;
         for (label, allowed_tools) in [
             ("full", None),
             (
@@ -316,6 +338,22 @@ mod tests {
                 "--no-session-persistence must be present for {label} profile; got: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn base_args_omits_no_session_persistence_when_not_supported() {
+        let mut agent = ClaudeCodeAgent::new(
+            PathBuf::from("claude"),
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
+        agent.no_session_persistence = false;
+        let req = AgentRequest::default();
+        let args = args_to_strings(&agent.base_args(&req));
+        assert!(
+            !args.contains(&"--no-session-persistence".to_string()),
+            "flag must be absent when no_session_persistence=false; got: {args:?}"
+        );
     }
 
     #[test]
