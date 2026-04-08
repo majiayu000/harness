@@ -774,7 +774,6 @@ fn build_completion_callback(
                             harness_core::prompts::parse_github_pr_url(pr_url)
                         {
                             let resolved_token = github_token
-                                .clone()
                                 .or_else(|| std::env::var("GITHUB_TOKEN").ok())
                                 .filter(|t| !t.is_empty());
                             match resolved_token {
