@@ -600,7 +600,9 @@ mod tests {
         let finding = make_finding("F1", "RS-03", "src/lib.rs", "P1");
 
         // First review: persist, claim and confirm task.
-        store.persist_findings("rev-1", &[finding.clone()]).await?;
+        store
+            .persist_findings("rev-1", std::slice::from_ref(&finding))
+            .await?;
         store.try_claim_finding("RS-03", "src/lib.rs").await?;
         store
             .confirm_task_spawned("RS-03", "src/lib.rs", "task-orig")
@@ -634,7 +636,9 @@ mod tests {
         let finding = make_finding("F1", "RS-03", "src/lib.rs", "P1");
 
         // Simulate: list_spawnable_findings returned F1 under rev-1.
-        store.persist_findings("rev-1", &[finding.clone()]).await?;
+        store
+            .persist_findings("rev-1", std::slice::from_ref(&finding))
+            .await?;
 
         // Simulate race: persist_findings runs with rev-2 BEFORE try_claim_finding.
         let finding2 = make_finding("F1", "RS-03", "src/lib.rs", "P1");
