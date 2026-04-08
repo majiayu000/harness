@@ -21,6 +21,35 @@ mod streaming;
 /// within that window (e.g. bad wrapper script, blocked NFS mount, first-run
 /// interactive prompt), the child is killed and the probe returns `false`.
 pub(crate) fn probe_no_session_persistence(cli_path: &std::path::Path) -> bool {
+    // Validate cli_path before spawning: must be absolute and an existing regular
+    // file.  This prevents an unsandboxed execution of an arbitrary/misconfigured
+    // path before wrap_command sandboxing has been applied.
+    if !cli_path.is_absolute() {
+        tracing::warn!(
+            path = %cli_path.display(),
+            "probe_no_session_persistence: cli_path is not absolute; skipping probe"
+        );
+        return false;
+    }
+    match std::fs::metadata(cli_path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            tracing::warn!(
+                path = %cli_path.display(),
+                "probe_no_session_persistence: cli_path is not a regular file; skipping probe"
+            );
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %cli_path.display(),
+                error = %e,
+                "probe_no_session_persistence: cannot stat cli_path; skipping probe"
+            );
+            return false;
+        }
+    }
+
     let claude_keys: Vec<String> = std::env::vars()
         .filter(|(k, _)| k.starts_with("CLAUDE"))
         .map(|(k, _)| k)

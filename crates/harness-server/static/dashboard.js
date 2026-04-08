@@ -579,18 +579,22 @@ async function fetchTokenUsage() {
       return;
     }
     const data = await resp.json();
+    renderTokenMetrics(data);
     if (data.source_dir_missing) {
+      // Inject the diagnostic warning into the chart container instead of
+      // calling renderRequestChart, which would immediately replace this
+      // message with "No data" when by_hour is empty.
       const chart = document.getElementById("tok-req-chart");
       if (chart) {
         chart.innerHTML =
           '<p class="empty-state" style="color:#f59e0b">' +
-          "⚠ Session directory (~/.claude/projects) not found — " +
+          "&#9888; Session directory (~/.claude/projects) not found &mdash; " +
           "check $HOME configuration, or expected when using --no-session-persistence" +
           "</p>";
       }
+    } else {
+      renderRequestChart(data.by_hour || {});
     }
-    renderTokenMetrics(data);
-    renderRequestChart(data.by_hour || {});
     renderModelTrend(data.model_trend || {}, data.models || []);
     renderTokenDayTable(data.by_day || {});
     renderTokenModelTable(data.by_model || {});

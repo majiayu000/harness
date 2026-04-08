@@ -80,11 +80,15 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
             ));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::warn!(
+            // NotFound is the expected steady state when --no-session-persistence
+            // is active.  Log at debug so that normal deployments do not flood
+            // warn-level logs on every 5 s dashboard poll.  The source_dir_missing
+            // flag in the JSON response surfaces the diagnostic to operators via
+            // the dashboard UI instead.
+            tracing::debug!(
                 path = %claude_projects_dir.display(),
                 "token_usage: session projects directory not found; \
-                 possible misconfiguration (wrong $HOME, deleted directory, \
-                 or path regression) — returning empty metrics"
+                 returning empty metrics (expected with --no-session-persistence)"
             );
             return missing_dir_response();
         }
