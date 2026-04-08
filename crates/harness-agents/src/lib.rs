@@ -13,10 +13,20 @@ mod streaming;
 /// Returns `false` on any spawn or read error so that agents on older CLI builds
 /// degrade gracefully (flag omitted) rather than failing every spawn with
 /// "unknown option --no-session-persistence".
+///
+/// All `CLAUDE`-prefixed environment variables are stripped before spawning to
+/// prevent nested-Claude SIGTRAP in environments launched from within Claude Code.
 pub(crate) fn probe_no_session_persistence(cli_path: &std::path::Path) -> bool {
-    std::process::Command::new(cli_path)
-        .arg("--help")
-        .output()
+    let claude_keys: Vec<String> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("CLAUDE"))
+        .map(|(k, _)| k)
+        .collect();
+    let mut cmd = std::process::Command::new(cli_path);
+    cmd.arg("--help");
+    for key in &claude_keys {
+        cmd.env_remove(key);
+    }
+    cmd.output()
         .map(|out| {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);

@@ -579,6 +579,12 @@ async function fetchTokenUsage() {
       return;
     }
     const data = await resp.json();
+    if (data.source_dir_missing) {
+      console.warn(
+        "token_usage: session directory (~/.claude/projects) not found — " +
+        "check $HOME configuration or expected when using --no-session-persistence"
+      );
+    }
     renderTokenMetrics(data);
     renderRequestChart(data.by_hour || {});
     renderModelTrend(data.model_trend || {}, data.models || []);
