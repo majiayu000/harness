@@ -470,12 +470,16 @@ async fn run_review_tick(
                                     //      description, action) are truncated to
                                     //      a safe maximum so adversarially long
                                     //      content cannot dominate the context
-                                    //      window.  File paths are NOT truncated
-                                    //      because agents need the exact path to
-                                    //      locate and patch the file.
+                                    //      window.  File paths use a generous cap
+                                    //      (PATH_MAX) to prevent resource exhaustion
+                                    //      from adversarially long strings while
+                                    //      still supporting any real-world path.
                                     const MAX_DESC_LEN: usize = 2_000;
                                     const MAX_ACTION_LEN: usize = 1_000;
                                     const MAX_FIELD_LEN: usize = 200;
+                                    // Linux PATH_MAX is 4096; this is generous for
+                                    // any real path while capping adversarial input.
+                                    const MAX_FILE_LEN: usize = 4_096;
                                     for finding in spawnable {
                                         let title = sanitize_delimiter(&truncate_to(
                                             &finding.title,
@@ -485,9 +489,13 @@ async fn run_review_tick(
                                             &finding.rule_id,
                                             MAX_FIELD_LEN,
                                         ));
-                                        // File path is sanitized but NOT truncated:
-                                        // agents need the exact path to open the file.
-                                        let file = sanitize_delimiter(&finding.file);
+                                        // File path is sanitized and capped at PATH_MAX
+                                        // to prevent resource exhaustion from adversarial
+                                        // reviewer output while preserving real paths.
+                                        let file = sanitize_delimiter(&truncate_to(
+                                            &finding.file,
+                                            MAX_FILE_LEN,
+                                        ));
                                         let description = sanitize_delimiter(&truncate_to(
                                             &finding.description,
                                             MAX_DESC_LEN,
@@ -1050,5 +1058,45 @@ mod tests {
     fn sanitize_delimiter_passthrough_clean_text() {
         let clean = "Fix the null pointer dereference on line 42.";
         assert_eq!(sanitize_delimiter(clean), clean);
+    }
+
+    /// truncate_to returns the original string when shorter than the limit.
+    #[test]
+    fn truncate_to_short_string_unchanged() {
+        assert_eq!(truncate_to("hello", 10), "hello");
+    }
+
+    /// truncate_to returns empty string unchanged.
+    #[test]
+    fn truncate_to_empty_string() {
+        assert_eq!(truncate_to("", 5), "");
+    }
+
+    /// truncate_to exactly at the limit is not truncated.
+    #[test]
+    fn truncate_to_exact_length() {
+        assert_eq!(truncate_to("abcde", 5), "abcde");
+    }
+
+    /// truncate_to appends ellipsis when string exceeds the limit.
+    #[test]
+    fn truncate_to_long_string_appends_ellipsis() {
+        let result = truncate_to("abcdefgh", 5);
+        assert_eq!(result, "abcde…");
+    }
+
+    /// truncate_to handles multi-byte Unicode characters correctly.
+    #[test]
+    fn truncate_to_multibyte_unicode() {
+        // Each '日' is 3 bytes; max_chars=2 must cut at character boundary.
+        let result = truncate_to("日本語", 2);
+        assert_eq!(result, "日本…");
+    }
+
+    /// truncate_to with limit 0 on non-empty string returns just the ellipsis.
+    #[test]
+    fn truncate_to_zero_limit() {
+        let result = truncate_to("abc", 0);
+        assert_eq!(result, "…");
     }
 }
