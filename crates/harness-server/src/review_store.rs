@@ -312,10 +312,40 @@ impl ReviewStore {
         Ok(rows)
     }
 
+    /// Mark open findings as 'resolved' when their fix task reached Done state.
+    ///
+    /// Done means the fix PR was approved and tests passed — the finding should not
+    /// be re-queued on the next cycle.  Unlike Failed/Cancelled tasks (which reset
+    /// task_id to NULL for retry), Done findings are closed permanently here.
+    /// Returns the number of rows updated.
+    pub async fn resolve_findings_for_done_tasks(
+        &self,
+        done_task_ids: &[&str],
+    ) -> anyhow::Result<u64> {
+        if done_task_ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = done_task_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE review_findings SET status = 'resolved', task_id = NULL \
+             WHERE status = 'open' AND task_id IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in done_task_ids {
+            query = query.bind(*id);
+        }
+        let result = query.execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
     /// Reset task_id to NULL for open findings whose task_id is in `terminal_task_ids`.
     ///
-    /// Called after detecting that the associated fix tasks have reached a terminal
-    /// state (Done / Failed / Cancelled), freeing the finding for a new spawn attempt.
+    /// Called after detecting that the associated fix tasks have reached a
+    /// Failed or Cancelled state, freeing the finding for a new spawn attempt.
     /// Returns the number of rows updated.
     pub async fn reset_task_ids_for_terminal(
         &self,

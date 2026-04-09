@@ -1088,8 +1088,30 @@ async fn run_review_tick(
                                                                 task_id = %fix_task_id,
                                                                 "scheduler: confirm_task_spawned \
                                                                  retry also failed ({retry_err}); \
-                                                                 periodic cleanup will recover"
+                                                                 releasing pending claim so next \
+                                                                 cycle can recover"
                                                             );
+                                                            // Release the 'pending' sentinel so
+                                                            // the next review cycle can re-spawn.
+                                                            // Leaving task_id='pending' would make
+                                                            // the finding permanently unspawnable:
+                                                            // list_assigned_task_ids excludes
+                                                            // pending rows, so scrub_terminal_task_ids
+                                                            // can never free it.
+                                                            if let Err(re) = rs
+                                                                .release_claim(
+                                                                    &finding.rule_id,
+                                                                    &finding.file,
+                                                                )
+                                                                .await
+                                                            {
+                                                                tracing::warn!(
+                                                                    finding_id = %finding.id,
+                                                                    "scheduler: failed to release \
+                                                                     pending claim after double \
+                                                                     confirm failure: {re}"
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1267,27 +1289,35 @@ async fn scrub_terminal_task_ids(
     if assigned.is_empty() {
         return Ok(0);
     }
-    let terminal_ids: Vec<String> = assigned
-        .into_iter()
-        .filter_map(|(_, _, task_id)| {
-            let tid = harness_core::types::TaskId(task_id.clone());
-            task_store.get(&tid).and_then(|t| {
-                if matches!(
-                    t.status,
-                    TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
-                ) {
-                    Some(task_id)
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
-    if terminal_ids.is_empty() {
+    let mut done_ids: Vec<String> = Vec::new();
+    let mut retry_ids: Vec<String> = Vec::new();
+    for (_, _, task_id) in assigned {
+        let tid = harness_core::types::TaskId(task_id.clone());
+        if let Some(t) = task_store.get(&tid) {
+            match t.status {
+                // Done: fix PR was approved — mark the finding resolved so it is
+                // not re-queued on the next cycle.
+                TaskStatus::Done => done_ids.push(task_id),
+                // Failed/Cancelled: fix attempt did not succeed — reset to NULL
+                // so the finding can be retried on the next cycle.
+                TaskStatus::Failed | TaskStatus::Cancelled => retry_ids.push(task_id),
+                _ => {}
+            }
+        }
+    }
+    if done_ids.is_empty() && retry_ids.is_empty() {
         return Ok(0);
     }
-    let refs: Vec<&str> = terminal_ids.iter().map(String::as_str).collect();
-    review_store.reset_task_ids_for_terminal(&refs).await
+    let mut freed = 0u64;
+    if !done_ids.is_empty() {
+        let refs: Vec<&str> = done_ids.iter().map(String::as_str).collect();
+        freed += review_store.resolve_findings_for_done_tasks(&refs).await?;
+    }
+    if !retry_ids.is_empty() {
+        let refs: Vec<&str> = retry_ids.iter().map(String::as_str).collect();
+        freed += review_store.reset_task_ids_for_terminal(&refs).await?;
+    }
+    Ok(freed)
 }
 
 #[cfg(test)]
