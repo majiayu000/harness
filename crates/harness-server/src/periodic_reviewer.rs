@@ -1069,20 +1069,38 @@ async fn run_review_tick(
                                                             )
                                                             .await
                                                         {
-                                                            // The task was already enqueued successfully;
-                                                            // do NOT release the claim.  Releasing would
-                                                            // set task_id = NULL and make this finding
-                                                            // spawn-eligible again on the next tick,
-                                                            // producing a duplicate auto-fix task.
-                                                            // Leave the finding in 'pending' (stuck) state
-                                                            // and let an operator investigate.
+                                                            // Both confirm attempts failed.  Leaving the
+                                                            // finding with task_id = 'pending' would strand
+                                                            // it permanently — list_spawnable_findings only
+                                                            // considers task_id IS NULL rows, so the finding
+                                                            // would never be auto-fixed.
+                                                            //
+                                                            // We release the claim here to allow the next
+                                                            // scheduler cycle to retry.  This carries a small
+                                                            // risk of spawning a duplicate fix task if the
+                                                            // original task is still running, but a transient
+                                                            // duplicate is far preferable to a permanently
+                                                            // stranded finding.
                                                             tracing::error!(
                                                                 finding_id = %finding.id,
                                                                 task_id = %fix_task_id,
                                                                 "scheduler: confirm_task_spawned retry failed; \
-                                                                 task already enqueued — claim NOT released \
-                                                                 to prevent duplicate fix tasks: {e2}"
+                                                                 releasing claim so next cycle can retry \
+                                                                 (duplicate task risk accepted): {e2}"
                                                             );
+                                                            if let Err(re) = rs
+                                                                .release_claim(
+                                                                    &finding.rule_id,
+                                                                    &finding.file,
+                                                                )
+                                                                .await
+                                                            {
+                                                                tracing::warn!(
+                                                                    finding_id = %finding.id,
+                                                                    "scheduler: failed to release claim \
+                                                                     after double confirm failure: {re}"
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                 }
