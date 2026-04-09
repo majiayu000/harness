@@ -59,7 +59,13 @@ struct ReviewState {
 /// point at a different repository, the new root gets its own key and reviews
 /// start from scratch instead of inheriting the previous root's history.
 fn project_hook_key(name: &str, root: &std::path::Path) -> String {
-    format!("periodic_review:{}@{}", name, root.display())
+    // Percent-encode '%' first (to avoid double-encoding), then '@', so that
+    // project names containing '@' cannot be confused with the name/root
+    // separator.  Root paths are absolute filesystem paths on macOS/Linux and
+    // do not require encoding — the first '@' after the colon is unambiguously
+    // the separator once the name is encoded.
+    let encoded_name = name.replace('%', "%25").replace('@', "%40");
+    format!("periodic_review:{}@{}", encoded_name, root.display())
 }
 
 pub fn start(state: Arc<AppState>, config: ReviewConfig) {
@@ -298,6 +304,33 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
         .map(|(n, p)| (n.as_str(), p))
         .collect();
 
+    // Pre-fetch live registry roots so that a runtime `POST /projects` upsert
+    // (same ID, new root) is honoured when resolving config project roots.
+    // Without this, config projects would always use the stale config/startup
+    // root while normal task routing resolves via the registry, creating
+    // split-brain execution against different repositories.
+    //
+    // Priority: registry (live) > startup CLI flag > config file (static).
+    let registry_root_by_id: HashMap<String, PathBuf> =
+        if let Some(registry) = state.core.project_registry.as_deref() {
+            match registry.list().await {
+                Ok(projects) => projects
+                    .into_iter()
+                    .filter(|p| p.active)
+                    .map(|p| (p.id.clone(), p.root.clone()))
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        "scheduler: failed to pre-fetch registry project roots; \
+                         config/startup roots will be used as fallback: {e}"
+                    );
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
+
     // Track roots and names already covered to deduplicate config vs registry entries.
     let mut seen_roots: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -324,12 +357,18 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
     } else {
         result.reserve(config_projects.len());
         for entry in config_projects {
-            // Use the CLI-overridden path from startup_projects when available.
-            // startup_projects already has canonicalized paths and incorporates
-            // any `--project name=path` override for this entry's name.
-            let effective_root: PathBuf = startup_path_by_name
+            // Resolve effective root with priority: registry (live) > startup CLI > config.
+            // Consulting the registry first ensures that a runtime `POST /projects`
+            // upsert (same ID, new root) is honoured — the registry is the
+            // authoritative live-state source, while startup/config are static snapshots.
+            let effective_root: PathBuf = registry_root_by_id
                 .get(entry.name.as_str())
-                .map(|p| (*p).clone())
+                .cloned()
+                .or_else(|| {
+                    startup_path_by_name
+                        .get(entry.name.as_str())
+                        .map(|p| (*p).clone())
+                })
                 .unwrap_or_else(|| entry.root.clone());
 
             if !effective_root.exists() {
