@@ -434,7 +434,111 @@ async fn run_review_tick(
                         .await
                     {
                         Ok(n) => {
-                            tracing::info!(new_findings = n, "scheduler: review findings persisted")
+                            tracing::info!(
+                                new_findings = n,
+                                "scheduler: review findings persisted"
+                            );
+                            // Auto-spawn fix tasks for P1/P2 open findings that have
+                            // no existing task yet (task_id IS NULL = dedup guard).
+                            // P0 excluded: critical issues require human judgment.
+                            // P3 excluded: informational only, too low priority.
+                            match rs
+                                .list_spawnable_findings(&final_task_id.0, &["P1", "P2"])
+                                .await
+                            {
+                                Ok(spawnable) => {
+                                    for finding in spawnable {
+                                        let prompt = format!(
+                                            "Fix finding '{}' ({}, {}:{}): {}\n\nRequired action: {}",
+                                            finding.title,
+                                            finding.rule_id,
+                                            finding.file,
+                                            finding.line,
+                                            finding.description,
+                                            finding.action
+                                        );
+                                        // Claim before enqueue: atomically mark this
+                                        // finding as "pending" so concurrent pollers
+                                        // see task_id IS NOT NULL and skip it.  Only
+                                        // if the claim succeeds do we enqueue a task,
+                                        // preventing orphaned tasks on race loss.
+                                        match rs
+                                            .try_claim_finding(&finding.rule_id, &finding.file)
+                                            .await
+                                        {
+                                            Ok(false) => {
+                                                tracing::debug!(
+                                                    finding_id = %finding.id,
+                                                    "scheduler: finding already claimed by concurrent poller, skipping"
+                                                );
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    finding_id = %finding.id,
+                                                    "scheduler: failed to claim finding: {e}"
+                                                );
+                                                continue;
+                                            }
+                                            Ok(true) => {} // won the claim
+                                        }
+                                        let req = CreateTaskRequest {
+                                            prompt: Some(prompt),
+                                            source: Some("auto-fix".into()),
+                                            ..CreateTaskRequest::default()
+                                        };
+                                        match task_routes::enqueue_task(&state_for_synthesis, req)
+                                            .await
+                                        {
+                                            Ok(fix_task_id) => {
+                                                match rs
+                                                    .confirm_task_spawned(
+                                                        &finding.rule_id,
+                                                        &finding.file,
+                                                        &fix_task_id.0,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(()) => {
+                                                        tracing::info!(
+                                                            finding_id = %finding.id,
+                                                            task_id = %fix_task_id,
+                                                            "scheduler: auto-fix task spawned"
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            finding_id = %finding.id,
+                                                            "scheduler: failed to confirm task spawn: {e}"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                // Release the claim so the next cycle can retry.
+                                                if let Err(re) = rs
+                                                    .release_claim(&finding.rule_id, &finding.file)
+                                                    .await
+                                                {
+                                                    tracing::warn!(
+                                                        finding_id = %finding.id,
+                                                        "scheduler: failed to release claim after enqueue failure: {re}"
+                                                    );
+                                                }
+                                                tracing::warn!(
+                                                    finding_id = %finding.id,
+                                                    "scheduler: failed to spawn fix task: {e}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "scheduler: failed to list spawnable findings: {e}"
+                                    );
+                                }
+                            }
                         }
                         Err(e) => tracing::warn!("scheduler: failed to persist findings: {e}"),
                     }
