@@ -52,6 +52,16 @@ struct ReviewState {
 ///
 /// If review is disabled in config the loop returns immediately without
 /// spawning anything; no resources are consumed.
+/// Returns the EventStore watermark key for a project.
+///
+/// Encoding the root path prevents stale watermarks from leaking across a
+/// root re-point: if a registered project is updated (via registry upsert) to
+/// point at a different repository, the new root gets its own key and reviews
+/// start from scratch instead of inheriting the previous root's history.
+fn project_hook_key(name: &str, root: &std::path::Path) -> String {
+    format!("periodic_review:{}@{}", name, root.display())
+}
+
 pub fn start(state: Arc<AppState>, config: ReviewConfig) {
     if !config.enabled {
         tracing::debug!("scheduler: periodic review disabled, review_loop not started");
@@ -90,7 +100,7 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     let mut min_delay = interval;
     let mut project_delays: Vec<Duration> = Vec::with_capacity(projects.len());
     for project in &projects {
-        let hook_key = format!("periodic_review:{}", project.name);
+        let hook_key = project_hook_key(&project.name, &project.root);
         let delay = match last_review_timestamp(&state, &hook_key).await {
             Some(last_ts) => {
                 let elapsed = Utc::now().signed_duration_since(last_ts);
@@ -131,21 +141,47 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
         sleep(min_delay).await;
     }
 
-    // Record the baseline before running the first tick so that deferred
-    // projects are scheduled relative to this point, not after the (potentially
-    // slow) first-tick processing completes.  Without this, run_review_tick
-    // executions can delay deferred projects by their own wall-clock duration.
-    let startup_now = Instant::now();
+    // Re-collect after the startup sleep to pick up projects registered via
+    // `POST /projects` during the sleep window (5 s init + min_delay).
+    // Build a delay-by-name lookup first so newly registered projects (absent
+    // from the original snapshot) default to delay=0 and run on the first tick.
+    let startup_delay_by_name: HashMap<String, Duration> = projects
+        .iter()
+        .zip(project_delays.iter())
+        .map(|(p, &d)| (p.name.clone(), d))
+        .collect();
+    let projects = collect_projects(&state).await;
+    // Ensure state_map covers any projects that appeared during the sleep.
+    for p in &projects {
+        state_map
+            .entry(p.name.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(ReviewState::default())));
+    }
+
+    // Build next_run_map incrementally so each project's schedule is anchored
+    // to its own tick-completion time.  A single startup_now captured before
+    // first-pass processing would place startup_now + interval in the past for
+    // slow guard scans / queue waits, triggering an immediate re-review and
+    // avoidable quota spikes when the main loop starts.
+    let mut next_run_map: HashMap<String, Instant> = HashMap::new();
 
     // First tick: only run projects that became due within the startup sleep window.
     // Projects whose remaining time exceeds min_delay are deferred to the regular
     // interval loop, avoiding unnecessary task/quota spikes on restart.
-    for (project, &project_delay) in projects.iter().zip(project_delays.iter()) {
+    for project in &projects {
+        let project_delay = *startup_delay_by_name
+            .get(&project.name)
+            .unwrap_or(&Duration::ZERO);
         if project_delay > min_delay {
             tracing::debug!(
                 project = %project.name,
                 remaining_secs = (project_delay - min_delay).as_secs(),
                 "scheduler: project not yet due at startup, deferring to next scheduled tick"
+            );
+            // Anchor deferred schedule relative to now (after sleep elapsed).
+            next_run_map.insert(
+                project.name.clone(),
+                Instant::now() + project_delay.saturating_sub(min_delay),
             );
             continue;
         }
@@ -156,32 +192,16 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
                 "scheduler: review tick failed: {e}"
             );
         }
+        // Anchor to Instant::now() post-tick so slow guard scans or queue
+        // waits never place next_run in the past before the main loop starts.
+        next_run_map.insert(project.name.clone(), Instant::now() + interval);
     }
 
-    // Track per-project next-run instants so that projects which were not run
-    // during the first tick (because their remaining delay exceeded min_delay)
-    // are not pushed back by a full `interval` before their first review.
-    let next_run: Vec<Instant> = projects
+    // Track last-known root per project name so root re-pointing (registry
+    // upsert to a different path) is detected each tick and triggers eviction.
+    let mut root_by_name: HashMap<String, PathBuf> = projects
         .iter()
-        .zip(project_delays.iter())
-        .map(|(_, &d)| {
-            if d <= min_delay {
-                // Was reviewed in the first tick — next run after a full interval.
-                startup_now + interval
-            } else {
-                // Not yet reviewed — schedule at the remaining delay minus the
-                // startup sleep already elapsed.
-                startup_now + d.saturating_sub(min_delay)
-            }
-        })
-        .collect();
-
-    // Convert startup per-project Vec<Instant> to HashMap keyed by project name
-    // so that dynamically registered projects can be added in the main loop.
-    let mut next_run_map: HashMap<String, Instant> = projects
-        .iter()
-        .zip(next_run.into_iter())
-        .map(|(p, t)| (p.name.clone(), t))
+        .map(|p| (p.name.clone(), p.root.clone()))
         .collect();
 
     loop {
@@ -197,6 +217,26 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
         // and the loop spins with sleep(0) until restart.
         next_run_map.retain(|name, _| current_names.contains(name.as_str()));
         state_map.retain(|name, _| current_names.contains(name.as_str()));
+        root_by_name.retain(|name, _| current_names.contains(name.as_str()));
+
+        // Detect root changes: if a project was re-pointed to a different
+        // repository via a registry upsert, evict its stale in-memory state
+        // and schedule so the new repo's history is not silently skipped.
+        for p in &current_projects {
+            if let Some(old_root) = root_by_name.get(&p.name) {
+                if *old_root != p.root {
+                    tracing::info!(
+                        project = %p.name,
+                        old_root = %old_root.display(),
+                        new_root = %p.root.display(),
+                        "scheduler: project root changed, resetting review state and schedule"
+                    );
+                    state_map.remove(&p.name);
+                    next_run_map.remove(&p.name);
+                }
+            }
+            root_by_name.insert(p.name.clone(), p.root.clone());
+        }
 
         for p in &current_projects {
             state_map
@@ -497,7 +537,7 @@ async fn run_review_tick(
     project: &ProjectInfo,
 ) -> anyhow::Result<()> {
     let project_root = &project.root;
-    let hook_key = format!("periodic_review:{}", project.name);
+    let hook_key = project_hook_key(&project.name, project_root);
 
     // Query EventStore for the most recent watermark for this project.
     let events = state
