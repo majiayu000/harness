@@ -56,11 +56,48 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
     };
 
     let claude_projects_dir = home.join(".claude").join("projects");
-    if !claude_projects_dir.is_dir() {
-        return error_response(format!(
-            "token usage source directory missing: {}",
-            claude_projects_dir.display()
-        ));
+
+    // When --no-session-persistence is active, Claude Code does not write
+    // session JSONL files to disk. Distinguish three cases:
+    //
+    //   1. Projects directory absent (NotFound) — potentially a misconfiguration
+    //      (wrong $HOME, deleted directory, path regression). Emit a warning
+    //      so operators can detect it in logs, and include a diagnostic field
+    //      in the response so callers can distinguish from genuine empty usage.
+    //
+    //   2. Directory present but no JSONL files — the expected steady-state
+    //      when --no-session-persistence is active. Silently return empty.
+    //
+    //   3. Metadata error other than NotFound (e.g. permission denied) — this
+    //      is a real OS-level failure that must surface as an error, not be
+    //      silently treated as "directory absent".
+    match std::fs::metadata(&claude_projects_dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return error_response(format!(
+                "token usage path is not a directory: {}",
+                claude_projects_dir.display()
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // NotFound is the expected steady state when --no-session-persistence
+            // is active.  Log at debug so that normal deployments do not flood
+            // warn-level logs on every 5 s dashboard poll.  The source_dir_missing
+            // flag in the JSON response surfaces the diagnostic to operators via
+            // the dashboard UI instead.
+            tracing::debug!(
+                path = %claude_projects_dir.display(),
+                "token_usage: session projects directory not found; \
+                 returning empty metrics (expected with --no-session-persistence)"
+            );
+            return missing_dir_response();
+        }
+        Err(e) => {
+            return error_response(format!(
+                "cannot access token usage directory {}: {e}",
+                claude_projects_dir.display()
+            ));
+        }
     }
 
     let files = match collect_session_files(&claude_projects_dir) {
@@ -69,10 +106,7 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
     };
 
     if files.is_empty() {
-        return error_response(format!(
-            "no token usage JSONL files found under {}",
-            claude_projects_dir.display()
-        ));
+        return empty_usage_response();
     }
 
     let mut by_day: BTreeMap<String, UsageBucket> = BTreeMap::new();
@@ -234,6 +268,52 @@ fn error_response(message: String) -> (StatusCode, Json<Value>) {
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({ "error": message })),
     )
+}
+
+/// Return zeroed metrics with 200 OK when the projects directory is missing.
+///
+/// Unlike `empty_usage_response`, this includes `"source_dir_missing": true`
+/// so callers and monitoring can distinguish "directory absent" (potentially a
+/// misconfiguration) from "directory present but no sessions yet" (expected
+/// in --no-session-persistence environments).
+fn missing_dir_response() -> (StatusCode, Json<Value>) {
+    let body = serde_json::json!({
+        "by_day": {},
+        "by_hour": {},
+        "model_trend": {},
+        "by_model": {},
+        "models": [],
+        "totals": UsageBucket::default(),
+        "total_context": 0,
+        "total_requests": 0,
+        "estimated_cost_usd": 0.0,
+        "task_usage": [],
+        "session_count": 0,
+        "source_dir_missing": true,
+    });
+    (StatusCode::OK, Json(body))
+}
+
+/// Return zeroed metrics with 200 OK when no session files are available.
+///
+/// This is the correct response when `--no-session-persistence` is active:
+/// agents do not write JSONL files, so an absent or empty projects directory
+/// is expected, not an error.
+fn empty_usage_response() -> (StatusCode, Json<Value>) {
+    let body = serde_json::json!({
+        "by_day": {},
+        "by_hour": {},
+        "model_trend": {},
+        "by_model": {},
+        "models": [],
+        "totals": UsageBucket::default(),
+        "total_context": 0,
+        "total_requests": 0,
+        "estimated_cost_usd": 0.0,
+        "task_usage": [],
+        "session_count": 0,
+    });
+    (StatusCode::OK, Json(body))
 }
 
 fn parse_usage_record(entry: &Value, ctx: &str) -> Result<Option<ParsedUsageRecord>, String> {

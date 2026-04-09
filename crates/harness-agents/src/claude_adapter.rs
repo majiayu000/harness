@@ -15,14 +15,19 @@ pub struct ClaudeAdapter {
     cli_path: PathBuf,
     default_model: String,
     child: Arc<Mutex<Option<tokio::process::Child>>>,
+    /// Whether the CLI binary supports `--no-session-persistence`. Probed once
+    /// at construction via `--help`; older builds skip the flag gracefully.
+    no_session_persistence: bool,
 }
 
 impl ClaudeAdapter {
     pub fn new(cli_path: PathBuf, default_model: String) -> Self {
+        let no_session_persistence = crate::probe_no_session_persistence(&cli_path);
         Self {
             cli_path,
             default_model,
             child: Arc::new(Mutex::new(None)),
+            no_session_persistence,
         }
     }
 }
@@ -53,6 +58,10 @@ impl AgentAdapter for ClaudeAdapter {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         crate::strip_claude_env(&mut cmd);
+
+        if self.no_session_persistence {
+            cmd.arg("--no-session-persistence");
+        }
 
         if !req.allowed_tools.is_empty() {
             cmd.arg("--allowedTools").arg(req.allowed_tools.join(","));

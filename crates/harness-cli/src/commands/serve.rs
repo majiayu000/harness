@@ -136,7 +136,8 @@ pub async fn run(
         serve_config.agents.claude.cli_path.clone(),
         serve_config.agents.claude.default_model.clone(),
         serve_config.agents.sandbox_mode,
-    );
+    )
+    .with_no_session_persistence_probe();
     if let Some(budget) = serve_config.agents.claude.reasoning_budget.clone() {
         claude_agent = claude_agent.with_reasoning_budget(budget);
     }
