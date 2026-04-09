@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+use tokio::time::Instant;
 
 /// Per-project information resolved once at startup and reused each tick.
 struct ProjectInfo {
@@ -151,15 +152,46 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
         }
     }
 
+    // Track per-project next-run instants so that projects which were not run
+    // during the first tick (because their remaining delay exceeded min_delay)
+    // are not pushed back by a full `interval` before their first review.
+    let startup_now = Instant::now();
+    let mut next_run: Vec<Instant> = projects
+        .iter()
+        .zip(project_delays.iter())
+        .map(|(_, &d)| {
+            if d <= min_delay {
+                // Was reviewed in the first tick — next run after a full interval.
+                startup_now + interval
+            } else {
+                // Not yet reviewed — schedule at the remaining delay minus the
+                // startup sleep already elapsed.
+                startup_now + d.saturating_sub(min_delay)
+            }
+        })
+        .collect();
+
     loop {
-        sleep(interval).await;
-        for project in &projects {
-            let review_state = state_map[&project.name].clone();
-            if let Err(e) = run_review_tick(&state, &config, &review_state, project).await {
-                tracing::error!(
-                    project = %project.name,
-                    "scheduler: review tick failed: {e}"
-                );
+        // Sleep only until the earliest project becomes due, not a full interval.
+        let sleep_dur = next_run
+            .iter()
+            .copied()
+            .min()
+            .map(|earliest| earliest.saturating_duration_since(Instant::now()))
+            .unwrap_or(interval);
+        sleep(sleep_dur).await;
+
+        let tick_now = Instant::now();
+        for (i, project) in projects.iter().enumerate() {
+            if next_run[i] <= tick_now {
+                let review_state = state_map[&project.name].clone();
+                if let Err(e) = run_review_tick(&state, &config, &review_state, project).await {
+                    tracing::error!(
+                        project = %project.name,
+                        "scheduler: review tick failed: {e}"
+                    );
+                }
+                next_run[i] = Instant::now() + interval;
             }
         }
     }
@@ -176,11 +208,26 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
 /// `state.core.project_root` for backward compatibility.
 async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
     let config_projects = &state.core.server.config.projects;
+
+    // Build a lookup from startup_projects so we can resolve the effective path
+    // for each config entry.  `startup_projects` is populated by the CLI layer
+    // (`serve.rs`) and already incorporates two things that `config.projects`
+    // does not: (a) canonicalized paths, and (b) `--project name=path` CLI
+    // overrides that replace same-named config entries.  Using it here ensures
+    // that a CLI override is honoured and the old config path is never reviewed.
+    let startup_path_by_name: HashMap<&str, &PathBuf> = state
+        .core
+        .server
+        .startup_projects
+        .iter()
+        .map(|(n, p)| (n.as_str(), p))
+        .collect();
+
     // Track roots already covered to deduplicate config vs registry entries.
     let mut seen_roots: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut result: Vec<ProjectInfo> = Vec::new();
 
-    if config_projects.is_empty() {
+    if config_projects.is_empty() && state.core.server.startup_projects.is_empty() {
         // Backward-compat: seed with the default project root.
         let root = state.core.project_root.clone();
         let name = root
@@ -200,15 +247,23 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
     } else {
         result.reserve(config_projects.len());
         for entry in config_projects {
-            if !entry.root.exists() {
+            // Use the CLI-overridden path from startup_projects when available.
+            // startup_projects already has canonicalized paths and incorporates
+            // any `--project name=path` override for this entry's name.
+            let effective_root: PathBuf = startup_path_by_name
+                .get(entry.name.as_str())
+                .map(|p| (*p).clone())
+                .unwrap_or_else(|| entry.root.clone());
+
+            if !effective_root.exists() {
                 tracing::warn!(
                     project = %entry.name,
-                    root = %entry.root.display(),
+                    root = %effective_root.display(),
                     "scheduler: project root does not exist on disk, skipping"
                 );
                 continue;
             }
-            let project_cfg = match load_project_config(&entry.root) {
+            let project_cfg = match load_project_config(&effective_root) {
                 Ok(cfg) => cfg,
                 Err(e) => {
                     tracing::warn!(
@@ -229,10 +284,16 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
                 );
                 continue;
             }
-            seen_roots.insert(entry.root.clone());
+            // Insert both raw and canonical forms so that relative/absolute
+            // aliasing of the same path does not produce duplicate entries.
+            let canonical_entry_root = effective_root
+                .canonicalize()
+                .unwrap_or_else(|_| effective_root.clone());
+            seen_roots.insert(effective_root.clone());
+            seen_roots.insert(canonical_entry_root);
             result.push(ProjectInfo {
                 name: entry.name.clone(),
-                root: entry.root.clone(),
+                root: effective_root,
                 review_type: project_cfg.review_type,
             });
         }
@@ -284,6 +345,10 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
                         root: proj.root.clone(),
                         review_type,
                     });
+                    // Mark both raw and canonical forms as seen so that a second
+                    // registry entry for the same physical root is skipped.
+                    seen_roots.insert(proj.root.clone());
+                    seen_roots.insert(canonical);
                 }
             }
             Err(e) => {
