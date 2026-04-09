@@ -102,7 +102,7 @@ pub async fn skill_governance_view(
                 scored_samples: skill.scored_samples,
                 canary_ratio: skill.canary_ratio,
                 last_scored: skill.last_scored,
-                freshness: skill.classify_freshness(),
+                freshness: skill.classify_freshness(chrono::Utc::now()),
             };
             match serde_json::to_value(&view) {
                 Ok(v) => RpcResponse::success(id, v),

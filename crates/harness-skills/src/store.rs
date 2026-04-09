@@ -517,11 +517,12 @@ impl SkillStore {
     /// then by `last_used` ascending (oldest first), with `None` (never used)
     /// last.
     pub fn list_stale(&self) -> Vec<(&Skill, FreshnessClass)> {
+        let now = Utc::now();
         let mut entries: Vec<(&Skill, FreshnessClass)> = self
             .skills
             .iter()
             .filter_map(|s| {
-                let class = s.classify_freshness();
+                let class = s.classify_freshness(now);
                 match class {
                     FreshnessClass::Dormant | FreshnessClass::Stale => Some((s, class)),
                     _ => None,

@@ -34,12 +34,12 @@ impl Skill {
     /// - age <= 30d → Active
     /// - age <= 90d AND scored_samples >= 5 → Dormant
     /// - otherwise → Stale
-    pub fn classify_freshness(&self) -> FreshnessClass {
+    pub fn classify_freshness(&self, now: chrono::DateTime<Utc>) -> FreshnessClass {
         let Some(last_used) = self.last_used else {
             // Never used → Stale
             return FreshnessClass::Stale;
         };
-        let age = Utc::now() - last_used;
+        let age = now - last_used;
         if age <= chrono::Duration::days(FRESH_DAYS) {
             FreshnessClass::Fresh
         } else if age <= chrono::Duration::days(ACTIVE_DAYS) {
@@ -88,13 +88,13 @@ mod tests {
     #[test]
     fn never_used_is_stale() {
         let skill = make_skill_with(None, 0);
-        assert_eq!(skill.classify_freshness(), FreshnessClass::Stale);
+        assert_eq!(skill.classify_freshness(Utc::now()), FreshnessClass::Stale);
     }
 
     #[test]
     fn used_3_days_ago_is_fresh() {
         let skill = make_skill_with(Some(days_ago(3)), 0);
-        assert_eq!(skill.classify_freshness(), FreshnessClass::Fresh);
+        assert_eq!(skill.classify_freshness(Utc::now()), FreshnessClass::Fresh);
     }
 
     #[test]
@@ -103,38 +103,41 @@ mod tests {
         // accounting for time elapsed between skill construction and the check.
         let last_used = Utc::now() - chrono::Duration::days(7) + chrono::Duration::seconds(1);
         let skill = make_skill_with(Some(last_used), 0);
-        assert_eq!(skill.classify_freshness(), FreshnessClass::Fresh);
+        assert_eq!(skill.classify_freshness(Utc::now()), FreshnessClass::Fresh);
     }
 
     #[test]
     fn used_8_days_ago_is_active() {
         let skill = make_skill_with(Some(days_ago(8)), 0);
-        assert_eq!(skill.classify_freshness(), FreshnessClass::Active);
+        assert_eq!(skill.classify_freshness(Utc::now()), FreshnessClass::Active);
     }
 
     #[test]
     fn used_30_days_ago_is_active_boundary_inclusive() {
         let last_used = Utc::now() - chrono::Duration::days(30) + chrono::Duration::seconds(1);
         let skill = make_skill_with(Some(last_used), 0);
-        assert_eq!(skill.classify_freshness(), FreshnessClass::Active);
+        assert_eq!(skill.classify_freshness(Utc::now()), FreshnessClass::Active);
     }
 
     #[test]
     fn used_31_days_ago_high_samples_is_dormant() {
         let skill = make_skill_with(Some(days_ago(31)), 6);
-        assert_eq!(skill.classify_freshness(), FreshnessClass::Dormant);
+        assert_eq!(
+            skill.classify_freshness(Utc::now()),
+            FreshnessClass::Dormant
+        );
     }
 
     #[test]
     fn used_31_days_ago_low_samples_is_stale() {
         let skill = make_skill_with(Some(days_ago(31)), 4);
-        assert_eq!(skill.classify_freshness(), FreshnessClass::Stale);
+        assert_eq!(skill.classify_freshness(Utc::now()), FreshnessClass::Stale);
     }
 
     #[test]
     fn used_91_days_ago_high_samples_is_stale() {
         let skill = make_skill_with(Some(days_ago(91)), 10);
-        assert_eq!(skill.classify_freshness(), FreshnessClass::Stale);
+        assert_eq!(skill.classify_freshness(Utc::now()), FreshnessClass::Stale);
     }
 
     #[test]
