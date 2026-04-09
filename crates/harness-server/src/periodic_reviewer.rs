@@ -183,6 +183,16 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
         // Re-collect on each tick to pick up projects registered at runtime
         // via `POST /projects` without requiring a server restart.
         let current_projects = collect_projects(&state).await;
+        let current_names: std::collections::HashSet<&str> =
+            current_projects.iter().map(|p| p.name.as_str()).collect();
+
+        // Prune stale entries for projects that were removed since last tick.
+        // Without this, a removed project's expired deadline stays in
+        // next_run_map; once it passes, saturating_duration_since returns 0
+        // and the loop spins with sleep(0) until restart.
+        next_run_map.retain(|name, _| current_names.contains(name.as_str()));
+        state_map.retain(|name, _| current_names.contains(name.as_str()));
+
         for p in &current_projects {
             state_map
                 .entry(p.name.clone())
@@ -311,6 +321,19 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
             let canonical_entry_root = effective_root
                 .canonicalize()
                 .unwrap_or_else(|_| effective_root.clone());
+            // Skip if this name or root was already added (handles duplicate
+            // [[projects]] entries with the same name or same physical path).
+            if seen_names.contains(&entry.name)
+                || seen_roots.contains(&effective_root)
+                || seen_roots.contains(&canonical_entry_root)
+            {
+                tracing::warn!(
+                    project = %entry.name,
+                    root = %effective_root.display(),
+                    "scheduler: duplicate config project (same name or root), skipping"
+                );
+                continue;
+            }
             seen_names.insert(entry.name.clone());
             seen_roots.insert(effective_root.clone());
             seen_roots.insert(canonical_entry_root);
