@@ -516,8 +516,7 @@ impl SkillStore {
     /// [`FreshnessClass::Stale`], sorted by staleness: Stale before Dormant,
     /// then by `last_used` ascending (oldest first), with `None` (never used)
     /// last.
-    pub fn list_stale(&self) -> Vec<(&Skill, FreshnessClass)> {
-        let now = Utc::now();
+    pub fn list_stale(&self, now: DateTime<Utc>) -> Vec<(&Skill, FreshnessClass)> {
         let mut entries: Vec<(&Skill, FreshnessClass)> = self
             .skills
             .iter()

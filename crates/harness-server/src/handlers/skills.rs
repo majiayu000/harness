@@ -128,7 +128,7 @@ pub async fn skill_stale(state: &AppState, id: Option<serde_json::Value>) -> Rpc
     let entries: Vec<StaleEntry> = {
         let skills = state.engines.skills.read().await;
         skills
-            .list_stale()
+            .list_stale(chrono::Utc::now())
             .into_iter()
             .map(|(s, freshness)| StaleEntry {
                 skill_id: s.id.clone(),

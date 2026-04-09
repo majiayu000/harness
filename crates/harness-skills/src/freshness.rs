@@ -40,11 +40,11 @@ impl Skill {
             return FreshnessClass::Stale;
         };
         let age = now - last_used;
-        if age <= chrono::Duration::days(FRESH_DAYS) {
+        if age <= chrono::TimeDelta::days(FRESH_DAYS) {
             FreshnessClass::Fresh
-        } else if age <= chrono::Duration::days(ACTIVE_DAYS) {
+        } else if age <= chrono::TimeDelta::days(ACTIVE_DAYS) {
             FreshnessClass::Active
-        } else if age <= chrono::Duration::days(DORMANT_DAYS)
+        } else if age <= chrono::TimeDelta::days(DORMANT_DAYS)
             && self.scored_samples >= MIN_SAMPLES_DORMANT
         {
             FreshnessClass::Dormant
@@ -82,7 +82,7 @@ mod tests {
     }
 
     fn days_ago(n: i64) -> chrono::DateTime<Utc> {
-        Utc::now() - chrono::Duration::days(n)
+        Utc::now() - chrono::TimeDelta::days(n)
     }
 
     #[test]
@@ -101,7 +101,7 @@ mod tests {
     fn used_7_days_ago_is_fresh_boundary_inclusive() {
         // Use N days minus 1 second so the age is just inside the boundary even
         // accounting for time elapsed between skill construction and the check.
-        let last_used = Utc::now() - chrono::Duration::days(7) + chrono::Duration::seconds(1);
+        let last_used = Utc::now() - chrono::TimeDelta::days(7) + chrono::TimeDelta::seconds(1);
         let skill = make_skill_with(Some(last_used), 0);
         assert_eq!(skill.classify_freshness(Utc::now()), FreshnessClass::Fresh);
     }
@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn used_30_days_ago_is_active_boundary_inclusive() {
-        let last_used = Utc::now() - chrono::Duration::days(30) + chrono::Duration::seconds(1);
+        let last_used = Utc::now() - chrono::TimeDelta::days(30) + chrono::TimeDelta::seconds(1);
         let skill = make_skill_with(Some(last_used), 0);
         assert_eq!(skill.classify_freshness(Utc::now()), FreshnessClass::Active);
     }
@@ -174,7 +174,7 @@ mod tests {
             s
         });
 
-        let results = store.list_stale();
+        let results = store.list_stale(Utc::now());
         let names: Vec<&str> = results.iter().map(|(s, _)| s.name.as_str()).collect();
 
         // Fresh excluded
@@ -213,7 +213,7 @@ mod tests {
             .skills_mut()
             .push(make_skill_with(Some(days_ago(95)), 0)); // Stale
 
-        let results = store.list_stale();
+        let results = store.list_stale(Utc::now());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, FreshnessClass::Stale);
     }
