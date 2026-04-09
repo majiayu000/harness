@@ -1055,6 +1055,10 @@ async fn run_review_tick(
                                                             task_id = %fix_task_id,
                                                             "scheduler: confirm_task_spawned failed, retrying once: {e}"
                                                         );
+                                                        // Brief pause before retry — improves success
+                                                        // rate against transient SQLite "database is
+                                                        // locked" errors.
+                                                        sleep(Duration::from_millis(100)).await;
                                                         // Retry once — the UPDATE is idempotent so a
                                                         // second attempt is safe.
                                                         if let Err(e2) = rs
