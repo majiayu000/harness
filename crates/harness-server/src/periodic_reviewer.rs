@@ -1,6 +1,6 @@
 use crate::http::task_routes;
 use crate::http::AppState;
-use crate::task_runner::CreateTaskRequest;
+use crate::task_runner::{CreateTaskRequest, TaskStatus};
 use chrono::{DateTime, Utc};
 use harness_core::{
     config::misc::ReviewConfig,
@@ -909,6 +909,23 @@ async fn run_review_tick(
                                 new_findings = n,
                                 "scheduler: review findings persisted"
                             );
+                            // Before listing spawnable findings, reset task_id=NULL
+                            // for any finding whose confirmed fix task has reached a
+                            // terminal state.  This recovers findings that were left
+                            // with a real task_id after confirm_task_spawned exhausted
+                            // its retries, and also frees findings whose fix tasks
+                            // failed/were cancelled so they can be retried.
+                            match scrub_terminal_task_ids(rs, &state_for_synthesis.core.tasks).await
+                            {
+                                Ok(n) if n > 0 => tracing::info!(
+                                    freed = n,
+                                    "scheduler: freed {n} finding(s) with terminal task_id"
+                                ),
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!("scheduler: terminal task_id scrub failed: {e}")
+                                }
+                            }
                             // Auto-spawn fix tasks for P1/P2 open findings that have
                             // no existing task yet (task_id IS NULL = dedup guard).
                             // P0 excluded: critical issues require human judgment.
@@ -1050,10 +1067,30 @@ async fn run_review_tick(
                                                         );
                                                     }
                                                     Err(e) => {
+                                                        // Retry once — task_id is known, so the
+                                                        // finding must not stay stuck at 'pending'.
                                                         tracing::warn!(
                                                             finding_id = %finding.id,
-                                                            "scheduler: failed to confirm task spawn: {e}"
+                                                            task_id = %fix_task_id,
+                                                            "scheduler: confirm_task_spawned failed \
+                                                             ({e}), retrying once"
                                                         );
+                                                        if let Err(retry_err) = rs
+                                                            .confirm_task_spawned(
+                                                                &finding.rule_id,
+                                                                &finding.file,
+                                                                &fix_task_id.0,
+                                                            )
+                                                            .await
+                                                        {
+                                                            tracing::error!(
+                                                                finding_id = %finding.id,
+                                                                task_id = %fix_task_id,
+                                                                "scheduler: confirm_task_spawned \
+                                                                 retry also failed ({retry_err}); \
+                                                                 periodic cleanup will recover"
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1213,6 +1250,44 @@ fn truncate_to(s: &str, max_chars: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Reset `task_id = NULL` for open review findings whose confirmed fix task has
+/// reached a terminal state (Done / Failed / Cancelled).
+///
+/// This recovers findings stuck with a real `task_id` after
+/// `confirm_task_spawned` exhausted its retries, and also frees findings whose
+/// fix tasks completed (successfully or otherwise) so they can be re-queued on
+/// the next review cycle.  Returns the number of rows reset.
+async fn scrub_terminal_task_ids(
+    review_store: &crate::review_store::ReviewStore,
+    task_store: &crate::task_runner::TaskStore,
+) -> anyhow::Result<u64> {
+    let assigned = review_store.list_assigned_task_ids().await?;
+    if assigned.is_empty() {
+        return Ok(0);
+    }
+    let terminal_ids: Vec<String> = assigned
+        .into_iter()
+        .filter_map(|(_, _, task_id)| {
+            let tid = harness_core::types::TaskId(task_id.clone());
+            task_store.get(&tid).and_then(|t| {
+                if matches!(
+                    t.status,
+                    TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+                ) {
+                    Some(task_id)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    if terminal_ids.is_empty() {
+        return Ok(0);
+    }
+    let refs: Vec<&str> = terminal_ids.iter().map(String::as_str).collect();
+    review_store.reset_task_ids_for_terminal(&refs).await
 }
 
 #[cfg(test)]

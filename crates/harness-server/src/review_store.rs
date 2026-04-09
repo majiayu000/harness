@@ -297,6 +297,50 @@ impl ReviewStore {
         Ok(())
     }
 
+    /// List (rule_id, file, task_id) for all open findings with a confirmed real task_id.
+    ///
+    /// Excludes NULL (not yet claimed) and 'pending' (claim in progress) entries.
+    /// Used by the periodic orphan-cleanup to detect findings whose fix tasks have
+    /// reached a terminal state and should be freed for re-spawning.
+    pub async fn list_assigned_task_ids(&self) -> anyhow::Result<Vec<(String, String, String)>> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT rule_id, file, task_id FROM review_findings \
+             WHERE status = 'open' AND task_id IS NOT NULL AND task_id != 'pending'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Reset task_id to NULL for open findings whose task_id is in `terminal_task_ids`.
+    ///
+    /// Called after detecting that the associated fix tasks have reached a terminal
+    /// state (Done / Failed / Cancelled), freeing the finding for a new spawn attempt.
+    /// Returns the number of rows updated.
+    pub async fn reset_task_ids_for_terminal(
+        &self,
+        terminal_task_ids: &[&str],
+    ) -> anyhow::Result<u64> {
+        if terminal_task_ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = terminal_task_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE review_findings SET task_id = NULL \
+             WHERE status = 'open' AND task_id IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in terminal_task_ids {
+            query = query.bind(*id);
+        }
+        let result = query.execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
     fn rows_to_findings(rows: Vec<FindingRow>) -> Vec<ReviewFinding> {
         rows.into_iter()
             .map(
