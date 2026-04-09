@@ -507,27 +507,19 @@ async fn run_review_tick(
                                                         );
                                                     }
                                                     Err(e) => {
+                                                        // Do NOT release the claim here.  The task
+                                                        // was already enqueued (fix_task_id is
+                                                        // real); resetting task_id to NULL would
+                                                        // make list_spawnable_findings pick this
+                                                        // finding up again and spawn a duplicate
+                                                        // task on the next tick.  Leaving task_id
+                                                        // as 'pending' prevents re-scheduling.
                                                         tracing::warn!(
                                                             finding_id = %finding.id,
-                                                            "scheduler: failed to confirm task spawn: {e}; releasing claim for retry"
+                                                            task_id = %fix_task_id,
+                                                            "scheduler: task enqueued but confirm_task_spawned failed: {e}; \
+                                                             finding remains pending to prevent duplicate spawning"
                                                         );
-                                                        // Release the pending claim so the next cycle
-                                                        // can retry.  Without this, task_id stays
-                                                        // 'pending' forever and list_spawnable_findings
-                                                        // (which filters task_id IS NULL) never picks
-                                                        // it up again.
-                                                        if let Err(re) = rs
-                                                            .release_claim(
-                                                                &finding.rule_id,
-                                                                &finding.file,
-                                                            )
-                                                            .await
-                                                        {
-                                                            tracing::warn!(
-                                                                finding_id = %finding.id,
-                                                                "scheduler: failed to release claim after confirm failure: {re}"
-                                                            );
-                                                        }
                                                     }
                                                 }
                                             }
