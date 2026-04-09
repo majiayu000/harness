@@ -66,7 +66,7 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     let interval = config.effective_interval();
 
     // Resolve all projects to review once at startup.
-    let projects = collect_projects(&state);
+    let projects = collect_projects(&state).await;
     // Per-project state map: each project gets its own ReviewState mutex.
     let state_map: HashMap<String, Arc<Mutex<ReviewState>>> = projects
         .iter()
@@ -81,11 +81,13 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // Brief delay to let the server fully initialize before checking.
     sleep(Duration::from_secs(5)).await;
 
-    // On startup, compute the minimum remaining time across all projects.
-    // If any project is overdue, trigger immediately.
+    // On startup, compute the per-project remaining time and the global minimum.
+    // Only projects whose individual delay falls within the minimum sleep window
+    // are run on the first tick; others wait for the regular interval loop.
     let interval_chrono =
         chrono::Duration::from_std(interval).unwrap_or_else(|_| chrono::Duration::hours(24));
     let mut min_delay = interval;
+    let mut project_delays: Vec<Duration> = Vec::with_capacity(projects.len());
     for project in &projects {
         let hook_key = format!("periodic_review:{}", project.name);
         let delay = match last_review_timestamp(&state, &hook_key).await {
@@ -118,6 +120,7 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
                 Duration::from_secs(0)
             }
         };
+        project_delays.push(delay);
         if delay < min_delay {
             min_delay = delay;
         }
@@ -127,8 +130,18 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
         sleep(min_delay).await;
     }
 
-    // First tick (may be immediate if any project is overdue).
-    for project in &projects {
+    // First tick: only run projects that became due within the startup sleep window.
+    // Projects whose remaining time exceeds min_delay are deferred to the regular
+    // interval loop, avoiding unnecessary task/quota spikes on restart.
+    for (project, &project_delay) in projects.iter().zip(project_delays.iter()) {
+        if project_delay > min_delay {
+            tracing::debug!(
+                project = %project.name,
+                remaining_secs = (project_delay - min_delay).as_secs(),
+                "scheduler: project not yet due at startup, deferring to next scheduled tick"
+            );
+            continue;
+        }
         let review_state = state_map[&project.name].clone();
         if let Err(e) = run_review_tick(&state, &config, &review_state, project).await {
             tracing::error!(
@@ -154,12 +167,21 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
 
 /// Resolve all projects that should be periodically reviewed.
 ///
-/// If no `[[projects]]` are configured, falls back to a single entry derived
-/// from `state.core.project_root` for backward compatibility.
-fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
+/// Merges two sources:
+/// 1. `[[projects]]` entries from `server.config` (static config file).
+/// 2. Projects registered at runtime via CLI `--project` flags or the HTTP
+///    `POST /projects` API (stored in `project_registry`).
+///
+/// When neither source has entries, falls back to a single entry derived from
+/// `state.core.project_root` for backward compatibility.
+async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
     let config_projects = &state.core.server.config.projects;
+    // Track roots already covered to deduplicate config vs registry entries.
+    let mut seen_roots: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut result: Vec<ProjectInfo> = Vec::new();
+
     if config_projects.is_empty() {
-        // Backward-compat: use the default project root.
+        // Backward-compat: seed with the default project root.
         let root = state.core.project_root.clone();
         let name = root
             .file_name()
@@ -169,50 +191,110 @@ fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
         let review_type = load_project_config(&root)
             .map(|cfg| cfg.review_type)
             .unwrap_or_default();
-        return vec![ProjectInfo {
+        seen_roots.insert(root.clone());
+        result.push(ProjectInfo {
             name,
             root,
             review_type,
-        }];
-    }
-
-    let mut result = Vec::with_capacity(config_projects.len());
-    for entry in config_projects {
-        if !entry.root.exists() {
-            tracing::warn!(
-                project = %entry.name,
-                root = %entry.root.display(),
-                "scheduler: project root does not exist on disk, skipping"
-            );
-            continue;
-        }
-        let project_cfg = match load_project_config(&entry.root) {
-            Ok(cfg) => cfg,
-            Err(e) => {
+        });
+    } else {
+        result.reserve(config_projects.len());
+        for entry in config_projects {
+            if !entry.root.exists() {
                 tracing::warn!(
                     project = %entry.name,
-                    error = %e,
-                    "scheduler: failed to load project config, skipping"
+                    root = %entry.root.display(),
+                    "scheduler: project root does not exist on disk, skipping"
                 );
                 continue;
             }
-        };
-        // Respect explicit opt-out via `.harness/config.toml` [review] enabled = false.
-        // TODO(#617): add a separate `periodic_review_enabled` field to avoid dual-use
-        // of the PR-review `enabled` flag.
-        if project_cfg.review.as_ref().and_then(|r| r.enabled) == Some(false) {
-            tracing::debug!(
-                project = %entry.name,
-                "scheduler: project opted out of periodic review, skipping"
-            );
-            continue;
+            let project_cfg = match load_project_config(&entry.root) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        project = %entry.name,
+                        error = %e,
+                        "scheduler: failed to load project config, skipping"
+                    );
+                    continue;
+                }
+            };
+            // Respect explicit opt-out via `.harness/config.toml` [review] enabled = false.
+            // TODO(#617): add a separate `periodic_review_enabled` field to avoid dual-use
+            // of the PR-review `enabled` flag.
+            if project_cfg.review.as_ref().and_then(|r| r.enabled) == Some(false) {
+                tracing::debug!(
+                    project = %entry.name,
+                    "scheduler: project opted out of periodic review, skipping"
+                );
+                continue;
+            }
+            seen_roots.insert(entry.root.clone());
+            result.push(ProjectInfo {
+                name: entry.name.clone(),
+                root: entry.root.clone(),
+                review_type: project_cfg.review_type,
+            });
         }
-        result.push(ProjectInfo {
-            name: entry.name.clone(),
-            root: entry.root.clone(),
-            review_type: project_cfg.review_type,
-        });
     }
+
+    // Also include projects registered at runtime via CLI flags or the HTTP API.
+    // These are stored in project_registry and are not reflected in server.config.projects.
+    if let Some(registry) = state.core.project_registry.as_deref() {
+        match registry.list().await {
+            Ok(reg_projects) => {
+                for proj in reg_projects {
+                    if !proj.active {
+                        continue;
+                    }
+                    // Skip roots already covered by config entries (check both raw
+                    // and canonical forms to handle symlinked paths).
+                    let canonical = proj
+                        .root
+                        .canonicalize()
+                        .unwrap_or_else(|_| proj.root.clone());
+                    if seen_roots.contains(&proj.root) || seen_roots.contains(&canonical) {
+                        continue;
+                    }
+                    if !proj.root.exists() {
+                        tracing::warn!(
+                            project = %proj.id,
+                            root = %proj.root.display(),
+                            "scheduler: registry project root does not exist on disk, skipping"
+                        );
+                        continue;
+                    }
+                    let (review_type, opted_out) = match load_project_config(&proj.root) {
+                        Ok(cfg) => {
+                            let opted_out =
+                                cfg.review.as_ref().and_then(|r| r.enabled) == Some(false);
+                            (cfg.review_type, opted_out)
+                        }
+                        Err(_) => (ReviewType::default(), false),
+                    };
+                    if opted_out {
+                        tracing::debug!(
+                            project = %proj.id,
+                            "scheduler: registry project opted out of periodic review, skipping"
+                        );
+                        continue;
+                    }
+                    result.push(ProjectInfo {
+                        name: proj.id.clone(),
+                        root: proj.root.clone(),
+                        review_type,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "scheduler: failed to list registry projects; \
+                     CLI/API-registered projects will be excluded from this review cycle: {e}"
+                );
+            }
+        }
+    }
+
     result
 }
 
@@ -403,6 +485,10 @@ async fn run_review_tick(
     let secondary_agent_name = secondary_agent.clone();
     let state_for_synthesis = state.clone();
     let fallback_ts_for_poll = review_state.clone();
+    // Capture project root so secondary/synthesis/auto-fix tasks target the
+    // correct repository — without this they fall back to main-worktree
+    // detection and can execute against the wrong project.
+    let project_root_for_poll = project_root.clone();
     let handle = tokio::spawn(async move {
         let primary_output = poll_task_output(&store, &primary_review_id, timeout_secs).await;
         tracing::info!(
@@ -457,6 +543,7 @@ async fn run_review_tick(
                 agent: Some(agent.clone()),
                 turn_timeout_secs: timeout_secs,
                 source: Some("periodic_review".to_string()),
+                project: Some(project_root_for_poll.clone()),
                 ..CreateTaskRequest::default()
             };
             match task_routes::enqueue_task(&state_for_synthesis, req).await {
@@ -508,6 +595,7 @@ async fn run_review_tick(
                     agent: Some(primary_agent_for_synthesis.clone()),
                     turn_timeout_secs: timeout_secs,
                     source: Some("periodic_review".to_string()),
+                    project: Some(project_root_for_poll.clone()),
                     ..CreateTaskRequest::default()
                 };
                 match task_routes::enqueue_task(&state_for_synthesis, synth_req).await {
@@ -671,6 +759,7 @@ async fn run_review_tick(
                                         let req = CreateTaskRequest {
                                             prompt: Some(prompt),
                                             source: Some("auto-fix".into()),
+                                            project: Some(project_root_for_poll.clone()),
                                             ..CreateTaskRequest::default()
                                         };
                                         match task_routes::enqueue_task(&state_for_synthesis, req)
