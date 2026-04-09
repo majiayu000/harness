@@ -69,7 +69,7 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // Resolve all projects to review once at startup.
     let projects = collect_projects(&state).await;
     // Per-project state map: each project gets its own ReviewState mutex.
-    let state_map: HashMap<String, Arc<Mutex<ReviewState>>> = projects
+    let mut state_map: HashMap<String, Arc<Mutex<ReviewState>>> = projects
         .iter()
         .map(|p| (p.name.clone(), Arc::new(Mutex::new(ReviewState::default()))))
         .collect();
@@ -156,7 +156,7 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // during the first tick (because their remaining delay exceeded min_delay)
     // are not pushed back by a full `interval` before their first review.
     let startup_now = Instant::now();
-    let mut next_run: Vec<Instant> = projects
+    let next_run: Vec<Instant> = projects
         .iter()
         .zip(project_delays.iter())
         .map(|(_, &d)| {
@@ -171,10 +171,30 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
         })
         .collect();
 
+    // Convert startup per-project Vec<Instant> to HashMap keyed by project name
+    // so that dynamically registered projects can be added in the main loop.
+    let mut next_run_map: HashMap<String, Instant> = projects
+        .iter()
+        .zip(next_run.into_iter())
+        .map(|(p, t)| (p.name.clone(), t))
+        .collect();
+
     loop {
+        // Re-collect on each tick to pick up projects registered at runtime
+        // via `POST /projects` without requiring a server restart.
+        let current_projects = collect_projects(&state).await;
+        for p in &current_projects {
+            state_map
+                .entry(p.name.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(ReviewState::default())));
+            next_run_map
+                .entry(p.name.clone())
+                .or_insert_with(Instant::now);
+        }
+
         // Sleep only until the earliest project becomes due, not a full interval.
-        let sleep_dur = next_run
-            .iter()
+        let sleep_dur = next_run_map
+            .values()
             .copied()
             .min()
             .map(|earliest| earliest.saturating_duration_since(Instant::now()))
@@ -182,8 +202,8 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
         sleep(sleep_dur).await;
 
         let tick_now = Instant::now();
-        for (i, project) in projects.iter().enumerate() {
-            if next_run[i] <= tick_now {
+        for project in &current_projects {
+            if next_run_map.get(&project.name).copied().unwrap_or(tick_now) <= tick_now {
                 let review_state = state_map[&project.name].clone();
                 if let Err(e) = run_review_tick(&state, &config, &review_state, project).await {
                     tracing::error!(
@@ -191,7 +211,7 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
                         "scheduler: review tick failed: {e}"
                     );
                 }
-                next_run[i] = Instant::now() + interval;
+                next_run_map.insert(project.name.clone(), Instant::now() + interval);
             }
         }
     }
@@ -223,8 +243,9 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
         .map(|(n, p)| (n.as_str(), p))
         .collect();
 
-    // Track roots already covered to deduplicate config vs registry entries.
+    // Track roots and names already covered to deduplicate config vs registry entries.
     let mut seen_roots: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut result: Vec<ProjectInfo> = Vec::new();
 
     if config_projects.is_empty() && state.core.server.startup_projects.is_empty() {
@@ -238,6 +259,7 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
         let review_type = load_project_config(&root)
             .map(|cfg| cfg.review_type)
             .unwrap_or_default();
+        seen_names.insert(name.clone());
         seen_roots.insert(root.clone());
         result.push(ProjectInfo {
             name,
@@ -289,6 +311,7 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
             let canonical_entry_root = effective_root
                 .canonicalize()
                 .unwrap_or_else(|_| effective_root.clone());
+            seen_names.insert(entry.name.clone());
             seen_roots.insert(effective_root.clone());
             seen_roots.insert(canonical_entry_root);
             result.push(ProjectInfo {
@@ -340,6 +363,9 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
                         );
                         continue;
                     }
+                    if seen_names.contains(proj.id.as_str()) {
+                        continue;
+                    }
                     result.push(ProjectInfo {
                         name: proj.id.clone(),
                         root: proj.root.clone(),
@@ -347,6 +373,7 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
                     });
                     // Mark both raw and canonical forms as seen so that a second
                     // registry entry for the same physical root is skipped.
+                    seen_names.insert(proj.id.clone());
                     seen_roots.insert(proj.root.clone());
                     seen_roots.insert(canonical);
                 }
@@ -358,6 +385,48 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
                 );
             }
         }
+    }
+
+    // P1-1: Also include startup_projects entries not already covered by config
+    // or registry, in case the registry registration failed at startup.
+    for (name, path) in state.core.server.startup_projects.iter() {
+        if seen_names.contains(name.as_str()) {
+            continue;
+        }
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if seen_roots.contains(path) || seen_roots.contains(&canonical) {
+            continue;
+        }
+        if !path.exists() {
+            tracing::warn!(
+                project = %name,
+                root = %path.display(),
+                "scheduler: startup project root does not exist on disk, skipping"
+            );
+            continue;
+        }
+        let (review_type, opted_out) = match load_project_config(path) {
+            Ok(cfg) => {
+                let opted_out = cfg.review.as_ref().and_then(|r| r.enabled) == Some(false);
+                (cfg.review_type, opted_out)
+            }
+            Err(_) => (ReviewType::default(), false),
+        };
+        if opted_out {
+            tracing::debug!(
+                project = %name,
+                "scheduler: startup project opted out of periodic review, skipping"
+            );
+            continue;
+        }
+        seen_names.insert(name.clone());
+        seen_roots.insert(path.clone());
+        seen_roots.insert(canonical);
+        result.push(ProjectInfo {
+            name: name.clone(),
+            root: path.clone(),
+            review_type,
+        });
     }
 
     result
