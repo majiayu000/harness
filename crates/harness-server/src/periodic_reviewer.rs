@@ -131,6 +131,12 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
         sleep(min_delay).await;
     }
 
+    // Record the baseline before running the first tick so that deferred
+    // projects are scheduled relative to this point, not after the (potentially
+    // slow) first-tick processing completes.  Without this, run_review_tick
+    // executions can delay deferred projects by their own wall-clock duration.
+    let startup_now = Instant::now();
+
     // First tick: only run projects that became due within the startup sleep window.
     // Projects whose remaining time exceeds min_delay are deferred to the regular
     // interval loop, avoiding unnecessary task/quota spikes on restart.
@@ -155,7 +161,6 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // Track per-project next-run instants so that projects which were not run
     // during the first tick (because their remaining delay exceeded min_delay)
     // are not pushed back by a full `interval` before their first review.
-    let startup_now = Instant::now();
     let next_run: Vec<Instant> = projects
         .iter()
         .zip(project_delays.iter())
@@ -377,7 +382,14 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
                                 cfg.review.as_ref().and_then(|r| r.enabled) == Some(false);
                             (cfg.review_type, opted_out)
                         }
-                        Err(_) => (ReviewType::default(), false),
+                        Err(e) => {
+                            tracing::warn!(
+                                project = %proj.id,
+                                error = %e,
+                                "scheduler: failed to load registry project config, skipping"
+                            );
+                            continue;
+                        }
                     };
                     if opted_out {
                         tracing::debug!(
@@ -433,7 +445,14 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
                 let opted_out = cfg.review.as_ref().and_then(|r| r.enabled) == Some(false);
                 (cfg.review_type, opted_out)
             }
-            Err(_) => (ReviewType::default(), false),
+            Err(e) => {
+                tracing::warn!(
+                    project = %name,
+                    error = %e,
+                    "scheduler: failed to load startup project config, skipping"
+                );
+                continue;
+            }
         };
         if opted_out {
             tracing::debug!(
