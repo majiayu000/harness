@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use super::dirs::dirs_data_dir;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub transport: Transport,
     pub http_addr: SocketAddr,
@@ -61,6 +62,57 @@ pub struct ServerConfig {
     /// Falls back to `GITHUB_TOKEN` env var when not configured.
     #[serde(default)]
     pub github_token: Option<String>,
+}
+
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Exhaustive destructure: compiler error if a new field is added but omitted here.
+        let Self {
+            transport,
+            http_addr,
+            data_dir,
+            project_root,
+            github_webhook_secret,
+            notification_broadcast_capacity,
+            notification_lag_log_every,
+            ws_heartbeat_interval_secs,
+            trusted_proxies,
+            api_token,
+            allowed_project_roots,
+            max_webhook_body_bytes,
+            signal_rate_limit_per_minute,
+            password_reset_rate_limit_per_hour,
+            constitution_enabled,
+            github_token,
+        } = self;
+        f.debug_struct("ServerConfig")
+            .field("transport", transport)
+            .field("http_addr", http_addr)
+            .field("data_dir", data_dir)
+            .field("project_root", project_root)
+            .field(
+                "github_webhook_secret",
+                &github_webhook_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "notification_broadcast_capacity",
+                notification_broadcast_capacity,
+            )
+            .field("notification_lag_log_every", notification_lag_log_every)
+            .field("ws_heartbeat_interval_secs", ws_heartbeat_interval_secs)
+            .field("trusted_proxies", trusted_proxies)
+            .field("api_token", &api_token.as_ref().map(|_| "[REDACTED]"))
+            .field("allowed_project_roots", allowed_project_roots)
+            .field("max_webhook_body_bytes", max_webhook_body_bytes)
+            .field("signal_rate_limit_per_minute", signal_rate_limit_per_minute)
+            .field(
+                "password_reset_rate_limit_per_hour",
+                password_reset_rate_limit_per_hour,
+            )
+            .field("constitution_enabled", constitution_enabled)
+            .field("github_token", &github_token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl Default for ServerConfig {
@@ -124,4 +176,54 @@ fn default_password_reset_rate_limit_per_hour() -> u32 {
 
 fn default_constitution_enabled() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_config_debug_redacts_secrets() {
+        let config = ServerConfig {
+            github_webhook_secret: Some("wh-secret-abc".to_string()),
+            api_token: Some("tok-xyz".to_string()),
+            github_token: Some("gh-token-123".to_string()),
+            ..ServerConfig::default()
+        };
+        let debug_output = format!("{config:?}");
+        assert!(
+            !debug_output.contains("wh-secret-abc"),
+            "github_webhook_secret must not appear in Debug output"
+        );
+        assert!(
+            !debug_output.contains("tok-xyz"),
+            "api_token must not appear in Debug output"
+        );
+        assert!(
+            !debug_output.contains("gh-token-123"),
+            "github_token must not appear in Debug output"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output must contain [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn server_config_debug_shows_none_for_absent_secrets() {
+        let config = ServerConfig::default();
+        let debug_output = format!("{config:?}");
+        assert!(
+            debug_output.contains("github_webhook_secret: None"),
+            "absent github_webhook_secret should show as None"
+        );
+        assert!(
+            debug_output.contains("api_token: None"),
+            "absent api_token should show as None"
+        );
+        assert!(
+            debug_output.contains("github_token: None"),
+            "absent github_token should show as None"
+        );
+    }
 }
