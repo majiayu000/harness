@@ -447,32 +447,36 @@ async fn run_review_tick(
                                 .await
                             {
                                 Ok(spawnable) => {
+                                    // Safety: all finding fields come from reviewer
+                                    // LLM output and must not be embedded verbatim
+                                    // — a malicious repository could craft those
+                                    // fields to redirect the fix agent.
+                                    // Mitigations applied:
+                                    //   1. The SYSTEM INSTRUCTION header contains
+                                    //      only hardcoded text — no untrusted data
+                                    //      is interpolated outside the delimited
+                                    //      block, preventing newline-injection from
+                                    //      title/rule_id/file escaping into the
+                                    //      trusted instruction region.
+                                    //   2. ALL untrusted fields (including title,
+                                    //      rule_id, file) are placed inside the
+                                    //      FINDING_CONTENT / END_FINDING_CONTENT
+                                    //      delimiters so the agent treats them as
+                                    //      data, not instructions.
+                                    //   3. Delimiter tokens are sanitized inside
+                                    //      every field to prevent early block
+                                    //      termination via injected delimiters.
+                                    //   4. Free-text fields (title, rule_id,
+                                    //      description, action) are truncated to
+                                    //      a safe maximum so adversarially long
+                                    //      content cannot dominate the context
+                                    //      window.  File paths are NOT truncated
+                                    //      because agents need the exact path to
+                                    //      locate and patch the file.
+                                    const MAX_DESC_LEN: usize = 2_000;
+                                    const MAX_ACTION_LEN: usize = 1_000;
+                                    const MAX_FIELD_LEN: usize = 200;
                                     for finding in spawnable {
-                                        // Safety: all finding fields come from reviewer
-                                        // LLM output and must not be embedded verbatim
-                                        // — a malicious repository could craft those
-                                        // fields to redirect the fix agent.
-                                        // Mitigations applied:
-                                        //   1. The SYSTEM INSTRUCTION header contains
-                                        //      only hardcoded text — no untrusted data
-                                        //      is interpolated outside the delimited
-                                        //      block, preventing newline-injection from
-                                        //      title/rule_id/file escaping into the
-                                        //      trusted instruction region.
-                                        //   2. ALL untrusted fields (including title,
-                                        //      rule_id, file) are placed inside the
-                                        //      FINDING_CONTENT / END_FINDING_CONTENT
-                                        //      delimiters so the agent treats them as
-                                        //      data, not instructions.
-                                        //   3. Delimiter tokens are sanitized inside
-                                        //      every field to prevent early block
-                                        //      termination via injected delimiters.
-                                        //   4. Fields are truncated to a safe maximum
-                                        //      so adversarially long content cannot
-                                        //      dominate the context window.
-                                        const MAX_DESC_LEN: usize = 2_000;
-                                        const MAX_ACTION_LEN: usize = 1_000;
-                                        const MAX_FIELD_LEN: usize = 200;
                                         let title = sanitize_delimiter(&truncate_to(
                                             &finding.title,
                                             MAX_FIELD_LEN,
@@ -481,10 +485,9 @@ async fn run_review_tick(
                                             &finding.rule_id,
                                             MAX_FIELD_LEN,
                                         ));
-                                        let file = sanitize_delimiter(&truncate_to(
-                                            &finding.file,
-                                            MAX_FIELD_LEN,
-                                        ));
+                                        // File path is sanitized but NOT truncated:
+                                        // agents need the exact path to open the file.
+                                        let file = sanitize_delimiter(&finding.file);
                                         let description = sanitize_delimiter(&truncate_to(
                                             &finding.description,
                                             MAX_DESC_LEN,
@@ -723,12 +726,12 @@ fn sanitize_delimiter(s: &str) -> String {
 /// fields before they are embedded in fix-agent prompts (SEC-03 / indirect
 /// prompt injection mitigation).
 fn truncate_to(s: &str, max_chars: usize) -> String {
-    let mut chars = s.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{truncated}…")
-    } else {
+    if let Some((idx, _)) = s.char_indices().nth(max_chars) {
+        let mut truncated = s[..idx].to_string();
+        truncated.push('…');
         truncated
+    } else {
+        s.to_string()
     }
 }
 
