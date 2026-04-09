@@ -1069,38 +1069,29 @@ async fn run_review_tick(
                                                             )
                                                             .await
                                                         {
-                                                            // Both confirm attempts failed.  Leaving the
-                                                            // finding with task_id = 'pending' would strand
-                                                            // it permanently — list_spawnable_findings only
-                                                            // considers task_id IS NULL rows, so the finding
-                                                            // would never be auto-fixed.
+                                                            // Both confirm attempts failed.  enqueue_task
+                                                            // already succeeded — a real task is running.
+                                                            // Do NOT release the claim (reset task_id to
+                                                            // NULL) here: doing so would let every future
+                                                            // scheduler cycle re-select this finding via
+                                                            // "task_id IS NULL" and spawn another task,
+                                                            // leading to unbounded duplicate tasks and
+                                                            // queue/quota saturation under load.
                                                             //
-                                                            // We release the claim here to allow the next
-                                                            // scheduler cycle to retry.  This carries a small
-                                                            // risk of spawning a duplicate fix task if the
-                                                            // original task is still running, but a transient
-                                                            // duplicate is far preferable to a permanently
-                                                            // stranded finding.
+                                                            // Leave task_id = 'pending' so the finding is
+                                                            // skipped until the running task completes and
+                                                            // an external update clears it.  Log a critical
+                                                            // error with the real task_id for operator
+                                                            // recovery.
                                                             tracing::error!(
                                                                 finding_id = %finding.id,
-                                                                task_id = %fix_task_id,
+                                                                real_task_id = %fix_task_id,
                                                                 "scheduler: confirm_task_spawned retry failed; \
-                                                                 releasing claim so next cycle can retry \
-                                                                 (duplicate task risk accepted): {e2}"
+                                                                 leaving finding with task_id='pending' to prevent \
+                                                                 unbounded duplicate-task spawning — \
+                                                                 real task already enqueued as {fix_task_id}, \
+                                                                 manual recovery may be needed: {e2}"
                                                             );
-                                                            if let Err(re) = rs
-                                                                .release_claim(
-                                                                    &finding.rule_id,
-                                                                    &finding.file,
-                                                                )
-                                                                .await
-                                                            {
-                                                                tracing::warn!(
-                                                                    finding_id = %finding.id,
-                                                                    "scheduler: failed to release claim \
-                                                                     after double confirm failure: {re}"
-                                                                );
-                                                            }
                                                         }
                                                     }
                                                 }
