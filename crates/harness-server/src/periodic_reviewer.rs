@@ -509,8 +509,25 @@ async fn run_review_tick(
                                                     Err(e) => {
                                                         tracing::warn!(
                                                             finding_id = %finding.id,
-                                                            "scheduler: failed to confirm task spawn: {e}"
+                                                            "scheduler: failed to confirm task spawn: {e}; releasing claim for retry"
                                                         );
+                                                        // Release the pending claim so the next cycle
+                                                        // can retry.  Without this, task_id stays
+                                                        // 'pending' forever and list_spawnable_findings
+                                                        // (which filters task_id IS NULL) never picks
+                                                        // it up again.
+                                                        if let Err(re) = rs
+                                                            .release_claim(
+                                                                &finding.rule_id,
+                                                                &finding.file,
+                                                            )
+                                                            .await
+                                                        {
+                                                            tracing::warn!(
+                                                                finding_id = %finding.id,
+                                                                "scheduler: failed to release claim after confirm failure: {re}"
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
