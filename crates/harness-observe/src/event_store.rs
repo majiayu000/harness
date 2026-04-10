@@ -132,7 +132,10 @@ impl EventStore {
                 None
             }
         };
-        *store.otel_pipeline.lock().unwrap() = pipeline;
+        *store
+            .otel_pipeline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = pipeline;
         Ok(store)
     }
 
@@ -199,7 +202,7 @@ impl EventStore {
 
     pub async fn log(&self, event: &Event) -> anyhow::Result<EventId> {
         self.insert_event(event).await?;
-        let slot = self.otel_pipeline.lock().unwrap();
+        let slot = self.otel_pipeline.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pipeline) = slot.as_ref() {
             pipeline.record_event(event);
         }
@@ -315,7 +318,11 @@ impl EventStore {
     }
 
     pub async fn shutdown(&self) {
-        let pipeline = self.otel_pipeline.lock().unwrap().take();
+        let pipeline = self
+            .otel_pipeline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(pipeline) = pipeline {
             pipeline.shutdown().await;
         }
