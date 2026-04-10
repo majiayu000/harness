@@ -132,13 +132,10 @@ impl EventStore {
                 None
             }
         };
-        match store.otel_pipeline.lock() {
-            Ok(mut slot) => *slot = pipeline,
-            Err(poisoned) => {
-                tracing::error!("OpenTelemetry pipeline mutex poisoned during init; recovering");
-                *poisoned.into_inner() = pipeline;
-            }
-        }
+        *store
+            .otel_pipeline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = pipeline;
         Ok(store)
     }
 
@@ -205,19 +202,9 @@ impl EventStore {
 
     pub async fn log(&self, event: &Event) -> anyhow::Result<EventId> {
         self.insert_event(event).await?;
-        match self.otel_pipeline.lock() {
-            Ok(slot) => {
-                if let Some(pipeline) = slot.as_ref() {
-                    pipeline.record_event(event);
-                }
-            }
-            Err(poisoned) => {
-                tracing::error!("OpenTelemetry pipeline mutex poisoned during log; recovering");
-                let slot = poisoned.into_inner();
-                if let Some(pipeline) = slot.as_ref() {
-                    pipeline.record_event(event);
-                }
-            }
+        let slot = self.otel_pipeline.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pipeline) = slot.as_ref() {
+            pipeline.record_event(event);
         }
         Ok(event.id.clone())
     }
@@ -331,15 +318,11 @@ impl EventStore {
     }
 
     pub async fn shutdown(&self) {
-        let pipeline = match self.otel_pipeline.lock() {
-            Ok(mut slot) => slot.take(),
-            Err(poisoned) => {
-                tracing::error!(
-                    "OpenTelemetry pipeline mutex poisoned during shutdown; recovering"
-                );
-                poisoned.into_inner().take()
-            }
-        };
+        let pipeline = self
+            .otel_pipeline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(pipeline) = pipeline {
             pipeline.shutdown().await;
         }
@@ -967,11 +950,7 @@ mod tests {
             ..OtelConfig::default()
         };
         let store = EventStore::with_policies_and_otel(dir.path(), 1800, 90, &config).await?;
-        assert!(store
-            .otel_pipeline
-            .lock()
-            .expect("otel pipeline mutex should not be poisoned")
-            .is_none());
+        assert!(store.otel_pipeline.lock().unwrap().is_none());
         let event = Event::new(
             SessionId::new(),
             "api_request",
