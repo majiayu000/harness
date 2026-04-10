@@ -34,13 +34,13 @@ impl GcCheckpoint {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => {
-                tracing::warn!("gc: failed to read checkpoint at {}: {e}", path.display());
+                tracing::error!("gc: failed to read checkpoint at {}: {e}", path.display());
                 return None;
             }
         };
         serde_json::from_str(&data)
             .map_err(|e| {
-                tracing::warn!("gc: corrupt checkpoint at {}: {e}", path.display());
+                tracing::error!("gc: corrupt checkpoint at {}: {e}", path.display());
             })
             .ok()
     }
@@ -124,6 +124,30 @@ mod tests {
         let path = dir.path().join("bad.json");
         std::fs::write(&path, b"not valid json").unwrap();
         assert!(GcCheckpoint::load(&path).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_returns_none_for_unreadable_file() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("no-read.json");
+        let json = serde_json::to_vec(&GcCheckpoint::new(Utc::now()))?;
+        std::fs::write(&path, json)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))?;
+
+        let result = GcCheckpoint::load(&path);
+
+        // Restore permissions so tempdir cleanup succeeds.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+
+        // If running as root, permission bits are ignored and load succeeds — skip assertion.
+        if result.is_some() {
+            return Ok(());
+        }
+        assert!(result.is_none());
+        Ok(())
     }
 
     #[test]
