@@ -707,7 +707,11 @@ impl TaskStore {
         }
         match self.db.get(id.0.as_str()).await {
             Ok(Some(task)) => matches!(task.status, TaskStatus::Done),
-            _ => false,
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(task_id = %id.0, "DB error checking dep done status: {e}; treating as not done");
+                false
+            }
         }
     }
 
@@ -719,7 +723,11 @@ impl TaskStore {
         }
         match self.db.get(id.0.as_str()).await {
             Ok(Some(task)) => matches!(task.status, TaskStatus::Failed),
-            _ => false,
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(task_id = %id.0, "DB error checking dep failed status: {e}; treating as not failed");
+                false
+            }
         }
     }
 

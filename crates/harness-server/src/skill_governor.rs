@@ -34,7 +34,9 @@ pub(crate) async fn run_skill_governance_tick(
     let task_statuses: HashMap<String, TaskStatus> = state
         .core
         .tasks
-        .list_all()
+        .list_all_with_terminal()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to list tasks for governance scoring: {e}"))?
         .into_iter()
         .map(|task| (task.id.as_str().to_string(), task.status))
         .collect();
