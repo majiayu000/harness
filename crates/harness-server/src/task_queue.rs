@@ -3,7 +3,7 @@ use harness_core::config::misc::ConcurrencyConfig;
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
@@ -55,6 +55,12 @@ struct Waiter {
     /// higher priority among equal-priority waiters (FIFO within same level).
     seq: u64,
     tx: oneshot::Sender<()>,
+    /// Set to `true` by `release()` before calling `tx.send()`.
+    ///
+    /// Shared with the waiting `AcquireGuard` so that Drop can detect the
+    /// "permit granted but future cancelled before rx.await completed" race
+    /// and return the permit to the pool via a CAS operation.
+    permit_granted: Arc<AtomicBool>,
 }
 
 impl PartialEq for Waiter {
@@ -110,22 +116,38 @@ impl PriorityPermitQueue {
     /// Attempt to claim a permit immediately.
     ///
     /// Returns `Ok(())` when a slot is free.  Otherwise pushes a `Waiter` and
-    /// returns the `Receiver` half of the notification channel; the caller
-    /// **must** `.await` it **outside** this lock.
-    fn try_acquire_or_enqueue(&mut self, priority: u8) -> Result<(), oneshot::Receiver<()>> {
+    /// returns the `Receiver` half of the notification channel plus the shared
+    /// `permit_granted` flag; the caller **must** `.await` the receiver
+    /// **outside** this lock.
+    fn try_acquire_or_enqueue(
+        &mut self,
+        priority: u8,
+    ) -> Result<(), (oneshot::Receiver<()>, Arc<AtomicBool>)> {
         if self.available > 0 {
             self.available -= 1;
             Ok(())
         } else {
+            let permit_granted = Arc::new(AtomicBool::new(false));
             let (tx, rx) = oneshot::channel();
             let seq = self.next_seq;
             self.next_seq += 1;
-            self.waiters.push(Waiter { priority, seq, tx });
-            Err(rx)
+            self.waiters.push(Waiter {
+                priority,
+                seq,
+                tx,
+                permit_granted: permit_granted.clone(),
+            });
+            Err((rx, permit_granted))
         }
     }
 
     /// Release a permit: wake the top-priority waiter, or increment `available`.
+    ///
+    /// Sets `permit_granted` on the waiter **before** sending so that the
+    /// waiter's `AcquireGuard::Drop` can detect the window where the permit
+    /// signal was already sent but the future was cancelled before `rx.await`
+    /// could complete.  A CAS is used to avoid double-release if both this
+    /// function and the guard's Drop try to reclaim the permit concurrently.
     fn release(&mut self) {
         loop {
             match self.waiters.pop() {
@@ -134,11 +156,33 @@ impl PriorityPermitQueue {
                     return;
                 }
                 Some(waiter) => {
-                    // Receiver already dropped means the waiter was cancelled.
-                    // Skip it and try the next one.
+                    // Mark granted BEFORE sending so the guard's Drop can see
+                    // it even if the future is cancelled between store and send.
+                    waiter.permit_granted.store(true, AtomicOrdering::SeqCst);
                     if waiter.tx.send(()).is_ok() {
+                        // Permit is in transit to the waiter. If the waiter
+                        // cancels before rx.await completes, its Drop handler
+                        // uses CAS to reclaim and re-release the permit.
                         return;
                     }
+                    // tx.send() failed: rx was already dropped.
+                    // Try to reclaim via CAS before looping to the next waiter.
+                    // If the guard's Drop already ran and reclaimed (CAS fails),
+                    // it already called release() — return to avoid double-release.
+                    if waiter
+                        .permit_granted
+                        .compare_exchange(
+                            true,
+                            false,
+                            AtomicOrdering::SeqCst,
+                            AtomicOrdering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        // Guard's Drop won the race and called release() already.
+                        return;
+                    }
+                    // We reclaimed; continue to grant the permit to the next waiter.
                 }
             }
         }
@@ -171,31 +215,45 @@ enum AcquirePhase {
 /// Cancellation-safe RAII guard for [`TaskQueue::acquire`].
 ///
 /// Dropped whenever the enclosing `async fn` is cancelled (future dropped) at
-/// any `.await` point, ensuring queue counters and acquired project permits are
-/// always released — even when the caller disconnects mid-wait.
+/// any `.await` point, ensuring queue counters and acquired permits are always
+/// released — even when the caller disconnects mid-wait.
+///
+/// The `project_permit_granted` / `global_permit_granted` flags (shared with
+/// the corresponding `Waiter` via `Arc<AtomicBool>`) let Drop detect the race
+/// where `release()` already sent a permit signal but the future was cancelled
+/// before `rx.await` could complete.  A CAS reclaims the permit in that case.
 ///
 /// Call [`AcquireGuard::defuse`] before returning the permit to prevent
 /// the guard from releasing resources that are now owned by the caller.
 struct AcquireGuard<'a> {
     queued_count: &'a AtomicUsize,
     project_queue: Arc<Mutex<PriorityPermitQueue>>,
+    global_queue: Arc<Mutex<PriorityPermitQueue>>,
     phase: AcquirePhase,
     defused: bool,
+    /// Shared flag with the project-queue Waiter; set by release() before send.
+    project_permit_granted: Option<Arc<AtomicBool>>,
+    /// Shared flag with the global-queue Waiter; set by release() before send.
+    global_permit_granted: Option<Arc<AtomicBool>>,
 }
 
 impl<'a> AcquireGuard<'a> {
     fn new(
         queued_count: &'a AtomicUsize,
         project_queue: Arc<Mutex<PriorityPermitQueue>>,
+        global_queue: Arc<Mutex<PriorityPermitQueue>>,
         project_queued_counter: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             queued_count,
             project_queue,
+            global_queue,
             phase: AcquirePhase::ProjectWait {
                 project_queued_counter,
             },
             defused: false,
+            project_permit_granted: None,
+            global_permit_granted: None,
         }
     }
 
@@ -223,14 +281,43 @@ impl<'a> Drop for AcquireGuard<'a> {
                 project_queued_counter,
             } => {
                 project_queued_counter.fetch_sub(1, AtomicOrdering::SeqCst);
-                // No project permit was acquired yet; nothing to release in the queue.
+                // If release() already sent the project permit signal but the
+                // future was cancelled before rx.await completed, reclaim it.
+                if let Some(granted) = &self.project_permit_granted {
+                    if granted
+                        .compare_exchange(
+                            true,
+                            false,
+                            AtomicOrdering::SeqCst,
+                            AtomicOrdering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        self.project_queue.lock().unwrap().release();
+                    }
+                }
             }
             AcquirePhase::GlobalWait {
                 project_awaiting_counter,
             } => {
                 project_awaiting_counter.fetch_sub(1, AtomicOrdering::SeqCst);
-                // Project permit was already acquired; release it so other waiters unblock.
+                // Project permit was already acquired; always release it.
                 self.project_queue.lock().unwrap().release();
+                // If release() already sent the global permit signal but the
+                // future was cancelled before rx.await completed, reclaim it.
+                if let Some(granted) = &self.global_permit_granted {
+                    if granted
+                        .compare_exchange(
+                            true,
+                            false,
+                            AtomicOrdering::SeqCst,
+                            AtomicOrdering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        self.global_queue.lock().unwrap().release();
+                    }
+                }
             }
         }
     }
@@ -363,10 +450,11 @@ impl TaskQueue {
         project_queued_counter.fetch_add(1, AtomicOrdering::SeqCst);
 
         // Cancellation-safe guard: if this future is dropped at any .await
-        // below, Drop releases counters and any acquired project permit.
+        // below, Drop releases counters and any acquired permits.
         let mut guard = AcquireGuard::new(
             &self.queued_count,
             project_queue.clone(),
+            self.global_queue.clone(),
             project_queued_counter.clone(),
         );
 
@@ -380,10 +468,14 @@ impl TaskQueue {
             .lock()
             .unwrap()
             .try_acquire_or_enqueue(priority);
-        if let Err(rx) = project_rx {
+        if let Err((rx, granted)) = project_rx {
+            // Store the flag so Drop can detect mid-send cancellation.
+            guard.project_permit_granted = Some(granted);
             // CANCELLATION POINT 1: guard cleans up if dropped here.
             rx.await
                 .map_err(|_| anyhow::anyhow!("project task queue closed"))?;
+            // Permit consumed successfully; clear flag so Drop skips reclaim.
+            guard.project_permit_granted = None;
         }
 
         // Project slot acquired; transition from "waiting for project" to
@@ -400,10 +492,14 @@ impl TaskQueue {
             .lock()
             .unwrap()
             .try_acquire_or_enqueue(priority);
-        if let Err(rx) = global_rx {
+        if let Err((rx, granted)) = global_rx {
+            // Store the flag so Drop can detect mid-send cancellation.
+            guard.global_permit_granted = Some(granted);
             // CANCELLATION POINT 2: guard releases project permit and cleans
             // up counters if dropped here.
             rx.await.map_err(|_| anyhow::anyhow!("task queue closed"))?;
+            // Permit consumed successfully; clear flag so Drop skips reclaim.
+            guard.global_permit_granted = None;
         }
 
         project_awaiting_counter.fetch_sub(1, AtomicOrdering::SeqCst);
@@ -422,11 +518,14 @@ impl TaskQueue {
     }
 
     /// Number of tasks currently holding a global execution slot (running).
+    ///
+    /// `global_limit - available_permits` gives the number of issued permits.
+    /// Global waiters have not received a permit yet and do not reduce
+    /// `available_permits`, so subtracting `waiter_count()` would undercount
+    /// running tasks when there are waiters in the queue.
     pub fn running_count(&self) -> usize {
         let q = self.global_queue.lock().unwrap();
-        self.global_limit
-            .saturating_sub(q.available_permits())
-            .saturating_sub(q.waiter_count())
+        self.global_limit.saturating_sub(q.available_permits())
     }
 
     /// Number of tasks waiting for a global execution slot.

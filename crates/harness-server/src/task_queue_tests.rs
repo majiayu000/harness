@@ -280,6 +280,28 @@ async fn priority_zero_default_compiles() {
     assert!(p.is_ok());
 }
 
+// --- running_count correctness ---
+
+#[tokio::test]
+async fn running_count_correct_with_global_waiters() {
+    // limit=2; fill both slots, add a waiter in the global queue.
+    // running_count must still report 2 — waiters do not reduce available_permits.
+    let q = Arc::new(TaskQueue::new(&config(2, 16)));
+    let _p1 = q.acquire("proj", 0).await.unwrap();
+    let _p2 = q.acquire("proj", 0).await.unwrap();
+    assert_eq!(q.running_count(), 2);
+
+    let q2 = q.clone();
+    let _h = tokio::spawn(async move { q2.acquire("proj", 0).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert_eq!(
+        q.running_count(),
+        2,
+        "running_count must not decrease because a global waiter is present"
+    );
+}
+
 // --- Cancellation-safety tests ---
 
 #[tokio::test]
@@ -360,5 +382,84 @@ async fn cancelled_global_wait_releases_project_permit() {
     assert!(
         result.is_ok(),
         "project permit not released after global-wait cancellation"
+    );
+}
+
+// --- Mid-send cancellation race regression tests (Issues 1 & 2) ---
+
+/// Regression: project permit must not be permanently lost when the future is
+/// cancelled *after* `release()` sends the signal but *before* `rx.await`
+/// completes (the "mid-send" race on the project queue).
+#[tokio::test]
+async fn project_permit_not_leaked_on_mid_send_cancellation() {
+    use std::collections::HashMap;
+    let mut per_project = HashMap::new();
+    per_project.insert("proj".to_string(), 1usize);
+    let cfg = ConcurrencyConfig {
+        max_concurrent_tasks: 4,
+        max_queue_size: 16,
+        stall_timeout_secs: 300,
+        per_project,
+    };
+    let q = Arc::new(TaskQueue::new(&cfg));
+
+    // Hold the single project slot.
+    let holder = q.acquire("proj", 0).await.unwrap();
+
+    // Waiter registers in the project queue.
+    let q2 = q.clone();
+    let handle = tokio::spawn(async move { q2.acquire("proj", 0).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Release holder (sends the permit signal) then immediately cancel the
+    // waiter — exercises the race where cancellation happens mid-send.
+    drop(holder);
+    handle.abort();
+    let _ = handle.await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // A new task must succeed; the project slot must have been returned.
+    let result = timeout(Duration::from_millis(100), q.acquire("proj", 0)).await;
+    assert!(
+        result.is_ok(),
+        "project permit leaked after mid-send cancellation"
+    );
+}
+
+/// Regression: global permit must not be permanently lost when the future is
+/// cancelled *after* `release()` sends the global signal but *before*
+/// `rx.await` completes (the "mid-send" race on the global queue).
+#[tokio::test]
+async fn global_permit_not_leaked_on_mid_send_cancellation() {
+    use std::collections::HashMap;
+    let mut per_project = HashMap::new();
+    per_project.insert("proj".to_string(), 2usize);
+    let cfg = ConcurrencyConfig {
+        max_concurrent_tasks: 1,
+        max_queue_size: 16,
+        stall_timeout_secs: 300,
+        per_project,
+    };
+    let q = Arc::new(TaskQueue::new(&cfg));
+
+    // Hold the single global slot.
+    let global_holder = q.acquire("proj", 0).await.unwrap();
+
+    // Waiter passes project-wait (project limit=2) and blocks at global-wait.
+    let q2 = q.clone();
+    let handle = tokio::spawn(async move { q2.acquire("proj", 0).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Release global holder (sends the global signal) then cancel the waiter.
+    drop(global_holder);
+    handle.abort();
+    let _ = handle.await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // A new task must succeed; the global slot must have been returned.
+    let result = timeout(Duration::from_millis(100), q.acquire("proj", 0)).await;
+    assert!(
+        result.is_ok(),
+        "global permit leaked after mid-send cancellation"
     );
 }
