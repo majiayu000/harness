@@ -107,20 +107,26 @@ impl TaskCheckpoint {
 
     /// Save the checkpoint to the filesystem path for this task.
     ///
-    /// Uses an atomic write: the JSON is first written to a uniquely-named
-    /// `.tmp` side-car file, synced to disk, then renamed into place.
+    /// Uses an atomic write: the JSON is first written to a temporary file
+    /// (via [`tempfile::NamedTempFile`]) that lives in the same directory as
+    /// the destination, synced to disk, then persisted (renamed) into place.
     ///
-    /// * **Unique temp name** — a UUID suffix prevents two concurrent `save()`
-    ///   calls for the same task from clobbering each other's temp file.
-    /// * **`sync_all()` before rename** — ensures the data bytes are on disk
-    ///   before the directory entry is updated; without this a power loss after
-    ///   `rename` can leave a zero-byte or truncated checkpoint file.
-    /// * **Parent-directory fsync after rename** — makes the new directory
-    ///   entry itself durable so the file is not lost on power loss even after
-    ///   the rename syscall returns.
+    /// * **Unique temp file** — `NamedTempFile::new_in` generates a unique
+    ///   name so two concurrent `save()` calls for the same task never
+    ///   clobber each other's temp file.
+    /// * **`sync_all()` before persist** — ensures data bytes are on disk
+    ///   before the directory entry is updated; without this a power loss
+    ///   after the rename can leave a zero-byte or truncated file.
+    /// * **`persist()` instead of `rename()`** — on Windows `std::fs::rename`
+    ///   fails when the destination already exists; `NamedTempFile::persist`
+    ///   uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` internally so it
+    ///   atomically replaces the destination on all platforms.
+    /// * **Parent-directory fsync after persist** — makes the new directory
+    ///   entry durable; unsupported on some filesystems (notably Windows) so
+    ///   failures are logged at debug level and treated as non-fatal.
     ///
-    /// POSIX guarantees that `rename(2)` is atomic with respect to readers, so
-    /// a concurrent `load` will always see either the previous complete
+    /// POSIX guarantees that `rename(2)` is atomic with respect to readers,
+    /// so a concurrent `load` will always see either the previous complete
     /// checkpoint or the new one — never a partial write.
     pub fn save(&self) -> anyhow::Result<()> {
         use std::io::Write as _;
@@ -133,26 +139,22 @@ impl TaskCheckpoint {
 
         let data = serde_json::to_string_pretty(self)?;
 
-        // Unique suffix prevents races when save() is called concurrently for
-        // the same task_id (e.g. from two tokio tasks).
-        // Sanitize task_id so path separators in the ID don't create a
-        // nested path under `parent` that hasn't been mkdir'd.
-        let safe_id = self.task_id.replace(['/', '\\'], "_");
-        let tmp_name = format!("{}.{}.tmp", safe_id, uuid::Uuid::new_v4());
-        let tmp_path = parent.join(tmp_name);
-
-        // Write and sync the temp file before rename so data is on disk.
-        {
-            let mut tmp_file = std::fs::File::create(&tmp_path)?;
-            tmp_file.write_all(data.as_bytes())?;
-            tmp_file.sync_all()?;
-        }
-        std::fs::rename(&tmp_path, &path)?;
+        // Create the temp file in the same directory as the destination so
+        // that persist() (rename) stays on the same filesystem.
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        tmp.write_all(data.as_bytes())?;
+        // Sync data to disk before rename so a power loss after rename does
+        // not leave a zero-byte or truncated checkpoint.
+        tmp.as_file().sync_all()?;
+        // persist() uses MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows
+        // and rename(2) on Unix — both atomically replace the destination.
+        tmp.persist(&path)
+            .map_err(|e| anyhow::anyhow!("checkpoint persist failed: {}", e.error))?;
 
         // Best-effort: fsync the parent directory so the renamed entry is
         // durable.  Directory fsync is unsupported on some filesystems
         // (notably Windows); treat failure as non-fatal so a successful
-        // rename is never rolled back into an error.
+        // persist is never rolled back into an error.
         if let Ok(dir) = std::fs::File::open(parent) {
             if let Err(e) = dir.sync_all() {
                 tracing::debug!("checkpoint: parent dir fsync not supported (non-fatal): {e}");
