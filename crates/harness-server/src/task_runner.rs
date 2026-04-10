@@ -1557,13 +1557,10 @@ where
                     )
                     .await;
 
-                    // Sequential (numbered-list) tasks require every step to succeed;
-                    // parallel (file-partitioned) tasks tolerate partial success.
-                    let succeeded = if run_result.is_sequential {
-                        run_result.results.iter().all(|r| r.response.is_some())
-                    } else {
-                        run_result.results.iter().any(|r| r.response.is_some())
-                    };
+                    // Both sequential and parallel tasks require ALL subtasks to succeed.
+                    // With up to MAX_PARALLEL (8) chunks, any() would mark Done on 1/8
+                    // success, silently dropping failed work.
+                    let succeeded = run_result.results.iter().all(|r| r.response.is_some());
                     mutate_and_persist(&store, &id, |s| {
                         for r in &run_result.results {
                             let detail = if let Some(ref resp) = r.response {
@@ -1589,11 +1586,23 @@ where
                         if succeeded {
                             s.status = TaskStatus::Done;
                         } else {
+                            let failed_count = run_result
+                                .results
+                                .iter()
+                                .filter(|r| r.response.is_none())
+                                .count();
+                            let total_count = run_result.results.len();
                             s.status = TaskStatus::Failed;
                             s.error = Some(if run_result.is_sequential {
-                                "one or more sequential subtasks failed; remaining steps were skipped".to_string()
+                                format!(
+                                    "{}/{} sequential subtasks failed; remaining steps were skipped",
+                                    failed_count, total_count
+                                )
                             } else {
-                                "all parallel subtasks failed".to_string()
+                                format!(
+                                    "{}/{} parallel subtasks failed",
+                                    failed_count, total_count
+                                )
                             });
                         }
                     })
