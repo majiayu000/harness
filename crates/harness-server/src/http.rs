@@ -629,18 +629,14 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                 interval.tick().await;
                 let ready_ids = crate::task_runner::check_awaiting_deps(&store);
                 for task_id in ready_ids {
-                    // Atomically take pending_request before dispatch to prevent double-dispatch.
+                    // Take pending_request from the in-memory cache only — do NOT persist
+                    // yet.  Deferring the DB write until after permit acquisition means that
+                    // if the process crashes before acquire, the DB still contains the
+                    // pending_request and startup recovery can retry the dispatch.
                     let pending_req = store
                         .cache
                         .get_mut(&task_id)
                         .and_then(|mut e| e.pending_request.take());
-
-                    if let Err(e) = store.persist(&task_id).await {
-                        tracing::warn!(
-                            "dep-watcher: failed to persist {} after transition: {e}",
-                            task_id.0
-                        );
-                    }
 
                     let req = match pending_req {
                         Some(r) => r,
@@ -666,10 +662,27 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                     let agent = match agent {
                         Some(a) => a,
                         None => {
+                            // Fail-close: mark the task failed so it surfaces to the
+                            // operator rather than silently hanging in pending forever.
                             tracing::error!(
                                 task_id = %task_id.0,
-                                "dep-watcher: could not resolve agent, skipping dispatch"
+                                "dep-watcher: could not resolve agent — failing task"
                             );
+                            if let Err(e) =
+                                crate::task_runner::mutate_and_persist(&store, &task_id, |s| {
+                                    s.status = crate::task_runner::TaskStatus::Failed;
+                                    s.error = Some(
+                                        "dep-watcher: no agent could be resolved for dispatch"
+                                            .to_string(),
+                                    );
+                                })
+                                .await
+                            {
+                                tracing::error!(
+                                    task_id = %task_id.0,
+                                    "dep-watcher: failed to persist failure state: {e}"
+                                );
+                            }
                             continue;
                         }
                     };
@@ -696,6 +709,14 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                     tokio::spawn(async move {
                         match task_queue2.acquire(&project_id).await {
                             Ok(permit) => {
+                                // Permit acquired — commit the pending_request clear to DB
+                                // now that dispatch is guaranteed to proceed.
+                                if let Err(e) = store2.persist(&task_id2).await {
+                                    tracing::warn!(
+                                        task_id = %task_id2.0,
+                                        "dep-watcher: failed to persist task before dispatch: {e}"
+                                    );
+                                }
                                 crate::task_runner::spawn_preregistered_task(
                                     task_id2,
                                     store2,
@@ -718,6 +739,12 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                     task_id = %task_id2.0,
                                     "dep-watcher: failed to acquire concurrency permit: {e}"
                                 );
+                                // Restore pending_request so the next watcher tick can
+                                // retry.  The DB still holds the original value because we
+                                // have not persisted yet, so no re-persist is needed.
+                                if let Some(mut entry) = store2.cache.get_mut(&task_id2) {
+                                    entry.pending_request = Some(req);
+                                }
                             }
                         }
                     });

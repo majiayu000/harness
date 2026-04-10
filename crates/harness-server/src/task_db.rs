@@ -707,7 +707,17 @@ impl TaskRow {
         let pending_request = pending_request_json
             .as_deref()
             .filter(|s| !s.is_empty())
-            .and_then(|s| serde_json::from_str(s).ok());
+            .and_then(|s| match serde_json::from_str(s) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::error!(
+                        task_id = %id,
+                        "task_db: failed to deserialize pending_request \
+                         (DB may be corrupted) — task will not be dispatched: {e}"
+                    );
+                    None
+                }
+            });
 
         Ok(TaskState {
             id: harness_core::types::TaskId(id),
