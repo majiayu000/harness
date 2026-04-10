@@ -136,7 +136,45 @@ impl TaskEventLog {
             }
         };
         let mut file = self.file.lock().unwrap();
-        if let Err(e) = writeln!(file, "{line}") {
+
+        // On Unix, `rename()` is atomic but leaves existing file descriptors
+        // pointing to the old (now unlinked) inode.  When compaction replaces
+        // `task-events.jsonl`, a running appender would silently write events
+        // to the unlinked inode — events are lost once the fd is closed.
+        // Detect the replacement by comparing inodes and reopen if needed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let replaced = file
+                .metadata()
+                .ok()
+                .zip(std::fs::metadata(&self.path).ok())
+                .map(|(fd_meta, path_meta)| fd_meta.ino() != path_meta.ino())
+                .unwrap_or(false);
+            if replaced {
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                {
+                    Ok(new_file) => {
+                        tracing::debug!(
+                            path = %self.path.display(),
+                            "event_log: log file replaced by compaction; reopened"
+                        );
+                        *file = new_file;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %self.path.display(),
+                            "event_log: log file replaced but reopen failed: {e}"
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Err(e) = writeln!(*file, "{line}") {
             tracing::warn!(
                 path = %self.path.display(),
                 "event_log: failed to append event: {e}"
