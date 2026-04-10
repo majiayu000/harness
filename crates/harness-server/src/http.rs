@@ -14,196 +14,26 @@ use axum::{
     Json, Router,
 };
 use dashmap::DashMap;
-use harness_protocol::{methods::RpcRequest, notifications::RpcNotification};
+use harness_protocol::methods::RpcRequest;
 use serde_json::json;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::RwLock;
 
 pub(crate) mod auth;
 pub(crate) mod rate_limit;
+pub(crate) mod startup;
+pub(crate) mod state;
 pub(crate) mod task_routes;
 
-/// Core services: thread/task management and persistence.
-pub struct CoreServices {
-    pub server: Arc<HarnessServer>,
-    pub project_root: std::path::PathBuf,
-    /// Home directory captured at startup to avoid TOCTOU when validating
-    /// project roots against `$HOME` in concurrent requests.
-    pub home_dir: std::path::PathBuf,
-    pub tasks: Arc<task_runner::TaskStore>,
-    pub thread_db: Option<crate::thread_db::ThreadDb>,
-    pub plan_db: Option<crate::plan_db::PlanDb>,
-    /// In-memory plan cache hydrated from `plan_db` on startup.
-    /// Write-through: every mutation must also persist via `plan_db`.
-    pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
-    pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
-    pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
-}
-
-/// Engine services: skills, rules, and garbage collection.
-pub struct EngineServices {
-    pub skills: Arc<RwLock<harness_skills::store::SkillStore>>,
-    pub rules: Arc<RwLock<harness_rules::engine::RuleEngine>>,
-    pub gc_agent: Arc<harness_gc::gc_agent::GcAgent>,
-}
-
-/// Observability services: event store and telemetry.
-pub struct ObservabilityServices {
-    pub events: Arc<harness_observe::event_store::EventStore>,
-    pub signal_rate_limiter: Arc<rate_limit::SignalRateLimiter>,
-    pub password_reset_rate_limiter: Arc<rate_limit::PasswordResetRateLimiter>,
-    pub review_store: Option<Arc<crate::review_store::ReviewStore>>,
-}
-
-/// Concurrency services: task queue and workspace isolation.
-pub struct ConcurrencyServices {
-    pub task_queue: Arc<crate::task_queue::TaskQueue>,
-    pub workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
-}
-
-/// Notification services: broadcast channels and lag tracking.
-pub struct NotificationServices {
-    /// Broadcast channel for server-push notifications (WebSocket and stdio transports).
-    pub notification_tx: broadcast::Sender<RpcNotification>,
-    /// Total number of dropped broadcast notifications due to lagged receivers.
-    pub notification_lagged_total: Arc<AtomicU64>,
-    /// Log lagged drops when the total crosses a multiple of this value.
-    /// Set to 0 to disable lag logs while still counting drops.
-    pub notification_lag_log_every: u64,
-    /// Channel for server-push JSON-RPC notifications (stdio transport only).
-    pub notify_tx: Option<crate::notify::NotifySender>,
-    /// Whether `initialize` has been received (but `initialized` may not yet be set).
-    /// Used to enforce the `initialize` → `initialized` ordering.
-    pub initializing: Arc<AtomicBool>,
-    /// Whether the client has completed the initialize/initialized handshake.
-    pub initialized: Arc<AtomicBool>,
-    /// Broadcast channel used to signal all active WebSocket connections to close gracefully.
-    pub ws_shutdown_tx: broadcast::Sender<()>,
-}
-
-/// Intake services: external event sources and task completion handling.
-pub struct IntakeServices {
-    /// Feishu Bot intake handler. None when feishu intake is disabled or not configured.
-    pub feishu_intake: Option<Arc<crate::intake::feishu::FeishuIntake>>,
-    /// All GitHub issue pollers, one per configured repo. The same Arc instances
-    /// are shared between the completion callback and the orchestrator so that
-    /// `on_task_complete` (e.g. evicting a failed issue from `dispatched`)
-    /// operates on the live poller rather than a detached clone.
-    pub github_pollers: Vec<Arc<dyn crate::intake::IntakeSource>>,
-    /// Completion callback invoked when a task reaches a terminal state.
-    pub completion_callback: Option<task_runner::CompletionCallback>,
-}
-
-pub struct AppState {
-    pub core: CoreServices,
-    pub engines: EngineServices,
-    pub observability: ObservabilityServices,
-    pub concurrency: ConcurrencyServices,
-    pub runtime_hosts: Arc<crate::runtime_hosts::RuntimeHostManager>,
-    pub runtime_project_cache: Arc<crate::runtime_project_cache::RuntimeProjectCacheManager>,
-    /// Serializes runtime snapshot writes to avoid out-of-order persistence.
-    pub runtime_state_persist_lock: Mutex<()>,
-    /// Set when a runtime-state persist fails; the next successful
-    /// `persist_runtime_state` call clears it.  Handlers that find no
-    /// in-memory mutation (e.g. idempotent deregister retry) still trigger a
-    /// persist when this flag is set, converging durable state.
-    pub runtime_state_dirty: AtomicBool,
-    pub notifications: NotificationServices,
-    pub intake: IntakeServices,
-    pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
-
-    // ── Service layer ────────────────────────────────────────────────────────
-    // Trait-based abstractions for independent testability. Each service owns
-    // its dependencies; the fields above are preserved for handlers that have
-    // not yet been migrated to the service interfaces.
-    /// Project registry operations and default-root lookup.
-    pub project_svc: Arc<dyn crate::services::project::ProjectService>,
-    /// Task lifecycle queries and stream subscriptions.
-    pub task_svc: Arc<dyn crate::services::task::TaskService>,
-    /// Task enqueue: project resolution, agent dispatch, concurrency, workspace.
-    pub execution_svc: Arc<dyn crate::services::execution::ExecutionService>,
-}
-
-impl AppState {
-    pub fn observe_notification_lag(&self, dropped: u64) -> u64 {
-        let previous_total = self
-            .notifications
-            .notification_lagged_total
-            .fetch_add(dropped, Ordering::Relaxed);
-        let dropped_total = previous_total.saturating_add(dropped);
-        let log_every = self.notifications.notification_lag_log_every;
-        if log_every > 0 && previous_total / log_every < dropped_total / log_every {
-            tracing::warn!(
-                dropped_since_last_recv = dropped,
-                dropped_total,
-                log_every,
-                "notification receiver lagged; dropped broadcast notifications"
-            );
-        }
-        dropped_total
-    }
-
-    pub async fn persist_runtime_state(&self) -> anyhow::Result<()> {
-        let _guard = self.runtime_state_persist_lock.lock().await;
-        let Some(store) = self.core.runtime_state_store.as_ref() else {
-            return Ok(());
-        };
-        let (hosts, leases) = self.runtime_hosts.snapshot_state();
-        let project_caches = self.runtime_project_cache.snapshot_state();
-        match store.persist_snapshot(hosts, leases, project_caches).await {
-            Ok(()) => {
-                self.runtime_state_dirty.store(false, Ordering::Release);
-                Ok(())
-            }
-            Err(e) => {
-                self.runtime_state_dirty.store(true, Ordering::Release);
-                Err(e)
-            }
-        }
-    }
-
-    /// Returns `true` when a previous persist failed and durable state may be
-    /// stale.  Handlers that skip their own mutation (e.g. idempotent
-    /// deregister retry returning NOT_FOUND) should check this and re-persist
-    /// to converge.
-    pub fn is_runtime_state_dirty(&self) -> bool {
-        self.runtime_state_dirty.load(Ordering::Acquire)
-    }
-}
-fn resolve_project_root(configured_root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-    let project_root = configured_root.canonicalize().map_err(|e| {
-        anyhow::anyhow!(
-            "invalid server.project_root '{}': {e}",
-            configured_root.display()
-        )
-    })?;
-    if !project_root.is_dir() {
-        anyhow::bail!(
-            "server.project_root is not a directory: {}",
-            project_root.display()
-        );
-    }
-    Ok(project_root)
-}
-
-/// Expand a leading `~/` or standalone `~` to the value of `$HOME`.
-/// Returns the path unchanged when `~` is not present or `HOME` is unset.
-fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
-    if let Some(s) = path.to_str() {
-        if let Some(rest) = s.strip_prefix("~/") {
-            if let Ok(home) = std::env::var("HOME") {
-                return std::path::PathBuf::from(home).join(rest);
-            }
-        } else if s == "~" {
-            if let Ok(home) = std::env::var("HOME") {
-                return std::path::PathBuf::from(home);
-            }
-        }
-    }
-    path.to_path_buf()
-}
+pub(crate) use startup::{
+    build_completion_callback, expand_tilde, infer_github_severity, resolve_project_root,
+    IngestSignalRequest, PasswordResetRequest,
+};
+pub use state::{
+    AppState, ConcurrencyServices, CoreServices, EngineServices, IntakeServices,
+    NotificationServices, ObservabilityServices,
+};
 
 /// Build an AppState with all stores. Used by both HTTP and stdio transports.
 pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppState> {
@@ -716,16 +546,16 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         },
         runtime_hosts,
         runtime_project_cache,
-        runtime_state_persist_lock: Mutex::new(()),
-        runtime_state_dirty: AtomicBool::new(false),
-        notifications: NotificationServices {
-            notification_tx: broadcast::channel(notification_broadcast_capacity).0,
-            notification_lagged_total: Arc::new(AtomicU64::new(0)),
+        runtime_state_persist_lock: tokio::sync::Mutex::new(()),
+        runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
+        notifications: state::NotificationServices {
+            notification_tx: tokio::sync::broadcast::channel(notification_broadcast_capacity).0,
+            notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             notification_lag_log_every,
             notify_tx: None,
-            initializing: Arc::new(AtomicBool::new(false)),
-            initialized: Arc::new(AtomicBool::new(false)),
-            ws_shutdown_tx: broadcast::channel(1).0,
+            initializing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
         interceptors,
         intake: IntakeServices {
@@ -737,183 +567,6 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         task_svc,
         execution_svc,
     })
-}
-
-fn build_completion_callback(
-    feishu_intake: &Option<Arc<crate::intake::feishu::FeishuIntake>>,
-    github_pollers: &[(String, Arc<dyn crate::intake::IntakeSource>)],
-    review_config: harness_core::config::agents::AgentReviewConfig,
-    quality_trigger: Option<Arc<crate::quality_trigger::QualityTrigger>>,
-    config_github_token: Option<String>,
-) -> Option<task_runner::CompletionCallback> {
-    let mut sources: std::collections::HashMap<String, Arc<dyn crate::intake::IntakeSource>> =
-        std::collections::HashMap::new();
-    // Insert each GitHub poller keyed by "github:{owner/repo}" for precise
-    // per-repo routing. Also insert the first poller under the bare "github"
-    // key as a backward-compat fallback for tasks that pre-date multi-repo
-    // support and have task.repo == None.
-    for (i, (key, poller)) in github_pollers.iter().enumerate() {
-        sources.insert(key.clone(), poller.clone());
-        if i == 0 {
-            sources.insert("github".to_string(), poller.clone());
-        }
-    }
-    if let Some(fi) = feishu_intake {
-        let fi_source: Arc<dyn crate::intake::IntakeSource> = fi.clone();
-        sources.insert(fi_source.name().to_string(), fi_source);
-    }
-    if sources.is_empty() && !review_config.review_bot_auto_trigger && quality_trigger.is_none() {
-        return None;
-    }
-    let sources = Arc::new(sources);
-    Some(Arc::new(move |task: task_runner::TaskState| {
-        let sources = sources.clone();
-        let review_config = review_config.clone();
-        let quality_trigger = quality_trigger.clone();
-        let github_token = config_github_token.clone();
-        Box::pin(async move {
-            // Grade recent events and auto-trigger GC if quality is poor.
-            if let Some(qt) = quality_trigger {
-                qt.check_and_maybe_trigger().await;
-            }
-
-            // Auto-trigger review bot comment when task completes with a PR URL.
-            if review_config.review_bot_auto_trigger {
-                if let task_runner::TaskStatus::Done = &task.status {
-                    if let Some(pr_url) = task.pr_url.as_deref() {
-                        if let Some((owner, repo, pr_num)) =
-                            harness_core::prompts::parse_github_pr_url(pr_url)
-                        {
-                            let resolved_token = github_token
-                                .or_else(|| std::env::var("GITHUB_TOKEN").ok())
-                                .filter(|t| !t.is_empty());
-                            match resolved_token {
-                                Some(token) => {
-                                    if let Err(e) = post_review_bot_comment(
-                                        &owner,
-                                        &repo,
-                                        pr_num,
-                                        &review_config.review_bot_command,
-                                        &token,
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(
-                                            pr_url,
-                                            "review_bot_auto_trigger: failed to post comment: {e}"
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            pr_url,
-                                            comment = review_config.review_bot_command,
-                                            "review bot comment posted"
-                                        );
-                                    }
-                                }
-                                _ => {
-                                    tracing::warn!(
-                                        pr_url,
-                                        "review_bot_auto_trigger: GITHUB_TOKEN not set or empty; skipping"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Intake source notification.
-            let Some(source_name) = task.source.as_deref() else {
-                return;
-            };
-            let Some(external_id) = task.external_id.as_deref() else {
-                tracing::warn!(
-                    task_id = ?task.id,
-                    source = source_name,
-                    "completion_callback: task missing external_id, skipping"
-                );
-                return;
-            };
-            // For GitHub tasks, route to the specific repo's poller using
-            // "github:{owner/repo}". Fall back to the bare "github" key for
-            // tasks persisted before multi-repo support (task.repo == None).
-            let lookup_key = if source_name == "github" {
-                task.repo
-                    .as_ref()
-                    .map(|r| format!("github:{r}"))
-                    .unwrap_or_else(|| "github".to_string())
-            } else {
-                source_name.to_string()
-            };
-            let Some(source) = sources.get(&lookup_key) else {
-                tracing::warn!(
-                    task_id = ?task.id,
-                    source = source_name,
-                    lookup_key,
-                    "completion_callback: intake source not found, skipping"
-                );
-                return;
-            };
-            let summary = match &task.status {
-                task_runner::TaskStatus::Done => task
-                    .pr_url
-                    .as_deref()
-                    .map(|url| format!("PR: {url}"))
-                    .unwrap_or_else(|| "Task completed.".to_string()),
-                task_runner::TaskStatus::Failed => {
-                    task.error.as_deref().unwrap_or("unknown error").to_string()
-                }
-                _ => {
-                    tracing::warn!(
-                        task_id = ?task.id,
-                        status = ?task.status,
-                        "completion_callback: called with non-terminal status, skipping"
-                    );
-                    return;
-                }
-            };
-            let result = crate::intake::TaskCompletionResult {
-                status: task.status.clone(),
-                pr_url: task.pr_url.clone(),
-                error: task.error.clone(),
-                summary,
-            };
-            if let Err(e) = source.on_task_complete(external_id, &result).await {
-                tracing::warn!(
-                    task_id = ?task.id,
-                    source = source_name,
-                    "on_task_complete failed: {e}"
-                );
-            }
-        })
-    }))
-}
-
-/// Post a comment to a GitHub PR via the Issues API.
-async fn post_review_bot_comment(
-    owner: &str,
-    repo: &str,
-    pr_number: u64,
-    body: &str,
-    github_token: &str,
-) -> anyhow::Result<()> {
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments");
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {github_token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", "harness-bot")
-        .json(&serde_json::json!({ "body": body }))
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("GitHub API returned {status}: {text}");
-    }
-    Ok(())
 }
 
 /// Resolve the reviewer agent for independent agent review.
@@ -1655,44 +1308,6 @@ async fn intake_status(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     }))
 }
 
-/// Request body for `POST /signals`.
-#[derive(serde::Deserialize)]
-struct IngestSignalRequest {
-    source: String,
-    #[serde(default)]
-    severity: Option<harness_core::types::Severity>,
-    payload: serde_json::Value,
-}
-
-/// Infer severity from a GitHub webhook payload: CI failure → High, changes_requested → Medium.
-fn infer_github_severity(payload: &serde_json::Value) -> Option<harness_core::types::Severity> {
-    if let Some(obj) = payload.as_object() {
-        // check_run completed with failure
-        if let (Some(action), Some(check_run)) = (
-            obj.get("action").and_then(|v| v.as_str()),
-            obj.get("check_run"),
-        ) {
-            if action == "completed" {
-                let conclusion = check_run
-                    .get("conclusion")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if conclusion == "failure" {
-                    return Some(harness_core::types::Severity::High);
-                }
-            }
-        }
-        // pull_request_review with changes_requested
-        if let Some(review) = obj.get("review") {
-            let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("");
-            if state.eq_ignore_ascii_case("changes_requested") {
-                return Some(harness_core::types::Severity::Medium);
-            }
-        }
-    }
-    None
-}
-
 /// POST /signals — ingest an external signal (CI failure, review feedback, etc.).
 ///
 /// Validates the `x-hub-signature-256` HMAC-SHA256 header using the configured
@@ -1791,11 +1406,6 @@ async fn ingest_signal(
         StatusCode::OK,
         Json(json!({"status": "accepted", "id": signal_id.as_str()})),
     )
-}
-
-#[derive(serde::Deserialize)]
-struct PasswordResetRequest {
-    email: String,
 }
 
 /// POST /auth/reset-password — initiate a password reset.

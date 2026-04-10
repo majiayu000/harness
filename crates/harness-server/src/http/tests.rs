@@ -8,6 +8,7 @@ use harness_core::{
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
