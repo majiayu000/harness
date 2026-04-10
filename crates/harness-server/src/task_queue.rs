@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
+/// Components returned when a caller is enqueued instead of immediately granted a permit.
+/// Contains the notification receiver, the permit-granted flag, and the cancellation flag.
+type EnqueuedWaiter = (oneshot::Receiver<()>, Arc<AtomicBool>, Arc<AtomicBool>);
+
 /// Per-project and global queue statistics.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueStats {
@@ -124,10 +128,7 @@ impl PriorityPermitQueue {
     /// returns the `Receiver` half of the notification channel, the shared
     /// `permit_granted` flag, and the shared `cancelled` flag; the caller
     /// **must** `.await` the receiver **outside** this lock.
-    fn try_acquire_or_enqueue(
-        &mut self,
-        priority: u8,
-    ) -> Result<(), (oneshot::Receiver<()>, Arc<AtomicBool>, Arc<AtomicBool>)> {
+    fn try_acquire_or_enqueue(&mut self, priority: u8) -> Result<(), EnqueuedWaiter> {
         if self.available > 0 {
             self.available -= 1;
             Ok(())
