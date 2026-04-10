@@ -244,6 +244,30 @@ impl TaskDb {
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 
+    /// Return tasks whose `status` column matches any value in `statuses`.
+    ///
+    /// Uses parameterized placeholders — safe for internal status string constants.
+    /// Returns an empty `Vec` when `statuses` is empty.
+    pub async fn list_by_status(&self, statuses: &[&str]) -> anyhow::Result<Vec<TaskState>> {
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(statuses.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project
+             FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at DESC"
+        );
+        let mut q = sqlx::query_as::<_, TaskRow>(&sql);
+        for status in statuses {
+            q = q.bind(*status);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.into_iter().map(TaskRow::try_into_task_state).collect()
+    }
+
     /// Return `true` if a task row with the given ID exists in the database.
     pub async fn exists_by_id(&self, id: &str) -> anyhow::Result<bool> {
         let row: Option<(String,)> = sqlx::query_as("SELECT id FROM tasks WHERE id = ?")

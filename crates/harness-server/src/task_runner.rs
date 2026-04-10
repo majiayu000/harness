@@ -657,7 +657,17 @@ impl TaskStore {
 
         let cache = DashMap::new();
         let persist_locks = DashMap::new();
-        for task in db.list().await? {
+        // Only load active (non-terminal) tasks into the in-memory cache to prevent
+        // unbounded memory growth from historical completed tasks.
+        let active_statuses = &[
+            "pending",
+            "awaiting_deps",
+            "implementing",
+            "agent_review",
+            "waiting",
+            "reviewing",
+        ];
+        for task in db.list_by_status(active_statuses).await? {
             persist_locks.insert(task.id.clone(), Arc::new(Mutex::new(())));
             cache.insert(task.id.clone(), task);
         }
@@ -677,10 +687,36 @@ impl TaskStore {
         self.cache.get(id).map(|r| r.value().clone())
     }
 
+    /// Look up a task by ID, checking the in-memory cache first.
+    /// Falls back to the database for terminal tasks that were evicted from
+    /// the cache at startup (Done, Failed, Cancelled).
+    /// Returns `None` only when the ID is unknown in both cache and DB.
+    pub async fn get_with_db_fallback(&self, id: &TaskId) -> Option<TaskState> {
+        if let Some(task) = self.cache.get(id) {
+            return Some(task.value().clone());
+        }
+        self.db.get(id.0.as_str()).await.ok().flatten()
+    }
+
+    /// Return terminal tasks (Done, Failed) directly from the database.
+    ///
+    /// Used during startup for worktree cleanup. Terminal tasks are not held
+    /// in the in-memory cache, so this is a targeted one-time DB query.
+    pub async fn list_terminal_from_db(&self) -> anyhow::Result<Vec<TaskState>> {
+        self.db.list_by_status(&["done", "failed"]).await
+    }
+
     pub fn count(&self) -> usize {
         self.cache.len()
     }
 
+    /// Return all tasks currently in the in-memory cache.
+    ///
+    /// **Semantic note**: since startup only loads active (non-terminal) tasks
+    /// into the cache, this method returns only Pending, AwaitingDeps,
+    /// Implementing, AgentReview, Waiting, and Reviewing tasks.
+    /// To look up a specific completed task use [`get_with_db_fallback`].
+    /// To enumerate terminal tasks use [`list_terminal_from_db`].
     pub fn list_all(&self) -> Vec<TaskState> {
         self.cache.iter().map(|e| e.value().clone()).collect()
     }

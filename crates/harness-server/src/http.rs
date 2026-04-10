@@ -471,16 +471,13 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         };
 
     // Cleanup orphan worktrees from any previous crash.
+    // Terminal tasks are no longer held in the in-memory cache, so query DB directly.
     if let Some(ref wmgr) = workspace_mgr {
         let terminal_ids: Vec<crate::task_runner::TaskId> = tasks
-            .list_all()
+            .list_terminal_from_db()
+            .await
+            .unwrap_or_default()
             .into_iter()
-            .filter(|t| {
-                matches!(
-                    t.status,
-                    crate::task_runner::TaskStatus::Done | crate::task_runner::TaskStatus::Failed
-                )
-            })
             .map(|t| t.id)
             .collect();
         wmgr.cleanup_orphan_worktrees(&project_root, &terminal_ids)
@@ -1568,7 +1565,12 @@ async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<task_runner:
 }
 
 async fn get_task(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    match state.core.tasks.get(&harness_core::types::TaskId(id)) {
+    match state
+        .core
+        .tasks
+        .get_with_db_fallback(&harness_core::types::TaskId(id))
+        .await
+    {
         Some(task) => Json(task).into_response(),
         None => (
             StatusCode::NOT_FOUND,
@@ -1584,7 +1586,13 @@ async fn get_task_artifacts(
     Path(id): Path<String>,
 ) -> Response {
     let task_id = harness_core::types::TaskId(id);
-    if state.core.tasks.get(&task_id).is_none() {
+    if state
+        .core
+        .tasks
+        .get_with_db_fallback(&task_id)
+        .await
+        .is_none()
+    {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "task not found"})),
@@ -1613,7 +1621,13 @@ async fn stream_task_sse(State(state): State<Arc<AppState>>, Path(id): Path<Stri
     let rx = match state.core.tasks.subscribe_task_stream(&task_id) {
         Some(rx) => rx,
         None => {
-            if state.core.tasks.get(&task_id).is_none() {
+            if state
+                .core
+                .tasks
+                .get_with_db_fallback(&task_id)
+                .await
+                .is_none()
+            {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(json!({"error": "task not found"})),
