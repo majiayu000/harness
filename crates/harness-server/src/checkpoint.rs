@@ -135,7 +135,10 @@ impl TaskCheckpoint {
 
         // Unique suffix prevents races when save() is called concurrently for
         // the same task_id (e.g. from two tokio tasks).
-        let tmp_name = format!("{}.{}.tmp", self.task_id, uuid::Uuid::new_v4());
+        // Sanitize task_id so path separators in the ID don't create a
+        // nested path under `parent` that hasn't been mkdir'd.
+        let safe_id = self.task_id.replace(['/', '\\'], "_");
+        let tmp_name = format!("{}.{}.tmp", safe_id, uuid::Uuid::new_v4());
         let tmp_path = parent.join(tmp_name);
 
         // Write and sync the temp file before rename so data is on disk.
@@ -146,9 +149,15 @@ impl TaskCheckpoint {
         }
         std::fs::rename(&tmp_path, &path)?;
 
-        // fsync the parent directory so the renamed directory entry is durable.
-        let dir = std::fs::File::open(parent)?;
-        dir.sync_all()?;
+        // Best-effort: fsync the parent directory so the renamed entry is
+        // durable.  Directory fsync is unsupported on some filesystems
+        // (notably Windows); treat failure as non-fatal so a successful
+        // rename is never rolled back into an error.
+        if let Ok(dir) = std::fs::File::open(parent) {
+            if let Err(e) = dir.sync_all() {
+                tracing::debug!("checkpoint: parent dir fsync not supported (non-fatal): {e}");
+            }
+        }
 
         Ok(())
     }
