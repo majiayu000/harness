@@ -8,6 +8,7 @@ fn config(max_concurrent: usize, max_queue: usize) -> ConcurrencyConfig {
         max_queue_size: max_queue,
         stall_timeout_secs: 300,
         per_project: Default::default(),
+        ..ConcurrencyConfig::default()
     }
 }
 
@@ -123,6 +124,7 @@ async fn per_project_limit_enforced() {
         max_queue_size: 16,
         stall_timeout_secs: 300,
         per_project,
+        ..ConcurrencyConfig::default()
     };
     let q = Arc::new(TaskQueue::new(&cfg));
 
@@ -153,6 +155,7 @@ async fn project_cannot_starve_another() {
         max_queue_size: 16,
         stall_timeout_secs: 300,
         per_project,
+        ..ConcurrencyConfig::default()
     };
     let q = Arc::new(TaskQueue::new(&cfg));
 
@@ -190,6 +193,7 @@ async fn project_stats_reflect_running_and_queued() {
         max_queue_size: 16,
         stall_timeout_secs: 300,
         per_project,
+        ..ConcurrencyConfig::default()
     };
     let q2 = Arc::new(TaskQueue::new(&cfg2));
     let _holder = q2.acquire("capped", 0).await.unwrap();
@@ -315,6 +319,7 @@ async fn cancelled_project_wait_does_not_leak_queued_count() {
         max_queue_size: 16,
         stall_timeout_secs: 300,
         per_project,
+        ..ConcurrencyConfig::default()
     };
     let q = Arc::new(TaskQueue::new(&cfg));
     let _holder = q.acquire("proj", 0).await.unwrap();
@@ -352,6 +357,7 @@ async fn cancelled_global_wait_releases_project_permit() {
         max_queue_size: 16,
         stall_timeout_secs: 300,
         per_project,
+        ..ConcurrencyConfig::default()
     };
     let q = Arc::new(TaskQueue::new(&cfg));
     // Hold the single global slot.
@@ -400,6 +406,7 @@ async fn project_permit_not_leaked_on_mid_send_cancellation() {
         max_queue_size: 16,
         stall_timeout_secs: 300,
         per_project,
+        ..ConcurrencyConfig::default()
     };
     let q = Arc::new(TaskQueue::new(&cfg));
 
@@ -439,6 +446,7 @@ async fn global_permit_not_leaked_on_mid_send_cancellation() {
         max_queue_size: 16,
         stall_timeout_secs: 300,
         per_project,
+        ..ConcurrencyConfig::default()
     };
     let q = Arc::new(TaskQueue::new(&cfg));
 
