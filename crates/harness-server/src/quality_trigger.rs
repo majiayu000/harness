@@ -93,33 +93,54 @@ impl QualityTrigger {
         // Cross-review gate: skip if no challenger, no task context, or grade=A.
         if let (Some(challenger), Some(ctx)) = (&self.challenger_agent, task_ctx) {
             if report.grade != Grade::A {
-                let target = format!("PR: {}\n\nDiff summary:\n{}", ctx.pr_description, ctx.diff);
+                // Cap diff to avoid oversized LLM requests (latency/cost spikes).
+                const MAX_DIFF_CHARS: usize = 4096;
+                let diff_excerpt = if ctx.diff.len() > MAX_DIFF_CHARS {
+                    &ctx.diff[..MAX_DIFF_CHARS]
+                } else {
+                    &ctx.diff
+                };
+                let target = format!(
+                    "PR: {}\n\nDiff summary:\n{}",
+                    ctx.pr_description, diff_excerpt
+                );
                 if let Some(primary) = self.agent_registry.default_agent() {
-                    match run_cross_review(
-                        primary,
-                        Some(challenger.clone()),
-                        self.project_root.clone(),
-                        target,
-                        2,
-                    )
-                    .await
-                    {
-                        Ok(result) => {
-                            report.semantic_verdict = Some(result.final_verdict.clone());
-                            if result.final_verdict == "NOT_CONVERGED" {
-                                let original = report.grade;
-                                report.grade = Self::downgrade(report.grade);
-                                tracing::info!(
-                                    original_grade = ?original,
-                                    effective_grade = ?report.grade,
-                                    "quality_trigger: NOT_CONVERGED — grade downgraded"
+                    // Identity guard: skip cross-review when primary and challenger are the
+                    // same agent — identical models produce correlated verdicts that cannot
+                    // serve as an independent check.
+                    if primary.name() == challenger.name() {
+                        tracing::warn!(
+                            agent = primary.name(),
+                            "quality_trigger: primary and challenger are the same agent; \
+                             skipping cross-review to preserve independence"
+                        );
+                    } else {
+                        match run_cross_review(
+                            primary,
+                            Some(challenger.clone()),
+                            self.project_root.clone(),
+                            target,
+                            2,
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                report.semantic_verdict = Some(result.final_verdict.clone());
+                                if result.final_verdict == "NOT_CONVERGED" {
+                                    let original = report.grade;
+                                    report.grade = Self::downgrade(report.grade);
+                                    tracing::info!(
+                                        original_grade = ?original,
+                                        effective_grade = ?report.grade,
+                                        "quality_trigger: NOT_CONVERGED — grade downgraded"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "quality_trigger: cross-review failed: {e}; using numeric grade only"
                                 );
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "quality_trigger: cross-review failed: {e}; using numeric grade only"
-                            );
                         }
                     }
                 } else {
@@ -227,6 +248,37 @@ mod tests {
             cooldown_secs,
             challenger,
         )
+    }
+
+    // Mock that returns "ISSUE: foo\nCONFIRMED: foo" — used as primary in NOT_CONVERGED tests.
+    // Has a distinct name from NotConvergedMock so the identity guard does not skip cross-review.
+    struct NotConvergedPrimaryMock;
+
+    #[async_trait::async_trait]
+    impl CodeAgent for NotConvergedPrimaryMock {
+        fn name(&self) -> &str {
+            "not-converged-primary"
+        }
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+        async fn execute(&self, _req: AgentRequest) -> HarnessResult<AgentResponse> {
+            Ok(AgentResponse {
+                output: "ISSUE: foo\nCONFIRMED: foo".to_string(),
+                stderr: String::new(),
+                items: vec![],
+                token_usage: TokenUsage::default(),
+                model: "mock".to_string(),
+                exit_code: Some(0),
+            })
+        }
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            _tx: Sender<StreamItem>,
+        ) -> HarnessResult<()> {
+            Ok(())
+        }
     }
 
     // Mock that returns "ISSUE: foo" (primary) or "CONFIRMED: foo" (challenger) — NOT_CONVERGED
@@ -518,7 +570,7 @@ mod tests {
             dir.path(),
             vec![Grade::D],
             300,
-            Some(Arc::new(NotConvergedMock)),
+            Some(Arc::new(NotConvergedPrimaryMock)),
             Some(Arc::new(NotConvergedMock)),
         )
         .await;

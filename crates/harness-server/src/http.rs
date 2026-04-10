@@ -859,7 +859,8 @@ fn build_completion_callback(
                         .map(|pr| crate::quality_trigger::TaskReviewContext {
                             diff: task
                                 .rounds
-                                .last()
+                                .iter()
+                                .find(|r| r.action == "implement")
                                 .and_then(|r| r.detail.clone())
                                 .unwrap_or_default(),
                             pr_description: pr.clone(),
