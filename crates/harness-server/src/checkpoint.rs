@@ -106,13 +106,61 @@ impl TaskCheckpoint {
     }
 
     /// Save the checkpoint to the filesystem path for this task.
+    ///
+    /// Uses an atomic write: the JSON is first written to a temporary file
+    /// (via [`tempfile::NamedTempFile`]) that lives in the same directory as
+    /// the destination, synced to disk, then persisted (renamed) into place.
+    ///
+    /// * **Unique temp file** — `NamedTempFile::new_in` generates a unique
+    ///   name so two concurrent `save()` calls for the same task never
+    ///   clobber each other's temp file.
+    /// * **`sync_all()` before persist** — ensures data bytes are on disk
+    ///   before the directory entry is updated; without this a power loss
+    ///   after the rename can leave a zero-byte or truncated file.
+    /// * **`persist()` instead of `rename()`** — on Windows `std::fs::rename`
+    ///   fails when the destination already exists; `NamedTempFile::persist`
+    ///   uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` internally so it
+    ///   atomically replaces the destination on all platforms.
+    /// * **Parent-directory fsync after persist** — makes the new directory
+    ///   entry durable; unsupported on some filesystems (notably Windows) so
+    ///   failures are logged at debug level and treated as non-fatal.
+    ///
+    /// POSIX guarantees that `rename(2)` is atomic with respect to readers,
+    /// so a concurrent `load` will always see either the previous complete
+    /// checkpoint or the new one — never a partial write.
     pub fn save(&self) -> anyhow::Result<()> {
+        use std::io::Write as _;
+
         let path = Self::default_path(&self.task_id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("checkpoint path has no parent directory"))?;
+        std::fs::create_dir_all(parent)?;
+
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, data)?;
+
+        // Create the temp file in the same directory as the destination so
+        // that persist() (rename) stays on the same filesystem.
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        tmp.write_all(data.as_bytes())?;
+        // Sync data to disk before rename so a power loss after rename does
+        // not leave a zero-byte or truncated checkpoint.
+        tmp.as_file().sync_all()?;
+        // persist() uses MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows
+        // and rename(2) on Unix — both atomically replace the destination.
+        tmp.persist(&path)
+            .map_err(|e| anyhow::anyhow!("checkpoint persist failed: {}", e.error))?;
+
+        // Best-effort: fsync the parent directory so the renamed entry is
+        // durable.  Directory fsync is unsupported on some filesystems
+        // (notably Windows); treat failure as non-fatal so a successful
+        // persist is never rolled back into an error.
+        if let Ok(dir) = std::fs::File::open(parent) {
+            if let Err(e) = dir.sync_all() {
+                tracing::debug!("checkpoint: parent dir fsync not supported (non-fatal): {e}");
+            }
+        }
+
         Ok(())
     }
 
