@@ -82,6 +82,7 @@ async fn restart_no_checkpoint_fails_interrupted_tasks() -> anyhow::Result<()> {
         let task = store
             .get_with_db_fallback(&CoreTaskId(id.to_string()))
             .await
+            .expect("DB query should not fail")
             .unwrap_or_else(|| panic!("{id} should be fetchable from DB"));
         assert!(
             matches!(task.status, TaskStatus::Failed),
@@ -106,12 +107,14 @@ async fn restart_no_checkpoint_fails_interrupted_tasks() -> anyhow::Result<()> {
     let done = store
         .get_with_db_fallback(&CoreTaskId("t-done".into()))
         .await
+        .expect("DB query should not fail")
         .expect("t-done must be fetchable from DB");
     assert!(matches!(done.status, TaskStatus::Done));
 
     let failed = store
         .get_with_db_fallback(&CoreTaskId("t-failed".into()))
         .await
+        .expect("DB query should not fail")
         .expect("t-failed must be fetchable from DB");
     assert!(matches!(failed.status, TaskStatus::Failed));
 
@@ -280,6 +283,7 @@ async fn restart_transient_retry_task_fails() -> anyhow::Result<()> {
     let transient = store
         .get_with_db_fallback(&CoreTaskId("t-transient".into()))
         .await
+        .expect("DB query should not fail")
         .expect("task must be fetchable from DB");
     assert!(
         matches!(transient.status, TaskStatus::Failed),
@@ -350,7 +354,7 @@ async fn restart_mixed_recovery_counts() -> anyhow::Result<()> {
     // Failed tasks are terminal and not in cache; fetch each from DB.
     let mut failed_count = 0;
     for id in ["t-fail-1", "t-fail-2"] {
-        if let Some(task) = store
+        if let Ok(Some(task)) = store
             .get_with_db_fallback(&CoreTaskId(id.to_string()))
             .await
         {

@@ -690,12 +690,37 @@ impl TaskStore {
     /// Look up a task by ID, checking the in-memory cache first.
     /// Falls back to the database for terminal tasks that were evicted from
     /// the cache at startup (Done, Failed, Cancelled).
-    /// Returns `None` only when the ID is unknown in both cache and DB.
-    pub async fn get_with_db_fallback(&self, id: &TaskId) -> Option<TaskState> {
+    /// Returns `Ok(None)` only when the ID is unknown in both cache and DB.
+    /// Returns `Err` when the database query itself fails.
+    pub async fn get_with_db_fallback(&self, id: &TaskId) -> anyhow::Result<Option<TaskState>> {
         if let Some(task) = self.cache.get(id) {
-            return Some(task.value().clone());
+            return Ok(Some(task.value().clone()));
         }
-        self.db.get(id.0.as_str()).await.ok().flatten()
+        self.db.get(id.0.as_str()).await
+    }
+
+    /// Check whether a dependency task is in Done status, consulting DB for
+    /// tasks evicted from the startup cache.
+    async fn is_dep_done(&self, id: &TaskId) -> bool {
+        if let Some(task) = self.cache.get(id) {
+            return matches!(task.status, TaskStatus::Done);
+        }
+        match self.db.get(id.0.as_str()).await {
+            Ok(Some(task)) => matches!(task.status, TaskStatus::Done),
+            _ => false,
+        }
+    }
+
+    /// Check whether a dependency task is in Failed status, consulting DB for
+    /// tasks evicted from the startup cache.
+    async fn is_dep_failed(&self, id: &TaskId) -> bool {
+        if let Some(task) = self.cache.get(id) {
+            return matches!(task.status, TaskStatus::Failed);
+        }
+        match self.db.get(id.0.as_str()).await {
+            Ok(Some(task)) => matches!(task.status, TaskStatus::Failed),
+            _ => false,
+        }
     }
 
     /// Return terminal tasks (Done, Failed) directly from the database.
@@ -716,9 +741,30 @@ impl TaskStore {
     /// into the cache, this method returns only Pending, AwaitingDeps,
     /// Implementing, AgentReview, Waiting, and Reviewing tasks.
     /// To look up a specific completed task use [`get_with_db_fallback`].
-    /// To enumerate terminal tasks use [`list_terminal_from_db`].
+    /// To enumerate all tasks including historical ones use [`list_all_with_terminal`].
     pub fn list_all(&self) -> Vec<TaskState> {
         self.cache.iter().map(|e| e.value().clone()).collect()
+    }
+
+    /// Return all tasks: active ones from cache (most current state) merged
+    /// with terminal tasks from the database (Done, Failed, Cancelled).
+    ///
+    /// Cache entries take precedence over DB rows for the same task ID so that
+    /// in-flight state is always reflected accurately.
+    pub async fn list_all_with_terminal(&self) -> anyhow::Result<Vec<TaskState>> {
+        // DB is the authoritative record of all tasks ever created.
+        let mut by_id: std::collections::HashMap<TaskId, TaskState> = self
+            .db
+            .list()
+            .await?
+            .into_iter()
+            .map(|t| (t.id.clone(), t))
+            .collect();
+        // Override with cache values — these carry the live in-flight state.
+        for entry in self.cache.iter() {
+            by_id.insert(entry.key().clone(), entry.value().clone());
+        }
+        Ok(by_id.into_values().collect())
     }
 
     /// Run `f` only if the task still exists and is live-`pending`.
@@ -1752,12 +1798,13 @@ pub async fn spawn_task_awaiting_deps(
         anyhow::bail!("circular dependency detected for task {}", task_id.0);
     }
 
-    let all_done = depends_on.iter().all(|dep_id| {
-        store
-            .get(dep_id)
-            .map(|s| matches!(s.status, TaskStatus::Done))
-            .unwrap_or(false)
-    });
+    let mut all_done = true;
+    for dep_id in &depends_on {
+        if !store.is_dep_done(dep_id).await {
+            all_done = false;
+            break;
+        }
+    }
 
     let mut state = TaskState::new(task_id.clone());
     state.depends_on = depends_on;
@@ -1780,46 +1827,51 @@ pub async fn spawn_task_awaiting_deps(
 
 /// Check all AwaitingDeps tasks and transition ready ones to Pending.
 /// Returns the IDs of tasks that were transitioned to Pending.
-pub fn check_awaiting_deps(store: &TaskStore) -> Vec<TaskId> {
+///
+/// Async because dependency status checks fall back to the database for
+/// terminal tasks (Done/Failed) that were evicted from the startup cache.
+pub async fn check_awaiting_deps(store: &TaskStore) -> Vec<TaskId> {
     let mut ready = Vec::new();
     let mut failed_deps: Vec<(TaskId, TaskId)> = Vec::new();
 
-    for entry in store.cache.iter() {
-        let task = entry.value();
-        if !matches!(task.status, TaskStatus::AwaitingDeps) {
+    // Snapshot AwaitingDeps tasks from cache before async work.
+    let awaiting: Vec<(TaskId, Vec<TaskId>)> = store
+        .cache
+        .iter()
+        .filter_map(|e| {
+            let task = e.value();
+            if matches!(task.status, TaskStatus::AwaitingDeps) {
+                Some((task.id.clone(), task.depends_on.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (task_id, depends_on) in awaiting {
+        // Find first failed dep (cache then DB).
+        let mut failed_dep_id = None;
+        for dep_id in &depends_on {
+            if store.is_dep_failed(dep_id).await {
+                failed_dep_id = Some(dep_id.clone());
+                break;
+            }
+        }
+        if let Some(fd) = failed_dep_id {
+            failed_deps.push((task_id, fd));
             continue;
         }
-        let any_failed = task.depends_on.iter().any(|dep_id| {
-            store
-                .get(dep_id)
-                .map(|s| matches!(s.status, TaskStatus::Failed))
-                .unwrap_or(false)
-        });
-        if any_failed {
-            let Some(failed_dep) = task
-                .depends_on
-                .iter()
-                .find(|dep_id| {
-                    store
-                        .get(dep_id)
-                        .map(|s| matches!(s.status, TaskStatus::Failed))
-                        .unwrap_or(false)
-                })
-                .cloned()
-            else {
-                continue;
-            };
-            failed_deps.push((task.id.clone(), failed_dep));
-            continue;
+
+        // Check all deps are done (cache then DB).
+        let mut all_done = true;
+        for dep_id in &depends_on {
+            if !store.is_dep_done(dep_id).await {
+                all_done = false;
+                break;
+            }
         }
-        let all_done = task.depends_on.iter().all(|dep_id| {
-            store
-                .get(dep_id)
-                .map(|s| matches!(s.status, TaskStatus::Done))
-                .unwrap_or(false)
-        });
         if all_done {
-            ready.push(task.id.clone());
+            ready.push(task_id);
         }
     }
 

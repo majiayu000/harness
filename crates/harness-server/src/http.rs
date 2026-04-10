@@ -696,7 +696,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let ready_ids = crate::task_runner::check_awaiting_deps(&store);
+                let ready_ids = crate::task_runner::check_awaiting_deps(&store).await;
                 for task_id in ready_ids {
                     if let Err(e) = store.persist(&task_id).await {
                         tracing::warn!(
@@ -1553,15 +1553,19 @@ async fn github_webhook(
     }
 }
 
-async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<task_runner::TaskSummary>> {
-    let tasks = state
-        .core
-        .tasks
-        .list_all()
-        .into_iter()
-        .map(|t| t.summary())
-        .collect();
-    Json(tasks)
+async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
+    match state.core.tasks.list_all_with_terminal().await {
+        Ok(tasks) => {
+            let summaries: Vec<task_runner::TaskSummary> =
+                tasks.into_iter().map(|t| t.summary()).collect();
+            Json(summaries).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("database error: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_task(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -1571,10 +1575,15 @@ async fn get_task(State(state): State<Arc<AppState>>, Path(id): Path<String>) ->
         .get_with_db_fallback(&harness_core::types::TaskId(id))
         .await
     {
-        Some(task) => Json(task).into_response(),
-        None => (
+        Ok(Some(task)) => Json(task).into_response(),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "task not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("database error: {e}")})),
         )
             .into_response(),
     }
@@ -1586,18 +1595,22 @@ async fn get_task_artifacts(
     Path(id): Path<String>,
 ) -> Response {
     let task_id = harness_core::types::TaskId(id);
-    if state
-        .core
-        .tasks
-        .get_with_db_fallback(&task_id)
-        .await
-        .is_none()
-    {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "task not found"})),
-        )
-            .into_response();
+    match state.core.tasks.get_with_db_fallback(&task_id).await {
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "task not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("database error: {e}")})),
+            )
+                .into_response();
+        }
+        Ok(Some(_)) => {}
     }
     match state.core.tasks.list_artifacts(&task_id).await {
         Ok(artifacts) => Json(artifacts).into_response(),
@@ -1621,18 +1634,22 @@ async fn stream_task_sse(State(state): State<Arc<AppState>>, Path(id): Path<Stri
     let rx = match state.core.tasks.subscribe_task_stream(&task_id) {
         Some(rx) => rx,
         None => {
-            if state
-                .core
-                .tasks
-                .get_with_db_fallback(&task_id)
-                .await
-                .is_none()
-            {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "task not found"})),
-                )
-                    .into_response();
+            match state.core.tasks.get_with_db_fallback(&task_id).await {
+                Ok(None) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"error": "task not found"})),
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("database error: {e}")})),
+                    )
+                        .into_response();
+                }
+                Ok(Some(_)) => {}
             }
             // Task exists but stream already closed (task completed before client connected).
             let stream = futures::stream::empty::<Result<Event, std::convert::Infallible>>();
