@@ -1566,6 +1566,10 @@ pub(crate) async fn run_task(
         let lgtm = raw_lgtm && pending_test_failure.is_none();
         let fixed = !lgtm && !waiting;
 
+        // Parse issue count before the Jaccard check so loop detection can distinguish
+        // genuine forward progress (decreasing issue count) from true stuck loops.
+        let current_issues = prompts::parse_issue_count(&output);
+
         // Jaccard loop detection: two consecutive non-waiting, non-LGTM outputs that are
         // too similar indicate the reviewer is stuck repeating itself without making progress.
         // Skip when the raw output is an approval: repeated LGTM is legitimate convergence
@@ -1574,16 +1578,26 @@ pub(crate) async fn run_task(
             if let Some(ref prev) = prev_review_output {
                 let score = jaccard_word_similarity(prev, &output);
                 if score >= jaccard_threshold {
-                    let msg = format!(
-                        "review loop detected: output similarity {score:.2} >= threshold {jaccard_threshold:.2}"
+                    // If the issue count decreased since the previous round, the agent is making
+                    // genuine progress despite similar output structure (e.g., one fix per round
+                    // with a consistent report format). Only abort on true stagnation.
+                    let last_count = issue_counts.last().and_then(|x| *x);
+                    let progressing = matches!(
+                        (last_count, current_issues),
+                        (Some(prev_n), Some(curr_n)) if curr_n < prev_n
                     );
-                    tracing::warn!(task_id = %task_id, round, score, jaccard_threshold, "jaccard loop detected in review");
-                    mutate_and_persist(store, task_id, |s| {
-                        s.status = TaskStatus::Failed;
-                        s.error = Some(msg.clone());
-                    })
-                    .await?;
-                    return Ok(());
+                    if !progressing {
+                        let msg = format!(
+                            "review loop detected: output similarity {score:.2} >= threshold {jaccard_threshold:.2}"
+                        );
+                        tracing::warn!(task_id = %task_id, round, score, jaccard_threshold, "jaccard loop detected in review");
+                        mutate_and_persist(store, task_id, |s| {
+                            s.status = TaskStatus::Failed;
+                            s.error = Some(msg.clone());
+                        })
+                        .await?;
+                        return Ok(());
+                    }
                 }
             }
             prev_review_output = Some(output.clone());
@@ -1594,8 +1608,6 @@ pub(crate) async fn run_task(
             prev_review_output = None;
         }
 
-        // Track issue count for convergence detection.
-        let current_issues = prompts::parse_issue_count(&output);
         if !waiting {
             issue_counts.push(current_issues);
         }
