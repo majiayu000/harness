@@ -71,6 +71,16 @@ pub struct ConcurrencyConfig {
     /// Projects not listed here use the global `max_concurrent_tasks` limit.
     #[serde(default)]
     pub per_project: HashMap<String, usize>,
+    /// Maximum total agent API calls across all phases (implementation + validation retries +
+    /// review rounds). `None` = unlimited. Counts every call including validation retries.
+    /// Recommended production value: 20.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+    /// Jaccard word-similarity threshold for review-loop detection.
+    /// If two consecutive non-waiting review outputs have similarity >= this value,
+    /// the task is marked Failed with "review loop detected". Default: 0.85.
+    #[serde(default = "default_loop_jaccard_threshold")]
+    pub loop_jaccard_threshold: f64,
 }
 
 fn default_max_concurrent_tasks() -> usize {
@@ -85,6 +95,10 @@ fn default_stall_timeout_secs() -> u64 {
     300
 }
 
+fn default_loop_jaccard_threshold() -> f64 {
+    0.85
+}
+
 impl Default for ConcurrencyConfig {
     fn default() -> Self {
         Self {
@@ -92,6 +106,8 @@ impl Default for ConcurrencyConfig {
             max_queue_size: default_max_queue_size(),
             stall_timeout_secs: default_stall_timeout_secs(),
             per_project: HashMap::new(),
+            max_turns: None,
+            loop_jaccard_threshold: default_loop_jaccard_threshold(),
         }
     }
 }

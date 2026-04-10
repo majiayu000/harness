@@ -230,6 +230,7 @@ impl TaskQueue {
             max_queue_size: 1024,
             stall_timeout_secs: 300,
             per_project: Default::default(),
+            ..ConcurrencyConfig::default()
         })
     }
 }
@@ -246,6 +247,7 @@ mod tests {
             max_queue_size: max_queue,
             stall_timeout_secs: 300,
             per_project: Default::default(),
+            ..ConcurrencyConfig::default()
         }
     }
 
@@ -361,6 +363,7 @@ mod tests {
             max_queue_size: 16,
             stall_timeout_secs: 300,
             per_project,
+            ..ConcurrencyConfig::default()
         };
         let q = Arc::new(TaskQueue::new(&cfg));
 
@@ -391,6 +394,7 @@ mod tests {
             max_queue_size: 16,
             stall_timeout_secs: 300,
             per_project,
+            ..ConcurrencyConfig::default()
         };
         let q = Arc::new(TaskQueue::new(&cfg));
 
@@ -428,6 +432,7 @@ mod tests {
             max_queue_size: 16,
             stall_timeout_secs: 300,
             per_project,
+            ..ConcurrencyConfig::default()
         };
         let q2 = Arc::new(TaskQueue::new(&cfg2));
         let _holder = q2.acquire("capped").await.unwrap();

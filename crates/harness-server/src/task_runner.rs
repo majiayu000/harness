@@ -258,6 +258,10 @@ pub struct CreateTaskRequest {
     /// this value always wins over triage-derived defaults.
     #[serde(default)]
     pub max_rounds: Option<u32>,
+    /// Maximum total agent API calls across all phases (implementation + validation retries +
+    /// review rounds). When None, falls back to the global `concurrency.max_turns` config value.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
     /// Per-turn timeout in seconds; defaults to 3600 (1 hour).
     #[serde(default = "default_turn_timeout")]
     pub turn_timeout_secs: u64,
@@ -302,6 +306,7 @@ impl Default for CreateTaskRequest {
             project: None,
             wait_secs: default_wait(),
             max_rounds: None,
+            max_turns: None,
             turn_timeout_secs: default_turn_timeout(),
             max_budget_usd: None,
             retry_base_backoff_ms: default_retry_base_backoff_ms(),
@@ -1463,6 +1468,9 @@ where
         // Retry loop: on transient errors, back off and retry up to MAX_TRANSIENT_RETRIES.
         // Retrying inside the spawn means the stream stays open and the task actually re-runs.
         let mut transient_attempts = 0u32;
+        // Track total turns used across all transient-retry attempts so the
+        // max_turns budget is enforced globally over the full task lifecycle.
+        let mut total_turns_used: u32 = 0;
         let task_result = loop {
             // Wait if global rate-limit circuit breaker is active (another task hit the limit).
             store.wait_for_rate_limit().await;
@@ -1478,6 +1486,7 @@ where
                 &req,
                 run_project.clone(),
                 server_config.as_ref(),
+                &mut total_turns_used,
             )
             .await;
 

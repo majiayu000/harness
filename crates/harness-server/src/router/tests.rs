@@ -378,6 +378,9 @@ async fn run_gc_adopt_and_wait_for_failure_turn(max_rounds: u32) -> anyhow::Resu
     config.gc.adopt_wait_secs = 0;
     config.gc.adopt_max_rounds = max_rounds;
     config.gc.adopt_turn_timeout_secs = 30;
+    // Disable Jaccard loop detection so this test can verify max_rounds exhaustion.
+    // NonLgtmAgent intentionally returns identical output every round.
+    config.concurrency.loop_jaccard_threshold = 1.1;
 
     let mut registry = AgentRegistry::new("mock");
     registry.register("mock", Arc::new(NonLgtmAgent::new()));

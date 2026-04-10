@@ -16,7 +16,7 @@ use harness_core::types::{
 };
 use harness_core::{config::project::load_project_config, lang_detect, prompts};
 use harness_protocol::{notifications::Notification, notifications::RpcNotification};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Extract tool list from a capability profile, returning an error if the
 /// profile unexpectedly returns `None` (which means Full/unrestricted).
@@ -515,7 +515,7 @@ async fn run_plan_for_prompt(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
-) -> anyhow::Result<(Option<String>, prompts::TriageComplexity)> {
+) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
     use crate::task_runner::TaskPhase;
 
     let prompt_text = req.prompt.as_deref().unwrap_or_default();
@@ -560,7 +560,7 @@ async fn run_plan_for_prompt(
     .await?;
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete (prompt-only)");
-    Ok((Some(plan_text), prompts::TriageComplexity::Medium))
+    Ok((Some(plan_text), prompts::TriageComplexity::Medium, 1))
 }
 
 /// Run triage → plan pipeline for a fresh issue-based task.
@@ -576,7 +576,7 @@ async fn run_triage_plan_pipeline(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
-) -> anyhow::Result<(Option<String>, prompts::TriageComplexity)> {
+) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
     use crate::task_runner::TaskPhase;
 
     // --- Phase 1: Triage ---
@@ -643,7 +643,7 @@ async fn run_triage_plan_pipeline(
         }
         prompts::TriageDecision::Proceed => {
             tracing::info!(task_id = %task_id, "triage: PROCEED — skipping plan phase");
-            return Ok((None, complexity));
+            return Ok((None, complexity, 1));
         }
         prompts::TriageDecision::ProceedWithPlan => {
             // Fall through to plan phase.
@@ -688,7 +688,7 @@ async fn run_triage_plan_pipeline(
     }
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete");
-    Ok((Some(plan_text), complexity))
+    Ok((Some(plan_text), complexity, 2))
 }
 
 pub(crate) async fn run_task(
@@ -702,6 +702,10 @@ pub(crate) async fn run_task(
     req: &CreateTaskRequest,
     project: PathBuf,
     server_config: &harness_core::config::HarnessConfig,
+    // Accumulated turn count from previous transient-retry attempts.
+    // Ensures the max_turns budget is global across the full task lifecycle,
+    // not reset on each retry (fix for budget-reset-on-retry bug).
+    turns_used_acc: &mut u32,
 ) -> anyhow::Result<()> {
     let task_start = Instant::now();
 
@@ -754,13 +758,13 @@ pub(crate) async fn run_task(
     // For issue-based tasks without an existing PR, run triage first.
     // Triage decides whether to skip planning or go through a plan phase.
     // Checkpoint overrides: if a plan was saved, skip the pipeline entirely.
-    let (plan_output, triage_complexity) = if resumed_pr_url.is_some() {
+    let (plan_output, triage_complexity, pipeline_turns) = if resumed_pr_url.is_some() {
         // PR already exists — skip triage/plan entirely.
-        (None, prompts::TriageComplexity::Medium)
+        (None, prompts::TriageComplexity::Medium, 0u32)
     } else if let Some(plan) = resumed_plan {
         // Plan checkpoint found — use saved plan, skip triage/plan pipeline.
         tracing::info!(task_id = %task_id, "checkpoint resume: using saved plan, skipping triage/plan");
-        (Some(plan), prompts::TriageComplexity::Medium)
+        (Some(plan), prompts::TriageComplexity::Medium, 0u32)
     } else if let Some(issue) = req.issue {
         // Only triage fresh issues (no existing PR to continue).
         let has_existing_pr = find_existing_pr_for_issue(&project, issue)
@@ -772,7 +776,7 @@ pub(crate) async fn run_task(
             run_triage_plan_pipeline(agent, store, task_id, issue, &cargo_env, &project, req)
                 .await?
         } else {
-            (None, prompts::TriageComplexity::Medium)
+            (None, prompts::TriageComplexity::Medium, 0u32)
         }
     } else {
         // Planning gate (task_runner) may have forced TaskPhase::Plan for a
@@ -790,7 +794,7 @@ pub(crate) async fn run_task(
             update_status(store, task_id, TaskStatus::Implementing, 1).await?;
             run_plan_for_prompt(agent, store, task_id, &cargo_env, &project, req).await?
         } else {
-            (None, prompts::TriageComplexity::Medium)
+            (None, prompts::TriageComplexity::Medium, 0u32)
         }
     };
 
@@ -803,11 +807,20 @@ pub(crate) async fn run_task(
         prompts::TriageComplexity::High => (8u32, false),
     };
     let effective_max_rounds = req.max_rounds.unwrap_or(triage_default_rounds);
+    // max_turns: per-request override wins; global config is the fallback.
+    // Counts every agent API call (impl + validation retries + review rounds).
+    let effective_max_turns: Option<u32> = req.max_turns.or(server_config.concurrency.max_turns);
+    // Start from accumulated turns (prior transient-retry attempts + pipeline phases)
+    // so the budget is global across the full task lifecycle.
+    let mut turns_used: u32 = *turns_used_acc + pipeline_turns;
+    *turns_used_acc = turns_used;
+    let jaccard_threshold = server_config.concurrency.loop_jaccard_threshold;
     tracing::info!(
         task_id = %task_id,
         ?triage_complexity,
         effective_max_rounds,
         skip_agent_review,
+        ?effective_max_turns,
         "triage complexity applied"
     );
 
@@ -1052,11 +1065,22 @@ pub(crate) async fn run_task(
         let mut impl_req = first_req.clone();
 
         let resp = loop {
+            if let Some(max) = effective_max_turns {
+                if turns_used >= max {
+                    return Err(anyhow::anyhow!(
+                        "Turn budget exhausted: used {} of {} allowed turns",
+                        turns_used,
+                        max
+                    ));
+                }
+            }
             let raw = tokio::time::timeout(
                 turn_timeout,
                 run_agent_streaming(agent, impl_req.clone(), task_id, store, 1),
             )
             .await;
+            turns_used += 1;
+            *turns_used_acc = turns_used;
             match raw {
                 Ok(Ok(r)) => {
                     // Post-execution tool isolation check (defense-in-depth alongside
@@ -1343,8 +1367,11 @@ pub(crate) async fn run_task(
                 project_config.review_type.as_str(),
                 &events,
                 &cargo_env,
+                effective_max_turns,
+                &mut turns_used,
             )
             .await?;
+            *turns_used_acc = turns_used;
             if !review_ok {
                 return Ok(());
             }
@@ -1409,6 +1436,9 @@ pub(crate) async fn run_task(
     // but the graduation check must still know a test gate rejection occurred.
     let mut lgtm_test_gate_rejected = false;
 
+    // Tracks the most recent non-waiting review output for Jaccard loop detection.
+    let mut prev_review_output: Option<String> = None;
+
     // Review loop.
     // Use an explicit counter so WAITING responses don't consume a round — `continue`
     // inside a `for` loop would silently advance the iterator even without a real review.
@@ -1448,7 +1478,24 @@ pub(crate) async fn run_task(
         };
         let check_req = run_pre_execute(&interceptors, check_req).await?;
 
+        if let Some(max) = effective_max_turns {
+            if turns_used >= max {
+                let msg = format!(
+                    "Turn budget exhausted: used {} of {} allowed turns",
+                    turns_used, max
+                );
+                tracing::warn!(task_id = %task_id, turns_used, max, "turn budget exhausted in review loop");
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Failed;
+                    s.error = Some(msg.clone());
+                })
+                .await?;
+                return Ok(());
+            }
+        }
         let resp = tokio::time::timeout(turn_timeout, agent.execute(check_req.clone())).await;
+        turns_used += 1;
+        *turns_used_acc = turns_used;
         let resp = match resp {
             Ok(Ok(r)) => {
                 let tool_violations = validate_tool_usage(
@@ -1511,16 +1558,56 @@ pub(crate) async fn run_task(
             tracing::warn!(round, stderr = %stderr, "agent stderr during review check");
         }
 
-        let lgtm = prompts::is_lgtm(&output);
+        let raw_lgtm = prompts::is_lgtm(&output);
         let waiting = prompts::is_waiting(&output);
         // If post-execute validation failed this round, block LGTM acceptance even
         // if the reviewer approved — the local validator caught an issue that must be
         // fixed before the PR can be marked done.
-        let lgtm = lgtm && pending_test_failure.is_none();
+        let lgtm = raw_lgtm && pending_test_failure.is_none();
         let fixed = !lgtm && !waiting;
 
-        // Track issue count for convergence detection.
+        // Parse issue count before the Jaccard check so loop detection can distinguish
+        // genuine forward progress (decreasing issue count) from true stuck loops.
         let current_issues = prompts::parse_issue_count(&output);
+
+        // Jaccard loop detection: two consecutive non-waiting, non-LGTM outputs that are
+        // too similar indicate the reviewer is stuck repeating itself without making progress.
+        // Skip when the raw output is an approval: repeated LGTM is legitimate convergence
+        // (e.g., reviewer approves again after a test-gate previously blocked acceptance).
+        if !waiting && !raw_lgtm {
+            if let Some(ref prev) = prev_review_output {
+                let score = jaccard_word_similarity(prev, &output);
+                if score >= jaccard_threshold {
+                    // If the issue count decreased since the previous round, the agent is making
+                    // genuine progress despite similar output structure (e.g., one fix per round
+                    // with a consistent report format). Only abort on true stagnation.
+                    let last_count = issue_counts.last().and_then(|x| *x);
+                    let progressing = matches!(
+                        (last_count, current_issues),
+                        (Some(prev_n), Some(curr_n)) if curr_n < prev_n
+                    );
+                    if !progressing {
+                        let msg = format!(
+                            "review loop detected: output similarity {score:.2} >= threshold {jaccard_threshold:.2}"
+                        );
+                        tracing::warn!(task_id = %task_id, round, score, jaccard_threshold, "jaccard loop detected in review");
+                        mutate_and_persist(store, task_id, |s| {
+                            s.status = TaskStatus::Failed;
+                            s.error = Some(msg.clone());
+                        })
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            prev_review_output = Some(output.clone());
+        } else if raw_lgtm {
+            // A test-gate-rejected LGTM still resets the comparison baseline so the
+            // next genuine non-LGTM review is not incorrectly compared against a
+            // pre-LGTM review and falsely flagged as a loop.
+            prev_review_output = None;
+        }
+
         if !waiting {
             issue_counts.push(current_issues);
         }
@@ -1722,6 +1809,33 @@ pub(crate) async fn run_task(
     Ok(())
 }
 
+/// Compute Jaccard word-similarity between two strings.
+///
+/// Tokenizes each string into a set of non-empty words (split on non-alphanumeric chars),
+/// then returns |intersection| / |union|.
+/// Both empty → 1.0; one empty → 0.0.
+fn jaccard_word_similarity(a: &str, b: &str) -> f64 {
+    let tokens_a: HashSet<&str> = a
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let tokens_b: HashSet<&str> = b
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if tokens_a.is_empty() && tokens_b.is_empty() {
+        return 1.0;
+    }
+    if tokens_a.is_empty() || tokens_b.is_empty() {
+        return 0.0;
+    }
+
+    let intersection = tokens_a.intersection(&tokens_b).count();
+    let union = tokens_a.union(&tokens_b).count();
+    intersection as f64 / union as f64
+}
+
 /// Normalize a set of review issues into a canonical ordered form.
 /// Issues are sorted by reference before collecting so that insertion order does not affect
 /// equality comparisons, and strings are not unnecessarily cloned during the sort.
@@ -1746,6 +1860,8 @@ async fn run_agent_review(
     project_type: &str,
     events: &harness_observe::event_store::EventStore,
     cargo_env: &HashMap<String, String>,
+    effective_max_turns: Option<u32>,
+    turns_used: &mut u32,
 ) -> anyhow::Result<(bool, bool)> {
     let max_rounds = review_config.max_rounds;
     // (normalized_issues, consecutive_count): tracks how many consecutive rounds produced identical issues.
@@ -1781,7 +1897,16 @@ async fn run_agent_review(
         };
         let review_req = run_pre_execute(interceptors, review_req).await?;
 
+        if let Some(max) = effective_max_turns {
+            if *turns_used >= max {
+                return Err(anyhow::anyhow!(
+                    "Turn budget exhausted before agent review round {agent_round}: used {} of {} allowed turns",
+                    turns_used, max
+                ));
+            }
+        }
         let resp = tokio::time::timeout(turn_timeout, reviewer.execute(review_req.clone())).await;
+        *turns_used += 1;
         let resp = match resp {
             Ok(Ok(r)) => {
                 let tool_violations = validate_tool_usage(
@@ -1961,7 +2086,16 @@ async fn run_agent_review(
         };
         let fix_req = run_pre_execute(interceptors, fix_req).await?;
 
+        if let Some(max) = effective_max_turns {
+            if *turns_used >= max {
+                return Err(anyhow::anyhow!(
+                    "Turn budget exhausted before agent review fix round {agent_round}: used {} of {} allowed turns",
+                    turns_used, max
+                ));
+            }
+        }
         let fix_resp = tokio::time::timeout(turn_timeout, agent.execute(fix_req.clone())).await;
+        *turns_used += 1;
         match fix_resp {
             Ok(Ok(r)) => {
                 if let Some(val_err) = run_post_execute(interceptors, &fix_req, &r).await {
@@ -2306,5 +2440,39 @@ mod tests {
         let (c_reset, i_reset, _) = step_tracker(&mut tracker, &other); // different issues
         assert_eq!(c_reset, 1, "counter resets on different issues");
         assert!(!i_reset, "no intervention after reset");
+    }
+
+    // --- jaccard_word_similarity unit tests ---
+
+    #[test]
+    fn jaccard_identical_strings() {
+        assert_eq!(jaccard_word_similarity("hello world", "hello world"), 1.0);
+    }
+
+    #[test]
+    fn jaccard_disjoint_strings() {
+        assert_eq!(jaccard_word_similarity("foo bar", "baz qux"), 0.0);
+    }
+
+    #[test]
+    fn jaccard_partial_overlap() {
+        // {"a", "b"} ∩ {"b", "c"} = {"b"}, union = {"a","b","c"} → 1/3
+        let score = jaccard_word_similarity("a b", "b c");
+        let expected = 1.0_f64 / 3.0_f64;
+        assert!(
+            (score - expected).abs() < 1e-10,
+            "expected ~{expected}, got {score}"
+        );
+    }
+
+    #[test]
+    fn jaccard_one_empty() {
+        assert_eq!(jaccard_word_similarity("", "hello world"), 0.0);
+        assert_eq!(jaccard_word_similarity("hello world", ""), 0.0);
+    }
+
+    #[test]
+    fn jaccard_both_empty() {
+        assert_eq!(jaccard_word_similarity("", ""), 1.0);
     }
 }
