@@ -75,10 +75,13 @@ async fn restart_no_checkpoint_fails_interrupted_tasks() -> anyhow::Result<()> {
     .await?;
 
     // All 4 interrupted tasks with no checkpoint → Failed.
+    // These are no longer in the in-memory cache (terminal tasks are excluded at startup),
+    // so fetch them from the DB via get_with_db_fallback.
     for id in ["t-impl", "t-review", "t-reviewing", "t-waiting"] {
         let task = store
-            .get(&CoreTaskId(id.to_string()))
-            .unwrap_or_else(|| panic!("{id} should be in cache"));
+            .get_with_db_fallback(&CoreTaskId(id.to_string()))
+            .await
+            .unwrap_or_else(|| panic!("{id} should be fetchable from DB"));
         assert!(
             matches!(task.status, TaskStatus::Failed),
             "{id}: expected Failed, got {:?}",
@@ -91,22 +94,24 @@ async fn restart_no_checkpoint_fails_interrupted_tasks() -> anyhow::Result<()> {
         );
     }
 
-    // Pending stays Pending (no error set by recovery).
+    // Pending stays Pending (active — present in the in-memory cache).
     let pending = store
         .get(&CoreTaskId("t-pending".into()))
-        .expect("t-pending must exist");
+        .expect("t-pending must exist in cache");
     assert!(matches!(pending.status, TaskStatus::Pending));
     assert!(pending.error.is_none());
 
-    // Terminal states unchanged.
+    // Terminal states unchanged (not in cache; fetch from DB).
     let done = store
-        .get(&CoreTaskId("t-done".into()))
-        .expect("t-done must exist");
+        .get_with_db_fallback(&CoreTaskId("t-done".into()))
+        .await
+        .expect("t-done must be fetchable from DB");
     assert!(matches!(done.status, TaskStatus::Done));
 
     let failed = store
-        .get(&CoreTaskId("t-failed".into()))
-        .expect("t-failed must exist");
+        .get_with_db_fallback(&CoreTaskId("t-failed".into()))
+        .await
+        .expect("t-failed must be fetchable from DB");
     assert!(matches!(failed.status, TaskStatus::Failed));
 
     Ok(())
@@ -270,9 +275,11 @@ async fn restart_transient_retry_task_fails() -> anyhow::Result<()> {
     })
     .await?;
 
+    // Transient-retry task was failed by recovery; not in cache — fetch from DB.
     let transient = store
-        .get(&CoreTaskId("t-transient".into()))
-        .expect("task must exist");
+        .get_with_db_fallback(&CoreTaskId("t-transient".into()))
+        .await
+        .expect("task must be fetchable from DB");
     assert!(
         matches!(transient.status, TaskStatus::Failed),
         "transient-retry pending task should be Failed on restart, got {:?}",
@@ -331,15 +338,26 @@ async fn restart_mixed_recovery_counts() -> anyhow::Result<()> {
     })
     .await?;
 
-    let all = store.list_all();
-    let (resumed_count, failed_count) =
-        all.iter()
-            .fold((0, 0), |(resumed, failed), task| match task.status {
-                TaskStatus::Pending => (resumed + 1, failed),
-                TaskStatus::Failed => (resumed, failed + 1),
-                _ => (resumed, failed),
-            });
+    // Resumed tasks are Pending and present in the in-memory cache.
+    let resumed_count = store
+        .list_all()
+        .iter()
+        .filter(|t| matches!(t.status, TaskStatus::Pending))
+        .count();
     assert_eq!(resumed_count, 2, "two tasks should have been resumed");
+
+    // Failed tasks are terminal and not in cache; fetch each from DB.
+    let mut failed_count = 0;
+    for id in ["t-fail-1", "t-fail-2"] {
+        if let Some(task) = store
+            .get_with_db_fallback(&CoreTaskId(id.to_string()))
+            .await
+        {
+            if matches!(task.status, TaskStatus::Failed) {
+                failed_count += 1;
+            }
+        }
+    }
     assert_eq!(failed_count, 2, "two tasks should have been failed");
 
     Ok(())
