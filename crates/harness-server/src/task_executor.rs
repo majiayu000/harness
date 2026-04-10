@@ -298,7 +298,23 @@ pub(crate) async fn run_turn_lifecycle(
                 );
             }
             Ok(None) => {}
-            Err(err) => tracing::warn!("failed to complete turn after execution: {err}"),
+            Err(err) => {
+                tracing::error!(
+                    thread_id = %thread_id,
+                    turn_id = %turn_id,
+                    "failed to complete turn after execution: {err}"
+                );
+                mark_turn_failed(
+                    &server,
+                    &thread_db,
+                    &notify_tx,
+                    &notification_tx,
+                    &thread_id,
+                    &turn_id,
+                    err.to_string(),
+                )
+                .await;
+            }
         },
         Err(err) => {
             let error_msg = err.to_string();
