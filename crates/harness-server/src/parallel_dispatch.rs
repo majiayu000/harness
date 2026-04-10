@@ -112,18 +112,10 @@ pub fn decompose(prompt: &str) -> Vec<SubtaskSpec> {
             })
             .collect();
         if items.len() >= 2 {
-            // Cap sequential subtasks to prevent unbounded semaphore queue depth.
-            if items.len() > MAX_PARALLEL {
-                tracing::warn!(
-                    "parallel_dispatch: numbered-list prompt has {} steps but MAX_PARALLEL={}: \
-                     steps {} through {} will NOT be executed",
-                    items.len(),
-                    MAX_PARALLEL,
-                    MAX_PARALLEL + 1,
-                    items.len()
-                );
-            }
-            let items: Vec<&str> = items.into_iter().take(MAX_PARALLEL).collect();
+            // Sequential numbered-list steps are not capped: each step depends on
+            // the previous, so they execute one-at-a-time and the semaphore queue
+            // depth is bounded by the number of concurrent parallel batches, not
+            // by the number of sequential steps within a single prompt.
             return items
                 .iter()
                 .enumerate()
@@ -481,17 +473,20 @@ mod tests {
     }
 
     #[test]
-    fn decompose_numbered_list_caps_at_max_parallel() {
-        // Build a list with MAX_PARALLEL + 2 items; result must not exceed MAX_PARALLEL.
-        let prompt: String = (1..=(MAX_PARALLEL + 2))
+    fn decompose_numbered_list_preserves_all_steps() {
+        // Sequential steps must ALL be preserved — dropping later steps is a
+        // correctness regression (e.g. a migration checklist must run every step).
+        let n = MAX_PARALLEL + 2;
+        let prompt: String = (1..=n)
             .map(|i| format!("{}. task {}", i, i))
             .collect::<Vec<_>>()
             .join("\n");
         let subtasks = decompose(&prompt);
-        assert!(
-            subtasks.len() <= MAX_PARALLEL,
-            "expected <= {} subtasks, got {}",
-            MAX_PARALLEL,
+        assert_eq!(
+            subtasks.len(),
+            n,
+            "expected all {} steps preserved, got {}",
+            n,
             subtasks.len()
         );
     }
