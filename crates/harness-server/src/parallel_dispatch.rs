@@ -113,6 +113,16 @@ pub fn decompose(prompt: &str) -> Vec<SubtaskSpec> {
             .collect();
         if items.len() >= 2 {
             // Cap sequential subtasks to prevent unbounded semaphore queue depth.
+            if items.len() > MAX_PARALLEL {
+                tracing::warn!(
+                    "parallel_dispatch: numbered-list prompt has {} steps but MAX_PARALLEL={}: \
+                     steps {} through {} will NOT be executed",
+                    items.len(),
+                    MAX_PARALLEL,
+                    MAX_PARALLEL + 1,
+                    items.len()
+                );
+            }
             let items: Vec<&str> = items.into_iter().take(MAX_PARALLEL).collect();
             return items
                 .iter()
