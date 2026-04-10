@@ -853,18 +853,22 @@ fn build_completion_callback(
         Box::pin(async move {
             // Grade recent events and auto-trigger GC if quality is poor.
             if let Some(qt) = quality_trigger {
-                let task_ctx =
-                    task.pr_url
-                        .as_ref()
-                        .map(|pr| crate::quality_trigger::TaskReviewContext {
-                            diff: task
-                                .rounds
-                                .iter()
-                                .find(|r| r.action == "implement")
-                                .and_then(|r| r.detail.clone())
-                                .unwrap_or_default(),
+                let task_ctx = task.pr_url.as_ref().and_then(|pr| {
+                    let diff = task
+                        .rounds
+                        .iter()
+                        .find(|r| r.action == "implement")
+                        .and_then(|r| r.detail.clone())
+                        .unwrap_or_default();
+                    if diff.is_empty() {
+                        None
+                    } else {
+                        Some(crate::quality_trigger::TaskReviewContext {
+                            diff,
                             pr_description: pr.clone(),
-                        });
+                        })
+                    }
+                });
                 qt.check_and_maybe_trigger(task_ctx.as_ref()).await;
             }
 
