@@ -7,6 +7,19 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::time::Duration;
 
+/// RAII guard that aborts a spawned Tokio task when dropped.
+///
+/// This ensures that if the parent future is cancelled (e.g. via the external
+/// cancel endpoint), the child task is also aborted rather than running to
+/// completion detached.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Maximum number of parallel subtasks — caps both chunk count in `decompose`
 /// and concurrent agent executions in `run_parallel_subtasks`.
 /// Wire up `--max-parallel` CLI flag to override this in a follow-up (see #638).
@@ -291,16 +304,22 @@ async fn run_sequential_subtasks(
         };
         // Spawn into a task so a panic in agent.execute surfaces as JoinError
         // instead of unwinding through this function and skipping cleanup.
+        //
+        // The AbortOnDrop guard ensures the child task is aborted whenever
+        // `handle` is dropped — including when the *parent* future is cancelled
+        // by an external abort (task_runner cancel endpoint).  Without it,
+        // dropping a JoinHandle merely detaches the child; the agent would keep
+        // running and writing to the shared workspace after cancellation.
         let agent_clone = agent.clone();
-        let mut handle = tokio::spawn(async move { agent_clone.execute(req).await });
-        let outcome = match tokio::time::timeout(turn_timeout, &mut handle).await {
+        let handle = tokio::spawn(async move { agent_clone.execute(req).await });
+        let _abort_guard = AbortOnDrop(handle.abort_handle());
+        let outcome = match tokio::time::timeout(turn_timeout, handle).await {
             Ok(Ok(Ok(resp))) => Ok(resp),
             Ok(Ok(Err(e))) => Err(format!("agent error: {e}")),
             Ok(Err(join_err)) => Err(format!("subtask panicked: {join_err}")),
             Err(_) => {
-                // Abort the detached task so it does not keep mutating the
-                // workspace or consuming resources after the timeout fires.
-                handle.abort();
+                // _abort_guard is dropped at end of scope and aborts the task;
+                // the explicit Err here records the timeout reason.
                 Err(format!(
                     "subtask timed out after {}s",
                     turn_timeout.as_secs()

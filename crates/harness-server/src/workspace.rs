@@ -271,7 +271,15 @@ impl WorkspaceManager {
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            if !terminal_dirs.contains(&dir_name) {
+            // Match both the exact task ID and any sub-workspace derived from it
+            // (e.g. `{task}-seq` for sequential runs, `{task}-p*` for parallel chunks).
+            // Without prefix matching, a crash between workspace creation and
+            // remove_workspace leaves `{task}-seq` / `{task}-p*` directories that the
+            // orphan sweep can never discover or clean up.
+            let is_terminal = terminal_dirs
+                .iter()
+                .any(|td| dir_name == *td || dir_name.starts_with(&format!("{td}-")));
+            if !is_terminal {
                 continue;
             }
             if self.active.iter().any(|e| e.workspace_path == path) {
