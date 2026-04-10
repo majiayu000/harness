@@ -244,6 +244,11 @@ impl TaskState {
     }
 }
 
+/// Maximum allowed scheduling priority. Values above this are rejected at the
+/// API boundary to prevent scheduler-level starvation of normal-priority tasks.
+/// `0` = normal (default), `1` = high, `2` = critical.
+pub const MAX_TASK_PRIORITY: u8 = 2;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateTaskRequest {
     /// Free-text task description (prompt, issue URL, etc.).

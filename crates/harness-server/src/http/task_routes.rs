@@ -43,6 +43,13 @@ pub(crate) async fn enqueue_task(
             "at least one of prompt, issue, or pr must be provided".to_string(),
         ));
     }
+    if req.priority > task_runner::MAX_TASK_PRIORITY {
+        return Err(EnqueueTaskError::BadRequest(format!(
+            "priority {} out of range; maximum is {} (0=normal, 1=high, 2=critical)",
+            req.priority,
+            task_runner::MAX_TASK_PRIORITY,
+        )));
+    }
 
     // Resolve project: if the supplied path does not exist as a directory,
     // treat it as a project ID and look it up in the registry.
@@ -217,6 +224,13 @@ async fn enqueue_task_background(
         return Err(EnqueueTaskError::BadRequest(
             "at least one of prompt, issue, or pr must be provided".to_string(),
         ));
+    }
+    if req.priority > task_runner::MAX_TASK_PRIORITY {
+        return Err(EnqueueTaskError::BadRequest(format!(
+            "priority {} out of range; maximum is {} (0=normal, 1=high, 2=critical)",
+            req.priority,
+            task_runner::MAX_TASK_PRIORITY,
+        )));
     }
 
     // Resolve project: if the supplied path does not exist as a directory,

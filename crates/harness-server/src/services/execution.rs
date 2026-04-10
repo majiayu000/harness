@@ -131,12 +131,19 @@ impl DefaultExecutionService {
         }
     }
 
-    /// Validate the request has at least one task specifier.
+    /// Validate the request has at least one task specifier and a valid priority.
     fn validate_request(req: &CreateTaskRequest) -> Result<(), EnqueueTaskError> {
         if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
             return Err(EnqueueTaskError::BadRequest(
                 "at least one of prompt, issue, or pr must be provided".to_string(),
             ));
+        }
+        if req.priority > task_runner::MAX_TASK_PRIORITY {
+            return Err(EnqueueTaskError::BadRequest(format!(
+                "priority {} out of range; maximum is {} (0=normal, 1=high, 2=critical)",
+                req.priority,
+                task_runner::MAX_TASK_PRIORITY,
+            )));
         }
         Ok(())
     }
