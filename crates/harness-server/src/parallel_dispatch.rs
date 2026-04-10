@@ -7,6 +7,11 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::time::Duration;
 
+/// Maximum number of parallel subtasks — caps both chunk count in `decompose`
+/// and concurrent agent executions in `run_parallel_subtasks`.
+/// Wire up `--max-parallel` CLI flag to override this in a follow-up (see #638).
+const MAX_PARALLEL: usize = 8;
+
 const PARALLEL_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "swift", "cpp", "c", "h", "toml",
     "yaml", "yml", "json", "sh", "md",
@@ -132,17 +137,18 @@ pub fn decompose(prompt: &str) -> Vec<SubtaskSpec> {
             depends_on_indices: vec![],
         }];
     }
-    let mid = files.len().div_ceil(2);
-    let total_chunks = files.chunks(mid).count();
+    // Scale chunk count linearly with file count, floor at 2, cap at MAX_PARALLEL.
+    let n_chunks = (files.len() / 3).clamp(2, MAX_PARALLEL);
+    let chunk_size = files.len().div_ceil(n_chunks);
     files
-        .chunks(mid)
+        .chunks(chunk_size)
         .enumerate()
         .map(|(i, group)| SubtaskSpec {
             prompt: format!(
                 "{}\n\n[Parallel subtask {}/{}] Focus on these files: {}",
                 prompt,
                 i + 1,
-                total_chunks,
+                n_chunks,
                 group.join(", ")
             ),
             depends_on_indices: vec![],
@@ -183,6 +189,7 @@ pub async fn run_parallel_subtasks(
     let mut handles: Vec<tokio::task::JoinHandle<(usize, Result<AgentResponse, String>)>> =
         Vec::with_capacity(count);
     let mut sub_ids: Vec<Option<TaskId>> = Vec::with_capacity(count);
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL));
 
     for (i, spec) in subtasks.into_iter().enumerate() {
         let sub_id = harness_core::types::TaskId(format!("{}-p{i}", task_id.0));
@@ -200,7 +207,12 @@ pub async fn run_parallel_subtasks(
                     context,
                     ..Default::default()
                 };
+                let sem = Arc::clone(&sem);
                 handles.push(tokio::spawn(async move {
+                    let _permit = match sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return (i, Err("semaphore closed unexpectedly".to_string())),
+                    };
                     let result = match tokio::time::timeout(turn_timeout, agent.execute(req)).await
                     {
                         Ok(Ok(resp)) => Ok(resp),
@@ -389,5 +401,67 @@ mod tests {
         assert_eq!(subtasks.len(), 2);
         assert!(subtasks[0].depends_on_indices.is_empty());
         assert!(subtasks[1].depends_on_indices.is_empty());
+    }
+
+    // --- dynamic chunk-count tests ---
+
+    fn make_prompt(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("src/file{i:02}.rs"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn test_decompose_small() {
+        // 2 files: (2/3).clamp(2,8) = 2 — minimum clamp
+        let subtasks = decompose(&make_prompt(2));
+        assert_eq!(subtasks.len(), 2);
+    }
+
+    #[test]
+    fn test_decompose_medium() {
+        // 9 files: (9/3).clamp(2,8) = 3
+        let subtasks = decompose(&make_prompt(9));
+        assert_eq!(subtasks.len(), 3);
+    }
+
+    #[test]
+    fn test_decompose_large() {
+        // 24 files: (24/3).clamp(2,8) = 8
+        let subtasks = decompose(&make_prompt(24));
+        assert_eq!(subtasks.len(), 8);
+    }
+
+    #[test]
+    fn test_decompose_very_large() {
+        // 30 files: (30/3).clamp(2,8) = 8 — cap
+        let subtasks = decompose(&make_prompt(30));
+        assert_eq!(subtasks.len(), 8);
+    }
+
+    #[test]
+    fn test_decompose_covers_all_files() {
+        // 12 files: every file appears exactly once across all chunks
+        let n = 12;
+        let prompt = make_prompt(n);
+        let subtasks = decompose(&prompt);
+        let expected: Vec<String> = (0..n).map(|i| format!("src/file{i:02}.rs")).collect();
+        let mut found: Vec<String> = subtasks
+            .iter()
+            .flat_map(|s| {
+                s.prompt
+                    .split_whitespace()
+                    .filter(|t| t.ends_with(".rs") && t.starts_with("src/file"))
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        found.sort();
+        let mut sorted_expected = expected.clone();
+        sorted_expected.sort();
+        assert_eq!(found, sorted_expected);
     }
 }
