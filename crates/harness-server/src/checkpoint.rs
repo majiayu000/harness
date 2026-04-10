@@ -107,20 +107,49 @@ impl TaskCheckpoint {
 
     /// Save the checkpoint to the filesystem path for this task.
     ///
-    /// Uses an atomic write: the JSON is first written to a `.tmp` side-car
-    /// file and then renamed into place.  POSIX guarantees that `rename(2)`
-    /// is atomic with respect to readers, so a concurrent `load` will always
-    /// see either the previous complete checkpoint or the new one — never a
-    /// partial write.
+    /// Uses an atomic write: the JSON is first written to a uniquely-named
+    /// `.tmp` side-car file, synced to disk, then renamed into place.
+    ///
+    /// * **Unique temp name** — a UUID suffix prevents two concurrent `save()`
+    ///   calls for the same task from clobbering each other's temp file.
+    /// * **`sync_all()` before rename** — ensures the data bytes are on disk
+    ///   before the directory entry is updated; without this a power loss after
+    ///   `rename` can leave a zero-byte or truncated checkpoint file.
+    /// * **Parent-directory fsync after rename** — makes the new directory
+    ///   entry itself durable so the file is not lost on power loss even after
+    ///   the rename syscall returns.
+    ///
+    /// POSIX guarantees that `rename(2)` is atomic with respect to readers, so
+    /// a concurrent `load` will always see either the previous complete
+    /// checkpoint or the new one — never a partial write.
     pub fn save(&self) -> anyhow::Result<()> {
+        use std::io::Write as _;
+
         let path = Self::default_path(&self.task_id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("checkpoint path has no parent directory"))?;
+        std::fs::create_dir_all(parent)?;
+
         let data = serde_json::to_string_pretty(self)?;
-        let tmp_path = path.with_extension("tmp");
-        std::fs::write(&tmp_path, &data)?;
+
+        // Unique suffix prevents races when save() is called concurrently for
+        // the same task_id (e.g. from two tokio tasks).
+        let tmp_name = format!("{}.{}.tmp", self.task_id, uuid::Uuid::new_v4());
+        let tmp_path = parent.join(tmp_name);
+
+        // Write and sync the temp file before rename so data is on disk.
+        {
+            let mut tmp_file = std::fs::File::create(&tmp_path)?;
+            tmp_file.write_all(data.as_bytes())?;
+            tmp_file.sync_all()?;
+        }
         std::fs::rename(&tmp_path, &path)?;
+
+        // fsync the parent directory so the renamed directory entry is durable.
+        let dir = std::fs::File::open(parent)?;
+        dir.sync_all()?;
+
         Ok(())
     }
 
