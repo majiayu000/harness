@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use harness_core::config::misc::ConcurrencyConfig;
 use serde::Serialize;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -33,6 +33,11 @@ impl std::fmt::Debug for TaskPermit {
 /// Maintains a global semaphore limiting total concurrent tasks across all projects,
 /// plus per-project semaphores so one project cannot starve others. Acquiring a slot
 /// requires holding BOTH permits simultaneously.
+///
+/// When a `memory_pressure` flag is supplied (via [`TaskQueue::new_with_pressure`]),
+/// `acquire()` returns an error immediately when the flag is `true`, preventing new
+/// tasks from being admitted while available system memory is below the configured
+/// threshold.
 pub struct TaskQueue {
     global_semaphore: Arc<Semaphore>,
     global_limit: usize,
@@ -48,10 +53,24 @@ pub struct TaskQueue {
     /// waiting for the global slot. These are "queued" not "running" from an
     /// observability standpoint — they haven't started executing yet.
     project_awaiting_global: DashMap<String, Arc<AtomicUsize>>,
+    /// Optional memory-pressure flag set by [`crate::memory_monitor`].
+    /// When `true`, `acquire()` rejects new tasks immediately.
+    /// `None` means the feature is disabled (default).
+    memory_pressure: Option<Arc<AtomicBool>>,
 }
 
 impl TaskQueue {
     pub fn new(config: &ConcurrencyConfig) -> Self {
+        Self::new_with_pressure(config, None)
+    }
+
+    /// Like [`TaskQueue::new`] but wires in an optional memory-pressure flag.
+    /// When the flag is `Some` and its value is `true`, `acquire()` returns an
+    /// error immediately instead of waiting for a semaphore slot.
+    pub fn new_with_pressure(
+        config: &ConcurrencyConfig,
+        memory_pressure: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let project_limits: DashMap<String, usize> = config
             .per_project
             .iter()
@@ -66,6 +85,7 @@ impl TaskQueue {
             project_limits,
             project_queued: DashMap::new(),
             project_awaiting_global: DashMap::new(),
+            memory_pressure,
         }
     }
 
@@ -105,9 +125,21 @@ impl TaskQueue {
     /// Acquiring a project permit first prevents a single project from
     /// monopolizing all global slots while waiting for its own limit.
     ///
-    /// Returns `Err` immediately if `max_queue_size` tasks are already waiting.
+    /// Returns `Err` immediately if `max_queue_size` tasks are already waiting,
+    /// or if the memory-pressure flag (set by `memory_monitor`) is `true`.
     /// The returned permit releases both slots on drop (even on panic).
     pub async fn acquire(&self, project_id: &str) -> anyhow::Result<TaskPermit> {
+        // Reject immediately when system memory is below the configured threshold.
+        if self
+            .memory_pressure
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+        {
+            return Err(anyhow::anyhow!(
+                "task rejected: available system memory is below the configured threshold"
+            ));
+        }
+
         // Reserve a global queue slot. fetch_add returns value before increment,
         // so if prev == max_queue_size the queue is already full.
         let prev = self.queued_count.fetch_add(1, Ordering::SeqCst);
@@ -443,5 +475,31 @@ mod tests {
         let stats2 = q2.project_stats("capped");
         assert_eq!(stats2.running, 1);
         assert_eq!(stats2.queued, 1);
+    }
+
+    #[tokio::test]
+    async fn task_admission_blocked_under_pressure() {
+        let pressure = Arc::new(AtomicBool::new(true));
+        let q = TaskQueue::new_with_pressure(&config(4, 16), Some(pressure));
+        let result = q.acquire("proj").await;
+        assert!(result.is_err(), "acquire must fail under memory pressure");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("available system memory"),
+            "error message should mention memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_admission_succeeds_no_pressure() {
+        let pressure = Arc::new(AtomicBool::new(false));
+        let q = TaskQueue::new_with_pressure(&config(4, 16), Some(pressure));
+        let result = q.acquire("proj").await;
+        assert!(
+            result.is_ok(),
+            "acquire must succeed when pressure flag is false"
+        );
     }
 }

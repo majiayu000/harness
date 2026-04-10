@@ -20,6 +20,7 @@ pub mod handlers;
 pub mod hook_enforcer;
 pub mod http;
 pub mod intake;
+pub mod memory_monitor;
 pub mod notify;
 pub mod parallel_dispatch;
 pub mod periodic_reviewer;
