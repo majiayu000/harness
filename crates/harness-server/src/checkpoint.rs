@@ -106,13 +106,21 @@ impl TaskCheckpoint {
     }
 
     /// Save the checkpoint to the filesystem path for this task.
+    ///
+    /// Uses an atomic write: the JSON is first written to a `.tmp` side-car
+    /// file and then renamed into place.  POSIX guarantees that `rename(2)`
+    /// is atomic with respect to readers, so a concurrent `load` will always
+    /// see either the previous complete checkpoint or the new one — never a
+    /// partial write.
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::default_path(&self.task_id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, data)?;
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, &data)?;
+        std::fs::rename(&tmp_path, &path)?;
         Ok(())
     }
 
