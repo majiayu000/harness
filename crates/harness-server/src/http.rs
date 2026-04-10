@@ -622,6 +622,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         let workspace_mgr_w = workspace_mgr.clone();
         let task_queue_w = task_queue.clone();
         let completion_callback_w = completion_callback.clone();
+        let allowed_roots_w = server.config.server.allowed_project_roots.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -716,11 +717,15 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                     // canonical path at registration time, but we resolve again here
                     // to guard against None / relative / symlink edge cases so the
                     // semaphore bucket is always consistent with other dispatch paths.
-                    let project_id =
+                    // We also re-apply the allowed_project_roots allowlist to prevent
+                    // a tampered/stale persisted project path from escaping the
+                    // configured sandbox (mirrors the check in execution.rs:182 and
+                    // task_routes.rs:260-264).
+                    let canonical =
                         match crate::task_runner::resolve_canonical_project(req.project.clone())
                             .await
                         {
-                            Ok(canonical) => canonical.to_string_lossy().into_owned(),
+                            Ok(c) => c,
                             Err(e) => {
                                 tracing::error!(
                                     task_id = %task_id.0,
@@ -744,6 +749,29 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                 continue;
                             }
                         };
+                    if let Err(e) =
+                        crate::project_registry::check_allowed_roots(&canonical, &allowed_roots_w)
+                    {
+                        tracing::error!(
+                            task_id = %task_id.0,
+                            "dep-watcher: project not in allowed_project_roots — failing task: {e}"
+                        );
+                        if let Err(pe) =
+                            crate::task_runner::mutate_and_persist(&store, &task_id, |s| {
+                                s.status = crate::task_runner::TaskStatus::Failed;
+                                s.error =
+                                    Some(format!("dep-watcher: project not in allowed roots: {e}"));
+                            })
+                            .await
+                        {
+                            tracing::error!(
+                                task_id = %task_id.0,
+                                "dep-watcher: failed to persist failure state: {pe}"
+                            );
+                        }
+                        continue;
+                    }
+                    let project_id = canonical.to_string_lossy().into_owned();
 
                     let task_id2 = task_id.clone();
                     let store2 = store.clone();
@@ -779,8 +807,17 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                 if let Err(e) = store2.persist(&task_id2).await {
                                     tracing::warn!(
                                         task_id = %task_id2.0,
-                                        "dep-watcher: failed to persist task before dispatch: {e}"
+                                        "dep-watcher: failed to persist task before dispatch: {e} \
+                                         — aborting dispatch, restoring state for next tick retry"
                                     );
+                                    // Restore in-memory state so the next watcher tick retries.
+                                    // The DB still holds the original pending_request_json
+                                    // because persist failed, so restart recovery is also safe.
+                                    if let Some(mut entry) = store2.cache.get_mut(&task_id2) {
+                                        entry.pending_request = Some(req);
+                                        entry.status = crate::task_runner::TaskStatus::AwaitingDeps;
+                                    }
+                                    return; // drops permit
                                 }
                                 crate::task_runner::spawn_preregistered_task(
                                     task_id2,
