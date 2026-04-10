@@ -9,8 +9,10 @@
     clippy::unnecessary_to_owned
 )]
 
-pub mod checkpoint;
-pub mod circuit_breaker;
+// Modules extracted to `harness-workflow`; re-exported so existing `crate::*`
+// paths inside this crate continue to resolve without modification.
+pub use harness_workflow::checkpoint;
+pub use harness_workflow::circuit_breaker;
 pub mod complexity_router;
 pub mod contract_validator;
 pub mod dashboard;
@@ -24,7 +26,7 @@ pub mod memory_monitor;
 pub mod notify;
 pub mod parallel_dispatch;
 pub mod periodic_reviewer;
-pub mod plan_db;
+pub use harness_workflow::plan_db;
 pub mod post_validator;
 pub mod project_registry;
 pub mod q_value_store;
@@ -45,7 +47,7 @@ pub mod skill_governor;
 pub mod stdio;
 pub mod task_db;
 pub mod task_executor;
-pub mod task_queue;
+pub use harness_workflow::task_queue;
 pub mod task_runner;
 pub mod thread_db;
 pub mod thread_manager;

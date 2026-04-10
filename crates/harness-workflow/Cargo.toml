@@ -1,0 +1,22 @@
+[package]
+name = "harness-workflow"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+harness-core = { workspace = true }
+harness-exec = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+uuid = { workspace = true }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+async-trait = { workspace = true }
+tempfile = { workspace = true }

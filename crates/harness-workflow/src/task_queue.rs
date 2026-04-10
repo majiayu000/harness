@@ -650,8 +650,7 @@ impl TaskQueue {
             .collect()
     }
 
-    /// Create an unbounded queue for tests (effectively no limit).
-    #[cfg(test)]
+    /// Create a practically unbounded queue (high limits for testing or dev use).
     pub fn unbounded() -> Self {
         Self::new(&ConcurrencyConfig {
             max_concurrent_tasks: 1024,
