@@ -94,9 +94,14 @@ impl QualityTrigger {
         if let (Some(challenger), Some(ctx)) = (&self.challenger_agent, task_ctx) {
             if report.grade != Grade::A {
                 // Cap diff to avoid oversized LLM requests (latency/cost spikes).
-                const MAX_DIFF_CHARS: usize = 4096;
-                let diff_excerpt = if ctx.diff.len() > MAX_DIFF_CHARS {
-                    &ctx.diff[..MAX_DIFF_CHARS]
+                // Use char-boundary-safe truncation to prevent panics on multibyte UTF-8.
+                const MAX_DIFF_BYTES: usize = 4096;
+                let diff_excerpt = if ctx.diff.len() > MAX_DIFF_BYTES {
+                    let end = (0..=MAX_DIFF_BYTES)
+                        .rev()
+                        .find(|&i| ctx.diff.is_char_boundary(i))
+                        .unwrap_or(0);
+                    &ctx.diff[..end]
                 } else {
                     &ctx.diff
                 };
@@ -115,16 +120,20 @@ impl QualityTrigger {
                              skipping cross-review to preserve independence"
                         );
                     } else {
-                        match run_cross_review(
-                            primary,
-                            Some(challenger.clone()),
-                            self.project_root.clone(),
-                            target,
-                            2,
+                        const CROSS_REVIEW_TIMEOUT_SECS: u64 = 120;
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(CROSS_REVIEW_TIMEOUT_SECS),
+                            run_cross_review(
+                                primary,
+                                Some(challenger.clone()),
+                                self.project_root.clone(),
+                                target,
+                                2,
+                            ),
                         )
                         .await
                         {
-                            Ok(result) => {
+                            Ok(Ok(result)) => {
                                 report.semantic_verdict = Some(result.final_verdict.clone());
                                 if result.final_verdict == "NOT_CONVERGED" {
                                     let original = report.grade;
@@ -136,9 +145,15 @@ impl QualityTrigger {
                                     );
                                 }
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 tracing::warn!(
                                     "quality_trigger: cross-review failed: {e}; using numeric grade only"
+                                );
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    "quality_trigger: cross-review timed out after {CROSS_REVIEW_TIMEOUT_SECS}s; \
+                                     using numeric grade only"
                                 );
                             }
                         }
