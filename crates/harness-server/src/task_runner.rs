@@ -851,8 +851,11 @@ impl TaskStore {
                     "task waiting for rate-limit circuit breaker to clear"
                 );
                 tokio::time::sleep_until(until).await;
-                // Clear the breaker after waking up.
-                *self.rate_limit_until.write().await = None;
+                // Only clear the breaker if it hasn't been extended during the sleep window.
+                let mut wl = self.rate_limit_until.write().await;
+                if *wl == Some(until) {
+                    *wl = None;
+                }
             }
         }
     }
