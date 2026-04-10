@@ -1544,7 +1544,7 @@ where
                     .await;
 
                     let turn_timeout = effective_turn_timeout(req.turn_timeout_secs);
-                    let results = crate::parallel_dispatch::run_parallel_subtasks(
+                    let run_result = crate::parallel_dispatch::run_parallel_subtasks(
                         &id,
                         agent.clone(),
                         subtask_specs,
@@ -1557,9 +1557,15 @@ where
                     )
                     .await;
 
-                    let any_success = results.iter().any(|r| r.response.is_some());
+                    // Sequential (numbered-list) tasks require every step to succeed;
+                    // parallel (file-partitioned) tasks tolerate partial success.
+                    let succeeded = if run_result.is_sequential {
+                        run_result.results.iter().all(|r| r.response.is_some())
+                    } else {
+                        run_result.results.iter().any(|r| r.response.is_some())
+                    };
                     mutate_and_persist(&store, &id, |s| {
-                        for r in &results {
+                        for r in &run_result.results {
                             let detail = if let Some(ref resp) = r.response {
                                 if resp.output.is_empty() {
                                     None
@@ -1580,11 +1586,15 @@ where
                                 detail,
                             });
                         }
-                        if any_success {
+                        if succeeded {
                             s.status = TaskStatus::Done;
                         } else {
                             s.status = TaskStatus::Failed;
-                            s.error = Some("all parallel subtasks failed".to_string());
+                            s.error = Some(if run_result.is_sequential {
+                                "one or more sequential subtasks failed; remaining steps were skipped".to_string()
+                            } else {
+                                "all parallel subtasks failed".to_string()
+                            });
                         }
                     })
                     .await?;

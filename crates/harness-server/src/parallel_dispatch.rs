@@ -174,14 +174,27 @@ pub struct SubtaskResult {
     pub error: Option<String>,
 }
 
-/// Run multiple agent executions concurrently, each in an isolated git worktree.
+/// Combined result returned by `run_parallel_subtasks`.
+pub struct ParallelRunResult {
+    /// Per-subtask outcomes (may be shorter than input when sequential execution
+    /// aborted early after a step failure).
+    pub results: Vec<SubtaskResult>,
+    /// True when subtasks ran serially in dependency order (numbered-list mode).
+    /// Callers must require *all* steps succeeded; `any_success` is not sufficient.
+    pub is_sequential: bool,
+}
+
+/// Run multiple agent executions, either serially (sequential deps) or concurrently
+/// (no deps), each in an isolated git worktree.
 ///
-/// Each subtask gets a derived `TaskId` of the form `{task_id}-p{index}` and its
-/// own worktree branch. Workspaces are removed after all executions finish,
-/// regardless of individual subtask outcome.
+/// **Sequential mode** (any subtask has `depends_on_indices`): subtasks execute
+/// one-at-a-time in order. The first failure aborts the remaining steps so that
+/// later steps never run without their prerequisites.
 ///
-/// Individual subtask failures are captured in `SubtaskResult::error` and do not
-/// abort the other subtasks.
+/// **Parallel mode** (no deps): subtasks execute concurrently, bounded by
+/// `MAX_PARALLEL`. Individual failures are captured and do not abort siblings.
+///
+/// Workspaces are removed after all executions finish.
 pub async fn run_parallel_subtasks(
     task_id: &TaskId,
     agent: Arc<dyn CodeAgent>,
@@ -192,7 +205,127 @@ pub async fn run_parallel_subtasks(
     base_branch: &str,
     context: Vec<ContextItem>,
     turn_timeout: Duration,
-) -> Vec<SubtaskResult> {
+) -> ParallelRunResult {
+    let is_sequential = subtasks.iter().any(|s| !s.depends_on_indices.is_empty());
+
+    if is_sequential {
+        return run_sequential_subtasks(
+            task_id,
+            agent,
+            subtasks,
+            workspace_mgr,
+            source_repo,
+            remote,
+            base_branch,
+            context,
+            turn_timeout,
+        )
+        .await;
+    }
+
+    run_concurrent_subtasks(
+        task_id,
+        agent,
+        subtasks,
+        workspace_mgr,
+        source_repo,
+        remote,
+        base_branch,
+        context,
+        turn_timeout,
+    )
+    .await
+}
+
+/// Execute subtasks one-at-a-time in order, stopping on the first failure.
+async fn run_sequential_subtasks(
+    task_id: &TaskId,
+    agent: Arc<dyn CodeAgent>,
+    subtasks: Vec<SubtaskSpec>,
+    workspace_mgr: Arc<WorkspaceManager>,
+    source_repo: &Path,
+    remote: &str,
+    base_branch: &str,
+    context: Vec<ContextItem>,
+    turn_timeout: Duration,
+) -> ParallelRunResult {
+    let total = subtasks.len();
+    let mut results = Vec::with_capacity(total);
+
+    for (i, spec) in subtasks.into_iter().enumerate() {
+        let sub_id = harness_core::types::TaskId(format!("{}-p{i}", task_id.0));
+        let outcome = match workspace_mgr
+            .create_workspace(&sub_id, source_repo, remote, base_branch)
+            .await
+        {
+            Ok(workspace) => {
+                let req = AgentRequest {
+                    prompt: spec.prompt,
+                    project_root: workspace,
+                    context: context.clone(),
+                    ..Default::default()
+                };
+                // Timeout covers only actual execution — no semaphore queue here.
+                match tokio::time::timeout(turn_timeout, agent.execute(req)).await {
+                    Ok(Ok(resp)) => Ok(resp),
+                    Ok(Err(e)) => Err(format!("agent error: {e}")),
+                    Err(_) => Err(format!(
+                        "subtask timed out after {}s",
+                        turn_timeout.as_secs()
+                    )),
+                }
+            }
+            Err(e) => {
+                tracing::warn!("parallel_dispatch: workspace creation failed for subtask {i}: {e}");
+                Err(format!("workspace creation failed: {e}"))
+            }
+        };
+
+        // Workspace cleanup happens immediately after each step.
+        if let Err(e) = workspace_mgr.remove_workspace(&sub_id).await {
+            tracing::warn!("parallel_dispatch: workspace cleanup failed for {sub_id:?}: {e}");
+        }
+
+        let (response, error) = match outcome {
+            Ok(resp) => (Some(resp), None),
+            Err(e) => {
+                tracing::warn!(
+                    "sequential subtask {i} failed: {e}; aborting remaining {} step(s)",
+                    total - i - 1
+                );
+                (None, Some(e))
+            }
+        };
+        let failed = response.is_none();
+        results.push(SubtaskResult {
+            index: i,
+            response,
+            error,
+        });
+
+        if failed {
+            break;
+        }
+    }
+
+    ParallelRunResult {
+        results,
+        is_sequential: true,
+    }
+}
+
+/// Execute subtasks concurrently, bounded by `MAX_PARALLEL`.
+async fn run_concurrent_subtasks(
+    task_id: &TaskId,
+    agent: Arc<dyn CodeAgent>,
+    subtasks: Vec<SubtaskSpec>,
+    workspace_mgr: Arc<WorkspaceManager>,
+    source_repo: &Path,
+    remote: &str,
+    base_branch: &str,
+    context: Vec<ContextItem>,
+    turn_timeout: Duration,
+) -> ParallelRunResult {
     let count = subtasks.len();
     let mut handles: Vec<tokio::task::JoinHandle<(usize, Result<AgentResponse, String>)>> =
         Vec::with_capacity(count);
@@ -217,23 +350,19 @@ pub async fn run_parallel_subtasks(
                 };
                 let sem = Arc::clone(&sem);
                 handles.push(tokio::spawn(async move {
-                    // Timeout covers both semaphore queue wait and execution so that
-                    // a task cannot be stuck waiting unbounded before it even starts.
-                    let timed = tokio::time::timeout(turn_timeout, async move {
-                        let _permit = match sem.acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => return Err("semaphore closed unexpectedly".to_string()),
-                        };
-                        match agent.execute(req).await {
-                            Ok(resp) => Ok(resp),
-                            Err(e) => Err(format!("agent error: {e}")),
-                        }
-                    })
-                    .await;
-                    let result = match timed {
-                        Ok(r) => r,
+                    // Acquire semaphore first (unbounded wait), then apply timeout
+                    // only to the actual agent execution — subtasks beyond the first
+                    // MAX_PARALLEL do not time out while waiting in the queue.
+                    let _permit = match sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return (i, Err("semaphore closed unexpectedly".to_string())),
+                    };
+                    let result = match tokio::time::timeout(turn_timeout, agent.execute(req)).await
+                    {
+                        Ok(Ok(resp)) => Ok(resp),
+                        Ok(Err(e)) => Err(format!("agent error: {e}")),
                         Err(_) => Err(format!(
-                            "subtask timed out after {}s (including queue wait)",
+                            "subtask timed out after {}s",
                             turn_timeout.as_secs()
                         )),
                     };
@@ -284,7 +413,10 @@ pub async fn run_parallel_subtasks(
         }
     }
 
-    results
+    ParallelRunResult {
+        results,
+        is_sequential: false,
+    }
 }
 
 #[cfg(test)]
