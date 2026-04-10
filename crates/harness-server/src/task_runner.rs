@@ -840,21 +840,37 @@ impl TaskStore {
     }
 
     /// Wait if the global rate-limit circuit breaker is active.
-    /// Returns immediately if no breaker is set or the deadline has passed.
+    /// Loops until the breaker is fully cleared, re-sleeping if the deadline
+    /// is extended during a sleep window (prevents early resume on 429 extension).
     pub async fn wait_for_rate_limit(&self) {
-        let deadline = { *self.rate_limit_until.read().await };
-        if let Some(until) = deadline {
-            if tokio::time::Instant::now() < until {
-                let remaining = until - tokio::time::Instant::now();
-                tracing::info!(
-                    remaining_secs = remaining.as_secs(),
-                    "task waiting for rate-limit circuit breaker to clear"
-                );
-                tokio::time::sleep_until(until).await;
-                // Only clear the breaker if it hasn't been extended during the sleep window.
-                let mut wl = self.rate_limit_until.write().await;
-                if *wl == Some(until) {
-                    *wl = None;
+        loop {
+            let deadline = { *self.rate_limit_until.read().await };
+            match deadline {
+                None => return,
+                Some(until) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= until {
+                        // Deadline already passed; clear if unchanged and return.
+                        let mut wl = self.rate_limit_until.write().await;
+                        if *wl == Some(until) {
+                            *wl = None;
+                        }
+                        return;
+                    }
+                    let remaining = until - now;
+                    tracing::info!(
+                        remaining_secs = remaining.as_secs(),
+                        "task waiting for rate-limit circuit breaker to clear"
+                    );
+                    tokio::time::sleep_until(until).await;
+                    // Only clear if the deadline wasn't extended during sleep.
+                    // If it was extended, loop to re-check and sleep to the new deadline.
+                    let mut wl = self.rate_limit_until.write().await;
+                    if *wl == Some(until) {
+                        *wl = None;
+                        return;
+                    }
+                    // Deadline changed (extended or cleared by another waiter); loop again.
                 }
             }
         }
