@@ -311,15 +311,26 @@ async fn run_sequential_subtasks(
         // dropping a JoinHandle merely detaches the child; the agent would keep
         // running and writing to the shared workspace after cancellation.
         let agent_clone = agent.clone();
-        let handle = tokio::spawn(async move { agent_clone.execute(req).await });
+        let mut handle = tokio::spawn(async move { agent_clone.execute(req).await });
         let _abort_guard = AbortOnDrop(handle.abort_handle());
-        let outcome = match tokio::time::timeout(turn_timeout, handle).await {
+        let outcome = match tokio::time::timeout(turn_timeout, &mut handle).await {
             Ok(Ok(Ok(resp))) => Ok(resp),
             Ok(Ok(Err(e))) => Err(format!("agent error: {e}")),
             Ok(Err(join_err)) => Err(format!("subtask panicked: {join_err}")),
             Err(_) => {
-                // _abort_guard is dropped at end of scope and aborts the task;
-                // the explicit Err here records the timeout reason.
+                // Abort and await the task so it is fully stopped before
+                // workspace cleanup begins.  Tokio abort() is asynchronous —
+                // the task can still run until its next yield point — so
+                // awaiting guarantees no background mutations occur after
+                // remove_workspace is called.
+                handle.abort();
+                if let Err(e) = handle.await {
+                    if !e.is_cancelled() {
+                        tracing::warn!(
+                            "sequential subtask {i} did not exit cleanly after abort: {e}"
+                        );
+                    }
+                }
                 Err(format!(
                     "subtask timed out after {}s",
                     turn_timeout.as_secs()
