@@ -267,6 +267,35 @@ impl TaskDb {
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 
+    /// Return all tasks as lightweight summaries, skipping the heavy `rounds` column.
+    ///
+    /// Used by the `/tasks` list endpoint to avoid deserializing large round histories
+    /// when only summary fields are needed.
+    pub async fn list_summaries(&self) -> anyhow::Result<Vec<crate::task_runner::TaskSummary>> {
+        let rows = sqlx::query_as::<_, TaskSummaryRow>(
+            "SELECT id, status, turn, pr_url, error, source, external_id, parent_id, \
+             created_at, repo, depends_on, project \
+             FROM tasks ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(TaskSummaryRow::try_into_summary)
+            .collect()
+    }
+
+    /// Return `(id, status)` pairs for all tasks — skips all heavy columns.
+    ///
+    /// Used by hot-path callers that only need task status for aggregation
+    /// (e.g. skill governance scoring).
+    pub async fn list_id_status(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, status FROM tasks ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
+    }
+
     /// Return `true` if a task row with the given ID exists in the database.
     pub async fn exists_by_id(&self, id: &str) -> anyhow::Result<bool> {
         let row: Option<(String,)> = sqlx::query_as("SELECT id FROM tasks WHERE id = ?")
@@ -742,6 +771,52 @@ impl TaskRow {
             triage_output: None,
             plan_output: None,
             repo,
+        })
+    }
+}
+
+/// Lightweight row for summary queries — omits the heavy `rounds` column.
+#[derive(sqlx::FromRow)]
+struct TaskSummaryRow {
+    id: String,
+    status: String,
+    turn: i64,
+    pr_url: Option<String>,
+    error: Option<String>,
+    source: Option<String>,
+    external_id: Option<String>,
+    parent_id: Option<String>,
+    created_at: Option<String>,
+    repo: Option<String>,
+    depends_on: String,
+    project: Option<String>,
+}
+
+impl TaskSummaryRow {
+    fn try_into_summary(self) -> anyhow::Result<crate::task_runner::TaskSummary> {
+        use harness_core::types::TaskId;
+        let depends_on: Vec<TaskId> = serde_json::from_str(&self.depends_on).map_err(|source| {
+            harness_core::error::TaskDbDecodeError::DependsOnDeserialize {
+                task_id: self.id.clone(),
+                source,
+            }
+        })?;
+        Ok(crate::task_runner::TaskSummary {
+            id: TaskId(self.id),
+            status: self.status.parse::<crate::task_runner::TaskStatus>()?,
+            turn: self.turn as u32,
+            pr_url: self.pr_url,
+            error: self.error,
+            source: self.source,
+            parent_id: self.parent_id.map(TaskId),
+            external_id: self.external_id,
+            repo: self.repo,
+            description: None,
+            created_at: self.created_at,
+            phase: crate::task_runner::TaskPhase::default(),
+            depends_on,
+            subtask_ids: Vec::new(),
+            project: self.project,
         })
     }
 }

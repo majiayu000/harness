@@ -775,6 +775,50 @@ impl TaskStore {
         Ok(by_id.into_values().collect())
     }
 
+    /// Return all tasks as lightweight [`TaskSummary`] values.
+    ///
+    /// Fetches summary columns from the DB (skipping the heavy `rounds` field),
+    /// then overrides with live cache entries so in-flight state is accurate.
+    /// Use this in the `/tasks` list endpoint instead of `list_all_with_terminal`.
+    pub async fn list_all_summaries_with_terminal(&self) -> anyhow::Result<Vec<TaskSummary>> {
+        let mut by_id: std::collections::HashMap<TaskId, TaskSummary> = self
+            .db
+            .list_summaries()
+            .await?
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
+        for entry in self.cache.iter() {
+            by_id.insert(entry.key().clone(), entry.value().summary());
+        }
+        Ok(by_id.into_values().collect())
+    }
+
+    /// Return `(TaskId, TaskStatus)` pairs for all tasks without deserializing `rounds`.
+    ///
+    /// Hot-path callers (skill governance, token usage attribution) that only need
+    /// task status should use this instead of `list_all_with_terminal`.
+    pub async fn list_all_statuses_with_terminal(
+        &self,
+    ) -> anyhow::Result<HashMap<TaskId, TaskStatus>> {
+        let mut by_id: HashMap<TaskId, TaskStatus> = self
+            .db
+            .list_id_status()
+            .await?
+            .into_iter()
+            .filter_map(|(id, status)| {
+                status
+                    .parse::<TaskStatus>()
+                    .ok()
+                    .map(|s| (harness_core::types::TaskId(id), s))
+            })
+            .collect();
+        for entry in self.cache.iter() {
+            by_id.insert(entry.key().clone(), entry.value().status.clone());
+        }
+        Ok(by_id)
+    }
+
     /// Run `f` only if the task still exists and is live-`pending`.
     ///
     /// Holding the mutable cache guard across `f` prevents a concurrent status
@@ -1885,13 +1929,20 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> Vec<TaskId> {
 
     for (task_id, failed_dep_id) in &failed_deps {
         if let Some(mut entry) = store.cache.get_mut(task_id) {
-            entry.status = TaskStatus::Failed;
-            entry.error = Some(format!("dependency {} failed", failed_dep_id.0));
+            // Only overwrite if the task is still AwaitingDeps — a concurrent
+            // cancel or status transition must not be clobbered.
+            if matches!(entry.status, TaskStatus::AwaitingDeps) {
+                entry.status = TaskStatus::Failed;
+                entry.error = Some(format!("dependency {} failed", failed_dep_id.0));
+            }
         }
     }
     for task_id in &ready {
         if let Some(mut entry) = store.cache.get_mut(task_id) {
-            entry.status = TaskStatus::Pending;
+            // Same guard: skip if status changed since we snapshotted.
+            if matches!(entry.status, TaskStatus::AwaitingDeps) {
+                entry.status = TaskStatus::Pending;
+            }
         }
     }
 
