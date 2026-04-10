@@ -238,6 +238,16 @@ pub async fn run_parallel_subtasks(
 }
 
 /// Execute subtasks one-at-a-time in order, stopping on the first failure.
+///
+/// All steps share a **single workspace** so that step N can observe the
+/// filesystem outputs of step N-1 (written files, applied patches, etc.).
+/// Creating a fresh workspace per step would give each step a clean clone of
+/// `source_repo`/`base_branch`, making the dependency chain meaningless.
+///
+/// Each `agent.execute` call is spawned into its own `tokio::task` so that a
+/// panic inside the agent surfaces as a `JoinError` rather than unwinding
+/// through this function — which would bypass the workspace cleanup and leave
+/// the task in an inconsistent in-progress state.
 async fn run_sequential_subtasks(
     task_id: &TaskId,
     agent: Arc<dyn CodeAgent>,
@@ -252,39 +262,46 @@ async fn run_sequential_subtasks(
     let total = subtasks.len();
     let mut results = Vec::with_capacity(total);
 
-    for (i, spec) in subtasks.into_iter().enumerate() {
-        let sub_id = harness_core::types::TaskId(format!("{}-p{i}", task_id.0));
-        let outcome = match workspace_mgr
-            .create_workspace(&sub_id, source_repo, remote, base_branch)
-            .await
-        {
-            Ok(workspace) => {
-                let req = AgentRequest {
-                    prompt: spec.prompt,
-                    project_root: workspace,
-                    context: context.clone(),
-                    ..Default::default()
-                };
-                // Timeout covers only actual execution — no semaphore queue here.
-                match tokio::time::timeout(turn_timeout, agent.execute(req)).await {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err(format!("agent error: {e}")),
-                    Err(_) => Err(format!(
-                        "subtask timed out after {}s",
-                        turn_timeout.as_secs()
-                    )),
-                }
-            }
-            Err(e) => {
-                tracing::warn!("parallel_dispatch: workspace creation failed for subtask {i}: {e}");
-                Err(format!("workspace creation failed: {e}"))
-            }
-        };
-
-        // Workspace cleanup happens immediately after each step.
-        if let Err(e) = workspace_mgr.remove_workspace(&sub_id).await {
-            tracing::warn!("parallel_dispatch: workspace cleanup failed for {sub_id:?}: {e}");
+    // One shared workspace for all sequential steps — step N sees step N-1 outputs.
+    let seq_id = harness_core::types::TaskId(format!("{}-seq", task_id.0));
+    let workspace = match workspace_mgr
+        .create_workspace(&seq_id, source_repo, remote, base_branch)
+        .await
+    {
+        Ok(ws) => ws,
+        Err(e) => {
+            tracing::warn!("parallel_dispatch: workspace creation failed for sequential run: {e}");
+            return ParallelRunResult {
+                results: vec![SubtaskResult {
+                    index: 0,
+                    response: None,
+                    error: Some(format!("workspace creation failed: {e}")),
+                }],
+                is_sequential: true,
+            };
         }
+    };
+
+    for (i, spec) in subtasks.into_iter().enumerate() {
+        let req = AgentRequest {
+            prompt: spec.prompt,
+            project_root: workspace.clone(),
+            context: context.clone(),
+            ..Default::default()
+        };
+        // Spawn into a task so a panic in agent.execute surfaces as JoinError
+        // instead of unwinding through this function and skipping cleanup.
+        let agent_clone = agent.clone();
+        let handle = tokio::spawn(async move { agent_clone.execute(req).await });
+        let outcome = match tokio::time::timeout(turn_timeout, handle).await {
+            Ok(Ok(Ok(resp))) => Ok(resp),
+            Ok(Ok(Err(e))) => Err(format!("agent error: {e}")),
+            Ok(Err(join_err)) => Err(format!("subtask panicked: {join_err}")),
+            Err(_) => Err(format!(
+                "subtask timed out after {}s",
+                turn_timeout.as_secs()
+            )),
+        };
 
         let (response, error) = match outcome {
             Ok(resp) => (Some(resp), None),
@@ -306,6 +323,11 @@ async fn run_sequential_subtasks(
         if failed {
             break;
         }
+    }
+
+    // Workspace is cleaned up once after all steps complete (or on early abort).
+    if let Err(e) = workspace_mgr.remove_workspace(&seq_id).await {
+        tracing::warn!("parallel_dispatch: workspace cleanup failed for {seq_id:?}: {e}");
     }
 
     ParallelRunResult {
