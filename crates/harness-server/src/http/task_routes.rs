@@ -500,12 +500,19 @@ pub(super) async fn cancel_task(
 
     let task_id = harness_core::types::TaskId(id);
 
-    let task = match state.core.tasks.get(&task_id) {
-        Some(t) => t,
-        None => {
+    let task = match state.core.tasks.get_with_db_fallback(&task_id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({ "error": "task not found" })),
+            );
+        }
+        Err(e) => {
+            tracing::error!("cancel_task: DB lookup failed for {task_id:?}: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal server error" })),
             );
         }
     };

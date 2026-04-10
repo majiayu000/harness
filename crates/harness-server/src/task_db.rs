@@ -280,6 +280,26 @@ impl TaskDb {
         Ok(rows)
     }
 
+    /// Return only task IDs whose `status` matches any value in `statuses`.
+    ///
+    /// Skips all heavy columns (rounds, error, etc.) — use this when only IDs
+    /// are needed (e.g. orphan-worktree cleanup at startup).
+    pub async fn list_ids_by_status(&self, statuses: &[&str]) -> anyhow::Result<Vec<String>> {
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", statuses.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT id FROM tasks WHERE status IN ({placeholders})");
+        let mut q = sqlx::query_as::<_, (String,)>(&sql);
+        for status in statuses {
+            q = q.bind(*status);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     /// Return `true` if a task row with the given ID exists in the database.
     pub async fn exists_by_id(&self, id: &str) -> anyhow::Result<bool> {
         let row: Option<(String,)> = sqlx::query_as("SELECT id FROM tasks WHERE id = ?")

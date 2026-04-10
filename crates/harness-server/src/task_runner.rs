@@ -711,12 +711,13 @@ impl TaskStore {
         }
     }
 
-    /// Return terminal tasks (Done, Failed) directly from the database.
+    /// Return IDs of terminal tasks (Done, Failed) directly from the database.
     ///
-    /// Used during startup for worktree cleanup. Terminal tasks are not held
-    /// in the in-memory cache, so this is a targeted one-time DB query.
-    pub async fn list_terminal_from_db(&self) -> anyhow::Result<Vec<TaskState>> {
-        self.db.list_by_status(&["done", "failed"]).await
+    /// Used during startup for worktree cleanup. Only fetches task IDs to avoid
+    /// deserializing the heavy `rounds` column for large historical datasets.
+    pub async fn list_terminal_ids_from_db(&self) -> anyhow::Result<Vec<TaskId>> {
+        let ids = self.db.list_ids_by_status(&["done", "failed"]).await?;
+        Ok(ids.into_iter().map(harness_core::types::TaskId).collect())
     }
 
     pub fn count(&self) -> usize {

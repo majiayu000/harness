@@ -458,10 +458,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     // Cleanup orphan worktrees from any previous crash.
     // Terminal tasks are no longer held in the in-memory cache, so query DB directly.
     if let Some(ref wmgr) = workspace_mgr {
-        match tasks.list_terminal_from_db().await {
-            Ok(terminal_tasks) => {
-                let terminal_ids: Vec<crate::task_runner::TaskId> =
-                    terminal_tasks.into_iter().map(|t| t.id).collect();
+        match tasks.list_terminal_ids_from_db().await {
+            Ok(terminal_ids) => {
                 wmgr.cleanup_orphan_worktrees(&project_root, &terminal_ids)
                     .await;
             }
