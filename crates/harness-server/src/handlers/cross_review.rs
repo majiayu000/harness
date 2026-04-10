@@ -35,10 +35,11 @@ pub async fn cross_review(
     let challenger = state.core.server.agent_registry.get("codex");
     let rounds = max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS);
 
-    let result = match run_cross_review(primary, challenger, project_root, target, rounds).await {
-        Ok(r) => r,
-        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-    };
+    let result =
+        match run_cross_review(primary, challenger, project_root, target, rounds, None).await {
+            Ok(r) => r,
+            Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+        };
 
     match serde_json::to_value(&result) {
         Ok(v) => RpcResponse::success(id, v),
@@ -54,12 +55,18 @@ pub async fn cross_review(
 /// 3. Challenger iterates up to `max_rounds - 1` times, classifying each issue as
 ///    CONFIRMED, FALSE-POSITIVE, or MISSED.
 /// 4. Returns APPROVED when no consensus issues remain; NOT_CONVERGED after max rounds.
+///
+/// `allowed_tools` controls agent execution permissions:
+/// - `None`        → Full profile (`--dangerously-skip-permissions`). Use for interactive calls.
+/// - `Some(tools)` → Restricted to the listed tools. Pass `Some(vec![])` to deny all tools
+///   (read-only text review where all content is in the prompt).
 pub async fn run_cross_review(
     primary: Arc<dyn CodeAgent>,
     challenger: Option<Arc<dyn CodeAgent>>,
     project_root: PathBuf,
     target: String,
     max_rounds: u32,
+    allowed_tools: Option<Vec<String>>,
 ) -> Result<CrossReviewResult, String> {
     let safe_target = harness_core::prompts::wrap_external_data(&target);
     let primary_prompt = format!(
@@ -72,6 +79,7 @@ pub async fn run_cross_review(
         .execute(AgentRequest {
             prompt: primary_prompt,
             project_root: project_root.clone(),
+            allowed_tools: allowed_tools.clone(),
             ..Default::default()
         })
         .await
@@ -129,6 +137,7 @@ pub async fn run_cross_review(
             .execute(AgentRequest {
                 prompt: challenge_prompt,
                 project_root: project_root.clone(),
+                allowed_tools: allowed_tools.clone(),
                 ..Default::default()
             })
             .await
@@ -302,6 +311,7 @@ mod tests {
             proj.path().to_path_buf(),
             "fn foo() {}".to_string(),
             3,
+            None,
         )
         .await
         .expect("run_cross_review should succeed");
@@ -321,6 +331,7 @@ mod tests {
             proj.path().to_path_buf(),
             "fn foo() {}".to_string(),
             3,
+            None,
         )
         .await
         .expect("single-agent should succeed");
@@ -343,6 +354,7 @@ mod tests {
             proj.path().to_path_buf(),
             "fn foo() {}".to_string(),
             3,
+            None,
         )
         .await
         .expect("lgtm path should succeed");

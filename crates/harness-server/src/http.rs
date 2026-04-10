@@ -854,11 +854,15 @@ fn build_completion_callback(
             // Grade recent events and auto-trigger GC if quality is poor.
             if let Some(qt) = quality_trigger {
                 let task_ctx = task.pr_url.as_ref().and_then(|pr| {
+                    // Use the last implementation-affecting round (implement or
+                    // agent_review_fix) with non-empty detail so the challenger
+                    // judges the final PR state, not the initial draft.
                     let diff = task
                         .rounds
                         .iter()
-                        .find(|r| r.action == "implement")
-                        .and_then(|r| r.detail.clone())
+                        .rev()
+                        .filter(|r| r.action == "implement" || r.action == "agent_review_fix")
+                        .find_map(|r| r.detail.clone().filter(|d| !d.is_empty()))
                         .unwrap_or_default();
                     if diff.is_empty() {
                         None

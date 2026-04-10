@@ -129,6 +129,9 @@ impl QualityTrigger {
                                 self.project_root.clone(),
                                 target,
                                 2,
+                                // Deny all tools: review is text-only, agents must not
+                                // mutate the repo during this background quality gate.
+                                Some(vec![]),
                             ),
                         )
                         .await
