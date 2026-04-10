@@ -1468,6 +1468,9 @@ where
         // Retry loop: on transient errors, back off and retry up to MAX_TRANSIENT_RETRIES.
         // Retrying inside the spawn means the stream stays open and the task actually re-runs.
         let mut transient_attempts = 0u32;
+        // Track total turns used across all transient-retry attempts so the
+        // max_turns budget is enforced globally over the full task lifecycle.
+        let mut total_turns_used: u32 = 0;
         let task_result = loop {
             // Wait if global rate-limit circuit breaker is active (another task hit the limit).
             store.wait_for_rate_limit().await;
@@ -1483,6 +1486,7 @@ where
                 &req,
                 run_project.clone(),
                 server_config.as_ref(),
+                &mut total_turns_used,
             )
             .await;
 
