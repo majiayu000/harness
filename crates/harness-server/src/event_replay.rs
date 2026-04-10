@@ -481,8 +481,40 @@ struct CompactLock {
 }
 
 impl CompactLock {
-    /// A lock file older than this many seconds is considered stale.
-    const STALE_SECS: u64 = 60;
+    /// Fallback age threshold (seconds) used on platforms where PID-based
+    /// liveness cannot be determined.  5 minutes is conservative enough to
+    /// cover realistic compaction durations on large logs.
+    const STALE_SECS: u64 = 300;
+
+    /// On Linux: reads the PID from the lock file and returns `true` iff
+    /// `/proc/{pid}` does not exist — a race-free, zero-overhead liveness test
+    /// that is independent of how long compaction takes.
+    #[cfg(target_os = "linux")]
+    fn is_stale(lock_path: &Path, meta: &std::fs::Metadata) -> bool {
+        if let Some(pid) = std::fs::read_to_string(lock_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            return !std::path::Path::new(&format!("/proc/{pid}")).exists();
+        }
+        // Can't read PID — fall back to age-based check.
+        meta.modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() > Self::STALE_SECS)
+            .unwrap_or(false)
+    }
+
+    /// On non-Linux: falls back to an age-based check with a conservative
+    /// threshold so a slow compaction on a large log is not incorrectly evicted.
+    #[cfg(not(target_os = "linux"))]
+    fn is_stale(_lock_path: &Path, meta: &std::fs::Metadata) -> bool {
+        meta.modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() > Self::STALE_SECS)
+            .unwrap_or(false)
+    }
 
     /// Try to acquire the lock.
     ///
@@ -493,13 +525,7 @@ impl CompactLock {
     fn try_acquire(lock_path: &Path) -> anyhow::Result<Option<Self>> {
         // Remove stale locks from crashed/killed processes.
         if let Ok(meta) = std::fs::metadata(lock_path) {
-            let stale = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .map(|d| d.as_secs() > Self::STALE_SECS)
-                .unwrap_or(false);
-            if stale {
+            if Self::is_stale(lock_path, &meta) {
                 tracing::debug!(
                     path = %lock_path.display(),
                     "event_replay: removing stale compaction lock"
