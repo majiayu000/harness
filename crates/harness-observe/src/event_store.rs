@@ -146,7 +146,7 @@ impl EventStore {
         use std::io::BufRead as _;
 
         let path = self.data_dir.join("events.jsonl");
-        if !path.exists() {
+        if !path.is_file() {
             return;
         }
         let file = match std::fs::File::open(&path) {
@@ -161,8 +161,10 @@ impl EventStore {
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
-                    tracing::warn!("event store: I/O error reading events.jsonl: {e}");
-                    continue;
+                    tracing::warn!(
+                        "event store: I/O error reading events.jsonl, aborting migration: {e}"
+                    );
+                    break;
                 }
             };
             let line = line.trim().to_owned();
