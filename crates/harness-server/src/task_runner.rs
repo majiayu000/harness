@@ -2115,7 +2115,9 @@ mod tests {
         // Allow async task to complete.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let state = store.get(&task_id).expect("task must exist");
+        let state = store.get(&task_id).ok_or_else(|| {
+            anyhow::anyhow!("task not found in store — possible concurrent deletion")
+        })?;
         assert!(
             matches!(state.status, TaskStatus::Failed),
             "expected Failed, got {:?}",
@@ -2206,7 +2208,9 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let state = store.get(&task_id).expect("task must exist");
+        let state = store.get(&task_id).ok_or_else(|| {
+            anyhow::anyhow!("task not found in store — possible concurrent deletion")
+        })?;
         assert!(
             matches!(state.status, TaskStatus::Failed),
             "expected Failed, got {:?}",
@@ -2258,7 +2262,9 @@ mod tests {
         };
 
         let task_id = register_pending_task(store.clone(), &req).await;
-        let state = store.get(&task_id).expect("task should exist");
+        let state = store.get(&task_id).ok_or_else(|| {
+            anyhow::anyhow!("task not found in store — possible concurrent deletion")
+        })?;
 
         assert_eq!(state.source.as_deref(), Some("github"));
         assert_eq!(state.external_id.as_deref(), Some("20"));
