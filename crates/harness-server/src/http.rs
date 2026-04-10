@@ -863,6 +863,23 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                     }
                                     return; // drops permit
                                 }
+                                // Re-check status after persist — cancel_task may have
+                                // flipped status to Cancelled during the await above.
+                                let still_pending_post_persist = store2
+                                    .cache
+                                    .get(&task_id2)
+                                    .map(|e| {
+                                        matches!(e.status, crate::task_runner::TaskStatus::Pending)
+                                    })
+                                    .unwrap_or(false);
+                                if !still_pending_post_persist {
+                                    tracing::warn!(
+                                        task_id = %task_id2.0,
+                                        "dep-watcher: task cancelled during persist — \
+                                         aborting dispatch"
+                                    );
+                                    return; // drops permit; DB already has no pending_request
+                                }
                                 crate::task_runner::spawn_preregistered_task(
                                     task_id2,
                                     store2,
