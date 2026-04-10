@@ -559,6 +559,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             project_root.clone(),
             gc_cfg.auto_gc_grades.clone(),
             gc_cfg.auto_gc_cooldown_secs,
+            server.agent_registry.get("codex"),
         ))
     };
 
@@ -852,7 +853,18 @@ fn build_completion_callback(
         Box::pin(async move {
             // Grade recent events and auto-trigger GC if quality is poor.
             if let Some(qt) = quality_trigger {
-                qt.check_and_maybe_trigger().await;
+                let task_ctx =
+                    task.pr_url
+                        .as_ref()
+                        .map(|pr| crate::quality_trigger::TaskReviewContext {
+                            diff: task
+                                .rounds
+                                .last()
+                                .map(|r| r.result.clone())
+                                .unwrap_or_default(),
+                            pr_description: pr.clone(),
+                        });
+                qt.check_and_maybe_trigger(task_ctx.as_ref()).await;
             }
 
             // Auto-trigger review bot comment when task completes with a PR URL.

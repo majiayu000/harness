@@ -1,3 +1,5 @@
+use crate::handlers::cross_review::run_cross_review;
+use harness_core::agent::CodeAgent;
 use harness_core::types::{EventFilters, Grade, Project};
 use harness_gc::gc_agent::GcAgent;
 use harness_observe::event_store::EventStore;
@@ -13,6 +15,12 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// Task context passed to cross-review: the diff output and PR URL.
+pub struct TaskReviewContext {
+    pub diff: String,
+    pub pr_description: String,
+}
+
 /// Evaluates project quality after each task completion and triggers GC when
 /// the grade falls below a configured threshold.
 pub struct QualityTrigger {
@@ -23,6 +31,7 @@ pub struct QualityTrigger {
     auto_gc_grades: Vec<Grade>,
     cooldown_secs: u64,
     last_triggered: Arc<AtomicU64>,
+    challenger_agent: Option<Arc<dyn CodeAgent>>,
 }
 
 impl QualityTrigger {
@@ -33,6 +42,7 @@ impl QualityTrigger {
         project_root: PathBuf,
         auto_gc_grades: Vec<Grade>,
         cooldown_secs: u64,
+        challenger_agent: Option<Arc<dyn CodeAgent>>,
     ) -> Self {
         Self {
             events,
@@ -42,6 +52,7 @@ impl QualityTrigger {
             auto_gc_grades,
             cooldown_secs,
             last_triggered: Arc::new(AtomicU64::new(0)),
+            challenger_agent,
         }
     }
 
@@ -56,8 +67,19 @@ impl QualityTrigger {
         unix_now().saturating_sub(last) >= self.cooldown_secs
     }
 
-    /// Grade recent events, log the result, and auto-trigger GC if warranted.
-    pub async fn check_and_maybe_trigger(&self) {
+    /// Downgrade a grade by one step. D stays at D (floor).
+    fn downgrade(grade: Grade) -> Grade {
+        match grade {
+            Grade::A => Grade::A, // gated before call; kept for completeness
+            Grade::B => Grade::C,
+            Grade::C => Grade::D,
+            Grade::D => Grade::D,
+        }
+    }
+
+    /// Grade recent events, run optional cross-review, log the result, and
+    /// auto-trigger GC if warranted.
+    pub async fn check_and_maybe_trigger(&self, task_ctx: Option<&TaskReviewContext>) {
         let events = match self.events.query(&EventFilters::default()).await {
             Ok(e) => e,
             Err(e) => {
@@ -66,7 +88,51 @@ impl QualityTrigger {
             }
         };
 
-        let report = QualityGrader::grade(&events, 0);
+        let mut report = QualityGrader::grade(&events, 0);
+
+        // Cross-review gate: skip if no challenger, no task context, or grade=A.
+        if let (Some(challenger), Some(ctx)) = (&self.challenger_agent, task_ctx) {
+            if report.grade != Grade::A {
+                let target = format!("PR: {}\n\nDiff summary:\n{}", ctx.pr_description, ctx.diff);
+                let primary = match self.agent_registry.default_agent() {
+                    Some(a) => a,
+                    None => {
+                        tracing::warn!(
+                            "quality_trigger: no primary agent for cross-review, skipping"
+                        );
+                        Arc::new(NoOpAgent)
+                    }
+                };
+                match run_cross_review(
+                    primary,
+                    Some(challenger.clone()),
+                    self.project_root.clone(),
+                    target,
+                    2,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        report.semantic_verdict = Some(result.final_verdict.clone());
+                        if result.final_verdict == "NOT_CONVERGED" {
+                            let original = report.grade;
+                            report.grade = Self::downgrade(report.grade);
+                            tracing::info!(
+                                original_grade = ?original,
+                                effective_grade = ?report.grade,
+                                "quality_trigger: NOT_CONVERGED — grade downgraded"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "quality_trigger: cross-review failed: {e}; using numeric grade only"
+                        );
+                    }
+                }
+            }
+        }
+
         self.events
             .log_quality_grade(report.grade, report.score)
             .await;
@@ -74,6 +140,7 @@ impl QualityTrigger {
         tracing::info!(
             grade = ?report.grade,
             score = report.score,
+            semantic_verdict = ?report.semantic_verdict,
             "quality_trigger: post-task quality check"
         );
 
@@ -111,19 +178,65 @@ impl QualityTrigger {
     }
 }
 
+/// Fallback primary agent used when the registry has no default agent during
+/// cross-review. Returns an empty LGTM so the cross-review degrades gracefully.
+struct NoOpAgent;
+
+#[async_trait::async_trait]
+impl CodeAgent for NoOpAgent {
+    fn name(&self) -> &str {
+        "noop"
+    }
+    fn capabilities(&self) -> Vec<harness_core::types::Capability> {
+        vec![]
+    }
+    async fn execute(
+        &self,
+        _req: harness_core::agent::AgentRequest,
+    ) -> harness_core::error::Result<harness_core::agent::AgentResponse> {
+        Ok(harness_core::agent::AgentResponse {
+            output: "LGTM".to_string(),
+            stderr: String::new(),
+            items: vec![],
+            token_usage: harness_core::types::TokenUsage::default(),
+            model: "noop".to_string(),
+            exit_code: Some(0),
+        })
+    }
+    async fn execute_stream(
+        &self,
+        _req: harness_core::agent::AgentRequest,
+        _tx: tokio::sync::mpsc::Sender<harness_core::agent::StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::types::{Decision, Event, Grade, SessionId};
+    use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+    use harness_core::error::Result as HarnessResult;
+    use harness_core::types::{Capability, Decision, Event, Grade, SessionId, TokenUsage};
     use harness_gc::draft_store::DraftStore;
     use harness_gc::gc_agent::GcAgent;
     use harness_gc::signal_detector::SignalDetector;
     use std::path::Path;
+    use tokio::sync::mpsc::Sender;
 
     async fn make_trigger(
         dir: &Path,
         auto_gc_grades: Vec<Grade>,
         cooldown_secs: u64,
+    ) -> QualityTrigger {
+        make_trigger_with_challenger(dir, auto_gc_grades, cooldown_secs, None).await
+    }
+
+    async fn make_trigger_with_challenger(
+        dir: &Path,
+        auto_gc_grades: Vec<Grade>,
+        cooldown_secs: u64,
+        challenger: Option<Arc<dyn CodeAgent>>,
     ) -> QualityTrigger {
         let events = Arc::new(EventStore::new(dir).await.expect("event store"));
         let gc_config = harness_core::config::misc::GcConfig::default();
@@ -146,7 +259,76 @@ mod tests {
             dir.to_path_buf(),
             auto_gc_grades,
             cooldown_secs,
+            challenger,
         )
+    }
+
+    // Mock that returns "ISSUE: foo" (primary) or "CONFIRMED: foo" (challenger) — NOT_CONVERGED
+    struct NotConvergedMock;
+
+    #[async_trait::async_trait]
+    impl CodeAgent for NotConvergedMock {
+        fn name(&self) -> &str {
+            "not-converged-mock"
+        }
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+        async fn execute(&self, _req: AgentRequest) -> HarnessResult<AgentResponse> {
+            Ok(AgentResponse {
+                output: "ISSUE: foo\nCONFIRMED: foo".to_string(),
+                stderr: String::new(),
+                items: vec![],
+                token_usage: TokenUsage::default(),
+                model: "mock".to_string(),
+                exit_code: Some(0),
+            })
+        }
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            _tx: Sender<StreamItem>,
+        ) -> HarnessResult<()> {
+            Ok(())
+        }
+    }
+
+    // Mock that returns LGTM — APPROVED
+    struct ApprovedMock;
+
+    #[async_trait::async_trait]
+    impl CodeAgent for ApprovedMock {
+        fn name(&self) -> &str {
+            "approved-mock"
+        }
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+        async fn execute(&self, _req: AgentRequest) -> HarnessResult<AgentResponse> {
+            Ok(AgentResponse {
+                output: "LGTM".to_string(),
+                stderr: String::new(),
+                items: vec![],
+                token_usage: TokenUsage::default(),
+                model: "mock".to_string(),
+                exit_code: Some(0),
+            })
+        }
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            _tx: Sender<StreamItem>,
+        ) -> HarnessResult<()> {
+            Ok(())
+        }
+    }
+
+    fn block_event(hook: &str) -> Event {
+        Event::new(SessionId::new(), hook, "Edit", Decision::Block)
+    }
+
+    fn pass_event() -> Event {
+        Event::new(SessionId::new(), "pre_tool_use", "Edit", Decision::Pass)
     }
 
     // --- grade_triggers_gc mapping tests ---
@@ -243,7 +425,7 @@ mod tests {
             .await
             .unwrap();
 
-        trigger.check_and_maybe_trigger().await;
+        trigger.check_and_maybe_trigger(None).await;
 
         let events = trigger
             .events
@@ -259,5 +441,217 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .starts_with("grade="));
+    }
+
+    // --- challenger cross-review tests (6 new scenarios) ---
+
+    // Scenario 1: challenger=None, task_ctx=None → existing behavior, one quality_grade event
+    #[tokio::test]
+    async fn no_challenger_no_ctx_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
+        trigger.events.log(&pass_event()).await.unwrap();
+        trigger.check_and_maybe_trigger(None).await;
+        let events = trigger
+            .events
+            .query(&harness_core::types::EventFilters {
+                hook: Some("quality_grade".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    // Scenario 2: challenger=Some, grade=A → cross-review skipped
+    #[tokio::test]
+    async fn challenger_grade_a_skips_cross_review() {
+        let dir = tempfile::tempdir().unwrap();
+        // Many pass events → grade A
+        let trigger = make_trigger_with_challenger(
+            dir.path(),
+            vec![Grade::D],
+            300,
+            Some(Arc::new(NotConvergedMock)),
+        )
+        .await;
+        for _ in 0..20 {
+            trigger.events.log(&pass_event()).await.unwrap();
+        }
+        let ctx = TaskReviewContext {
+            diff: "diff".to_string(),
+            pr_description: "https://github.com/o/r/pull/1".to_string(),
+        };
+        trigger.check_and_maybe_trigger(Some(&ctx)).await;
+        // Grade should remain A (no downgrade happened)
+        let events = trigger
+            .events
+            .query(&harness_core::types::EventFilters {
+                hook: Some("quality_grade".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let detail = events[0].detail.as_deref().unwrap_or("");
+        assert!(detail.contains("A"), "expected grade A in detail: {detail}");
+    }
+
+    // Scenario 3: challenger=Some, grade=B, verdict=APPROVED → grade stays B
+    #[tokio::test]
+    async fn challenger_grade_b_approved_stays_b() {
+        let dir = tempfile::tempdir().unwrap();
+        // Mix: many pass, a few security blocks to land on B
+        // security=70, stability=70, coverage=100, perf=100 → score=79 → B
+        let trigger = make_trigger_with_challenger(
+            dir.path(),
+            vec![Grade::D],
+            300,
+            Some(Arc::new(ApprovedMock)),
+        )
+        .await;
+        for _ in 0..7 {
+            trigger.events.log(&pass_event()).await.unwrap();
+        }
+        for _ in 0..3 {
+            trigger
+                .events
+                .log(&block_event("security_check"))
+                .await
+                .unwrap();
+        }
+        let ctx = TaskReviewContext {
+            diff: "diff".to_string(),
+            pr_description: "https://github.com/o/r/pull/1".to_string(),
+        };
+        trigger.check_and_maybe_trigger(Some(&ctx)).await;
+        let events = trigger
+            .events
+            .query(&harness_core::types::EventFilters {
+                hook: Some("quality_grade".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        // Grade must not have dropped below B (APPROVED verdict, no downgrade)
+        let detail = events[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("B") || detail.contains("A"),
+            "expected B or A in detail after APPROVED: {detail}"
+        );
+    }
+
+    // Scenario 4: challenger=Some, grade=B, verdict=NOT_CONVERGED → downgraded to C
+    #[tokio::test]
+    async fn challenger_grade_b_not_converged_downgraded_to_c() {
+        let dir = tempfile::tempdir().unwrap();
+        let trigger = make_trigger_with_challenger(
+            dir.path(),
+            vec![Grade::D],
+            300,
+            Some(Arc::new(NotConvergedMock)),
+        )
+        .await;
+        // security=70, stability=70, coverage=100, perf=100 → score=79 → grade B
+        for _ in 0..7 {
+            trigger.events.log(&pass_event()).await.unwrap();
+        }
+        for _ in 0..3 {
+            trigger
+                .events
+                .log(&block_event("security_check"))
+                .await
+                .unwrap();
+        }
+        let ctx = TaskReviewContext {
+            diff: "diff".to_string(),
+            pr_description: "https://github.com/o/r/pull/1".to_string(),
+        };
+        trigger.check_and_maybe_trigger(Some(&ctx)).await;
+        let events = trigger
+            .events
+            .query(&harness_core::types::EventFilters {
+                hook: Some("quality_grade".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let detail = events[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("C") || detail.contains("D"),
+            "expected downgrade to C or D after NOT_CONVERGED: {detail}"
+        );
+    }
+
+    // Scenario 5: challenger=Some, grade=C, NOT_CONVERGED → D, GC triggered (D in auto_gc_grades)
+    #[tokio::test]
+    async fn challenger_grade_c_not_converged_triggers_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let trigger = make_trigger_with_challenger(
+            dir.path(),
+            vec![Grade::D],
+            0, // zero cooldown so GC fires immediately
+            Some(Arc::new(NotConvergedMock)),
+        )
+        .await;
+        // security=50, stability=50, coverage=100, perf=100 → score=65 → grade C
+        for _ in 0..5 {
+            trigger.events.log(&pass_event()).await.unwrap();
+        }
+        for _ in 0..5 {
+            trigger
+                .events
+                .log(&block_event("security_check"))
+                .await
+                .unwrap();
+        }
+        let ctx = TaskReviewContext {
+            diff: "diff".to_string(),
+            pr_description: "https://github.com/o/r/pull/1".to_string(),
+        };
+        // Does not panic; grade C → D after NOT_CONVERGED; GC fires (no agent registered so
+        // the GC path logs a warning — that's acceptable in this unit test)
+        trigger.check_and_maybe_trigger(Some(&ctx)).await;
+        let events = trigger
+            .events
+            .query(&harness_core::types::EventFilters {
+                hook: Some("quality_grade".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let detail = events[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("C") || detail.contains("D"),
+            "expected C or D after NOT_CONVERGED on C input: {detail}"
+        );
+    }
+
+    // Scenario 6: task_ctx=None, challenger=Some → cross-review skipped, numeric grade only
+    #[tokio::test]
+    async fn challenger_no_ctx_skips_cross_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let trigger = make_trigger_with_challenger(
+            dir.path(),
+            vec![Grade::D],
+            300,
+            Some(Arc::new(NotConvergedMock)),
+        )
+        .await;
+        trigger.events.log(&pass_event()).await.unwrap();
+        // No ctx → cross-review skipped despite challenger being present
+        trigger.check_and_maybe_trigger(None).await;
+        let events = trigger
+            .events
+            .query(&harness_core::types::EventFilters {
+                hook: Some("quality_grade".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
     }
 }

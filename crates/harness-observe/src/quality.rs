@@ -7,6 +7,9 @@ pub struct QualityReport {
     pub grade: Grade,
     pub dimensions: QualityDimensions,
     pub recommended_gc_interval: std::time::Duration,
+    /// Semantic verdict from challenger-agent cross-review.
+    /// "APPROVED" | "NOT_CONVERGED" | None (cross-review not run)
+    pub semantic_verdict: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +68,7 @@ impl QualityGrader {
                 performance,
             },
             recommended_gc_interval: grade.recommended_gc_interval(),
+            semantic_verdict: None,
         }
     }
 }
