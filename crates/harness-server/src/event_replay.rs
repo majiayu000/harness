@@ -319,8 +319,10 @@ pub fn replay_events(log_path: &Path) -> anyhow::Result<ReplayResult> {
 /// committed their state to the database.  Removing them prevents the log from
 /// growing unboundedly across server restarts.
 ///
-/// Uses an atomic rename (write to a sibling `.tmp` file, then `rename`) so
-/// that a crash during compaction leaves the original log intact.
+/// Uses an atomic rename (write to a per-process `.tmp` file, then `rename`)
+/// so that a crash during compaction leaves the original log intact.  A
+/// [`CompactLock`] serialises concurrent server instances that share the same
+/// data directory, preventing silent event loss from a rename race.
 ///
 /// Returns the number of event lines removed.
 fn compact_log(log_path: &Path, states: &HashMap<String, ReplayedState>) -> anyhow::Result<u32> {
@@ -334,45 +336,177 @@ fn compact_log(log_path: &Path, states: &HashMap<String, ReplayedState>) -> anyh
         return Ok(0);
     }
 
+    // Acquire an exclusive lock to prevent concurrent server instances from
+    // racing on the same log file.
+    let lock_path = {
+        let stem = log_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let mut p = log_path.to_path_buf();
+        p.set_file_name(format!("{stem}.compact.lock"));
+        p
+    };
+    let _lock = match CompactLock::try_acquire(&lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            tracing::warn!(
+                path = %log_path.display(),
+                "event_replay: compaction lock held by another process, skipping"
+            );
+            return Ok(0);
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Unique tmp path per process (PID + sub-second nonce) so two instances
+    // that somehow both pass the lock check cannot clobber each other's tmp.
+    let tmp_path = {
+        let pid = std::process::id();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let stem = log_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let mut p = log_path.to_path_buf();
+        p.set_file_name(format!("{stem}.{pid}.{nonce}.tmp"));
+        p
+    };
+
     let file = std::fs::File::open(log_path)?;
     let reader = BufReader::new(file);
-    let mut kept: Vec<String> = Vec::new();
     let mut removed = 0u32;
 
-    for line_result in reader.lines() {
-        let line = line_result?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let keep = match serde_json::from_str::<TaskEvent>(trimmed) {
-            Ok(event) => !terminal_ids.contains(event.task_id()),
-            // Keep lines we cannot parse — do not silently drop unknown data.
-            Err(_) => true,
-        };
-        if keep {
-            kept.push(line);
-        } else {
-            removed += 1;
-        }
-    }
-
-    // Atomic write: write to a sibling .tmp file, then rename into place.
-    let mut tmp_path = log_path.to_path_buf();
-    let mut tmp_name = log_path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(".tmp");
-    tmp_path.set_file_name(tmp_name);
-
+    // Stream directly to the tmp file line-by-line — never buffer all lines
+    // in memory, which could OOM the server on a large log.
     {
         let mut tmp_file = std::fs::File::create(&tmp_path)?;
-        for line in &kept {
-            writeln!(tmp_file, "{line}")?;
+        for line_result in reader.lines() {
+            let line = line_result?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let keep = match serde_json::from_str::<TaskEvent>(trimmed) {
+                Ok(event) => !terminal_ids.contains(event.task_id()),
+                // Keep lines we cannot parse — do not silently drop unknown data.
+                Err(_) => true,
+            };
+            if keep {
+                writeln!(tmp_file, "{trimmed}")?;
+            } else {
+                removed += 1;
+            }
         }
+        // Flush buffered writer state then sync to durable storage before the
+        // rename.  This ensures the compacted data survives a power failure
+        // that occurs between flush and rename.
         tmp_file.flush()?;
+        tmp_file.sync_all()?;
+        // File is closed (dropped) here, before rename.
     }
+
     std::fs::rename(&tmp_path, log_path)?;
 
+    // Sync the parent directory to make the directory-entry rename durable.
+    if let Some(parent) = log_path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            if let Err(e) = dir.sync_all() {
+                tracing::warn!(
+                    path = %log_path.display(),
+                    "event_replay: failed to fsync parent dir after compaction: {e}"
+                );
+            }
+        }
+    }
+
     Ok(removed)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CompactLock — per-directory mutex for log compaction
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// RAII guard for the compaction lock file.
+///
+/// Uses [`std::fs::OpenOptions::create_new`] for atomic creation (mutual
+/// exclusion without `libc`).  Stale locks left by crashed processes are
+/// detected via the file's modification time: a lock older than
+/// [`STALE_SECS`](CompactLock::STALE_SECS) is assumed abandoned and removed.
+struct CompactLock {
+    path: std::path::PathBuf,
+}
+
+impl CompactLock {
+    /// A lock file older than this many seconds is considered stale.
+    const STALE_SECS: u64 = 60;
+
+    /// Try to acquire the lock.
+    ///
+    /// Returns:
+    /// - `Ok(Some(guard))` — lock acquired; compaction may proceed.
+    /// - `Ok(None)` — lock is held by a live process; caller must skip.
+    /// - `Err(_)` — unexpected I/O failure.
+    fn try_acquire(lock_path: &Path) -> anyhow::Result<Option<Self>> {
+        // Remove stale locks from crashed/killed processes.
+        if let Ok(meta) = std::fs::metadata(lock_path) {
+            let stale = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| d.as_secs() > Self::STALE_SECS)
+                .unwrap_or(false);
+            if stale {
+                tracing::debug!(
+                    path = %lock_path.display(),
+                    "event_replay: removing stale compaction lock"
+                );
+                if let Err(e) = std::fs::remove_file(lock_path) {
+                    tracing::warn!(
+                        path = %lock_path.display(),
+                        "event_replay: failed to remove stale lock: {e}"
+                    );
+                }
+            }
+        }
+
+        let pid = std::process::id().to_string();
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(mut f) => {
+                if let Err(e) = IoWrite::write_all(&mut f, pid.as_bytes()) {
+                    tracing::warn!(
+                        path = %lock_path.display(),
+                        "event_replay: failed to write PID to lock file: {e}"
+                    );
+                }
+                Ok(Some(Self {
+                    path: lock_path.to_path_buf(),
+                }))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Drop for CompactLock {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            tracing::warn!(
+                path = %self.path.display(),
+                "event_replay: failed to remove compaction lock: {e}"
+            );
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
