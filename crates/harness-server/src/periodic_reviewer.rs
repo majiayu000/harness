@@ -775,14 +775,6 @@ async fn run_review_tick(
             return;
         }
 
-        if primary_output.is_none() {
-            tracing::error!(
-                task_id = %primary_review_id,
-                "scheduler: primary review produced no output (agent failed/timed out) — watermark not advanced, next tick will re-review"
-            );
-            return;
-        }
-
         // Now it is safe to enqueue the secondary reviewer (Cross strategy only).
         let secondary_review_id: Option<harness_core::types::TaskId> = if let Some(agent) =
             secondary_agent_name.as_ref()
@@ -866,9 +858,35 @@ async fn run_review_tick(
         }
 
         let Some(output) = final_output else {
-            tracing::warn!("scheduler: no review output to parse — watermark not advanced, next tick will re-review");
+            tracing::error!(
+                task_id = %final_task_id,
+                "scheduler: review produced no output (agent may have OOM/rate-limited/timed out) \
+                 — watermark NOT advanced; will retry next tick"
+            );
             return;
         };
+
+        // Advance the watermark only after confirmed non-None output.
+        // Advancing at enqueue time or before output is confirmed creates a
+        // duplicate-review gap: commits arriving between enqueue and execution
+        // are covered by this agent (--since has no --until bound) but would
+        // also fall inside the next tick's --since window, producing duplicate
+        // issues.  By advancing here we set the boundary to after all review
+        // tasks complete, ensuring the next tick's --since is always ≥ all
+        // commits this agent reviewed.  When the agent produces no output (OOM,
+        // rate-limit, timeout) the watermark is left unchanged so the next tick
+        // re-reviews the same window.
+        let review_complete_ts = Utc::now();
+        fallback_ts_for_poll.lock().await.fallback_ts = Some(review_complete_ts);
+        let watermark_event = Event::new(SessionId::new(), &hook_key, "scheduler", Decision::Pass);
+        if let Err(err) = state_for_synthesis
+            .observability
+            .events
+            .log(&watermark_event)
+            .await
+        {
+            tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
+        }
 
         match crate::review_store::parse_review_output(&output) {
             Ok(review) => {
