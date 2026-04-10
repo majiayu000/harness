@@ -316,7 +316,7 @@ impl TurnInterceptor for PostExecutionValidator {
                                 "post_validator: PR verification failed"
                             );
                             errors.push(format!(
-                                "PR {pr_url} could not be verified via GitHub API: {e}"
+                                "[VALIDATION ERROR] PR {pr_url} could not be verified via GitHub API: {e}"
                             ));
                         }
                     }

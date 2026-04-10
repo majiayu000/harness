@@ -1066,7 +1066,7 @@ pub(crate) async fn run_task(
                     let tool_violations = validate_tool_usage(&r.output, impl_tools);
                     let violation_err: Option<String> = if !tool_violations.is_empty() {
                         let msg = format!(
-                        "Tool isolation violation: agent used disallowed tools: [{}]. Only [{}] are permitted.",
+                        "[VALIDATION ERROR] Tool isolation violation: agent used disallowed tools: [{}]. Only [{}] are permitted.",
                         tool_violations.join(", "),
                         impl_tools.join(", ")
                     );
@@ -1112,7 +1112,7 @@ pub(crate) async fn run_task(
                             );
                             let truncated = truncate_validation_error(&err, 2000);
                             impl_req.prompt = format!(
-                                "{}\n\nPost-execution validation failed (attempt {}/{}).\nErrors are prefixed with [COMPILE ERROR], [TEST FAILURE], [LINT ERROR], or [VALIDATION ERROR] — focus your fix on the indicated error type:\n{}",
+                                "{}\n\nPost-execution validation failed (attempt {}/{}).\nErrors are prefixed with [COMPILE ERROR], [TEST FAILURE], [LINT ERROR], or [VALIDATION ERROR] for classified failures, or with an interceptor name (e.g. [hook_name]) for hook/policy violations — focus your fix on the indicated error type:\n{}",
                                 first_req.prompt,
                                 validation_attempt,
                                 max_validation_retries,
