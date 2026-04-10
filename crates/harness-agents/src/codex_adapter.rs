@@ -225,7 +225,9 @@ impl AgentAdapter for CodexAdapter {
             if let Err(e) = Self::send_request(&mut state, "turn/interrupt", json!({})).await {
                 tracing::warn!("failed to send turn/interrupt: {e}, killing process");
                 if let Some(ref mut child) = state.child {
-                    let _ = child.kill().await;
+                    if let Err(e) = child.kill().await {
+                        tracing::warn!(pid = ?child.id(), "kill failed: {e}");
+                    }
                 }
             }
         }
