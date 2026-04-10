@@ -11,7 +11,7 @@
 use crate::task_db::TaskDb;
 use crate::task_runner::TaskStatus;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::path::Path;
@@ -312,6 +312,69 @@ pub fn replay_events(log_path: &Path) -> anyhow::Result<ReplayResult> {
     })
 }
 
+/// Compact `task-events.jsonl` by removing all events for tasks that have
+/// reached a terminal state.
+///
+/// Terminal-task events are redundant after [`replay_and_recover`] has
+/// committed their state to the database.  Removing them prevents the log from
+/// growing unboundedly across server restarts.
+///
+/// Uses an atomic rename (write to a sibling `.tmp` file, then `rename`) so
+/// that a crash during compaction leaves the original log intact.
+///
+/// Returns the number of event lines removed.
+fn compact_log(log_path: &Path, states: &HashMap<String, ReplayedState>) -> anyhow::Result<u32> {
+    let terminal_ids: HashSet<&str> = states
+        .iter()
+        .filter(|(_, s)| s.terminal)
+        .map(|(id, _)| id.as_str())
+        .collect();
+
+    if terminal_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let file = std::fs::File::open(log_path)?;
+    let reader = BufReader::new(file);
+    let mut kept: Vec<String> = Vec::new();
+    let mut removed = 0u32;
+
+    for line_result in reader.lines() {
+        let line = line_result?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let keep = match serde_json::from_str::<TaskEvent>(trimmed) {
+            Ok(event) => !terminal_ids.contains(event.task_id()),
+            // Keep lines we cannot parse — do not silently drop unknown data.
+            Err(_) => true,
+        };
+        if keep {
+            kept.push(line);
+        } else {
+            removed += 1;
+        }
+    }
+
+    // Atomic write: write to a sibling .tmp file, then rename into place.
+    let mut tmp_path = log_path.to_path_buf();
+    let mut tmp_name = log_path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    tmp_path.set_file_name(tmp_name);
+
+    {
+        let mut tmp_file = std::fs::File::create(&tmp_path)?;
+        for line in &kept {
+            writeln!(tmp_file, "{line}")?;
+        }
+        tmp_file.flush()?;
+    }
+    std::fs::rename(&tmp_path, log_path)?;
+
+    Ok(removed)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Startup integration
 // ──────────────────────────────────────────────────────────────────────────────
@@ -362,6 +425,19 @@ pub async fn replay_and_recover(db: &TaskDb, log_path: &Path) -> anyhow::Result<
 
     if updated > 0 {
         tracing::info!("event_replay: applied replayed state to {updated} task(s)");
+    }
+
+    // Compact the log: remove events for tasks that have reached terminal
+    // state — they are now committed to the DB and no longer needed.
+    match compact_log(log_path, &states) {
+        Ok(removed) if removed > 0 => {
+            tracing::info!("event_replay: compacted log, removed {removed} terminal-task line(s)");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // Compaction failure is non-fatal: recovery already succeeded.
+            tracing::warn!("event_replay: log compaction failed (non-fatal): {e}");
+        }
     }
 
     Ok(updated)
