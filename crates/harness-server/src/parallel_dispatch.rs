@@ -112,6 +112,8 @@ pub fn decompose(prompt: &str) -> Vec<SubtaskSpec> {
             })
             .collect();
         if items.len() >= 2 {
+            // Cap sequential subtasks to prevent unbounded semaphore queue depth.
+            let items: Vec<&str> = items.into_iter().take(MAX_PARALLEL).collect();
             return items
                 .iter()
                 .enumerate()
@@ -140,15 +142,19 @@ pub fn decompose(prompt: &str) -> Vec<SubtaskSpec> {
     // Scale chunk count linearly with file count, floor at 2, cap at MAX_PARALLEL.
     let n_chunks = (files.len() / 3).clamp(2, MAX_PARALLEL);
     let chunk_size = files.len().div_ceil(n_chunks);
-    files
-        .chunks(chunk_size)
+    // Collect first so actual_count reflects real chunk count (may be < n_chunks
+    // when file count is not evenly divisible, e.g. 16 files → 4 chunks not 5).
+    let groups: Vec<Vec<String>> = files.chunks(chunk_size).map(|g| g.to_vec()).collect();
+    let actual_count = groups.len();
+    groups
+        .into_iter()
         .enumerate()
         .map(|(i, group)| SubtaskSpec {
             prompt: format!(
                 "{}\n\n[Parallel subtask {}/{}] Focus on these files: {}",
                 prompt,
                 i + 1,
-                n_chunks,
+                actual_count,
                 group.join(", ")
             ),
             depends_on_indices: vec![],
@@ -209,16 +215,23 @@ pub async fn run_parallel_subtasks(
                 };
                 let sem = Arc::clone(&sem);
                 handles.push(tokio::spawn(async move {
-                    let _permit = match sem.acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => return (i, Err("semaphore closed unexpectedly".to_string())),
-                    };
-                    let result = match tokio::time::timeout(turn_timeout, agent.execute(req)).await
-                    {
-                        Ok(Ok(resp)) => Ok(resp),
-                        Ok(Err(e)) => Err(format!("agent error: {e}")),
+                    // Timeout covers both semaphore queue wait and execution so that
+                    // a task cannot be stuck waiting unbounded before it even starts.
+                    let timed = tokio::time::timeout(turn_timeout, async move {
+                        let _permit = match sem.acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => return Err("semaphore closed unexpectedly".to_string()),
+                        };
+                        match agent.execute(req).await {
+                            Ok(resp) => Ok(resp),
+                            Err(e) => Err(format!("agent error: {e}")),
+                        }
+                    })
+                    .await;
+                    let result = match timed {
+                        Ok(r) => r,
                         Err(_) => Err(format!(
-                            "subtask timed out after {}s",
+                            "subtask timed out after {}s (including queue wait)",
                             turn_timeout.as_secs()
                         )),
                     };
@@ -438,6 +451,39 @@ mod tests {
         // 30 files: (30/3).clamp(2,8) = 8 — cap
         let subtasks = decompose(&make_prompt(30));
         assert_eq!(subtasks.len(), 8);
+    }
+
+    #[test]
+    fn decompose_labels_reflect_actual_chunk_count() {
+        // 16 files: n_chunks = (16/3).clamp(2,8) = 5, chunk_size = ceil(16/5) = 4
+        // actual chunks from .chunks(4) = 4, so labels must be X/4 not X/5.
+        let subtasks = decompose(&make_prompt(16));
+        let actual = subtasks.len();
+        assert_eq!(actual, 4, "expected 4 actual chunks for 16 files");
+        for (i, s) in subtasks.iter().enumerate() {
+            let expected = format!("[Parallel subtask {}/{}]", i + 1, actual);
+            assert!(
+                s.prompt.contains(&expected),
+                "label mismatch: expected '{}' in prompt",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn decompose_numbered_list_caps_at_max_parallel() {
+        // Build a list with MAX_PARALLEL + 2 items; result must not exceed MAX_PARALLEL.
+        let prompt: String = (1..=(MAX_PARALLEL + 2))
+            .map(|i| format!("{}. task {}", i, i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let subtasks = decompose(&prompt);
+        assert!(
+            subtasks.len() <= MAX_PARALLEL,
+            "expected <= {} subtasks, got {}",
+            MAX_PARALLEL,
+            subtasks.len()
+        );
     }
 
     #[test]
