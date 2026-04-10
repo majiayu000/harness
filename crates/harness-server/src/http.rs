@@ -40,6 +40,8 @@ pub struct CoreServices {
     pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
     pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
     pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
+    /// Q-value store for MemRL rule utility tracking. None when unavailable.
+    pub q_values: Option<Arc<crate::q_value_store::QValueStore>>,
 }
 
 /// Engine services: skills, rules, and garbage collection.
@@ -261,6 +263,14 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let db_path = harness_core::config::dirs::default_db_path(&dir, "tasks");
     tracing::debug!("task db: {}", db_path.display());
     let tasks = task_runner::TaskStore::open(&db_path).await?;
+
+    let q_values_db_path = harness_core::config::dirs::default_db_path(&dir, "q_values");
+    tracing::debug!("q_value db: {}", q_values_db_path.display());
+    let q_values = Arc::new(
+        crate::q_value_store::QValueStore::open(&q_values_db_path)
+            .await
+            .context("failed to open q_value store")?,
+    );
 
     let mut rule_engine = harness_rules::engine::RuleEngine::new();
     rule_engine.configure_sources(
@@ -565,9 +575,10 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     {
         let tasks_for_recovery = tasks.clone();
         let cb_for_recovery = completion_callback.clone();
+        let q_values_for_recovery = q_values.clone();
         tokio::spawn(async move {
             tasks_for_recovery
-                .validate_recovered_tasks(cb_for_recovery)
+                .validate_recovered_tasks(cb_for_recovery, Some(q_values_for_recovery))
                 .await;
         });
     }
@@ -685,6 +696,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             plan_cache,
             project_registry: Some(project_registry),
             runtime_state_store,
+            q_values: Some(q_values),
         },
         engines: EngineServices {
             skills: skills_arc,
