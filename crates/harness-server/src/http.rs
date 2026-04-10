@@ -665,6 +665,17 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                     "dep-watcher: failed to persist failure state: {e}"
                                 );
                             }
+                            store.close_task_stream(&task_id);
+                            if let Some(ref cb) = completion_callback_w {
+                                if let Some(final_state) = store.get(&task_id) {
+                                    cb(final_state).await;
+                                } else {
+                                    tracing::warn!(
+                                        task_id = %task_id.0,
+                                        "dep-watcher: task not found in store after fail-close"
+                                    );
+                                }
+                            }
                             continue;
                         }
                     };
@@ -702,6 +713,17 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                     task_id = %task_id.0,
                                     "dep-watcher: failed to persist failure state: {e}"
                                 );
+                            }
+                            store.close_task_stream(&task_id);
+                            if let Some(ref cb) = completion_callback_w {
+                                if let Some(final_state) = store.get(&task_id) {
+                                    cb(final_state).await;
+                                } else {
+                                    tracing::warn!(
+                                        task_id = %task_id.0,
+                                        "dep-watcher: task not found in store after fail-close"
+                                    );
+                                }
                             }
                             continue;
                         }
@@ -745,6 +767,17 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                         task_id = %task_id.0,
                                         "dep-watcher: failed to persist failure state: {pe}"
                                     );
+                                }
+                                store.close_task_stream(&task_id);
+                                if let Some(ref cb) = completion_callback_w {
+                                    if let Some(final_state) = store.get(&task_id) {
+                                        cb(final_state).await;
+                                    } else {
+                                        tracing::warn!(
+                                            task_id = %task_id.0,
+                                            "dep-watcher: task not found in store after fail-close"
+                                        );
+                                    }
                                 }
                                 continue;
                             }
