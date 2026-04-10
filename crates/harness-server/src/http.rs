@@ -860,7 +860,7 @@ fn build_completion_callback(
                             diff: task
                                 .rounds
                                 .last()
-                                .map(|r| r.result.clone())
+                                .and_then(|r| r.detail.clone())
                                 .unwrap_or_default(),
                             pr_description: pr.clone(),
                         });

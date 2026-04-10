@@ -94,41 +94,36 @@ impl QualityTrigger {
         if let (Some(challenger), Some(ctx)) = (&self.challenger_agent, task_ctx) {
             if report.grade != Grade::A {
                 let target = format!("PR: {}\n\nDiff summary:\n{}", ctx.pr_description, ctx.diff);
-                let primary = match self.agent_registry.default_agent() {
-                    Some(a) => a,
-                    None => {
-                        tracing::warn!(
-                            "quality_trigger: no primary agent for cross-review, skipping"
-                        );
-                        Arc::new(NoOpAgent)
-                    }
-                };
-                match run_cross_review(
-                    primary,
-                    Some(challenger.clone()),
-                    self.project_root.clone(),
-                    target,
-                    2,
-                )
-                .await
-                {
-                    Ok(result) => {
-                        report.semantic_verdict = Some(result.final_verdict.clone());
-                        if result.final_verdict == "NOT_CONVERGED" {
-                            let original = report.grade;
-                            report.grade = Self::downgrade(report.grade);
-                            tracing::info!(
-                                original_grade = ?original,
-                                effective_grade = ?report.grade,
-                                "quality_trigger: NOT_CONVERGED — grade downgraded"
+                if let Some(primary) = self.agent_registry.default_agent() {
+                    match run_cross_review(
+                        primary,
+                        Some(challenger.clone()),
+                        self.project_root.clone(),
+                        target,
+                        2,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            report.semantic_verdict = Some(result.final_verdict.clone());
+                            if result.final_verdict == "NOT_CONVERGED" {
+                                let original = report.grade;
+                                report.grade = Self::downgrade(report.grade);
+                                tracing::info!(
+                                    original_grade = ?original,
+                                    effective_grade = ?report.grade,
+                                    "quality_trigger: NOT_CONVERGED — grade downgraded"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "quality_trigger: cross-review failed: {e}; using numeric grade only"
                             );
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "quality_trigger: cross-review failed: {e}; using numeric grade only"
-                        );
-                    }
+                } else {
+                    tracing::warn!("quality_trigger: no primary agent for cross-review, skipping");
                 }
             }
         }
@@ -178,40 +173,6 @@ impl QualityTrigger {
     }
 }
 
-/// Fallback primary agent used when the registry has no default agent during
-/// cross-review. Returns an empty LGTM so the cross-review degrades gracefully.
-struct NoOpAgent;
-
-#[async_trait::async_trait]
-impl CodeAgent for NoOpAgent {
-    fn name(&self) -> &str {
-        "noop"
-    }
-    fn capabilities(&self) -> Vec<harness_core::types::Capability> {
-        vec![]
-    }
-    async fn execute(
-        &self,
-        _req: harness_core::agent::AgentRequest,
-    ) -> harness_core::error::Result<harness_core::agent::AgentResponse> {
-        Ok(harness_core::agent::AgentResponse {
-            output: "LGTM".to_string(),
-            stderr: String::new(),
-            items: vec![],
-            token_usage: harness_core::types::TokenUsage::default(),
-            model: "noop".to_string(),
-            exit_code: Some(0),
-        })
-    }
-    async fn execute_stream(
-        &self,
-        _req: harness_core::agent::AgentRequest,
-        _tx: tokio::sync::mpsc::Sender<harness_core::agent::StreamItem>,
-    ) -> harness_core::error::Result<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,13 +190,14 @@ mod tests {
         auto_gc_grades: Vec<Grade>,
         cooldown_secs: u64,
     ) -> QualityTrigger {
-        make_trigger_with_challenger(dir, auto_gc_grades, cooldown_secs, None).await
+        make_trigger_with_challenger(dir, auto_gc_grades, cooldown_secs, None, None).await
     }
 
     async fn make_trigger_with_challenger(
         dir: &Path,
         auto_gc_grades: Vec<Grade>,
         cooldown_secs: u64,
+        primary: Option<Arc<dyn CodeAgent>>,
         challenger: Option<Arc<dyn CodeAgent>>,
     ) -> QualityTrigger {
         let events = Arc::new(EventStore::new(dir).await.expect("event store"));
@@ -251,7 +213,11 @@ mod tests {
             draft_store,
             dir.to_path_buf(),
         ));
-        let agent_registry = Arc::new(harness_agents::registry::AgentRegistry::new("test"));
+        let mut registry = harness_agents::registry::AgentRegistry::new("test");
+        if let Some(p) = primary {
+            registry.register("test", p);
+        }
+        let agent_registry = Arc::new(registry);
         QualityTrigger::new(
             events,
             gc_agent,
@@ -472,6 +438,7 @@ mod tests {
             dir.path(),
             vec![Grade::D],
             300,
+            None,
             Some(Arc::new(NotConvergedMock)),
         )
         .await;
@@ -507,6 +474,7 @@ mod tests {
             dir.path(),
             vec![Grade::D],
             300,
+            None,
             Some(Arc::new(ApprovedMock)),
         )
         .await;
@@ -551,6 +519,7 @@ mod tests {
             vec![Grade::D],
             300,
             Some(Arc::new(NotConvergedMock)),
+            Some(Arc::new(NotConvergedMock)),
         )
         .await;
         // security=70, stability=70, coverage=100, perf=100 → score=79 → grade B
@@ -593,6 +562,7 @@ mod tests {
             dir.path(),
             vec![Grade::D],
             0, // zero cooldown so GC fires immediately
+            None,
             Some(Arc::new(NotConvergedMock)),
         )
         .await;
@@ -638,6 +608,7 @@ mod tests {
             dir.path(),
             vec![Grade::D],
             300,
+            None,
             Some(Arc::new(NotConvergedMock)),
         )
         .await;
