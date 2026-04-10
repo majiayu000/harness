@@ -292,15 +292,20 @@ async fn run_sequential_subtasks(
         // Spawn into a task so a panic in agent.execute surfaces as JoinError
         // instead of unwinding through this function and skipping cleanup.
         let agent_clone = agent.clone();
-        let handle = tokio::spawn(async move { agent_clone.execute(req).await });
-        let outcome = match tokio::time::timeout(turn_timeout, handle).await {
+        let mut handle = tokio::spawn(async move { agent_clone.execute(req).await });
+        let outcome = match tokio::time::timeout(turn_timeout, &mut handle).await {
             Ok(Ok(Ok(resp))) => Ok(resp),
             Ok(Ok(Err(e))) => Err(format!("agent error: {e}")),
             Ok(Err(join_err)) => Err(format!("subtask panicked: {join_err}")),
-            Err(_) => Err(format!(
-                "subtask timed out after {}s",
-                turn_timeout.as_secs()
-            )),
+            Err(_) => {
+                // Abort the detached task so it does not keep mutating the
+                // workspace or consuming resources after the timeout fires.
+                handle.abort();
+                Err(format!(
+                    "subtask timed out after {}s",
+                    turn_timeout.as_secs()
+                ))
+            }
         };
 
         let (response, error) = match outcome {
