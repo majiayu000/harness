@@ -1470,17 +1470,16 @@ async fn github_webhook(
 }
 
 async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
-    match state.core.tasks.list_all_with_terminal().await {
-        Ok(tasks) => {
-            let summaries: Vec<task_runner::TaskSummary> =
-                tasks.into_iter().map(|t| t.summary()).collect();
-            Json(summaries).into_response()
+    match state.core.tasks.list_all_summaries_with_terminal().await {
+        Ok(summaries) => Json(summaries).into_response(),
+        Err(e) => {
+            tracing::error!("list_tasks: database error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("database error: {e}")})),
-        )
-            .into_response(),
     }
 }
 
@@ -1497,11 +1496,14 @@ async fn get_task(State(state): State<Arc<AppState>>, Path(id): Path<String>) ->
             Json(json!({"error": "task not found"})),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("database error: {e}")})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("get_task: database error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1520,9 +1522,10 @@ async fn get_task_artifacts(
                 .into_response();
         }
         Err(e) => {
+            tracing::error!("get_task_artifacts: database error: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("database error: {e}")})),
+                Json(json!({"error": "internal server error"})),
             )
                 .into_response();
         }
@@ -1530,11 +1533,14 @@ async fn get_task_artifacts(
     }
     match state.core.tasks.list_artifacts(&task_id).await {
         Ok(artifacts) => Json(artifacts).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("get_task_artifacts: list artifacts error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1559,9 +1565,10 @@ async fn stream_task_sse(State(state): State<Arc<AppState>>, Path(id): Path<Stri
                         .into_response();
                 }
                 Err(e) => {
+                    tracing::error!("stream_task_sse: database error: {e}");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": format!("database error: {e}")})),
+                        Json(json!({"error": "internal server error"})),
                     )
                         .into_response();
                 }

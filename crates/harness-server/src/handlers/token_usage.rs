@@ -116,7 +116,7 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
     let mut totals = UsageBucket::default();
     let mut task_usage: HashMap<String, UsageBucket> = HashMap::new();
 
-    let all_tasks = match state.core.tasks.list_all_with_terminal().await {
+    let all_tasks = match state.core.tasks.list_all_summaries_with_terminal().await {
         Ok(tasks) => tasks,
         Err(e) => {
             return error_response(format!("failed to list tasks for usage attribution: {e}"))
