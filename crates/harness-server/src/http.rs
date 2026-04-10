@@ -641,10 +641,29 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                     let req = match pending_req {
                         Some(r) => r,
                         None => {
-                            tracing::warn!(
+                            // pending_request missing means the row is corrupt/invalid.
+                            // The task is already in Pending status (set by
+                            // check_awaiting_deps) but will never be dispatched, so
+                            // fail it explicitly rather than leaving it stuck.
+                            tracing::error!(
                                 task_id = %task_id.0,
-                                "dep-watcher: task ready but pending_request is None, skipping dispatch"
+                                "dep-watcher: task ready but pending_request is None — failing task"
                             );
+                            if let Err(e) =
+                                crate::task_runner::mutate_and_persist(&store, &task_id, |s| {
+                                    s.status = crate::task_runner::TaskStatus::Failed;
+                                    s.error = Some(
+                                        "dep-watcher: missing pending_request; cannot dispatch"
+                                            .to_string(),
+                                    );
+                                })
+                                .await
+                            {
+                                tracing::error!(
+                                    task_id = %task_id.0,
+                                    "dep-watcher: failed to persist failure state: {e}"
+                                );
+                            }
                             continue;
                         }
                     };
@@ -709,6 +728,23 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                     tokio::spawn(async move {
                         match task_queue2.acquire(&project_id).await {
                             Ok(permit) => {
+                                // Re-check status — user may have cancelled while we were
+                                // waiting for the permit.
+                                let still_pending = store2
+                                    .cache
+                                    .get(&task_id2)
+                                    .map(|e| {
+                                        matches!(e.status, crate::task_runner::TaskStatus::Pending)
+                                    })
+                                    .unwrap_or(false);
+                                if !still_pending {
+                                    tracing::warn!(
+                                        task_id = %task_id2.0,
+                                        "dep-watcher: task status changed while waiting for \
+                                         permit — aborting dispatch"
+                                    );
+                                    return;
+                                }
                                 // Permit acquired — commit the pending_request clear to DB
                                 // now that dispatch is guaranteed to proceed.
                                 if let Err(e) = store2.persist(&task_id2).await {
@@ -739,11 +775,13 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                     task_id = %task_id2.0,
                                     "dep-watcher: failed to acquire concurrency permit: {e}"
                                 );
-                                // Restore pending_request so the next watcher tick can
-                                // retry.  The DB still holds the original value because we
-                                // have not persisted yet, so no re-persist is needed.
+                                // Restore both pending_request AND status so the next
+                                // watcher tick (which only scans AwaitingDeps) can retry.
+                                // The DB still holds the original values because we have
+                                // not persisted yet, so no re-persist is needed.
                                 if let Some(mut entry) = store2.cache.get_mut(&task_id2) {
                                     entry.pending_request = Some(req);
+                                    entry.status = crate::task_runner::TaskStatus::AwaitingDeps;
                                 }
                             }
                         }
