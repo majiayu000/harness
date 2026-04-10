@@ -7,7 +7,7 @@ use harness_core::types::{
 };
 use sqlx::sqlite::SqlitePool;
 use std::path::{Path, PathBuf};
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 
 /// Versioned migrations for the events table.
 static EVENT_MIGRATIONS: &[Migration] = &[
@@ -132,7 +132,7 @@ impl EventStore {
                 None
             }
         };
-        *store.otel_pipeline.lock().await = pipeline;
+        *store.otel_pipeline.lock().unwrap() = pipeline;
         Ok(store)
     }
 
@@ -199,7 +199,7 @@ impl EventStore {
 
     pub async fn log(&self, event: &Event) -> anyhow::Result<EventId> {
         self.insert_event(event).await?;
-        let slot = self.otel_pipeline.lock().await;
+        let slot = self.otel_pipeline.lock().unwrap();
         if let Some(pipeline) = slot.as_ref() {
             pipeline.record_event(event);
         }
@@ -315,7 +315,7 @@ impl EventStore {
     }
 
     pub async fn shutdown(&self) {
-        let pipeline = self.otel_pipeline.lock().await.take();
+        let pipeline = self.otel_pipeline.lock().unwrap().take();
         if let Some(pipeline) = pipeline {
             pipeline.shutdown().await;
         }
@@ -943,7 +943,7 @@ mod tests {
             ..OtelConfig::default()
         };
         let store = EventStore::with_policies_and_otel(dir.path(), 1800, 90, &config).await?;
-        assert!(store.otel_pipeline.lock().await.is_none());
+        assert!(store.otel_pipeline.lock().unwrap().is_none());
         let event = Event::new(
             SessionId::new(),
             "api_request",
