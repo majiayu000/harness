@@ -16,7 +16,7 @@ use harness_core::types::{
 };
 use harness_core::{config::project::load_project_config, lang_detect, prompts};
 use harness_protocol::{notifications::Notification, notifications::RpcNotification};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Extract tool list from a capability profile, returning an error if the
 /// profile unexpectedly returns `None` (which means Full/unrestricted).
@@ -803,11 +803,17 @@ pub(crate) async fn run_task(
         prompts::TriageComplexity::High => (8u32, false),
     };
     let effective_max_rounds = req.max_rounds.unwrap_or(triage_default_rounds);
+    // max_turns: per-request override wins; global config is the fallback.
+    // Counts every agent API call (impl + validation retries + review rounds).
+    let effective_max_turns: Option<u32> = req.max_turns.or(server_config.concurrency.max_turns);
+    let mut turns_used: u32 = 0;
+    let jaccard_threshold = server_config.concurrency.loop_jaccard_threshold;
     tracing::info!(
         task_id = %task_id,
         ?triage_complexity,
         effective_max_rounds,
         skip_agent_review,
+        ?effective_max_turns,
         "triage complexity applied"
     );
 
@@ -1052,11 +1058,21 @@ pub(crate) async fn run_task(
         let mut impl_req = first_req.clone();
 
         let resp = loop {
+            if let Some(max) = effective_max_turns {
+                if turns_used >= max {
+                    return Err(anyhow::anyhow!(
+                        "Turn budget exhausted: used {} of {} allowed turns",
+                        turns_used,
+                        max
+                    ));
+                }
+            }
             let raw = tokio::time::timeout(
                 turn_timeout,
                 run_agent_streaming(agent, impl_req.clone(), task_id, store, 1),
             )
             .await;
+            turns_used += 1;
             match raw {
                 Ok(Ok(r)) => {
                     // Post-execution tool isolation check (defense-in-depth alongside
@@ -1409,6 +1425,9 @@ pub(crate) async fn run_task(
     // but the graduation check must still know a test gate rejection occurred.
     let mut lgtm_test_gate_rejected = false;
 
+    // Tracks the most recent non-waiting review output for Jaccard loop detection.
+    let mut prev_review_output: Option<String> = None;
+
     // Review loop.
     // Use an explicit counter so WAITING responses don't consume a round — `continue`
     // inside a `for` loop would silently advance the iterator even without a real review.
@@ -1448,7 +1467,23 @@ pub(crate) async fn run_task(
         };
         let check_req = run_pre_execute(&interceptors, check_req).await?;
 
+        if let Some(max) = effective_max_turns {
+            if turns_used >= max {
+                let msg = format!(
+                    "Turn budget exhausted: used {} of {} allowed turns",
+                    turns_used, max
+                );
+                tracing::warn!(task_id = %task_id, turns_used, max, "turn budget exhausted in review loop");
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Failed;
+                    s.error = Some(msg.clone());
+                })
+                .await?;
+                return Ok(());
+            }
+        }
         let resp = tokio::time::timeout(turn_timeout, agent.execute(check_req.clone())).await;
+        turns_used += 1;
         let resp = match resp {
             Ok(Ok(r)) => {
                 let tool_violations = validate_tool_usage(
@@ -1518,6 +1553,27 @@ pub(crate) async fn run_task(
         // fixed before the PR can be marked done.
         let lgtm = lgtm && pending_test_failure.is_none();
         let fixed = !lgtm && !waiting;
+
+        // Jaccard loop detection: two consecutive non-waiting outputs that are too similar
+        // indicate the reviewer is stuck repeating itself without making progress.
+        if !waiting {
+            if let Some(ref prev) = prev_review_output {
+                let score = jaccard_word_similarity(prev, &output);
+                if score >= jaccard_threshold {
+                    let msg = format!(
+                        "review loop detected: output similarity {score:.2} >= threshold {jaccard_threshold:.2}"
+                    );
+                    tracing::warn!(task_id = %task_id, round, score, jaccard_threshold, "jaccard loop detected in review");
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.error = Some(msg.clone());
+                    })
+                    .await?;
+                    return Ok(());
+                }
+            }
+            prev_review_output = Some(output.clone());
+        }
 
         // Track issue count for convergence detection.
         let current_issues = prompts::parse_issue_count(&output);
@@ -1720,6 +1776,33 @@ pub(crate) async fn run_task(
         "task_completed"
     );
     Ok(())
+}
+
+/// Compute Jaccard word-similarity between two strings.
+///
+/// Tokenizes each string into a set of non-empty words (split on non-alphanumeric chars),
+/// then returns |intersection| / |union|.
+/// Both empty → 1.0; one empty → 0.0.
+fn jaccard_word_similarity(a: &str, b: &str) -> f64 {
+    let tokens_a: HashSet<&str> = a
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let tokens_b: HashSet<&str> = b
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if tokens_a.is_empty() && tokens_b.is_empty() {
+        return 1.0;
+    }
+    if tokens_a.is_empty() || tokens_b.is_empty() {
+        return 0.0;
+    }
+
+    let intersection = tokens_a.intersection(&tokens_b).count();
+    let union = tokens_a.union(&tokens_b).count();
+    intersection as f64 / union as f64
 }
 
 /// Normalize a set of review issues into a canonical ordered form.
@@ -2306,5 +2389,39 @@ mod tests {
         let (c_reset, i_reset, _) = step_tracker(&mut tracker, &other); // different issues
         assert_eq!(c_reset, 1, "counter resets on different issues");
         assert!(!i_reset, "no intervention after reset");
+    }
+
+    // --- jaccard_word_similarity unit tests ---
+
+    #[test]
+    fn jaccard_identical_strings() {
+        assert_eq!(jaccard_word_similarity("hello world", "hello world"), 1.0);
+    }
+
+    #[test]
+    fn jaccard_disjoint_strings() {
+        assert_eq!(jaccard_word_similarity("foo bar", "baz qux"), 0.0);
+    }
+
+    #[test]
+    fn jaccard_partial_overlap() {
+        // {"a", "b"} ∩ {"b", "c"} = {"b"}, union = {"a","b","c"} → 1/3
+        let score = jaccard_word_similarity("a b", "b c");
+        let expected = 1.0_f64 / 3.0_f64;
+        assert!(
+            (score - expected).abs() < 1e-10,
+            "expected ~{expected}, got {score}"
+        );
+    }
+
+    #[test]
+    fn jaccard_one_empty() {
+        assert_eq!(jaccard_word_similarity("", "hello world"), 0.0);
+        assert_eq!(jaccard_word_similarity("hello world", ""), 0.0);
+    }
+
+    #[test]
+    fn jaccard_both_empty() {
+        assert_eq!(jaccard_word_similarity("", ""), 1.0);
     }
 }

@@ -258,6 +258,10 @@ pub struct CreateTaskRequest {
     /// this value always wins over triage-derived defaults.
     #[serde(default)]
     pub max_rounds: Option<u32>,
+    /// Maximum total agent API calls across all phases (implementation + validation retries +
+    /// review rounds). When None, falls back to the global `concurrency.max_turns` config value.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
     /// Per-turn timeout in seconds; defaults to 3600 (1 hour).
     #[serde(default = "default_turn_timeout")]
     pub turn_timeout_secs: u64,
@@ -302,6 +306,7 @@ impl Default for CreateTaskRequest {
             project: None,
             wait_secs: default_wait(),
             max_rounds: None,
+            max_turns: None,
             turn_timeout_secs: default_turn_timeout(),
             max_budget_usd: None,
             retry_base_backoff_ms: default_retry_base_backoff_ms(),
