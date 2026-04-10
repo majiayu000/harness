@@ -710,11 +710,40 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                         &server_config.agents.review,
                         agent.name(),
                     );
-                    let project_id = req
-                        .project
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default();
+                    // Re-canonicalize project to derive the concurrency-permit key,
+                    // matching what the direct-dispatch paths (execution.rs,
+                    // task_routes.rs) do.  `pending_request` was stored with a
+                    // canonical path at registration time, but we resolve again here
+                    // to guard against None / relative / symlink edge cases so the
+                    // semaphore bucket is always consistent with other dispatch paths.
+                    let project_id =
+                        match crate::task_runner::resolve_canonical_project(req.project.clone())
+                            .await
+                        {
+                            Ok(canonical) => canonical.to_string_lossy().into_owned(),
+                            Err(e) => {
+                                tracing::error!(
+                                    task_id = %task_id.0,
+                                    "dep-watcher: cannot resolve canonical project \
+                                     for concurrency key — failing task: {e}"
+                                );
+                                if let Err(pe) =
+                                    crate::task_runner::mutate_and_persist(&store, &task_id, |s| {
+                                        s.status = crate::task_runner::TaskStatus::Failed;
+                                        s.error = Some(format!(
+                                            "dep-watcher: cannot resolve project path: {e}"
+                                        ));
+                                    })
+                                    .await
+                                {
+                                    tracing::error!(
+                                        task_id = %task_id.0,
+                                        "dep-watcher: failed to persist failure state: {pe}"
+                                    );
+                                }
+                                continue;
+                            }
+                        };
 
                     let task_id2 = task_id.clone();
                     let store2 = store.clone();
