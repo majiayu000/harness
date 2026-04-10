@@ -266,11 +266,16 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     let q_values_db_path = harness_core::config::dirs::default_db_path(&dir, "q_values");
     tracing::debug!("q_value db: {}", q_values_db_path.display());
-    let q_values = Arc::new(
-        crate::q_value_store::QValueStore::open(&q_values_db_path)
-            .await
-            .context("failed to open q_value store")?,
-    );
+    let q_values = match crate::q_value_store::QValueStore::open(&q_values_db_path).await {
+        Ok(store) => Some(Arc::new(store)),
+        Err(e) => {
+            tracing::warn!(
+                path = %q_values_db_path.display(),
+                "q_value store init failed, rule utility tracking will be disabled: {e}"
+            );
+            None
+        }
+    };
 
     let mut rule_engine = harness_rules::engine::RuleEngine::new();
     rule_engine.configure_sources(
@@ -578,7 +583,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         let q_values_for_recovery = q_values.clone();
         tokio::spawn(async move {
             tasks_for_recovery
-                .validate_recovered_tasks(cb_for_recovery, Some(q_values_for_recovery))
+                .validate_recovered_tasks(cb_for_recovery, q_values_for_recovery)
                 .await;
         });
     }
@@ -696,7 +701,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             plan_cache,
             project_registry: Some(project_registry),
             runtime_state_store,
-            q_values: Some(q_values),
+            q_values,
         },
         engines: EngineServices {
             skills: skills_arc,
