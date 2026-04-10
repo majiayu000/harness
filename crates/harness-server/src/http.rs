@@ -1533,7 +1533,9 @@ async fn stream_task_sse(State(state): State<Arc<AppState>>, Path(id): Path<Stri
     // 60 s idle timeout) don't drop the connection while the agent is silent.
     let heartbeat_interval = {
         let start = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        tokio::time::interval_at(start, std::time::Duration::from_secs(30))
+        let mut iv = tokio::time::interval_at(start, std::time::Duration::from_secs(30));
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        iv
     };
 
     let stream = futures::stream::unfold(
