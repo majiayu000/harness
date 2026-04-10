@@ -146,11 +146,14 @@ impl EventStore {
         use std::io::BufRead as _;
 
         let path = self.data_dir.join("events.jsonl");
-        if !path.is_file() {
-            return;
-        }
+        // Use File::open directly rather than Path::is_file(): is_file() returns
+        // false both when the file is absent *and* when metadata fails (e.g.
+        // permissions), silently suppressing the latter case with no warning.
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return; // fresh install — no legacy events.jsonl to migrate
+            }
             Err(e) => {
                 tracing::warn!("event store: could not open events.jsonl for migration: {e}");
                 return;

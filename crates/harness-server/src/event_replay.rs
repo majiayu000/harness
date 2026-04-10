@@ -264,13 +264,15 @@ pub fn replay_events(log_path: &Path) -> anyhow::Result<ReplayResult> {
         let line = match line {
             Ok(l) => l,
             Err(e) => {
-                tracing::warn!("event_replay: I/O error reading line: {e}");
-                total_lines += 1;
-                corrupt_lines += 1;
-                // Break rather than continue: a stream-level I/O error means
-                // the file descriptor is unrecoverable; looping would spin
-                // forever on repeated errors (e.g. EISDIR on macOS).
-                break;
+                // Return Err rather than break with partial state: using an
+                // incomplete event history is fail-open and can persist stale
+                // values (e.g. a stale pr_url) into the database.
+                // EISDIR is already caught above by the meta.is_file() check,
+                // so this path only fires for genuine mid-stream I/O errors.
+                return Err(anyhow::anyhow!(
+                    "event_replay: I/O error reading {}: {e}",
+                    log_path.display()
+                ));
             }
         };
         let trimmed = line.trim();
