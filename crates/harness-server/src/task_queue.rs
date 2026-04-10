@@ -202,6 +202,19 @@ impl PriorityPermitQueue {
         }
     }
 
+    /// Remove all waiters that have been marked cancelled.
+    ///
+    /// Called from `AcquireGuard::Drop` when a heap-resident waiter is
+    /// cancelled to prevent stale entries from accumulating unboundedly
+    /// under repeated enqueue/cancel patterns.  Without eager removal the
+    /// heap can grow to `max_queue_size × N` entries after N cycles because
+    /// `queued_count` (the admission gate) decrements on cancel while the
+    /// heap entry remains.
+    fn drain_cancelled(&mut self) {
+        self.waiters
+            .retain(|w| !w.cancelled.load(AtomicOrdering::SeqCst));
+    }
+
     fn available_permits(&self) -> usize {
         self.available
     }
@@ -309,8 +322,11 @@ impl<'a> Drop for AcquireGuard<'a> {
                 project_queued_counter.fetch_sub(1, AtomicOrdering::SeqCst);
                 // Mark heap-resident waiter as cancelled so release() skips it
                 // eagerly instead of attempting a send guaranteed to fail.
+                // Also drain all stale entries to prevent unbounded heap growth
+                // under repeated enqueue/cancel patterns.
                 if let Some(c) = &self.project_waiter_cancelled {
                     c.store(true, AtomicOrdering::SeqCst);
+                    self.project_queue.lock().unwrap().drain_cancelled();
                 }
                 // If release() already sent the project permit signal but the
                 // future was cancelled before rx.await completed, reclaim it.
@@ -336,8 +352,10 @@ impl<'a> Drop for AcquireGuard<'a> {
                 self.project_queue.lock().unwrap().release();
                 // Mark heap-resident global waiter as cancelled so release()
                 // skips it eagerly instead of attempting a send guaranteed to fail.
+                // Also drain all stale entries to prevent unbounded heap growth.
                 if let Some(c) = &self.global_waiter_cancelled {
                     c.store(true, AtomicOrdering::SeqCst);
+                    self.global_queue.lock().unwrap().drain_cancelled();
                 }
                 // If release() already sent the global permit signal but the
                 // future was cancelled before rx.await completed, reclaim it.
