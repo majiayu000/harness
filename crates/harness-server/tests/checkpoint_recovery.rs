@@ -27,6 +27,7 @@ fn make_task(id: &str, status: TaskStatus) -> TaskState {
         issue: None,
         description: None,
         created_at: None,
+        priority: 0,
         phase: TaskPhase::default(),
         triage_output: None,
         plan_output: None,

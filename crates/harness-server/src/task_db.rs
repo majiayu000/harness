@@ -91,6 +91,11 @@ static TASK_MIGRATIONS: &[Migration] = &[
         sql: "CREATE INDEX IF NOT EXISTS idx_tasks_project_status_updated \
               ON tasks(project, status, updated_at DESC)",
     },
+    Migration {
+        version: 11,
+        description: "add priority column for task scheduling",
+        sql: "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+    },
 ];
 
 /// A single persisted artifact captured from agent output during task execution.
@@ -161,8 +166,8 @@ impl TaskDb {
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let status = state.status.as_ref();
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?)",
+            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?)",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -177,6 +182,7 @@ impl TaskDb {
         .bind(&state.repo)
         .bind(&depends_on_json)
         .bind(state.project_root.as_ref().map(|p| p.to_string_lossy().into_owned()))
+        .bind(state.priority as i64)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -188,7 +194,8 @@ impl TaskDb {
         let status = state.status.as_ref();
         sqlx::query(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
-                    source = ?, external_id = ?, repo = ?, depends_on = ?, project = ?, updated_at = datetime('now')
+                    source = ?, external_id = ?, repo = ?, depends_on = ?, project = ?,
+                    priority = ?, updated_at = datetime('now')
              WHERE id = ?",
         )
         .bind(status)
@@ -200,7 +207,13 @@ impl TaskDb {
         .bind(&state.external_id)
         .bind(&state.repo)
         .bind(&depends_on_json)
-        .bind(state.project_root.as_ref().map(|p| p.to_string_lossy().into_owned()))
+        .bind(
+            state
+                .project_root
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        )
+        .bind(state.priority as i64)
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -209,7 +222,7 @@ impl TaskDb {
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority
              FROM tasks WHERE id = ?",
         )
         .bind(id)
@@ -220,7 +233,7 @@ impl TaskDb {
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority
              FROM tasks ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -571,7 +584,7 @@ impl TaskDb {
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority
              FROM tasks WHERE parent_id = ? ORDER BY created_at DESC",
         )
         .bind(parent_id)
@@ -647,6 +660,7 @@ struct TaskRow {
     repo: Option<String>,
     depends_on: String,
     project: Option<String>,
+    priority: i64,
 }
 
 impl TaskRow {
@@ -665,6 +679,7 @@ impl TaskRow {
             repo,
             depends_on,
             project,
+            priority,
         } = self;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
@@ -696,6 +711,7 @@ impl TaskRow {
             issue: None,
             description: None,
             created_at,
+            priority: priority.clamp(0, 255) as u8,
             phase: crate::task_runner::TaskPhase::default(),
             triage_output: None,
             plan_output: None,
@@ -725,6 +741,7 @@ mod tests {
             repo: None,
             depends_on: depends_on.to_string(),
             project: None,
+            priority: 0,
         }
     }
 
@@ -828,6 +845,7 @@ mod tests {
             issue: None,
             description: None,
             created_at: None,
+            priority: 0,
             phase: crate::task_runner::TaskPhase::default(),
             triage_output: None,
             plan_output: None,

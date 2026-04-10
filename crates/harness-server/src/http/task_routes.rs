@@ -78,7 +78,7 @@ pub(crate) async fn enqueue_task(
     let permit = state
         .concurrency
         .task_queue
-        .acquire(&project_id)
+        .acquire(&project_id, req.priority)
         .await
         .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
 
@@ -290,7 +290,12 @@ async fn enqueue_task_background(
             } else {
                 None
             };
-            match state.concurrency.task_queue.acquire(&project_id).await {
+            match state
+                .concurrency
+                .task_queue
+                .acquire(&project_id, req.priority)
+                .await
+            {
                 Ok(permit) => {
                     task_runner::spawn_preregistered_task(
                         task_id2,

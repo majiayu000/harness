@@ -186,7 +186,7 @@ impl ExecutionService for DefaultExecutionService {
 
         let permit = self
             .task_queue
-            .acquire(&project_id)
+            .acquire(&project_id, req.priority)
             .await
             .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
 
@@ -255,7 +255,7 @@ impl ExecutionService for DefaultExecutionService {
         let completion_callback = self.completion_callback.clone();
         let task_id2 = task_id.clone();
         tokio::spawn(async move {
-            match task_queue.acquire(&project_id).await {
+            match task_queue.acquire(&project_id, req.priority).await {
                 Ok(permit) => {
                     task_runner::spawn_preregistered_task(
                         task_id2,

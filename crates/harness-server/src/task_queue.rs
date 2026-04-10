@@ -1,9 +1,11 @@
 use dashmap::DashMap;
 use harness_core::config::misc::ConcurrencyConfig;
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
 
 /// Per-project and global queue statistics.
 #[derive(Debug, Clone, Serialize)]
@@ -18,8 +20,8 @@ pub struct QueueStats {
 
 /// Acquired execution slot. Dropping this releases both the global and project slots.
 pub struct TaskPermit {
-    _global_permit: OwnedSemaphorePermit,
-    _project_permit: OwnedSemaphorePermit,
+    _global_release: PermitReleaseHandle,
+    _project_release: PermitReleaseHandle,
 }
 
 impl std::fmt::Debug for TaskPermit {
@@ -28,23 +30,144 @@ impl std::fmt::Debug for TaskPermit {
     }
 }
 
-/// Bounded task queue using semaphores for concurrency control.
+/// RAII guard that calls `PriorityPermitQueue::release()` on drop.
 ///
-/// Maintains a global semaphore limiting total concurrent tasks across all projects,
-/// plus per-project semaphores so one project cannot starve others. Acquiring a slot
-/// requires holding BOTH permits simultaneously.
+/// Uses `std::sync::Mutex` (not tokio) so the critical section (heap push/pop)
+/// can be taken synchronously inside `Drop`.  The critical section is
+/// microseconds — blocking the thread briefly is acceptable.
+struct PermitReleaseHandle {
+    queue: Arc<Mutex<PriorityPermitQueue>>,
+}
+
+impl Drop for PermitReleaseHandle {
+    fn drop(&mut self) {
+        // Mutex::lock().unwrap() is the right pattern here (RS-03 exemption:
+        // poisoned-lock panic is correct behaviour).
+        self.queue.lock().unwrap().release();
+    }
+}
+
+/// An entry waiting for a permit, ordered by (priority DESC, seq ASC) so
+/// that the `BinaryHeap` max-heap yields the highest-priority / earliest waiter.
+struct Waiter {
+    priority: u8,
+    /// Monotonically increasing sequence number; lower seq = earlier enqueue =
+    /// higher priority among equal-priority waiters (FIFO within same level).
+    seq: u64,
+    tx: oneshot::Sender<()>,
+}
+
+impl PartialEq for Waiter {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.seq == other.seq
+    }
+}
+
+impl Eq for Waiter {}
+
+impl PartialOrd for Waiter {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Waiter {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Higher priority wins.  Tie-break: lower seq → higher rank (FIFO).
+        match self.priority.cmp(&other.priority) {
+            Ordering::Equal => other.seq.cmp(&self.seq),
+            ord => ord,
+        }
+    }
+}
+
+/// Priority-aware permit queue.
 ///
-/// When a `memory_pressure` flag is supplied (via [`TaskQueue::new_with_pressure`]),
-/// `acquire()` returns an error immediately when the flag is `true`, preventing new
-/// tasks from being admitted while available system memory is below the configured
-/// threshold.
+/// Replaces `tokio::sync::Semaphore` so that high-priority waiters can skip
+/// ahead of lower-priority ones when a slot becomes free.
+///
+/// # Known limitations
+/// - **Priority inversion**: a low-priority task holding a permit blocks a
+///   high-priority waiter.  Full aging/anti-starvation is a follow-up.
+/// - **Low-priority starvation**: a continuous stream of high-priority tasks
+///   can starve priority-0 waiters indefinitely.  Callers are responsible for
+///   bounding this at a higher level.
+struct PriorityPermitQueue {
+    available: usize,
+    next_seq: u64,
+    waiters: BinaryHeap<Waiter>,
+}
+
+impl PriorityPermitQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            available: capacity,
+            next_seq: 0,
+            waiters: BinaryHeap::new(),
+        }
+    }
+
+    /// Attempt to claim a permit immediately.
+    ///
+    /// Returns `Ok(())` when a slot is free.  Otherwise pushes a `Waiter` and
+    /// returns the `Receiver` half of the notification channel; the caller
+    /// **must** `.await` it **outside** this lock.
+    fn try_acquire_or_enqueue(&mut self, priority: u8) -> Result<(), oneshot::Receiver<()>> {
+        if self.available > 0 {
+            self.available -= 1;
+            Ok(())
+        } else {
+            let (tx, rx) = oneshot::channel();
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            self.waiters.push(Waiter { priority, seq, tx });
+            Err(rx)
+        }
+    }
+
+    /// Release a permit: wake the top-priority waiter, or increment `available`.
+    fn release(&mut self) {
+        loop {
+            match self.waiters.pop() {
+                None => {
+                    self.available += 1;
+                    return;
+                }
+                Some(waiter) => {
+                    // Receiver already dropped means the waiter was cancelled.
+                    // Skip it and try the next one.
+                    if waiter.tx.send(()).is_ok() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn available_permits(&self) -> usize {
+        self.available
+    }
+
+    fn waiter_count(&self) -> usize {
+        self.waiters.len()
+    }
+}
+
+/// Bounded task queue with priority-aware scheduling.
+///
+/// Maintains a global `PriorityPermitQueue` limiting total concurrent tasks
+/// across all projects, plus per-project queues so one project cannot starve
+/// others.  Acquiring a slot requires holding BOTH permits simultaneously.
+///
+/// Higher `priority` values are served first when multiple tasks are waiting.
+/// Within the same priority level, tasks are served FIFO.
 pub struct TaskQueue {
-    global_semaphore: Arc<Semaphore>,
+    global_queue: Arc<Mutex<PriorityPermitQueue>>,
     global_limit: usize,
     max_queue_size: usize,
     queued_count: AtomicUsize,
-    /// Per-project execution semaphores. Created on first use.
-    project_semaphores: DashMap<String, Arc<Semaphore>>,
+    /// Per-project execution queues. Created on first use.
+    project_queues: DashMap<String, Arc<Mutex<PriorityPermitQueue>>>,
     /// Configured per-project max concurrent limits. Missing entries fall back to `global_limit`.
     project_limits: DashMap<String, usize>,
     /// Per-project count of tasks waiting for a project-level slot.
@@ -77,11 +200,13 @@ impl TaskQueue {
             .map(|(k, v)| (k.clone(), *v))
             .collect();
         Self {
-            global_semaphore: Arc::new(Semaphore::new(config.max_concurrent_tasks)),
+            global_queue: Arc::new(Mutex::new(PriorityPermitQueue::new(
+                config.max_concurrent_tasks,
+            ))),
             global_limit: config.max_concurrent_tasks,
             max_queue_size: config.max_queue_size,
             queued_count: AtomicUsize::new(0),
-            project_semaphores: DashMap::new(),
+            project_queues: DashMap::new(),
             project_limits,
             project_queued: DashMap::new(),
             project_awaiting_global: DashMap::new(),
@@ -96,12 +221,12 @@ impl TaskQueue {
             .unwrap_or(self.global_limit)
     }
 
-    fn get_or_create_project_semaphore(&self, project_id: &str) -> Arc<Semaphore> {
-        self.project_semaphores
+    fn get_or_create_project_queue(&self, project_id: &str) -> Arc<Mutex<PriorityPermitQueue>> {
+        self.project_queues
             .entry(project_id.to_string())
             .or_insert_with(|| {
                 let limit = self.project_limit(project_id);
-                Arc::new(Semaphore::new(limit))
+                Arc::new(Mutex::new(PriorityPermitQueue::new(limit)))
             })
             .clone()
     }
@@ -120,7 +245,10 @@ impl TaskQueue {
             .clone()
     }
 
-    /// Acquire a global + project-level execution slot.
+    /// Acquire a global + project-level execution slot, respecting `priority`.
+    ///
+    /// Higher `priority` values are served before lower values when multiple
+    /// tasks are waiting. Within the same priority level, tasks are served FIFO.
     ///
     /// Acquiring a project permit first prevents a single project from
     /// monopolizing all global slots while waiting for its own limit.
@@ -128,78 +256,87 @@ impl TaskQueue {
     /// Returns `Err` immediately if `max_queue_size` tasks are already waiting,
     /// or if the memory-pressure flag (set by `memory_monitor`) is `true`.
     /// The returned permit releases both slots on drop (even on panic).
-    pub async fn acquire(&self, project_id: &str) -> anyhow::Result<TaskPermit> {
-        // Reject immediately when system memory is below the configured threshold.
-        if self
-            .memory_pressure
-            .as_ref()
-            .is_some_and(|f| f.load(Ordering::Relaxed))
-        {
-            return Err(anyhow::anyhow!(
-                "task rejected: available system memory is below the configured threshold"
-            ));
-        }
-
+    pub async fn acquire(&self, project_id: &str, priority: u8) -> anyhow::Result<TaskPermit> {
         // Reserve a global queue slot. fetch_add returns value before increment,
         // so if prev == max_queue_size the queue is already full.
-        let prev = self.queued_count.fetch_add(1, Ordering::SeqCst);
+        let prev = self.queued_count.fetch_add(1, AtomicOrdering::SeqCst);
         if prev >= self.max_queue_size {
-            self.queued_count.fetch_sub(1, Ordering::SeqCst);
+            self.queued_count.fetch_sub(1, AtomicOrdering::SeqCst);
             return Err(anyhow::anyhow!(
                 "task queue is full (max_queue_size={})",
                 self.max_queue_size
             ));
         }
 
-        let project_sem = self.get_or_create_project_semaphore(project_id);
+        let project_queue = self.get_or_create_project_queue(project_id);
         let project_queued_counter = self.get_or_create_project_queued(project_id);
-        project_queued_counter.fetch_add(1, Ordering::SeqCst);
+        project_queued_counter.fetch_add(1, AtomicOrdering::SeqCst);
 
         // Acquire the project-level slot first. This ensures a project cannot
         // hold global slots while waiting for its own concurrency limit,
         // preventing one project from starving others.
-        let project_permit = match project_sem.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => {
-                self.queued_count.fetch_sub(1, Ordering::SeqCst);
-                project_queued_counter.fetch_sub(1, Ordering::SeqCst);
+        //
+        // Lock briefly to either claim a slot or register a waiter, then release
+        // the std::sync::Mutex before awaiting so we never hold it across .await.
+        let project_rx = project_queue
+            .lock()
+            .unwrap()
+            .try_acquire_or_enqueue(priority);
+        if let Err(rx) = project_rx {
+            if rx.await.is_err() {
+                self.queued_count.fetch_sub(1, AtomicOrdering::SeqCst);
+                project_queued_counter.fetch_sub(1, AtomicOrdering::SeqCst);
                 return Err(anyhow::anyhow!("project task queue closed"));
             }
-        };
+        }
+
         // Project slot acquired; transition from "waiting for project" to
         // "waiting for global". Keep this task counted as queued (not running)
         // until it also holds the global slot.
-        project_queued_counter.fetch_sub(1, Ordering::SeqCst);
+        project_queued_counter.fetch_sub(1, AtomicOrdering::SeqCst);
         let project_awaiting_counter = self.get_or_create_project_awaiting_global(project_id);
-        project_awaiting_counter.fetch_add(1, Ordering::SeqCst);
+        project_awaiting_counter.fetch_add(1, AtomicOrdering::SeqCst);
 
         // Then acquire the global slot.
-        let global_permit = match self.global_semaphore.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => {
-                self.queued_count.fetch_sub(1, Ordering::SeqCst);
-                project_awaiting_counter.fetch_sub(1, Ordering::SeqCst);
+        let global_rx = self
+            .global_queue
+            .lock()
+            .unwrap()
+            .try_acquire_or_enqueue(priority);
+        if let Err(rx) = global_rx {
+            if rx.await.is_err() {
+                // Global queue was dropped. Release the project permit we hold.
+                project_queue.lock().unwrap().release();
+                self.queued_count.fetch_sub(1, AtomicOrdering::SeqCst);
+                project_awaiting_counter.fetch_sub(1, AtomicOrdering::SeqCst);
                 return Err(anyhow::anyhow!("task queue closed"));
             }
-        };
-        project_awaiting_counter.fetch_sub(1, Ordering::SeqCst);
-        self.queued_count.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        project_awaiting_counter.fetch_sub(1, AtomicOrdering::SeqCst);
+        self.queued_count.fetch_sub(1, AtomicOrdering::SeqCst);
 
         Ok(TaskPermit {
-            _global_permit: global_permit,
-            _project_permit: project_permit,
+            _global_release: PermitReleaseHandle {
+                queue: self.global_queue.clone(),
+            },
+            _project_release: PermitReleaseHandle {
+                queue: project_queue,
+            },
         })
     }
 
     /// Number of tasks currently holding a global execution slot (running).
     pub fn running_count(&self) -> usize {
+        let q = self.global_queue.lock().unwrap();
         self.global_limit
-            .saturating_sub(self.global_semaphore.available_permits())
+            .saturating_sub(q.available_permits())
+            .saturating_sub(q.waiter_count())
     }
 
     /// Number of tasks waiting for a global execution slot.
     pub fn queued_count(&self) -> usize {
-        self.queued_count.load(Ordering::Relaxed)
+        self.queued_count.load(AtomicOrdering::Relaxed)
     }
 
     /// Global execution limit.
@@ -210,24 +347,18 @@ impl TaskQueue {
     /// Stats for a specific project (tasks that have acquired a project slot).
     pub fn project_stats(&self, project_id: &str) -> QueueStats {
         let limit = self.project_limit(project_id);
-        if let Some(sem) = self.project_semaphores.get(project_id) {
-            // Tasks that hold the project semaphore but haven't yet acquired
-            // the global semaphore are still waiting — count them as queued,
-            // not running. "running" means the task holds BOTH permits and is
-            // actively executing.
+        if let Some(pq) = self.project_queues.get(project_id) {
+            let q = pq.lock().unwrap();
+            let holding_project = limit.saturating_sub(q.available_permits());
+            let waiting_for_project = q.waiter_count();
+            drop(q);
             let awaiting_global = self
                 .project_awaiting_global
                 .get(project_id)
-                .map(|c| c.load(Ordering::Relaxed))
+                .map(|c| c.load(AtomicOrdering::Relaxed))
                 .unwrap_or(0);
-            let holding_project = limit.saturating_sub(sem.available_permits());
             let running = holding_project.saturating_sub(awaiting_global);
-            let queued = self
-                .project_queued
-                .get(project_id)
-                .map(|c| c.load(Ordering::Relaxed))
-                .unwrap_or(0)
-                + awaiting_global;
+            let queued = waiting_for_project + awaiting_global;
             QueueStats {
                 running,
                 queued,
@@ -244,7 +375,7 @@ impl TaskQueue {
 
     /// Stats for all projects that have been used at least once.
     pub fn all_project_stats(&self) -> Vec<(String, QueueStats)> {
-        self.project_semaphores
+        self.project_queues
             .iter()
             .map(|entry| {
                 let project_id = entry.key().clone();
@@ -287,7 +418,7 @@ mod tests {
     async fn acquire_and_release_single_permit() {
         let q = TaskQueue::new(&config(2, 8));
         assert_eq!(q.running_count(), 0);
-        let permit = q.acquire("proj").await.unwrap();
+        let permit = q.acquire("proj", 0).await.unwrap();
         assert_eq!(q.running_count(), 1);
         drop(permit);
         assert_eq!(q.running_count(), 0);
@@ -298,18 +429,18 @@ mod tests {
         let q = Arc::new(TaskQueue::new(&config(2, 16)));
 
         // Acquire both permits.
-        let p1 = q.acquire("proj").await.unwrap();
-        let p2 = q.acquire("proj").await.unwrap();
+        let p1 = q.acquire("proj", 0).await.unwrap();
+        let p2 = q.acquire("proj", 0).await.unwrap();
         assert_eq!(q.running_count(), 2);
 
         // Third acquire must block; verify with a short timeout.
         let q2 = q.clone();
-        let blocked = timeout(Duration::from_millis(50), q2.acquire("proj")).await;
+        let blocked = timeout(Duration::from_millis(50), q2.acquire("proj", 0)).await;
         assert!(blocked.is_err(), "third acquire should block when limit=2");
 
         // Release a slot; third acquire should now succeed.
         drop(p1);
-        let p3 = q.acquire("proj").await.unwrap();
+        let p3 = q.acquire("proj", 0).await.unwrap();
         assert_eq!(q.running_count(), 2);
         drop(p2);
         drop(p3);
@@ -322,19 +453,19 @@ mod tests {
         let q = Arc::new(TaskQueue::new(&config(1, 2)));
 
         // Hold the single execution slot.
-        let _p1 = q.acquire("proj").await.unwrap();
+        let _p1 = q.acquire("proj", 0).await.unwrap();
 
         // Two tasks queue up (they block, so spawn them).
         let q2 = q.clone();
-        let _h1 = tokio::spawn(async move { q2.acquire("proj").await });
+        let _h1 = tokio::spawn(async move { q2.acquire("proj", 0).await });
         let q3 = q.clone();
-        let _h2 = tokio::spawn(async move { q3.acquire("proj").await });
+        let _h2 = tokio::spawn(async move { q3.acquire("proj", 0).await });
 
         // Give spawned tasks time to increment queued_count.
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // Third waiter exceeds max_queue_size=2 → error.
-        let result = q.acquire("proj").await;
+        let result = q.acquire("proj", 0).await;
         assert!(result.is_err(), "expected queue full error");
         assert!(result.unwrap_err().to_string().contains("max_queue_size=2"));
     }
@@ -347,14 +478,14 @@ mod tests {
             let q_inner = q.clone();
             // Run in a separate task that acquires a permit then panics.
             let handle = tokio::spawn(async move {
-                let _permit = q_inner.acquire("proj").await.unwrap();
+                let _permit = q_inner.acquire("proj", 0).await.unwrap();
                 panic!("forced panic to test permit drop");
             });
             let _ = handle.await; // ignore the JoinError from the panic
         }
 
         // The permit must have been released; acquiring again should succeed immediately.
-        let result = timeout(Duration::from_millis(100), q.acquire("proj")).await;
+        let result = timeout(Duration::from_millis(100), q.acquire("proj", 0)).await;
         assert!(result.is_ok(), "permit should be released after panic");
     }
 
@@ -363,11 +494,11 @@ mod tests {
         let q = Arc::new(TaskQueue::new(&config(1, 8)));
 
         // Hold the slot so the next acquire must wait.
-        let _holder = q.acquire("proj").await.unwrap();
+        let _holder = q.acquire("proj", 0).await.unwrap();
         assert_eq!(q.queued_count(), 0);
 
         let q2 = q.clone();
-        let _waiter = tokio::spawn(async move { q2.acquire("proj").await });
+        let _waiter = tokio::spawn(async move { q2.acquire("proj", 0).await });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(q.queued_count(), 1);
@@ -376,8 +507,8 @@ mod tests {
     #[tokio::test]
     async fn running_count_and_queued_count_reset_after_completion() {
         let q = TaskQueue::new(&config(4, 16));
-        let p1 = q.acquire("proj").await.unwrap();
-        let p2 = q.acquire("proj").await.unwrap();
+        let p1 = q.acquire("proj", 0).await.unwrap();
+        let p2 = q.acquire("proj", 0).await.unwrap();
         assert_eq!(q.running_count(), 2);
         drop(p1);
         drop(p2);
@@ -400,16 +531,16 @@ mod tests {
         let q = Arc::new(TaskQueue::new(&cfg));
 
         // proj_a has limit=1; second acquire must block.
-        let _p1 = q.acquire("proj_a").await.unwrap();
+        let _p1 = q.acquire("proj_a", 0).await.unwrap();
         let q2 = q.clone();
-        let blocked = timeout(Duration::from_millis(50), q2.acquire("proj_a")).await;
+        let blocked = timeout(Duration::from_millis(50), q2.acquire("proj_a", 0)).await;
         assert!(
             blocked.is_err(),
             "proj_a second acquire should block (limit=1)"
         );
 
         // proj_b has no configured limit (uses global=4); can still acquire.
-        let p_b = q.acquire("proj_b").await.unwrap();
+        let p_b = q.acquire("proj_b", 0).await.unwrap();
         assert_eq!(q.running_count(), 2);
         drop(p_b);
     }
@@ -431,18 +562,18 @@ mod tests {
         let q = Arc::new(TaskQueue::new(&cfg));
 
         // proj_a fills its project slot (limit=1).
-        let _pa = q.acquire("proj_a").await.unwrap();
+        let _pa = q.acquire("proj_a", 0).await.unwrap();
 
         // proj_a cannot take another slot even though 1 global slot remains.
         let q2 = q.clone();
-        let blocked = timeout(Duration::from_millis(50), q2.acquire("proj_a")).await;
+        let blocked = timeout(Duration::from_millis(50), q2.acquire("proj_a", 0)).await;
         assert!(
             blocked.is_err(),
             "proj_a blocked at project limit while global slot is free"
         );
 
         // proj_b can still acquire the remaining global slot.
-        let pb = timeout(Duration::from_millis(100), q.acquire("proj_b")).await;
+        let pb = timeout(Duration::from_millis(100), q.acquire("proj_b", 0)).await;
         assert!(pb.is_ok(), "proj_b should get the remaining global slot");
     }
 
@@ -450,7 +581,7 @@ mod tests {
     async fn project_stats_reflect_running_and_queued() {
         let q = Arc::new(TaskQueue::new(&config(4, 16)));
 
-        let _p1 = q.acquire("stats_proj").await.unwrap();
+        let _p1 = q.acquire("stats_proj", 0).await.unwrap();
         let stats = q.project_stats("stats_proj");
         assert_eq!(stats.running, 1);
         assert_eq!(stats.queued, 0);
@@ -467,9 +598,9 @@ mod tests {
             ..ConcurrencyConfig::default()
         };
         let q2 = Arc::new(TaskQueue::new(&cfg2));
-        let _holder = q2.acquire("capped").await.unwrap();
+        let _holder = q2.acquire("capped", 0).await.unwrap();
         let q3 = q2.clone();
-        let _waiter = tokio::spawn(async move { q3.acquire("capped").await });
+        let _waiter = tokio::spawn(async move { q3.acquire("capped", 0).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let stats2 = q2.project_stats("capped");
@@ -477,29 +608,81 @@ mod tests {
         assert_eq!(stats2.queued, 1);
     }
 
+    // --- New priority tests ---
+
     #[tokio::test]
-    async fn task_admission_blocked_under_pressure() {
-        let pressure = Arc::new(AtomicBool::new(true));
-        let q = TaskQueue::new_with_pressure(&config(4, 16), Some(pressure));
-        let result = q.acquire("proj").await;
-        assert!(result.is_err(), "acquire must fail under memory pressure");
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("available system memory"),
-            "error message should mention memory"
-        );
+    async fn high_priority_acquired_before_low_when_slots_full() {
+        // 1 slot: hold it, then enqueue priority=0 then priority=1.
+        // When the slot is released, priority=1 should unblock first.
+        let q = Arc::new(TaskQueue::new(&config(1, 16)));
+        let holder = q.acquire("proj", 0).await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+
+        let q1 = q.clone();
+        let tx1 = tx.clone();
+        tokio::spawn(async move {
+            let _p = q1.acquire("proj", 0).await.unwrap();
+            let _ = tx1.send(0);
+        });
+
+        // Small delay to ensure priority=0 waiter is registered first.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let q2 = q.clone();
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            let _p = q2.acquire("proj", 1).await.unwrap();
+            let _ = tx2.send(1);
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Release the holder; the priority=1 waiter should unblock first.
+        drop(holder);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let first = rx.recv().await.expect("should receive first");
+        assert_eq!(first, 1, "priority=1 task should unblock before priority=0");
     }
 
     #[tokio::test]
-    async fn task_admission_succeeds_no_pressure() {
-        let pressure = Arc::new(AtomicBool::new(false));
-        let q = TaskQueue::new_with_pressure(&config(4, 16), Some(pressure));
-        let result = q.acquire("proj").await;
-        assert!(
-            result.is_ok(),
-            "acquire must succeed when pressure flag is false"
-        );
+    async fn same_priority_is_fifo() {
+        // 1 slot: hold it, then enqueue three priority=1 waiters in order.
+        // They should unblock in enqueue order (FIFO).
+        let q = Arc::new(TaskQueue::new(&config(1, 16)));
+        let holder = q.acquire("proj", 1).await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+
+        for i in 0u8..3 {
+            let q_i = q.clone();
+            let tx_i = tx.clone();
+            tokio::spawn(async move {
+                let _p = q_i.acquire("proj", 1).await.unwrap();
+                let _ = tx_i.send(i);
+                // Hold slot briefly so ordering is observable.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            });
+            // Stagger enqueue so seq ordering is deterministic.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Release the holder.
+        drop(holder);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut order = Vec::new();
+        while let Ok(v) = rx.try_recv() {
+            order.push(v);
+        }
+        assert_eq!(order, vec![0, 1, 2], "same-priority waiters must be FIFO");
+    }
+
+    #[tokio::test]
+    async fn priority_zero_default_compiles() {
+        let q = TaskQueue::new(&config(2, 8));
+        let p = q.acquire("proj", 0).await;
+        assert!(p.is_ok());
     }
 }

@@ -309,7 +309,7 @@ pub async fn gc_adopt(
             }
             let dispatch_result =
                 if let Some((agent, reviewer, req, project_id)) = task_dispatch_plan {
-                    match state.concurrency.task_queue.acquire(&project_id).await {
+                    match state.concurrency.task_queue.acquire(&project_id, 0).await {
                         Ok(permit) => {
                             let tid = crate::task_runner::spawn_task(
                                 state.core.tasks.clone(),
