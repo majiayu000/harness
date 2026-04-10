@@ -850,12 +850,15 @@ impl TaskStore {
                 Some(until) => {
                     let now = tokio::time::Instant::now();
                     if now >= until {
-                        // Deadline already passed; clear if unchanged and return.
+                        // Deadline passed; only clear+return if unchanged.
+                        // If a newer deadline was set between the read-lock and
+                        // write-lock, fall through and loop to respect it.
                         let mut wl = self.rate_limit_until.write().await;
                         if *wl == Some(until) {
                             *wl = None;
+                            return;
                         }
-                        return;
+                        // Deadline extended; drop write lock and loop.
                     }
                     let remaining = until - now;
                     tracing::info!(
