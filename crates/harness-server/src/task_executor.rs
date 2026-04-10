@@ -1359,6 +1359,8 @@ pub(crate) async fn run_task(
                 project_config.review_type.as_str(),
                 &events,
                 &cargo_env,
+                effective_max_turns,
+                &mut turns_used,
             )
             .await?;
             if !review_ok {
@@ -1546,17 +1548,19 @@ pub(crate) async fn run_task(
             tracing::warn!(round, stderr = %stderr, "agent stderr during review check");
         }
 
-        let lgtm = prompts::is_lgtm(&output);
+        let raw_lgtm = prompts::is_lgtm(&output);
         let waiting = prompts::is_waiting(&output);
         // If post-execute validation failed this round, block LGTM acceptance even
         // if the reviewer approved — the local validator caught an issue that must be
         // fixed before the PR can be marked done.
-        let lgtm = lgtm && pending_test_failure.is_none();
+        let lgtm = raw_lgtm && pending_test_failure.is_none();
         let fixed = !lgtm && !waiting;
 
-        // Jaccard loop detection: two consecutive non-waiting outputs that are too similar
-        // indicate the reviewer is stuck repeating itself without making progress.
-        if !waiting {
+        // Jaccard loop detection: two consecutive non-waiting, non-LGTM outputs that are
+        // too similar indicate the reviewer is stuck repeating itself without making progress.
+        // Skip when the raw output is an approval: repeated LGTM is legitimate convergence
+        // (e.g., reviewer approves again after a test-gate previously blocked acceptance).
+        if !waiting && !raw_lgtm {
             if let Some(ref prev) = prev_review_output {
                 let score = jaccard_word_similarity(prev, &output);
                 if score >= jaccard_threshold {
@@ -1829,6 +1833,8 @@ async fn run_agent_review(
     project_type: &str,
     events: &harness_observe::event_store::EventStore,
     cargo_env: &HashMap<String, String>,
+    effective_max_turns: Option<u32>,
+    turns_used: &mut u32,
 ) -> anyhow::Result<(bool, bool)> {
     let max_rounds = review_config.max_rounds;
     // (normalized_issues, consecutive_count): tracks how many consecutive rounds produced identical issues.
@@ -1864,7 +1870,16 @@ async fn run_agent_review(
         };
         let review_req = run_pre_execute(interceptors, review_req).await?;
 
+        if let Some(max) = effective_max_turns {
+            if *turns_used >= max {
+                return Err(anyhow::anyhow!(
+                    "Turn budget exhausted before agent review round {agent_round}: used {} of {} allowed turns",
+                    turns_used, max
+                ));
+            }
+        }
         let resp = tokio::time::timeout(turn_timeout, reviewer.execute(review_req.clone())).await;
+        *turns_used += 1;
         let resp = match resp {
             Ok(Ok(r)) => {
                 let tool_violations = validate_tool_usage(
@@ -2044,7 +2059,16 @@ async fn run_agent_review(
         };
         let fix_req = run_pre_execute(interceptors, fix_req).await?;
 
+        if let Some(max) = effective_max_turns {
+            if *turns_used >= max {
+                return Err(anyhow::anyhow!(
+                    "Turn budget exhausted before agent review fix round {agent_round}: used {} of {} allowed turns",
+                    turns_used, max
+                ));
+            }
+        }
         let fix_resp = tokio::time::timeout(turn_timeout, agent.execute(fix_req.clone())).await;
+        *turns_used += 1;
         match fix_resp {
             Ok(Ok(r)) => {
                 if let Some(val_err) = run_post_execute(interceptors, &fix_req, &r).await {
