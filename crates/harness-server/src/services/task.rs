@@ -119,6 +119,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             repo: None,
+            pending_request: None,
         };
         state.source = Some("github".to_string());
         store.insert(&state).await;
@@ -158,6 +159,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             repo: None,
+            pending_request: None,
         };
         store.insert(&parent_state).await;
 
@@ -181,6 +183,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             repo: None,
+            pending_request: None,
         };
         store.insert(&child_state).await;
 

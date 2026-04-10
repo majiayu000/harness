@@ -31,6 +31,7 @@ fn make_task(id: &str, status: TaskStatus) -> TaskState {
         triage_output: None,
         plan_output: None,
         repo: None,
+        pending_request: None,
     }
 }
 

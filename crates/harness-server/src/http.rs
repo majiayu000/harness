@@ -614,6 +614,14 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     // Spawn background watcher for AwaitingDeps tasks.
     {
         let store = tasks.clone();
+        let agent_registry = server.agent_registry.clone();
+        let server_config = Arc::new(server.config.clone());
+        let skills = skills_arc.clone();
+        let events_w = events.clone();
+        let interceptors_w = interceptors.clone();
+        let workspace_mgr_w = workspace_mgr.clone();
+        let task_queue_w = task_queue.clone();
+        let completion_callback_w = completion_callback.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -621,12 +629,98 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                 interval.tick().await;
                 let ready_ids = crate::task_runner::check_awaiting_deps(&store);
                 for task_id in ready_ids {
+                    // Atomically take pending_request before dispatch to prevent double-dispatch.
+                    let pending_req = store
+                        .cache
+                        .get_mut(&task_id)
+                        .and_then(|mut e| e.pending_request.take());
+
                     if let Err(e) = store.persist(&task_id).await {
                         tracing::warn!(
                             "dep-watcher: failed to persist {} after transition: {e}",
                             task_id.0
                         );
                     }
+
+                    let req = match pending_req {
+                        Some(r) => r,
+                        None => {
+                            tracing::warn!(
+                                task_id = %task_id.0,
+                                "dep-watcher: task ready but pending_request is None, skipping dispatch"
+                            );
+                            continue;
+                        }
+                    };
+
+                    let agent = if let Some(ref name) = req.agent {
+                        agent_registry.get(name)
+                    } else {
+                        let cls = crate::complexity_router::classify(
+                            req.prompt.as_deref().unwrap_or_default(),
+                            req.issue,
+                            req.pr,
+                        );
+                        agent_registry.dispatch(&cls).ok()
+                    };
+                    let agent = match agent {
+                        Some(a) => a,
+                        None => {
+                            tracing::error!(
+                                task_id = %task_id.0,
+                                "dep-watcher: could not resolve agent, skipping dispatch"
+                            );
+                            continue;
+                        }
+                    };
+                    let (reviewer, _) = resolve_reviewer(
+                        &agent_registry,
+                        &server_config.agents.review,
+                        agent.name(),
+                    );
+                    let project_id = req
+                        .project
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+
+                    let task_id2 = task_id.clone();
+                    let store2 = store.clone();
+                    let server_config2 = server_config.clone();
+                    let skills2 = skills.clone();
+                    let events2 = events_w.clone();
+                    let interceptors2 = interceptors_w.clone();
+                    let workspace_mgr2 = workspace_mgr_w.clone();
+                    let task_queue2 = task_queue_w.clone();
+                    let cb2 = completion_callback_w.clone();
+                    tokio::spawn(async move {
+                        match task_queue2.acquire(&project_id).await {
+                            Ok(permit) => {
+                                crate::task_runner::spawn_preregistered_task(
+                                    task_id2,
+                                    store2,
+                                    agent,
+                                    reviewer,
+                                    server_config2,
+                                    skills2,
+                                    events2,
+                                    interceptors2,
+                                    req,
+                                    workspace_mgr2,
+                                    permit,
+                                    cb2,
+                                    None,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    task_id = %task_id2.0,
+                                    "dep-watcher: failed to acquire concurrency permit: {e}"
+                                );
+                            }
+                        }
+                    });
                 }
             }
         });

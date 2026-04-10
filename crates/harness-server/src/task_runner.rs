@@ -150,6 +150,10 @@ pub struct TaskState {
     /// Output from the Plan phase (Architect plan). Not persisted to DB.
     #[serde(skip)]
     pub plan_output: Option<String>,
+    /// Original request stored for AwaitingDeps tasks; cleared after dispatch.
+    /// Not persisted via serde — task_db handles serialization as JSON.
+    #[serde(skip)]
+    pub pending_request: Option<CreateTaskRequest>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -212,6 +216,7 @@ impl TaskState {
             triage_output: None,
             plan_output: None,
             repo: None,
+            pending_request: None,
         }
     }
 
@@ -239,7 +244,7 @@ impl TaskState {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTaskRequest {
     /// Free-text task description (prompt, issue URL, etc.).
     pub prompt: Option<String>,
@@ -1711,6 +1716,7 @@ pub async fn spawn_task_awaiting_deps(
 
     if !all_done && !state.depends_on.is_empty() {
         state.status = TaskStatus::AwaitingDeps;
+        state.pending_request = Some(req.clone());
     }
 
     store.insert(&state).await;
@@ -2674,6 +2680,162 @@ mod tests {
         assert!(counts.contains_key(&key_b), "beta counts missing");
         assert_eq!(counts[&key_b].done, 1, "beta done");
         assert_eq!(counts[&key_b].failed, 2, "beta failed");
+        Ok(())
+    }
+
+    // ── depends_on / dep-watcher tests ───────────────────────────────────────
+
+    fn make_request(prompt: &str) -> CreateTaskRequest {
+        CreateTaskRequest {
+            prompt: Some(prompt.into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_task_awaiting_deps_stores_request() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        // Upstream task that is NOT done.
+        let mut upstream = TaskState::new(TaskId::new());
+        upstream.status = TaskStatus::Implementing;
+        store.insert(&upstream).await;
+
+        let req = CreateTaskRequest {
+            prompt: Some("downstream task".into()),
+            depends_on: vec![upstream.id.clone()],
+            ..Default::default()
+        };
+
+        let task_id = spawn_task_awaiting_deps(store.clone(), req.clone()).await?;
+        let state = store.get(&task_id).expect("task must exist");
+
+        assert!(
+            matches!(state.status, TaskStatus::AwaitingDeps),
+            "expected AwaitingDeps, got {:?}",
+            state.status
+        );
+        let stored_req = state.pending_request.expect("pending_request must be Some");
+        assert_eq!(stored_req.prompt, req.prompt);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dep_watcher_dispatches_ready_task() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        // T1: dependency, starts Implementing then transitions to Done.
+        let mut t1 = TaskState::new(TaskId::new());
+        t1.status = TaskStatus::Implementing;
+        store.insert(&t1).await;
+
+        // T2: awaiting T1.
+        let req = make_request("downstream");
+        let t2_id = spawn_task_awaiting_deps(
+            store.clone(),
+            CreateTaskRequest {
+                depends_on: vec![t1.id.clone()],
+                ..req
+            },
+        )
+        .await?;
+
+        // Transition T1 to Done.
+        if let Some(mut entry) = store.cache.get_mut(&t1.id) {
+            entry.status = TaskStatus::Done;
+        }
+
+        let ready = check_awaiting_deps(&store);
+        assert_eq!(ready, vec![t2_id.clone()], "T2 should be ready");
+
+        let state = store.get(&t2_id).expect("T2 must exist");
+        assert!(
+            matches!(state.status, TaskStatus::Pending),
+            "expected Pending after transition, got {:?}",
+            state.status
+        );
+        assert!(
+            state.pending_request.is_some(),
+            "pending_request must survive check_awaiting_deps"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn awaiting_deps_persists_and_reloads_request() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let mut upstream = TaskState::new(TaskId::new());
+        upstream.status = TaskStatus::Implementing;
+        store.insert(&upstream).await;
+
+        let req = CreateTaskRequest {
+            prompt: Some("reload-test".into()),
+            depends_on: vec![upstream.id.clone()],
+            ..Default::default()
+        };
+        let task_id = spawn_task_awaiting_deps(store.clone(), req.clone()).await?;
+
+        // Reload from DB.
+        let reloaded = store
+            .db
+            .get(task_id.as_str())
+            .await?
+            .expect("task must be in DB");
+        assert!(
+            matches!(reloaded.status, TaskStatus::AwaitingDeps),
+            "reloaded status should be AwaitingDeps"
+        );
+        let stored = reloaded
+            .pending_request
+            .expect("pending_request must survive DB round-trip");
+        assert_eq!(stored.prompt, req.prompt);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dep_watcher_clears_request_after_taking() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let mut upstream = TaskState::new(TaskId::new());
+        upstream.status = TaskStatus::Implementing;
+        store.insert(&upstream).await;
+
+        let task_id = spawn_task_awaiting_deps(
+            store.clone(),
+            CreateTaskRequest {
+                prompt: Some("clear-test".into()),
+                depends_on: vec![upstream.id.clone()],
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // Transition upstream to Done.
+        if let Some(mut e) = store.cache.get_mut(&upstream.id) {
+            e.status = TaskStatus::Done;
+        }
+        check_awaiting_deps(&store);
+
+        // Simulate the dep-watcher clearing pending_request before dispatch.
+        let taken = store
+            .cache
+            .get_mut(&task_id)
+            .and_then(|mut e| e.pending_request.take());
+        assert!(taken.is_some(), "dep-watcher should take pending_request");
+
+        store.persist(&task_id).await?;
+
+        // Second tick: pending_request is None, so dispatch is skipped.
+        let reloaded = store.cache.get(&task_id).expect("task must exist");
+        assert!(
+            reloaded.pending_request.is_none(),
+            "pending_request must be cleared after first dispatch"
+        );
         Ok(())
     }
 }

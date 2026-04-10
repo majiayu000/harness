@@ -91,6 +91,11 @@ static TASK_MIGRATIONS: &[Migration] = &[
         sql: "CREATE INDEX IF NOT EXISTS idx_tasks_project_status_updated \
               ON tasks(project, status, updated_at DESC)",
     },
+    Migration {
+        version: 11,
+        description: "add pending_request_json column for AwaitingDeps tasks",
+        sql: "ALTER TABLE tasks ADD COLUMN pending_request_json TEXT",
+    },
 ];
 
 /// A single persisted artifact captured from agent output during task execution.
@@ -159,10 +164,15 @@ impl TaskDb {
     pub async fn insert(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
+        let pending_request_json = state
+            .pending_request
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let status = state.status.as_ref();
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?)",
+            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, pending_request_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?)",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -177,6 +187,7 @@ impl TaskDb {
         .bind(&state.repo)
         .bind(&depends_on_json)
         .bind(state.project_root.as_ref().map(|p| p.to_string_lossy().into_owned()))
+        .bind(pending_request_json)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -185,10 +196,16 @@ impl TaskDb {
     pub async fn update(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
+        let pending_request_json = state
+            .pending_request
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let status = state.status.as_ref();
         sqlx::query(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
-                    source = ?, external_id = ?, repo = ?, depends_on = ?, project = ?, updated_at = datetime('now')
+                    source = ?, external_id = ?, repo = ?, depends_on = ?, project = ?,
+                    pending_request_json = ?, updated_at = datetime('now')
              WHERE id = ?",
         )
         .bind(status)
@@ -200,7 +217,13 @@ impl TaskDb {
         .bind(&state.external_id)
         .bind(&state.repo)
         .bind(&depends_on_json)
-        .bind(state.project_root.as_ref().map(|p| p.to_string_lossy().into_owned()))
+        .bind(
+            state
+                .project_root
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        )
+        .bind(pending_request_json)
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -209,7 +232,7 @@ impl TaskDb {
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, pending_request_json
              FROM tasks WHERE id = ?",
         )
         .bind(id)
@@ -220,7 +243,7 @@ impl TaskDb {
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, pending_request_json
              FROM tasks ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -571,7 +594,7 @@ impl TaskDb {
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, pending_request_json
              FROM tasks WHERE parent_id = ? ORDER BY created_at DESC",
         )
         .bind(parent_id)
@@ -647,6 +670,7 @@ struct TaskRow {
     repo: Option<String>,
     depends_on: String,
     project: Option<String>,
+    pending_request_json: Option<String>,
 }
 
 impl TaskRow {
@@ -665,6 +689,7 @@ impl TaskRow {
             repo,
             depends_on,
             project,
+            pending_request_json,
         } = self;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
@@ -679,6 +704,10 @@ impl TaskRow {
                 source,
             }
         })?;
+        let pending_request = pending_request_json
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| serde_json::from_str(s).ok());
 
         Ok(TaskState {
             id: harness_core::types::TaskId(id),
@@ -700,6 +729,7 @@ impl TaskRow {
             triage_output: None,
             plan_output: None,
             repo,
+            pending_request,
         })
     }
 }
@@ -725,6 +755,7 @@ mod tests {
             repo: None,
             depends_on: depends_on.to_string(),
             project: None,
+            pending_request_json: None,
         }
     }
 
@@ -832,6 +863,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             repo: None,
+            pending_request: None,
         }
     }
 
