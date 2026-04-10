@@ -1529,30 +1529,51 @@ async fn stream_task_sse(State(state): State<Arc<AppState>>, Path(id): Path<Stri
         }
     };
 
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Ok(item) => {
-                let data = match serde_json::to_string(&item) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!("sse: failed to serialize event: {e}");
-                        String::new()
+    // Send a heartbeat comment every 30 s so reverse proxies (nginx default
+    // 60 s idle timeout) don't drop the connection while the agent is silent.
+    let heartbeat_interval = {
+        let start = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        tokio::time::interval_at(start, std::time::Duration::from_secs(30))
+    };
+
+    let stream = futures::stream::unfold(
+        (rx, heartbeat_interval),
+        |(mut rx, mut interval)| async move {
+            tokio::select! {
+                biased;
+                result = rx.recv() => {
+                    match result {
+                        Ok(item) => {
+                            let data = match serde_json::to_string(&item) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::warn!("sse: failed to serialize event: {e}");
+                                    String::new()
+                                }
+                            };
+                            Some((
+                                Ok::<Event, std::convert::Infallible>(Event::default().data(data)),
+                                (rx, interval),
+                            ))
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            let event = Event::default()
+                                .event("lag")
+                                .data(format!("dropped {n} events due to slow consumer"));
+                            Some((Ok(event), (rx, interval)))
+                        }
                     }
-                };
-                Some((
-                    Ok::<Event, std::convert::Infallible>(Event::default().data(data)),
-                    rx,
-                ))
+                }
+                _ = interval.tick() => {
+                    Some((
+                        Ok::<Event, std::convert::Infallible>(Event::default().comment("heartbeat")),
+                        (rx, interval),
+                    ))
+                }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                let event = Event::default()
-                    .event("lag")
-                    .data(format!("dropped {n} events due to slow consumer"));
-                Some((Ok(event), rx))
-            }
-        }
-    });
+        },
+    );
 
     Sse::new(stream).into_response()
 }
