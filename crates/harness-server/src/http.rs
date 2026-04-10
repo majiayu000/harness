@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::{self},
     response::{
-        sse::{Event, Sse},
+        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
     routing::{get, post},
@@ -1554,7 +1554,15 @@ async fn stream_task_sse(State(state): State<Arc<AppState>>, Path(id): Path<Stri
         }
     });
 
-    Sse::new(stream).into_response()
+    // Send a heartbeat comment every 30 s so reverse proxies (nginx default
+    // 60 s idle timeout) don't drop the connection while the agent is silent.
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(30))
+                .text("heartbeat"),
+        )
+        .into_response()
 }
 
 /// GET /api/intake — current status of all intake channels and recent dispatches.
