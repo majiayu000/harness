@@ -478,6 +478,9 @@ const TRANSIENT_PATTERNS: &[&str] = &[
     "stream stall",
     "ECONNRESET",
     "ETIMEDOUT",
+    // SQLite transient contention — SQLITE_BUSY / SQLITE_LOCKED
+    "database is locked",
+    "SQLITE_BUSY",
 ];
 
 /// Pattern indicating the CLI account-level usage limit has been reached.
