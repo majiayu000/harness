@@ -1112,7 +1112,7 @@ pub(crate) async fn run_task(
                             );
                             let truncated = truncate_validation_error(&err, 2000);
                             impl_req.prompt = format!(
-                                "{}\n\nPost-execution validation failed (attempt {}/{}):\n{}",
+                                "{}\n\nPost-execution validation failed (attempt {}/{}).\nErrors are prefixed with [COMPILE ERROR], [TEST FAILURE], [LINT ERROR], or [VALIDATION ERROR] — focus your fix on the indicated error type:\n{}",
                                 first_req.prompt,
                                 validation_attempt,
                                 max_validation_retries,

@@ -22,6 +22,42 @@ pub struct PostExecutionValidator {
     gh_bin: String,
 }
 
+/// Classify a command string into a human-readable error prefix.
+///
+/// Matches on substrings in priority order (first match wins). Commands
+/// always carry args (e.g. `cargo test -- --nocapture`), so substring
+/// matching on the full command string handles path-prefixed binaries
+/// (e.g. `/home/ci/bin/cargo check`) without extra processing.
+fn classify_command(cmd: &str) -> &'static str {
+    // Compile: check/build commands
+    if cmd.contains("cargo check")
+        || cmd.contains("cargo build")
+        || cmd.contains("go build")
+        || cmd.contains("tsc")
+    {
+        return "[COMPILE ERROR]";
+    }
+    // Test: test runner commands
+    if cmd.contains("cargo test")
+        || cmd.contains("go test")
+        || cmd.contains("pytest")
+        || cmd.contains("bun test")
+        || cmd.contains("jest")
+    {
+        return "[TEST FAILURE]";
+    }
+    // Lint: formatting and linting commands
+    if cmd.contains("cargo clippy")
+        || cmd.contains("cargo fmt")
+        || cmd.contains("ruff")
+        || cmd.contains("eslint")
+        || cmd.contains("golangci-lint")
+    {
+        return "[LINT ERROR]";
+    }
+    "[VALIDATION ERROR]"
+}
+
 /// Validate that a command string does not contain unquoted shell operators
 /// that could enable command chaining or execution escalation.
 ///
@@ -226,7 +262,7 @@ impl TurnInterceptor for PostExecutionValidator {
                 Ok(()) => tracing::debug!(cmd = %cmd, "post_validator: passed"),
                 Err(e) => {
                     tracing::warn!(cmd = %cmd, error = %e, "post_validator: failed");
-                    errors.push(e);
+                    errors.push(format!("{}\n{}", classify_command(cmd), e));
                 }
             }
         }
@@ -239,7 +275,7 @@ impl TurnInterceptor for PostExecutionValidator {
                     Ok(()) => tracing::debug!(cmd = %cmd, "post_validator: passed"),
                     Err(e) => {
                         tracing::warn!(cmd = %cmd, error = %e, "post_validator: failed");
-                        errors.push(e);
+                        errors.push(format!("{}\n{}", classify_command(cmd), e));
                     }
                 }
             }
@@ -553,6 +589,116 @@ mod tests {
     }
 
     // ── PR existence verification ─────────────────────────────────────────────
+
+    // ── classify_command ──────────────────────────────────────────────────────
+
+    #[test]
+    fn classify_compile_commands() {
+        for cmd in &[
+            "cargo check --workspace",
+            "cargo build --release",
+            "go build ./...",
+            "npx tsc --noEmit",
+            "/home/ci/bin/cargo check",
+        ] {
+            assert_eq!(
+                classify_command(cmd),
+                "[COMPILE ERROR]",
+                "expected [COMPILE ERROR] for `{cmd}`"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_test_commands() {
+        for cmd in &[
+            "cargo test",
+            "cargo test -- --nocapture",
+            "go test ./...",
+            "pytest",
+            "bun test",
+            "jest --coverage",
+        ] {
+            assert_eq!(
+                classify_command(cmd),
+                "[TEST FAILURE]",
+                "expected [TEST FAILURE] for `{cmd}`"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_lint_commands() {
+        for cmd in &[
+            "cargo clippy --workspace -- -D warnings",
+            "cargo fmt --check",
+            "ruff check .",
+            "eslint src/",
+            "golangci-lint run",
+        ] {
+            assert_eq!(
+                classify_command(cmd),
+                "[LINT ERROR]",
+                "expected [LINT ERROR] for `{cmd}`"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_unknown_command() {
+        for cmd in &["false", "./scripts/check.sh", "make verify", "true"] {
+            assert_eq!(
+                classify_command(cmd),
+                "[VALIDATION ERROR]",
+                "expected [VALIDATION ERROR] for `{cmd}`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn error_prefix_appears_in_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ValidationConfig {
+            pre_commit: vec!["cargo check --workspace".to_string()],
+            ..Default::default()
+        };
+        let validator = PostExecutionValidator::new(config);
+        let req = make_req(dir.path().to_path_buf());
+        let resp = make_resp("done");
+        let result = validator.post_execute(&req, &resp).await;
+        // `cargo check` will fail (not a real Rust project), error must carry prefix
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("[COMPILE ERROR]"),
+            "expected [COMPILE ERROR] prefix, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_error_different_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        // Both commands run in pre_commit so both can fail in the same pass.
+        let config = ValidationConfig {
+            pre_commit: vec![
+                "cargo check --workspace".to_string(),
+                "cargo clippy --workspace -- -D warnings".to_string(),
+            ],
+            ..Default::default()
+        };
+        let validator = PostExecutionValidator::new(config);
+        let req = make_req(dir.path().to_path_buf());
+        let resp = make_resp("done");
+        let result = validator.post_execute(&req, &resp).await;
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("[COMPILE ERROR]"),
+            "expected [COMPILE ERROR] in combined error, got: {err}"
+        );
+        assert!(
+            err.contains("[LINT ERROR]"),
+            "expected [LINT ERROR] in combined error, got: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn pr_verification_skipped_when_output_has_no_pr_url() {
