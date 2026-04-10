@@ -81,6 +81,17 @@ pub struct ConcurrencyConfig {
     /// the task is marked Failed with "review loop detected". Default: 0.85.
     #[serde(default = "default_loop_jaccard_threshold")]
     pub loop_jaccard_threshold: f64,
+    /// Minimum available system memory (MB) required to admit new tasks.
+    /// When available memory falls below this threshold the task queue
+    /// rejects new `acquire()` calls until memory recovers.
+    /// `None` (default) disables the check entirely.
+    #[serde(default)]
+    pub memory_pressure_threshold_mb: Option<u64>,
+    /// How often (seconds) the memory monitor re-samples available memory.
+    /// Values below 1 are clamped to 1. Default: 5.
+    /// Only meaningful when `memory_pressure_threshold_mb` is `Some`.
+    #[serde(default = "default_memory_poll_interval_secs")]
+    pub memory_poll_interval_secs: u64,
 }
 
 fn default_max_concurrent_tasks() -> usize {
@@ -99,6 +110,10 @@ fn default_loop_jaccard_threshold() -> f64 {
     0.85
 }
 
+fn default_memory_poll_interval_secs() -> u64 {
+    5
+}
+
 impl Default for ConcurrencyConfig {
     fn default() -> Self {
         Self {
@@ -108,6 +123,8 @@ impl Default for ConcurrencyConfig {
             per_project: HashMap::new(),
             max_turns: None,
             loop_jaccard_threshold: default_loop_jaccard_threshold(),
+            memory_pressure_threshold_mb: None,
+            memory_poll_interval_secs: default_memory_poll_interval_secs(),
         }
     }
 }
@@ -403,5 +420,38 @@ impl Default for ReviewConfig {
             strategy: ReviewStrategy::Single,
             timeout_secs: default_review_timeout_secs(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_default_disables_monitor() {
+        let cfg = ConcurrencyConfig::default();
+        assert!(
+            cfg.memory_pressure_threshold_mb.is_none(),
+            "memory monitor must be disabled by default"
+        );
+        assert_eq!(cfg.memory_poll_interval_secs, 5);
+    }
+
+    #[test]
+    fn toml_roundtrip_with_threshold() {
+        let toml = r#"
+            memory_pressure_threshold_mb = 512
+            memory_poll_interval_secs = 10
+        "#;
+        let cfg: ConcurrencyConfig = toml::from_str(toml).expect("toml parse failed");
+        assert_eq!(cfg.memory_pressure_threshold_mb, Some(512));
+        assert_eq!(cfg.memory_poll_interval_secs, 10);
+    }
+
+    #[test]
+    fn toml_roundtrip_without_threshold_uses_defaults() {
+        let cfg: ConcurrencyConfig = toml::from_str("").expect("toml parse failed");
+        assert!(cfg.memory_pressure_threshold_mb.is_none());
+        assert_eq!(cfg.memory_poll_interval_secs, 5);
     }
 }

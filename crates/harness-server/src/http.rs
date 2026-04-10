@@ -472,8 +472,19 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             .await;
     }
 
-    let task_queue = Arc::new(crate::task_queue::TaskQueue::new(
+    let memory_pressure =
+        server
+            .config
+            .concurrency
+            .memory_pressure_threshold_mb
+            .map(|threshold_mb| {
+                let poll_secs = server.config.concurrency.memory_poll_interval_secs;
+                tracing::info!(threshold_mb, poll_secs, "memory pressure monitor enabled");
+                crate::memory_monitor::start(threshold_mb, poll_secs)
+            });
+    let task_queue = Arc::new(crate::task_queue::TaskQueue::new_with_pressure(
         &server.config.concurrency,
+        memory_pressure,
     ));
     tracing::debug!(
         max_concurrent = server.config.concurrency.max_concurrent_tasks,
