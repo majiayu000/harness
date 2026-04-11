@@ -107,6 +107,15 @@ impl ReviewStore {
             )
             .execute(&pool)
             .await?;
+            // Clear all pre-migration rows: they have project_name='' and cannot be
+            // attributed to any specific project. Without this, persist_findings would
+            // insert new rows under the real project_name while the legacy '' rows
+            // remain, defeating project-scoped dedup and causing duplicate auto-fix
+            // tasks/PRs on the first review after upgrade. They will be re-generated
+            // on the next review cycle.
+            sqlx::query("DELETE FROM review_findings WHERE project_name = ''")
+                .execute(&pool)
+                .await?;
         }
         let has_claimed_at = columns
             .iter()

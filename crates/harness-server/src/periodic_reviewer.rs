@@ -1343,14 +1343,20 @@ async fn scrub_terminal_task_ids(
                 //      from the latest output — the fix actually worked).
                 //   2. The task completed cleanly without a warning error
                 //      (error.is_none() excludes graduated exits where issues remain).
-                // Any other Done case (finding recurred, or task graduated with issues)
-                // resets task_id to NULL so the finding can be re-spawned next cycle.
+                // If the task graduated with errors (error.is_some()), reset task_id
+                // so the finding can be re-spawned on the next cycle.
+                // If the task is Done but the finding still recurs with no error, the
+                // fix PR is likely still in review — leave task_id intact to prevent
+                // spawning a duplicate task/PR in the same tick.
                 TaskStatus::Done => {
                     if review_id != current_review_id && t.error.is_none() {
                         done_ids.push(task_id);
-                    } else {
+                    } else if t.error.is_some() {
+                        // Graduated exit: agent acknowledged remaining issues → retry.
                         retry_ids.push(task_id);
                     }
+                    // else: Done + recurred + no error → PR in flight; skip to avoid
+                    // duplicate spawning. Next cycle re-evaluates once the PR lands.
                 }
                 // Failed/Cancelled: fix attempt did not succeed — reset to NULL
                 // so the finding can be retried on the next cycle.
