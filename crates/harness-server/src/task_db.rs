@@ -263,9 +263,17 @@ impl TaskDb {
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(TaskSummaryRow::try_into_summary)
-            .collect()
+        let mut summaries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = row.id.clone();
+            match TaskSummaryRow::try_into_summary(row) {
+                Ok(summary) => summaries.push(summary),
+                Err(e) => {
+                    tracing::warn!(task_id = %id, "skipping malformed task row in list_summaries: {e}");
+                }
+            }
+        }
+        Ok(summaries)
     }
 
     /// Return `(id, status)` pairs for all tasks — skips all heavy columns.
@@ -298,6 +306,19 @@ impl TaskDb {
         }
         let rows = q.fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Return the status of a single task, fetching only the `status` column.
+    ///
+    /// Much lighter than `get()` — avoids deserializing the `rounds` JSON.
+    /// Used by `check_awaiting_deps` to resolve dependency status with a single
+    /// DB round-trip instead of a full row fetch.
+    pub async fn get_status_only(&self, id: &str) -> anyhow::Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM tasks WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(s,)| s))
     }
 
     /// Return `true` if a task row with the given ID exists in the database.
