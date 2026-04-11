@@ -471,3 +471,29 @@ async fn global_permit_not_leaked_on_mid_send_cancellation() {
         "global permit leaked after mid-send cancellation"
     );
 }
+
+#[tokio::test]
+async fn task_admission_blocked_under_pressure() {
+    let pressure = Arc::new(AtomicBool::new(true));
+    let q = TaskQueue::new_with_pressure(&config(4, 16), Some(pressure));
+    let result = q.acquire("proj", 0).await;
+    assert!(result.is_err(), "acquire must fail under memory pressure");
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("available system memory"),
+        "error message should mention memory"
+    );
+}
+
+#[tokio::test]
+async fn task_admission_succeeds_no_pressure() {
+    let pressure = Arc::new(AtomicBool::new(false));
+    let q = TaskQueue::new_with_pressure(&config(4, 16), Some(pressure));
+    let result = q.acquire("proj", 0).await;
+    assert!(
+        result.is_ok(),
+        "acquire must succeed when pressure flag is false"
+    );
+}

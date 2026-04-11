@@ -488,6 +488,17 @@ impl TaskQueue {
     /// releases all acquired resources — counters are decremented and any
     /// held project permit is returned to the queue.
     pub async fn acquire(&self, project_id: &str, priority: u8) -> anyhow::Result<TaskPermit> {
+        // Reject immediately when system memory is below the configured threshold.
+        if self
+            .memory_pressure
+            .as_ref()
+            .is_some_and(|f| f.load(AtomicOrdering::Relaxed))
+        {
+            return Err(anyhow::anyhow!(
+                "task rejected: available system memory is below the configured threshold"
+            ));
+        }
+
         // Reserve a global queue slot. fetch_add returns value before increment,
         // so if prev == max_queue_size the queue is already full.
         let prev = self.queued_count.fetch_add(1, AtomicOrdering::SeqCst);
