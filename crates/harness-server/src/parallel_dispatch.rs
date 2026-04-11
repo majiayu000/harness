@@ -174,11 +174,22 @@ pub fn decompose(prompt: &str) -> Result<Vec<SubtaskSpec>, String> {
     }
     // Scale chunk count linearly with file count, floor at 2, cap at MAX_PARALLEL.
     let n_chunks = (files.len() / 3).clamp(2, MAX_PARALLEL);
-    let chunk_size = files.len().div_ceil(n_chunks);
-    // Collect first so actual_count reflects real chunk count (may be < n_chunks
-    // when file count is not evenly divisible, e.g. 16 files → 4 chunks not 5).
-    let groups: Vec<Vec<String>> = files.chunks(chunk_size).map(|g| g.to_vec()).collect();
-    let actual_count = groups.len();
+    // Partition into exactly n_chunks groups (array-split style) so that actual
+    // parallelism is monotonically non-decreasing as file count grows.
+    // Using div_ceil for chunk_size causes files.chunks() to produce fewer than
+    // n_chunks groups (e.g. 25 files → 7 groups instead of 8).  Instead,
+    // distribute files as evenly as possible: first `extra` groups get one extra
+    // file, the rest get `base` files each.
+    let base = files.len() / n_chunks;
+    let extra = files.len() % n_chunks;
+    let mut groups: Vec<Vec<String>> = Vec::with_capacity(n_chunks);
+    let mut start = 0;
+    for i in 0..n_chunks {
+        let size = base + usize::from(i < extra);
+        groups.push(files[start..start + size].to_vec());
+        start += size;
+    }
+    let actual_count = n_chunks;
     Ok(groups
         .into_iter()
         .enumerate()
@@ -680,11 +691,11 @@ mod tests {
 
     #[test]
     fn decompose_labels_reflect_actual_chunk_count() {
-        // 16 files: n_chunks = (16/3).clamp(2,8) = 5, chunk_size = ceil(16/5) = 4
-        // actual chunks from .chunks(4) = 4, so labels must be X/4 not X/5.
+        // 16 files: n_chunks = (16/3).clamp(2,8) = 5; array-split gives exactly 5
+        // groups, so labels must be X/5.
         let subtasks = decompose(&make_prompt(16)).unwrap();
         let actual = subtasks.len();
-        assert_eq!(actual, 4, "expected 4 actual chunks for 16 files");
+        assert_eq!(actual, 5, "expected 5 actual chunks for 16 files");
         for (i, s) in subtasks.iter().enumerate() {
             let expected = format!("[Parallel subtask {}/{}]", i + 1, actual);
             assert!(
@@ -693,6 +704,18 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn test_decompose_chunk_count_monotone() {
+        // Chunk count must be monotonically non-decreasing as file count grows
+        // within the [2, MAX_PARALLEL] band (24→25 was a known regression).
+        let chunks_24 = decompose(&make_prompt(24)).unwrap().len();
+        let chunks_25 = decompose(&make_prompt(25)).unwrap().len();
+        assert!(
+            chunks_25 >= chunks_24,
+            "expected monotone: 25 files ({chunks_25} chunks) >= 24 files ({chunks_24} chunks)"
+        );
     }
 
     #[test]
