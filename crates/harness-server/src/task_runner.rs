@@ -1014,11 +1014,7 @@ impl TaskStore {
     ///
     /// `gh` CLI failures are treated as transient network errors; the task is left
     /// Pending so it will be retried normally.
-    pub async fn validate_recovered_tasks(
-        &self,
-        completion_callback: Option<CompletionCallback>,
-        q_values: Option<Arc<crate::q_value_store::QValueStore>>,
-    ) {
+    pub async fn validate_recovered_tasks(&self, completion_callback: Option<CompletionCallback>) {
         let candidates: Vec<(TaskId, String)> = self
             .cache
             .iter()
@@ -1125,33 +1121,6 @@ impl TaskStore {
                     pr_url,
                     "startup recovery: PR state {state} → task status updated"
                 );
-                // Back-propagate Q-values for all rules/experiences used during
-                // this task's pipeline stages (MemRL pattern, arxiv:2601.03192).
-                if let Some(ref qv) = q_values {
-                    let reward = match state.as_str() {
-                        "MERGED" => crate::q_value_store::REWARD_MERGED,
-                        "CLOSED" => crate::q_value_store::REWARD_CLOSED,
-                        _ => crate::q_value_store::REWARD_UNKNOWN_CLOSED,
-                    };
-                    match qv.get_experiences_for_task(&task_id.0).await {
-                        Ok(ids) if !ids.is_empty() => {
-                            if let Err(e) = qv
-                                .apply_q_update(&ids, reward, crate::q_value_store::DEFAULT_ALPHA)
-                                .await
-                            {
-                                tracing::warn!(
-                                    task_id = %task_id.0,
-                                    "q_value backpropagation failed: {e}"
-                                );
-                            }
-                        }
-                        Ok(_) => {} // no experiences recorded for this task
-                        Err(e) => tracing::warn!(
-                            task_id = %task_id.0,
-                            "failed to fetch experiences for Q-value update: {e}"
-                        ),
-                    }
-                }
                 if let Some(cb) = &completion_callback {
                     if let Some(final_state) = self.get(&task_id) {
                         cb(final_state).await;

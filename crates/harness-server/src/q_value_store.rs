@@ -94,6 +94,7 @@ impl QValueStore {
         experience_ids: &[&str],
     ) -> anyhow::Result<()> {
         let experiences_json = serde_json::to_string(experience_ids)?;
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO pipeline_events (task_id, phase, experiences_used, created_at)
              VALUES (?, ?, ?, datetime('now'))",
@@ -101,12 +102,22 @@ impl QValueStore {
         .bind(task_id)
         .bind(phase)
         .bind(&experiences_json)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         for rule_id in experience_ids {
-            self.increment_retrieval(rule_id).await?;
+            sqlx::query(
+                "INSERT INTO rule_experiences (rule_id, retrieval_count, updated_at)
+                 VALUES (?, 1, datetime('now'))
+                 ON CONFLICT(rule_id) DO UPDATE SET
+                   retrieval_count = retrieval_count + 1,
+                   updated_at      = datetime('now')",
+            )
+            .bind(rule_id)
+            .execute(&mut *tx)
+            .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -158,32 +169,28 @@ impl QValueStore {
             return Ok(());
         }
         let success_delta: i64 = if reward >= 1.0 { 1 } else { 0 };
+        let mut tx = self.pool.begin().await?;
         for rule_id in experience_ids {
-            // Ensure the row exists with default values first.
+            // Insert or update in one statement: Q_new = Q_old + alpha * (reward - Q_old)
             sqlx::query(
-                "INSERT INTO rule_experiences (rule_id, updated_at)
-                 VALUES (?, datetime('now'))
-                 ON CONFLICT(rule_id) DO NOTHING",
+                "INSERT INTO rule_experiences (rule_id, q_value, success_count, updated_at)
+                 VALUES (?, 0.5 + ? * (? - 0.5), ?, datetime('now'))
+                 ON CONFLICT(rule_id) DO UPDATE SET
+                   q_value       = q_value + ? * (? - q_value),
+                   success_count = success_count + ?,
+                   updated_at    = datetime('now')",
             )
             .bind(rule_id)
-            .execute(&self.pool)
-            .await?;
-
-            // Apply Q-update: Q_new = Q_old + alpha * (reward - Q_old)
-            sqlx::query(
-                "UPDATE rule_experiences
-                 SET q_value       = q_value + ? * (? - q_value),
-                     success_count = success_count + ?,
-                     updated_at    = datetime('now')
-                 WHERE rule_id = ?",
-            )
             .bind(alpha)
             .bind(reward)
             .bind(success_delta)
-            .bind(rule_id)
-            .execute(&self.pool)
+            .bind(alpha)
+            .bind(reward)
+            .bind(success_delta)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         tracing::debug!(
             experience_count = experience_ids.len(),
             reward,

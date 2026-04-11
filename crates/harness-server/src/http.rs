@@ -651,10 +651,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     {
         let tasks_for_recovery = tasks.clone();
         let cb_for_recovery = completion_callback.clone();
-        let q_values_for_recovery = q_values.clone();
         tokio::spawn(async move {
             tasks_for_recovery
-                .validate_recovered_tasks(cb_for_recovery, q_values_for_recovery)
+                .validate_recovered_tasks(cb_for_recovery)
                 .await;
         });
     }
