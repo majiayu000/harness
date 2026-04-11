@@ -282,7 +282,7 @@ impl WorkspaceManager {
                     || dir_name == format!("{td}-seq")
                     || dir_name
                         .strip_prefix(&format!("{td}-p"))
-                        .map_or(false, |rest| {
+                        .is_some_and(|rest| {
                             !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
                         })
             });
