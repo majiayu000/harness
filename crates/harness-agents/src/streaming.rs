@@ -174,6 +174,10 @@ pub(crate) async fn stream_child_output(
             tokio::time::timeout(dur, lines.next_line())
                 .await
                 .map_err(|_| {
+                    // Kill entire process group to prevent orphaned grandchild
+                    // processes (e.g. cargo test binaries) from running forever.
+                    #[cfg(unix)]
+                    crate::kill_process_group(child);
                     HarnessError::AgentExecution(format!(
                         "{agent_name} stream idle timeout after {}s: zombie connection terminated",
                         dur.as_secs()

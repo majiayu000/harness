@@ -151,6 +151,8 @@ impl CodeAgent for ClaudeCodeAgent {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        crate::set_process_group(&mut cmd);
         crate::strip_claude_env(&mut cmd);
         cmd.envs(&req.env_vars);
 
@@ -241,6 +243,8 @@ impl CodeAgent for ClaudeCodeAgent {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        crate::set_process_group(&mut cmd);
         crate::strip_claude_env(&mut cmd);
         cmd.envs(&req.env_vars);
 

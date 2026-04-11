@@ -142,6 +142,8 @@ impl AgentAdapter for CodexAdapter {
                 .stderr(std::process::Stdio::piped())
                 .current_dir(&req.project_root)
                 .kill_on_drop(true);
+            #[cfg(unix)]
+            crate::set_process_group(&mut cmd);
             crate::strip_claude_env(&mut cmd);
 
             let mut child = cmd.spawn().map_err(|e| {
