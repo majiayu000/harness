@@ -98,6 +98,16 @@ impl ReviewStore {
                 .execute(&pool)
                 .await?;
         }
+        let has_project_name = columns
+            .iter()
+            .any(|(_, name, _, _, _, _)| name == "project_name");
+        if !has_project_name {
+            sqlx::query(
+                "ALTER TABLE review_findings ADD COLUMN project_name TEXT NOT NULL DEFAULT ''",
+            )
+            .execute(&pool)
+            .await?;
+        }
         // Remove duplicate (rule_id, file, status) rows that may exist from
         // before this unique index was introduced; keep the most recent row per group.
         sqlx::query(
@@ -128,6 +138,7 @@ impl ReviewStore {
     pub async fn persist_findings(
         &self,
         review_id: &str,
+        project_name: &str,
         findings: &[ReviewFinding],
     ) -> anyhow::Result<usize> {
         // Detect PK duplicates within the batch before touching the DB.
@@ -147,12 +158,13 @@ impl ReviewStore {
         for f in findings {
             let result = sqlx::query(
                 "INSERT OR IGNORE INTO review_findings \
-                 (id, review_id, rule_id, priority, impact, confidence, effort, \
+                 (id, review_id, project_name, rule_id, priority, impact, confidence, effort, \
                   file, line, title, description, action) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&f.id)
             .bind(review_id)
+            .bind(project_name)
             .bind(&f.rule_id)
             .bind(&f.priority)
             .bind(f.impact)
@@ -171,10 +183,11 @@ impl ReviewStore {
             } else {
                 // Existing open finding for the same rule_id+file — mark as recurring.
                 sqlx::query(
-                    "UPDATE review_findings SET review_id = ? \
+                    "UPDATE review_findings SET review_id = ?, project_name = ? \
                      WHERE rule_id = ? AND file = ? AND status = 'open'",
                 )
                 .bind(review_id)
+                .bind(project_name)
                 .bind(&f.rule_id)
                 .bind(&f.file)
                 .execute(&mut *tx)
@@ -304,14 +317,19 @@ impl ReviewStore {
     /// reached a terminal state and should be freed for re-spawning.
     pub async fn list_assigned_task_ids(
         &self,
+        project_name: &str,
     ) -> anyhow::Result<Vec<(String, String, String, String)>> {
-        // Returns (rule_id, file, task_id, review_id).
+        // Returns (rule_id, file, task_id, review_id) scoped to the given project.
+        // Scoping by project_name prevents a tick for project A from touching
+        // findings that belong to project B (cross-project state corruption).
         // review_id is used by the scrub pass to detect findings that recurred in the
         // current review cycle (proving the previous fix task did not resolve them).
         let rows: Vec<(String, String, String, String)> = sqlx::query_as(
             "SELECT rule_id, file, task_id, review_id FROM review_findings \
-             WHERE status = 'open' AND task_id IS NOT NULL AND task_id != 'pending'",
+             WHERE status = 'open' AND task_id IS NOT NULL AND task_id != 'pending' \
+             AND project_name = ?",
         )
+        .bind(project_name)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
@@ -526,8 +544,8 @@ mod tests {
         let f2 = findings.clone();
 
         let (r1, r2) = tokio::join!(
-            store1.persist_findings("rev-1", &f1),
-            store2.persist_findings("rev-2", &f2),
+            store1.persist_findings("rev-1", "proj", &f1),
+            store2.persist_findings("rev-2", "proj", &f2),
         );
 
         // Both calls must succeed without constraint violation errors.
@@ -563,7 +581,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         let findings = vec![make_finding("F001", "RS-03", "src/lib.rs", "P1")];
-        store.persist_findings("rev-1", &findings).await?;
+        store.persist_findings("rev-1", "proj", &findings).await?;
 
         // First claim wins.
         assert!(
@@ -595,7 +613,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         let findings = vec![make_finding("F001", "RS-03", "src/lib.rs", "P1")];
-        store.persist_findings("rev-1", &findings).await?;
+        store.persist_findings("rev-1", "proj", &findings).await?;
 
         // Claim, then release (simulates enqueue failure).
         assert!(store.try_claim_finding("RS-03", "src/lib.rs").await?);
@@ -619,7 +637,7 @@ mod tests {
             make_finding("F2", "R2", "c.rs", "P2"),
             make_finding("F3", "R3", "d.rs", "P3"),
         ];
-        store.persist_findings("rev-1", &findings).await?;
+        store.persist_findings("rev-1", "proj", &findings).await?;
 
         let spawnable = store
             .list_spawnable_findings("rev-1", &["P1", "P2"])
@@ -640,7 +658,7 @@ mod tests {
             make_finding("F1", "R1", "a.rs", "P1"),
             make_finding("F2", "R2", "b.rs", "P2"),
         ];
-        store.persist_findings("rev-1", &findings).await?;
+        store.persist_findings("rev-1", "proj", &findings).await?;
         store.try_claim_finding("R1", "a.rs").await?;
         store.confirm_task_spawned("R1", "a.rs", "task-111").await?;
 
@@ -657,7 +675,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         let findings = vec![make_finding("F1", "R1", "a.rs", "P1")];
-        store.persist_findings("rev-1", &findings).await?;
+        store.persist_findings("rev-1", "proj", &findings).await?;
         sqlx::query("UPDATE review_findings SET status = 'resolved' WHERE id = 'F1'")
             .execute(&store.pool)
             .await?;
@@ -680,7 +698,7 @@ mod tests {
 
         // First review: persist, claim and confirm task.
         store
-            .persist_findings("rev-1", std::slice::from_ref(&finding))
+            .persist_findings("rev-1", "proj", std::slice::from_ref(&finding))
             .await?;
         store.try_claim_finding("RS-03", "src/lib.rs").await?;
         store
@@ -690,7 +708,7 @@ mod tests {
         // Second review: same rule_id+file triggers UPDATE (recurring finding),
         // review_id changes to rev-2 but task_id must be preserved.
         let finding2 = make_finding("F1", "RS-03", "src/lib.rs", "P1");
-        store.persist_findings("rev-2", &[finding2]).await?;
+        store.persist_findings("rev-2", "proj", &[finding2]).await?;
 
         // task_id IS NOT NULL so it must not appear in spawnable list.
         let spawnable = store
@@ -716,12 +734,12 @@ mod tests {
 
         // Simulate: list_spawnable_findings returned F1 under rev-1.
         store
-            .persist_findings("rev-1", std::slice::from_ref(&finding))
+            .persist_findings("rev-1", "proj", std::slice::from_ref(&finding))
             .await?;
 
         // Simulate race: persist_findings runs with rev-2 BEFORE try_claim_finding.
         let finding2 = make_finding("F1", "RS-03", "src/lib.rs", "P1");
-        store.persist_findings("rev-2", &[finding2]).await?;
+        store.persist_findings("rev-2", "proj", &[finding2]).await?;
 
         // try_claim_finding must succeed even though the row now has review_id="rev-2".
         let claimed = store.try_claim_finding("RS-03", "src/lib.rs").await?;
@@ -761,11 +779,11 @@ mod tests {
             task_id: None,
         }];
 
-        let inserted = store.persist_findings("rev-1", &findings).await?;
+        let inserted = store.persist_findings("rev-1", "proj", &findings).await?;
         assert_eq!(inserted, 1);
 
         // Same rule_id + file = dedup (recurring).
-        let inserted = store.persist_findings("rev-2", &findings).await?;
+        let inserted = store.persist_findings("rev-2", "proj", &findings).await?;
         assert_eq!(inserted, 0);
 
         let open = store.list_open().await?;

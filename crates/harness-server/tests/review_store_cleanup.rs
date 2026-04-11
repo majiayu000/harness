@@ -29,7 +29,7 @@ async fn list_assigned_task_ids_excludes_null_and_pending() -> anyhow::Result<()
         make_finding("F2", "R2", "b.rs", "P1"),
         make_finding("F3", "R3", "c.rs", "P1"),
     ];
-    store.persist_findings("rev-1", &findings).await?;
+    store.persist_findings("rev-1", "proj", &findings).await?;
 
     // F1: leave task_id NULL
     // F2: claim only → task_id = 'pending'
@@ -40,7 +40,7 @@ async fn list_assigned_task_ids_excludes_null_and_pending() -> anyhow::Result<()
         .confirm_task_spawned("R3", "c.rs", "task-real")
         .await?;
 
-    let assigned = store.list_assigned_task_ids().await?;
+    let assigned = store.list_assigned_task_ids("proj").await?;
     assert_eq!(assigned.len(), 1);
     assert_eq!(assigned[0].0, "R3");
     assert_eq!(assigned[0].1, "c.rs");
@@ -56,7 +56,7 @@ async fn reset_task_ids_for_terminal_frees_finding() -> anyhow::Result<()> {
         make_finding("F1", "R1", "a.rs", "P1"),
         make_finding("F2", "R2", "b.rs", "P1"),
     ];
-    store.persist_findings("rev-1", &findings).await?;
+    store.persist_findings("rev-1", "proj", &findings).await?;
 
     store.try_claim_finding("R1", "a.rs").await?;
     store.confirm_task_spawned("R1", "a.rs", "task-111").await?;

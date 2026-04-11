@@ -744,6 +744,7 @@ async fn run_review_tick(
     // correct repository — without this they fall back to main-worktree
     // detection and can execute against the wrong project.
     let project_root_for_poll = project_root.clone();
+    let project_name_for_poll = project.name.clone();
     // Capture the scan boundary before the review agents run. Using this
     // timestamp (rather than Utc::now() after synthesis completes) as the
     // watermark ensures that commits arriving while secondary/synthesis agents
@@ -901,7 +902,11 @@ async fn run_review_tick(
                 );
                 if let Some(ref rs) = review_store {
                     match rs
-                        .persist_findings(&final_task_id.0, &review.findings)
+                        .persist_findings(
+                            &final_task_id.0,
+                            &project_name_for_poll,
+                            &review.findings,
+                        )
                         .await
                     {
                         Ok(n) => {
@@ -918,6 +923,7 @@ async fn run_review_tick(
                             match scrub_terminal_task_ids(
                                 rs,
                                 &state_for_synthesis.core.tasks,
+                                &project_name_for_poll,
                                 &final_task_id.0,
                             )
                             .await
@@ -1294,9 +1300,10 @@ fn truncate_to(s: &str, max_chars: usize) -> String {
 async fn scrub_terminal_task_ids(
     review_store: &crate::review_store::ReviewStore,
     task_store: &crate::task_runner::TaskStore,
+    project_name: &str,
     current_review_id: &str,
 ) -> anyhow::Result<u64> {
-    let assigned = review_store.list_assigned_task_ids().await?;
+    let assigned = review_store.list_assigned_task_ids(project_name).await?;
     if assigned.is_empty() {
         return Ok(0);
     }
