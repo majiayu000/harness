@@ -775,10 +775,19 @@ async fn run_review_tick(
             return;
         }
 
-        // Now it is safe to enqueue the secondary reviewer (Cross strategy only).
-        let secondary_review_id: Option<harness_core::types::TaskId> = if let Some(agent) =
-            secondary_agent_name.as_ref()
-        {
+        // Only enqueue secondary (Cross strategy) when primary produced output.
+        // Synthesis requires both outputs; running secondary when primary timed
+        // out / OOM wastes queue/quota because its output will be discarded.
+        let secondary_review_id: Option<harness_core::types::TaskId> = if primary_output.is_none() {
+            if secondary_agent_name.is_some() {
+                tracing::warn!(
+                    task_id = %primary_review_id,
+                    "scheduler: primary produced no output — skipping secondary enqueue \
+                     to avoid queue/quota exhaustion (synthesis requires both outputs)"
+                );
+            }
+            None
+        } else if let Some(agent) = secondary_agent_name.as_ref() {
             let req = CreateTaskRequest {
                 prompt: Some(base_prompt.clone()),
                 agent: Some(agent.clone()),
@@ -892,32 +901,6 @@ async fn run_review_tick(
             return;
         };
 
-        // Advance the watermark only after confirmed non-None output.
-        // Advancing at enqueue time or before output is confirmed creates a
-        // duplicate-review gap: commits arriving between enqueue and execution
-        // are covered by this agent (--since has no --until bound) but would
-        // also fall inside the next tick's --since window, producing duplicate
-        // issues.  By advancing here we set the boundary to after all review
-        // tasks complete, ensuring the next tick's --since is always ≥ all
-        // commits this agent reviewed.  When the agent produces no output (OOM,
-        // rate-limit, timeout) the watermark is left unchanged so the next tick
-        // re-reviews the same window.
-        // Use pre_synthesis_ts when available (Cross mode) so the watermark
-        // boundary does not jump past commits that arrived during synthesis
-        // latency.  Falls back to Utc::now() for Single-strategy paths where
-        // no synthesis step exists.
-        let review_complete_ts = review_bound_ts.unwrap_or_else(Utc::now);
-        fallback_ts_for_poll.lock().await.fallback_ts = Some(review_complete_ts);
-        let watermark_event = Event::new(SessionId::new(), &hook_key, "scheduler", Decision::Pass);
-        if let Err(err) = state_for_synthesis
-            .observability
-            .events
-            .log(&watermark_event)
-            .await
-        {
-            tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
-        }
-
         match crate::review_store::parse_review_output(&output) {
             Ok(review) => {
                 // Advance the watermark only after parse succeeds.
@@ -929,7 +912,12 @@ async fn run_review_tick(
                 // enqueued, so commits arriving during secondary/synthesis are
                 // NOT included in the advanced watermark and will be reviewed
                 // on the next tick (fixes the Cross-strategy skip-forever bug).
-                fallback_ts_for_poll.lock().await.fallback_ts = Some(scan_ts);
+                // Use pre_synthesis_ts when available (Cross mode) so the
+                // watermark boundary does not jump past commits that arrived
+                // during synthesis latency.  Falls back to scan_ts for
+                // Single-strategy paths where no synthesis step exists.
+                let watermark_ts = review_bound_ts.unwrap_or(scan_ts);
+                fallback_ts_for_poll.lock().await.fallback_ts = Some(watermark_ts);
                 let watermark_event =
                     Event::new(SessionId::new(), &hook_key, "scheduler", Decision::Pass);
                 if let Err(err) = state_for_synthesis
