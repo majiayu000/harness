@@ -699,12 +699,15 @@ impl TaskStore {
         }
     }
 
-    /// Return IDs of terminal tasks (Done, Failed) directly from the database.
+    /// Return IDs of terminal tasks (Done, Failed, Cancelled) directly from the database.
     ///
     /// Used during startup for worktree cleanup. Only fetches task IDs to avoid
     /// deserializing the heavy `rounds` column for large historical datasets.
     pub async fn list_terminal_ids_from_db(&self) -> anyhow::Result<Vec<TaskId>> {
-        let ids = self.db.list_ids_by_status(&["done", "failed"]).await?;
+        let ids = self
+            .db
+            .list_ids_by_status(&["done", "failed", "cancelled"])
+            .await?;
         Ok(ids.into_iter().map(harness_core::types::TaskId).collect())
     }
 
@@ -1847,7 +1850,10 @@ pub async fn spawn_task_awaiting_deps(
 ///
 /// Async because dependency status checks fall back to the database for
 /// terminal tasks (Done/Failed) that were evicted from the startup cache.
-pub async fn check_awaiting_deps(store: &TaskStore) -> Vec<TaskId> {
+///
+/// Returns `(ready_ids, newly_failed_ids)`.  Both sets must be persisted by
+/// the caller so that status transitions survive a process restart.
+pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>) {
     let mut ready = Vec::new();
     let mut failed_deps: Vec<(TaskId, TaskId)> = Vec::new();
 
@@ -1893,6 +1899,7 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> Vec<TaskId> {
         }
     }
 
+    let mut newly_failed: Vec<TaskId> = Vec::new();
     for (task_id, failed_dep_id) in &failed_deps {
         if let Some(mut entry) = store.cache.get_mut(task_id) {
             // Only overwrite if the task is still AwaitingDeps — a concurrent
@@ -1900,6 +1907,7 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> Vec<TaskId> {
             if matches!(entry.status, TaskStatus::AwaitingDeps) {
                 entry.status = TaskStatus::Failed;
                 entry.error = Some(format!("dependency {} failed", failed_dep_id.0));
+                newly_failed.push(task_id.clone());
             }
         }
     }
@@ -1912,7 +1920,7 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> Vec<TaskId> {
         }
     }
 
-    ready
+    (ready, newly_failed)
 }
 
 #[cfg(test)]
