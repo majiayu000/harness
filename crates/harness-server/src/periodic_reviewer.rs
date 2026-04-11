@@ -1279,9 +1279,12 @@ const MAX_FILE_PATH_CHARS: usize = 4096;
 ///    mistaken for a structural marker.
 /// 3. Truncates the result to `max_chars` to bound payload size.
 fn sanitize_field(s: &str, max_chars: usize) -> String {
-    // Step 1: collapse all newline-like characters (including Unicode line/
+    // Step 1: truncate to `max_chars` BEFORE any allocation-heavy processing
+    // so that a maliciously large input cannot spike memory or CPU.
+    let bounded: String = s.chars().take(max_chars).collect();
+    // Step 2: collapse all newline-like characters (including Unicode line/
     // paragraph separators) to a plain space.
-    let no_newlines: String = s
+    let no_newlines: String = bounded
         .chars()
         .map(|c| {
             if matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
@@ -1291,13 +1294,11 @@ fn sanitize_field(s: &str, max_chars: usize) -> String {
             }
         })
         .collect();
-    // Step 2: neutralise literal delimiter tokens so they cannot be mistaken
+    // Step 3: neutralise literal delimiter tokens so they cannot be mistaken
     // for structural markers even when embedded within a single field line.
-    let neutralised = no_newlines
+    no_newlines
         .replace("[END FINDING]", "[END_FINDING]")
-        .replace("[HARNESS TASK", "[HARNESS_TASK");
-    // Step 3: truncate to bound payload size.
-    neutralised.chars().take(max_chars).collect()
+        .replace("[HARNESS TASK", "[HARNESS_TASK")
 }
 
 /// Build an injection-hardened prompt for a fix task.
