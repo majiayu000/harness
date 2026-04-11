@@ -302,9 +302,14 @@ impl ReviewStore {
     /// Excludes NULL (not yet claimed) and 'pending' (claim in progress) entries.
     /// Used by the periodic orphan-cleanup to detect findings whose fix tasks have
     /// reached a terminal state and should be freed for re-spawning.
-    pub async fn list_assigned_task_ids(&self) -> anyhow::Result<Vec<(String, String, String)>> {
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT rule_id, file, task_id FROM review_findings \
+    pub async fn list_assigned_task_ids(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String, String, String)>> {
+        // Returns (rule_id, file, task_id, review_id).
+        // review_id is used by the scrub pass to detect findings that recurred in the
+        // current review cycle (proving the previous fix task did not resolve them).
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT rule_id, file, task_id, review_id FROM review_findings \
              WHERE status = 'open' AND task_id IS NOT NULL AND task_id != 'pending'",
         )
         .fetch_all(&self.pool)

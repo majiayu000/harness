@@ -1334,15 +1334,17 @@ pub(crate) async fn run_task(
         }
 
         let Some(pr_num) = pr_num else {
-            tracing::warn!("no PR number found in agent output; skipping review");
+            tracing::warn!("no PR number found in agent output; marking failed for retry");
             mutate_and_persist(store, task_id, |s| {
-                s.status = TaskStatus::Done;
+                s.status = TaskStatus::Failed;
                 s.turn = 2;
+                s.error =
+                    Some("Implementation produced no PR; retry on next review cycle.".to_string());
             })
             .await?;
             tracing::info!(
                 task_id = %task_id,
-                status = "done",
+                status = "failed",
                 turns = 2,
                 pr_url = tracing::field::Empty,
                 total_elapsed_secs = task_start.elapsed().as_secs(),

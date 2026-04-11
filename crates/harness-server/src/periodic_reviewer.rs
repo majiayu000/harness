@@ -915,7 +915,12 @@ async fn run_review_tick(
                             // with a real task_id after confirm_task_spawned exhausted
                             // its retries, and also frees findings whose fix tasks
                             // failed/were cancelled so they can be retried.
-                            match scrub_terminal_task_ids(rs, &state_for_synthesis.core.tasks).await
+                            match scrub_terminal_task_ids(
+                                rs,
+                                &state_for_synthesis.core.tasks,
+                                &final_task_id.0,
+                            )
+                            .await
                             {
                                 Ok(n) if n > 0 => tracing::info!(
                                     freed = n,
@@ -1281,9 +1286,15 @@ fn truncate_to(s: &str, max_chars: usize) -> String {
 /// `confirm_task_spawned` exhausted its retries, and also frees findings whose
 /// fix tasks completed (successfully or otherwise) so they can be re-queued on
 /// the next review cycle.  Returns the number of rows reset.
+///
+/// `current_review_id` is the review_id written by `persist_findings` in this
+/// cycle.  A finding whose `review_id` matches the current cycle recurred in
+/// this review output, which proves that the associated task did not fix it —
+/// even if the task status is `Done`.
 async fn scrub_terminal_task_ids(
     review_store: &crate::review_store::ReviewStore,
     task_store: &crate::task_runner::TaskStore,
+    current_review_id: &str,
 ) -> anyhow::Result<u64> {
     let assigned = review_store.list_assigned_task_ids().await?;
     if assigned.is_empty() {
@@ -1291,13 +1302,25 @@ async fn scrub_terminal_task_ids(
     }
     let mut done_ids: Vec<String> = Vec::new();
     let mut retry_ids: Vec<String> = Vec::new();
-    for (_, _, task_id) in assigned {
+    for (_, _, task_id, review_id) in assigned {
         let tid = harness_core::types::TaskId(task_id.clone());
         if let Some(t) = task_store.get(&tid) {
             match t.status {
-                // Done: fix PR was approved — mark the finding resolved so it is
-                // not re-queued on the next cycle.
-                TaskStatus::Done => done_ids.push(task_id),
+                // Done: permanently resolve the finding only when both conditions hold:
+                //   1. The finding did NOT recur in the current review cycle
+                //      (review_id != current_review_id means the finding disappeared
+                //      from the latest output — the fix actually worked).
+                //   2. The task completed cleanly without a warning error
+                //      (error.is_none() excludes graduated exits where issues remain).
+                // Any other Done case (finding recurred, or task graduated with issues)
+                // resets task_id to NULL so the finding can be re-spawned next cycle.
+                TaskStatus::Done => {
+                    if review_id != current_review_id && t.error.is_none() {
+                        done_ids.push(task_id);
+                    } else {
+                        retry_ids.push(task_id);
+                    }
+                }
                 // Failed/Cancelled: fix attempt did not succeed — reset to NULL
                 // so the finding can be retried on the next cycle.
                 TaskStatus::Failed | TaskStatus::Cancelled => retry_ids.push(task_id),
