@@ -869,20 +869,27 @@ async fn run_review_tick(
                         let synth_out = poll_task_output(&store, &synth_id, timeout_secs).await;
                         if synth_out.is_none() {
                             // Synthesis timed out / OOM / rate-limited.  Fall back to
-                            // primary output so the watermark still advances and the
-                            // same window is not retried forever with duplicate work
-                            // (issue-1 fix).
+                            // primary output.  Do NOT advance the watermark to
+                            // pre_synthesis_ts here — secondary may have reviewed
+                            // commits that primary never saw, and advancing past them
+                            // would skip those commits forever.  Leave review_bound_ts
+                            // as None so the watermark falls back to scan_ts (primary's
+                            // boundary) at the merge site below.
                             tracing::warn!(
                                 task_id = %synth_id,
                                 "scheduler: synthesis produced no output \
                                  (timeout/OOM/rate-limit); falling back to primary \
-                                 review output to avoid duplicate retry loop"
+                                 review output; watermark held at scan_ts to avoid \
+                                 skipping commits only seen by secondary"
                             );
                             final_output = primary_output.clone();
                         } else {
                             final_output = synth_out;
+                            // Only advance to pre_synthesis_ts when synthesis actually
+                            // succeeded — it is safe because both primary and secondary
+                            // outputs are captured in the synthesis result.
+                            review_bound_ts = Some(pre_synthesis_ts);
                         }
-                        review_bound_ts = Some(pre_synthesis_ts);
                     }
                     Err(err) => {
                         tracing::warn!("scheduler: failed to enqueue synthesis review: {err}");
@@ -918,8 +925,15 @@ async fn run_review_tick(
                 // Single-strategy paths where no synthesis step exists.
                 let watermark_ts = review_bound_ts.unwrap_or(scan_ts);
                 fallback_ts_for_poll.lock().await.fallback_ts = Some(watermark_ts);
-                let watermark_event =
+                // Set the event's ts to watermark_ts (not Utc::now()) so that next
+                // tick's db_last_review_ts = max(event.ts) == watermark_ts.  If we
+                // used Utc::now() here, db_last_review_ts >> watermark_ts, and the
+                // max(db_ts, fallback_ts) merge would always pick db_ts, nullifying
+                // the intended bound and allowing commit-window skips during long
+                // secondary/synthesis latency (issue-2 fix).
+                let mut watermark_event =
                     Event::new(SessionId::new(), &hook_key, "scheduler", Decision::Pass);
+                watermark_event.ts = watermark_ts;
                 if let Err(err) = state_for_synthesis
                     .observability
                     .events
