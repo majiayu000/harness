@@ -1520,11 +1520,11 @@ where
             match result {
                 ok @ Ok(()) => break ok,
                 Err(ref e)
-                    if is_transient_error(&e.to_string())
+                    if is_transient_error(&format!("{:#}", e))
                         && transient_attempts < MAX_TRANSIENT_RETRIES =>
                 {
                     transient_attempts += 1;
-                    let reason = e.to_string();
+                    let reason = format!("{:#}", e);
 
                     // Account-level limit: activate global circuit breaker (60 min pause)
                     // so all other tasks stop burning turns.
