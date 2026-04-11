@@ -1346,6 +1346,25 @@ pub(crate) fn build_fix_prompt(
 mod tests {
     use super::*;
 
+    /// Extract the value of a named field from a `build_fix_prompt` output.
+    ///
+    /// Finds the first line whose trimmed prefix matches `field_name:` and
+    /// returns the trimmed value after the first colon.  Returns `None` if no
+    /// matching line is found.
+    fn extract_field_from_prompt(prompt: &str, field_name: &str) -> Option<String> {
+        let prefix = format!("{field_name}:");
+        let line = prompt
+            .lines()
+            .find(|l| l.trim_start().starts_with(&prefix))?;
+        let value = line
+            .split_once(':')
+            .map(|x| x.1)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        Some(value)
+    }
+
     #[test]
     fn review_config_defaults_disabled() {
         let config = ReviewConfig::default();
@@ -1751,17 +1770,8 @@ mod tests {
     fn test_description_truncated_at_500() {
         let long_desc: String = "a".repeat(600);
         let prompt = build_fix_prompt("RS-01", "src/lib.rs", 1, "T", &long_desc, "act");
-        // Extract the Description line
-        let desc_line = prompt
-            .lines()
-            .find(|l| l.trim_start().starts_with("Description:"))
+        let value = extract_field_from_prompt(&prompt, "Description")
             .expect("Description line must be present");
-        let value = desc_line
-            .split_once(':')
-            .map(|x| x.1)
-            .unwrap_or("")
-            .trim()
-            .to_string();
         assert_eq!(
             value.chars().count(),
             500,
@@ -1773,16 +1783,8 @@ mod tests {
     fn test_action_truncated_at_500() {
         let long_action: String = "b".repeat(600);
         let prompt = build_fix_prompt("RS-01", "src/lib.rs", 1, "T", "desc", &long_action);
-        let action_line = prompt
-            .lines()
-            .find(|l| l.trim_start().starts_with("Action:"))
-            .expect("Action line must be present");
-        let value = action_line
-            .split_once(':')
-            .map(|x| x.1)
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let value =
+            extract_field_from_prompt(&prompt, "Action").expect("Action line must be present");
         assert_eq!(
             value.chars().count(),
             500,
