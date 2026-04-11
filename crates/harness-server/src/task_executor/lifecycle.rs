@@ -612,7 +612,16 @@ pub(crate) async fn run_agent_review(
         };
         let fix_req = run_pre_execute(interceptors, fix_req).await?;
 
+        if let Some(max) = effective_max_turns {
+            if *turns_used >= max {
+                return Err(anyhow::anyhow!(
+                    "Turn budget exhausted before agent review fix round {agent_round}: used {} of {} allowed turns",
+                    turns_used, max
+                ));
+            }
+        }
         let fix_resp = tokio::time::timeout(turn_timeout, agent.execute(fix_req.clone())).await;
+        *turns_used += 1;
         match fix_resp {
             Ok(Ok(r)) => {
                 if let Some(val_err) = run_post_execute(interceptors, &fix_req, &r).await {

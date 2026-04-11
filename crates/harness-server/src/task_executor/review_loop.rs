@@ -36,6 +36,8 @@ pub(crate) struct ExternalReviewParams<'a> {
     pub turn_timeout: Duration,
     pub task_start: Instant,
     pub jaccard_threshold: f64,
+    pub effective_max_turns: Option<u32>,
+    pub turns_used: &'a mut u32,
 }
 
 /// Run the external review bot wait-and-respond loop.
@@ -66,6 +68,8 @@ pub(crate) async fn run_external_review_loop(p: ExternalReviewParams<'_>) -> any
         turn_timeout,
         task_start,
         jaccard_threshold,
+        effective_max_turns,
+        turns_used,
     } = p;
 
     let mut waiting_count: u32 = 1;
@@ -119,7 +123,16 @@ pub(crate) async fn run_external_review_loop(p: ExternalReviewParams<'_>) -> any
         };
         let check_req = run_pre_execute(interceptors, check_req).await?;
 
+        if let Some(max) = effective_max_turns {
+            if *turns_used >= max {
+                return Err(anyhow::anyhow!(
+                    "Turn budget exhausted before external review round {round}: used {} of {} allowed turns",
+                    turns_used, max
+                ));
+            }
+        }
         let resp = tokio::time::timeout(turn_timeout, agent.execute(check_req.clone())).await;
+        *turns_used += 1;
         let resp = match resp {
             Ok(Ok(r)) => {
                 let tool_violations = validate_tool_usage(

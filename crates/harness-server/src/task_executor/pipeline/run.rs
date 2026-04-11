@@ -646,6 +646,8 @@ pub(crate) async fn run_task(
         turn_timeout,
         task_start,
         jaccard_threshold: server_config.concurrency.loop_jaccard_threshold,
+        effective_max_turns,
+        turns_used: &mut turns_used,
     })
     .await
 }
