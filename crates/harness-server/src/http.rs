@@ -1550,9 +1550,69 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                                 "startup recovery (dep-watcher): \
                                  failed to resolve project path: {e}"
                             );
+                            // Fail-close: mark Failed so the task is not stuck in Pending
+                            // forever (check_awaiting_deps only scans AwaitingDeps, not Pending).
+                            if let Err(pe) = task_runner::mutate_and_persist(
+                                &state.core.tasks,
+                                &task.id,
+                                move |s| {
+                                    s.status = task_runner::TaskStatus::Failed;
+                                    s.error = Some(format!(
+                                        "startup recovery: cannot resolve project path: {e}"
+                                    ));
+                                },
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    "startup recovery (dep-watcher): \
+                                     failed to persist failure state: {pe}"
+                                );
+                            }
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
                             return;
                         }
                     };
+
+                    // Enforce allowed_project_roots: mirrors the check in execution.rs:182
+                    // and task_routes.rs:260-264 so a stale/tampered persisted project path
+                    // cannot execute outside the current allowlist after a restart.
+                    if let Err(e) = crate::project_registry::check_allowed_roots(
+                        &canonical,
+                        &state.core.server.config.server.allowed_project_roots,
+                    ) {
+                        tracing::error!(
+                            task_id = ?task.id,
+                            "startup recovery (dep-watcher): \
+                             project not in allowed_project_roots — marking task failed: {e}"
+                        );
+                        if let Err(pe) =
+                            task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
+                                s.status = task_runner::TaskStatus::Failed;
+                                s.error = Some(format!(
+                                    "startup recovery: project not in allowed roots: {e}"
+                                ));
+                            })
+                            .await
+                        {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery (dep-watcher): \
+                                 failed to persist failure state: {pe}"
+                            );
+                        }
+                        if let Some(cb) = &state.intake.completion_callback {
+                            if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                cb(final_state).await;
+                            }
+                        }
+                        return;
+                    }
                     let project_id = canonical.to_string_lossy().into_owned();
 
                     let permit = match state.concurrency.task_queue.acquire(&project_id).await {
@@ -1563,23 +1623,81 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                                 "startup recovery (dep-watcher): \
                                  failed to acquire permit: {e}"
                             );
+                            // Fail-close: mark Failed so the task is not stuck in Pending.
+                            if let Err(pe) = task_runner::mutate_and_persist(
+                                &state.core.tasks,
+                                &task.id,
+                                move |s| {
+                                    s.status = task_runner::TaskStatus::Failed;
+                                    s.error = Some(format!(
+                                        "startup recovery: failed to acquire concurrency permit: {e}"
+                                    ));
+                                },
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    "startup recovery (dep-watcher): \
+                                     failed to persist failure state: {pe}"
+                                );
+                            }
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
                             return;
                         }
                     };
 
-                    let classification = crate::complexity_router::classify(
-                        req.prompt.as_deref().unwrap_or(""),
-                        req.issue,
-                        req.pr,
-                    );
-                    let agent = match state.core.server.agent_registry.dispatch(&classification) {
-                        Ok(a) => a,
-                        Err(e) => {
+                    // Honor req.agent if explicitly set (mirrors runtime dep-watcher dispatch
+                    // at http.rs:692-701) so crash recovery runs the same agent as originally
+                    // requested rather than always re-classifying by complexity.
+                    let agent = if let Some(ref name) = req.agent {
+                        state.core.server.agent_registry.get(name)
+                    } else {
+                        let classification = crate::complexity_router::classify(
+                            req.prompt.as_deref().unwrap_or(""),
+                            req.issue,
+                            req.pr,
+                        );
+                        state
+                            .core
+                            .server
+                            .agent_registry
+                            .dispatch(&classification)
+                            .ok()
+                    };
+                    let agent = match agent {
+                        Some(a) => a,
+                        None => {
                             tracing::error!(
                                 task_id = ?task.id,
                                 "startup recovery (dep-watcher): \
-                                 failed to dispatch agent: {e}"
+                                 failed to resolve agent — marking task failed"
                             );
+                            if let Err(pe) =
+                                task_runner::mutate_and_persist(&state.core.tasks, &task.id, |s| {
+                                    s.status = task_runner::TaskStatus::Failed;
+                                    s.error = Some(
+                                        "startup recovery: no agent could be resolved for dispatch"
+                                            .to_string(),
+                                    );
+                                })
+                                .await
+                            {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    "startup recovery (dep-watcher): \
+                                     failed to persist failure state: {pe}"
+                                );
+                            }
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
                             return;
                         }
                     };
