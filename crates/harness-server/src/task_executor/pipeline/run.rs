@@ -86,7 +86,6 @@ pub(crate) async fn run_task(
     // completed agent call), so it already reflects any triage/plan turns even
     // if a previous transient attempt partially consumed the budget.
     let mut turns_used: u32 = *turns_used_acc;
-    *turns_used_acc = turns_used;
     tracing::info!(
         task_id = %task_id,
         ?triage_complexity,
