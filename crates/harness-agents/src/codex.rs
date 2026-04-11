@@ -286,17 +286,81 @@ mod tests {
         (dir, path)
     }
 
-    async fn wait_for_path(path: &std::path::Path, timeout_duration: Duration) -> bool {
-        timeout(timeout_duration, async {
-            loop {
-                if path.exists() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+    enum StreamObservation {
+        Item(Option<StreamItem>),
+        TaskFinished(Result<harness_core::error::Result<()>, tokio::task::JoinError>),
+    }
+
+    fn describe_stream_task_outcome(
+        outcome: Result<harness_core::error::Result<()>, tokio::task::JoinError>,
+    ) -> String {
+        match outcome {
+            Ok(Ok(())) => "task returned Ok(())".to_string(),
+            Ok(Err(err)) => format!("task returned Err({err})"),
+            Err(join_err) => format!("task join failed: {join_err}"),
+        }
+    }
+
+    async fn wait_for_stream_item_or_task_exit(
+        rx: &mut tokio::sync::mpsc::Receiver<StreamItem>,
+        handle: &mut tokio::task::JoinHandle<harness_core::error::Result<()>>,
+        timeout_duration: Duration,
+        description: &str,
+    ) -> Option<StreamItem> {
+        match timeout(timeout_duration, async {
+            tokio::select! {
+                item = rx.recv() => StreamObservation::Item(item),
+                result = &mut *handle => StreamObservation::TaskFinished(result),
             }
         })
         .await
-        .is_ok()
+        {
+            Ok(StreamObservation::Item(item)) => item,
+            Ok(StreamObservation::TaskFinished(outcome)) => {
+                panic!(
+                    "execute_stream finished before {description}: {}",
+                    describe_stream_task_outcome(outcome)
+                );
+            }
+            Err(_) => {
+                handle.abort();
+                let abort_outcome = timeout(Duration::from_secs(2), handle).await;
+                panic!(
+                    "timed out waiting for {description} after {timeout_duration:?}; abort outcome: {abort_outcome:?}"
+                );
+            }
+        }
+    }
+
+    async fn assert_path_observed_before_task_exit(
+        path: &std::path::Path,
+        handle: &mut tokio::task::JoinHandle<harness_core::error::Result<()>>,
+        timeout_duration: Duration,
+        description: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + timeout_duration;
+        loop {
+            if path.exists() {
+                return;
+            }
+            if handle.is_finished() {
+                let outcome = handle.await;
+                panic!(
+                    "execute_stream finished before {description} at `{}`: {}",
+                    path.display(),
+                    describe_stream_task_outcome(outcome)
+                );
+            }
+            if tokio::time::Instant::now() >= deadline {
+                handle.abort();
+                let abort_outcome = timeout(Duration::from_secs(2), handle).await;
+                panic!(
+                    "timed out waiting for {description} at `{}` after {timeout_duration:?}; abort outcome: {abort_outcome:?}",
+                    path.display()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -395,9 +459,9 @@ printf 'world\n'
         let (dir, script) = write_executable_script(
             r#"
 printf 'first\n'
-sleep 2
+sleep 0.5
 printf 'second\n'
-sleep 2
+sleep 0.5
 printf 'third\n'
 "#,
         );
@@ -409,15 +473,16 @@ printf 'third\n'
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let handle = tokio::spawn(async move { agent.execute_stream(request, tx).await });
+        let mut handle = tokio::spawn(async move { agent.execute_stream(request, tx).await });
 
-        let first = timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("timed out waiting for first stream item");
-
-        // On slow CI the process may exit before the first item arrives.
-        // Either way, dropping the receiver must cause convergence.
-        if let Some(item) = first {
+        if let Some(item) = wait_for_stream_item_or_task_exit(
+            &mut rx,
+            &mut handle,
+            Duration::from_secs(20),
+            "first stream item",
+        )
+        .await
+        {
             assert!(
                 matches!(item, StreamItem::MessageDelta { .. }),
                 "expected first event to be delta, got {item:?}"
@@ -426,7 +491,7 @@ printf 'third\n'
 
         drop(rx);
 
-        let result = timeout(Duration::from_secs(15), handle)
+        let result = timeout(Duration::from_secs(10), handle)
             .await
             .expect("execute_stream task should converge after cancellation")
             .expect("join should succeed");
@@ -472,12 +537,15 @@ printf 'third\n'
             ..AgentRequest::default()
         };
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let handle = tokio::spawn(async move { agent.execute_stream(request, tx).await });
+        let mut handle = tokio::spawn(async move { agent.execute_stream(request, tx).await });
 
-        if !wait_for_path(&started_marker, Duration::from_secs(10)).await {
-            let outcome = timeout(Duration::from_secs(1), handle).await;
-            panic!("stream process did not stay alive long enough to observe startup: {outcome:?}");
-        }
+        assert_path_observed_before_task_exit(
+            &started_marker,
+            &mut handle,
+            Duration::from_secs(20),
+            "startup marker",
+        )
+        .await;
 
         handle.abort();
         let join_err = timeout(Duration::from_secs(2), handle)
