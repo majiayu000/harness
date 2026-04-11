@@ -25,6 +25,15 @@ impl Drop for AbortOnDrop {
 /// Wire up `--max-parallel` CLI flag to override this in a follow-up (see #638).
 const MAX_PARALLEL: usize = 8;
 
+/// Maximum number of sequential steps accepted from a numbered-list prompt.
+///
+/// Each step executes serially with the full `turn_timeout` (default 3600 s).
+/// Without this cap a single numbered-list prompt with N steps would occupy a
+/// worker for up to `N × turn_timeout` seconds — a practical queue-starvation
+/// / DoS path. The limit is intentionally generous (20 × 3600 s = 20 h worst
+/// case) but cuts off adversarially large inputs.
+const MAX_SEQUENTIAL_STEPS: usize = 20;
+
 const PARALLEL_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "swift", "cpp", "c", "h", "toml",
     "yaml", "yml", "json", "sh", "md",
@@ -125,10 +134,21 @@ pub fn decompose(prompt: &str) -> Vec<SubtaskSpec> {
             })
             .collect();
         if items.len() >= 2 {
-            // Sequential numbered-list steps are not capped: each step depends on
-            // the previous, so they execute one-at-a-time and the semaphore queue
-            // depth is bounded by the number of concurrent parallel batches, not
-            // by the number of sequential steps within a single prompt.
+            // Cap to MAX_SEQUENTIAL_STEPS to prevent queue starvation.
+            // Each step runs serially with the full turn_timeout (default 3600 s);
+            // an unbounded list would occupy a worker for N × timeout seconds.
+            let items: &[&str] = if items.len() > MAX_SEQUENTIAL_STEPS {
+                tracing::warn!(
+                    "parallel_dispatch: numbered-list has {} steps, \
+                     capping at {} to prevent queue starvation",
+                    items.len(),
+                    MAX_SEQUENTIAL_STEPS
+                );
+                &items[..MAX_SEQUENTIAL_STEPS]
+            } else {
+                &items
+            };
+            let total = items.len();
             return items
                 .iter()
                 .enumerate()
@@ -137,7 +157,7 @@ pub fn decompose(prompt: &str) -> Vec<SubtaskSpec> {
                         "{}\n\n[Sequential subtask {}/{}] {}",
                         prompt,
                         i + 1,
-                        items.len(),
+                        total,
                         item.trim()
                     ),
                     depends_on_indices: if i == 0 { vec![] } else { vec![i - 1] },
@@ -387,6 +407,12 @@ async fn run_concurrent_subtasks(
     let mut handles: Vec<tokio::task::JoinHandle<(usize, Result<AgentResponse, String>)>> =
         Vec::with_capacity(count);
     let mut sub_ids: Vec<Option<TaskId>> = Vec::with_capacity(count);
+    // RAII abort guards: when this Vec is dropped (including when the parent
+    // future is cancelled via the cancel endpoint), every spawned task is
+    // aborted.  Without these guards, dropping a JoinHandle merely detaches
+    // the child; agent processes would keep running and mutating worktrees
+    // even after the parent task is cancelled.
+    let mut abort_guards: Vec<AbortOnDrop> = Vec::with_capacity(count);
     let sem = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL));
 
     for (i, spec) in subtasks.into_iter().enumerate() {
@@ -406,7 +432,7 @@ async fn run_concurrent_subtasks(
                     ..Default::default()
                 };
                 let sem = Arc::clone(&sem);
-                handles.push(tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     // Acquire semaphore first (unbounded wait), then apply timeout
                     // only to the actual agent execution — subtasks beyond the first
                     // MAX_PARALLEL do not time out while waiting in the queue.
@@ -424,14 +450,19 @@ async fn run_concurrent_subtasks(
                         )),
                     };
                     (i, result)
-                }));
+                });
+                abort_guards.push(AbortOnDrop(handle.abort_handle()));
+                handles.push(handle);
             }
             Err(e) => {
                 tracing::warn!("parallel_dispatch: workspace creation failed for subtask {i}: {e}");
                 sub_ids.push(None);
-                handles.push(tokio::spawn(async move {
-                    (i, Err(format!("workspace creation failed: {e}")))
-                }));
+                let handle =
+                    tokio::spawn(
+                        async move { (i, Err(format!("workspace creation failed: {e}"))) },
+                    );
+                abort_guards.push(AbortOnDrop(handle.abort_handle()));
+                handles.push(handle);
             }
         }
     }
@@ -469,6 +500,11 @@ async fn run_concurrent_subtasks(
             tracing::warn!("parallel_dispatch: workspace cleanup failed for {sub_id:?}: {e}");
         }
     }
+
+    // All tasks have completed — dropping abort_guards here is a no-op.
+    // On parent-future cancellation they would have been dropped earlier,
+    // aborting every task before this point is reached.
+    drop(abort_guards);
 
     ParallelRunResult {
         results,
@@ -662,10 +698,10 @@ mod tests {
     }
 
     #[test]
-    fn decompose_numbered_list_preserves_all_steps() {
-        // Sequential steps must ALL be preserved — dropping later steps is a
+    fn decompose_numbered_list_preserves_all_steps_within_cap() {
+        // Steps within the cap must ALL be preserved — dropping steps is a
         // correctness regression (e.g. a migration checklist must run every step).
-        let n = MAX_PARALLEL + 2;
+        let n = MAX_PARALLEL + 2; // 10 < MAX_SEQUENTIAL_STEPS (20)
         let prompt: String = (1..=n)
             .map(|i| format!("{}. task {}", i, i))
             .collect::<Vec<_>>()
@@ -677,6 +713,31 @@ mod tests {
             "expected all {} steps preserved, got {}",
             n,
             subtasks.len()
+        );
+    }
+
+    #[test]
+    fn decompose_numbered_list_caps_at_max_sequential_steps() {
+        // Inputs exceeding MAX_SEQUENTIAL_STEPS must be truncated to prevent
+        // queue starvation (N × turn_timeout seconds of serial execution).
+        let n = MAX_SEQUENTIAL_STEPS + 5;
+        let prompt: String = (1..=n)
+            .map(|i| format!("{}. task {}", i, i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let subtasks = decompose(&prompt);
+        assert_eq!(
+            subtasks.len(),
+            MAX_SEQUENTIAL_STEPS,
+            "expected cap at {}, got {}",
+            MAX_SEQUENTIAL_STEPS,
+            subtasks.len()
+        );
+        // Dependency chain must remain intact within the capped set.
+        assert!(subtasks[0].depends_on_indices.is_empty());
+        assert_eq!(
+            subtasks[MAX_SEQUENTIAL_STEPS - 1].depends_on_indices,
+            vec![MAX_SEQUENTIAL_STEPS - 2]
         );
     }
 
