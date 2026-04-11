@@ -688,6 +688,14 @@ async fn run_review_tick(
         );
     }
 
+    // Capture the scan boundary BEFORE enqueuing the primary task so that
+    // any commit landing between the agent's git-history snapshot and this
+    // point is included in the next tick's window.  Moving this capture
+    // after enqueue_task would create a skip-forever edge case: commits
+    // arriving in that gap are missed by the current run and then excluded
+    // by `--since=scan_ts` on the next tick.
+    let scan_ts = Utc::now();
+
     let review_req = CreateTaskRequest {
         prompt: Some(base_prompt.clone()),
         agent: Some(review_agent.clone()),
@@ -744,11 +752,6 @@ async fn run_review_tick(
     // correct repository — without this they fall back to main-worktree
     // detection and can execute against the wrong project.
     let project_root_for_poll = project_root.clone();
-    // Capture the scan boundary before the review agents run. Using this
-    // timestamp (rather than Utc::now() after synthesis completes) as the
-    // watermark ensures that commits arriving while secondary/synthesis agents
-    // are executing are NOT silently skipped on the next tick.
-    let scan_ts = Utc::now();
     let handle = tokio::spawn(async move {
         let primary_output = poll_task_output(&store, &primary_review_id, timeout_secs).await;
         tracing::info!(
@@ -882,8 +885,14 @@ async fn run_review_tick(
                 // NOT included in the advanced watermark and will be reviewed
                 // on the next tick (fixes the Cross-strategy skip-forever bug).
                 fallback_ts_for_poll.lock().await.fallback_ts = Some(scan_ts);
-                let watermark_event =
+                // Stamp the event with `scan_ts` (not Utc::now()) so the DB
+                // watermark matches the in-memory fallback_ts.  If we used
+                // Utc::now() here the next tick's `max(db_ts, fallback_ts)`
+                // would resolve to post-synthesis time, silently skipping
+                // commits that arrived between scan_ts and synthesis end.
+                let mut watermark_event =
                     Event::new(SessionId::new(), &hook_key, "scheduler", Decision::Pass);
+                watermark_event.ts = scan_ts;
                 if let Err(err) = state_for_synthesis
                     .observability
                     .events
