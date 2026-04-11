@@ -480,7 +480,9 @@ const TRANSIENT_PATTERNS: &[&str] = &[
     "ETIMEDOUT",
     // SQLite transient contention — SQLITE_BUSY / SQLITE_LOCKED
     "database is locked",
+    "database table is locked",
     "SQLITE_BUSY",
+    "SQLITE_LOCKED",
 ];
 
 /// Pattern indicating the CLI account-level usage limit has been reached.
