@@ -1301,6 +1301,25 @@ where
         // spawn_preregistered_task returns, which happens almost immediately).
         let _permit = permit;
         let _group_permit = group_permit;
+
+        // Guard against the cancel-before-abort-handle-registration race:
+        // the dep-watcher checks status before calling spawn_preregistered_task,
+        // but store_abort_handle() runs *after* tokio::spawn() returns — so a
+        // concurrent cancel arriving in that gap is a no-op on the abort handle.
+        // Re-check here before doing any real work so we never execute a task
+        // that was already cancelled.
+        if store
+            .cache
+            .get(&id)
+            .is_some_and(|e| matches!(e.status, TaskStatus::Cancelled))
+        {
+            tracing::info!(
+                task_id = %id.0,
+                "task cancelled before execution began — skipping"
+            );
+            return Ok(());
+        }
+
         let detect_worktree = detect_worktree.clone();
         let raw_project =
             resolve_project_root_with(req.project.clone(), move || detect_worktree()).await?;

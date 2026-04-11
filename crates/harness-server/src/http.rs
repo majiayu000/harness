@@ -630,14 +630,17 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                 interval.tick().await;
                 let ready_ids = crate::task_runner::check_awaiting_deps(&store);
                 for task_id in ready_ids {
-                    // Take pending_request from the in-memory cache only — do NOT persist
-                    // yet.  Deferring the DB write until after permit acquisition means that
-                    // if the process crashes before acquire, the DB still contains the
-                    // pending_request and startup recovery can retry the dispatch.
+                    // Clone pending_request from cache (do NOT take/remove it yet).
+                    // Keeping pending_request in cache means that when we persist after
+                    // permit acquisition the DB row retains pending_request_json.  If the
+                    // server crashes between that persist and spawn_preregistered_task, the
+                    // DB will show status=Pending + pending_request set, and startup recovery
+                    // can detect and re-dispatch the task.  The entry is cleared from cache
+                    // (and DB) after spawn_preregistered_task returns successfully.
                     let pending_req = store
                         .cache
-                        .get_mut(&task_id)
-                        .and_then(|mut e| e.pending_request.take());
+                        .get(&task_id)
+                        .and_then(|e| e.pending_request.clone());
 
                     let req = match pending_req {
                         Some(r) => r,
@@ -859,24 +862,26 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                     );
                                     return;
                                 }
-                                // Permit acquired — commit the pending_request clear to DB
-                                // now that dispatch is guaranteed to proceed.
+                                // Permit acquired — persist Pending status to DB while
+                                // retaining pending_request_json (cloned, not taken).  If the
+                                // server crashes between this persist and the spawn below,
+                                // startup recovery detects Pending + pending_request and
+                                // re-dispatches the task.
                                 if let Err(e) = store2.persist(&task_id2).await {
                                     tracing::warn!(
                                         task_id = %task_id2.0,
                                         "dep-watcher: failed to persist task before dispatch: {e} \
                                          — aborting dispatch, restoring state for next tick retry"
                                     );
-                                    // Restore in-memory state so the next watcher tick retries,
-                                    // but only if the task has not been cancelled (or otherwise
-                                    // transitioned) during the persist await — resurrecting a
-                                    // cancelled task would re-dispatch it on the next tick.
+                                    // Restore status so the next watcher tick retries.
+                                    // Guard: only restore if still Pending — don't resurrect
+                                    // a cancelled task.  pending_request was cloned (not taken)
+                                    // so it is already in the cache; only status needs resetting.
                                     if let Some(mut entry) = store2.cache.get_mut(&task_id2) {
                                         if matches!(
                                             entry.status,
                                             crate::task_runner::TaskStatus::Pending
                                         ) {
-                                            entry.pending_request = Some(req);
                                             entry.status =
                                                 crate::task_runner::TaskStatus::AwaitingDeps;
                                         }
@@ -898,8 +903,10 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                         "dep-watcher: task cancelled during persist — \
                                          aborting dispatch"
                                     );
-                                    return; // drops permit; DB already has no pending_request
+                                    return; // drops permit; task cancelled, no re-dispatch needed
                                 }
+                                let store3 = store2.clone();
+                                let task_id3 = task_id2.clone();
                                 crate::task_runner::spawn_preregistered_task(
                                     task_id2,
                                     store2,
@@ -916,24 +923,30 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                     None,
                                 )
                                 .await;
+                                // Task is now executing.  Clear pending_request from cache so
+                                // the dep-watcher does not attempt a second dispatch and so
+                                // subsequent persists (e.g. status → Implementing) write
+                                // pending_request_json = NULL to the DB.
+                                if let Some(mut entry) = store3.cache.get_mut(&task_id3) {
+                                    entry.pending_request = None;
+                                };
                             }
                             Err(e) => {
                                 tracing::error!(
                                     task_id = %task_id2.0,
                                     "dep-watcher: failed to acquire concurrency permit: {e}"
                                 );
-                                // Restore both pending_request AND status so the next
-                                // watcher tick (which only scans AwaitingDeps) can retry.
-                                // The DB still holds the original values because we have
-                                // not persisted yet, so no re-persist is needed.
-                                // Guard against resurrecting a cancelled task: only restore
-                                // if the status is still Pending (set by check_awaiting_deps).
+                                // Restore status so the next watcher tick (which only scans
+                                // AwaitingDeps) can retry.  DB still holds the original values
+                                // (no persist yet) so no re-persist is needed.
+                                // Guard: only restore if still Pending — don't resurrect a
+                                // cancelled task.  pending_request was cloned (not taken) so
+                                // it is already in the cache; only status needs resetting.
                                 if let Some(mut entry) = store2.cache.get_mut(&task_id2) {
                                     if matches!(
                                         entry.status,
                                         crate::task_runner::TaskStatus::Pending
                                     ) {
-                                        entry.pending_request = Some(req);
                                         entry.status = crate::task_runner::TaskStatus::AwaitingDeps;
                                     }
                                 }
@@ -1478,6 +1491,126 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         None,
                     )
                     .await;
+                });
+            }
+        }
+    }
+
+    // Re-dispatch dep-watcher tasks that were in mid-dispatch when the server crashed.
+    // These tasks have status=Pending and pending_request persisted in the DB as
+    // pending_request_json, but have no pr_url (the task had not yet started executing).
+    // The pr_url-based recovery block above will NOT pick them up, so without this
+    // second pass they silently stay stuck in Pending forever.
+    {
+        let dep_watcher_stuck: Vec<_> = state
+            .core
+            .tasks
+            .list_all()
+            .into_iter()
+            .filter(|t| {
+                matches!(t.status, task_runner::TaskStatus::Pending)
+                    && t.pending_request.is_some()
+                    && t.pr_url.is_none()
+            })
+            .collect();
+        if !dep_watcher_stuck.is_empty() {
+            tracing::info!(
+                count = dep_watcher_stuck.len(),
+                "startup: re-dispatching dep-watcher pending task(s) with stored requests"
+            );
+            for task in dep_watcher_stuck {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let req = match task.pending_request.clone() {
+                        Some(r) => r,
+                        None => {
+                            // Unreachable: the filter guarantees Some, but guard
+                            // defensively so we never produce a stuck task.
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery (dep-watcher): \
+                                 pending_request is None despite filter — skipping"
+                            );
+                            return;
+                        }
+                    };
+
+                    // Resolve canonical project path from the stored request, falling
+                    // back to the repo slug if the request had no explicit project set.
+                    let project_path = req
+                        .project
+                        .clone()
+                        .or_else(|| task.repo.as_deref().map(std::path::PathBuf::from));
+                    let canonical = match task_runner::resolve_canonical_project(project_path).await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery (dep-watcher): \
+                                 failed to resolve project path: {e}"
+                            );
+                            return;
+                        }
+                    };
+                    let project_id = canonical.to_string_lossy().into_owned();
+
+                    let permit = match state.concurrency.task_queue.acquire(&project_id).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery (dep-watcher): \
+                                 failed to acquire permit: {e}"
+                            );
+                            return;
+                        }
+                    };
+
+                    let classification = crate::complexity_router::classify(
+                        req.prompt.as_deref().unwrap_or(""),
+                        req.issue,
+                        req.pr,
+                    );
+                    let agent = match state.core.server.agent_registry.dispatch(&classification) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery (dep-watcher): \
+                                 failed to dispatch agent: {e}"
+                            );
+                            return;
+                        }
+                    };
+                    let (reviewer, _) = resolve_reviewer(
+                        &state.core.server.agent_registry,
+                        &state.core.server.config.agents.review,
+                        agent.name(),
+                    );
+
+                    state.core.tasks.register_task_stream(&task.id);
+                    task_runner::spawn_preregistered_task(
+                        task.id.clone(),
+                        state.core.tasks.clone(),
+                        agent,
+                        reviewer,
+                        Arc::new(state.core.server.config.clone()),
+                        state.engines.skills.clone(),
+                        state.observability.events.clone(),
+                        state.interceptors.clone(),
+                        req,
+                        state.concurrency.workspace_mgr.clone(),
+                        permit,
+                        state.intake.completion_callback.clone(),
+                        None,
+                    )
+                    .await;
+                    // Clear pending_request from cache so subsequent persists
+                    // (e.g. status → Implementing) write pending_request_json = NULL.
+                    if let Some(mut entry) = state.core.tasks.cache.get_mut(&task.id) {
+                        entry.pending_request = None;
+                    }
                 });
             }
         }
