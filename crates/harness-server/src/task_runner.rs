@@ -860,42 +860,43 @@ impl TaskStore {
     }
 
     /// Wait if the global rate-limit circuit breaker is active.
-    /// Loops until the breaker is fully cleared, re-sleeping if the deadline
-    /// is extended during a sleep window (prevents early resume on 429 extension).
+    /// Returns only after the deadline is None or already past. Loops to handle
+    /// the case where a concurrent `set_rate_limit()` extends the deadline while
+    /// this task is sleeping — without looping, the task would proceed after the
+    /// original deadline and burn turns / trigger extra 429s.
     pub async fn wait_for_rate_limit(&self) {
         loop {
             let deadline = { *self.rate_limit_until.read().await };
-            match deadline {
-                None => return,
-                Some(until) => {
-                    let now = tokio::time::Instant::now();
-                    if now >= until {
-                        // Deadline passed; only clear+return if unchanged.
-                        // If a newer deadline was set between the read-lock and
-                        // write-lock, fall through and loop to respect it.
-                        let mut wl = self.rate_limit_until.write().await;
-                        if *wl == Some(until) {
-                            *wl = None;
-                            return;
-                        }
-                        // Deadline extended; drop write lock and loop.
-                    }
-                    let remaining = until - now;
-                    tracing::info!(
-                        remaining_secs = remaining.as_secs(),
-                        "task waiting for rate-limit circuit breaker to clear"
-                    );
-                    tokio::time::sleep_until(until).await;
-                    // Only clear if the deadline wasn't extended during sleep.
-                    // If it was extended, loop to re-check and sleep to the new deadline.
-                    let mut wl = self.rate_limit_until.write().await;
-                    if *wl == Some(until) {
-                        *wl = None;
-                        return;
-                    }
-                    // Deadline changed (extended or cleared by another waiter); loop again.
+            let Some(until) = deadline else { return };
+            let now = tokio::time::Instant::now();
+            if now >= until {
+                // Deadline already passed. Clear it if unchanged; if a concurrent
+                // setter extended the deadline, re-loop to wait for the new value.
+                let mut wl = self.rate_limit_until.write().await;
+                if *wl == Some(until) {
+                    *wl = None;
+                    return;
+                }
+                // Deadline was extended concurrently — fall through to re-loop.
+                continue;
+            }
+            let remaining = until - now;
+            tracing::info!(
+                remaining_secs = remaining.as_secs(),
+                "task waiting for rate-limit circuit breaker to clear"
+            );
+            tokio::time::sleep_until(until).await;
+            // Only clear the breaker if it still holds the same deadline we
+            // snapshotted. A concurrent set_rate_limit() call may have extended
+            // the deadline during our sleep; preserving the new deadline lets
+            // the next loop iteration wait for the extension.
+            {
+                let mut wl = self.rate_limit_until.write().await;
+                if *wl == Some(until) {
+                    *wl = None;
                 }
             }
+            // Loop again: re-read the deadline in case it was extended.
         }
     }
 
