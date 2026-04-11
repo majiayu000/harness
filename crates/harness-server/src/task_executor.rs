@@ -747,7 +747,13 @@ pub(crate) async fn run_task(
     // Load checkpoint and task state to determine if we can skip phases.
     // This is the duplicate-PR prevention gate: if the task already has a PR,
     // we skip triage/plan/implement and jump directly to agent review.
-    let checkpoint = store.load_checkpoint(task_id).await.unwrap_or(None);
+    let checkpoint = match store.load_checkpoint(task_id).await {
+        Ok(ck) => ck,
+        Err(e) => {
+            tracing::error!(task_id = %task_id, "failed to load checkpoint: {e}; proceeding without resume (duplicate-PR risk)");
+            None
+        }
+    };
     let resumed_pr_url: Option<String> = store
         .get(task_id)
         .and_then(|t| t.pr_url)
