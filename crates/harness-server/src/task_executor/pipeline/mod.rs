@@ -362,7 +362,7 @@ pub(crate) async fn load_task_config(
         .await
         .unwrap_or_else(|| "{owner}/{repo}".to_string());
 
-    let checkpoint = store.load_checkpoint(task_id).await.unwrap_or(None);
+    let checkpoint = store.load_checkpoint(task_id).await?;
     let resumed_pr_url: Option<String> = store
         .get(task_id)
         .and_then(|t| t.pr_url)
