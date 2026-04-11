@@ -576,7 +576,7 @@ pub(crate) async fn run_task(
     if review_config.enabled && !skip_agent_review {
         if let Some(reviewer) = reviewer {
             tracing::info!(pr_url = %pr_url.as_deref().unwrap_or(""), "starting agent review");
-            let (review_ok, pushed) = lifecycle::run_agent_review(
+            let agent_review_result = lifecycle::run_agent_review(
                 store,
                 task_id,
                 agent,
@@ -593,7 +593,11 @@ pub(crate) async fn run_task(
                 effective_max_turns,
                 &mut turns_used,
             )
-            .await?;
+            .await;
+            // Sync accumulated turns before any return so transient retries
+            // carry forward the turns consumed in the agent review phase.
+            *turns_used_acc = turns_used;
+            let (review_ok, pushed) = agent_review_result?;
             if !review_ok {
                 return Ok(());
             }
@@ -624,30 +628,35 @@ pub(crate) async fn run_task(
     let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
     let max_rounds = resolved.review_max_rounds.unwrap_or(effective_max_rounds);
 
-    review_loop::run_external_review_loop(review_loop::ExternalReviewParams {
-        store,
-        task_id,
-        agent,
-        interceptors: &interceptors,
-        context_items: &context_items,
-        project: &project,
-        cargo_env: &cargo_env,
-        pr_url: pr_url.as_deref(),
-        pr_num,
-        agent_pushed_commit,
-        max_rounds,
-        wait_secs,
-        issue: req.issue,
-        review_bot_command: &review_config.review_bot_command,
-        reviewer_name: &review_config.reviewer_name,
-        pre_push_cmds: &project_config.validation.pre_push,
-        test_gate_timeout_secs: project_config.validation.test_gate_timeout_secs,
-        events: &events,
-        turn_timeout,
-        task_start,
-        jaccard_threshold: server_config.concurrency.loop_jaccard_threshold,
-        effective_max_turns,
-        turns_used: &mut turns_used,
-    })
-    .await
+    let ext_review_result =
+        review_loop::run_external_review_loop(review_loop::ExternalReviewParams {
+            store,
+            task_id,
+            agent,
+            interceptors: &interceptors,
+            context_items: &context_items,
+            project: &project,
+            cargo_env: &cargo_env,
+            pr_url: pr_url.as_deref(),
+            pr_num,
+            agent_pushed_commit,
+            max_rounds,
+            wait_secs,
+            issue: req.issue,
+            review_bot_command: &review_config.review_bot_command,
+            reviewer_name: &review_config.reviewer_name,
+            pre_push_cmds: &project_config.validation.pre_push,
+            test_gate_timeout_secs: project_config.validation.test_gate_timeout_secs,
+            events: &events,
+            turn_timeout,
+            task_start,
+            jaccard_threshold: server_config.concurrency.loop_jaccard_threshold,
+            effective_max_turns,
+            turns_used: &mut turns_used,
+        })
+        .await;
+    // Sync accumulated turns before returning so transient retries carry
+    // forward the turns consumed in the external review loop.
+    *turns_used_acc = turns_used;
+    ext_review_result
 }
