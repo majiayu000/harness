@@ -1047,13 +1047,6 @@ async fn run_review_tick(
                                             prompt: Some(prompt),
                                             source: Some("auto-fix".into()),
                                             project: Some(project_root_for_poll.clone()),
-                                            // Bound to 1 turn so the 3900 s stale-claim
-                                            // threshold (3600 s turn timeout + 300 s buffer)
-                                            // is guaranteed to exceed the task's max
-                                            // lifetime.  Unbounded turns would allow the
-                                            // task to outlive the threshold and cause
-                                            // duplicate-task fanout.
-                                            max_turns: Some(1),
                                             ..CreateTaskRequest::default()
                                         };
                                         match task_routes::enqueue_task(&state_for_synthesis, req)
