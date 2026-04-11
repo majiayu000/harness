@@ -108,21 +108,38 @@ impl ReviewStore {
             .execute(&pool)
             .await?;
         }
-        // Remove duplicate (rule_id, file, status) rows that may exist from
-        // before this unique index was introduced; keep the most recent row per group.
+        let has_claimed_at = columns
+            .iter()
+            .any(|(_, name, _, _, _, _)| name == "claimed_at");
+        if !has_claimed_at {
+            // claimed_at is stamped by try_claim_finding; used by
+            // release_stale_pending_claims to avoid clearing live in-flight claims.
+            sqlx::query("ALTER TABLE review_findings ADD COLUMN claimed_at TEXT")
+                .execute(&pool)
+                .await?;
+        }
+        // Drop the old project-unscoped dedup index if it exists, then recreate
+        // scoped to (project_name, rule_id, file, status) to prevent cross-project
+        // row hijacking when two repos share the same rule_id+file pair.
+        sqlx::query("DROP INDEX IF EXISTS idx_finding_dedup")
+            .execute(&pool)
+            .await?;
+        // Remove any duplicate (project_name, rule_id, file, status) rows that
+        // predate the new unique index; keep the highest-rowid row per group.
         sqlx::query(
             "DELETE FROM review_findings \
              WHERE rowid NOT IN ( \
-                 SELECT MAX(rowid) FROM review_findings GROUP BY rule_id, file, status \
+                 SELECT MAX(rowid) FROM review_findings \
+                 GROUP BY project_name, rule_id, file, status \
              )",
         )
         .execute(&pool)
         .await?;
-        // Unique index enables specific-conflict INSERT deduplication without a
+        // Unique index enables conflict-free INSERT deduplication without a
         // TOCTOU race between a SELECT check and an INSERT.
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_dedup \
-             ON review_findings(rule_id, file, status)",
+             ON review_findings(project_name, rule_id, file, status)",
         )
         .execute(&pool)
         .await?;
@@ -181,10 +198,11 @@ impl ReviewStore {
             if result.rows_affected() == 1 {
                 inserted += 1;
             } else {
-                // Existing open finding for the same rule_id+file — mark as recurring.
+                // Existing open finding for same project+rule_id+file — mark as recurring.
+                // project_name scope prevents cross-project row hijacking.
                 sqlx::query(
-                    "UPDATE review_findings SET review_id = ?, project_name = ? \
-                     WHERE rule_id = ? AND file = ? AND status = 'open'",
+                    "UPDATE review_findings SET review_id = ? \
+                     WHERE project_name = ? AND rule_id = ? AND file = ? AND status = 'open'",
                 )
                 .bind(review_id)
                 .bind(project_name)
@@ -264,7 +282,8 @@ impl ReviewStore {
     /// Returns `true` if this caller won the claim, `false` if already claimed.
     pub async fn try_claim_finding(&self, rule_id: &str, file: &str) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            "UPDATE review_findings SET task_id = 'pending' \
+            "UPDATE review_findings \
+             SET task_id = 'pending', claimed_at = datetime('now') \
              WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id IS NULL",
         )
         .bind(rule_id)
@@ -310,19 +329,24 @@ impl ReviewStore {
         Ok(())
     }
 
-    /// Reset task_id to NULL for all open findings stuck at task_id='pending' for
-    /// the given project.  A 'pending' sentinel that survives into the next scrub
-    /// cycle is stale: it means `confirm_task_spawned` exhausted its retries AND
-    /// the subsequent `release_claim` call also failed (e.g., transient DB error).
-    /// Without this cleanup those findings would be permanently unspawnable because
-    /// `list_assigned_task_ids` excludes 'pending' rows.
+    /// Reset task_id to NULL for open findings stuck at 'pending' for longer than
+    /// `stale_secs` seconds.  The age gate prevents a newer overlapping-poller tick
+    /// from clearing a live in-flight claim set by an older tick still inside
+    /// `confirm_task_spawned` (which completes in milliseconds; 300 s >> that window).
     /// Returns the number of rows reset.
-    pub async fn release_stale_pending_claims(&self, project_name: &str) -> anyhow::Result<u64> {
+    pub async fn release_stale_pending_claims(
+        &self,
+        project_name: &str,
+        stale_secs: u64,
+    ) -> anyhow::Result<u64> {
         let result = sqlx::query(
-            "UPDATE review_findings SET task_id = NULL \
-             WHERE status = 'open' AND task_id = 'pending' AND project_name = ?",
+            "UPDATE review_findings SET task_id = NULL, claimed_at = NULL \
+             WHERE status = 'open' AND task_id = 'pending' AND project_name = ? \
+             AND (claimed_at IS NULL \
+                  OR claimed_at <= datetime('now', printf('-%d seconds', ?)))",
         )
         .bind(project_name)
+        .bind(stale_secs as i64)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())

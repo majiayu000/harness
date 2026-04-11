@@ -1306,8 +1306,9 @@ async fn scrub_terminal_task_ids(
     // Release any findings stuck at task_id='pending' from a previous cycle.
     // This handles the case where confirm_task_spawned exhausted retries AND
     // release_claim also failed (e.g., transient DB error or process crash).
+    // 300 s >> confirm_task_spawned round-trip; safe below any review interval.
     let stale = review_store
-        .release_stale_pending_claims(project_name)
+        .release_stale_pending_claims(project_name, 300)
         .await?;
     if stale > 0 {
         tracing::warn!(
