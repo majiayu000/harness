@@ -155,44 +155,51 @@ impl QualityTrigger {
                         } else {
                             Some(challenger.clone())
                         };
-                        const CROSS_REVIEW_TIMEOUT_SECS: u64 = 120;
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(CROSS_REVIEW_TIMEOUT_SECS),
-                            run_cross_review(
-                                primary,
-                                review_challenger,
-                                self.project_root.clone(),
-                                target,
-                                2,
-                                // Deny all tools: review is text-only, agents must not
-                                // mutate the repo during this background quality gate.
-                                Some(vec![]),
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(Ok(result)) => {
-                                report.semantic_verdict = Some(result.final_verdict.clone());
-                                if result.final_verdict == "NOT_CONVERGED" {
-                                    let original = report.grade;
-                                    report.grade = Self::downgrade(report.grade);
-                                    tracing::info!(
-                                        original_grade = ?original,
-                                        effective_grade = ?report.grade,
-                                        "quality_trigger: NOT_CONVERGED — grade downgraded"
+                        // Guard: skip cross-review when challenger was filtered to None
+                        // due to Write/Execute capabilities.  Calling run_cross_review
+                        // with challenger=None degrades to single-model mode where the
+                        // primary alone can produce NOT_CONVERGED, downgrading the grade
+                        // without two-party verification.
+                        if let Some(rc) = review_challenger {
+                            const CROSS_REVIEW_TIMEOUT_SECS: u64 = 120;
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(CROSS_REVIEW_TIMEOUT_SECS),
+                                run_cross_review(
+                                    primary,
+                                    Some(rc),
+                                    self.project_root.clone(),
+                                    target,
+                                    2,
+                                    // Deny all tools: review is text-only, agents must not
+                                    // mutate the repo during this background quality gate.
+                                    Some(vec![]),
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(result)) => {
+                                    report.semantic_verdict = Some(result.final_verdict.clone());
+                                    if result.final_verdict == "NOT_CONVERGED" {
+                                        let original = report.grade;
+                                        report.grade = Self::downgrade(report.grade);
+                                        tracing::info!(
+                                            original_grade = ?original,
+                                            effective_grade = ?report.grade,
+                                            "quality_trigger: NOT_CONVERGED — grade downgraded"
+                                        );
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::warn!(
+                                        "quality_trigger: cross-review failed: {e}; using numeric grade only"
                                     );
                                 }
-                            }
-                            Ok(Err(e)) => {
-                                tracing::warn!(
-                                    "quality_trigger: cross-review failed: {e}; using numeric grade only"
-                                );
-                            }
-                            Err(_elapsed) => {
-                                tracing::warn!(
-                                    "quality_trigger: cross-review timed out after {CROSS_REVIEW_TIMEOUT_SECS}s; \
-                                     using numeric grade only"
-                                );
+                                Err(_elapsed) => {
+                                    tracing::warn!(
+                                        "quality_trigger: cross-review timed out after {CROSS_REVIEW_TIMEOUT_SECS}s; \
+                                         using numeric grade only"
+                                    );
+                                }
                             }
                         }
                     }

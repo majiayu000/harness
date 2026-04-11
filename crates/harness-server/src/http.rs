@@ -870,21 +870,13 @@ fn build_completion_callback(
                         .rev()
                         .find(|r| r.action == "implement" || r.action == "agent_review_fix");
                     let diff = match last_impl_round {
-                        Some(r) if r.action == "implement" => r
-                            .detail
-                            .clone()
-                            .filter(|d| {
-                                // detail is raw implement-agent output; only treat it
-                                // as a usable diff when it contains recognisable diff
-                                // markers.  Narrative/metadata text lacks these and
-                                // would produce spurious NOT_CONVERGED verdicts.
-                                !d.is_empty()
-                                    && (d.contains("diff --git")
-                                        || d.contains("\n@@")
-                                        || d.contains("\n--- a/")
-                                        || d.contains("\n+++ b/"))
-                            })
-                            .unwrap_or_default(),
+                        Some(r) if r.action == "implement" => {
+                            // Use the full implement-agent output as review context.
+                            // The implementation prompt contract requires a PR_URL line
+                            // but does not mandate unified-diff format, so accepting
+                            // any non-empty detail avoids silently dropping valid rounds.
+                            r.detail.clone().unwrap_or_default()
+                        }
                         // agent_review_fix (detail always None) or no round at all
                         _ => String::new(),
                     };
