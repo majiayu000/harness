@@ -914,12 +914,20 @@ async fn run_review_tick(
                             //   enqueue succeeded): recovered only when the underlying
                             //   task has reached a terminal state, so no fixed time
                             //   bound is needed regardless of rounds or queue wait.
-                            // - Rows without real_task_id (mid-claim window): recovered
-                            //   after 300 s, covering the brief span between
-                            //   try_claim_finding and enqueue/release_claim.
+                            // - Rows without real_task_id: covers two sub-cases:
+                            //   (a) genuine mid-claim window (try_claim → enqueue,
+                            //       normally a few seconds), and
+                            //   (b) rows where confirm_task_spawned AND record_real_task_id
+                            //       both failed — the task is running but its ID was not
+                            //       persisted, so we must wait long enough to avoid
+                            //       concurrent duplicate tasks.  Use 3900 s (≥ one full
+                            //       turn timeout) as the fallback threshold; this also
+                            //       protects migration-backfilled pre-upgrade rows from
+                            //       premature recovery while any task spawned before the
+                            //       upgrade may still be running.
                             let tasks_snapshot = state_for_synthesis.core.tasks.clone();
                             match rs
-                                .recover_stale_pending_claims(300, |tid| {
+                                .recover_stale_pending_claims(3900, |tid| {
                                     let id = harness_core::types::TaskId(tid.to_string());
                                     tasks_snapshot.get(&id).map_or(
                                         true, // task not in store → treat as done
@@ -1117,18 +1125,48 @@ async fn run_review_tick(
                                                             // can gate on actual task completion rather
                                                             // than a fixed time threshold that does not
                                                             // bound multi-round or queued task lifetime.
-                                                            if let Err(re) = rs
-                                                                .record_real_task_id(
-                                                                    &finding.rule_id,
-                                                                    &finding.file,
-                                                                    &fix_task_id.0,
-                                                                )
-                                                                .await
-                                                            {
-                                                                tracing::warn!(
+                                                            // Retry record_real_task_id: confirm_task_spawned
+                                                            // just failed, likely due to a transient DB lock.
+                                                            // A brief pause lets the lock clear so that
+                                                            // record_real_task_id can persist the task ID.
+                                                            // Without real_task_id the fallback stale
+                                                            // threshold (3900 s) would apply, which is safe
+                                                            // but slower; persisting real_task_id enables
+                                                            // the faster task-completion-based recovery.
+                                                            let delays_ms: &[u64] =
+                                                                &[200, 500, 1000];
+                                                            let mut record_ok = false;
+                                                            for &delay in delays_ms {
+                                                                sleep(Duration::from_millis(delay))
+                                                                    .await;
+                                                                match rs
+                                                                    .record_real_task_id(
+                                                                        &finding.rule_id,
+                                                                        &finding.file,
+                                                                        &fix_task_id.0,
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    Ok(()) => {
+                                                                        record_ok = true;
+                                                                        break;
+                                                                    }
+                                                                    Err(re) => {
+                                                                        tracing::warn!(
+                                                                            finding_id = %finding.id,
+                                                                            real_task_id = %fix_task_id,
+                                                                            "scheduler: record_real_task_id attempt failed (retrying): {re}"
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                            if !record_ok {
+                                                                tracing::error!(
                                                                     finding_id = %finding.id,
                                                                     real_task_id = %fix_task_id,
-                                                                    "scheduler: record_real_task_id failed: {re}"
+                                                                    "scheduler: record_real_task_id failed after all retries; \
+                                                                     row will be recovered by 3900 s time threshold — \
+                                                                     manual review recommended if duplicate tasks appear"
                                                                 );
                                                             }
                                                             tracing::error!(

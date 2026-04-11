@@ -109,11 +109,10 @@ impl ReviewStore {
             // ALTER TABLE sets claimed_at = NULL for all existing rows, but the
             // recovery query requires `claimed_at IS NOT NULL`, so without this
             // backfill those rows would remain permanently dead-lettered.
-            // Use datetime('now') rather than a pre-dated timestamp: some of
-            // these rows may correspond to tasks that were still running at
-            // upgrade time.  Setting claimed_at = now ensures they pass through
-            // the normal stale-threshold check and are only recovered once the
-            // threshold has elapsed, preventing immediate duplicate-task spawning.
+            // Use datetime('now') so they enter the time-based fallback path in
+            // recover_stale_pending_claims.  The caller uses a 3900 s threshold
+            // (≥ one full turn timeout), which prevents immediate duplicate-task
+            // spawning if any pre-upgrade task was still running at upgrade time.
             sqlx::query(
                 "UPDATE review_findings \
                  SET claimed_at = datetime('now') \
