@@ -424,6 +424,13 @@ fn compact_log(log_path: &Path, states: &HashMap<String, ReplayedState>) -> anyh
     let reader = BufReader::new(src_file);
     let mut removed = 0u32;
 
+    // Open a second fd to the source file seeked to snapshot_len.  We keep
+    // this fd open across the rename so we can perform a post-rename second
+    // drain to capture any bytes written to the old inode between the first
+    // drain and the rename.
+    let mut drain = std::fs::File::open(log_path)?;
+    drain.seek(SeekFrom::Start(snapshot_len))?;
+
     // Stream directly to the tmp file line-by-line — never buffer all lines
     // in memory, which could OOM the server on a large log.
     {
@@ -446,19 +453,9 @@ fn compact_log(log_path: &Path, states: &HashMap<String, ReplayedState>) -> anyh
             }
         }
 
-        // Drain bytes appended to the source file while the filter pass was
-        // running.  A concurrent appender in another process may have written
-        // events to the original inode after we opened it (snapshot_len).
-        // Copy those bytes verbatim into the tmp file before the rename so
-        // they are preserved.  The tiny window between this drain and the
-        // rename is handled by the inode-detection reopen logic in
-        // TaskEventLog::append, which redirects the next write to the new
-        // inode if it detects the path has been replaced.
-        {
-            let mut drain = std::fs::File::open(log_path)?;
-            drain.seek(SeekFrom::Start(snapshot_len))?;
-            std::io::copy(&mut drain, &mut tmp_file)?;
-        }
+        // First drain: copy bytes appended to the source inode during the
+        // filter pass (positions snapshot_len..current_end).
+        std::io::copy(&mut drain, &mut tmp_file)?;
 
         // Flush buffered writer state then sync to durable storage before the
         // rename.  This ensures the compacted data survives a power failure
@@ -469,6 +466,41 @@ fn compact_log(log_path: &Path, states: &HashMap<String, ReplayedState>) -> anyh
     }
 
     std::fs::rename(&tmp_path, log_path)?;
+
+    // Second drain: capture bytes written to the old inode between the first
+    // drain and the rename.  On Unix, rename() is atomic; a concurrent
+    // appender that had not yet detected the inode change may have written
+    // events to the pre-rename inode during that window.  `drain` still holds
+    // an open fd to the now-unlinked old inode, so we copy any remaining
+    // bytes into the new file.  The inode-detection reopen in
+    // TaskEventLog::append redirects the next write to the new inode once the
+    // appender observes the path replacement, closing the window from the
+    // appender's side.
+    {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            Ok(mut new_file) => {
+                if let Err(e) =
+                    std::io::copy(&mut drain, &mut new_file).and_then(|_| new_file.sync_all())
+                {
+                    tracing::warn!(
+                        path = %log_path.display(),
+                        "event_replay: second drain after rename failed (non-fatal): {e}"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %log_path.display(),
+                    "event_replay: failed to open new log for second drain (non-fatal): {e}"
+                );
+            }
+        }
+    }
+    drop(drain);
 
     // Sync the parent directory to make the directory-entry rename durable.
     if let Some(parent) = log_path.parent() {
