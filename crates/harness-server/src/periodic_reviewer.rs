@@ -825,6 +825,17 @@ async fn run_review_tick(
         // ensures commits that arrive *during* synthesis latency are caught by
         // the next tick rather than permanently skipped (issue-2 fix).
         let mut review_bound_ts: Option<DateTime<Utc>> = None;
+
+        // Cross mode: primary is confirmed non-None and non-REVIEW_SKIPPED.
+        // Advance the in-memory watermark speculatively to scan_ts now so that
+        // concurrent scheduler ticks do not re-enqueue the same commit window
+        // while secondary/synthesis agents are in flight.  The DB-backed
+        // periodic_review event is only written after a successful parse (below),
+        // so a server restart resets fallback_ts and the DB remains authoritative.
+        if secondary_review_id.is_some() {
+            fallback_ts_for_poll.lock().await.fallback_ts = Some(scan_ts);
+        }
+
         if let (Some(secondary_id), Some(secondary_name)) =
             (secondary_review_id.as_ref(), secondary_agent_name.as_ref())
         {
