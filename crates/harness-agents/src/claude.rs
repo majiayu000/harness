@@ -717,6 +717,12 @@ printf 'second\n'
             fs::set_permissions(&script, perms).expect("set executable permissions");
         }
 
+        // On Linux CI kernels (tmpfs), the inode write-access count may not be
+        // fully settled immediately after close() + fsync. A short sleep lets
+        // the kernel scheduler process the fd-close before execve() is called,
+        // preventing ETXTBSY (os error 26).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
         let agent = ClaudeCodeAgent::new(
             script,
             "test-model".to_string(),
