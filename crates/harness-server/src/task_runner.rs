@@ -640,12 +640,12 @@ impl TaskStore {
         // Only load active (non-terminal) tasks into the in-memory cache to prevent
         // unbounded memory growth from historical completed tasks.
         let active_statuses = &[
-            "pending",
-            "awaiting_deps",
-            "implementing",
-            "agent_review",
-            "waiting",
-            "reviewing",
+            TaskStatus::Pending.as_ref(),
+            TaskStatus::AwaitingDeps.as_ref(),
+            TaskStatus::Implementing.as_ref(),
+            TaskStatus::AgentReview.as_ref(),
+            TaskStatus::Waiting.as_ref(),
+            TaskStatus::Reviewing.as_ref(),
         ];
         for task in db.list_by_status(active_statuses).await? {
             persist_locks.insert(task.id.clone(), Arc::new(Mutex::new(())));
@@ -690,7 +690,13 @@ impl TaskStore {
             return Some(task.status.clone());
         }
         match self.db.get_status_only(id.0.as_str()).await {
-            Ok(Some(s)) => s.parse::<TaskStatus>().ok(),
+            Ok(Some(s)) => match s.parse::<TaskStatus>() {
+                Ok(status) => Some(status),
+                Err(_) => {
+                    tracing::warn!(task_id = %id.0, status = %s, "unrecognized dep task status; treating as absent");
+                    None
+                }
+            },
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!(task_id = %id.0, "DB error fetching dep status: {e}; treating as absent");
@@ -778,11 +784,12 @@ impl TaskStore {
             .list_id_status()
             .await?
             .into_iter()
-            .filter_map(|(id, status)| {
-                status
-                    .parse::<TaskStatus>()
-                    .ok()
-                    .map(|s| (harness_core::types::TaskId(id), s))
+            .filter_map(|(id, status)| match status.parse::<TaskStatus>() {
+                Ok(s) => Some((harness_core::types::TaskId(id), s)),
+                Err(_) => {
+                    tracing::warn!(task_id = %id, status = %status, "unrecognized task status in DB; skipping for governance");
+                    None
+                }
             })
             .collect();
         for entry in self.cache.iter() {
