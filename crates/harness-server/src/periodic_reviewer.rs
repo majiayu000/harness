@@ -1306,7 +1306,6 @@ pub(crate) fn build_fix_prompt(
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1722,8 +1721,8 @@ mod tests {
             .find(|l| l.trim_start().starts_with("Description:"))
             .expect("Description line must be present");
         let value = desc_line
-            .splitn(2, ':')
-            .nth(1)
+            .split_once(':')
+            .map(|x| x.1)
             .unwrap_or("")
             .trim()
             .to_string();
@@ -1743,8 +1742,8 @@ mod tests {
             .find(|l| l.trim_start().starts_with("Action:"))
             .expect("Action line must be present");
         let value = action_line
-            .splitn(2, ':')
-            .nth(1)
+            .split_once(':')
+            .map(|x| x.1)
             .unwrap_or("")
             .trim()
             .to_string();
@@ -1865,7 +1864,7 @@ mod tests {
             .lines()
             .find(|l| l.trim_start().starts_with("Rule:"))
             .expect("Rule line must be present");
-        let rule_val = rule_line.splitn(2, ':').nth(1).unwrap_or("").trim();
+        let rule_val = rule_line.split_once(':').map(|x| x.1).unwrap_or("").trim();
         assert_eq!(
             rule_val.chars().count(),
             200,
@@ -1876,11 +1875,11 @@ mod tests {
             .find(|l| l.trim_start().starts_with("File:"))
             .expect("File line must be present");
         // File value is `{file_s}:{line}` — strip the trailing `:<line>` suffix
-        let file_val_raw = file_line.splitn(2, ':').nth(1).unwrap_or("").trim();
+        let file_val_raw = file_line.split_once(':').map(|x| x.1).unwrap_or("").trim();
         // The file portion is everything before the last colon (the line number)
         let file_chars = file_val_raw
-            .rsplitn(2, ':')
-            .nth(1)
+            .rsplit_once(':')
+            .map(|x| x.0)
             .unwrap_or(file_val_raw)
             .chars()
             .count();
@@ -1889,7 +1888,7 @@ mod tests {
             .lines()
             .find(|l| l.trim_start().starts_with("Title:"))
             .expect("Title line must be present");
-        let title_val = title_line.splitn(2, ':').nth(1).unwrap_or("").trim();
+        let title_val = title_line.split_once(':').map(|x| x.1).unwrap_or("").trim();
         assert_eq!(
             title_val.chars().count(),
             200,
