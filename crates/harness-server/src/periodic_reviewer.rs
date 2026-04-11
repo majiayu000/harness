@@ -770,23 +770,12 @@ async fn run_review_tick(
             return;
         }
 
-        // Primary confirmed new commits exist — advance the watermark now.
-        // Advancing at enqueue time creates a duplicate-review gap: commits
-        // arriving between enqueue and execution are covered by this agent
-        // (--since has no --until bound) but would also fall inside the next
-        // tick's --since window, producing duplicate issues.  By advancing here
-        // we set the boundary to the agent's execution completion time, ensuring
-        // the next tick's --since is always ≥ all commits this agent reviewed.
-        let review_complete_ts = Utc::now();
-        fallback_ts_for_poll.lock().await.fallback_ts = Some(review_complete_ts);
-        let watermark_event = Event::new(SessionId::new(), &hook_key, "scheduler", Decision::Pass);
-        if let Err(err) = state_for_synthesis
-            .observability
-            .events
-            .log(&watermark_event)
-            .await
-        {
-            tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
+        if primary_output.is_none() {
+            tracing::error!(
+                task_id = %primary_review_id,
+                "scheduler: primary review produced no output (agent failed/timed out) — watermark not advanced, next tick will re-review"
+            );
+            return;
         }
 
         // Now it is safe to enqueue the secondary reviewer (Cross strategy only).
@@ -868,17 +857,30 @@ async fn run_review_tick(
                         final_output = primary_output;
                     }
                 }
-            } else if primary_output.is_none() {
-                // Primary failed/no output: fall back to secondary output if available.
-                final_task_id = secondary_id.clone();
-                final_output = secondary_output;
             }
         }
 
         let Some(output) = final_output else {
-            tracing::warn!("scheduler: no review output to parse");
+            tracing::warn!("scheduler: no review output to parse — watermark not advanced, next tick will re-review");
             return;
         };
+
+        // Advance the watermark only after the review produced parseable output.
+        // Moving this here (from the earlier unconditional advance) prevents
+        // a failed/timed-out agent from silently marking its commit window as
+        // "reviewed" and skipping it on the next tick.
+        let review_complete_ts = Utc::now();
+        fallback_ts_for_poll.lock().await.fallback_ts = Some(review_complete_ts);
+        let watermark_event = Event::new(SessionId::new(), &hook_key, "scheduler", Decision::Pass);
+        if let Err(err) = state_for_synthesis
+            .observability
+            .events
+            .log(&watermark_event)
+            .await
+        {
+            tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
+        }
+
         match crate::review_store::parse_review_output(&output) {
             Ok(review) => {
                 tracing::info!(
