@@ -151,7 +151,8 @@ pub(crate) async fn run_plan_for_prompt(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
-) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
+    turns_used_acc: &mut u32,
+) -> anyhow::Result<(Option<String>, prompts::TriageComplexity)> {
     use crate::task_runner::TaskPhase;
 
     let prompt_text = req.prompt.as_deref().unwrap_or_default();
@@ -187,6 +188,8 @@ pub(crate) async fn run_plan_for_prompt(
         .await
         .map_err(|_| anyhow::anyhow!("plan phase timed out after {}s", req.turn_timeout_secs))?
         .map_err(|e| anyhow::anyhow!("plan phase agent error: {e}"))?;
+    // Persist the turn immediately so transient-retry restarts count this turn.
+    *turns_used_acc += 1;
 
     let plan_text = plan_resp.output.clone();
     mutate_and_persist(store, task_id, |state| {
@@ -196,7 +199,7 @@ pub(crate) async fn run_plan_for_prompt(
     .await?;
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete (prompt-only)");
-    Ok((Some(plan_text), prompts::TriageComplexity::Medium, 1))
+    Ok((Some(plan_text), prompts::TriageComplexity::Medium))
 }
 
 /// Run triage → plan pipeline for a fresh issue-based task.
@@ -212,7 +215,8 @@ pub(crate) async fn run_triage_plan_pipeline(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
-) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
+    turns_used_acc: &mut u32,
+) -> anyhow::Result<(Option<String>, prompts::TriageComplexity)> {
     use crate::task_runner::TaskPhase;
 
     // --- Phase 1: Triage ---
@@ -239,6 +243,8 @@ pub(crate) async fn run_triage_plan_pipeline(
     .await
     .map_err(|_| anyhow::anyhow!("triage phase timed out after {}s", req.turn_timeout_secs))?
     .map_err(|e| anyhow::anyhow!("triage phase agent error: {e}"))?;
+    // Persist triage turn immediately so transient-retry restarts count it.
+    *turns_used_acc += 1;
 
     let triage_text = triage_resp.output.clone();
     mutate_and_persist(store, task_id, |state| {
@@ -279,7 +285,7 @@ pub(crate) async fn run_triage_plan_pipeline(
         }
         prompts::TriageDecision::Proceed => {
             tracing::info!(task_id = %task_id, "triage: PROCEED — skipping plan phase");
-            return Ok((None, complexity, 1));
+            return Ok((None, complexity));
         }
         prompts::TriageDecision::ProceedWithPlan => {
             // Fall through to plan phase.
@@ -309,6 +315,8 @@ pub(crate) async fn run_triage_plan_pipeline(
     .await
     .map_err(|_| anyhow::anyhow!("plan phase timed out after {}s", req.turn_timeout_secs))?
     .map_err(|e| anyhow::anyhow!("plan phase agent error: {e}"))?;
+    // Persist plan turn immediately so transient-retry restarts count it.
+    *turns_used_acc += 1;
 
     let plan_text = plan_resp.output.clone();
     mutate_and_persist(store, task_id, |state| {
@@ -324,7 +332,7 @@ pub(crate) async fn run_triage_plan_pipeline(
     }
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete");
-    Ok((Some(plan_text), complexity, 2))
+    Ok((Some(plan_text), complexity))
 }
 
 /// Load project config and resolve settings needed by run_task.
@@ -371,6 +379,10 @@ pub(crate) async fn load_task_config(
 }
 
 /// Determine triage/plan output: run the triage pipeline or use checkpoint resume.
+///
+/// `turns_used_acc` is incremented after each completed agent call so that
+/// transient-retry restarts start from the correct accumulated turn count,
+/// even if the function ultimately returns `Err`.
 pub(crate) async fn resolve_plan(
     store: &TaskStore,
     task_id: &TaskId,
@@ -380,13 +392,14 @@ pub(crate) async fn resolve_plan(
     cargo_env: &HashMap<String, String>,
     resumed_pr_url: Option<&str>,
     resumed_plan: Option<String>,
-) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
+    turns_used_acc: &mut u32,
+) -> anyhow::Result<(Option<String>, prompts::TriageComplexity)> {
     if resumed_pr_url.is_some() {
-        return Ok((None, prompts::TriageComplexity::Medium, 0));
+        return Ok((None, prompts::TriageComplexity::Medium));
     }
     if let Some(plan) = resumed_plan {
         tracing::info!(task_id = %task_id, "checkpoint resume: using saved plan, skipping triage/plan");
-        return Ok((Some(plan), prompts::TriageComplexity::Medium, 0));
+        return Ok((Some(plan), prompts::TriageComplexity::Medium));
     }
     if let Some(issue) = req.issue {
         let has_existing_pr = find_existing_pr_for_issue(project, issue)
@@ -395,10 +408,19 @@ pub(crate) async fn resolve_plan(
             .flatten()
             .is_some();
         if !has_existing_pr {
-            return run_triage_plan_pipeline(agent, store, task_id, issue, cargo_env, project, req)
-                .await;
+            return run_triage_plan_pipeline(
+                agent,
+                store,
+                task_id,
+                issue,
+                cargo_env,
+                project,
+                req,
+                turns_used_acc,
+            )
+            .await;
         }
-        return Ok((None, prompts::TriageComplexity::Medium, 0));
+        return Ok((None, prompts::TriageComplexity::Medium));
     }
     // Planning gate (task_runner) may have forced TaskPhase::Plan for a
     // complex prompt-only task.
@@ -408,7 +430,16 @@ pub(crate) async fn resolve_plan(
         .unwrap_or(false);
     if forced_plan && req.issue.is_none() && req.pr.is_none() {
         update_status(store, task_id, TaskStatus::Implementing, 1).await?;
-        return run_plan_for_prompt(agent, store, task_id, cargo_env, project, req).await;
+        return run_plan_for_prompt(
+            agent,
+            store,
+            task_id,
+            cargo_env,
+            project,
+            req,
+            turns_used_acc,
+        )
+        .await;
     }
-    Ok((None, prompts::TriageComplexity::Medium, 0))
+    Ok((None, prompts::TriageComplexity::Medium))
 }

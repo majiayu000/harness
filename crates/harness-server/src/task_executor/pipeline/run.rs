@@ -60,7 +60,7 @@ pub(crate) async fn run_task(
     let review_config = &resolved.review;
     let git = Some(&project_config.git);
 
-    let (plan_output, triage_complexity, pipeline_turns) = resolve_plan(
+    let (plan_output, triage_complexity) = resolve_plan(
         store,
         task_id,
         agent,
@@ -69,6 +69,7 @@ pub(crate) async fn run_task(
         &cargo_env,
         resumed_pr_url.as_deref(),
         resumed_plan,
+        turns_used_acc,
     )
     .await?;
 
@@ -81,9 +82,10 @@ pub(crate) async fn run_task(
     // max_turns: per-request override wins; global config is the fallback.
     // Counts every agent API call (impl + validation retries + review rounds).
     let effective_max_turns: Option<u32> = req.max_turns.or(server_config.concurrency.max_turns);
-    // Start from accumulated turns (prior transient-retry attempts + pipeline phases)
-    // so the budget is global across the full task lifecycle.
-    let mut turns_used: u32 = *turns_used_acc + pipeline_turns;
+    // turns_used_acc was updated incrementally inside resolve_plan (once per
+    // completed agent call), so it already reflects any triage/plan turns even
+    // if a previous transient attempt partially consumed the budget.
+    let mut turns_used: u32 = *turns_used_acc;
     *turns_used_acc = turns_used;
     tracing::info!(
         task_id = %task_id,
