@@ -559,7 +559,11 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             project_root.clone(),
             gc_cfg.auto_gc_grades.clone(),
             gc_cfg.auto_gc_cooldown_secs,
-            server.agent_registry.get("codex"),
+            // anthropic-api has only Read capability and passes the
+            // read-only capability check in QualityTrigger.  codex/claude
+            // advertise Write|Execute and are always silently dropped,
+            // causing the single-model false-positive fallback path to run.
+            server.agent_registry.get("anthropic-api"),
         ))
     };
 
@@ -869,7 +873,17 @@ fn build_completion_callback(
                         Some(r) if r.action == "implement" => r
                             .detail
                             .clone()
-                            .filter(|d| !d.is_empty())
+                            .filter(|d| {
+                                // detail is raw implement-agent output; only treat it
+                                // as a usable diff when it contains recognisable diff
+                                // markers.  Narrative/metadata text lacks these and
+                                // would produce spurious NOT_CONVERGED verdicts.
+                                !d.is_empty()
+                                    && (d.contains("diff --git")
+                                        || d.contains("\n@@")
+                                        || d.contains("\n--- a/")
+                                        || d.contains("\n+++ b/"))
+                            })
                             .unwrap_or_default(),
                         // agent_review_fix (detail always None) or no round at all
                         _ => String::new(),
