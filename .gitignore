@@ -8,3 +8,4 @@ crates/*/.harness/
 **/.harness/drafts/
 .claude/
 ~/.local/
+.omx/
