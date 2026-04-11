@@ -335,10 +335,11 @@ impl ReviewStore {
                     "UPDATE review_findings \
                      SET task_id = NULL, claimed_at = NULL, real_task_id = NULL \
                      WHERE rule_id = ? AND file = ? AND status = 'open' \
-                       AND task_id = 'pending'",
+                       AND task_id = 'pending' AND real_task_id = ?",
                 )
                 .bind(&rule_id)
                 .bind(&file)
+                .bind(&real_tid)
                 .execute(&self.pool)
                 .await?;
                 recovered += res.rows_affected();
