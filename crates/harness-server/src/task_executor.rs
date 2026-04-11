@@ -4,7 +4,7 @@ pub(crate) mod pr_detection;
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::config::agents::CapabilityProfile;
 use harness_core::error::HarnessError;
