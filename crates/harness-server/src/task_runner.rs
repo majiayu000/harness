@@ -699,34 +699,22 @@ impl TaskStore {
         self.db.get(id.0.as_str()).await
     }
 
-    /// Check whether a dependency task is in Done status, consulting DB for
-    /// tasks evicted from the startup cache.
-    async fn is_dep_done(&self, id: &TaskId) -> bool {
+    /// Return the status of a dependency task with a single DB lookup.
+    ///
+    /// Checks the in-memory cache first; falls back to a lightweight
+    /// `SELECT status` query (no `rounds` JSON decode) for terminal tasks
+    /// evicted from the startup cache.  Returns `None` when the task is
+    /// unknown in both cache and DB, or when the DB call fails.
+    async fn dep_status(&self, id: &TaskId) -> Option<TaskStatus> {
         if let Some(task) = self.cache.get(id) {
-            return matches!(task.status, TaskStatus::Done);
+            return Some(task.status.clone());
         }
-        match self.db.get(id.0.as_str()).await {
-            Ok(Some(task)) => matches!(task.status, TaskStatus::Done),
-            Ok(None) => false,
+        match self.db.get_status_only(id.0.as_str()).await {
+            Ok(Some(s)) => s.parse::<TaskStatus>().ok(),
+            Ok(None) => None,
             Err(e) => {
-                tracing::warn!(task_id = %id.0, "DB error checking dep done status: {e}; treating as not done");
-                false
-            }
-        }
-    }
-
-    /// Check whether a dependency task is in Failed status, consulting DB for
-    /// tasks evicted from the startup cache.
-    async fn is_dep_failed(&self, id: &TaskId) -> bool {
-        if let Some(task) = self.cache.get(id) {
-            return matches!(task.status, TaskStatus::Failed);
-        }
-        match self.db.get(id.0.as_str()).await {
-            Ok(Some(task)) => matches!(task.status, TaskStatus::Failed),
-            Ok(None) => false,
-            Err(e) => {
-                tracing::warn!(task_id = %id.0, "DB error checking dep failed status: {e}; treating as not failed");
-                false
+                tracing::warn!(task_id = %id.0, "DB error fetching dep status: {e}; treating as absent");
+                None
             }
         }
     }
@@ -1853,7 +1841,7 @@ pub async fn spawn_task_awaiting_deps(
 
     let mut all_done = true;
     for dep_id in &depends_on {
-        if !store.is_dep_done(dep_id).await {
+        if !matches!(store.dep_status(dep_id).await, Some(TaskStatus::Done)) {
             all_done = false;
             break;
         }
@@ -1902,26 +1890,27 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> Vec<TaskId> {
         .collect();
 
     for (task_id, depends_on) in awaiting {
-        // Find first failed dep (cache then DB).
+        // Single pass: one DB lookup per dep (cache-first, then lightweight
+        // `SELECT status` — no `rounds` JSON decode).
         let mut failed_dep_id = None;
+        let mut all_done = true;
         for dep_id in &depends_on {
-            if store.is_dep_failed(dep_id).await {
-                failed_dep_id = Some(dep_id.clone());
-                break;
+            match store.dep_status(dep_id).await {
+                Some(TaskStatus::Failed) => {
+                    failed_dep_id = Some(dep_id.clone());
+                    break; // fail-fast — no need to inspect remaining deps
+                }
+                Some(TaskStatus::Done) => {} // this dep is satisfied
+                _ => {
+                    // Pending, Implementing, or unknown — not ready yet.
+                    // Keep scanning in case a later dep is Failed.
+                    all_done = false;
+                }
             }
         }
         if let Some(fd) = failed_dep_id {
             failed_deps.push((task_id, fd));
             continue;
-        }
-
-        // Check all deps are done (cache then DB).
-        let mut all_done = true;
-        for dep_id in &depends_on {
-            if !store.is_dep_done(dep_id).await {
-                all_done = false;
-                break;
-            }
         }
         if all_done {
             ready.push(task_id);
