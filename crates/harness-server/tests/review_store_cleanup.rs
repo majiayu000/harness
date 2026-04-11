@@ -33,11 +33,11 @@ async fn list_assigned_task_ids_excludes_null_and_pending() -> anyhow::Result<()
 
     // F1: leave task_id NULL
     // F2: claim only → task_id = 'pending'
-    store.try_claim_finding("R2", "b.rs").await?;
+    store.try_claim_finding("proj", "R2", "b.rs").await?;
     // F3: claim + confirm → real task_id
-    store.try_claim_finding("R3", "c.rs").await?;
+    store.try_claim_finding("proj", "R3", "c.rs").await?;
     store
-        .confirm_task_spawned("R3", "c.rs", "task-real")
+        .confirm_task_spawned("proj", "R3", "c.rs", "task-real")
         .await?;
 
     let assigned = store.list_assigned_task_ids("proj").await?;
@@ -58,10 +58,14 @@ async fn reset_task_ids_for_terminal_frees_finding() -> anyhow::Result<()> {
     ];
     store.persist_findings("rev-1", "proj", &findings).await?;
 
-    store.try_claim_finding("R1", "a.rs").await?;
-    store.confirm_task_spawned("R1", "a.rs", "task-111").await?;
-    store.try_claim_finding("R2", "b.rs").await?;
-    store.confirm_task_spawned("R2", "b.rs", "task-222").await?;
+    store.try_claim_finding("proj", "R1", "a.rs").await?;
+    store
+        .confirm_task_spawned("proj", "R1", "a.rs", "task-111")
+        .await?;
+    store.try_claim_finding("proj", "R2", "b.rs").await?;
+    store
+        .confirm_task_spawned("proj", "R2", "b.rs", "task-222")
+        .await?;
 
     // Only task-111 reached terminal state.
     let reset = store.reset_task_ids_for_terminal(&["task-111"]).await?;

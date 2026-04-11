@@ -1033,7 +1033,11 @@ async fn run_review_tick(
                                         // if the claim succeeds do we enqueue a task,
                                         // preventing orphaned tasks on race loss.
                                         match rs
-                                            .try_claim_finding(&finding.rule_id, &finding.file)
+                                            .try_claim_finding(
+                                                &project_name_for_poll,
+                                                &finding.rule_id,
+                                                &finding.file,
+                                            )
                                             .await
                                         {
                                             Ok(false) => {
@@ -1064,6 +1068,7 @@ async fn run_review_tick(
                                             Ok(fix_task_id) => {
                                                 match rs
                                                     .confirm_task_spawned(
+                                                        &project_name_for_poll,
                                                         &finding.rule_id,
                                                         &finding.file,
                                                         &fix_task_id.0,
@@ -1088,6 +1093,7 @@ async fn run_review_tick(
                                                         );
                                                         if let Err(retry_err) = rs
                                                             .confirm_task_spawned(
+                                                                &project_name_for_poll,
                                                                 &finding.rule_id,
                                                                 &finding.file,
                                                                 &fix_task_id.0,
@@ -1111,6 +1117,7 @@ async fn run_review_tick(
                                                             // can never free it.
                                                             if let Err(re) = rs
                                                                 .release_claim(
+                                                                    &project_name_for_poll,
                                                                     &finding.rule_id,
                                                                     &finding.file,
                                                                 )
@@ -1130,7 +1137,11 @@ async fn run_review_tick(
                                             Err(e) => {
                                                 // Release the claim so the next cycle can retry.
                                                 if let Err(re) = rs
-                                                    .release_claim(&finding.rule_id, &finding.file)
+                                                    .release_claim(
+                                                        &project_name_for_poll,
+                                                        &finding.rule_id,
+                                                        &finding.file,
+                                                    )
                                                     .await
                                                 {
                                                     tracing::warn!(
