@@ -650,7 +650,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                 task_id = %task_id.0,
                                 "dep-watcher: task ready but pending_request is None — failing task"
                             );
-                            if let Err(e) =
+                            let persist_result =
                                 crate::task_runner::mutate_and_persist(&store, &task_id, |s| {
                                     s.status = crate::task_runner::TaskStatus::Failed;
                                     s.error = Some(
@@ -658,22 +658,28 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                             .to_string(),
                                     );
                                 })
-                                .await
-                            {
+                                .await;
+                            if let Err(ref e) = persist_result {
                                 tracing::error!(
                                     task_id = %task_id.0,
                                     "dep-watcher: failed to persist failure state: {e}"
                                 );
                             }
                             store.close_task_stream(&task_id);
-                            if let Some(ref cb) = completion_callback_w {
-                                if let Some(final_state) = store.get(&task_id) {
-                                    cb(final_state).await;
-                                } else {
-                                    tracing::warn!(
-                                        task_id = %task_id.0,
-                                        "dep-watcher: task not found in store after fail-close"
-                                    );
+                            // Only invoke the completion callback when the terminal state has
+                            // been durably written; if persist failed the SQLite row still has
+                            // a non-terminal status and the callback must not fire (would cause
+                            // duplicate processing after restart).
+                            if persist_result.is_ok() {
+                                if let Some(ref cb) = completion_callback_w {
+                                    if let Some(final_state) = store.get(&task_id) {
+                                        cb(final_state).await;
+                                    } else {
+                                        tracing::warn!(
+                                            task_id = %task_id.0,
+                                            "dep-watcher: task not found in store after fail-close"
+                                        );
+                                    }
                                 }
                             }
                             continue;
@@ -699,7 +705,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                 task_id = %task_id.0,
                                 "dep-watcher: could not resolve agent — failing task"
                             );
-                            if let Err(e) =
+                            let persist_result =
                                 crate::task_runner::mutate_and_persist(&store, &task_id, |s| {
                                     s.status = crate::task_runner::TaskStatus::Failed;
                                     s.error = Some(
@@ -707,22 +713,24 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                             .to_string(),
                                     );
                                 })
-                                .await
-                            {
+                                .await;
+                            if let Err(ref e) = persist_result {
                                 tracing::error!(
                                     task_id = %task_id.0,
                                     "dep-watcher: failed to persist failure state: {e}"
                                 );
                             }
                             store.close_task_stream(&task_id);
-                            if let Some(ref cb) = completion_callback_w {
-                                if let Some(final_state) = store.get(&task_id) {
-                                    cb(final_state).await;
-                                } else {
-                                    tracing::warn!(
-                                        task_id = %task_id.0,
-                                        "dep-watcher: task not found in store after fail-close"
-                                    );
+                            if persist_result.is_ok() {
+                                if let Some(ref cb) = completion_callback_w {
+                                    if let Some(final_state) = store.get(&task_id) {
+                                        cb(final_state).await;
+                                    } else {
+                                        tracing::warn!(
+                                            task_id = %task_id.0,
+                                            "dep-watcher: task not found in store after fail-close"
+                                        );
+                                    }
                                 }
                             }
                             continue;
@@ -743,32 +751,34 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                     // a tampered/stale persisted project path from escaping the
                     // configured sandbox (mirrors the check in execution.rs:182 and
                     // task_routes.rs:260-264).
-                    let canonical =
-                        match crate::task_runner::resolve_canonical_project(req.project.clone())
-                            .await
-                        {
-                            Ok(c) => c,
-                            Err(e) => {
+                    let canonical = match crate::task_runner::resolve_canonical_project(
+                        req.project.clone(),
+                    )
+                    .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = %task_id.0,
+                                "dep-watcher: cannot resolve canonical project \
+                                 for concurrency key — failing task: {e}"
+                            );
+                            let persist_result =
+                                crate::task_runner::mutate_and_persist(&store, &task_id, |s| {
+                                    s.status = crate::task_runner::TaskStatus::Failed;
+                                    s.error = Some(format!(
+                                        "dep-watcher: cannot resolve project path: {e}"
+                                    ));
+                                })
+                                .await;
+                            if let Err(ref pe) = persist_result {
                                 tracing::error!(
                                     task_id = %task_id.0,
-                                    "dep-watcher: cannot resolve canonical project \
-                                     for concurrency key — failing task: {e}"
+                                    "dep-watcher: failed to persist failure state: {pe}"
                                 );
-                                if let Err(pe) =
-                                    crate::task_runner::mutate_and_persist(&store, &task_id, |s| {
-                                        s.status = crate::task_runner::TaskStatus::Failed;
-                                        s.error = Some(format!(
-                                            "dep-watcher: cannot resolve project path: {e}"
-                                        ));
-                                    })
-                                    .await
-                                {
-                                    tracing::error!(
-                                        task_id = %task_id.0,
-                                        "dep-watcher: failed to persist failure state: {pe}"
-                                    );
-                                }
-                                store.close_task_stream(&task_id);
+                            }
+                            store.close_task_stream(&task_id);
+                            if persist_result.is_ok() {
                                 if let Some(ref cb) = completion_callback_w {
                                     if let Some(final_state) = store.get(&task_id) {
                                         cb(final_state).await;
@@ -779,9 +789,10 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                         );
                                     }
                                 }
-                                continue;
                             }
-                        };
+                            continue;
+                        }
+                    };
                     if let Err(e) =
                         crate::project_registry::check_allowed_roots(&canonical, &allowed_roots_w)
                     {
@@ -789,28 +800,30 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                             task_id = %task_id.0,
                             "dep-watcher: project not in allowed_project_roots — failing task: {e}"
                         );
-                        if let Err(pe) =
+                        let persist_result =
                             crate::task_runner::mutate_and_persist(&store, &task_id, |s| {
                                 s.status = crate::task_runner::TaskStatus::Failed;
                                 s.error =
                                     Some(format!("dep-watcher: project not in allowed roots: {e}"));
                             })
-                            .await
-                        {
+                            .await;
+                        if let Err(ref pe) = persist_result {
                             tracing::error!(
                                 task_id = %task_id.0,
                                 "dep-watcher: failed to persist failure state: {pe}"
                             );
                         }
                         store.close_task_stream(&task_id);
-                        if let Some(ref cb) = completion_callback_w {
-                            if let Some(final_state) = store.get(&task_id) {
-                                cb(final_state).await;
-                            } else {
-                                tracing::warn!(
-                                    task_id = %task_id.0,
-                                    "dep-watcher: task not found in store after fail-close"
-                                );
+                        if persist_result.is_ok() {
+                            if let Some(ref cb) = completion_callback_w {
+                                if let Some(final_state) = store.get(&task_id) {
+                                    cb(final_state).await;
+                                } else {
+                                    tracing::warn!(
+                                        task_id = %task_id.0,
+                                        "dep-watcher: task not found in store after fail-close"
+                                    );
+                                }
                             }
                         }
                         continue;
@@ -854,12 +867,19 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                         "dep-watcher: failed to persist task before dispatch: {e} \
                                          — aborting dispatch, restoring state for next tick retry"
                                     );
-                                    // Restore in-memory state so the next watcher tick retries.
-                                    // The DB still holds the original pending_request_json
-                                    // because persist failed, so restart recovery is also safe.
+                                    // Restore in-memory state so the next watcher tick retries,
+                                    // but only if the task has not been cancelled (or otherwise
+                                    // transitioned) during the persist await — resurrecting a
+                                    // cancelled task would re-dispatch it on the next tick.
                                     if let Some(mut entry) = store2.cache.get_mut(&task_id2) {
-                                        entry.pending_request = Some(req);
-                                        entry.status = crate::task_runner::TaskStatus::AwaitingDeps;
+                                        if matches!(
+                                            entry.status,
+                                            crate::task_runner::TaskStatus::Pending
+                                        ) {
+                                            entry.pending_request = Some(req);
+                                            entry.status =
+                                                crate::task_runner::TaskStatus::AwaitingDeps;
+                                        }
                                     }
                                     return; // drops permit
                                 }
@@ -906,9 +926,16 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                                 // watcher tick (which only scans AwaitingDeps) can retry.
                                 // The DB still holds the original values because we have
                                 // not persisted yet, so no re-persist is needed.
+                                // Guard against resurrecting a cancelled task: only restore
+                                // if the status is still Pending (set by check_awaiting_deps).
                                 if let Some(mut entry) = store2.cache.get_mut(&task_id2) {
-                                    entry.pending_request = Some(req);
-                                    entry.status = crate::task_runner::TaskStatus::AwaitingDeps;
+                                    if matches!(
+                                        entry.status,
+                                        crate::task_runner::TaskStatus::Pending
+                                    ) {
+                                        entry.pending_request = Some(req);
+                                        entry.status = crate::task_runner::TaskStatus::AwaitingDeps;
+                                    }
                                 }
                             }
                         }
