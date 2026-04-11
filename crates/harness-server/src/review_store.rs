@@ -105,6 +105,19 @@ impl ReviewStore {
             sqlx::query("ALTER TABLE review_findings ADD COLUMN claimed_at TEXT")
                 .execute(&pool)
                 .await?;
+            // Backfill pre-upgrade rows that are already stuck in task_id='pending'.
+            // ALTER TABLE sets claimed_at = NULL for all existing rows, but the
+            // recovery query requires `claimed_at IS NOT NULL`, so without this
+            // backfill those rows would remain permanently dead-lettered.
+            // Set claimed_at well past the stale threshold (3900 s) so the next
+            // scheduler cycle recovers them immediately.
+            sqlx::query(
+                "UPDATE review_findings \
+                 SET claimed_at = datetime('now', '-3901 seconds') \
+                 WHERE task_id = 'pending' AND claimed_at IS NULL",
+            )
+            .execute(&pool)
+            .await?;
         }
         // Remove duplicate (rule_id, file, status) rows that may exist from
         // before this unique index was introduced; keep the most recent row per group.

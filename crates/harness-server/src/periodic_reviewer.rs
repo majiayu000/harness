@@ -909,13 +909,16 @@ async fn run_review_tick(
                                 new_findings = n,
                                 "scheduler: review findings persisted"
                             );
-                            // Recover findings stuck in task_id='pending' for >10 min.
-                            // Both confirm_task_spawned attempts may have failed due to
-                            // transient SQLite lock errors, leaving the finding
-                            // permanently dead-lettered (invisible to list_spawnable_findings
-                            // which requires task_id IS NULL).  Reset them so the next
-                            // cycle can retry spawning.
-                            match rs.recover_stale_pending_claims(600).await {
+                            // Recover findings stuck in task_id='pending' after the
+                            // maximum possible task lifetime has elapsed.  Both
+                            // confirm_task_spawned attempts may have failed (transient
+                            // SQLite lock) while enqueue_task already succeeded — the
+                            // real task is running.  We must not reset the claim while
+                            // that task could still be alive: the default per-turn
+                            // timeout is 3600 s, so 3900 s (3600 + 300 s buffer)
+                            // guarantees the original task has completed before we
+                            // allow re-spawning, preventing duplicate-task overlap.
+                            match rs.recover_stale_pending_claims(3900).await {
                                 Ok(0) => {}
                                 Ok(n) => tracing::warn!(
                                     recovered = n,
