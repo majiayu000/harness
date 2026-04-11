@@ -696,9 +696,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let ready_ids = crate::task_runner::check_awaiting_deps(&store).await;
-                for task_id in ready_ids {
-                    if let Err(e) = store.persist(&task_id).await {
+                let (ready_ids, failed_ids) = crate::task_runner::check_awaiting_deps(&store).await;
+                for task_id in ready_ids.iter().chain(failed_ids.iter()) {
+                    if let Err(e) = store.persist(task_id).await {
                         tracing::warn!(
                             "dep-watcher: failed to persist {} after transition: {e}",
                             task_id.0
