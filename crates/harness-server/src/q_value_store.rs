@@ -329,7 +329,8 @@ mod tests {
                 .fetch_optional(&store.pool)
                 .await?;
         assert_eq!(
-            row.ok_or_else(|| anyhow::anyhow!("rule-W row missing after closed"))?.0,
+            row.ok_or_else(|| anyhow::anyhow!("rule-W row missing after closed"))?
+                .0,
             0
         );
 
@@ -343,7 +344,8 @@ mod tests {
                 .fetch_optional(&store.pool)
                 .await?;
         assert_eq!(
-            row.ok_or_else(|| anyhow::anyhow!("rule-W row missing after merged"))?.0,
+            row.ok_or_else(|| anyhow::anyhow!("rule-W row missing after merged"))?
+                .0,
             1
         );
         Ok(())

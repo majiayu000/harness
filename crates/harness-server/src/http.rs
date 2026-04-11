@@ -573,6 +573,77 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         server.config.server.github_token.clone(),
     );
 
+    // Wrap completion callback to record Q-value pipeline events and apply backprop on
+    // every live task completion (Done/Failed).  This ensures MemRL updates fire during
+    // normal server operation, not only at startup recovery (validate_recovered_tasks).
+    // Guard IDs are captured once at startup; they are stable after registration.
+    let completion_callback = {
+        let guard_ids: std::sync::Arc<Vec<String>> = {
+            let engine = rules.read().await;
+            std::sync::Arc::new(engine.guards().iter().map(|g| g.id.to_string()).collect())
+        };
+        if let Some(ref qv) = q_values {
+            let qv = qv.clone();
+            let inner = completion_callback;
+            let ids = guard_ids;
+            let cb: task_runner::CompletionCallback =
+                std::sync::Arc::new(move |state: task_runner::TaskState| {
+                    let qv = qv.clone();
+                    let ids = ids.clone();
+                    let inner = inner.clone();
+                    Box::pin(async move {
+                        // Record which guards were active during the implement phase.
+                        if !ids.is_empty() {
+                            let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+                            if let Err(e) = qv
+                                .record_pipeline_event(&state.id.0, "implement", &id_refs)
+                                .await
+                            {
+                                tracing::warn!(
+                                    task_id = %state.id.0,
+                                    "q_value record_pipeline_event failed: {e}"
+                                );
+                            }
+                        }
+                        // Apply Q-value backprop: Done→reward=1.0, else→reward=0.0.
+                        let reward = if matches!(state.status, task_runner::TaskStatus::Done) {
+                            crate::q_value_store::REWARD_MERGED
+                        } else {
+                            crate::q_value_store::REWARD_CLOSED
+                        };
+                        match qv.get_experiences_for_task(&state.id.0).await {
+                            Ok(exp_ids) if !exp_ids.is_empty() => {
+                                if let Err(e) = qv
+                                    .apply_q_update(
+                                        &exp_ids,
+                                        reward,
+                                        crate::q_value_store::DEFAULT_ALPHA,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        task_id = %state.id.0,
+                                        "q_value apply_q_update failed: {e}"
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(
+                                task_id = %state.id.0,
+                                "q_value get_experiences_for_task failed: {e}"
+                            ),
+                        }
+                        if let Some(cb) = inner {
+                            cb(state).await;
+                        }
+                    })
+                });
+            Some(cb)
+        } else {
+            completion_callback
+        }
+    };
+
     // Validate recovered pending tasks in the background so startup is not blocked
     // by serial `gh pr view` calls. The completion_callback is passed so that tasks
     // marked Failed (closed PR) trigger intake cleanup (e.g. removing the issue from
