@@ -744,6 +744,11 @@ async fn run_review_tick(
     // correct repository — without this they fall back to main-worktree
     // detection and can execute against the wrong project.
     let project_root_for_poll = project_root.clone();
+    // Capture the scan boundary before the review agents run. Using this
+    // timestamp (rather than Utc::now() after synthesis completes) as the
+    // watermark ensures that commits arriving while secondary/synthesis agents
+    // are executing are NOT silently skipped on the next tick.
+    let scan_ts = Utc::now();
     let handle = tokio::spawn(async move {
         let primary_output = poll_task_output(&store, &primary_review_id, timeout_secs).await;
         tracing::info!(
@@ -865,24 +870,30 @@ async fn run_review_tick(
             return;
         };
 
-        // Advance the watermark only after the review produced parseable output.
-        // Moving this here (from the earlier unconditional advance) prevents
-        // a failed/timed-out agent from silently marking its commit window as
-        // "reviewed" and skipping it on the next tick.
-        let review_complete_ts = Utc::now();
-        fallback_ts_for_poll.lock().await.fallback_ts = Some(review_complete_ts);
-        let watermark_event = Event::new(SessionId::new(), &hook_key, "scheduler", Decision::Pass);
-        if let Err(err) = state_for_synthesis
-            .observability
-            .events
-            .log(&watermark_event)
-            .await
-        {
-            tracing::error!("scheduler: failed to log periodic_review event (continuing): {err}");
-        }
-
         match crate::review_store::parse_review_output(&output) {
             Ok(review) => {
+                // Advance the watermark only after parse succeeds.
+                // Doing this here (rather than before the match) prevents a
+                // non-empty but malformed JSON response from permanently
+                // dropping its commit window — on parse failure the watermark
+                // stays put and the next tick will re-review the same window.
+                // `scan_ts` is the boundary captured before agents were
+                // enqueued, so commits arriving during secondary/synthesis are
+                // NOT included in the advanced watermark and will be reviewed
+                // on the next tick (fixes the Cross-strategy skip-forever bug).
+                fallback_ts_for_poll.lock().await.fallback_ts = Some(scan_ts);
+                let watermark_event =
+                    Event::new(SessionId::new(), &hook_key, "scheduler", Decision::Pass);
+                if let Err(err) = state_for_synthesis
+                    .observability
+                    .events
+                    .log(&watermark_event)
+                    .await
+                {
+                    tracing::error!(
+                        "scheduler: failed to log periodic_review event (continuing): {err}"
+                    );
+                }
                 tracing::info!(
                     findings = review.findings.len(),
                     health_score = review.summary.health_score,
