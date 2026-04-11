@@ -1484,8 +1484,20 @@ where
         let is_non_decomposable_source = is_non_decomposable_prompt_source(req.source.as_deref());
         if req.issue.is_none() && req.pr.is_none() && is_complex && !is_non_decomposable_source {
             if let Some(ref wmgr) = workspace_mgr {
-                let mut subtask_specs =
-                    crate::parallel_dispatch::decompose(req.prompt.as_deref().unwrap_or_default());
+                let mut subtask_specs = match crate::parallel_dispatch::decompose(
+                    req.prompt.as_deref().unwrap_or_default(),
+                ) {
+                    Ok(specs) => specs,
+                    Err(msg) => {
+                        tracing::warn!(task_id = %id.0, "parallel_dispatch rejected: {}", msg);
+                        mutate_and_persist(&store, &id, |s| {
+                            s.status = TaskStatus::Failed;
+                            s.error = Some(msg);
+                        })
+                        .await?;
+                        return Ok(());
+                    }
+                };
                 if subtask_specs.len() > 1 {
                     // Prepend sibling-awareness context to each subtask prompt so parallel
                     // agents know what other top-level tasks are running on the same project.

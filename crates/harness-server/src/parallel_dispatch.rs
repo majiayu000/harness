@@ -97,6 +97,7 @@ pub(crate) fn extract_file_refs(prompt: &str) -> Vec<String> {
 }
 
 /// A subtask produced by decomposing a complex prompt.
+#[derive(Debug)]
 pub struct SubtaskSpec {
     /// The full prompt for this subtask (including focus directive).
     pub prompt: String,
@@ -122,7 +123,7 @@ fn is_numbered_list(prompt: &str) -> bool {
 /// parallel specs with no dependencies.
 ///
 /// Returns a single-element vec when decomposition is not meaningful.
-pub fn decompose(prompt: &str) -> Vec<SubtaskSpec> {
+pub fn decompose(prompt: &str) -> Result<Vec<SubtaskSpec>, String> {
     // Numbered list → sequential subtasks.
     if is_numbered_list(prompt) {
         let items: Vec<&str> = prompt
@@ -134,22 +135,19 @@ pub fn decompose(prompt: &str) -> Vec<SubtaskSpec> {
             })
             .collect();
         if items.len() >= 2 {
-            // Cap to MAX_SEQUENTIAL_STEPS to prevent queue starvation.
+            // Reject over-limit lists explicitly to prevent silent partial execution.
             // Each step runs serially with the full turn_timeout (default 3600 s);
             // an unbounded list would occupy a worker for N × timeout seconds.
-            let items: &[&str] = if items.len() > MAX_SEQUENTIAL_STEPS {
-                tracing::warn!(
-                    "parallel_dispatch: numbered-list has {} steps, \
-                     capping at {} to prevent queue starvation",
+            if items.len() > MAX_SEQUENTIAL_STEPS {
+                return Err(format!(
+                    "Prompt contains {} sequential steps, which exceeds the {} step limit. \
+                     Please split your request into smaller tasks.",
                     items.len(),
                     MAX_SEQUENTIAL_STEPS
-                );
-                &items[..MAX_SEQUENTIAL_STEPS]
-            } else {
-                &items
-            };
+                ));
+            }
             let total = items.len();
-            return items
+            return Ok(items
                 .iter()
                 .enumerate()
                 .map(|(i, item)| SubtaskSpec {
@@ -162,17 +160,17 @@ pub fn decompose(prompt: &str) -> Vec<SubtaskSpec> {
                     ),
                     depends_on_indices: if i == 0 { vec![] } else { vec![i - 1] },
                 })
-                .collect();
+                .collect());
         }
     }
 
     // File-ref partitioning → parallel subtasks.
     let files = extract_file_refs(prompt);
     if files.len() < 2 {
-        return vec![SubtaskSpec {
+        return Ok(vec![SubtaskSpec {
             prompt: prompt.to_string(),
             depends_on_indices: vec![],
-        }];
+        }]);
     }
     // Scale chunk count linearly with file count, floor at 2, cap at MAX_PARALLEL.
     let n_chunks = (files.len() / 3).clamp(2, MAX_PARALLEL);
@@ -181,7 +179,7 @@ pub fn decompose(prompt: &str) -> Vec<SubtaskSpec> {
     // when file count is not evenly divisible, e.g. 16 files → 4 chunks not 5).
     let groups: Vec<Vec<String>> = files.chunks(chunk_size).map(|g| g.to_vec()).collect();
     let actual_count = groups.len();
-    groups
+    Ok(groups
         .into_iter()
         .enumerate()
         .map(|(i, group)| SubtaskSpec {
@@ -194,7 +192,7 @@ pub fn decompose(prompt: &str) -> Vec<SubtaskSpec> {
             ),
             depends_on_indices: vec![],
         })
-        .collect()
+        .collect())
 }
 
 /// Result of a single parallel subtask execution.
@@ -519,7 +517,7 @@ mod tests {
     #[test]
     fn decompose_no_files_returns_original() {
         let prompt = "Fix the login bug";
-        let subtasks = decompose(prompt);
+        let subtasks = decompose(prompt).unwrap();
         assert_eq!(subtasks.len(), 1);
         assert_eq!(subtasks[0].prompt, prompt);
     }
@@ -527,7 +525,7 @@ mod tests {
     #[test]
     fn decompose_one_file_returns_original() {
         let prompt = "Fix the bug in src/main.rs";
-        let subtasks = decompose(prompt);
+        let subtasks = decompose(prompt).unwrap();
         assert_eq!(subtasks.len(), 1);
         assert_eq!(subtasks[0].prompt, prompt);
     }
@@ -535,14 +533,14 @@ mod tests {
     #[test]
     fn decompose_two_files_yields_two_subtasks() {
         let prompt = "Update src/auth.rs and src/db.rs";
-        let subtasks = decompose(prompt);
+        let subtasks = decompose(prompt).unwrap();
         assert_eq!(subtasks.len(), 2);
     }
 
     #[test]
     fn decompose_multiple_files_splits_into_two() {
         let prompt = "Refactor src/a.rs src/b.rs src/c.rs src/d.rs";
-        let subtasks = decompose(prompt);
+        let subtasks = decompose(prompt).unwrap();
         assert_eq!(subtasks.len(), 2);
         assert!(subtasks[0].prompt.contains("[Parallel subtask 1/2]"));
         assert!(subtasks[1].prompt.contains("[Parallel subtask 2/2]"));
@@ -551,7 +549,7 @@ mod tests {
     #[test]
     fn decompose_subtasks_start_with_original_prompt() {
         let prompt = "Fix auth.rs and db.rs together";
-        let subtasks = decompose(prompt);
+        let subtasks = decompose(prompt).unwrap();
         for subtask in &subtasks {
             assert!(subtask.prompt.starts_with(prompt));
         }
@@ -560,7 +558,7 @@ mod tests {
     #[test]
     fn decompose_six_files_yields_two_subtasks() {
         let prompt = "Refactor src/a.rs src/b.rs src/c.rs src/d.rs src/e.rs src/f.rs";
-        let subtasks = decompose(prompt);
+        let subtasks = decompose(prompt).unwrap();
         assert_eq!(subtasks.len(), 2);
     }
 
@@ -619,7 +617,7 @@ mod tests {
     #[test]
     fn decompose_subtask_contains_focus_directive() {
         let prompt = "Update auth.rs and db.rs";
-        let subtasks = decompose(prompt);
+        let subtasks = decompose(prompt).unwrap();
         assert_eq!(subtasks.len(), 2);
         assert!(subtasks[0].prompt.contains("Focus on these files:"));
         assert!(subtasks[1].prompt.contains("Focus on these files:"));
@@ -628,7 +626,7 @@ mod tests {
     #[test]
     fn decompose_numbered_list_yields_sequential_specs() {
         let prompt = "1. Write the auth module\n2. Refactor the db layer";
-        let subtasks = decompose(prompt);
+        let subtasks = decompose(prompt).unwrap();
         assert_eq!(subtasks.len(), 2);
         assert!(subtasks[0].depends_on_indices.is_empty());
         assert_eq!(subtasks[1].depends_on_indices, vec![0]);
@@ -637,7 +635,7 @@ mod tests {
     #[test]
     fn decompose_parallel_specs_have_no_dependencies() {
         let prompt = "Update src/auth.rs and src/db.rs";
-        let subtasks = decompose(prompt);
+        let subtasks = decompose(prompt).unwrap();
         assert_eq!(subtasks.len(), 2);
         assert!(subtasks[0].depends_on_indices.is_empty());
         assert!(subtasks[1].depends_on_indices.is_empty());
@@ -655,28 +653,28 @@ mod tests {
     #[test]
     fn test_decompose_small() {
         // 2 files: (2/3).clamp(2,8) = 2 — minimum clamp
-        let subtasks = decompose(&make_prompt(2));
+        let subtasks = decompose(&make_prompt(2)).unwrap();
         assert_eq!(subtasks.len(), 2);
     }
 
     #[test]
     fn test_decompose_medium() {
         // 9 files: (9/3).clamp(2,8) = 3
-        let subtasks = decompose(&make_prompt(9));
+        let subtasks = decompose(&make_prompt(9)).unwrap();
         assert_eq!(subtasks.len(), 3);
     }
 
     #[test]
     fn test_decompose_large() {
         // 24 files: (24/3).clamp(2,8) = 8
-        let subtasks = decompose(&make_prompt(24));
+        let subtasks = decompose(&make_prompt(24)).unwrap();
         assert_eq!(subtasks.len(), 8);
     }
 
     #[test]
     fn test_decompose_very_large() {
         // 30 files: (30/3).clamp(2,8) = 8 — cap
-        let subtasks = decompose(&make_prompt(30));
+        let subtasks = decompose(&make_prompt(30)).unwrap();
         assert_eq!(subtasks.len(), 8);
     }
 
@@ -684,7 +682,7 @@ mod tests {
     fn decompose_labels_reflect_actual_chunk_count() {
         // 16 files: n_chunks = (16/3).clamp(2,8) = 5, chunk_size = ceil(16/5) = 4
         // actual chunks from .chunks(4) = 4, so labels must be X/4 not X/5.
-        let subtasks = decompose(&make_prompt(16));
+        let subtasks = decompose(&make_prompt(16)).unwrap();
         let actual = subtasks.len();
         assert_eq!(actual, 4, "expected 4 actual chunks for 16 files");
         for (i, s) in subtasks.iter().enumerate() {
@@ -706,7 +704,7 @@ mod tests {
             .map(|i| format!("{}. task {}", i, i))
             .collect::<Vec<_>>()
             .join("\n");
-        let subtasks = decompose(&prompt);
+        let subtasks = decompose(&prompt).unwrap();
         assert_eq!(
             subtasks.len(),
             n,
@@ -717,27 +715,22 @@ mod tests {
     }
 
     #[test]
-    fn decompose_numbered_list_caps_at_max_sequential_steps() {
-        // Inputs exceeding MAX_SEQUENTIAL_STEPS must be truncated to prevent
-        // queue starvation (N × turn_timeout seconds of serial execution).
+    fn decompose_numbered_list_rejects_over_limit() {
+        // Inputs exceeding MAX_SEQUENTIAL_STEPS must be rejected with an explicit
+        // error — silent truncation causes partial execution marked as Done.
         let n = MAX_SEQUENTIAL_STEPS + 5;
         let prompt: String = (1..=n)
             .map(|i| format!("{}. task {}", i, i))
             .collect::<Vec<_>>()
             .join("\n");
-        let subtasks = decompose(&prompt);
-        assert_eq!(
-            subtasks.len(),
-            MAX_SEQUENTIAL_STEPS,
-            "expected cap at {}, got {}",
-            MAX_SEQUENTIAL_STEPS,
-            subtasks.len()
+        let err = decompose(&prompt).unwrap_err();
+        assert!(
+            err.contains(&n.to_string()),
+            "error should mention actual step count: {err}"
         );
-        // Dependency chain must remain intact within the capped set.
-        assert!(subtasks[0].depends_on_indices.is_empty());
-        assert_eq!(
-            subtasks[MAX_SEQUENTIAL_STEPS - 1].depends_on_indices,
-            vec![MAX_SEQUENTIAL_STEPS - 2]
+        assert!(
+            err.contains(&MAX_SEQUENTIAL_STEPS.to_string()),
+            "error should mention the limit: {err}"
         );
     }
 
@@ -746,7 +739,7 @@ mod tests {
         // 12 files: every file appears exactly once across all chunks
         let n = 12;
         let prompt = make_prompt(n);
-        let subtasks = decompose(&prompt);
+        let subtasks = decompose(&prompt).unwrap();
         let expected: Vec<String> = (0..n).map(|i| format!("src/file{i:02}.rs")).collect();
         let mut found: Vec<String> = subtasks
             .iter()
