@@ -40,6 +40,11 @@ impl Skill {
             return FreshnessClass::Stale;
         };
         let age = now - last_used;
+        // Future timestamp (clock skew or corrupted sidecar data): treat as Stale
+        // to avoid hiding stale skills indefinitely.
+        if age < chrono::TimeDelta::zero() {
+            return FreshnessClass::Stale;
+        }
         if age <= chrono::TimeDelta::days(FRESH_DAYS) {
             FreshnessClass::Fresh
         } else if age <= chrono::TimeDelta::days(ACTIVE_DAYS) {
@@ -140,6 +145,29 @@ mod tests {
     fn used_91_days_ago_high_samples_is_stale() {
         let now = Utc::now();
         let skill = make_skill_with(Some(days_ago(now, 91)), 10);
+        assert_eq!(skill.classify_freshness(now), FreshnessClass::Stale);
+    }
+
+    #[test]
+    fn future_last_used_is_stale_not_fresh() {
+        // A future timestamp (clock skew or corrupted sidecar) must never
+        // classify as Fresh — it should fall back to Stale.
+        let now = Utc::now();
+        let future = now + chrono::TimeDelta::days(1);
+        let skill = make_skill_with(Some(future), 10);
+        assert_eq!(
+            skill.classify_freshness(now),
+            FreshnessClass::Stale,
+            "future last_used must be Stale, not Fresh"
+        );
+    }
+
+    #[test]
+    fn far_future_last_used_is_stale() {
+        // Even a timestamp far in the future should be Stale.
+        let now = Utc::now();
+        let far_future = now + chrono::TimeDelta::days(365);
+        let skill = make_skill_with(Some(far_future), 10);
         assert_eq!(skill.classify_freshness(now), FreshnessClass::Stale);
     }
 
