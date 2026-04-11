@@ -909,16 +909,32 @@ async fn run_review_tick(
                                 new_findings = n,
                                 "scheduler: review findings persisted"
                             );
-                            // Recover findings stuck in task_id='pending' after the
-                            // maximum possible task lifetime has elapsed.  Both
-                            // confirm_task_spawned attempts may have failed (transient
-                            // SQLite lock) while enqueue_task already succeeded — the
-                            // real task is running.  We must not reset the claim while
-                            // that task could still be alive: the default per-turn
-                            // timeout is 3600 s, so 3900 s (3600 + 300 s buffer)
-                            // guarantees the original task has completed before we
-                            // allow re-spawning, preventing duplicate-task overlap.
-                            match rs.recover_stale_pending_claims(3900).await {
+                            // Recover findings stuck in task_id='pending':
+                            // - Rows with real_task_id set (both confirms failed but
+                            //   enqueue succeeded): recovered only when the underlying
+                            //   task has reached a terminal state, so no fixed time
+                            //   bound is needed regardless of rounds or queue wait.
+                            // - Rows without real_task_id (mid-claim window): recovered
+                            //   after 300 s, covering the brief span between
+                            //   try_claim_finding and enqueue/release_claim.
+                            let tasks_snapshot = state_for_synthesis.core.tasks.clone();
+                            match rs
+                                .recover_stale_pending_claims(300, |tid| {
+                                    let id = harness_core::types::TaskId(tid.to_string());
+                                    tasks_snapshot.get(&id).map_or(
+                                        true, // task not in store → treat as done
+                                        |t| {
+                                            matches!(
+                                                t.status,
+                                                crate::task_runner::TaskStatus::Done
+                                                    | crate::task_runner::TaskStatus::Failed
+                                                    | crate::task_runner::TaskStatus::Cancelled
+                                            )
+                                        },
+                                    )
+                                })
+                                .await
+                            {
                                 Ok(0) => {}
                                 Ok(n) => tracing::warn!(
                                     recovered = n,
@@ -1097,11 +1113,24 @@ async fn run_review_tick(
                                                             // leading to unbounded duplicate tasks and
                                                             // queue/quota saturation under load.
                                                             //
-                                                            // Leave task_id = 'pending' so the finding is
-                                                            // skipped until the running task completes and
-                                                            // an external update clears it.  Log a critical
-                                                            // error with the real task_id for operator
-                                                            // recovery.
+                                                            // Record real_task_id so that stale recovery
+                                                            // can gate on actual task completion rather
+                                                            // than a fixed time threshold that does not
+                                                            // bound multi-round or queued task lifetime.
+                                                            if let Err(re) = rs
+                                                                .record_real_task_id(
+                                                                    &finding.rule_id,
+                                                                    &finding.file,
+                                                                    &fix_task_id.0,
+                                                                )
+                                                                .await
+                                                            {
+                                                                tracing::warn!(
+                                                                    finding_id = %finding.id,
+                                                                    real_task_id = %fix_task_id,
+                                                                    "scheduler: record_real_task_id failed: {re}"
+                                                                );
+                                                            }
                                                             tracing::error!(
                                                                 finding_id = %finding.id,
                                                                 real_task_id = %fix_task_id,
