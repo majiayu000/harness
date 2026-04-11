@@ -4,7 +4,7 @@ pub(crate) mod pr_detection;
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::config::agents::CapabilityProfile;
 use harness_core::error::HarnessError;
@@ -747,10 +747,13 @@ pub(crate) async fn run_task(
     // Load checkpoint and task state to determine if we can skip phases.
     // This is the duplicate-PR prevention gate: if the task already has a PR,
     // we skip triage/plan/implement and jump directly to agent review.
-    let checkpoint = store
-        .load_checkpoint(task_id)
-        .await
-        .context("failed to load checkpoint")?;
+    let checkpoint = match store.load_checkpoint(task_id).await {
+        Ok(ck) => ck,
+        Err(e) => {
+            tracing::error!(task_id = %task_id, error = %e, "failed to load checkpoint");
+            return Err(anyhow!("failed to load checkpoint: {e}"));
+        }
+    };
     let resumed_pr_url: Option<String> = store
         .get(task_id)
         .and_then(|t| t.pr_url)
