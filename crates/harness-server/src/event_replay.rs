@@ -564,7 +564,7 @@ impl CompactLock {
     /// be read or parsed.
     #[cfg(target_os = "linux")]
     fn is_stale(lock_path: &Path, meta: &std::fs::Metadata) -> bool {
-        if let Some(content) = std::fs::read_to_string(lock_path).ok() {
+        if let Ok(content) = std::fs::read_to_string(lock_path) {
             let trimmed = content.trim();
             // Lock file format: "pid:starttime" (new) or bare "pid" (legacy).
             let (pid_opt, stored_start_opt) = if let Some((p, s)) = trimmed.split_once(':') {
