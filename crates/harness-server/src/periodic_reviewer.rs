@@ -909,6 +909,22 @@ async fn run_review_tick(
                                 new_findings = n,
                                 "scheduler: review findings persisted"
                             );
+                            // Recover findings stuck in task_id='pending' for >10 min.
+                            // Both confirm_task_spawned attempts may have failed due to
+                            // transient SQLite lock errors, leaving the finding
+                            // permanently dead-lettered (invisible to list_spawnable_findings
+                            // which requires task_id IS NULL).  Reset them so the next
+                            // cycle can retry spawning.
+                            match rs.recover_stale_pending_claims(600).await {
+                                Ok(0) => {}
+                                Ok(n) => tracing::warn!(
+                                    recovered = n,
+                                    "scheduler: reset stale pending claims to allow retry"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "scheduler: recover_stale_pending_claims failed (continuing): {e}"
+                                ),
+                            }
                             // Auto-spawn fix tasks for P1/P2 open findings that have
                             // no existing task yet (task_id IS NULL = dedup guard).
                             // P0 excluded: critical issues require human judgment.

@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "harness-agents"
-version = "0.6.33"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1111,7 +1111,7 @@ dependencies = [
 
 [[package]]
 name = "harness-api"
-version = "0.6.33"
+version = "0.6.29"
 dependencies = [
  "harness-core",
  "harness-exec",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "harness-cli"
-version = "0.6.33"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "harness-core"
-version = "0.6.33"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "harness-exec"
-version = "0.6.33"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1176,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "harness-gc"
-version = "0.6.33"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "harness-observe"
-version = "0.6.33"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "harness-protocol"
-version = "0.6.33"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "harness-rules"
-version = "0.6.33"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1250,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "harness-sandbox"
-version = "0.6.33"
+version = "0.6.29"
 dependencies = [
  "harness-core",
  "tempfile",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "harness-server"
-version = "0.6.33"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1275,7 +1275,6 @@ dependencies = [
  "harness-protocol",
  "harness-rules",
  "harness-skills",
- "harness-workflow",
  "hmac",
  "http-body-util",
  "reqwest",
@@ -1298,7 +1297,7 @@ dependencies = [
 
 [[package]]
 name = "harness-skills"
-version = "0.6.33"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1308,28 +1307,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "harness-workflow"
-version = "0.6.33"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "dashmap",
- "futures",
- "harness-core",
- "harness-exec",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
  "tracing",
  "uuid",
 ]
@@ -2512,9 +2489,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.9.3"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ec095654a25171c2124e9e3393a930bddbffdc939556c914957a4c3e0a87166"
+checksum = "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
@@ -3960,7 +3937,7 @@ dependencies = [
  "http",
  "httparse",
  "log",
- "rand 0.9.3",
+ "rand 0.9.2",
  "sha1",
  "thiserror 2.0.18",
  "utf-8",
@@ -3977,7 +3954,7 @@ dependencies = [
  "http",
  "httparse",
  "log",
- "rand 0.9.3",
+ "rand 0.9.2",
  "sha1",
  "thiserror 2.0.18",
  "utf-8",

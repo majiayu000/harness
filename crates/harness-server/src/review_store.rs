@@ -84,7 +84,7 @@ impl ReviewStore {
         )
         .execute(&pool)
         .await?;
-        // Migrate existing databases: add task_id column if absent.
+        // Migrate existing databases: add task_id / claimed_at columns if absent.
         // PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk).
         let columns: Vec<(i32, String, String, i32, Option<String>, i32)> =
             sqlx::query_as("PRAGMA table_info(review_findings)")
@@ -95,6 +95,14 @@ impl ReviewStore {
             .any(|(_, name, _, _, _, _)| name == "task_id");
         if !has_task_id {
             sqlx::query("ALTER TABLE review_findings ADD COLUMN task_id TEXT")
+                .execute(&pool)
+                .await?;
+        }
+        let has_claimed_at = columns
+            .iter()
+            .any(|(_, name, _, _, _, _)| name == "claimed_at");
+        if !has_claimed_at {
+            sqlx::query("ALTER TABLE review_findings ADD COLUMN claimed_at TEXT")
                 .execute(&pool)
                 .await?;
         }
@@ -251,7 +259,7 @@ impl ReviewStore {
     /// Returns `true` if this caller won the claim, `false` if already claimed.
     pub async fn try_claim_finding(&self, rule_id: &str, file: &str) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            "UPDATE review_findings SET task_id = 'pending' \
+            "UPDATE review_findings SET task_id = 'pending', claimed_at = datetime('now') \
              WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id IS NULL",
         )
         .bind(rule_id)
@@ -259,6 +267,28 @@ impl ReviewStore {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Reset findings stuck in `task_id='pending'` for longer than `stale_secs` seconds
+    /// back to `task_id=NULL` so the next scheduler cycle can retry spawning.
+    ///
+    /// Recovers from the rare case where `enqueue_task` succeeded but both
+    /// `confirm_task_spawned` attempts failed due to transient SQLite lock errors,
+    /// permanently dead-lettering the finding.  A stale threshold of several minutes
+    /// ensures any legitimately in-flight confirm attempt has long since completed.
+    ///
+    /// Returns the number of findings recovered.
+    pub async fn recover_stale_pending_claims(&self, stale_secs: i64) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE review_findings SET task_id = NULL, claimed_at = NULL \
+             WHERE task_id = 'pending' AND status = 'open' \
+               AND claimed_at IS NOT NULL \
+               AND claimed_at < datetime('now', '-' || cast(? as text) || ' seconds')",
+        )
+        .bind(stale_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Confirm a pending claim by replacing the "pending" sentinel with the
