@@ -811,6 +811,11 @@ async fn run_review_tick(
 
         let mut final_task_id = primary_review_id.clone();
         let mut final_output = primary_output.clone();
+        // When synthesis is used (Cross mode) we record the timestamp captured
+        // just before polling synthesis.  Advancing the watermark to this bound
+        // ensures commits that arrive *during* synthesis latency are caught by
+        // the next tick rather than permanently skipped (issue-2 fix).
+        let mut review_bound_ts: Option<DateTime<Utc>> = None;
         if let (Some(secondary_id), Some(secondary_name)) =
             (secondary_review_id.as_ref(), secondary_agent_name.as_ref())
         {
@@ -847,7 +852,28 @@ async fn run_review_tick(
                             "scheduler: synthesis review enqueued"
                         );
                         final_task_id = synth_id.clone();
-                        final_output = poll_task_output(&store, &synth_id, timeout_secs).await;
+                        // Capture bound before polling synthesis so the watermark
+                        // covers only commits primary/secondary actually reviewed;
+                        // commits arriving during synthesis latency are caught next
+                        // tick (issue-2 fix).
+                        let pre_synthesis_ts = Utc::now();
+                        let synth_out = poll_task_output(&store, &synth_id, timeout_secs).await;
+                        if synth_out.is_none() {
+                            // Synthesis timed out / OOM / rate-limited.  Fall back to
+                            // primary output so the watermark still advances and the
+                            // same window is not retried forever with duplicate work
+                            // (issue-1 fix).
+                            tracing::warn!(
+                                task_id = %synth_id,
+                                "scheduler: synthesis produced no output \
+                                 (timeout/OOM/rate-limit); falling back to primary \
+                                 review output to avoid duplicate retry loop"
+                            );
+                            final_output = primary_output.clone();
+                        } else {
+                            final_output = synth_out;
+                        }
+                        review_bound_ts = Some(pre_synthesis_ts);
                     }
                     Err(err) => {
                         tracing::warn!("scheduler: failed to enqueue synthesis review: {err}");
@@ -876,7 +902,11 @@ async fn run_review_tick(
         // commits this agent reviewed.  When the agent produces no output (OOM,
         // rate-limit, timeout) the watermark is left unchanged so the next tick
         // re-reviews the same window.
-        let review_complete_ts = Utc::now();
+        // Use pre_synthesis_ts when available (Cross mode) so the watermark
+        // boundary does not jump past commits that arrived during synthesis
+        // latency.  Falls back to Utc::now() for Single-strategy paths where
+        // no synthesis step exists.
+        let review_complete_ts = review_bound_ts.unwrap_or_else(Utc::now);
         fallback_ts_for_poll.lock().await.fallback_ts = Some(review_complete_ts);
         let watermark_event = Event::new(SessionId::new(), &hook_key, "scheduler", Decision::Pass);
         if let Err(err) = state_for_synthesis
