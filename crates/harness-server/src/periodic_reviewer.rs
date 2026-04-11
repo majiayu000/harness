@@ -1303,9 +1303,21 @@ async fn scrub_terminal_task_ids(
     project_name: &str,
     current_review_id: &str,
 ) -> anyhow::Result<u64> {
+    // Release any findings stuck at task_id='pending' from a previous cycle.
+    // This handles the case where confirm_task_spawned exhausted retries AND
+    // release_claim also failed (e.g., transient DB error or process crash).
+    let stale = review_store
+        .release_stale_pending_claims(project_name)
+        .await?;
+    if stale > 0 {
+        tracing::warn!(
+            count = stale,
+            "scrub: released {stale} stale pending claim(s) for project '{project_name}'"
+        );
+    }
     let assigned = review_store.list_assigned_task_ids(project_name).await?;
     if assigned.is_empty() {
-        return Ok(0);
+        return Ok(stale);
     }
     let mut done_ids: Vec<String> = Vec::new();
     let mut retry_ids: Vec<String> = Vec::new();

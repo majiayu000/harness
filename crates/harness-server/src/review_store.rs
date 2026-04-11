@@ -310,6 +310,24 @@ impl ReviewStore {
         Ok(())
     }
 
+    /// Reset task_id to NULL for all open findings stuck at task_id='pending' for
+    /// the given project.  A 'pending' sentinel that survives into the next scrub
+    /// cycle is stale: it means `confirm_task_spawned` exhausted its retries AND
+    /// the subsequent `release_claim` call also failed (e.g., transient DB error).
+    /// Without this cleanup those findings would be permanently unspawnable because
+    /// `list_assigned_task_ids` excludes 'pending' rows.
+    /// Returns the number of rows reset.
+    pub async fn release_stale_pending_claims(&self, project_name: &str) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE review_findings SET task_id = NULL \
+             WHERE status = 'open' AND task_id = 'pending' AND project_name = ?",
+        )
+        .bind(project_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// List (rule_id, file, task_id) for all open findings with a confirmed real task_id.
     ///
     /// Excludes NULL (not yet claimed) and 'pending' (claim in progress) entries.
@@ -354,7 +372,7 @@ impl ReviewStore {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "UPDATE review_findings SET status = 'resolved', task_id = NULL \
+            "UPDATE OR REPLACE review_findings SET status = 'resolved', task_id = NULL \
              WHERE status = 'open' AND task_id IN ({placeholders})"
         );
         let mut query = sqlx::query(&sql);
