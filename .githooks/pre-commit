@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== pre-commit: fmt ==="
+cargo fmt --all -- --check
+
+echo "=== pre-commit: clippy ==="
+RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets
+
+echo "=== pre-commit: test ==="
+cargo test --workspace
+
+echo "=== pre-commit: all checks passed ==="

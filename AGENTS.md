@@ -21,7 +21,7 @@ All outputs MUST be in English, including:
 
 ## Architecture
 
-Harness is an agent orchestration layer. It constructs prompts and manages lifecycle — agents (Claude Code CLI) decide how to execute.
+Harness is an agent orchestration layer. It constructs prompts and manages lifecycle — agents (Codex CLI) decide how to execute.
 
 - ZERO `Command::new("gh")` or `Command::new("git")` calls inside harness crates — all GitHub/git interaction must be in agent prompts only
 - When user says "fix issue X" or "handle PR Y", ALWAYS delegate to harness server (`POST /tasks`) instead of implementing directly
@@ -38,18 +38,18 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 - If Gemini leaves review comments, address valid feedback before merge
 - If no comments or only false positives, proceed with merge
 
-## Claude CLI Argument Order (CRITICAL)
+## Codex CLI Argument Order (CRITICAL)
 
-- Claude CLI `-p` takes its prompt as the NEXT token: `claude -p <PROMPT> [other flags...]`
+- Codex CLI `-p` takes its prompt as the NEXT token: `Codex -p <PROMPT> [other flags...]`
 - The prompt MUST immediately follow `-p`. Placing it at the end of the arg list causes "Input must be provided" errors
-- Both `claude.rs` (CodeAgent) and `claude_adapter.rs` (AgentAdapter) spawn Claude CLI — changes to CLI arg construction MUST be applied to BOTH files
+- Both `Codex.rs` (CodeAgent) and `claude_adapter.rs` (AgentAdapter) spawn Codex CLI — changes to CLI arg construction MUST be applied to BOTH files
 - After modifying either adapter's arg construction, verify with: `cargo test --package harness-agents` (86 tests)
 
 ## Server Operation
 
-- NEVER start `harness serve` from within a Claude Code session — the `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` env vars cause spawned agents to SIGTRAP
+- NEVER start `harness serve` from within a Codex session — the `Codex` and `CLAUDE_CODE_ENTRYPOINT` env vars cause spawned agents to SIGTRAP
 - Always start the server from a standalone terminal: `./target/release/harness serve --transport http --port 9800 --project-root <path>`
-- If already running inside Claude Code, only stop/kill the server — let the user start it manually
+- If already running inside Codex, only stop/kill the server — let the user start it manually
 
 ## Dependencies
 
@@ -63,4 +63,4 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 - RS-13: only flag functions returning `()` or `Result<()>` — typed returns are transformers, not action functions
 - U-16 exempt: `**/prompts.rs` → 1200-line limit, `**/dispatch.rs` → 1000-line limit
 - L1 exempt: new files matching `src/**/{mod,lib,main}.rs` (standard Rust module files)
-- gh/git guard: CLAUDE.md rule is semantic (agent prompts only); bash guard should not double-block `cargo test` subprocesses
+- gh/git guard: AGENTS.md rule is semantic (agent prompts only); bash guard should not double-block `cargo test` subprocesses

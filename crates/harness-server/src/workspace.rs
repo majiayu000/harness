@@ -5,6 +5,37 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 
+/// Git hook invocations inherit repository-local environment variables such as
+/// `GIT_INDEX_FILE=.git/index`. Those paths are valid for the original checkout
+/// but break nested `git worktree` operations because worktrees use a `.git`
+/// file instead of a directory. Strip the local Git env before spawning any
+/// git subprocess for workspace management or test repo setup.
+const GIT_LOCAL_ENV_VARS: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+fn git_command() -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("git");
+    for key in GIT_LOCAL_ENV_VARS {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
 struct ActiveWorkspace {
     workspace_path: PathBuf,
     source_repo: PathBuf,
@@ -65,7 +96,7 @@ impl WorkspaceManager {
         }
 
         // Fetch latest base_branch from remote so the worktree starts from upstream HEAD.
-        let fetch_output = tokio::process::Command::new("git")
+        let fetch_output = git_command()
             .args([
                 "-C",
                 &source_repo.to_string_lossy(),
@@ -88,7 +119,7 @@ impl WorkspaceManager {
         // Falls back to local base_branch if fetch failed above.
         let remote_ref = format!("{remote}/{base_branch}");
         let branch = format!("harness/{}", task_id.0);
-        let output = tokio::process::Command::new("git")
+        let output = git_command()
             .args([
                 "-C",
                 &source_repo.to_string_lossy(),
@@ -104,7 +135,7 @@ impl WorkspaceManager {
 
         if !output.status.success() {
             // Fallback: try local base_branch (useful for repos without remotes, e.g. tests).
-            let fallback = tokio::process::Command::new("git")
+            let fallback = git_command()
                 .args([
                     "-C",
                     &source_repo.to_string_lossy(),
@@ -256,7 +287,7 @@ impl WorkspaceManager {
         }
 
         // Prune stale worktree metadata so git no longer tracks removed directories.
-        if let Err(e) = tokio::process::Command::new("git")
+        if let Err(e) = git_command()
             .args(["-C", &source_repo.to_string_lossy(), "worktree", "prune"])
             .output()
             .await
@@ -308,7 +339,7 @@ async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {
 }
 
 async fn remove_worktree(source_repo: &Path, workspace_path: &Path) -> anyhow::Result<()> {
-    let output = tokio::process::Command::new("git")
+    let output = git_command()
         .args([
             "-C",
             &source_repo.to_string_lossy(),
@@ -337,13 +368,66 @@ async fn remove_worktree(source_repo: &Path, workspace_path: &Path) -> anyhow::R
 mod tests {
     use super::*;
     use crate::task_runner::TaskId;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn git_command_std() -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        for key in GIT_LOCAL_ENV_VARS {
+            cmd.env_remove(key);
+        }
+        cmd
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct ScopedEnvVar {
+        key: String,
+        original: Option<String>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &str, value: &str) -> Self {
+            let guard = env_lock().lock().expect("env lock should not be poisoned");
+            let original = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self {
+                key: key.to_string(),
+                original,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                unsafe { std::env::set_var(&self.key, value) };
+            } else {
+                unsafe { std::env::remove_var(&self.key) };
+            }
+        }
+    }
+
+    fn run_git(args: &[&str]) -> std::process::Output {
+        let output = git_command_std()
+            .args(args)
+            .output()
+            .expect("git command failed to spawn");
+        assert!(
+            output.status.success(),
+            "git command failed: args={args:?}, stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
 
     fn init_git_repo(dir: &Path) {
         let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .output()
-                .expect("git command failed");
+            run_git(args);
         };
         run(&["-C", &dir.to_string_lossy(), "init"]);
         run(&[
@@ -371,16 +455,13 @@ mod tests {
     }
 
     fn current_branch(repo: &Path) -> String {
-        let out = std::process::Command::new("git")
-            .args([
-                "-C",
-                &repo.to_string_lossy(),
-                "rev-parse",
-                "--abbrev-ref",
-                "HEAD",
-            ])
-            .output()
-            .expect("git rev-parse failed");
+        let out = run_git(&[
+            "-C",
+            &repo.to_string_lossy(),
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+        ]);
         String::from_utf8(out.stdout)
             .expect("utf8")
             .trim()
@@ -491,6 +572,31 @@ mod tests {
             .await
             .expect("create second");
         assert_eq!(path1, path2);
+
+        mgr.remove_workspace(&task_id).await.expect("remove");
+    }
+
+    #[tokio::test]
+    async fn create_workspace_ignores_inherited_git_index_file() {
+        let _guard = ScopedEnvVar::set("GIT_INDEX_FILE", ".git/index");
+
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let task_id = harness_core::types::TaskId("test-task-git-index-file".to_string());
+
+        let ws_path = mgr
+            .create_workspace(&task_id, source.path(), "origin", &branch)
+            .await
+            .expect("create");
+        assert!(ws_path.is_dir());
 
         mgr.remove_workspace(&task_id).await.expect("remove");
     }
