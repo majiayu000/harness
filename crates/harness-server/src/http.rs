@@ -586,36 +586,46 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                     let qv = qv.clone();
                     let inner = inner.clone();
                     Box::pin(async move {
-                        // Apply Q-value backprop only for experiences that were explicitly
-                        // recorded via record_pipeline_event during task execution.
-                        // (Recording all guards here was incorrect — it caused Q-values to
-                        // converge to the global success rate rather than per-rule utility.)
-                        let reward = if matches!(state.status, task_runner::TaskStatus::Done) {
-                            crate::q_value_store::REWARD_MERGED
-                        } else {
-                            crate::q_value_store::REWARD_CLOSED
-                        };
-                        match qv.get_experiences_for_task(&state.id.0).await {
-                            Ok(exp_ids) if !exp_ids.is_empty() => {
-                                if let Err(e) = qv
-                                    .apply_q_update(
-                                        &exp_ids,
-                                        reward,
-                                        crate::q_value_store::DEFAULT_ALPHA,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        task_id = %state.id.0,
-                                        "q_value apply_q_update failed: {e}"
-                                    );
-                                }
+                        // Apply Q-value backprop only for terminal task states and only for
+                        // experiences explicitly recorded via record_pipeline_event during
+                        // task execution. Non-terminal states (Pending, Implementing, etc.)
+                        // must not trigger Q-updates — they would incorrectly penalize rules
+                        // that are still in the middle of a task.
+                        let reward = match state.status {
+                            task_runner::TaskStatus::Done => {
+                                Some(crate::q_value_store::REWARD_MERGED)
                             }
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!(
-                                task_id = %state.id.0,
-                                "q_value get_experiences_for_task failed: {e}"
-                            ),
+                            task_runner::TaskStatus::Failed => {
+                                Some(crate::q_value_store::REWARD_CLOSED)
+                            }
+                            task_runner::TaskStatus::Cancelled => {
+                                Some(crate::q_value_store::REWARD_UNKNOWN_CLOSED)
+                            }
+                            _ => None,
+                        };
+                        if let Some(reward) = reward {
+                            match qv.get_experiences_for_task(&state.id.0).await {
+                                Ok(exp_ids) if !exp_ids.is_empty() => {
+                                    if let Err(e) = qv
+                                        .apply_q_update(
+                                            &exp_ids,
+                                            reward,
+                                            crate::q_value_store::DEFAULT_ALPHA,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            task_id = %state.id.0,
+                                            "q_value apply_q_update failed: {e}"
+                                        );
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!(
+                                    task_id = %state.id.0,
+                                    "q_value get_experiences_for_task failed: {e}"
+                                ),
+                            }
                         }
                         if let Some(cb) = inner {
                             cb(state).await;
