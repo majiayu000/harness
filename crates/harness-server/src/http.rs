@@ -552,6 +552,38 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     let quality_trigger = {
         let gc_cfg = &server.config.gc;
+        // Select a read-only challenger dynamically: find the first registered agent
+        // that (a) differs from the default primary and (b) does not advertise
+        // Write or Execute capabilities.  Hard-coding "anthropic-api" makes the gate
+        // unreachable when that agent is not registered or when it is also the
+        // configured default (which triggers the identity guard in QualityTrigger).
+        let default_name = server
+            .agent_registry
+            .resolved_default_agent_name()
+            .map(|s| s.to_owned());
+        let all_names: Vec<String> = server
+            .agent_registry
+            .list()
+            .iter()
+            .map(|&s| s.to_owned())
+            .collect();
+        let challenger = all_names.iter().find_map(|name| {
+            if Some(name.as_str()) == default_name.as_deref() {
+                return None;
+            }
+            let agent = server.agent_registry.get(name)?;
+            if agent.capabilities().iter().any(|c| {
+                matches!(
+                    c,
+                    harness_core::types::Capability::Write
+                        | harness_core::types::Capability::Execute
+                )
+            }) {
+                None
+            } else {
+                Some(agent)
+            }
+        });
         Arc::new(crate::quality_trigger::QualityTrigger::new(
             events.clone(),
             gc_agent.clone(),
@@ -559,11 +591,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             project_root.clone(),
             gc_cfg.auto_gc_grades.clone(),
             gc_cfg.auto_gc_cooldown_secs,
-            // anthropic-api has only Read capability and passes the
-            // read-only capability check in QualityTrigger.  codex/claude
-            // advertise Write|Execute and are always silently dropped,
-            // causing the single-model false-positive fallback path to run.
-            server.agent_registry.get("anthropic-api"),
+            challenger,
         ))
     };
 
