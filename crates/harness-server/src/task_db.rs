@@ -74,7 +74,7 @@ static TASK_MIGRATIONS: &[Migration] = &[
         sql: "ALTER TABLE tasks ADD COLUMN project TEXT",
     },
     Migration {
-        version: 9,
+        version: 11,
         description: "create task_checkpoints table for phase recovery",
         sql: "CREATE TABLE IF NOT EXISTS task_checkpoints (
             task_id       TEXT PRIMARY KEY,
