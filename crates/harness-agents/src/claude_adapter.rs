@@ -54,6 +54,8 @@ impl AgentAdapter for ClaudeAdapter {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        crate::set_process_group(&mut cmd);
         crate::strip_claude_env(&mut cmd);
 
         if !req.allowed_tools.is_empty() {
