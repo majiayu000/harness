@@ -254,6 +254,15 @@ impl WorkspaceManager {
                 tracing::warn!("cleanup_orphan_worktrees: failed to remove {:?}: {e}", path);
             }
         }
+
+        // Prune stale worktree metadata so git no longer tracks removed directories.
+        if let Err(e) = tokio::process::Command::new("git")
+            .args(["-C", &source_repo.to_string_lossy(), "worktree", "prune"])
+            .output()
+            .await
+        {
+            tracing::warn!("cleanup_orphan_worktrees: git worktree prune failed: {e}");
+        }
     }
 }
 
@@ -312,6 +321,13 @@ async fn remove_worktree(source_repo: &Path, workspace_path: &Path) -> anyhow::R
         .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if workspace_path.exists() {
+            tracing::warn!(
+                "orphan workspace {:?} is not a git worktree — delete it manually: rm -rf {:?}",
+                workspace_path,
+                workspace_path
+            );
+        }
         anyhow::bail!("git worktree remove failed: {}", stderr.trim());
     }
     Ok(())

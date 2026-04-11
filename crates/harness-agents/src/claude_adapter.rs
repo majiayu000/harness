@@ -40,7 +40,9 @@ impl AgentAdapter for ClaudeAdapter {
     ) -> harness_core::error::Result<()> {
         let model = req.model.as_deref().unwrap_or(&self.default_model);
         let mut cmd = Command::new(&self.cli_path);
+        // Prompt MUST follow -p immediately: Claude CLI parses `-p <VALUE>`.
         cmd.arg("-p")
+            .arg(&req.prompt)
             .arg("--dangerously-skip-permissions")
             .arg("--output-format")
             .arg("stream-json")
@@ -58,10 +60,6 @@ impl AgentAdapter for ClaudeAdapter {
             cmd.arg("--allowedTools").arg(req.allowed_tools.join(","));
         }
 
-        // Prompt is the final positional argument — Claude CLI does not read
-        // stdin in --print mode.
-        cmd.arg(&req.prompt);
-
         let mut child = cmd.spawn().map_err(|e| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to spawn claude: {e}"
@@ -73,6 +71,25 @@ impl AgentAdapter for ClaudeAdapter {
                 "no stdout from claude process".into(),
             )
         })?;
+
+        // Drain stderr concurrently to avoid pipe-buffer deadlock and capture
+        // the error message when the process exits non-zero.
+        let stderr_handle = child.stderr.take();
+        let stderr_task = tokio::spawn(async move {
+            let Some(stderr) = stderr_handle else {
+                return String::new();
+            };
+            let mut buf = String::new();
+            if let Err(e) = tokio::io::AsyncReadExt::read_to_string(
+                &mut tokio::io::BufReader::new(stderr),
+                &mut buf,
+            )
+            .await
+            {
+                tracing::warn!("claude: failed to read stderr: {e}");
+            }
+            buf
+        });
 
         // Store child handle for interrupt()
         {
@@ -124,11 +141,30 @@ impl AgentAdapter for ClaudeAdapter {
             }
         };
 
+        let stderr_text = stderr_task.await.unwrap_or_default();
+        if !stderr_text.is_empty() {
+            tracing::warn!("claude stderr: {}", stderr_text.trim());
+        }
+
         if let Some(status) = exit_status {
             if !status.success() {
+                let stderr_suffix = if stderr_text.is_empty() {
+                    String::new()
+                } else {
+                    // Keep last 500 chars of stderr for the error message.
+                    let trimmed: String = stderr_text
+                        .chars()
+                        .rev()
+                        .take(500)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    format!(": {}", trimmed.trim())
+                };
                 if let Err(e) = tx
                     .send(AgentEvent::Error {
-                        message: format!("claude exited with {status}"),
+                        message: format!("claude exited with {status}{stderr_suffix}"),
                     })
                     .await
                 {

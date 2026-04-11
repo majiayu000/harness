@@ -37,6 +37,13 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 - If Gemini leaves review comments, address valid feedback before merge
 - If no comments or only false positives, proceed with merge
 
+## Claude CLI Argument Order (CRITICAL)
+
+- Claude CLI `-p` takes its prompt as the NEXT token: `claude -p <PROMPT> [other flags...]`
+- The prompt MUST immediately follow `-p`. Placing it at the end of the arg list causes "Input must be provided" errors
+- Both `claude.rs` (CodeAgent) and `claude_adapter.rs` (AgentAdapter) spawn Claude CLI — changes to CLI arg construction MUST be applied to BOTH files
+- After modifying either adapter's arg construction, verify with: `cargo test --package harness-agents` (86 tests)
+
 ## Server Operation
 
 - NEVER start `harness serve` from within a Claude Code session — the `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` env vars cause spawned agents to SIGTRAP

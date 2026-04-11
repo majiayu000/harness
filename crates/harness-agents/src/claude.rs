@@ -62,13 +62,17 @@ impl ClaudeCodeAgent {
         req.model.as_deref().unwrap_or(&self.default_model)
     }
 
-    /// Build CLI arguments for the Claude Code agent, including the prompt as a
-    /// positional argument. Claude CLI requires the prompt as a positional arg
-    /// when using `-p`/`--print`; stdin is not supported in that mode.
+    /// Build CLI arguments for the Claude Code agent.
+    ///
+    /// **Critical**: the prompt MUST be the token immediately after `-p`.
+    /// Claude CLI parses `-p <VALUE>` — the prompt is the value of `-p`,
+    /// not a trailing positional argument. Placing it at the end causes
+    /// "Input must be provided" errors.
     fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
         let model = self.resolve_model(req);
         let mut base_args = vec![
             OsString::from("-p"),
+            OsString::from(&req.prompt), // prompt MUST follow -p immediately
             OsString::from("--output-format"),
             OsString::from("text"),
             OsString::from("--model"),
@@ -107,9 +111,6 @@ impl ClaudeCodeAgent {
             base_args.push(OsString::from(budget.to_string()));
         }
 
-        // Prompt is the final positional argument. Claude CLI `-p`/`--print`
-        // does not read from stdin; the prompt must be passed as a positional arg.
-        base_args.push(OsString::from(&req.prompt));
         base_args
     }
 }
@@ -209,6 +210,29 @@ impl CodeAgent for ClaudeCodeAgent {
                     "sandbox setup failed for claude: {error}"
                 ))
             })?;
+
+        // Dump full args (truncate each to 120 chars) so we can diagnose
+        // exactly what is being passed to the Claude CLI process.
+        let args_debug: Vec<String> = wrapped_command
+            .args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let s = a.to_string_lossy();
+                if s.len() > 120 {
+                    format!("[{i}] {}…({} chars)", &s[..120], s.len())
+                } else {
+                    format!("[{i}] {s}")
+                }
+            })
+            .collect();
+        tracing::info!(
+            program = %wrapped_command.program.display(),
+            arg_count = wrapped_command.args.len(),
+            prompt_len = req.prompt.len(),
+            args = %args_debug.join(" | "),
+            "claude execute_stream: full command args"
+        );
 
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
