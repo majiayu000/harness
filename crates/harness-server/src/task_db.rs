@@ -92,7 +92,7 @@ static TASK_MIGRATIONS: &[Migration] = &[
               ON tasks(project, status, updated_at DESC)",
     },
     Migration {
-        version: 11,
+        version: 12,
         description: "add pending_request_json column for AwaitingDeps tasks",
         sql: "ALTER TABLE tasks ADD COLUMN pending_request_json TEXT",
     },
