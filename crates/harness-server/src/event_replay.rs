@@ -13,7 +13,7 @@ use crate::task_runner::TaskStatus;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write as IoWrite};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write as IoWrite};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -416,8 +416,12 @@ fn compact_log(log_path: &Path, states: &HashMap<String, ReplayedState>) -> anyh
         p
     };
 
-    let file = std::fs::File::open(log_path)?;
-    let reader = BufReader::new(file);
+    let src_file = std::fs::File::open(log_path)?;
+    // Record the file size at open time.  After the filter pass, we drain any
+    // bytes appended by concurrent writers between now and the rename below,
+    // so events written during the compaction window are not silently lost.
+    let snapshot_len = src_file.metadata()?.len();
+    let reader = BufReader::new(src_file);
     let mut removed = 0u32;
 
     // Stream directly to the tmp file line-by-line — never buffer all lines
@@ -441,6 +445,21 @@ fn compact_log(log_path: &Path, states: &HashMap<String, ReplayedState>) -> anyh
                 removed += 1;
             }
         }
+
+        // Drain bytes appended to the source file while the filter pass was
+        // running.  A concurrent appender in another process may have written
+        // events to the original inode after we opened it (snapshot_len).
+        // Copy those bytes verbatim into the tmp file before the rename so
+        // they are preserved.  The tiny window between this drain and the
+        // rename is handled by the inode-detection reopen logic in
+        // TaskEventLog::append, which redirects the next write to the new
+        // inode if it detects the path has been replaced.
+        {
+            let mut drain = std::fs::File::open(log_path)?;
+            drain.seek(SeekFrom::Start(snapshot_len))?;
+            std::io::copy(&mut drain, &mut tmp_file)?;
+        }
+
         // Flush buffered writer state then sync to durable storage before the
         // rename.  This ensures the compacted data survives a power failure
         // that occurs between flush and rename.
@@ -486,18 +505,58 @@ impl CompactLock {
     /// cover realistic compaction durations on large logs.
     const STALE_SECS: u64 = 300;
 
-    /// On Linux: reads the PID from the lock file and returns `true` iff
-    /// `/proc/{pid}` does not exist — a race-free, zero-overhead liveness test
-    /// that is independent of how long compaction takes.
+    /// Read `starttime` (field 22) from `/proc/<pid>/stat`.
+    ///
+    /// The start time is clock ticks since system boot.  It is unique per
+    /// boot: if a PID is recycled the new process will have a different start
+    /// time, letting us distinguish a live holder from a reuse.
+    #[cfg(target_os = "linux")]
+    fn read_proc_start_time(pid: u32) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Format: "pid (comm) state ppid pgrp session tty_nr tpgid flags
+        //   minflt cminflt majflt cmajflt utime stime cutime cstime
+        //   priority nice num_threads itrealvalue starttime ..."
+        // `comm` may contain spaces/parens — use rfind to find the last ')'.
+        let after_comm = stat.rfind(')')?;
+        // After ')': state(0) ppid(1) pgrp(2) session(3) tty_nr(4)
+        //   tpgid(5) flags(6) minflt(7) cminflt(8) majflt(9) cmajflt(10)
+        //   utime(11) stime(12) cutime(13) cstime(14) priority(15) nice(16)
+        //   num_threads(17) itrealvalue(18) starttime(19)
+        let fields: Vec<&str> = stat[after_comm + 1..].split_whitespace().collect();
+        fields.get(19)?.parse().ok()
+    }
+
+    /// On Linux: reads `pid:starttime` from the lock file.  Returns `true`
+    /// iff the process is gone **or** its start time differs from the stored
+    /// value (PID reuse).  Falls back to age-based check when the lock cannot
+    /// be read or parsed.
     #[cfg(target_os = "linux")]
     fn is_stale(lock_path: &Path, meta: &std::fs::Metadata) -> bool {
-        if let Some(pid) = std::fs::read_to_string(lock_path)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-        {
-            return !std::path::Path::new(&format!("/proc/{pid}")).exists();
+        if let Some(content) = std::fs::read_to_string(lock_path).ok() {
+            let trimmed = content.trim();
+            // Lock file format: "pid:starttime" (new) or bare "pid" (legacy).
+            let (pid_opt, stored_start_opt) = if let Some((p, s)) = trimmed.split_once(':') {
+                (p.parse::<u32>().ok(), s.parse::<u64>().ok())
+            } else {
+                (trimmed.parse::<u32>().ok(), None)
+            };
+            if let Some(pid) = pid_opt {
+                if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    return true; // Process is gone.
+                }
+                // Guard against PID reuse: a mismatch means the original
+                // writer exited and a different process inherited the PID.
+                if let (Some(stored), Some(current)) =
+                    (stored_start_opt, Self::read_proc_start_time(pid))
+                {
+                    if stored != current {
+                        return true; // PID reused; lock is stale.
+                    }
+                }
+                return false; // Process is live and PID not reused.
+            }
         }
-        // Can't read PID — fall back to age-based check.
+        // Cannot read the lock file — fall back to age-based check.
         meta.modified()
             .ok()
             .and_then(|t| t.elapsed().ok())
@@ -539,14 +598,23 @@ impl CompactLock {
             }
         }
 
-        let pid = std::process::id().to_string();
+        let pid = std::process::id();
+        // On Linux include the process start time so is_stale can detect PID
+        // reuse (a recycled PID has a different start time).
+        #[cfg(target_os = "linux")]
+        let lock_content = {
+            let start = Self::read_proc_start_time(pid).unwrap_or(0);
+            format!("{pid}:{start}")
+        };
+        #[cfg(not(target_os = "linux"))]
+        let lock_content = pid.to_string();
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(lock_path)
         {
             Ok(mut f) => {
-                if let Err(e) = IoWrite::write_all(&mut f, pid.as_bytes()) {
+                if let Err(e) = IoWrite::write_all(&mut f, lock_content.as_bytes()) {
                     tracing::warn!(
                         path = %lock_path.display(),
                         "event_replay: failed to write PID to lock file: {e}"
