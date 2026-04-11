@@ -1,6 +1,6 @@
 use crate::handlers::cross_review::run_cross_review;
 use harness_core::agent::CodeAgent;
-use harness_core::types::{EventFilters, Grade, Project};
+use harness_core::types::{Capability, EventFilters, Grade, Project};
 use harness_gc::gc_agent::GcAgent;
 use harness_observe::event_store::EventStore;
 use harness_observe::quality::QualityGrader;
@@ -120,12 +120,32 @@ impl QualityTrigger {
                              skipping cross-review to preserve independence"
                         );
                     } else {
+                        // Only allow the challenger when its capabilities are
+                        // read-only.  Agents that advertise Write or Execute
+                        // capabilities (e.g. CodexAgent) do not honour
+                        // allowed_tools and will run with their configured
+                        // sandbox, potentially mutating the workspace.
+                        let review_challenger = if challenger
+                            .capabilities()
+                            .iter()
+                            .any(|c| matches!(c, Capability::Write | Capability::Execute))
+                        {
+                            tracing::warn!(
+                                agent = challenger.name(),
+                                "quality_trigger: challenger has Write/Execute capabilities \
+                                 and does not honour allowed_tools; skipping as \
+                                 cross-review challenger to prevent workspace mutation"
+                            );
+                            None
+                        } else {
+                            Some(challenger.clone())
+                        };
                         const CROSS_REVIEW_TIMEOUT_SECS: u64 = 120;
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(CROSS_REVIEW_TIMEOUT_SECS),
                             run_cross_review(
                                 primary,
-                                Some(challenger.clone()),
+                                review_challenger,
                                 self.project_root.clone(),
                                 target,
                                 2,
