@@ -1006,23 +1006,20 @@ fn build_completion_callback(
                 );
                 return;
             };
-            let summary = match &task.status {
-                task_runner::TaskStatus::Done => task
-                    .pr_url
+            let summary = if task.status.is_success() {
+                task.pr_url
                     .as_deref()
                     .map(|url| format!("PR: {url}"))
-                    .unwrap_or_else(|| "Task completed.".to_string()),
-                task_runner::TaskStatus::Failed => {
-                    task.error.as_deref().unwrap_or("unknown error").to_string()
-                }
-                _ => {
-                    tracing::warn!(
-                        task_id = ?task.id,
-                        status = ?task.status,
-                        "completion_callback: called with non-terminal status, skipping"
-                    );
-                    return;
-                }
+                    .unwrap_or_else(|| "Task completed.".to_string())
+            } else if task.status.is_failure() {
+                task.error.as_deref().unwrap_or("unknown error").to_string()
+            } else {
+                tracing::warn!(
+                    task_id = ?task.id,
+                    status = ?task.status,
+                    "completion_callback: called with non-terminal status, skipping"
+                );
+                return;
             };
             let result = crate::intake::TaskCompletionResult {
                 status: task.status.clone(),

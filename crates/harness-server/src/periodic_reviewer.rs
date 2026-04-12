@@ -999,14 +999,9 @@ async fn run_review_tick(
                                 .recover_stale_pending_claims(3900, |tid| {
                                     let id = harness_core::types::TaskId(tid.to_string());
                                     // task not in store → treat as done
-                                    tasks_snapshot.get(&id).is_none_or(|t| {
-                                        matches!(
-                                            t.status,
-                                            crate::task_runner::TaskStatus::Done
-                                                | crate::task_runner::TaskStatus::Failed
-                                                | crate::task_runner::TaskStatus::Cancelled
-                                        )
-                                    })
+                                    tasks_snapshot
+                                        .get(&id)
+                                        .is_none_or(|t| t.status.is_terminal())
                                 })
                                 .await
                             {
@@ -1305,10 +1300,7 @@ async fn poll_task_output(
         let Some(task) = store.get(task_id) else {
             continue;
         };
-        if !matches!(
-            task.status,
-            crate::task_runner::TaskStatus::Done | crate::task_runner::TaskStatus::Failed
-        ) {
+        if !task.status.is_terminal() {
             continue;
         }
         let output: String = task

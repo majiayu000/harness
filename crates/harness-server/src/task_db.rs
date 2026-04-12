@@ -165,6 +165,10 @@ pub struct TaskDb {
 }
 
 impl TaskDb {
+    fn status_placeholders(len: usize) -> String {
+        std::iter::repeat_n("?", len).collect::<Vec<_>>().join(", ")
+    }
+
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let pool = open_pool(path).await?;
         let db = Self { pool };
@@ -256,9 +260,7 @@ impl TaskDb {
         if statuses.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = std::iter::repeat_n("?", statuses.len())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders = Self::status_placeholders(statuses.len());
         let sql = format!(
             "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at DESC"
         );
@@ -315,9 +317,7 @@ impl TaskDb {
         if statuses.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = std::iter::repeat_n("?", statuses.len())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders = Self::status_placeholders(statuses.len());
         let sql = format!("SELECT id FROM tasks WHERE status IN ({placeholders})");
         let mut q = sqlx::query_as::<_, (String,)>(&sql);
         for status in statuses {
@@ -367,17 +367,18 @@ impl TaskDb {
         if let Some(status) = terminal_status {
             // Overwrite to terminal status; only touches tasks still in interrupted states
             // so we never downgrade a task that already reached Done/Failed in the DB.
-            sqlx::query(
+            let sql = format!(
                 "UPDATE tasks SET status = ?, pr_url = COALESCE(?, pr_url), \
                  updated_at = datetime('now') \
                  WHERE id = ? \
-                 AND status IN ('implementing', 'agent_review', 'reviewing', 'waiting')",
-            )
-            .bind(status)
-            .bind(pr_url)
-            .bind(task_id)
-            .execute(&self.pool)
-            .await?;
+                 AND status IN ({})",
+                Self::status_placeholders(TaskStatus::resumable_statuses().len())
+            );
+            let query = sqlx::query(&sql).bind(status).bind(pr_url).bind(task_id);
+            let query = TaskStatus::resumable_statuses()
+                .iter()
+                .fold(query, |query, resumable| query.bind(*resumable));
+            query.execute(&self.pool).await?;
         } else if let Some(url) = pr_url {
             // Write pr_url back only when the DB row currently has no pr_url.
             sqlx::query(
@@ -413,15 +414,22 @@ impl TaskDb {
     /// Returns a [`RecoveryResult`] with counts for each outcome.
     pub async fn recover_in_progress(&self) -> anyhow::Result<RecoveryResult> {
         // Collect all interrupted tasks with their checkpoint data via LEFT JOIN.
-        let rows = sqlx::query_as::<_, RecoveryRow>(
-            "SELECT t.id, t.status, t.turn, t.pr_url AS task_pr_url,
-                    c.triage_output, c.plan_output, c.pr_url AS ck_pr_url
-             FROM tasks t
-             LEFT JOIN task_checkpoints c ON t.id = c.task_id
-             WHERE t.status IN ('implementing', 'agent_review', 'reviewing', 'waiting')",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = {
+            let sql = format!(
+                "SELECT t.id, t.status, t.turn, t.pr_url AS task_pr_url,
+                        c.triage_output, c.plan_output, c.pr_url AS ck_pr_url
+                 FROM tasks t
+                 LEFT JOIN task_checkpoints c ON t.id = c.task_id
+                 WHERE t.status IN ({})",
+                Self::status_placeholders(TaskStatus::resumable_statuses().len())
+            );
+            let query = TaskStatus::resumable_statuses()
+                .iter()
+                .fold(sqlx::query_as::<_, RecoveryRow>(&sql), |query, status| {
+                    query.bind(*status)
+                });
+            query.fetch_all(&self.pool).await?
+        };
 
         let mut result = RecoveryResult::default();
 
@@ -654,24 +662,37 @@ impl TaskDb {
     pub async fn count_done_failed_by_project(
         &self,
     ) -> anyhow::Result<(u64, u64, Vec<(String, u64, u64)>)> {
-        let global: (i64, i64) = sqlx::query_as(
+        let outcome_statuses = [TaskStatus::Done.as_ref(), TaskStatus::Failed.as_ref()];
+        let global_sql = format!(
             "SELECT COUNT(CASE WHEN status = 'done' THEN 1 END), \
                     COUNT(CASE WHEN status = 'failed' THEN 1 END) \
-             FROM tasks WHERE status IN ('done', 'failed')",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+             FROM tasks WHERE status IN ({})",
+            Self::status_placeholders(outcome_statuses.len())
+        );
+        let global: (i64, i64) = outcome_statuses
+            .iter()
+            .fold(sqlx::query_as(&global_sql), |query, status| {
+                query.bind(*status)
+            })
+            .fetch_one(&self.pool)
+            .await?;
 
-        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        let rows_sql = format!(
             "SELECT project, \
                     COUNT(CASE WHEN status = 'done' THEN 1 END), \
                     COUNT(CASE WHEN status = 'failed' THEN 1 END) \
              FROM tasks \
-             WHERE status IN ('done', 'failed') AND project IS NOT NULL \
+             WHERE status IN ({}) AND project IS NOT NULL \
              GROUP BY project",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+            Self::status_placeholders(outcome_statuses.len())
+        );
+        let rows: Vec<(String, i64, i64)> = outcome_statuses
+            .iter()
+            .fold(sqlx::query_as(&rows_sql), |query, status| {
+                query.bind(*status)
+            })
+            .fetch_all(&self.pool)
+            .await?;
 
         let by_project = rows
             .into_iter()
@@ -1211,6 +1232,8 @@ mod tests {
         db.insert(&make_task("t-done", TaskStatus::Done)).await?;
         db.insert(&make_task("t-failed", TaskStatus::Failed))
             .await?;
+        db.insert(&make_task("t-cancelled", TaskStatus::Cancelled))
+            .await?;
 
         let result = db.recover_in_progress().await?;
         assert_eq!(
@@ -1273,7 +1296,59 @@ mod tests {
         assert!(matches!(done.status, TaskStatus::Done));
         let failed = db.get("t-failed").await?.expect("should exist");
         assert!(matches!(failed.status, TaskStatus::Failed));
+        let cancelled = db.get("t-cancelled").await?.expect("should exist");
+        assert!(matches!(cancelled.status, TaskStatus::Cancelled));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_replayed_state_does_not_touch_cancelled() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("t-cancelled", TaskStatus::Cancelled);
+        task.pr_url = Some("https://github.com/owner/repo/pull/9".to_string());
+        db.insert(&task).await?;
+
+        db.apply_replayed_state(
+            "t-cancelled",
+            Some("https://github.com/owner/repo/pull/10"),
+            Some("failed"),
+        )
+        .await?;
+
+        let loaded = db.get("t-cancelled").await?.expect("should exist");
+        assert!(matches!(loaded.status, TaskStatus::Cancelled));
+        assert_eq!(
+            loaded.pr_url.as_deref(),
+            Some("https://github.com/owner/repo/pull/9")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_done_failed_by_project_excludes_cancelled() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let root = "/projects/alpha";
+        let mut done = make_task("done", TaskStatus::Done);
+        done.project_root = Some(std::path::PathBuf::from(root));
+        db.insert(&done).await?;
+
+        let mut failed = make_task("failed", TaskStatus::Failed);
+        failed.project_root = Some(std::path::PathBuf::from(root));
+        db.insert(&failed).await?;
+
+        let mut cancelled = make_task("cancelled", TaskStatus::Cancelled);
+        cancelled.project_root = Some(std::path::PathBuf::from(root));
+        db.insert(&cancelled).await?;
+
+        let (global_done, global_failed, by_project) = db.count_done_failed_by_project().await?;
+        assert_eq!(global_done, 1);
+        assert_eq!(global_failed, 1);
+        assert_eq!(by_project, vec![(root.to_string(), 1, 1)]);
         Ok(())
     }
 
