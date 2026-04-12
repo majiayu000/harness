@@ -271,7 +271,22 @@ impl WorkspaceManager {
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            if !terminal_dirs.contains(&dir_name) {
+            // Match the exact task ID or a known derived sub-workspace suffix:
+            //   `{task}-seq`   — sequential run workspace
+            //   `{task}-p{N}`  — parallel chunk workspace (N = decimal digits only)
+            // A broad `starts_with("{td}-")` would also match unrelated workspaces
+            // like `task-42-hotfix`, incorrectly deleting them when `task-42` is
+            // terminal.  Restricting to the two known suffixes prevents false positives.
+            let is_terminal = terminal_dirs.iter().any(|td| {
+                dir_name == *td
+                    || dir_name == format!("{td}-seq")
+                    || dir_name
+                        .strip_prefix(&format!("{td}-p"))
+                        .is_some_and(|rest| {
+                            !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+                        })
+            });
+            if !is_terminal {
                 continue;
             }
             if self.active.iter().any(|e| e.workspace_path == path) {

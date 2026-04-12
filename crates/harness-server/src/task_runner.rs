@@ -1484,8 +1484,20 @@ where
         let is_non_decomposable_source = is_non_decomposable_prompt_source(req.source.as_deref());
         if req.issue.is_none() && req.pr.is_none() && is_complex && !is_non_decomposable_source {
             if let Some(ref wmgr) = workspace_mgr {
-                let mut subtask_specs =
-                    crate::parallel_dispatch::decompose(req.prompt.as_deref().unwrap_or_default());
+                let mut subtask_specs = match crate::parallel_dispatch::decompose(
+                    req.prompt.as_deref().unwrap_or_default(),
+                ) {
+                    Ok(specs) => specs,
+                    Err(msg) => {
+                        tracing::warn!(task_id = %id.0, "parallel_dispatch rejected: {}", msg);
+                        mutate_and_persist(&store, &id, |s| {
+                            s.status = TaskStatus::Failed;
+                            s.error = Some(msg);
+                        })
+                        .await?;
+                        return Ok(());
+                    }
+                };
                 if subtask_specs.len() > 1 {
                     // Prepend sibling-awareness context to each subtask prompt so parallel
                     // agents know what other top-level tasks are running on the same project.
@@ -1544,7 +1556,7 @@ where
                     .await;
 
                     let turn_timeout = effective_turn_timeout(req.turn_timeout_secs);
-                    let results = crate::parallel_dispatch::run_parallel_subtasks(
+                    let run_result = crate::parallel_dispatch::run_parallel_subtasks(
                         &id,
                         agent.clone(),
                         subtask_specs,
@@ -1557,9 +1569,12 @@ where
                     )
                     .await;
 
-                    let any_success = results.iter().any(|r| r.response.is_some());
+                    // Both sequential and parallel tasks require ALL subtasks to succeed.
+                    // With up to MAX_PARALLEL (8) chunks, any() would mark Done on 1/8
+                    // success, silently dropping failed work.
+                    let succeeded = run_result.results.iter().all(|r| r.response.is_some());
                     mutate_and_persist(&store, &id, |s| {
-                        for r in &results {
+                        for r in &run_result.results {
                             let detail = if let Some(ref resp) = r.response {
                                 if resp.output.is_empty() {
                                     None
@@ -1580,11 +1595,27 @@ where
                                 detail,
                             });
                         }
-                        if any_success {
+                        if succeeded {
                             s.status = TaskStatus::Done;
                         } else {
+                            let failed_count = run_result
+                                .results
+                                .iter()
+                                .filter(|r| r.response.is_none())
+                                .count();
+                            let total_count = run_result.results.len();
                             s.status = TaskStatus::Failed;
-                            s.error = Some("all parallel subtasks failed".to_string());
+                            s.error = Some(if run_result.is_sequential {
+                                format!(
+                                    "{}/{} sequential subtasks failed; remaining steps were skipped",
+                                    failed_count, total_count
+                                )
+                            } else {
+                                format!(
+                                    "{}/{} parallel subtasks failed",
+                                    failed_count, total_count
+                                )
+                            });
                         }
                     })
                     .await?;
