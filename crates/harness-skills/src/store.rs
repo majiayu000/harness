@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub use crate::freshness::FreshnessClass;
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillGovernanceStatus {
@@ -504,6 +506,47 @@ impl SkillStore {
         self.skills.iter().find(|s| s.name == name)
     }
 
+    /// Mutable access to the skills vector — used internally and in tests.
+    #[cfg(test)]
+    pub fn skills_mut(&mut self) -> &mut Vec<Skill> {
+        &mut self.skills
+    }
+
+    /// Return all skills classified as [`FreshnessClass::Dormant`] or
+    /// [`FreshnessClass::Stale`], sorted by staleness: Stale before Dormant,
+    /// then by `last_used` ascending (oldest first), with `None` (never used)
+    /// last.
+    pub fn list_stale(&self, now: DateTime<Utc>) -> Vec<(&Skill, FreshnessClass)> {
+        let mut entries: Vec<(&Skill, FreshnessClass)> = self
+            .skills
+            .iter()
+            .filter_map(|s| {
+                let class = s.classify_freshness(now);
+                match class {
+                    FreshnessClass::Dormant | FreshnessClass::Stale => Some((s, class)),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        entries.sort_by(|(a, ac), (b, bc)| {
+            // Stale sorts before Dormant
+            let class_ord = stale_class_order(*ac).cmp(&stale_class_order(*bc));
+            if class_ord != std::cmp::Ordering::Equal {
+                return class_ord;
+            }
+            // Within same class: oldest last_used first; None (never used) last
+            match (a.last_used, b.last_used) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (Some(ta), Some(tb)) => ta.cmp(&tb),
+            }
+        });
+
+        entries
+    }
+
     pub fn load_builtin(&mut self) {
         let builtins = [
             ("interview", include_str!("../../../skills/interview.md")),
@@ -689,6 +732,15 @@ fn load_usage_sidecar(dir: &Path, skill_name: &str) -> SkillUsage {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Sort key for staleness: lower = sorted first. Stale (0) before Dormant (1).
+fn stale_class_order(class: FreshnessClass) -> u8 {
+    match class {
+        FreshnessClass::Stale => 0,
+        FreshnessClass::Dormant => 1,
+        _ => 2,
+    }
 }
 
 fn location_priority(loc: SkillLocation) -> u8 {

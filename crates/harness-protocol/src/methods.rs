@@ -112,6 +112,8 @@ pub enum Method {
         until: Option<chrono::DateTime<chrono::Utc>>,
         limit: Option<usize>,
     },
+    /// Return all skills classified as Dormant or Stale, sorted by staleness.
+    SkillStale,
 
     // === Rule engine ===
     RuleLoad {
@@ -236,7 +238,22 @@ impl<'de> Deserialize<'de> for RpcRequest {
             let mut raw_method = serde_json::Map::new();
             raw_method.insert("method".to_string(), serde_json::Value::String(method));
             if let Some(params) = params {
-                raw_method.insert("params".to_string(), params);
+                let is_empty = params.is_null() || params.as_object().is_some_and(|m| m.is_empty());
+                if !is_empty {
+                    raw_method.insert("params".to_string(), params);
+                } else {
+                    // Empty/null params: unit variants (e.g. SkillStale) reject a
+                    // content field, but struct variants with all-optional fields
+                    // (e.g. GcRun) need it.  Try without first; if serde errors
+                    // (struct variant expected content), insert the empty params.
+                    let ok_without = serde_json::from_value::<Method>(serde_json::Value::Object(
+                        raw_method.clone(),
+                    ))
+                    .is_ok();
+                    if !ok_without {
+                        raw_method.insert("params".to_string(), params);
+                    }
+                }
             }
             serde_json::from_value::<Method>(serde_json::Value::Object(raw_method))
                 .map_err(de::Error::custom)?
@@ -338,6 +355,7 @@ impl Method {
             Self::CrossReview { .. } => "cross_review",
             Self::SkillGovernanceView { .. } => "skill/governance/view",
             Self::SkillGovernanceHistory { .. } => "skill/governance/history",
+            Self::SkillStale => "skill/stale",
         }
     }
 }

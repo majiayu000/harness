@@ -145,6 +145,18 @@ mod tests {
     }
 
     #[test]
+    fn skill_stale_accepts_empty_params() -> anyhow::Result<()> {
+        // JSON-RPC clients that always send params: {} must not be rejected.
+        let json = r#"{"jsonrpc":"2.0","id":9,"method":"skill/stale","params":{}}"#;
+        let req: RpcRequest = decode_request(json)?;
+        assert!(matches!(req.method, Method::SkillStale));
+        let json_null = r#"{"jsonrpc":"2.0","id":10,"method":"skill/stale","params":null}"#;
+        let req2: RpcRequest = decode_request(json_null)?;
+        assert!(matches!(req2.method, Method::SkillStale));
+        Ok(())
+    }
+
+    #[test]
     fn slash_style_exec_plan_init() -> anyhow::Result<()> {
         let json = r#"{"jsonrpc":"2.0","id":4,"method":"exec_plan/init","params":{"spec":"do stuff","project_root":"/tmp"}}"#;
         let req: RpcRequest = decode_request(json)?;
