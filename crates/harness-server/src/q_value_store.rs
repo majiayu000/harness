@@ -132,9 +132,14 @@ impl QValueStore {
         let mut ids = Vec::new();
         for (json,) in rows {
             let parsed: Vec<String> = serde_json::from_str(&json).unwrap_or_else(|e| {
+                let truncated = if json.len() > 200 {
+                    format!("{}…({} bytes total)", &json[..200], json.len())
+                } else {
+                    json.clone()
+                };
                 tracing::error!(
                     task_id = %task_id,
-                    json = %json,
+                    json = %truncated,
                     error = %e,
                     "Failed to parse experiences_used JSON; skipping row"
                 );
