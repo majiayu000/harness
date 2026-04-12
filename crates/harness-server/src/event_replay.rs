@@ -12,7 +12,8 @@ use crate::task_db::TaskDb;
 use crate::task_runner::TaskStatus;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Write as IoWrite;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -148,6 +149,26 @@ impl TaskEventLog {
 // Replay state machine
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Statistics collected during a [`replay_events`] pass.
+#[derive(Debug, Default)]
+pub struct ReplayStats {
+    /// Number of non-empty lines processed.
+    pub total_lines: usize,
+    /// Number of lines that could not be parsed (corrupt or I/O error).
+    pub corrupt_lines: usize,
+    /// Number of distinct task IDs encountered.
+    pub tasks_seen: usize,
+}
+
+/// Return value of [`replay_events`].
+#[derive(Debug)]
+pub struct ReplayResult {
+    /// Per-task reconstructed state.
+    pub states: HashMap<String, ReplayedState>,
+    /// Parsing statistics from this replay pass.
+    pub stats: ReplayStats,
+}
+
 /// Per-task state reconstructed from replaying the event log.
 #[derive(Debug, Default)]
 pub struct ReplayedState {
@@ -202,26 +223,63 @@ pub fn apply_event(states: &mut HashMap<String, ReplayedState>, event: TaskEvent
     }
 }
 
-/// Read `task-events.jsonl` and return a map of task_id → [`ReplayedState`].
+/// Read `task-events.jsonl` line-by-line and return reconstructed state.
 ///
-/// - Missing file → empty map (fresh install, no error).
-/// - Corrupt lines → skipped with a warning (partial-write tolerance).
-pub fn replay_events(log_path: &Path) -> HashMap<String, ReplayedState> {
-    let data = match std::fs::read_to_string(log_path) {
-        Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+/// - Missing file → `Ok` with empty result (fresh install, no error).
+/// - Unreadable file (permissions, I/O error) → `Err` propagated to caller.
+/// - Corrupt lines → skipped with `warn!`; if ≥ 10 % of lines are corrupt,
+///   an additional `error!` is emitted to surface possible log corruption.
+pub fn replay_events(log_path: &Path) -> anyhow::Result<ReplayResult> {
+    let file = match File::open(log_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ReplayResult {
+                states: HashMap::new(),
+                stats: ReplayStats::default(),
+            });
+        }
         Err(e) => {
-            tracing::warn!("event_replay: failed to read {}: {e}", log_path.display());
-            return HashMap::new();
+            return Err(anyhow::anyhow!(
+                "event_replay: failed to open {}: {e}",
+                log_path.display()
+            ));
         }
     };
 
+    // On macOS, File::open() succeeds on directories; detect this early to
+    // avoid an infinite loop of EISDIR errors from BufReader::lines().
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(anyhow::anyhow!(
+            "event_replay: {} is not a regular file",
+            log_path.display()
+        ));
+    }
+
     let mut states: HashMap<String, ReplayedState> = HashMap::new();
-    for line in data.lines() {
+    let mut total_lines = 0usize;
+    let mut corrupt_lines = 0usize;
+
+    for line in BufReader::new(file).lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                // Return Err rather than break with partial state: using an
+                // incomplete event history is fail-open and can persist stale
+                // values (e.g. a stale pr_url) into the database.
+                // EISDIR is already caught above by the meta.is_file() check,
+                // so this path only fires for genuine mid-stream I/O errors.
+                return Err(anyhow::anyhow!(
+                    "event_replay: I/O error reading {}: {e}",
+                    log_path.display()
+                ));
+            }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
+        total_lines += 1;
         match serde_json::from_str::<TaskEvent>(trimmed) {
             Ok(event) => apply_event(&mut states, event),
             Err(e) => {
@@ -229,10 +287,29 @@ pub fn replay_events(log_path: &Path) -> HashMap<String, ReplayedState> {
                     "event_replay: skipping malformed line: {e} — line: {}",
                     &trimmed[..trimmed.len().min(80)]
                 );
+                corrupt_lines += 1;
             }
         }
     }
-    states
+
+    // Threshold-based error: ≥ 10 % corrupt lines signals possible corruption.
+    if corrupt_lines > 0 && total_lines > 0 && corrupt_lines * 10 >= total_lines {
+        tracing::error!(
+            corrupt_lines,
+            total_lines,
+            "event_replay: event log integrity degraded — possible corruption"
+        );
+    }
+
+    let tasks_seen = states.len();
+    Ok(ReplayResult {
+        states,
+        stats: ReplayStats {
+            total_lines,
+            corrupt_lines,
+            tasks_seen,
+        },
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -249,7 +326,8 @@ pub fn replay_events(log_path: &Path) -> HashMap<String, ReplayedState> {
 ///
 /// Returns the number of tasks whose DB rows were updated.
 pub async fn replay_and_recover(db: &TaskDb, log_path: &Path) -> anyhow::Result<u32> {
-    let states = replay_events(log_path);
+    let result = replay_events(log_path)?;
+    let states = result.states;
     if states.is_empty() {
         return Ok(0);
     }
@@ -294,389 +372,5 @@ pub async fn replay_and_recover(db: &TaskDb, log_path: &Path) -> anyhow::Result<
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use harness_core::types::TaskId;
-
-    fn ts() -> u64 {
-        0
-    }
-
-    fn make_event_log(dir: &std::path::Path) -> TaskEventLog {
-        TaskEventLog::open(&dir.join("task-events.jsonl")).unwrap()
-    }
-
-    // ── apply_event tests ─────────────────────────────────────────────────────
-
-    #[test]
-    fn apply_created_sets_no_status() {
-        let mut states = HashMap::new();
-        apply_event(
-            &mut states,
-            TaskEvent::Created {
-                task_id: "t1".into(),
-                ts: ts(),
-            },
-        );
-        let s = &states["t1"];
-        assert!(s.status.is_none());
-        assert!(!s.terminal);
-    }
-
-    #[test]
-    fn apply_status_changed_updates_status_and_turn() {
-        let mut states = HashMap::new();
-        apply_event(
-            &mut states,
-            TaskEvent::StatusChanged {
-                task_id: "t1".into(),
-                ts: ts(),
-                status: "implementing".into(),
-                turn: 3,
-            },
-        );
-        let s = &states["t1"];
-        assert!(matches!(s.status, Some(TaskStatus::Implementing)));
-        assert_eq!(s.turn, Some(3));
-    }
-
-    #[test]
-    fn apply_failed_sets_terminal() {
-        let mut states = HashMap::new();
-        apply_event(
-            &mut states,
-            TaskEvent::Failed {
-                task_id: "t1".into(),
-                ts: ts(),
-                reason: "boom".into(),
-            },
-        );
-        let s = &states["t1"];
-        assert!(matches!(s.status, Some(TaskStatus::Failed)));
-        assert!(s.terminal);
-    }
-
-    #[test]
-    fn apply_completed_sets_terminal() {
-        let mut states = HashMap::new();
-        apply_event(
-            &mut states,
-            TaskEvent::Completed {
-                task_id: "t1".into(),
-                ts: ts(),
-            },
-        );
-        let s = &states["t1"];
-        assert!(matches!(s.status, Some(TaskStatus::Done)));
-        assert!(s.terminal);
-    }
-
-    #[test]
-    fn apply_event_ignores_status_changed_after_terminal_failed() {
-        let mut states = HashMap::new();
-        apply_event(
-            &mut states,
-            TaskEvent::Failed {
-                task_id: "t1".into(),
-                ts: ts(),
-                reason: "".into(),
-            },
-        );
-        // Late StatusChanged must be ignored (stale-event resistance).
-        apply_event(
-            &mut states,
-            TaskEvent::StatusChanged {
-                task_id: "t1".into(),
-                ts: ts(),
-                status: "implementing".into(),
-                turn: 5,
-            },
-        );
-        let s = &states["t1"];
-        assert!(matches!(s.status, Some(TaskStatus::Failed)));
-        assert!(s.terminal);
-    }
-
-    #[test]
-    fn apply_pr_detected_sets_pr_url() {
-        let mut states = HashMap::new();
-        apply_event(
-            &mut states,
-            TaskEvent::PrDetected {
-                task_id: "t1".into(),
-                ts: ts(),
-                pr_url: "https://github.com/o/r/pull/1".into(),
-            },
-        );
-        assert_eq!(
-            states["t1"].pr_url.as_deref(),
-            Some("https://github.com/o/r/pull/1")
-        );
-    }
-
-    #[test]
-    fn pr_url_from_pr_detected_not_overwritten_by_status_changed() {
-        let mut states = HashMap::new();
-        apply_event(
-            &mut states,
-            TaskEvent::PrDetected {
-                task_id: "t1".into(),
-                ts: ts(),
-                pr_url: "https://github.com/o/r/pull/42".into(),
-            },
-        );
-        apply_event(
-            &mut states,
-            TaskEvent::StatusChanged {
-                task_id: "t1".into(),
-                ts: ts(),
-                status: "reviewing".into(),
-                turn: 2,
-            },
-        );
-        // pr_url must survive the status change.
-        assert_eq!(
-            states["t1"].pr_url.as_deref(),
-            Some("https://github.com/o/r/pull/42")
-        );
-    }
-
-    #[test]
-    fn apply_round_completed_increments_count() {
-        let mut states = HashMap::new();
-        apply_event(
-            &mut states,
-            TaskEvent::RoundCompleted {
-                task_id: "t1".into(),
-                ts: ts(),
-                round: 1,
-                result: "lgtm".into(),
-            },
-        );
-        apply_event(
-            &mut states,
-            TaskEvent::RoundCompleted {
-                task_id: "t1".into(),
-                ts: ts(),
-                round: 2,
-                result: "fixed".into(),
-            },
-        );
-        assert_eq!(states["t1"].rounds_count, 2);
-    }
-
-    // ── replay_events tests ───────────────────────────────────────────────────
-
-    #[test]
-    fn replay_events_returns_empty_for_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = replay_events(&dir.path().join("task-events.jsonl"));
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn replay_events_skips_malformed_lines_and_continues() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("task-events.jsonl");
-        std::fs::write(
-            &path,
-            concat!(
-                "{\"type\":\"created\",\"task_id\":\"t1\",\"ts\":0}\n",
-                "this is not json\n",
-                "{\"type\":\"pr_detected\",\"task_id\":\"t1\",\"ts\":0,\"pr_url\":\"https://github.com/o/r/pull/9\"}\n",
-            ),
-        )
-        .unwrap();
-        let result = replay_events(&path);
-        assert!(result.contains_key("t1"));
-        assert_eq!(
-            result["t1"].pr_url.as_deref(),
-            Some("https://github.com/o/r/pull/9")
-        );
-    }
-
-    #[test]
-    fn replay_events_returns_empty_for_empty_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("task-events.jsonl");
-        std::fs::write(&path, "").unwrap();
-        let result = replay_events(&path);
-        assert!(result.is_empty());
-    }
-
-    // ── TaskEventLog tests ────────────────────────────────────────────────────
-
-    #[test]
-    fn event_log_append_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = make_event_log(dir.path());
-        log.append(&TaskEvent::Created {
-            task_id: "t1".into(),
-            ts: 42,
-        });
-        log.append(&TaskEvent::PrDetected {
-            task_id: "t1".into(),
-            ts: 43,
-            pr_url: "https://github.com/o/r/pull/7".into(),
-        });
-        drop(log);
-
-        let result = replay_events(&dir.path().join("task-events.jsonl"));
-        assert!(result.contains_key("t1"));
-        assert_eq!(
-            result["t1"].pr_url.as_deref(),
-            Some("https://github.com/o/r/pull/7")
-        );
-    }
-
-    #[test]
-    fn event_log_deduplication_two_completed_events() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = make_event_log(dir.path());
-        // Emit Completed twice (simulates sites 4 and 7 both firing).
-        log.append(&TaskEvent::Completed {
-            task_id: "t1".into(),
-            ts: 1,
-        });
-        log.append(&TaskEvent::Completed {
-            task_id: "t1".into(),
-            ts: 2,
-        });
-        drop(log);
-
-        let path = dir.path().join("task-events.jsonl");
-        let result = replay_events(&path);
-        // apply_event ignores the second Completed; state is still Done.
-        assert!(matches!(result["t1"].status, Some(TaskStatus::Done)));
-        assert!(result["t1"].terminal);
-    }
-
-    // ── Integration: full round-trip ──────────────────────────────────────────
-
-    #[tokio::test]
-    async fn replay_and_recover_integration() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("tasks.db");
-        let db = TaskDb::open(&db_path).await?;
-
-        // Insert a task in-progress (simulates crash mid-implement).
-        let mut state = crate::task_runner::TaskState::new(TaskId("task-abc".into()));
-        state.status = crate::task_runner::TaskStatus::Implementing;
-        db.insert(&state).await?;
-
-        // Write an event log showing a PR was detected.
-        let log_path = dir.path().join("task-events.jsonl");
-        let log = TaskEventLog::open(&log_path)?;
-        log.append(&TaskEvent::Created {
-            task_id: "task-abc".into(),
-            ts: 1,
-        });
-        log.append(&TaskEvent::StatusChanged {
-            task_id: "task-abc".into(),
-            ts: 2,
-            status: "implementing".into(),
-            turn: 1,
-        });
-        log.append(&TaskEvent::PrDetected {
-            task_id: "task-abc".into(),
-            ts: 3,
-            pr_url: "https://github.com/o/r/pull/99".into(),
-        });
-        drop(log);
-
-        // Replay should write pr_url back to DB.
-        let updated = replay_and_recover(&db, &log_path).await?;
-        assert_eq!(updated, 1);
-
-        // The task should now have pr_url set in DB.
-        let tasks = db.list().await?;
-        let task = tasks.iter().find(|t| t.id.0 == "task-abc").unwrap();
-        assert_eq!(
-            task.pr_url.as_deref(),
-            Some("https://github.com/o/r/pull/99")
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn replay_skips_phantom_task_not_in_db() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("tasks.db");
-        let db = TaskDb::open(&db_path).await?;
-
-        let log_path = dir.path().join("task-events.jsonl");
-        let log = TaskEventLog::open(&log_path)?;
-        log.append(&TaskEvent::Created {
-            task_id: "phantom-task".into(),
-            ts: 1,
-        });
-        drop(log);
-
-        // Should succeed without inserting a phantom row.
-        let updated = replay_and_recover(&db, &log_path).await?;
-        assert_eq!(updated, 0);
-
-        let tasks = db.list().await?;
-        assert!(tasks.is_empty());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn replay_event_log_has_pr_url_checkpoint_has_none() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("tasks.db");
-        let db = TaskDb::open(&db_path).await?;
-
-        let mut state = crate::task_runner::TaskState::new(TaskId("t-conflict".into()));
-        state.status = crate::task_runner::TaskStatus::Implementing;
-        db.insert(&state).await?;
-
-        let log_path = dir.path().join("task-events.jsonl");
-        let log = TaskEventLog::open(&log_path)?;
-        log.append(&TaskEvent::PrDetected {
-            task_id: "t-conflict".into(),
-            ts: 1,
-            pr_url: "https://github.com/o/r/pull/7".into(),
-        });
-        drop(log);
-
-        replay_and_recover(&db, &log_path).await?;
-
-        let tasks = db.list().await?;
-        let t = tasks.iter().find(|t| t.id.0 == "t-conflict").unwrap();
-        assert_eq!(t.pr_url.as_deref(), Some("https://github.com/o/r/pull/7"));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn replay_terminal_failed_overrides_implementing() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("tasks.db");
-        let db = TaskDb::open(&db_path).await?;
-
-        let mut state = crate::task_runner::TaskState::new(TaskId("t-term".into()));
-        state.status = crate::task_runner::TaskStatus::Implementing;
-        db.insert(&state).await?;
-
-        let log_path = dir.path().join("task-events.jsonl");
-        let log = TaskEventLog::open(&log_path)?;
-        log.append(&TaskEvent::Failed {
-            task_id: "t-term".into(),
-            ts: 1,
-            reason: "crashed".into(),
-        });
-        drop(log);
-
-        replay_and_recover(&db, &log_path).await?;
-
-        // recover_in_progress won't touch it since it's now 'failed'.
-        let tasks = db.list().await?;
-        let t = tasks.iter().find(|t| t.id.0 == "t-term").unwrap();
-        assert!(matches!(t.status, TaskStatus::Failed));
-
-        Ok(())
-    }
-}
+#[path = "event_replay_tests.rs"]
+mod tests;

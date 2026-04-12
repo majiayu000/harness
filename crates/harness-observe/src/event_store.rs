@@ -143,24 +143,38 @@ impl EventStore {
     ///
     /// Silently skips lines that fail to parse or insert (duplicate id = IGNORE).
     async fn migrate_from_jsonl(&self) {
+        use std::io::BufRead as _;
+
         let path = self.data_dir.join("events.jsonl");
-        if !path.exists() {
-            return;
-        }
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
+        // Use File::open directly rather than Path::is_file(): is_file() returns
+        // false both when the file is absent *and* when metadata fails (e.g.
+        // permissions), silently suppressing the latter case with no warning.
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return; // fresh install — no legacy events.jsonl to migrate
+            }
             Err(e) => {
-                tracing::warn!("event store: could not read events.jsonl for migration: {e}");
+                tracing::warn!("event store: could not open events.jsonl for migration: {e}");
                 return;
             }
         };
         let mut imported = 0usize;
-        for line in contents.lines() {
-            let line = line.trim();
+        for line in std::io::BufReader::new(file).lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(
+                        "event store: I/O error reading events.jsonl, aborting migration: {e}"
+                    );
+                    break;
+                }
+            };
+            let line = line.trim().to_owned();
             if line.is_empty() {
                 continue;
             }
-            if let Ok(event) = serde_json::from_str::<Event>(line) {
+            if let Ok(event) = serde_json::from_str::<Event>(&line) {
                 if let Err(e) = self.insert_event(&event).await {
                     tracing::warn!("event store: failed to insert migrated event: {e}");
                 } else {
