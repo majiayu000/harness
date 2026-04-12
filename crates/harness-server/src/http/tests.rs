@@ -1,10 +1,13 @@
 use super::*;
+use crate::test_helpers::{HomeGuard, HOME_LOCK};
+use crate::thread_manager::ThreadManager;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Request;
+use harness_agents::registry::AgentRegistry;
 use harness_core::{
     agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, agent::StreamItem,
-    types::Capability, types::TokenUsage,
+    config::HarnessConfig, types::Capability, types::TokenUsage,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -181,6 +184,41 @@ async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>>
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await
+}
+
+#[tokio::test]
+async fn build_app_state_preserves_startup_wiring() -> anyhow::Result<()> {
+    let _lock = HOME_LOCK.lock().await;
+    let sandbox = tempfile::tempdir()?;
+    let project_root = sandbox.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let data_dir = sandbox.path().join("data");
+
+    let fake_home = sandbox.path().join("home");
+    std::fs::create_dir_all(&fake_home)?;
+    let _env_guard = unsafe { HomeGuard::set(&fake_home) };
+
+    let mut config = HarnessConfig::default();
+    config.server.project_root = project_root.clone();
+    config.server.data_dir = data_dir;
+    config.server.notification_broadcast_capacity = 0;
+    let server = Arc::new(HarnessServer::new(
+        config,
+        ThreadManager::new(),
+        AgentRegistry::new("test"),
+    ));
+
+    let state = build_app_state(server).await?;
+
+    assert!(state.core.project_registry.is_some());
+    assert!(state.core.runtime_state_store.is_some());
+    assert!(state.observability.review_store.is_some());
+    assert_eq!(state.notifications.notification_tx.receiver_count(), 0);
+    let _rx = state.notifications.notification_tx.subscribe();
+    assert_eq!(state.notifications.notification_tx.receiver_count(), 1);
+    assert!(state.intake.github_pollers.is_empty());
+    assert!(state.interceptors.len() >= 4);
+    Ok(())
 }
 
 #[tokio::test]

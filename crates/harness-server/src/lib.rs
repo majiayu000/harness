@@ -44,6 +44,7 @@ pub mod self_evolution;
 pub mod server;
 pub mod services;
 pub mod skill_governor;
+pub mod startup;
 pub mod stdio;
 pub mod task_db;
 pub mod task_executor;
