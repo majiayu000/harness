@@ -16,6 +16,7 @@ use axum::{
 use dashmap::DashMap;
 use harness_protocol::{methods::RpcRequest, notifications::RpcNotification};
 use serde_json::json;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -24,6 +25,32 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 pub(crate) mod auth;
 pub(crate) mod rate_limit;
 pub(crate) mod task_routes;
+
+fn validated_project_limit(limit: Option<u32>, project_label: &str) -> Option<usize> {
+    match limit {
+        Some(0) => {
+            tracing::warn!(project = %project_label, "ignoring invalid max_concurrent=0");
+            None
+        }
+        Some(limit) => Some(limit as usize),
+        None => None,
+    }
+}
+
+fn apply_registry_project_limits(
+    queue_config: &mut harness_core::config::misc::ConcurrencyConfig,
+    projects: Vec<crate::project_registry::Project>,
+) {
+    let mut seen_roots = HashSet::new();
+    for project in projects {
+        if !seen_roots.insert(project.root.clone()) {
+            continue;
+        }
+        if let Some(limit) = validated_project_limit(project.max_concurrent, &project.id) {
+            queue_config.set_project_limit(&project.root, limit);
+        }
+    }
+}
 
 /// Core services: thread/task management and persistence.
 pub struct CoreServices {
@@ -375,20 +402,27 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     )
     .await?;
     let mut queue_config = server.config.concurrency.clone();
-    // Auto-register the default project from --project-root on startup.
-    let default_project = crate::project_registry::Project {
-        id: "default".to_string(),
-        root: project_root.clone(),
-        max_concurrent: None,
-        default_agent: None,
-        active: true,
-        created_at: chrono::Utc::now().to_rfc3339(),
-    };
-    if let Err(e) = project_registry.register(default_project).await {
-        tracing::warn!("failed to auto-register default project: {e}");
+    // Auto-register the default project from --project-root on startup without
+    // overwriting runtime edits that already exist in the persistent registry.
+    if project_registry.get("default").await?.is_none() {
+        let default_project = crate::project_registry::Project {
+            id: "default".to_string(),
+            root: project_root.clone(),
+            max_concurrent: None,
+            default_agent: None,
+            active: true,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Err(e) = project_registry.register(default_project).await {
+            tracing::warn!("failed to auto-register default project: {e}");
+        }
     }
-    // Register any extra named projects supplied via --project CLI flags.
+    // Register any extra named projects supplied via --project CLI flags without
+    // clobbering operator overrides already persisted in the registry.
     for (name, path) in &server.startup_projects {
+        if project_registry.get(name).await?.is_some() {
+            continue;
+        }
         let configured_limit = server
             .config
             .projects
@@ -398,7 +432,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         let proj = crate::project_registry::Project {
             id: name.clone(),
             root: path.clone(),
-            max_concurrent: configured_limit,
+            max_concurrent: configured_limit.filter(|limit| *limit > 0),
             default_agent: None,
             active: true,
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -406,15 +440,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         if let Err(e) = project_registry.register(proj).await {
             tracing::warn!(project = %name, "failed to register startup project: {e}");
         }
-        if let Some(limit) = configured_limit.map(|limit| limit as usize) {
-            queue_config.set_project_limit(path, limit);
-        }
     }
-    for project in project_registry.list().await? {
-        if let Some(limit) = project.max_concurrent.map(|limit| limit as usize) {
-            queue_config.set_project_limit(&project.root, limit);
-        }
-    }
+    apply_registry_project_limits(&mut queue_config, project_registry.list().await?);
     let plans_md_dir = dir.join("plans");
     match plan_db.migrate_from_markdown_dir(&plans_md_dir).await {
         Ok(0) => {}

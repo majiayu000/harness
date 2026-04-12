@@ -373,6 +373,212 @@ async fn build_app_state_restores_registry_project_concurrency_limits_after_rest
     Ok(())
 }
 
+#[tokio::test]
+async fn build_app_state_preserves_runtime_override_for_startup_project_after_restart(
+) -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let home = tempfile::tempdir()?;
+    let _home_guard = unsafe { crate::test_helpers::HomeGuard::set(home.path()) };
+    let project_root = crate::test_helpers::tempdir_in_home("http-startup-override-root-")?;
+    let startup_project = crate::test_helpers::tempdir_in_home("http-startup-override-project-")?;
+    let data_dir = crate::test_helpers::tempdir_in_home("http-startup-override-data-")?;
+
+    let canonical_project_root = startup_project.path().canonicalize()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.project_root = project_root.path().to_path_buf();
+    config.server.data_dir = data_dir.path().to_path_buf();
+    config.projects.push(harness_core::config::ProjectEntry {
+        name: "demo".to_string(),
+        root: canonical_project_root.clone(),
+        default: false,
+        default_agent: None,
+        max_concurrent: Some(3),
+    });
+
+    let mut first_agent_registry = harness_agents::registry::AgentRegistry::new("test");
+    first_agent_registry.register("test", CapturingAgent::new());
+    let mut first_server = crate::server::HarnessServer::new(
+        config.clone(),
+        crate::thread_manager::ThreadManager::new(),
+        first_agent_registry,
+    );
+    first_server.startup_projects = vec![("demo".to_string(), canonical_project_root.clone())];
+    let first_state = build_app_state(Arc::new(first_server)).await?;
+
+    first_state
+        .core
+        .project_registry
+        .as_ref()
+        .expect("registry should exist")
+        .register(crate::project_registry::Project {
+            id: "demo".to_string(),
+            root: canonical_project_root.clone(),
+            max_concurrent: Some(1),
+            default_agent: None,
+            active: true,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .await?;
+
+    drop(first_state);
+
+    let mut restarted_agent_registry = harness_agents::registry::AgentRegistry::new("test");
+    restarted_agent_registry.register("test", CapturingAgent::new());
+    let mut restarted_server = crate::server::HarnessServer::new(
+        config,
+        crate::thread_manager::ThreadManager::new(),
+        restarted_agent_registry,
+    );
+    restarted_server.startup_projects = vec![("demo".to_string(), canonical_project_root.clone())];
+    let restarted_state = build_app_state(Arc::new(restarted_server)).await?;
+
+    let project_id = canonical_project_root.to_string_lossy().into_owned();
+    let permit = restarted_state
+        .concurrency
+        .task_queue
+        .acquire(&project_id, 0)
+        .await?;
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(50),
+        restarted_state
+            .concurrency
+            .task_queue
+            .acquire(&project_id, 0),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "runtime override for startup project should survive restart instead of resetting to config"
+    );
+    drop(permit);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn build_app_state_prefers_latest_limit_when_multiple_registry_ids_share_canonical_root(
+) -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let home = tempfile::tempdir()?;
+    let _home_guard = unsafe { crate::test_helpers::HomeGuard::set(home.path()) };
+    let project_root = crate::test_helpers::tempdir_in_home("http-alias-root-")?;
+    let shared_project = crate::test_helpers::tempdir_in_home("http-alias-project-")?;
+    let data_dir = crate::test_helpers::tempdir_in_home("http-alias-data-")?;
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.project_root = project_root.path().to_path_buf();
+    config.server.data_dir = data_dir.path().to_path_buf();
+
+    let canonical_project_root = shared_project.path().canonicalize()?;
+    let mut first_agent_registry = harness_agents::registry::AgentRegistry::new("test");
+    first_agent_registry.register("test", CapturingAgent::new());
+    let first_server = crate::server::HarnessServer::new(
+        config.clone(),
+        crate::thread_manager::ThreadManager::new(),
+        first_agent_registry,
+    );
+    let first_state = build_app_state(Arc::new(first_server)).await?;
+    let registry = first_state
+        .core
+        .project_registry
+        .as_ref()
+        .expect("registry should exist");
+
+    registry
+        .register(crate::project_registry::Project {
+            id: "newer-alias".to_string(),
+            root: canonical_project_root.clone(),
+            max_concurrent: Some(1),
+            default_agent: None,
+            active: true,
+            created_at: "2026-04-13T12:00:00Z".to_string(),
+        })
+        .await?;
+    registry
+        .register(crate::project_registry::Project {
+            id: "older-alias".to_string(),
+            root: canonical_project_root.clone(),
+            max_concurrent: Some(2),
+            default_agent: None,
+            active: true,
+            created_at: "2026-04-13T11:00:00Z".to_string(),
+        })
+        .await?;
+
+    drop(first_state);
+
+    let mut restarted_agent_registry = harness_agents::registry::AgentRegistry::new("test");
+    restarted_agent_registry.register("test", CapturingAgent::new());
+    let restarted_server = crate::server::HarnessServer::new(
+        config,
+        crate::thread_manager::ThreadManager::new(),
+        restarted_agent_registry,
+    );
+    let restarted_state = build_app_state(Arc::new(restarted_server)).await?;
+
+    let project_id = canonical_project_root.to_string_lossy().into_owned();
+    let permit_a = restarted_state
+        .concurrency
+        .task_queue
+        .acquire(&project_id, 0)
+        .await?;
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(50),
+        restarted_state
+            .concurrency
+            .task_queue
+            .acquire(&project_id, 0),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "newest alias limit should win for a shared canonical root after restart"
+    );
+    drop(permit_a);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn build_app_state_ignores_zero_max_concurrent_for_startup_project_limits(
+) -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let home = tempfile::tempdir()?;
+    let _home_guard = unsafe { crate::test_helpers::HomeGuard::set(home.path()) };
+    let project_root = crate::test_helpers::tempdir_in_home("http-zero-root-")?;
+    let startup_project = crate::test_helpers::tempdir_in_home("http-zero-project-")?;
+    let data_dir = crate::test_helpers::tempdir_in_home("http-zero-data-")?;
+
+    let canonical_project_root = startup_project.path().canonicalize()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.project_root = project_root.path().to_path_buf();
+    config.server.data_dir = data_dir.path().to_path_buf();
+    config.projects.push(harness_core::config::ProjectEntry {
+        name: "demo".to_string(),
+        root: canonical_project_root.clone(),
+        default: false,
+        default_agent: None,
+        max_concurrent: Some(0),
+    });
+
+    let mut agent_registry = harness_agents::registry::AgentRegistry::new("test");
+    agent_registry.register("test", CapturingAgent::new());
+    let mut server = crate::server::HarnessServer::new(
+        config,
+        crate::thread_manager::ThreadManager::new(),
+        agent_registry,
+    );
+    server.startup_projects = vec![("demo".to_string(), canonical_project_root.clone())];
+    let state = build_app_state(Arc::new(server)).await?;
+
+    let project_id = canonical_project_root.to_string_lossy().into_owned();
+    let permit_a = state.concurrency.task_queue.acquire(&project_id, 0).await?;
+    let permit_b = state.concurrency.task_queue.acquire(&project_id, 0).await?;
+    drop((permit_a, permit_b));
+
+    Ok(())
+}
+
 async fn make_test_state_with_agent(
     dir: &std::path::Path,
     webhook_secret: Option<&str>,
