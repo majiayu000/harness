@@ -131,7 +131,15 @@ impl QValueStore {
 
         let mut ids = Vec::new();
         for (json,) in rows {
-            let parsed: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+            let parsed: Vec<String> = serde_json::from_str(&json).unwrap_or_else(|e| {
+                tracing::error!(
+                    task_id = %task_id,
+                    json = %json,
+                    error = %e,
+                    "Failed to parse experiences_used JSON; skipping row"
+                );
+                Vec::new()
+            });
             ids.extend(parsed);
         }
         ids.sort();
