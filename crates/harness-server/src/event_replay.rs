@@ -11,9 +11,9 @@
 use crate::task_db::TaskDb;
 use crate::task_runner::TaskStatus;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write as IoWrite};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write as IoWrite};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -136,7 +136,45 @@ impl TaskEventLog {
             }
         };
         let mut file = self.file.lock().unwrap();
-        if let Err(e) = writeln!(file, "{line}") {
+
+        // On Unix, `rename()` is atomic but leaves existing file descriptors
+        // pointing to the old (now unlinked) inode.  When compaction replaces
+        // `task-events.jsonl`, a running appender would silently write events
+        // to the unlinked inode — events are lost once the fd is closed.
+        // Detect the replacement by comparing inodes and reopen if needed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let replaced = file
+                .metadata()
+                .ok()
+                .zip(std::fs::metadata(&self.path).ok())
+                .map(|(fd_meta, path_meta)| fd_meta.ino() != path_meta.ino())
+                .unwrap_or(false);
+            if replaced {
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                {
+                    Ok(new_file) => {
+                        tracing::debug!(
+                            path = %self.path.display(),
+                            "event_log: log file replaced by compaction; reopened"
+                        );
+                        *file = new_file;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %self.path.display(),
+                            "event_log: log file replaced but reopen failed: {e}"
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Err(e) = writeln!(*file, "{line}") {
             tracing::warn!(
                 path = %self.path.display(),
                 "event_log: failed to append event: {e}"
@@ -312,6 +350,329 @@ pub fn replay_events(log_path: &Path) -> anyhow::Result<ReplayResult> {
     })
 }
 
+/// Compact `task-events.jsonl` by removing all events for tasks that have
+/// reached a terminal state.
+///
+/// Terminal-task events are redundant after [`replay_and_recover`] has
+/// committed their state to the database.  Removing them prevents the log from
+/// growing unboundedly across server restarts.
+///
+/// Uses an atomic rename (write to a per-process `.tmp` file, then `rename`)
+/// so that a crash during compaction leaves the original log intact.  A
+/// [`CompactLock`] serialises concurrent server instances that share the same
+/// data directory, preventing silent event loss from a rename race.
+///
+/// Returns the number of event lines removed.
+fn compact_log(log_path: &Path, states: &HashMap<String, ReplayedState>) -> anyhow::Result<u32> {
+    let terminal_ids: HashSet<&str> = states
+        .iter()
+        .filter(|(_, s)| s.terminal)
+        .map(|(id, _)| id.as_str())
+        .collect();
+
+    if terminal_ids.is_empty() {
+        return Ok(0);
+    }
+
+    // Acquire an exclusive lock to prevent concurrent server instances from
+    // racing on the same log file.
+    let lock_path = {
+        let stem = log_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let mut p = log_path.to_path_buf();
+        p.set_file_name(format!("{stem}.compact.lock"));
+        p
+    };
+    let _lock = match CompactLock::try_acquire(&lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            tracing::warn!(
+                path = %log_path.display(),
+                "event_replay: compaction lock held by another process, skipping"
+            );
+            return Ok(0);
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Unique tmp path per process (PID + sub-second nonce) so two instances
+    // that somehow both pass the lock check cannot clobber each other's tmp.
+    let tmp_path = {
+        let pid = std::process::id();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let stem = log_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let mut p = log_path.to_path_buf();
+        p.set_file_name(format!("{stem}.{pid}.{nonce}.tmp"));
+        p
+    };
+
+    let src_file = std::fs::File::open(log_path)?;
+    // Record the file size at open time.  After the filter pass, we drain any
+    // bytes appended by concurrent writers between now and the rename below,
+    // so events written during the compaction window are not silently lost.
+    let snapshot_len = src_file.metadata()?.len();
+    let reader = BufReader::new(src_file);
+    let mut removed = 0u32;
+
+    // Open a second fd to the source file seeked to snapshot_len.  We keep
+    // this fd open across the rename so we can perform a post-rename second
+    // drain to capture any bytes written to the old inode between the first
+    // drain and the rename.
+    let mut drain = std::fs::File::open(log_path)?;
+    drain.seek(SeekFrom::Start(snapshot_len))?;
+
+    // Stream directly to the tmp file line-by-line — never buffer all lines
+    // in memory, which could OOM the server on a large log.
+    {
+        let mut tmp_file = std::fs::File::create(&tmp_path)?;
+        for line_result in reader.lines() {
+            let line = line_result?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let keep = match serde_json::from_str::<TaskEvent>(trimmed) {
+                Ok(event) => !terminal_ids.contains(event.task_id()),
+                // Keep lines we cannot parse — do not silently drop unknown data.
+                Err(_) => true,
+            };
+            if keep {
+                writeln!(tmp_file, "{trimmed}")?;
+            } else {
+                removed += 1;
+            }
+        }
+
+        // First drain: copy bytes appended to the source inode during the
+        // filter pass (positions snapshot_len..current_end).
+        std::io::copy(&mut drain, &mut tmp_file)?;
+
+        // Flush buffered writer state then sync to durable storage before the
+        // rename.  This ensures the compacted data survives a power failure
+        // that occurs between flush and rename.
+        tmp_file.flush()?;
+        tmp_file.sync_all()?;
+        // File is closed (dropped) here, before rename.
+    }
+
+    std::fs::rename(&tmp_path, log_path)?;
+
+    // Second drain: capture bytes written to the old inode between the first
+    // drain and the rename.  On Unix, rename() is atomic; a concurrent
+    // appender that had not yet detected the inode change may have written
+    // events to the pre-rename inode during that window.  `drain` still holds
+    // an open fd to the now-unlinked old inode, so we copy any remaining
+    // bytes into the new file.  The inode-detection reopen in
+    // TaskEventLog::append redirects the next write to the new inode once the
+    // appender observes the path replacement, closing the window from the
+    // appender's side.
+    {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            Ok(mut new_file) => {
+                if let Err(e) =
+                    std::io::copy(&mut drain, &mut new_file).and_then(|_| new_file.sync_all())
+                {
+                    tracing::warn!(
+                        path = %log_path.display(),
+                        "event_replay: second drain after rename failed (non-fatal): {e}"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %log_path.display(),
+                    "event_replay: failed to open new log for second drain (non-fatal): {e}"
+                );
+            }
+        }
+    }
+    drop(drain);
+
+    // Sync the parent directory to make the directory-entry rename durable.
+    if let Some(parent) = log_path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            if let Err(e) = dir.sync_all() {
+                tracing::warn!(
+                    path = %log_path.display(),
+                    "event_replay: failed to fsync parent dir after compaction: {e}"
+                );
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CompactLock — per-directory mutex for log compaction
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// RAII guard for the compaction lock file.
+///
+/// Uses [`std::fs::OpenOptions::create_new`] for atomic creation (mutual
+/// exclusion without `libc`).  Stale locks left by crashed processes are
+/// detected via the file's modification time: a lock older than
+/// [`STALE_SECS`](CompactLock::STALE_SECS) is assumed abandoned and removed.
+struct CompactLock {
+    path: std::path::PathBuf,
+}
+
+impl CompactLock {
+    /// Fallback age threshold (seconds) used on platforms where PID-based
+    /// liveness cannot be determined.  5 minutes is conservative enough to
+    /// cover realistic compaction durations on large logs.
+    const STALE_SECS: u64 = 300;
+
+    /// Read `starttime` (field 22) from `/proc/<pid>/stat`.
+    ///
+    /// The start time is clock ticks since system boot.  It is unique per
+    /// boot: if a PID is recycled the new process will have a different start
+    /// time, letting us distinguish a live holder from a reuse.
+    #[cfg(target_os = "linux")]
+    fn read_proc_start_time(pid: u32) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Format: "pid (comm) state ppid pgrp session tty_nr tpgid flags
+        //   minflt cminflt majflt cmajflt utime stime cutime cstime
+        //   priority nice num_threads itrealvalue starttime ..."
+        // `comm` may contain spaces/parens — use rfind to find the last ')'.
+        let after_comm = stat.rfind(')')?;
+        // After ')': state(0) ppid(1) pgrp(2) session(3) tty_nr(4)
+        //   tpgid(5) flags(6) minflt(7) cminflt(8) majflt(9) cmajflt(10)
+        //   utime(11) stime(12) cutime(13) cstime(14) priority(15) nice(16)
+        //   num_threads(17) itrealvalue(18) starttime(19)
+        let fields: Vec<&str> = stat[after_comm + 1..].split_whitespace().collect();
+        fields.get(19)?.parse().ok()
+    }
+
+    /// On Linux: reads `pid:starttime` from the lock file.  Returns `true`
+    /// iff the process is gone **or** its start time differs from the stored
+    /// value (PID reuse).  Falls back to age-based check when the lock cannot
+    /// be read or parsed.
+    #[cfg(target_os = "linux")]
+    fn is_stale(lock_path: &Path, meta: &std::fs::Metadata) -> bool {
+        if let Ok(content) = std::fs::read_to_string(lock_path) {
+            let trimmed = content.trim();
+            // Lock file format: "pid:starttime" (new) or bare "pid" (legacy).
+            let (pid_opt, stored_start_opt) = if let Some((p, s)) = trimmed.split_once(':') {
+                (p.parse::<u32>().ok(), s.parse::<u64>().ok())
+            } else {
+                (trimmed.parse::<u32>().ok(), None)
+            };
+            if let Some(pid) = pid_opt {
+                if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    return true; // Process is gone.
+                }
+                // Guard against PID reuse: a mismatch means the original
+                // writer exited and a different process inherited the PID.
+                if let (Some(stored), Some(current)) =
+                    (stored_start_opt, Self::read_proc_start_time(pid))
+                {
+                    if stored != current {
+                        return true; // PID reused; lock is stale.
+                    }
+                }
+                return false; // Process is live and PID not reused.
+            }
+        }
+        // Cannot read the lock file — fall back to age-based check.
+        meta.modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() > Self::STALE_SECS)
+            .unwrap_or(false)
+    }
+
+    /// On non-Linux: falls back to an age-based check with a conservative
+    /// threshold so a slow compaction on a large log is not incorrectly evicted.
+    #[cfg(not(target_os = "linux"))]
+    fn is_stale(_lock_path: &Path, meta: &std::fs::Metadata) -> bool {
+        meta.modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() > Self::STALE_SECS)
+            .unwrap_or(false)
+    }
+
+    /// Try to acquire the lock.
+    ///
+    /// Returns:
+    /// - `Ok(Some(guard))` — lock acquired; compaction may proceed.
+    /// - `Ok(None)` — lock is held by a live process; caller must skip.
+    /// - `Err(_)` — unexpected I/O failure.
+    fn try_acquire(lock_path: &Path) -> anyhow::Result<Option<Self>> {
+        // Remove stale locks from crashed/killed processes.
+        if let Ok(meta) = std::fs::metadata(lock_path) {
+            if Self::is_stale(lock_path, &meta) {
+                tracing::debug!(
+                    path = %lock_path.display(),
+                    "event_replay: removing stale compaction lock"
+                );
+                if let Err(e) = std::fs::remove_file(lock_path) {
+                    tracing::warn!(
+                        path = %lock_path.display(),
+                        "event_replay: failed to remove stale lock: {e}"
+                    );
+                }
+            }
+        }
+
+        let pid = std::process::id();
+        // On Linux include the process start time so is_stale can detect PID
+        // reuse (a recycled PID has a different start time).
+        #[cfg(target_os = "linux")]
+        let lock_content = {
+            let start = Self::read_proc_start_time(pid).unwrap_or(0);
+            format!("{pid}:{start}")
+        };
+        #[cfg(not(target_os = "linux"))]
+        let lock_content = pid.to_string();
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(mut f) => {
+                if let Err(e) = IoWrite::write_all(&mut f, lock_content.as_bytes()) {
+                    tracing::warn!(
+                        path = %lock_path.display(),
+                        "event_replay: failed to write PID to lock file: {e}"
+                    );
+                }
+                Ok(Some(Self {
+                    path: lock_path.to_path_buf(),
+                }))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Drop for CompactLock {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            tracing::warn!(
+                path = %self.path.display(),
+                "event_replay: failed to remove compaction lock: {e}"
+            );
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Startup integration
 // ──────────────────────────────────────────────────────────────────────────────
@@ -362,6 +723,19 @@ pub async fn replay_and_recover(db: &TaskDb, log_path: &Path) -> anyhow::Result<
 
     if updated > 0 {
         tracing::info!("event_replay: applied replayed state to {updated} task(s)");
+    }
+
+    // Compact the log: remove events for tasks that have reached terminal
+    // state — they are now committed to the DB and no longer needed.
+    match compact_log(log_path, &states) {
+        Ok(removed) if removed > 0 => {
+            tracing::info!("event_replay: compacted log, removed {removed} terminal-task line(s)");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // Compaction failure is non-fatal: recovery already succeeded.
+            tracing::warn!("event_replay: log compaction failed (non-fatal): {e}");
+        }
     }
 
     Ok(updated)

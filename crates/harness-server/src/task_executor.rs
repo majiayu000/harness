@@ -1283,6 +1283,10 @@ pub(crate) async fn run_task(
                 });
             })
             .await?;
+            store.log_event(crate::event_replay::TaskEvent::Completed {
+                task_id: task_id.0.clone(),
+                ts: crate::event_replay::now_ts(),
+            });
             tracing::info!(
                 task_id = %task_id,
                 status = "done",
@@ -1388,6 +1392,10 @@ pub(crate) async fn run_task(
                 s.turn = 2;
             })
             .await?;
+            store.log_event(crate::event_replay::TaskEvent::Completed {
+                task_id: task_id.0.clone(),
+                ts: crate::event_replay::now_ts(),
+            });
             tracing::info!(
                 task_id = %task_id,
                 status = "done",
@@ -1444,6 +1452,10 @@ pub(crate) async fn run_task(
             s.turn = 2;
         })
         .await?;
+        store.log_event(crate::event_replay::TaskEvent::Completed {
+            task_id: task_id.0.clone(),
+            ts: crate::event_replay::now_ts(),
+        });
         tracing::info!(
             task_id = %task_id,
             status = "done",
@@ -1766,6 +1778,10 @@ pub(crate) async fn run_task(
                         s.turn = round.saturating_add(1);
                     })
                     .await?;
+                    store.log_event(crate::event_replay::TaskEvent::Completed {
+                        task_id: task_id.0.clone(),
+                        ts: crate::event_replay::now_ts(),
+                    });
                     tracing::info!(
                         task_id = %task_id,
                         phase = "reviewing",

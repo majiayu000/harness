@@ -359,6 +359,45 @@ fn replay_events_errors_on_unreadable_path() {
     assert!(result.is_err());
 }
 
+// ── CompactLock PID-reuse detection tests (Linux only) ────────────────────
+
+#[cfg(target_os = "linux")]
+#[test]
+fn compact_lock_is_stale_when_start_time_mismatches() {
+    // Simulate PID reuse: write a lock with the current PID but a start time
+    // that cannot match (start time 1 is before any real process).
+    let dir = tempfile::tempdir().unwrap();
+    let lock_path = dir.path().join("task-events.jsonl.compact.lock");
+    let pid = std::process::id();
+    let real_start =
+        CompactLock::read_proc_start_time(pid).expect("must be able to read our own start time");
+    let wrong_start = real_start.wrapping_add(1);
+    std::fs::write(&lock_path, format!("{pid}:{wrong_start}")).unwrap();
+
+    let meta = std::fs::metadata(&lock_path).unwrap();
+    assert!(
+        CompactLock::is_stale(&lock_path, &meta),
+        "lock with mismatched start time should be stale (PID reuse)"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn compact_lock_is_not_stale_for_live_process_with_correct_start_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock_path = dir.path().join("task-events.jsonl.compact.lock");
+    let pid = std::process::id();
+    let start =
+        CompactLock::read_proc_start_time(pid).expect("must be able to read our own start time");
+    std::fs::write(&lock_path, format!("{pid}:{start}")).unwrap();
+
+    let meta = std::fs::metadata(&lock_path).unwrap();
+    assert!(
+        !CompactLock::is_stale(&lock_path, &meta),
+        "lock held by current live process with correct start time should not be stale"
+    );
+}
+
 // ── Integration: full round-trip ──────────────────────────────────────────
 
 #[tokio::test]
