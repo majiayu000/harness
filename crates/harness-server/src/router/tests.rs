@@ -1886,6 +1886,50 @@ async fn run_turn_lifecycle_uses_fresh_adapter_instance_per_turn() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn run_turn_lifecycle_claude_without_adapter_leaves_approval_unsupported(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut registry = AgentRegistry::new("claude");
+    registry.register("claude", Arc::new(TestAgent::new("claude")));
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), HarnessConfig::default(), registry)
+            .await?;
+    let server = state.core.server.clone();
+    let thread_id = server.thread_manager.start_thread(dir.path().to_path_buf());
+    let turn_id = server.thread_manager.start_turn(
+        &thread_id,
+        "prompt".to_string(),
+        harness_core::types::AgentId::new(),
+    )?;
+
+    crate::task_executor::run_turn_lifecycle(
+        server.clone(),
+        state.core.thread_db.clone(),
+        state.notifications.notify_tx.clone(),
+        state.notifications.notification_tx.clone(),
+        thread_id,
+        turn_id.clone(),
+        "prompt".to_string(),
+        "claude".to_string(),
+    )
+    .await;
+
+    let result = server
+        .thread_manager
+        .respond_approval_on_turn(
+            &turn_id,
+            "req-1".to_string(),
+            harness_core::agent::ApprovalDecision::Accept,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "claude server turns should stay on CodeAgent path and not register live approval adapter"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_turn_lifecycle_without_adapter_leaves_approval_unsupported() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut registry = AgentRegistry::new("plain");

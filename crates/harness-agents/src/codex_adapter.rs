@@ -1,21 +1,25 @@
 use async_trait::async_trait;
 use harness_core::{
-    agent::AgentAdapter, agent::AgentEvent, agent::ApprovalDecision, agent::TurnRequest,
+    agent::AgentAdapter,
+    agent::AgentEvent,
+    agent::ApprovalDecision,
+    agent::TurnRequest,
+    config::agents::{CodexCloudConfig, SandboxMode},
 };
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
-use tracing;
 
 /// Codex App Server adapter (L3-L4).
 ///
-/// Spawns `codex` as a long-lived stdio subprocess speaking JSON-RPC 2.0.
-/// Bidirectional: sends requests via stdin, reads responses/notifications from stdout.
-/// Supports approval gates, interrupt, and steer.
+/// Spawns `codex app-server` as a stdio subprocess speaking JSON-RPC 2.0.
+/// Supports approval gates, interrupt, and steer for a single live turn.
 pub struct CodexAdapter {
     cli_path: PathBuf,
+    sandbox_mode: SandboxMode,
+    cloud: CodexCloudConfig,
     state: Arc<Mutex<AdapterState>>,
 }
 
@@ -42,14 +46,23 @@ impl AdapterState {
 }
 
 impl CodexAdapter {
-    pub fn new(cli_path: PathBuf) -> Self {
+    pub fn new(cli_path: PathBuf, sandbox_mode: SandboxMode, cloud: CodexCloudConfig) -> Self {
         Self {
             cli_path,
+            sandbox_mode,
+            cloud,
             state: Arc::new(Mutex::new(AdapterState::new())),
         }
     }
 
-    /// Send a JSON-RPC request via stdin and return the request id.
+    fn sandbox_policy(&self) -> &'static str {
+        match self.sandbox_mode {
+            SandboxMode::ReadOnly => "readOnly",
+            SandboxMode::WorkspaceWrite => "workspaceWrite",
+            SandboxMode::DangerFullAccess => "dangerFullAccess",
+        }
+    }
+
     async fn send_request(
         state: &mut AdapterState,
         method: &str,
@@ -88,7 +101,6 @@ impl CodexAdapter {
         Ok(id)
     }
 
-    /// Send a JSON-RPC notification (no id, no response expected).
     async fn send_notification(
         state: &mut AdapterState,
         method: &str,
@@ -133,97 +145,145 @@ impl AgentAdapter for CodexAdapter {
         tx: mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
         let mut state = self.state.lock().await;
+        if state.child.is_some() {
+            return Err(harness_core::error::HarnessError::AgentExecution(
+                "codex adapter cannot reuse an existing app-server process across turns"
+                    .to_string(),
+            ));
+        }
 
-        // Spawn codex if not already running
-        if state.child.is_none() {
-            let mut cmd = tokio::process::Command::new(&self.cli_path);
-            cmd.stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .current_dir(&req.project_root)
-                .kill_on_drop(true);
-            #[cfg(unix)]
-            crate::set_process_group(&mut cmd);
-            crate::strip_claude_env(&mut cmd);
+        if self.cloud.enabled {
+            crate::cloud_setup::run_setup_phase(&self.cloud, &req.project_root).await?;
+        }
 
-            let mut child = cmd.spawn().map_err(|e| {
-                harness_core::error::HarnessError::AgentExecution(format!(
-                    "failed to spawn codex: {e}"
-                ))
-            })?;
+        let mut cmd = tokio::process::Command::new(&self.cli_path);
+        cmd.arg("app-server")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .current_dir(&req.project_root)
+            .kill_on_drop(true);
+        if self.cloud.enabled {
+            cmd.arg("--ephemeral");
+        }
+        for key in &self.cloud.setup_secret_env {
+            cmd.env_remove(key);
+        }
+        #[cfg(unix)]
+        crate::set_process_group(&mut cmd);
+        crate::strip_claude_env(&mut cmd);
 
-            state.stdin = child.stdin.take();
-            let stdout = child.stdout.take().ok_or_else(|| {
-                harness_core::error::HarnessError::AgentExecution("no stdout from codex".into())
-            })?;
-            state.child = Some(child);
+        let mut child = cmd.spawn().map_err(|e| {
+            harness_core::error::HarnessError::AgentExecution(format!("failed to spawn codex: {e}"))
+        })?;
 
-            // Initialize handshake
-            Self::send_request(&mut state, "initialize", json!({})).await?;
+        state.stdin = child.stdin.take();
+        let stdout = child.stdout.take().ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution("no stdout from codex".into())
+        })?;
+        state.child = Some(child);
 
-            // Read initialize response (blocking on first line)
-            let reader = tokio::io::BufReader::new(stdout);
-            let mut lines = reader.lines();
+        Self::send_request(
+            &mut state,
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "harness",
+                    "title": "Harness",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }),
+        )
+        .await?;
+        Self::send_request(
+            &mut state,
+            "thread/start",
+            json!({
+                "cwd": req.project_root,
+                "sandboxPolicy": { "type": self.sandbox_policy() }
+            }),
+        )
+        .await?;
 
-            // Read init response
+        let reader = tokio::io::BufReader::new(stdout);
+        let mut lines = reader.lines();
+        let mut thread_id: Option<String> = None;
+
+        for _ in 0..2 {
             if let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!(line = %line, "codex initialize response");
-            }
-
-            // Send initialized notification
-            Self::send_notification(&mut state, "initialized").await?;
-
-            // Send turn/start
-            Self::send_request(&mut state, "turn/start", json!({ "text": req.prompt })).await?;
-
-            // Release lock before reading event stream
-            drop(state);
-
-            if tx.send(AgentEvent::TurnStarted).await.is_err() {
-                return Ok(());
-            }
-
-            // Read event stream until turn completes
-            let mut output_buf = String::new();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                if let Some(event) = parse_codex_message(&line) {
-                    if let AgentEvent::MessageDelta { ref text } = event {
-                        output_buf.push_str(text);
-                    }
-
-                    let is_turn_completed = matches!(event, AgentEvent::TurnCompleted { .. });
-                    let is_error = matches!(event, AgentEvent::Error { .. });
-
-                    if tx.send(event).await.is_err() {
-                        break;
-                    }
-
-                    if is_turn_completed || is_error {
-                        break;
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if let Some(id) = value
+                        .get("result")
+                        .and_then(|result| result.get("thread"))
+                        .and_then(|thread| thread.get("id"))
+                        .and_then(|id| id.as_str())
+                    {
+                        thread_id = Some(id.to_string());
                     }
                 }
-            }
-        } else {
-            // Already running — just send a new turn
-            Self::send_request(&mut state, "turn/start", json!({ "text": req.prompt })).await?;
-            drop(state);
-
-            if let Err(e) = tx.send(AgentEvent::TurnStarted).await {
-                tracing::debug!("stream channel closed: {e}");
             }
         }
 
+        Self::send_notification(&mut state, "initialized").await?;
+
+        let thread_id = thread_id.ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution(
+                "codex thread/start did not return thread id".into(),
+            )
+        })?;
+        Self::send_request(
+            &mut state,
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": req.prompt }],
+                "sandboxPolicy": { "type": self.sandbox_policy() }
+            }),
+        )
+        .await?;
+
+        if let Ok(Some(_line)) = lines.next_line().await {
+            // Consume turn/start response before notifications.
+        }
+
+        drop(state);
+
+        let mut turn_started_sent = false;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            if let Some(event) = parse_codex_message(&line) {
+                if !turn_started_sent {
+                    if tx.send(AgentEvent::TurnStarted).await.is_err() {
+                        break;
+                    }
+                    turn_started_sent = true;
+                }
+
+                let is_turn_completed = matches!(event, AgentEvent::TurnCompleted { .. });
+                let is_error = matches!(event, AgentEvent::Error { .. });
+
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+
+                if is_turn_completed || is_error {
+                    break;
+                }
+            }
+        }
+
+        let mut state = self.state.lock().await;
+        state.stdin = None;
+        state.child = None;
         Ok(())
     }
 
     async fn interrupt(&self) -> harness_core::error::Result<()> {
         let mut state = self.state.lock().await;
         if state.stdin.is_some() {
-            // Try graceful interrupt first
             if let Err(e) = Self::send_request(&mut state, "turn/interrupt", json!({})).await {
                 tracing::warn!("failed to send turn/interrupt: {e}, killing process");
                 if let Some(ref mut child) = state.child {
@@ -259,7 +319,6 @@ impl AgentAdapter for CodexAdapter {
             harness_core::error::HarnessError::AgentExecution("codex stdin not available".into())
         })?;
 
-        // Approval response uses the original request id
         let response = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -286,18 +345,14 @@ impl AgentAdapter for CodexAdapter {
 }
 
 /// Parse a Codex App Server JSON-RPC message into an AgentEvent.
-///
-/// Handles both notifications (method field, no id) and responses (id, result/error).
 pub fn parse_codex_message(line: &str) -> Option<AgentEvent> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
 
-    // Notification: has "method" field
     if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
         let params = v.get("params").cloned().unwrap_or(serde_json::Value::Null);
         return parse_notification(method, &params);
     }
 
-    // Response: has "id" field
     if v.get("id").is_some() {
         if let Some(error) = v.get("error") {
             let message = error
@@ -307,7 +362,6 @@ pub fn parse_codex_message(line: &str) -> Option<AgentEvent> {
                 .to_string();
             return Some(AgentEvent::Error { message });
         }
-        // Successful response — typically handled by request correlation, skip here
         return None;
     }
 
@@ -316,7 +370,9 @@ pub fn parse_codex_message(line: &str) -> Option<AgentEvent> {
 
 fn parse_notification(method: &str, params: &serde_json::Value) -> Option<AgentEvent> {
     match method {
-        "turn/started" | "turn_started" => Some(AgentEvent::TurnStarted),
+        "turn/started" | "turn_started" | "thread/started" | "thread_started" => {
+            Some(AgentEvent::TurnStarted)
+        }
         "item/started" | "item_started" => {
             let item_type = params
                 .get("type")
@@ -458,9 +514,37 @@ mod tests {
         assert!(matches!(event, AgentEvent::TurnCompleted { .. }));
     }
 
+    #[test]
+    fn sandbox_policy_maps_config_values() {
+        let read_only = CodexAdapter::new(
+            PathBuf::from("codex"),
+            SandboxMode::ReadOnly,
+            CodexCloudConfig::default(),
+        );
+        assert_eq!(read_only.sandbox_policy(), "readOnly");
+
+        let workspace_write = CodexAdapter::new(
+            PathBuf::from("codex"),
+            SandboxMode::WorkspaceWrite,
+            CodexCloudConfig::default(),
+        );
+        assert_eq!(workspace_write.sandbox_policy(), "workspaceWrite");
+
+        let danger = CodexAdapter::new(
+            PathBuf::from("codex"),
+            SandboxMode::DangerFullAccess,
+            CodexCloudConfig::default(),
+        );
+        assert_eq!(danger.sandbox_policy(), "dangerFullAccess");
+    }
+
     #[tokio::test]
     async fn interrupt_noop_when_no_child() {
-        let adapter = CodexAdapter::new(PathBuf::from("codex"));
+        let adapter = CodexAdapter::new(
+            PathBuf::from("codex"),
+            SandboxMode::DangerFullAccess,
+            CodexCloudConfig::default(),
+        );
         adapter.interrupt().await.unwrap();
     }
 }

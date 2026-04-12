@@ -1,7 +1,7 @@
 use anyhow::Context;
 use harness_agents::{
-    claude::ClaudeCodeAgent, claude_adapter::ClaudeAdapter, codex::CodexAgent,
-    codex_adapter::CodexAdapter, registry::AgentRegistry,
+    claude::ClaudeCodeAgent, codex::CodexAgent, codex_adapter::CodexAdapter,
+    registry::AgentRegistry,
 };
 use harness_core::{agent::AgentRequest, config::HarnessConfig, prompts, types::ThreadId};
 use serde::Deserialize;
@@ -499,10 +499,7 @@ pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
             .with_no_session_persistence_probe()
             .with_stream_timeout(config.agents.stream_timeout_secs),
         ),
-        Some(Arc::new(ClaudeAdapter::new(
-            config.agents.claude.cli_path.clone(),
-            config.agents.claude.default_model.clone(),
-        ))),
+        None,
     );
     agent_registry.register_with_adapter(
         "codex",
@@ -512,6 +509,8 @@ pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
         ),
         Some(Arc::new(CodexAdapter::new(
             config.agents.codex.cli_path.clone(),
+            config.agents.sandbox_mode,
+            config.agents.codex.cloud.clone(),
         ))),
     );
 

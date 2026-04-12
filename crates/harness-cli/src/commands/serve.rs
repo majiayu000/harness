@@ -1,5 +1,5 @@
 use anyhow::Result;
-use harness_agents::{claude_adapter::ClaudeAdapter, codex_adapter::CodexAdapter};
+use harness_agents::codex_adapter::CodexAdapter;
 use harness_core::config::HarnessConfig;
 use harness_server::project_registry::validate_project_root;
 use std::path::PathBuf;
@@ -143,12 +143,10 @@ pub async fn run(
         claude_agent = claude_agent.with_reasoning_budget(budget);
     }
     claude_agent = claude_agent.with_stream_timeout(serve_config.agents.stream_timeout_secs);
-    let claude_cli_path = serve_config.agents.claude.cli_path.clone();
-    let claude_default_model = serve_config.agents.claude.default_model.clone();
-    agent_registry.register_with_fresh_adapter("claude", Arc::new(claude_agent), move || {
-        ClaudeAdapter::new(claude_cli_path.clone(), claude_default_model.clone())
-    });
+    agent_registry.register("claude", Arc::new(claude_agent));
     let codex_cli_path = serve_config.agents.codex.cli_path.clone();
+    let codex_cloud = serve_config.agents.codex.cloud.clone();
+    let codex_sandbox_mode = serve_config.agents.sandbox_mode;
     agent_registry.register_with_fresh_adapter(
         "codex",
         Arc::new(
@@ -158,7 +156,13 @@ pub async fn run(
             )
             .with_stream_timeout(serve_config.agents.stream_timeout_secs),
         ),
-        move || CodexAdapter::new(codex_cli_path.clone()),
+        move || {
+            CodexAdapter::new(
+                codex_cli_path.clone(),
+                codex_sandbox_mode,
+                codex_cloud.clone(),
+            )
+        },
     );
     if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
         agent_registry.register(
