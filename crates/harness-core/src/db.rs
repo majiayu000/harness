@@ -4,7 +4,40 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::OnceLock;
 
-static SQLITE_NON_TRANSACTIONAL_PREFIXES: OnceLock<Vec<&'static str>> = OnceLock::new();
+static SQLITE_TRANSACTIONAL_PREFIXES: OnceLock<Vec<&'static str>> = OnceLock::new();
+
+fn sqlite_transactional_prefixes() -> &'static [&'static str] {
+    SQLITE_TRANSACTIONAL_PREFIXES.get_or_init(|| {
+        vec![
+            "CREATE TABLE",
+            "CREATE INDEX",
+            "CREATE UNIQUE INDEX",
+            "CREATE VIEW",
+            "CREATE TRIGGER",
+            "ALTER TABLE",
+            "DROP TABLE",
+            "DROP INDEX",
+            "DROP VIEW",
+            "DROP TRIGGER",
+            "INSERT INTO",
+            "UPDATE ",
+            "DELETE FROM",
+            "REPLACE INTO",
+            "SELECT ",
+            "WITH ",
+        ]
+    })
+}
+
+fn normalized_sqlite_statement_prefix(statement: &str) -> String {
+    statement
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("--"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase()
+}
 
 /// Create a SQLite connection pool for the given path.
 ///
@@ -190,9 +223,8 @@ fn duplicate_add_column_error(statement: &str, error: &sqlx::Error) -> bool {
 }
 
 fn sqlite_statement_is_transaction_safe(statement: &str) -> bool {
-    let normalized = statement.trim_start().to_ascii_uppercase();
-    !SQLITE_NON_TRANSACTIONAL_PREFIXES
-        .get_or_init(|| vec!["VACUUM", "PRAGMA JOURNAL_MODE", "ATTACH ", "DETACH "])
+    let normalized = normalized_sqlite_statement_prefix(statement);
+    sqlite_transactional_prefixes()
         .iter()
         .any(|prefix| normalized.starts_with(prefix))
 }
@@ -610,6 +642,82 @@ mod tests {
 
         assert!(
             message.contains("migration v2 'broken migration' failed at statement 2"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pragma_foreign_keys_migration_runs_outside_transaction() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = open_pool(&dir.path().join("mig.db")).await?;
+        let migrations = [
+            Migration {
+                version: 1,
+                description: "create items table",
+                sql: "CREATE TABLE items (id TEXT PRIMARY KEY)",
+            },
+            Migration {
+                version: 2,
+                description: "pragma migration",
+                sql: "PRAGMA foreign_keys = OFF; SELECT nope FROM missing_table",
+            },
+        ];
+
+        let err = Migrator::new(&pool, &migrations).run().await.unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("outside transaction"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiline_create_table_migration_stays_transactional() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = open_pool(&dir.path().join("mig.db")).await?;
+        let migrations = [Migration {
+            version: 1,
+            description: "broken multiline create table",
+            sql: "CREATE\nTABLE items (id TEXT PRIMARY KEY); SELECT nope FROM missing_table",
+        }];
+
+        let err = Migrator::new(&pool, &migrations).run().await.unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            !message.contains("outside transaction"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(applied_versions(&pool).await?, Vec::<i64>::new());
+        assert_eq!(table_columns(&pool, "items").await?, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pragma_defer_foreign_keys_migration_runs_outside_transaction() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = open_pool(&dir.path().join("mig.db")).await?;
+        let migrations = [
+            Migration {
+                version: 1,
+                description: "create items table",
+                sql: "CREATE TABLE items (id TEXT PRIMARY KEY)",
+            },
+            Migration {
+                version: 2,
+                description: "pragma defer migration",
+                sql: "PRAGMA defer_foreign_keys = ON; SELECT nope FROM missing_table",
+            },
+        ];
+
+        let err = Migrator::new(&pool, &migrations).run().await.unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("outside transaction"),
             "unexpected error: {message}"
         );
         Ok(())
