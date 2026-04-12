@@ -40,6 +40,8 @@ pub struct CoreServices {
     pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
     pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
     pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
+    /// Q-value store for MemRL rule utility tracking. None when unavailable.
+    pub q_values: Option<Arc<crate::q_value_store::QValueStore>>,
 }
 
 /// Engine services: skills, rules, and garbage collection.
@@ -261,6 +263,19 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let db_path = harness_core::config::dirs::default_db_path(&dir, "tasks");
     tracing::debug!("task db: {}", db_path.display());
     let tasks = task_runner::TaskStore::open(&db_path).await?;
+
+    let q_values_db_path = harness_core::config::dirs::default_db_path(&dir, "q_values");
+    tracing::debug!("q_value db: {}", q_values_db_path.display());
+    let q_values = match crate::q_value_store::QValueStore::open(&q_values_db_path).await {
+        Ok(store) => Some(Arc::new(store)),
+        Err(e) => {
+            tracing::warn!(
+                path = %q_values_db_path.display(),
+                "q_value store init failed, rule utility tracking will be disabled: {e}"
+            );
+            None
+        }
+    };
 
     let mut rule_engine = harness_rules::engine::RuleEngine::new();
     rule_engine.configure_sources(
@@ -558,6 +573,71 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         server.config.server.github_token.clone(),
     );
 
+    // Wrap completion callback to record Q-value pipeline events and apply backprop on
+    // every live task completion (Done/Failed).  This ensures MemRL updates fire during
+    // normal server operation, not only at startup recovery (validate_recovered_tasks).
+    // Guard IDs are captured once at startup; they are stable after registration.
+    let completion_callback = {
+        if let Some(ref qv) = q_values {
+            let qv = qv.clone();
+            let inner = completion_callback;
+            let cb: task_runner::CompletionCallback =
+                std::sync::Arc::new(move |state: task_runner::TaskState| {
+                    let qv = qv.clone();
+                    let inner = inner.clone();
+                    Box::pin(async move {
+                        // Apply Q-value backprop only for terminal task states and only for
+                        // experiences explicitly recorded via record_pipeline_event during
+                        // task execution. Non-terminal states (Pending, Implementing, etc.)
+                        // must not trigger Q-updates — they would incorrectly penalize rules
+                        // that are still in the middle of a task.
+                        let reward = match state.status {
+                            task_runner::TaskStatus::Done => {
+                                Some(crate::q_value_store::REWARD_MERGED)
+                            }
+                            task_runner::TaskStatus::Failed => {
+                                Some(crate::q_value_store::REWARD_CLOSED)
+                            }
+                            task_runner::TaskStatus::Cancelled => {
+                                Some(crate::q_value_store::REWARD_UNKNOWN_CLOSED)
+                            }
+                            _ => None,
+                        };
+                        if let Some(reward) = reward {
+                            match qv.get_experiences_for_task(&state.id.0).await {
+                                Ok(exp_ids) if !exp_ids.is_empty() => {
+                                    if let Err(e) = qv
+                                        .apply_q_update(
+                                            &exp_ids,
+                                            reward,
+                                            crate::q_value_store::DEFAULT_ALPHA,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            task_id = %state.id.0,
+                                            "q_value apply_q_update failed: {e}"
+                                        );
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!(
+                                    task_id = %state.id.0,
+                                    "q_value get_experiences_for_task failed: {e}"
+                                ),
+                            }
+                        }
+                        if let Some(cb) = inner {
+                            cb(state).await;
+                        }
+                    })
+                });
+            Some(cb)
+        } else {
+            completion_callback
+        }
+    };
+
     // Validate recovered pending tasks in the background so startup is not blocked
     // by serial `gh pr view` calls. The completion_callback is passed so that tasks
     // marked Failed (closed PR) trigger intake cleanup (e.g. removing the issue from
@@ -685,6 +765,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             plan_cache,
             project_registry: Some(project_registry),
             runtime_state_store,
+            q_values,
         },
         engines: EngineServices {
             skills: skills_arc,

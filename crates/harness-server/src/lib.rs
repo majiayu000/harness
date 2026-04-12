@@ -27,6 +27,7 @@ pub mod periodic_reviewer;
 pub mod plan_db;
 pub mod post_validator;
 pub mod project_registry;
+pub mod q_value_store;
 pub mod quality_trigger;
 pub mod review_store;
 pub mod router;

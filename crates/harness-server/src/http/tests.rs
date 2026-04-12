@@ -124,6 +124,7 @@ async fn make_test_state_with(
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             project_registry: None,
             runtime_state_store: None,
+            q_values: None,
         },
         engines: crate::http::EngineServices {
             skills: Arc::new(tokio::sync::RwLock::new(

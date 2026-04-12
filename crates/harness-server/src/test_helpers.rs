@@ -155,6 +155,7 @@ async fn make_state_inner(
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             project_registry: None,
             runtime_state_store: None,
+            q_values: None,
         },
         engines: crate::http::EngineServices {
             skills: Default::default(),
