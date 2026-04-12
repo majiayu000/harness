@@ -330,8 +330,12 @@ pub(crate) async fn run_turn_lifecycle(
                                         &notification_tx,
                                         &thread_id,
                                         &turn_id,
-                                        StreamItem::Error { message },
+                                        StreamItem::Error {
+                                            message: message.clone(),
+                                        },
                                     ).await;
+                                    execution_result = Some(Err(HarnessError::AgentExecution(message)));
+                                    stream_closed = true;
                                 }
                             }
                         }

@@ -143,15 +143,13 @@ pub async fn run(
         claude_agent = claude_agent.with_reasoning_budget(budget);
     }
     claude_agent = claude_agent.with_stream_timeout(serve_config.agents.stream_timeout_secs);
-    agent_registry.register_with_adapter(
-        "claude",
-        Arc::new(claude_agent),
-        Some(Arc::new(ClaudeAdapter::new(
-            serve_config.agents.claude.cli_path.clone(),
-            serve_config.agents.claude.default_model.clone(),
-        ))),
-    );
-    agent_registry.register_with_adapter(
+    let claude_cli_path = serve_config.agents.claude.cli_path.clone();
+    let claude_default_model = serve_config.agents.claude.default_model.clone();
+    agent_registry.register_with_fresh_adapter("claude", Arc::new(claude_agent), move || {
+        ClaudeAdapter::new(claude_cli_path.clone(), claude_default_model.clone())
+    });
+    let codex_cli_path = serve_config.agents.codex.cli_path.clone();
+    agent_registry.register_with_fresh_adapter(
         "codex",
         Arc::new(
             harness_agents::codex::CodexAgent::from_config(
@@ -160,9 +158,7 @@ pub async fn run(
             )
             .with_stream_timeout(serve_config.agents.stream_timeout_secs),
         ),
-        Some(Arc::new(CodexAdapter::new(
-            serve_config.agents.codex.cli_path.clone(),
-        ))),
+        move || CodexAdapter::new(codex_cli_path.clone()),
     );
     if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
         agent_registry.register(

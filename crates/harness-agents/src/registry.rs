@@ -5,11 +5,13 @@ use harness_core::{
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+type AdapterFactory = Arc<dyn Fn() -> Arc<dyn AgentAdapter> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct RegisteredAgentDescriptor {
     pub name: String,
     pub code_agent: Arc<dyn CodeAgent>,
-    pub adapter: Option<Arc<dyn AgentAdapter>>,
+    adapter_factory: Option<AdapterFactory>,
     pub registration_index: usize,
     pub capabilities: Vec<Capability>,
     pub is_default: bool,
@@ -22,8 +24,12 @@ impl RegisteredAgentDescriptor {
     }
 
     pub fn adapter(&self) -> Option<Arc<dyn AgentAdapter>> {
-        self.adapter.clone()
+        self.adapter_factory.as_ref().map(|factory| factory())
     }
+}
+
+fn singleton_adapter_factory(adapter: Arc<dyn AgentAdapter>) -> AdapterFactory {
+    Arc::new(move || adapter.clone())
 }
 
 pub struct AgentRegistry {
@@ -69,7 +75,7 @@ impl AgentRegistry {
             RegisteredAgentDescriptor {
                 name,
                 code_agent: agent.clone(),
-                adapter,
+                adapter_factory: adapter.map(singleton_adapter_factory),
                 registration_index,
                 capabilities: agent.capabilities(),
                 is_default: false,
@@ -82,9 +88,73 @@ impl AgentRegistry {
     pub fn register_adapter(&mut self, name: impl Into<String>, adapter: Arc<dyn AgentAdapter>) {
         let name = name.into();
         if let Some(existing) = self.descriptors.get_mut(&name) {
-            existing.adapter = Some(adapter);
+            existing.adapter_factory = Some(singleton_adapter_factory(adapter));
             self.refresh_metadata();
         }
+    }
+
+    pub fn register_with_adapter_factory(
+        &mut self,
+        name: impl Into<String>,
+        agent: Arc<dyn CodeAgent>,
+        adapter_factory: Option<AdapterFactory>,
+    ) {
+        let name = name.into();
+        let registration_index = self.ensure_registration_slot(&name);
+        self.descriptors.insert(
+            name.clone(),
+            RegisteredAgentDescriptor {
+                name,
+                code_agent: agent.clone(),
+                adapter_factory,
+                registration_index,
+                capabilities: agent.capabilities(),
+                is_default: false,
+                complexity_preferred: false,
+            },
+        );
+        self.refresh_metadata();
+    }
+
+    pub fn register_adapter_factory(
+        &mut self,
+        name: impl Into<String>,
+        adapter_factory: AdapterFactory,
+    ) {
+        let name = name.into();
+        if let Some(existing) = self.descriptors.get_mut(&name) {
+            existing.adapter_factory = Some(adapter_factory);
+            self.refresh_metadata();
+        }
+    }
+
+    pub fn register_with_fresh_adapter<A, F>(
+        &mut self,
+        name: impl Into<String>,
+        agent: Arc<dyn CodeAgent>,
+        adapter_factory: F,
+    ) where
+        A: AgentAdapter + 'static,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        self.register_with_adapter_factory(
+            name,
+            agent,
+            Some(Arc::new(move || {
+                Arc::new(adapter_factory()) as Arc<dyn AgentAdapter>
+            })),
+        );
+    }
+
+    pub fn register_fresh_adapter<A, F>(&mut self, name: impl Into<String>, adapter_factory: F)
+    where
+        A: AgentAdapter + 'static,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        self.register_adapter_factory(
+            name,
+            Arc::new(move || Arc::new(adapter_factory()) as Arc<dyn AgentAdapter>),
+        );
     }
 
     pub fn descriptor(&self, name: &str) -> Option<&RegisteredAgentDescriptor> {

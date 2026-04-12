@@ -9,11 +9,12 @@ use harness_agents::registry::AgentRegistry;
 use harness_core::{
     agent::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest},
     config::HarnessConfig,
+    types::TurnStatus,
 };
 use harness_protocol::{methods::Method, methods::RpcRequest, methods::INTERNAL_ERROR};
 use serde_json::json;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use tokio::sync::{oneshot, Mutex, RwLock};
@@ -1488,12 +1489,12 @@ async fn agent_list_returns_registered_agents_once_in_order() -> anyhow::Result<
 async fn run_turn_lifecycle_registers_active_adapter_from_descriptor() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut registry = AgentRegistry::new("streaming");
+    let adapter_log = Arc::new(RecordingAdapterLog::default());
+    let adapter = Arc::new(RecordingAdapter::new(adapter_log));
     registry.register_with_adapter(
         "streaming",
         Arc::new(TestAgent::new("streaming")),
-        Some(Arc::new(crate::test_helpers::NoopTestAdapter::new(
-            "streaming",
-        ))),
+        Some(adapter),
     );
     let state =
         make_test_state_with_config_and_registry(dir.path(), HarnessConfig::default(), registry)
@@ -1540,7 +1541,8 @@ async fn run_turn_lifecycle_registers_active_adapter_from_descriptor() -> anyhow
 async fn run_turn_lifecycle_starts_codex_style_adapter_for_live_controls() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut registry = AgentRegistry::new("codex");
-    let adapter = Arc::new(RecordingAdapter::new());
+    let adapter_log = Arc::new(RecordingAdapterLog::default());
+    let adapter = Arc::new(RecordingAdapter::new(adapter_log));
     registry.register_with_adapter(
         "codex",
         Arc::new(TestAgent::new("codex")),
@@ -1636,8 +1638,18 @@ async fn run_turn_lifecycle_does_not_expose_unstarted_adapter_controls() -> anyh
         .await
         .expect_err("completed turn must not retain active adapter control");
     assert!(
-        steer_err.to_string().contains("no active adapter"),
-        "expected no-active-adapter error, got: {steer_err}"
+        steer_err.to_string().contains("not in Running state"),
+        "expected completed turn to reject live steering, got: {steer_err}"
+    );
+
+    let approval_err = server
+        .thread_manager
+        .respond_approval_on_turn(&turn_id, "req-1".to_string(), ApprovalDecision::Accept)
+        .await
+        .expect_err("completed turn must not retain approval control");
+    assert!(
+        approval_err.to_string().contains("no active adapter"),
+        "expected adapter deregistration after completion, got: {approval_err}"
     );
     Ok(())
 }
@@ -1648,18 +1660,25 @@ struct RecordingState {
     approvals: Vec<(String, ApprovalDecision)>,
 }
 
+#[derive(Default)]
+struct RecordingAdapterLog {
+    started_instances: AtomicUsize,
+}
+
 struct RecordingAdapter {
     started: AtomicBool,
+    log: Arc<RecordingAdapterLog>,
     state: Mutex<RecordingState>,
     started_tx: Mutex<Option<oneshot::Sender<()>>>,
     started_rx: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl RecordingAdapter {
-    fn new() -> Self {
+    fn new(log: Arc<RecordingAdapterLog>) -> Self {
         let (started_tx, started_rx) = oneshot::channel();
         Self {
             started: AtomicBool::new(false),
+            log,
             state: Mutex::new(RecordingState::default()),
             started_tx: Mutex::new(Some(started_tx)),
             started_rx: Mutex::new(Some(started_rx)),
@@ -1699,6 +1718,7 @@ impl AgentAdapter for RecordingAdapter {
         _req: TurnRequest,
         tx: tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
+        self.log.started_instances.fetch_add(1, Ordering::SeqCst);
         self.started.store(true, Ordering::SeqCst);
         if let Some(started_tx) = self.started_tx.lock().await.take() {
             let _ = started_tx.send(());
@@ -1738,6 +1758,131 @@ impl AgentAdapter for RecordingAdapter {
         self.state.lock().await.approvals.push((id, decision));
         Ok(())
     }
+}
+
+struct ErrorThenCompleteAdapter;
+
+#[async_trait::async_trait]
+impl AgentAdapter for ErrorThenCompleteAdapter {
+    fn name(&self) -> &str {
+        "error_then_complete"
+    }
+
+    async fn start_turn(
+        &self,
+        _req: TurnRequest,
+        tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> harness_core::error::Result<()> {
+        tx.send(AgentEvent::TurnStarted)
+            .await
+            .map_err(|err| harness_core::error::HarnessError::AgentExecution(err.to_string()))?;
+        tx.send(AgentEvent::Error {
+            message: "adapter exploded".to_string(),
+        })
+        .await
+        .map_err(|err| harness_core::error::HarnessError::AgentExecution(err.to_string()))?;
+        tx.send(AgentEvent::TurnCompleted {
+            output: "should not succeed".to_string(),
+        })
+        .await
+        .map_err(|err| harness_core::error::HarnessError::AgentExecution(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn run_turn_lifecycle_marks_turn_failed_when_adapter_emits_error_event() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let mut registry = AgentRegistry::new("claude");
+    registry.register_with_adapter(
+        "claude",
+        Arc::new(TestAgent::new("claude")),
+        Some(Arc::new(ErrorThenCompleteAdapter)),
+    );
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), HarnessConfig::default(), registry)
+            .await?;
+    let server = state.core.server.clone();
+    let thread_id = server.thread_manager.start_thread(dir.path().to_path_buf());
+    let turn_id = server.thread_manager.start_turn(
+        &thread_id,
+        "prompt".to_string(),
+        harness_core::types::AgentId::new(),
+    )?;
+
+    crate::task_executor::run_turn_lifecycle(
+        server.clone(),
+        state.core.thread_db.clone(),
+        state.notifications.notify_tx.clone(),
+        state.notifications.notification_tx.clone(),
+        thread_id.clone(),
+        turn_id.clone(),
+        "prompt".to_string(),
+        "claude".to_string(),
+    )
+    .await;
+
+    let turn = server
+        .thread_manager
+        .get_turn(&thread_id, &turn_id)
+        .ok_or_else(|| anyhow::anyhow!("turn missing after lifecycle"))?;
+    assert_eq!(turn.status, TurnStatus::Failed);
+    assert!(
+        turn.items.iter().any(|item| matches!(
+            item,
+            harness_core::types::Item::Error { message, .. }
+            if message.contains("adapter exploded")
+        )),
+        "adapter error should be persisted on the failed turn"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_turn_lifecycle_uses_fresh_adapter_instance_per_turn() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut registry = AgentRegistry::new("codex");
+    let adapter_log = Arc::new(RecordingAdapterLog::default());
+    let adapter_log_for_factory = adapter_log.clone();
+    registry.register_with_fresh_adapter("codex", Arc::new(TestAgent::new("codex")), move || {
+        RecordingAdapter::new(adapter_log_for_factory.clone())
+    });
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), HarnessConfig::default(), registry)
+            .await?;
+    let server = state.core.server.clone();
+    let thread_id = server.thread_manager.start_thread(dir.path().to_path_buf());
+
+    for prompt in ["prompt one", "prompt two"] {
+        let turn_id = server.thread_manager.start_turn(
+            &thread_id,
+            prompt.to_string(),
+            harness_core::types::AgentId::new(),
+        )?;
+        crate::task_executor::run_turn_lifecycle(
+            server.clone(),
+            state.core.thread_db.clone(),
+            state.notifications.notify_tx.clone(),
+            state.notifications.notification_tx.clone(),
+            thread_id.clone(),
+            turn_id,
+            prompt.to_string(),
+            "codex".to_string(),
+        )
+        .await;
+    }
+
+    assert_eq!(
+        adapter_log.started_instances.load(Ordering::SeqCst),
+        2,
+        "each turn must start on a fresh adapter instance"
+    );
+    Ok(())
 }
 
 #[tokio::test]
