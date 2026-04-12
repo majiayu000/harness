@@ -84,7 +84,7 @@ impl ReviewStore {
         )
         .execute(&pool)
         .await?;
-        // Migrate existing databases: add task_id column if absent.
+        // Migrate existing databases: add task_id / claimed_at columns if absent.
         // PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk).
         let columns: Vec<(i32, String, String, i32, Option<String>, i32)> =
             sqlx::query_as("PRAGMA table_info(review_findings)")
@@ -95,6 +95,40 @@ impl ReviewStore {
             .any(|(_, name, _, _, _, _)| name == "task_id");
         if !has_task_id {
             sqlx::query("ALTER TABLE review_findings ADD COLUMN task_id TEXT")
+                .execute(&pool)
+                .await?;
+        }
+        let has_claimed_at = columns
+            .iter()
+            .any(|(_, name, _, _, _, _)| name == "claimed_at");
+        if !has_claimed_at {
+            sqlx::query("ALTER TABLE review_findings ADD COLUMN claimed_at TEXT")
+                .execute(&pool)
+                .await?;
+            // Backfill pre-upgrade rows that are already stuck in task_id='pending'.
+            // ALTER TABLE sets claimed_at = NULL for all existing rows, but the
+            // recovery query requires `claimed_at IS NOT NULL`, so without this
+            // backfill those rows would remain permanently dead-lettered.
+            // Use datetime('now') so they enter the time-based fallback path in
+            // recover_stale_pending_claims.  The caller uses a 3900 s threshold
+            // (≥ one full turn timeout), which prevents immediate duplicate-task
+            // spawning if any pre-upgrade task was still running at upgrade time.
+            sqlx::query(
+                "UPDATE review_findings \
+                 SET claimed_at = datetime('now') \
+                 WHERE task_id = 'pending' AND claimed_at IS NULL",
+            )
+            .execute(&pool)
+            .await?;
+        }
+        // Migrate: add real_task_id column for confirmed-stale recovery (issue #611).
+        // Populated when both confirm_task_spawned attempts fail; allows recovery to
+        // gate on actual task completion rather than a fixed time threshold.
+        let has_real_task_id = columns
+            .iter()
+            .any(|(_, name, _, _, _, _)| name == "real_task_id");
+        if !has_real_task_id {
+            sqlx::query("ALTER TABLE review_findings ADD COLUMN real_task_id TEXT")
                 .execute(&pool)
                 .await?;
         }
@@ -251,7 +285,7 @@ impl ReviewStore {
     /// Returns `true` if this caller won the claim, `false` if already claimed.
     pub async fn try_claim_finding(&self, rule_id: &str, file: &str) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            "UPDATE review_findings SET task_id = 'pending' \
+            "UPDATE review_findings SET task_id = 'pending', claimed_at = datetime('now') \
              WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id IS NULL",
         )
         .bind(rule_id)
@@ -259,6 +293,94 @@ impl ReviewStore {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Reset findings stuck in `task_id='pending'` back to `task_id=NULL` so the
+    /// next scheduler cycle can retry spawning.
+    ///
+    /// Two recovery strategies:
+    ///
+    /// 1. **Known-task rows** (`real_task_id IS NOT NULL`): both `confirm_task_spawned`
+    ///    attempts failed but `enqueue_task` succeeded.  We stored the real task id in
+    ///    `real_task_id` so recovery can call `is_task_done(real_task_id)` to verify
+    ///    the underlying task has reached a terminal state before resetting the claim.
+    ///    This is correct regardless of how many rounds the task ran or how long it
+    ///    spent queued — no fixed time threshold is needed.
+    ///
+    /// 2. **Unknown-task rows** (`real_task_id IS NULL`): the claim is from the narrow
+    ///    window between `try_claim_finding` and the `enqueue_task` / `release_claim`
+    ///    calls.  A time-based `stale_secs` threshold is appropriate here; this window
+    ///    should never exceed a few seconds under normal operation.
+    ///
+    /// Returns the number of findings recovered.
+    pub async fn recover_stale_pending_claims(
+        &self,
+        stale_secs: i64,
+        is_task_done: impl Fn(&str) -> bool,
+    ) -> anyhow::Result<u64> {
+        // Strategy 1: recover rows whose real underlying task has terminated.
+        let with_real_id: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT rule_id, file, real_task_id \
+             FROM review_findings \
+             WHERE task_id = 'pending' AND status = 'open' \
+               AND claimed_at IS NOT NULL AND real_task_id IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut recovered = 0u64;
+        for (rule_id, file, real_tid) in with_real_id {
+            if is_task_done(&real_tid) {
+                let res = sqlx::query(
+                    "UPDATE review_findings \
+                     SET task_id = NULL, claimed_at = NULL, real_task_id = NULL \
+                     WHERE rule_id = ? AND file = ? AND status = 'open' \
+                       AND task_id = 'pending' AND real_task_id = ?",
+                )
+                .bind(&rule_id)
+                .bind(&file)
+                .bind(&real_tid)
+                .execute(&self.pool)
+                .await?;
+                recovered += res.rows_affected();
+            }
+        }
+
+        // Strategy 2: recover mid-claim rows (no real task id yet) via time threshold.
+        let result = sqlx::query(
+            "UPDATE review_findings SET task_id = NULL, claimed_at = NULL \
+             WHERE task_id = 'pending' AND status = 'open' \
+               AND claimed_at IS NOT NULL AND real_task_id IS NULL \
+               AND claimed_at < datetime('now', '-' || cast(? as text) || ' seconds')",
+        )
+        .bind(stale_secs)
+        .execute(&self.pool)
+        .await?;
+        recovered += result.rows_affected();
+
+        Ok(recovered)
+    }
+
+    /// Record the real task id for a finding stuck in `task_id='pending'` after
+    /// both `confirm_task_spawned` attempts failed.  This enables task-status-based
+    /// stale recovery via [`recover_stale_pending_claims`] without relying on a
+    /// fixed time threshold that may not bound actual task lifetime.
+    pub async fn record_real_task_id(
+        &self,
+        rule_id: &str,
+        file: &str,
+        real_task_id: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE review_findings SET real_task_id = ? \
+             WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id = 'pending'",
+        )
+        .bind(real_task_id)
+        .bind(rule_id)
+        .bind(file)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Confirm a pending claim by replacing the "pending" sentinel with the

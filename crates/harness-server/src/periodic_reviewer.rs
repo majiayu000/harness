@@ -909,6 +909,47 @@ async fn run_review_tick(
                                 new_findings = n,
                                 "scheduler: review findings persisted"
                             );
+                            // Recover findings stuck in task_id='pending':
+                            // - Rows with real_task_id set (both confirms failed but
+                            //   enqueue succeeded): recovered only when the underlying
+                            //   task has reached a terminal state, so no fixed time
+                            //   bound is needed regardless of rounds or queue wait.
+                            // - Rows without real_task_id: covers two sub-cases:
+                            //   (a) genuine mid-claim window (try_claim → enqueue,
+                            //       normally a few seconds), and
+                            //   (b) rows where confirm_task_spawned AND record_real_task_id
+                            //       both failed — the task is running but its ID was not
+                            //       persisted, so we must wait long enough to avoid
+                            //       concurrent duplicate tasks.  Use 3900 s (≥ one full
+                            //       turn timeout) as the fallback threshold; this also
+                            //       protects migration-backfilled pre-upgrade rows from
+                            //       premature recovery while any task spawned before the
+                            //       upgrade may still be running.
+                            let tasks_snapshot = state_for_synthesis.core.tasks.clone();
+                            match rs
+                                .recover_stale_pending_claims(3900, |tid| {
+                                    let id = harness_core::types::TaskId(tid.to_string());
+                                    // task not in store → treat as done
+                                    tasks_snapshot.get(&id).is_none_or(|t| {
+                                        matches!(
+                                            t.status,
+                                            crate::task_runner::TaskStatus::Done
+                                                | crate::task_runner::TaskStatus::Failed
+                                                | crate::task_runner::TaskStatus::Cancelled
+                                        )
+                                    })
+                                })
+                                .await
+                            {
+                                Ok(0) => {}
+                                Ok(n) => tracing::warn!(
+                                    recovered = n,
+                                    "scheduler: reset stale pending claims to allow retry"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "scheduler: recover_stale_pending_claims failed (continuing): {e}"
+                                ),
+                            }
                             // Auto-spawn fix tasks for P1/P2 open findings that have
                             // no existing task yet (task_id IS NULL = dedup guard).
                             // P0 excluded: critical issues require human judgment.
@@ -1052,8 +1093,90 @@ async fn run_review_tick(
                                                     Err(e) => {
                                                         tracing::warn!(
                                                             finding_id = %finding.id,
-                                                            "scheduler: failed to confirm task spawn: {e}"
+                                                            task_id = %fix_task_id,
+                                                            "scheduler: confirm_task_spawned failed, retrying once: {e}"
                                                         );
+                                                        // Brief pause before retry — improves success
+                                                        // rate against transient SQLite "database is
+                                                        // locked" errors.
+                                                        sleep(Duration::from_millis(100)).await;
+                                                        // Retry once — the UPDATE is idempotent so a
+                                                        // second attempt is safe.
+                                                        if let Err(e2) = rs
+                                                            .confirm_task_spawned(
+                                                                &finding.rule_id,
+                                                                &finding.file,
+                                                                &fix_task_id.0,
+                                                            )
+                                                            .await
+                                                        {
+                                                            // Both confirm attempts failed.  enqueue_task
+                                                            // already succeeded — a real task is running.
+                                                            // Do NOT release the claim (reset task_id to
+                                                            // NULL) here: doing so would let every future
+                                                            // scheduler cycle re-select this finding via
+                                                            // "task_id IS NULL" and spawn another task,
+                                                            // leading to unbounded duplicate tasks and
+                                                            // queue/quota saturation under load.
+                                                            //
+                                                            // Record real_task_id so that stale recovery
+                                                            // can gate on actual task completion rather
+                                                            // than a fixed time threshold that does not
+                                                            // bound multi-round or queued task lifetime.
+                                                            // Retry record_real_task_id: confirm_task_spawned
+                                                            // just failed, likely due to a transient DB lock.
+                                                            // A brief pause lets the lock clear so that
+                                                            // record_real_task_id can persist the task ID.
+                                                            // Without real_task_id the fallback stale
+                                                            // threshold (3900 s) would apply, which is safe
+                                                            // but slower; persisting real_task_id enables
+                                                            // the faster task-completion-based recovery.
+                                                            let delays_ms: &[u64] =
+                                                                &[200, 500, 1000];
+                                                            let mut record_ok = false;
+                                                            for &delay in delays_ms {
+                                                                sleep(Duration::from_millis(delay))
+                                                                    .await;
+                                                                match rs
+                                                                    .record_real_task_id(
+                                                                        &finding.rule_id,
+                                                                        &finding.file,
+                                                                        &fix_task_id.0,
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    Ok(()) => {
+                                                                        record_ok = true;
+                                                                        break;
+                                                                    }
+                                                                    Err(re) => {
+                                                                        tracing::warn!(
+                                                                            finding_id = %finding.id,
+                                                                            real_task_id = %fix_task_id,
+                                                                            "scheduler: record_real_task_id attempt failed (retrying): {re}"
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                            if !record_ok {
+                                                                tracing::error!(
+                                                                    finding_id = %finding.id,
+                                                                    real_task_id = %fix_task_id,
+                                                                    "scheduler: record_real_task_id failed after all retries; \
+                                                                     row will be recovered by 3900 s time threshold — \
+                                                                     manual review recommended if duplicate tasks appear"
+                                                                );
+                                                            }
+                                                            tracing::error!(
+                                                                finding_id = %finding.id,
+                                                                real_task_id = %fix_task_id,
+                                                                "scheduler: confirm_task_spawned retry failed; \
+                                                                 leaving finding with task_id='pending' to prevent \
+                                                                 unbounded duplicate-task spawning — \
+                                                                 real task already enqueued as {fix_task_id}, \
+                                                                 manual recovery may be needed: {e2}"
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
