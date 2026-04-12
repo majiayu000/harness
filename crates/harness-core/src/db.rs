@@ -213,6 +213,8 @@ fn migration_statements(sql: &str) -> Vec<MigrationStatement<'_>> {
     let mut in_line_comment = false;
     let mut in_block_comment = false;
     let mut trigger_begin_depth = 0usize;
+    let mut statement_tokens = Vec::new();
+    let mut current_statement_is_trigger = false;
 
     while let Some(ch) = chars.next() {
         let next = chars.peek().copied();
@@ -297,9 +299,25 @@ fn migration_statements(sql: &str) -> Vec<MigrationStatement<'_>> {
                 }
             }
 
-            match token.to_ascii_uppercase().as_str() {
-                "BEGIN" => trigger_begin_depth += 1,
-                "END" if trigger_begin_depth > 0 => trigger_begin_depth -= 1,
+            let token = token.to_ascii_uppercase();
+            if statement_tokens.len() < 3 {
+                statement_tokens.push(token.clone());
+                current_statement_is_trigger |= match statement_tokens.as_slice() {
+                    [first, second] => first == "CREATE" && second == "TRIGGER",
+                    [first, second, third] => {
+                        first == "CREATE"
+                            && (second == "TEMP" || second == "TEMPORARY")
+                            && third == "TRIGGER"
+                    }
+                    _ => false,
+                };
+            }
+
+            match token.as_str() {
+                "BEGIN" if current_statement_is_trigger => trigger_begin_depth += 1,
+                "END" if current_statement_is_trigger && trigger_begin_depth > 0 => {
+                    trigger_begin_depth -= 1;
+                }
                 _ => {}
             }
             continue;
@@ -315,6 +333,8 @@ fn migration_statements(sql: &str) -> Vec<MigrationStatement<'_>> {
                 });
             }
             current.clear();
+            statement_tokens.clear();
+            current_statement_is_trigger = false;
         }
     }
 
@@ -886,6 +906,25 @@ mod tests {
             "unexpected trigger statement: {}",
             statements[1].sql
         );
+    }
+
+    #[test]
+    fn migration_statements_split_explicit_transaction_control() {
+        let statements = migration_statements(
+            "BEGIN;\n\
+             CREATE TABLE items (id INTEGER PRIMARY KEY);\n\
+             INSERT INTO items VALUES (1);\n\
+             COMMIT;",
+        );
+
+        assert_eq!(statements.len(), 4);
+        assert_eq!(statements[0].sql, "BEGIN");
+        assert_eq!(
+            statements[1].sql,
+            "CREATE TABLE items (id INTEGER PRIMARY KEY)"
+        );
+        assert_eq!(statements[2].sql, "INSERT INTO items VALUES (1)");
+        assert_eq!(statements[3].sql, "COMMIT");
     }
 
     #[tokio::test]
