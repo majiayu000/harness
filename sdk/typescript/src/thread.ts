@@ -133,6 +133,7 @@ export class HarnessThread {
             params: {
               thread_id: this.id,
               turn_id: turnId,
+              timeout_ms: timeoutMs,
               timeout_seconds: timeoutMs / 1000,
               source: "sdk-poll",
               server_method: "turn/status",

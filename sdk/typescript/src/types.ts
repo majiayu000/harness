@@ -176,6 +176,7 @@ interface ThreadCompletedEventParams {
 interface ThreadTimeoutEventParams {
   thread_id: string;
   turn_id: string;
+  timeout_ms: number;
   timeout_seconds: number;
   source: "sdk-poll";
   server_method: "turn/status";

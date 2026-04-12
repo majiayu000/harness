@@ -331,6 +331,7 @@ test("run handles timeout when turn never reaches terminal status", async () => 
   assert.equal(result.timedOut, true);
   const timeoutEvent = result.events.find((event) => event.method === SDK_TURN_TIMEOUT);
   assert.ok(timeoutEvent);
+  assert.equal(timeoutEvent.params.timeout_ms, 5);
   assert.equal(timeoutEvent.params.timeout_seconds, 0.005);
 });
 
