@@ -72,6 +72,20 @@ impl AsRef<str> for TaskStatus {
     }
 }
 
+fn phase_for_status(status: &TaskStatus) -> TaskPhase {
+    match status {
+        TaskStatus::Pending | TaskStatus::AwaitingDeps | TaskStatus::Implementing => {
+            TaskPhase::Implement
+        }
+        TaskStatus::AgentReview | TaskStatus::Waiting | TaskStatus::Reviewing => TaskPhase::Review,
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled => TaskPhase::Terminal,
+    }
+}
+
+fn sync_phase_from_status(task: &mut TaskState) {
+    task.phase = phase_for_status(&task.status);
+}
+
 impl std::str::FromStr for TaskStatus {
     type Err = anyhow::Error;
 
@@ -137,7 +151,7 @@ pub struct TaskState {
     pub repo: Option<String>,
     /// Short description derived from the task prompt or issue number.
     /// Persisted in the tasks table so DB fallback and summaries preserve the real value.
-    #[serde(skip)]
+    #[serde(default)]
     pub description: Option<String>,
     /// ISO 8601 creation timestamp. Set at spawn time and persisted to the tasks DB.
     #[serde(default)]
@@ -1811,16 +1825,8 @@ pub(crate) async fn update_status(
 ) -> anyhow::Result<()> {
     let status_str = status.as_ref().to_string();
     mutate_and_persist(store, task_id, |s| {
-        s.phase = match status {
-            TaskStatus::Pending | TaskStatus::AwaitingDeps | TaskStatus::Implementing => {
-                TaskPhase::Implement
-            }
-            TaskStatus::AgentReview | TaskStatus::Waiting | TaskStatus::Reviewing => {
-                TaskPhase::Review
-            }
-            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled => TaskPhase::Terminal,
-        };
         s.status = status;
+        sync_phase_from_status(s);
         s.turn = turn;
     })
     .await?;
@@ -1840,7 +1846,9 @@ pub(crate) async fn mutate_and_persist(
     f: impl FnOnce(&mut TaskState),
 ) -> anyhow::Result<()> {
     if let Some(mut entry) = store.cache.get_mut(id) {
-        f(entry.value_mut());
+        let task = entry.value_mut();
+        f(task);
+        sync_phase_from_status(task);
     }
     store.persist(id).await
 }
@@ -2849,6 +2857,35 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("task should exist after done update"))?;
         assert!(matches!(done.status, TaskStatus::Done));
         assert_eq!(done.phase, TaskPhase::Terminal);
+
+        let reloaded = store
+            .db
+            .get(task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("reloaded task should exist"))?;
+        assert!(matches!(reloaded.status, TaskStatus::Done));
+        assert_eq!(reloaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutate_and_persist_syncs_terminal_phase_from_status() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = harness_core::types::TaskId("phase-terminal-persist-test".to_string());
+        let task = TaskState::new(task_id.clone());
+        store.insert(&task).await;
+
+        mutate_and_persist(&store, &task_id, |state| {
+            state.status = TaskStatus::Done;
+        })
+        .await?;
+
+        let cached = store
+            .get(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("task should exist after terminal persist"))?;
+        assert!(matches!(cached.status, TaskStatus::Done));
+        assert_eq!(cached.phase, TaskPhase::Terminal);
 
         let reloaded = store
             .db

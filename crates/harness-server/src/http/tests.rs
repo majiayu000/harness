@@ -707,6 +707,34 @@ async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn get_task_returns_persisted_description() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let task_id = harness_core::types::TaskId("task-description-detail".to_string());
+    let mut task = crate::task_runner::TaskState::new(task_id.clone());
+    task.description = Some("persisted description".to_string());
+    state.core.tasks.insert(&task).await;
+    state.core.tasks.cache.remove(&task_id);
+
+    use http_body_util::BodyExt;
+    let response = task_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/tasks/task-description-detail")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await?.to_bytes();
+    let task_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(task_json["id"], "task-description-detail");
+    assert_eq!(task_json["description"], "persisted description");
+    Ok(())
+}
+
+#[tokio::test]
 async fn intake_status_returns_three_channels() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
