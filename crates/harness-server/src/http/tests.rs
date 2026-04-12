@@ -299,6 +299,80 @@ async fn build_app_state_keeps_registry_alias_but_executes_batching_by_canonical
     Ok(())
 }
 
+#[tokio::test]
+async fn build_app_state_restores_registry_project_concurrency_limits_after_restart(
+) -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let home = tempfile::tempdir()?;
+    let _home_guard = unsafe { crate::test_helpers::HomeGuard::set(home.path()) };
+    let project_root = crate::test_helpers::tempdir_in_home("http-restart-root-")?;
+    let api_project = crate::test_helpers::tempdir_in_home("http-restart-api-")?;
+    let data_dir = crate::test_helpers::tempdir_in_home("http-restart-data-")?;
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.project_root = project_root.path().to_path_buf();
+    config.server.data_dir = data_dir.path().to_path_buf();
+
+    let mut first_agent_registry = harness_agents::registry::AgentRegistry::new("test");
+    first_agent_registry.register("test", CapturingAgent::new());
+
+    let server = crate::server::HarnessServer::new(
+        config.clone(),
+        crate::thread_manager::ThreadManager::new(),
+        first_agent_registry,
+    );
+    let first_state = build_app_state(Arc::new(server)).await?;
+
+    let canonical_project_root = api_project.path().canonicalize()?;
+    first_state
+        .core
+        .project_registry
+        .as_ref()
+        .expect("registry should exist")
+        .register(crate::project_registry::Project {
+            id: "api-project".to_string(),
+            root: canonical_project_root.clone(),
+            max_concurrent: Some(1),
+            default_agent: None,
+            active: true,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .await?;
+
+    drop(first_state);
+
+    let mut restarted_agent_registry = harness_agents::registry::AgentRegistry::new("test");
+    restarted_agent_registry.register("test", CapturingAgent::new());
+    let restarted_server = crate::server::HarnessServer::new(
+        config,
+        crate::thread_manager::ThreadManager::new(),
+        restarted_agent_registry,
+    );
+    let restarted_state = build_app_state(Arc::new(restarted_server)).await?;
+    let project_id = canonical_project_root.to_string_lossy().into_owned();
+    let permit = restarted_state
+        .concurrency
+        .task_queue
+        .acquire(&project_id, 0)
+        .await?;
+
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(50),
+        restarted_state
+            .concurrency
+            .task_queue
+            .acquire(&project_id, 0),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "registry-backed max_concurrent should survive restart and still cap canonical queue key"
+    );
+
+    drop(permit);
+    Ok(())
+}
+
 async fn make_test_state_with_agent(
     dir: &std::path::Path,
     webhook_secret: Option<&str>,

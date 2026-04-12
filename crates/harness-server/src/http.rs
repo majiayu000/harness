@@ -389,10 +389,16 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     }
     // Register any extra named projects supplied via --project CLI flags.
     for (name, path) in &server.startup_projects {
+        let configured_limit = server
+            .config
+            .projects
+            .iter()
+            .find(|entry| entry.name == *name)
+            .and_then(|entry| entry.max_concurrent);
         let proj = crate::project_registry::Project {
             id: name.clone(),
             root: path.clone(),
-            max_concurrent: None,
+            max_concurrent: configured_limit,
             default_agent: None,
             active: true,
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -400,15 +406,13 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         if let Err(e) = project_registry.register(proj).await {
             tracing::warn!(project = %name, "failed to register startup project: {e}");
         }
-        if let Some(limit) = server
-            .config
-            .projects
-            .iter()
-            .find(|entry| entry.name == *name)
-            .and_then(|entry| entry.max_concurrent)
-            .map(|limit| limit as usize)
-        {
+        if let Some(limit) = configured_limit.map(|limit| limit as usize) {
             queue_config.set_project_limit(path, limit);
+        }
+    }
+    for project in project_registry.list().await? {
+        if let Some(limit) = project.max_concurrent.map(|limit| limit as usize) {
+            queue_config.set_project_limit(&project.root, limit);
         }
     }
     let plans_md_dir = dir.join("plans");

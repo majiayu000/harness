@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use harness_core::{config::misc::ConcurrencyConfig, project_identity::canonical_project_key};
+use harness_core::config::misc::ConcurrencyConfig;
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -421,7 +421,7 @@ impl TaskQueue {
         let project_limits: DashMap<String, usize> = config
             .per_project
             .iter()
-            .map(|(k, v)| (canonical_project_key(k), *v))
+            .map(|(k, v)| (k.clone(), *v))
             .collect();
 
         Self {
@@ -440,36 +440,32 @@ impl TaskQueue {
     }
 
     fn project_limit(&self, project_id: &str) -> usize {
-        let project_id = canonical_project_key(project_id);
         self.project_limits
-            .get(&project_id)
+            .get(project_id)
             .map(|v| *v)
             .unwrap_or(self.global_limit)
     }
 
     fn get_or_create_project_queue(&self, project_id: &str) -> Arc<Mutex<PriorityPermitQueue>> {
-        let project_id = canonical_project_key(project_id);
         self.project_queues
-            .entry(project_id.clone())
+            .entry(project_id.to_string())
             .or_insert_with(|| {
-                let limit = self.project_limit(&project_id);
+                let limit = self.project_limit(project_id);
                 Arc::new(Mutex::new(PriorityPermitQueue::new(limit)))
             })
             .clone()
     }
 
     fn get_or_create_project_queued(&self, project_id: &str) -> Arc<AtomicUsize> {
-        let project_id = canonical_project_key(project_id);
         self.project_queued
-            .entry(project_id)
+            .entry(project_id.to_string())
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone()
     }
 
     fn get_or_create_project_awaiting_global(&self, project_id: &str) -> Arc<AtomicUsize> {
-        let project_id = canonical_project_key(project_id);
         self.project_awaiting_global
-            .entry(project_id)
+            .entry(project_id.to_string())
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone()
     }
@@ -616,16 +612,15 @@ impl TaskQueue {
 
     /// Stats for a specific project (tasks that have acquired a project slot).
     pub fn project_stats(&self, project_id: &str) -> QueueStats {
-        let project_id = canonical_project_key(project_id);
-        let limit = self.project_limit(&project_id);
-        if let Some(pq) = self.project_queues.get(&project_id) {
+        let limit = self.project_limit(project_id);
+        if let Some(pq) = self.project_queues.get(project_id) {
             let q = pq.lock().unwrap();
             let holding_project = limit.saturating_sub(q.available_permits());
             let waiting_for_project = q.waiter_count();
             drop(q);
             let awaiting_global = self
                 .project_awaiting_global
-                .get(&project_id)
+                .get(project_id)
                 .map(|c| c.load(AtomicOrdering::Relaxed))
                 .unwrap_or(0);
             let running = holding_project.saturating_sub(awaiting_global);

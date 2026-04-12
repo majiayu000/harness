@@ -201,6 +201,46 @@ async fn canonical_and_relative_project_keys_share_queue_stats_bucket() -> anyho
 }
 
 #[tokio::test]
+async fn repeated_alias_key_does_not_split_after_canonicalize_starts_failing() -> anyhow::Result<()>
+{
+    use std::collections::HashMap;
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+    let alias = temp.path().join("repo-link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&repo, &alias)?;
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&repo, &alias)?;
+    let alias_key = alias.display().to_string();
+
+    let mut per_project = HashMap::new();
+    per_project.insert(alias_key.clone(), 1usize);
+    let cfg = ConcurrencyConfig {
+        max_concurrent_tasks: 4,
+        max_queue_size: 16,
+        stall_timeout_secs: 300,
+        per_project,
+        ..ConcurrencyConfig::default()
+    };
+    let q = Arc::new(TaskQueue::new(&cfg));
+
+    let _holder = q.acquire(&alias_key, 0).await.unwrap();
+    std::fs::remove_file(&alias)?;
+
+    let blocked = timeout(Duration::from_millis(50), q.acquire(&alias_key, 0)).await;
+    assert!(
+        blocked.is_err(),
+        "the same project key should keep its original queue bucket even after canonicalize later fails"
+    );
+
+    let stats = q.project_stats(&alias_key);
+    assert_eq!(stats.limit, 1, "configured limit should still be visible");
+    Ok(())
+}
+
+#[tokio::test]
 async fn project_cannot_starve_another() {
     use std::collections::HashMap;
     // global=2, proj_a=1 → proj_a can use at most 1 global slot,
