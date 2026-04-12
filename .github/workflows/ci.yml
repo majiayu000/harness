@@ -11,30 +11,64 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  # ── Step 1: Detect changed paths ──────────────────────────────────────
+  changed:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      server: ${{ steps.filter.outputs.server }}
+      agents: ${{ steps.filter.outputs.agents }}
+      ci: ${{ steps.filter.outputs.ci }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            server:
+              - 'crates/harness-server/**'
+              - 'crates/harness-core/**'
+              - 'crates/harness-workflow/**'
+            agents:
+              - 'crates/harness-agents/**'
+              - 'crates/harness-core/**'
+            ci:
+              - '.github/workflows/**'
+
+  # ── Step 2: Fast checks (always run on Rust changes) ──────────────────
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    needs: changed
+    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
   check:
     name: Check
     runs-on: ubuntu-latest
+    needs: changed
+    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    needs: check
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     needs: check
+    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -43,19 +77,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets
 
-  fmt:
-    name: Format
+  # ── Step 3: Tests (only when relevant crates change) ──────────────────
+  test:
+    name: Test
     runs-on: ubuntu-latest
+    needs: [check, changed]
+    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true'
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
 
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    needs: changed
+    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true'
     permissions:
       contents: read
       checks: write
@@ -64,3 +103,21 @@ jobs:
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Fan-in gate: single required check for branch protection ──────────
+  ci-result:
+    name: CI Result
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [fmt, check, clippy, test, audit]
+    steps:
+      - name: Check all jobs
+        run: |
+          results=("${{ needs.fmt.result }}" "${{ needs.check.result }}" "${{ needs.clippy.result }}" "${{ needs.test.result }}" "${{ needs.audit.result }}")
+          for r in "${results[@]}"; do
+            if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then
+              echo "Job failed or cancelled: $r"
+              exit 1
+            fi
+          done
+          echo "All CI jobs passed or were skipped"
