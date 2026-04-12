@@ -131,10 +131,10 @@ impl QValueStore {
 
         let mut ids = Vec::new();
         for (json,) in rows {
-            let parsed: Vec<String> = serde_json::from_str(&json).unwrap_or_else(|e| {
-                tracing::error!(task_id, row = %json, "q_value_store: failed to parse experiences_used: {e}");
-                Vec::new()
-            });
+            let parsed: Vec<String> = serde_json::from_str(&json).map_err(|e| {
+                tracing::error!(%task_id, row = %json, error = %e, "q_value_store: failed to parse experiences_used");
+                e
+            })?;
             ids.extend(parsed);
         }
         ids.sort();
@@ -224,6 +224,23 @@ mod tests {
         let path = dir.path().join("q_values.db");
         let store = QValueStore::open(&path).await?;
         Ok((store, dir))
+    }
+
+    #[tokio::test]
+    async fn get_experiences_returns_error_on_corrupt_json() -> anyhow::Result<()> {
+        let (store, _dir) = open_test_store().await?;
+        // Insert a row with invalid JSON directly to simulate DB corruption.
+        sqlx::query(
+            "INSERT INTO pipeline_events (task_id, phase, experiences_used) VALUES (?, ?, ?)",
+        )
+        .bind("task-corrupt")
+        .bind("implement")
+        .bind("not valid json")
+        .execute(&store.pool)
+        .await?;
+        let result = store.get_experiences_for_task("task-corrupt").await;
+        assert!(result.is_err(), "expected Err on corrupt JSON, got Ok");
+        Ok(())
     }
 
     #[tokio::test]
