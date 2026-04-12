@@ -37,6 +37,9 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 - After creating a PR, wait for Gemini code review bot before merging
 - If Gemini leaves review comments, address valid feedback before merge
 - If no comments or only false positives, proceed with merge
+- **Squash-merge only** — repo enforces squash merge to minimize cascade conflicts
+- **Do NOT modify `Cargo.toml` version in feature/fix PRs** — version bumps happen only at release time (prevents merge conflicts across parallel PRs)
+- CI uses path-based change detection — only affected crate tests run on PRs
 
 ## Claude CLI Argument Order (CRITICAL)
 
