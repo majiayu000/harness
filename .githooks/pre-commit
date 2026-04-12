@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Unset git env vars that leak into test subprocesses during commit.
+# GIT_INDEX_FILE points to a temp file during commit, breaking workspace
+# tests that spawn their own git repos in temp directories.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE 2>/dev/null || true
+
 echo "=== pre-commit: fmt ==="
 cargo fmt --all -- --check
 
