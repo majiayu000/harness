@@ -982,6 +982,14 @@ impl TaskStore {
         }
     }
 
+    /// Set `execution_started_at` for the given task if not already set.
+    /// Idempotent; logs and swallows errors so that a DB failure does not abort task execution.
+    pub(crate) async fn set_execution_started_at(&self, id: &TaskId, ts: &str) {
+        if let Err(e) = self.db.set_execution_started_at(id.0.as_str(), ts).await {
+            tracing::warn!(task_id = %id.0, "failed to set execution_started_at: {e}");
+        }
+    }
+
     /// Set `first_output_at` for the given task if not already set.
     /// Idempotent; logs and swallows errors so that a DB failure does not abort task execution.
     pub(crate) async fn set_first_output_at(&self, id: &TaskId, ts: &str) {
@@ -1845,6 +1853,12 @@ pub(crate) async fn update_status(
     turn: u32,
 ) -> anyhow::Result<()> {
     let status_str = status.as_ref().to_string();
+    // Stamp execution_started_at the first time a task enters Implementing so
+    // that first-token latency excludes queue-wait time.
+    if matches!(status, TaskStatus::Implementing) {
+        let ts = chrono::Utc::now().to_rfc3339();
+        store.set_execution_started_at(task_id, &ts).await;
+    }
     mutate_and_persist(store, task_id, |s| {
         s.status = status;
         s.turn = turn;

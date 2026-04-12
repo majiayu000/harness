@@ -3,9 +3,26 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 use crate::http::AppState;
+
+/// Cached result of the last full JSONL cost scan with its expiry time.
+struct CostStatsCache {
+    total: f64,
+    avg: f64,
+    expires: Instant,
+}
+
+/// TTL for the cost stats cache: avoids re-scanning all JSONL files on every poll.
+const COST_CACHE_TTL: Duration = Duration::from_secs(60);
+
+fn cost_cache() -> &'static Mutex<Option<CostStatsCache>> {
+    static CACHE: OnceLock<Mutex<Option<CostStatsCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
 
 #[derive(Debug, Default, Clone, Serialize)]
 struct UsageBucket {
@@ -432,10 +449,37 @@ fn aggregate_cost_stats(task_usage: &HashMap<String, UsageBucket>) -> (f64, f64)
 
 /// Load per-task cost statistics from Claude CLI session JSONL files.
 ///
-/// Returns `(total_cost_usd, avg_cost_per_task_usd)`.  Returns `(0.0, 0.0)`
-/// on any error (missing directory, unreadable files, etc.) so that the
-/// dashboard degrades gracefully without an error response.
+/// Results are cached for [`COST_CACHE_TTL`] to avoid re-scanning all JSONL
+/// files on every dashboard poll.  Returns `(0.0, 0.0)` on any error so that
+/// the dashboard degrades gracefully without an error response.
 pub(crate) async fn load_cost_stats(state: &Arc<crate::http::AppState>) -> (f64, f64) {
+    // Fast path: return cached result if still fresh.
+    {
+        let guard = cost_cache().lock().await;
+        if let Some(ref c) = *guard {
+            if c.expires > Instant::now() {
+                return (c.total, c.avg);
+            }
+        }
+    }
+
+    let result = load_cost_stats_uncached(state).await;
+
+    // Update cache regardless of success/failure so repeated errors don't
+    // cause a thundering herd.
+    {
+        let mut guard = cost_cache().lock().await;
+        *guard = Some(CostStatsCache {
+            total: result.0,
+            avg: result.1,
+            expires: Instant::now() + COST_CACHE_TTL,
+        });
+    }
+
+    result
+}
+
+async fn load_cost_stats_uncached(state: &Arc<crate::http::AppState>) -> (f64, f64) {
     let home = match home_dir() {
         Ok(p) => p,
         Err(_) => return (0.0, 0.0),

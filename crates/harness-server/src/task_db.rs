@@ -21,6 +21,8 @@ const ARTIFACT_MAX_BYTES: usize = 65_536;
 /// v12 – add priority column for priority-based task scheduling.
 /// v13 – add review_turns column for tracking review cycles per task.
 /// v14 – add first_output_at column for first-token latency tracking.
+/// v15 – add execution_started_at column: stamped when task transitions to
+///        Implementing, used for accurate first-token latency (excludes queue wait).
 static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -110,6 +112,11 @@ static TASK_MIGRATIONS: &[Migration] = &[
         version: 14,
         description: "add first_output_at column for first-token latency tracking",
         sql: "ALTER TABLE tasks ADD COLUMN first_output_at TEXT",
+    },
+    Migration {
+        version: 15,
+        description: "add execution_started_at column for accurate first-token latency",
+        sql: "ALTER TABLE tasks ADD COLUMN execution_started_at TEXT",
     },
 ];
 
@@ -769,6 +776,23 @@ impl TaskDb {
         Ok(())
     }
 
+    /// Set `execution_started_at` for the given task if it has not been set yet.
+    ///
+    /// Called when the task transitions to `Implementing` so that
+    /// `avg_first_token_latency_ms` measures agent response time only, excluding
+    /// queue-wait time.  Idempotent via `WHERE execution_started_at IS NULL`.
+    pub async fn set_execution_started_at(&self, task_id: &str, ts: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE tasks SET execution_started_at = ? \
+             WHERE id = ? AND execution_started_at IS NULL",
+        )
+        .bind(ts)
+        .bind(task_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Set `first_output_at` for the given task if it has not been set yet.
     ///
     /// Idempotent: subsequent calls are no-ops because the WHERE clause
@@ -800,16 +824,20 @@ impl TaskDb {
     /// Return the average first-token latency in milliseconds across done tasks
     /// that have `first_output_at` set, or `None` when no such tasks exist.
     ///
-    /// Latency is computed as `(first_output_at - created_at)` using SQLite's
-    /// `julianday` function converted to milliseconds. Results clamped to >= 0
-    /// in the query to guard against clock skew.
+    /// Latency is computed as `first_output_at - execution_started_at` when the
+    /// latter is available (tasks created after v15 migration), falling back to
+    /// `created_at` for older rows.  This ensures queue-wait time is excluded
+    /// from the metric on new tasks while retaining data for historical ones.
     pub async fn avg_first_token_latency_ms(&self) -> anyhow::Result<Option<f64>> {
         let row: Option<(Option<f64>,)> = sqlx::query_as(
-            "SELECT AVG(MAX(0.0, (julianday(first_output_at) - julianday(created_at)) * 86400000.0)) \
+            "SELECT AVG(MAX(0.0, \
+               (julianday(first_output_at) \
+                - julianday(COALESCE(execution_started_at, created_at))) \
+               * 86400000.0)) \
              FROM tasks \
              WHERE status = 'done' \
                AND first_output_at IS NOT NULL \
-               AND created_at IS NOT NULL",
+               AND COALESCE(execution_started_at, created_at) IS NOT NULL",
         )
         .fetch_optional(&self.pool)
         .await?;
