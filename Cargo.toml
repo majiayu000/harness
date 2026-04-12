@@ -13,6 +13,7 @@ members = [
     "crates/harness-exec",
     "crates/harness-observe",
     "crates/harness-cli",
+    "crates/harness-workflow",
 ]
 
 [workspace.package]
@@ -34,6 +35,7 @@ harness-rules = { path = "crates/harness-rules" }
 harness-skills = { path = "crates/harness-skills" }
 harness-exec = { path = "crates/harness-exec" }
 harness-observe = { path = "crates/harness-observe" }
+harness-workflow = { path = "crates/harness-workflow" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

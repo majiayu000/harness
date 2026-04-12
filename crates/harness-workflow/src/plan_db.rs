@@ -135,7 +135,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db = PlanDb::open(&dir.path().join("plans.db")).await?;
 
-        let plan = ExecPlan::from_spec("Test plan purpose", &dir.path().to_path_buf())?;
+        let plan = ExecPlan::from_spec("Test plan purpose", dir.path())?;
         db.upsert(&plan).await?;
 
         let loaded = db.get(&plan.id).await?.expect("plan should exist");
@@ -160,7 +160,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db = PlanDb::open(&dir.path().join("plans.db")).await?;
 
-        let plan = ExecPlan::from_spec("# Delete me", &dir.path().to_path_buf())?;
+        let plan = ExecPlan::from_spec("# Delete me", dir.path())?;
         db.upsert(&plan).await?;
         assert!(db.delete(&plan.id).await?);
         assert!(db.get(&plan.id).await?.is_none());
@@ -180,10 +180,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db = PlanDb::open(&dir.path().join("plans.db")).await?;
 
-        let draft = ExecPlan::from_spec("# Draft plan", &dir.path().to_path_buf())?;
-        let mut active = ExecPlan::from_spec("# Active plan", &dir.path().to_path_buf())?;
+        let draft = ExecPlan::from_spec("# Draft plan", dir.path())?;
+        let mut active = ExecPlan::from_spec("# Active plan", dir.path())?;
         active.activate();
-        let mut completed = ExecPlan::from_spec("# Completed plan", &dir.path().to_path_buf())?;
+        let mut completed = ExecPlan::from_spec("# Completed plan", dir.path())?;
         completed.complete();
 
         db.upsert(&draft).await?;
@@ -205,8 +205,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db = PlanDb::open(&dir.path().join("plans.db")).await?;
 
-        let auth = ExecPlan::from_spec("# Implement authentication", &dir.path().to_path_buf())?;
-        let deploy = ExecPlan::from_spec("# Deploy to production", &dir.path().to_path_buf())?;
+        let auth = ExecPlan::from_spec("# Implement authentication", dir.path())?;
+        let deploy = ExecPlan::from_spec("# Deploy to production", dir.path())?;
 
         db.upsert(&auth).await?;
         db.upsert(&deploy).await?;
@@ -226,7 +226,7 @@ mod tests {
         let db = PlanDb::open(&dir.path().join("plans.db")).await?;
 
         // Write a minimal ExecPlan markdown file.
-        let plan = ExecPlan::from_spec("# Migration test plan", &dir.path().to_path_buf())?;
+        let plan = ExecPlan::from_spec("# Migration test plan", dir.path())?;
         let md = plan.to_markdown();
         std::fs::write(dir.path().join("plan1.md"), &md)?;
 
@@ -258,7 +258,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db = PlanDb::open(&dir.path().join("plans.db")).await?;
 
-        let plan = ExecPlan::from_spec("# Update test", &dir.path().to_path_buf())?;
+        let plan = ExecPlan::from_spec("# Update test", dir.path())?;
         db.upsert(&plan).await?;
 
         let updated = db
