@@ -621,16 +621,18 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                         // task execution. Non-terminal states (Pending, Implementing, etc.)
                         // must not trigger Q-updates — they would incorrectly penalize rules
                         // that are still in the middle of a task.
-                        let reward = match state.status {
-                            task_runner::TaskStatus::Done => {
+                        let reward = match (&state.status, &state.pr_url) {
+                            (task_runner::TaskStatus::Done, Some(_)) => {
                                 Some(crate::q_value_store::REWARD_MERGED)
                             }
-                            task_runner::TaskStatus::Failed => {
+                            (task_runner::TaskStatus::Failed, Some(_)) => {
                                 Some(crate::q_value_store::REWARD_CLOSED)
                             }
-                            task_runner::TaskStatus::Cancelled => {
+                            (task_runner::TaskStatus::Cancelled, _) => {
                                 Some(crate::q_value_store::REWARD_UNKNOWN_CLOSED)
                             }
+                            // Non-PR tasks (no pr_url): skip Q-value update to avoid
+                            // spuriously inflating rule Q-values for prompt/analysis tasks.
                             _ => None,
                         };
                         if let Some(reward) = reward {
