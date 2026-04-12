@@ -775,18 +775,19 @@ async fn run_review_tick(
             return;
         }
 
-        if primary_output.is_none() {
-            tracing::error!(
-                task_id = %primary_review_id,
-                "scheduler: primary review produced no output (agent failed/timed out) — watermark not advanced, next tick will re-review"
-            );
-            return;
-        }
-
-        // Now it is safe to enqueue the secondary reviewer (Cross strategy only).
-        let secondary_review_id: Option<harness_core::types::TaskId> = if let Some(agent) =
-            secondary_agent_name.as_ref()
-        {
+        // Only enqueue secondary (Cross strategy) when primary produced output.
+        // Synthesis requires both outputs; running secondary when primary timed
+        // out / OOM wastes queue/quota because its output will be discarded.
+        let secondary_review_id: Option<harness_core::types::TaskId> = if primary_output.is_none() {
+            if secondary_agent_name.is_some() {
+                tracing::warn!(
+                    task_id = %primary_review_id,
+                    "scheduler: primary produced no output — skipping secondary enqueue \
+                     to avoid queue/quota exhaustion (synthesis requires both outputs)"
+                );
+            }
+            None
+        } else if let Some(agent) = secondary_agent_name.as_ref() {
             let req = CreateTaskRequest {
                 prompt: Some(base_prompt.clone()),
                 agent: Some(agent.clone()),
@@ -819,6 +820,30 @@ async fn run_review_tick(
 
         let mut final_task_id = primary_review_id.clone();
         let mut final_output = primary_output.clone();
+        // When synthesis is used (Cross mode) we record the timestamp captured
+        // just before polling synthesis.  Advancing the watermark to this bound
+        // ensures commits that arrive *during* synthesis latency are caught by
+        // the next tick rather than permanently skipped (issue-2 fix).
+        let mut review_bound_ts: Option<DateTime<Utc>> = None;
+
+        // Cross mode: primary is confirmed non-None and non-REVIEW_SKIPPED.
+        // Advance the in-memory watermark speculatively to scan_ts now so that
+        // concurrent scheduler ticks do not re-enqueue the same commit window
+        // while secondary/synthesis agents are in flight.  The DB-backed
+        // periodic_review event is only written after a successful parse (below),
+        // so a server restart resets fallback_ts and the DB remains authoritative.
+        // We capture the pre-advance value so it can be restored if
+        // parse_review_output later fails (prevents silent commit-window loss).
+        let pre_speculative_fallback_ts: Option<Option<DateTime<Utc>>> =
+            if secondary_review_id.is_some() {
+                let mut guard = fallback_ts_for_poll.lock().await;
+                let prev = guard.fallback_ts;
+                guard.fallback_ts = Some(scan_ts);
+                Some(prev)
+            } else {
+                None
+            };
+
         if let (Some(secondary_id), Some(secondary_name)) =
             (secondary_review_id.as_ref(), secondary_agent_name.as_ref())
         {
@@ -855,7 +880,35 @@ async fn run_review_tick(
                             "scheduler: synthesis review enqueued"
                         );
                         final_task_id = synth_id.clone();
-                        final_output = poll_task_output(&store, &synth_id, timeout_secs).await;
+                        // Capture bound before polling synthesis so the watermark
+                        // covers only commits primary/secondary actually reviewed;
+                        // commits arriving during synthesis latency are caught next
+                        // tick (issue-2 fix).
+                        let pre_synthesis_ts = Utc::now();
+                        let synth_out = poll_task_output(&store, &synth_id, timeout_secs).await;
+                        if synth_out.is_none() {
+                            // Synthesis timed out / OOM / rate-limited.  Fall back to
+                            // primary output.  Do NOT advance the watermark to
+                            // pre_synthesis_ts here — secondary may have reviewed
+                            // commits that primary never saw, and advancing past them
+                            // would skip those commits forever.  Leave review_bound_ts
+                            // as None so the watermark falls back to scan_ts (primary's
+                            // boundary) at the merge site below.
+                            tracing::warn!(
+                                task_id = %synth_id,
+                                "scheduler: synthesis produced no output \
+                                 (timeout/OOM/rate-limit); falling back to primary \
+                                 review output; watermark held at scan_ts to avoid \
+                                 skipping commits only seen by secondary"
+                            );
+                            final_output = primary_output.clone();
+                        } else {
+                            final_output = synth_out;
+                            // Only advance to pre_synthesis_ts when synthesis actually
+                            // succeeded — it is safe because both primary and secondary
+                            // outputs are captured in the synthesis result.
+                            review_bound_ts = Some(pre_synthesis_ts);
+                        }
                     }
                     Err(err) => {
                         tracing::warn!("scheduler: failed to enqueue synthesis review: {err}");
@@ -866,7 +919,11 @@ async fn run_review_tick(
         }
 
         let Some(output) = final_output else {
-            tracing::warn!("scheduler: no review output to parse — watermark not advanced, next tick will re-review");
+            tracing::error!(
+                task_id = %final_task_id,
+                "scheduler: review produced no output (agent may have OOM/rate-limited/timed out) \
+                 — watermark NOT advanced; will retry next tick"
+            );
             return;
         };
 
@@ -881,9 +938,21 @@ async fn run_review_tick(
                 // enqueued, so commits arriving during secondary/synthesis are
                 // NOT included in the advanced watermark and will be reviewed
                 // on the next tick (fixes the Cross-strategy skip-forever bug).
-                fallback_ts_for_poll.lock().await.fallback_ts = Some(scan_ts);
-                let watermark_event =
+                // Use pre_synthesis_ts when available (Cross mode) so the
+                // watermark boundary does not jump past commits that arrived
+                // during synthesis latency.  Falls back to scan_ts for
+                // Single-strategy paths where no synthesis step exists.
+                let watermark_ts = review_bound_ts.unwrap_or(scan_ts);
+                fallback_ts_for_poll.lock().await.fallback_ts = Some(watermark_ts);
+                // Set the event's ts to watermark_ts (not Utc::now()) so that next
+                // tick's db_last_review_ts = max(event.ts) == watermark_ts.  If we
+                // used Utc::now() here, db_last_review_ts >> watermark_ts, and the
+                // max(db_ts, fallback_ts) merge would always pick db_ts, nullifying
+                // the intended bound and allowing commit-window skips during long
+                // secondary/synthesis latency (issue-2 fix).
+                let mut watermark_event =
                     Event::new(SessionId::new(), &hook_key, "scheduler", Decision::Pass);
+                watermark_event.ts = watermark_ts;
                 if let Err(err) = state_for_synthesis
                     .observability
                     .events
@@ -1144,6 +1213,16 @@ async fn run_review_tick(
             }
             Err(e) => {
                 tracing::error!("scheduler: failed to parse review output as JSON: {e}");
+                // Rollback the speculative in-memory watermark advance (Cross
+                // mode) so the next tick retries this commit window instead of
+                // permanently skipping it due to a parse failure.
+                if let Some(prev_ts) = pre_speculative_fallback_ts {
+                    fallback_ts_for_poll.lock().await.fallback_ts = prev_ts;
+                    tracing::warn!(
+                        "scheduler: rolled back speculative fallback_ts after parse failure; \
+                         next tick will retry this commit window"
+                    );
+                }
             }
         }
     });
