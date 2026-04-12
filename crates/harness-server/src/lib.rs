@@ -67,3 +67,6 @@ mod runtime_state_store_tests;
 
 #[cfg(test)]
 mod thread_manager_tests;
+
+#[cfg(test)]
+mod quality_trigger_tests;

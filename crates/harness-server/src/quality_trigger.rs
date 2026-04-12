@@ -1,4 +1,6 @@
-use harness_core::types::{EventFilters, Grade, Project};
+use crate::handlers::cross_review::run_cross_review;
+use harness_core::agent::CodeAgent;
+use harness_core::types::{Capability, EventFilters, Grade, Project};
 use harness_gc::gc_agent::GcAgent;
 use harness_observe::event_store::EventStore;
 use harness_observe::quality::QualityGrader;
@@ -6,23 +8,30 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
 
+/// Task context passed to cross-review: the diff output and PR URL.
+pub struct TaskReviewContext {
+    pub diff: String,
+    pub pr_description: String,
+}
+
 /// Evaluates project quality after each task completion and triggers GC when
 /// the grade falls below a configured threshold.
 pub struct QualityTrigger {
-    events: Arc<EventStore>,
+    pub(crate) events: Arc<EventStore>,
     gc_agent: Arc<GcAgent>,
     agent_registry: Arc<harness_agents::registry::AgentRegistry>,
     project_root: PathBuf,
     auto_gc_grades: Vec<Grade>,
     cooldown_secs: u64,
-    last_triggered: Arc<AtomicU64>,
+    pub(crate) last_triggered: Arc<AtomicU64>,
+    challenger_agent: Option<Arc<dyn CodeAgent>>,
 }
 
 impl QualityTrigger {
@@ -33,6 +42,7 @@ impl QualityTrigger {
         project_root: PathBuf,
         auto_gc_grades: Vec<Grade>,
         cooldown_secs: u64,
+        challenger_agent: Option<Arc<dyn CodeAgent>>,
     ) -> Self {
         Self {
             events,
@@ -42,6 +52,7 @@ impl QualityTrigger {
             auto_gc_grades,
             cooldown_secs,
             last_triggered: Arc::new(AtomicU64::new(0)),
+            challenger_agent,
         }
     }
 
@@ -51,13 +62,24 @@ impl QualityTrigger {
     }
 
     /// Returns true if the cooldown period has elapsed since the last trigger.
-    fn cooldown_elapsed(&self) -> bool {
+    pub(crate) fn cooldown_elapsed(&self) -> bool {
         let last = self.last_triggered.load(Ordering::Relaxed);
         unix_now().saturating_sub(last) >= self.cooldown_secs
     }
 
-    /// Grade recent events, log the result, and auto-trigger GC if warranted.
-    pub async fn check_and_maybe_trigger(&self) {
+    /// Downgrade a grade by one step. D stays at D (floor).
+    fn downgrade(grade: Grade) -> Grade {
+        match grade {
+            Grade::A => Grade::A, // gated before call; kept for completeness
+            Grade::B => Grade::C,
+            Grade::C => Grade::D,
+            Grade::D => Grade::D,
+        }
+    }
+
+    /// Grade recent events, run optional cross-review, log the result, and
+    /// auto-trigger GC if warranted.
+    pub async fn check_and_maybe_trigger(&self, task_ctx: Option<&TaskReviewContext>) {
         let events = match self.events.query(&EventFilters::default()).await {
             Ok(e) => e,
             Err(e) => {
@@ -66,7 +88,127 @@ impl QualityTrigger {
             }
         };
 
-        let report = QualityGrader::grade(&events, 0);
+        let mut report = QualityGrader::grade(&events, 0);
+
+        // Cross-review gate: skip if no challenger, no task context, or grade=A.
+        if let (Some(challenger), Some(ctx)) = (&self.challenger_agent, task_ctx) {
+            if report.grade != Grade::A {
+                // Cap diff to avoid oversized LLM requests (latency/cost spikes).
+                // Use char-boundary-safe truncation to prevent panics on multibyte UTF-8.
+                const MAX_DIFF_BYTES: usize = 4096;
+                let diff_excerpt = if ctx.diff.len() > MAX_DIFF_BYTES {
+                    let end = (0..=MAX_DIFF_BYTES)
+                        .rev()
+                        .find(|&i| ctx.diff.is_char_boundary(i))
+                        .unwrap_or(0);
+                    &ctx.diff[..end]
+                } else {
+                    &ctx.diff
+                };
+                let target = format!(
+                    "PR: {}\n\nDiff summary:\n{}",
+                    ctx.pr_description, diff_excerpt
+                );
+                if let Some(primary) = self.agent_registry.default_agent() {
+                    // Identity guard: skip cross-review when primary and challenger are the
+                    // same agent — identical models produce correlated verdicts that cannot
+                    // serve as an independent check.
+                    if primary.name() == challenger.name() {
+                        tracing::warn!(
+                            agent = primary.name(),
+                            "quality_trigger: primary and challenger are the same agent; \
+                             skipping cross-review to preserve independence"
+                        );
+                    } else if primary
+                        .capabilities()
+                        .iter()
+                        .any(|c| matches!(c, Capability::Write | Capability::Execute))
+                    {
+                        // Guard the primary as well: agents that advertise Write or
+                        // Execute capabilities (e.g. CodexAgent) ignore allowed_tools
+                        // and run with their configured sandbox, potentially mutating
+                        // the workspace during this background quality gate.
+                        tracing::warn!(
+                            agent = primary.name(),
+                            "quality_trigger: primary agent has Write/Execute capabilities \
+                             and does not honour allowed_tools; skipping cross-review \
+                             to prevent workspace mutation"
+                        );
+                    } else {
+                        // Only allow the challenger when its capabilities are
+                        // read-only.  Agents that advertise Write or Execute
+                        // capabilities (e.g. CodexAgent) do not honour
+                        // allowed_tools and will run with their configured
+                        // sandbox, potentially mutating the workspace.
+                        let review_challenger = if challenger
+                            .capabilities()
+                            .iter()
+                            .any(|c| matches!(c, Capability::Write | Capability::Execute))
+                        {
+                            tracing::warn!(
+                                agent = challenger.name(),
+                                "quality_trigger: challenger has Write/Execute capabilities \
+                                 and does not honour allowed_tools; skipping as \
+                                 cross-review challenger to prevent workspace mutation"
+                            );
+                            None
+                        } else {
+                            Some(challenger.clone())
+                        };
+                        // Guard: skip cross-review when challenger was filtered to None
+                        // due to Write/Execute capabilities.  Calling run_cross_review
+                        // with challenger=None degrades to single-model mode where the
+                        // primary alone can produce NOT_CONVERGED, downgrading the grade
+                        // without two-party verification.
+                        if let Some(rc) = review_challenger {
+                            const CROSS_REVIEW_TIMEOUT_SECS: u64 = 120;
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(CROSS_REVIEW_TIMEOUT_SECS),
+                                run_cross_review(
+                                    primary,
+                                    Some(rc),
+                                    self.project_root.clone(),
+                                    target,
+                                    2,
+                                    // Deny all tools: review is text-only, agents must not
+                                    // mutate the repo during this background quality gate.
+                                    Some(vec![]),
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(result)) => {
+                                    report.semantic_verdict = Some(result.final_verdict.clone());
+                                    if result.final_verdict == "NOT_CONVERGED" {
+                                        let original = report.grade;
+                                        report.grade = Self::downgrade(report.grade);
+                                        tracing::info!(
+                                            original_grade = ?original,
+                                            effective_grade = ?report.grade,
+                                            "quality_trigger: NOT_CONVERGED — grade downgraded"
+                                        );
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::warn!(
+                                        "quality_trigger: cross-review failed: {e}; using numeric grade only"
+                                    );
+                                }
+                                Err(_elapsed) => {
+                                    tracing::warn!(
+                                        "quality_trigger: cross-review timed out after {CROSS_REVIEW_TIMEOUT_SECS}s; \
+                                         using numeric grade only"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    tracing::warn!("quality_trigger: no primary agent for cross-review, skipping");
+                }
+            }
+        }
+
         self.events
             .log_quality_grade(report.grade, report.score)
             .await;
@@ -74,6 +216,7 @@ impl QualityTrigger {
         tracing::info!(
             grade = ?report.grade,
             score = report.score,
+            semantic_verdict = ?report.semantic_verdict,
             "quality_trigger: post-task quality check"
         );
 
@@ -108,156 +251,5 @@ impl QualityTrigger {
         {
             tracing::warn!("quality_trigger: gc_agent.run failed: {e}");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use harness_core::types::{Decision, Event, Grade, SessionId};
-    use harness_gc::draft_store::DraftStore;
-    use harness_gc::gc_agent::GcAgent;
-    use harness_gc::signal_detector::SignalDetector;
-    use std::path::Path;
-
-    async fn make_trigger(
-        dir: &Path,
-        auto_gc_grades: Vec<Grade>,
-        cooldown_secs: u64,
-    ) -> QualityTrigger {
-        let events = Arc::new(EventStore::new(dir).await.expect("event store"));
-        let gc_config = harness_core::config::misc::GcConfig::default();
-        let signal_detector = SignalDetector::new(
-            gc_config.signal_thresholds.clone().into(),
-            harness_core::types::ProjectId::new(),
-        );
-        let draft_store = DraftStore::new(dir).expect("draft store");
-        let gc_agent = Arc::new(GcAgent::new(
-            gc_config,
-            signal_detector,
-            draft_store,
-            dir.to_path_buf(),
-        ));
-        let agent_registry = Arc::new(harness_agents::registry::AgentRegistry::new("test"));
-        QualityTrigger::new(
-            events,
-            gc_agent,
-            agent_registry,
-            dir.to_path_buf(),
-            auto_gc_grades,
-            cooldown_secs,
-        )
-    }
-
-    // --- grade_triggers_gc mapping tests ---
-
-    #[tokio::test]
-    async fn grade_d_triggers_gc_by_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
-        assert!(trigger.grade_triggers_gc(Grade::D));
-    }
-
-    #[tokio::test]
-    async fn grade_a_does_not_trigger_gc_by_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
-        assert!(!trigger.grade_triggers_gc(Grade::A));
-    }
-
-    #[tokio::test]
-    async fn grade_b_does_not_trigger_gc_by_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
-        assert!(!trigger.grade_triggers_gc(Grade::B));
-    }
-
-    #[tokio::test]
-    async fn grade_c_does_not_trigger_gc_by_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
-        assert!(!trigger.grade_triggers_gc(Grade::C));
-    }
-
-    #[tokio::test]
-    async fn configuring_c_and_d_both_trigger() {
-        let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::C, Grade::D], 300).await;
-        assert!(trigger.grade_triggers_gc(Grade::C));
-        assert!(trigger.grade_triggers_gc(Grade::D));
-        assert!(!trigger.grade_triggers_gc(Grade::A));
-        assert!(!trigger.grade_triggers_gc(Grade::B));
-    }
-
-    #[tokio::test]
-    async fn empty_auto_gc_grades_never_triggers() {
-        let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![], 300).await;
-        assert!(!trigger.grade_triggers_gc(Grade::A));
-        assert!(!trigger.grade_triggers_gc(Grade::B));
-        assert!(!trigger.grade_triggers_gc(Grade::C));
-        assert!(!trigger.grade_triggers_gc(Grade::D));
-    }
-
-    // --- cooldown tests ---
-
-    #[tokio::test]
-    async fn cooldown_elapsed_when_never_triggered() {
-        let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
-        assert!(trigger.cooldown_elapsed());
-    }
-
-    #[tokio::test]
-    async fn cooldown_not_elapsed_immediately_after_trigger() {
-        let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
-        trigger.last_triggered.store(unix_now(), Ordering::Relaxed);
-        assert!(!trigger.cooldown_elapsed());
-    }
-
-    #[tokio::test]
-    async fn zero_cooldown_always_elapsed() {
-        let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 0).await;
-        trigger.last_triggered.store(unix_now(), Ordering::Relaxed);
-        assert!(trigger.cooldown_elapsed());
-    }
-
-    // --- log_quality_grade integration test ---
-
-    #[tokio::test]
-    async fn check_logs_quality_grade_event() {
-        let dir = tempfile::tempdir().unwrap();
-        let trigger = make_trigger(dir.path(), vec![Grade::D], 300).await;
-
-        // Seed a passing event so grade comes back as A (score ~ 100)
-        trigger
-            .events
-            .log(&Event::new(
-                SessionId::new(),
-                "pre_tool_use",
-                "Edit",
-                Decision::Pass,
-            ))
-            .await
-            .unwrap();
-
-        trigger.check_and_maybe_trigger().await;
-
-        let events = trigger
-            .events
-            .query(&harness_core::types::EventFilters {
-                hook: Some("quality_grade".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 1, "expected exactly one quality_grade event");
-        assert!(events[0]
-            .detail
-            .as_deref()
-            .unwrap_or("")
-            .starts_with("grade="));
     }
 }

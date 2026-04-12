@@ -552,6 +552,38 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     let quality_trigger = {
         let gc_cfg = &server.config.gc;
+        // Select a read-only challenger dynamically: find the first registered agent
+        // that (a) differs from the default primary and (b) does not advertise
+        // Write or Execute capabilities.  Hard-coding "anthropic-api" makes the gate
+        // unreachable when that agent is not registered or when it is also the
+        // configured default (which triggers the identity guard in QualityTrigger).
+        let default_name = server
+            .agent_registry
+            .resolved_default_agent_name()
+            .map(|s| s.to_owned());
+        let all_names: Vec<String> = server
+            .agent_registry
+            .list()
+            .iter()
+            .map(|&s| s.to_owned())
+            .collect();
+        let challenger = all_names.iter().find_map(|name| {
+            if Some(name.as_str()) == default_name.as_deref() {
+                return None;
+            }
+            let agent = server.agent_registry.get(name)?;
+            if agent.capabilities().iter().any(|c| {
+                matches!(
+                    c,
+                    harness_core::types::Capability::Write
+                        | harness_core::types::Capability::Execute
+                )
+            }) {
+                None
+            } else {
+                Some(agent)
+            }
+        });
         Arc::new(crate::quality_trigger::QualityTrigger::new(
             events.clone(),
             gc_agent.clone(),
@@ -559,6 +591,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             project_root.clone(),
             gc_cfg.auto_gc_grades.clone(),
             gc_cfg.auto_gc_cooldown_secs,
+            challenger,
         ))
     };
 
@@ -852,7 +885,39 @@ fn build_completion_callback(
         Box::pin(async move {
             // Grade recent events and auto-trigger GC if quality is poor.
             if let Some(qt) = quality_trigger {
-                qt.check_and_maybe_trigger().await;
+                let task_ctx = task.pr_url.as_ref().and_then(|pr| {
+                    // Find the most recent implementation-affecting round.
+                    // agent_review_fix rounds always store detail: None, so if
+                    // the most recent such round is a fix round we have no
+                    // usable diff for the final PR state — skip cross-review
+                    // entirely to avoid judging stale initial-implement content
+                    // and spuriously downgrading an already-fixed PR.
+                    let last_impl_round = task
+                        .rounds
+                        .iter()
+                        .rev()
+                        .find(|r| r.action == "implement" || r.action == "agent_review_fix");
+                    let diff = match last_impl_round {
+                        Some(r) if r.action == "implement" => {
+                            // Use the full implement-agent output as review context.
+                            // The implementation prompt contract requires a PR_URL line
+                            // but does not mandate unified-diff format, so accepting
+                            // any non-empty detail avoids silently dropping valid rounds.
+                            r.detail.clone().unwrap_or_default()
+                        }
+                        // agent_review_fix (detail always None) or no round at all
+                        _ => String::new(),
+                    };
+                    if diff.is_empty() {
+                        None
+                    } else {
+                        Some(crate::quality_trigger::TaskReviewContext {
+                            diff,
+                            pr_description: pr.clone(),
+                        })
+                    }
+                });
+                qt.check_and_maybe_trigger(task_ctx.as_ref()).await;
             }
 
             // Auto-trigger review bot comment when task completes with a PR URL.
