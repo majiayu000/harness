@@ -207,6 +207,31 @@ fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
     path.to_path_buf()
 }
 
+/// Select the Q-value reward signal for a terminal task state.
+///
+/// Returns `Some(reward)` only for PR-backed tasks (i.e. `pr_url` is `Some`).
+/// Non-PR tasks (periodic_review, sprint_planner, free-prompt, etc.) return `None`
+/// so their cancellation or completion never pollutes rule Q-values.
+pub(crate) fn q_value_reward_for_state(
+    status: &crate::task_runner::TaskStatus,
+    pr_url: &Option<String>,
+) -> Option<f64> {
+    match (status, pr_url) {
+        (crate::task_runner::TaskStatus::Done, Some(_)) => {
+            Some(crate::q_value_store::REWARD_MERGED)
+        }
+        (crate::task_runner::TaskStatus::Failed, Some(_)) => {
+            Some(crate::q_value_store::REWARD_CLOSED)
+        }
+        (crate::task_runner::TaskStatus::Cancelled, Some(_)) => {
+            Some(crate::q_value_store::REWARD_UNKNOWN_CLOSED)
+        }
+        // Non-PR tasks (no pr_url): skip Q-value update to avoid
+        // spuriously inflating rule Q-values for prompt/analysis tasks.
+        _ => None,
+    }
+}
+
 /// Build an AppState with all stores. Used by both HTTP and stdio transports.
 pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppState> {
     let dir = expand_tilde(&server.config.server.data_dir);
@@ -621,20 +646,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                         // task execution. Non-terminal states (Pending, Implementing, etc.)
                         // must not trigger Q-updates — they would incorrectly penalize rules
                         // that are still in the middle of a task.
-                        let reward = match (&state.status, &state.pr_url) {
-                            (task_runner::TaskStatus::Done, Some(_)) => {
-                                Some(crate::q_value_store::REWARD_MERGED)
-                            }
-                            (task_runner::TaskStatus::Failed, Some(_)) => {
-                                Some(crate::q_value_store::REWARD_CLOSED)
-                            }
-                            (task_runner::TaskStatus::Cancelled, _) => {
-                                Some(crate::q_value_store::REWARD_UNKNOWN_CLOSED)
-                            }
-                            // Non-PR tasks (no pr_url): skip Q-value update to avoid
-                            // spuriously inflating rule Q-values for prompt/analysis tasks.
-                            _ => None,
-                        };
+                        let reward = q_value_reward_for_state(&state.status, &state.pr_url);
                         if let Some(reward) = reward {
                             match qv.get_experiences_for_task(&state.id.0).await {
                                 Ok(exp_ids) if !exp_ids.is_empty() => {

@@ -1217,3 +1217,77 @@ async fn dispatch_simple_prompt_selects_default_agent() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ── q_value_reward_for_state unit tests ──────────────────────────────────────
+//
+// These tests guard the PR-gate invariant: only tasks with a pr_url set should
+// emit a Q-value reward signal.  Non-PR tasks (periodic_review, sprint_planner,
+// free-prompt, etc.) must always return None regardless of terminal status so
+// they cannot pollute rule Q-values.
+
+#[test]
+fn q_reward_done_with_pr_url_returns_merged() {
+    let reward = super::q_value_reward_for_state(
+        &crate::task_runner::TaskStatus::Done,
+        &Some("https://github.com/org/repo/pull/1".to_string()),
+    );
+    assert_eq!(reward, Some(crate::q_value_store::REWARD_MERGED));
+}
+
+#[test]
+fn q_reward_failed_with_pr_url_returns_closed() {
+    let reward = super::q_value_reward_for_state(
+        &crate::task_runner::TaskStatus::Failed,
+        &Some("https://github.com/org/repo/pull/2".to_string()),
+    );
+    assert_eq!(reward, Some(crate::q_value_store::REWARD_CLOSED));
+}
+
+#[test]
+fn q_reward_cancelled_with_pr_url_returns_unknown_closed() {
+    let reward = super::q_value_reward_for_state(
+        &crate::task_runner::TaskStatus::Cancelled,
+        &Some("https://github.com/org/repo/pull/3".to_string()),
+    );
+    assert_eq!(reward, Some(crate::q_value_store::REWARD_UNKNOWN_CLOSED));
+}
+
+#[test]
+fn q_reward_cancelled_without_pr_url_returns_none() {
+    // Regression: non-PR tasks (periodic_review, sprint_planner) must not emit
+    // a reward even when cancelled — this was the bug fixed in PR #679.
+    let reward = super::q_value_reward_for_state(&crate::task_runner::TaskStatus::Cancelled, &None);
+    assert_eq!(reward, None, "cancelled non-PR task must not emit Q-update");
+}
+
+#[test]
+fn q_reward_done_without_pr_url_returns_none() {
+    let reward = super::q_value_reward_for_state(&crate::task_runner::TaskStatus::Done, &None);
+    assert_eq!(reward, None);
+}
+
+#[test]
+fn q_reward_failed_without_pr_url_returns_none() {
+    let reward = super::q_value_reward_for_state(&crate::task_runner::TaskStatus::Failed, &None);
+    assert_eq!(reward, None);
+}
+
+#[test]
+fn q_reward_non_terminal_statuses_return_none() {
+    for status in [
+        crate::task_runner::TaskStatus::Pending,
+        crate::task_runner::TaskStatus::Implementing,
+        crate::task_runner::TaskStatus::Reviewing,
+        crate::task_runner::TaskStatus::Waiting,
+    ] {
+        let with_pr = super::q_value_reward_for_state(
+            &status,
+            &Some("https://github.com/org/repo/pull/9".to_string()),
+        );
+        assert_eq!(
+            with_pr, None,
+            "non-terminal status {:?} must not emit Q-update even with pr_url",
+            status
+        );
+    }
+}
