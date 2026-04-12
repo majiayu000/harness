@@ -367,17 +367,21 @@ impl TaskDb {
         if let Some(status) = terminal_status {
             // Overwrite to terminal status; only touches tasks still in interrupted states
             // so we never downgrade a task that already reached Done/Failed in the DB.
-            sqlx::query(
+            let placeholders =
+                std::iter::repeat_n("?", TaskStatus::interrupted_for_recovery_statuses().len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            let sql = format!(
                 "UPDATE tasks SET status = ?, pr_url = COALESCE(?, pr_url), \
                  updated_at = datetime('now') \
                  WHERE id = ? \
-                 AND status IN ('implementing', 'agent_review', 'reviewing', 'waiting')",
-            )
-            .bind(status)
-            .bind(pr_url)
-            .bind(task_id)
-            .execute(&self.pool)
-            .await?;
+                 AND status IN ({placeholders})"
+            );
+            let mut query = sqlx::query(&sql).bind(status).bind(pr_url).bind(task_id);
+            for interrupted in TaskStatus::interrupted_for_recovery_statuses() {
+                query = query.bind(*interrupted);
+            }
+            query.execute(&self.pool).await?;
         } else if let Some(url) = pr_url {
             // Write pr_url back only when the DB row currently has no pr_url.
             sqlx::query(
@@ -413,15 +417,22 @@ impl TaskDb {
     /// Returns a [`RecoveryResult`] with counts for each outcome.
     pub async fn recover_in_progress(&self) -> anyhow::Result<RecoveryResult> {
         // Collect all interrupted tasks with their checkpoint data via LEFT JOIN.
-        let rows = sqlx::query_as::<_, RecoveryRow>(
+        let placeholders =
+            std::iter::repeat_n("?", TaskStatus::interrupted_for_recovery_statuses().len())
+                .collect::<Vec<_>>()
+                .join(", ");
+        let sql = format!(
             "SELECT t.id, t.status, t.turn, t.pr_url AS task_pr_url,
                     c.triage_output, c.plan_output, c.pr_url AS ck_pr_url
              FROM tasks t
              LEFT JOIN task_checkpoints c ON t.id = c.task_id
-             WHERE t.status IN ('implementing', 'agent_review', 'reviewing', 'waiting')",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+             WHERE t.status IN ({placeholders})"
+        );
+        let mut query = sqlx::query_as::<_, RecoveryRow>(&sql);
+        for interrupted in TaskStatus::interrupted_for_recovery_statuses() {
+            query = query.bind(*interrupted);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
 
         let mut result = RecoveryResult::default();
 
@@ -604,9 +615,10 @@ impl TaskDb {
     /// to Done, which correctly reflects completion time rather than creation time.
     pub async fn latest_done_pr_url(&self) -> anyhow::Result<Option<String>> {
         let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT pr_url FROM tasks WHERE status = 'done' AND pr_url IS NOT NULL \
+            "SELECT pr_url FROM tasks WHERE status = ? AND pr_url IS NOT NULL \
              ORDER BY updated_at DESC LIMIT 1",
         )
+        .bind(TaskStatus::done_status())
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.and_then(|(pr_url,)| pr_url))
@@ -619,9 +631,10 @@ impl TaskDb {
     ) -> anyhow::Result<Option<String>> {
         let row: Option<(Option<String>,)> = sqlx::query_as(
             "SELECT pr_url FROM tasks \
-             WHERE status = 'done' AND pr_url IS NOT NULL AND project = ?1 \
+             WHERE status = ?1 AND pr_url IS NOT NULL AND project = ?2 \
              ORDER BY updated_at DESC LIMIT 1",
         )
+        .bind(TaskStatus::done_status())
         .bind(project)
         .fetch_optional(&self.pool)
         .await?;
@@ -638,9 +651,10 @@ impl TaskDb {
                SELECT project, pr_url, \
                       ROW_NUMBER() OVER (PARTITION BY project ORDER BY updated_at DESC) AS rn \
                FROM tasks \
-               WHERE status = 'done' AND pr_url IS NOT NULL AND project IS NOT NULL\
+               WHERE status = ? AND pr_url IS NOT NULL AND project IS NOT NULL\
              ) WHERE rn = 1",
         )
+        .bind(TaskStatus::done_status())
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().collect())
@@ -654,24 +668,41 @@ impl TaskDb {
     pub async fn count_done_failed_by_project(
         &self,
     ) -> anyhow::Result<(u64, u64, Vec<(String, u64, u64)>)> {
-        let global: (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(CASE WHEN status = 'done' THEN 1 END), \
-                    COUNT(CASE WHEN status = 'failed' THEN 1 END) \
-             FROM tasks WHERE status IN ('done', 'failed')",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let done = TaskStatus::done_status();
+        let failed = TaskStatus::failed_status();
+        let done_failed = TaskStatus::done_failed_statuses();
+        let placeholders = std::iter::repeat_n("?", done_failed.len())
+            .collect::<Vec<_>>()
+            .join(", ");
 
-        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        let global_sql = format!(
+            "SELECT COUNT(CASE WHEN status = ? THEN 1 END), \
+                    COUNT(CASE WHEN status = ? THEN 1 END) \
+             FROM tasks WHERE status IN ({placeholders})"
+        );
+        let mut global_query = sqlx::query_as::<_, (i64, i64)>(&global_sql)
+            .bind(done)
+            .bind(failed);
+        for status in done_failed {
+            global_query = global_query.bind(*status);
+        }
+        let global = global_query.fetch_one(&self.pool).await?;
+
+        let rows_sql = format!(
             "SELECT project, \
-                    COUNT(CASE WHEN status = 'done' THEN 1 END), \
-                    COUNT(CASE WHEN status = 'failed' THEN 1 END) \
+                    COUNT(CASE WHEN status = ? THEN 1 END), \
+                    COUNT(CASE WHEN status = ? THEN 1 END) \
              FROM tasks \
-             WHERE status IN ('done', 'failed') AND project IS NOT NULL \
-             GROUP BY project",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+             WHERE status IN ({placeholders}) AND project IS NOT NULL \
+             GROUP BY project"
+        );
+        let mut rows_query = sqlx::query_as::<_, (String, i64, i64)>(&rows_sql)
+            .bind(done)
+            .bind(failed);
+        for status in done_failed {
+            rows_query = rows_query.bind(*status);
+        }
+        let rows = rows_query.fetch_all(&self.pool).await?;
 
         let by_project = rows
             .into_iter()
@@ -1618,8 +1649,305 @@ mod tests {
         let multi = db.list_by_status(&["pending", "done"]).await?;
         assert_eq!(multi.len(), 2);
 
-        let empty = db.list_by_status(&[]).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replayed_state_only_updates_interrupted_statuses() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("impl", TaskStatus::Implementing))
+            .await?;
+        db.insert(&make_task("pending", TaskStatus::Pending))
+            .await?;
+        db.insert(&make_task("done", TaskStatus::Done)).await?;
+        db.insert(&make_task("cancelled", TaskStatus::Cancelled))
+            .await?;
+
+        db.apply_replayed_state(
+            "impl",
+            Some("https://github.com/o/r/pull/1"),
+            Some("failed"),
+        )
+        .await?;
+        db.apply_replayed_state(
+            "pending",
+            Some("https://github.com/o/r/pull/2"),
+            Some("failed"),
+        )
+        .await?;
+        db.apply_replayed_state(
+            "done",
+            Some("https://github.com/o/r/pull/3"),
+            Some("failed"),
+        )
+        .await?;
+        db.apply_replayed_state(
+            "cancelled",
+            Some("https://github.com/o/r/pull/4"),
+            Some("failed"),
+        )
+        .await?;
+
+        assert!(matches!(
+            db.get("impl").await?.unwrap().status,
+            TaskStatus::Failed
+        ));
+        assert!(matches!(
+            db.get("pending").await?.unwrap().status,
+            TaskStatus::Pending
+        ));
+        assert!(matches!(
+            db.get("done").await?.unwrap().status,
+            TaskStatus::Done
+        ));
+        assert!(matches!(
+            db.get("cancelled").await?.unwrap().status,
+            TaskStatus::Cancelled
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_done_queries_ignore_cancelled_tasks() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut cancelled = make_task("cancelled", TaskStatus::Cancelled);
+        cancelled.project_root = Some(std::path::PathBuf::from("/repo/a"));
+        cancelled.pr_url = Some("https://github.com/o/r/pull/99".to_string());
+        db.insert(&cancelled).await?;
+
+        let mut done = make_task("done", TaskStatus::Done);
+        done.project_root = Some(std::path::PathBuf::from("/repo/a"));
+        done.pr_url = Some("https://github.com/o/r/pull/42".to_string());
+        db.insert(&done).await?;
+
+        assert_eq!(
+            db.latest_done_pr_url().await?,
+            Some("https://github.com/o/r/pull/42".to_string())
+        );
+        assert_eq!(
+            db.latest_done_pr_url_by_project("/repo/a").await?,
+            Some("https://github.com/o/r/pull/42".to_string())
+        );
+        assert_eq!(
+            db.latest_done_pr_urls_all_projects().await?,
+            std::collections::HashMap::from([(
+                "/repo/a".to_string(),
+                "https://github.com/o/r/pull/42".to_string(),
+            )])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn done_failed_counts_ignore_cancelled_tasks() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut done = make_task("done", TaskStatus::Done);
+        done.project_root = Some(std::path::PathBuf::from("/repo/a"));
+        db.insert(&done).await?;
+
+        let mut failed = make_task("failed", TaskStatus::Failed);
+        failed.project_root = Some(std::path::PathBuf::from("/repo/a"));
+        db.insert(&failed).await?;
+
+        let mut cancelled = make_task("cancelled", TaskStatus::Cancelled);
+        cancelled.project_root = Some(std::path::PathBuf::from("/repo/a"));
+        db.insert(&cancelled).await?;
+
+        let (global_done, global_failed, by_project) = db.count_done_failed_by_project().await?;
+        assert_eq!((global_done, global_failed), (1, 1));
+        assert_eq!(by_project, vec![("/repo/a".to_string(), 1, 1)]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_by_status_accepts_centralized_status_sets() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("pending", TaskStatus::Pending))
+            .await?;
+        db.insert(&make_task("reviewing", TaskStatus::Reviewing))
+            .await?;
+        db.insert(&make_task("done", TaskStatus::Done)).await?;
+        db.insert(&make_task("cancelled", TaskStatus::Cancelled))
+            .await?;
+
+        let active = db.list_by_status(TaskStatus::active_statuses()).await?;
+        let terminals = db
+            .list_ids_by_status(TaskStatus::terminal_statuses())
+            .await?;
+
+        assert_eq!(active.len(), 2);
+        assert_eq!(terminals.len(), 2);
+        assert!(terminals.iter().any(|id| id == "done"));
+        assert!(terminals.iter().any(|id| id == "cancelled"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_skips_cancelled_tasks() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("cancelled", TaskStatus::Cancelled))
+            .await?;
+        db.insert(&make_task("implementing", TaskStatus::Implementing))
+            .await?;
+
+        let result = db.recover_in_progress().await?;
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.resumed, 0);
+        assert!(matches!(
+            db.get("cancelled").await?.unwrap().status,
+            TaskStatus::Cancelled
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_ids_by_status_returns_matching_ids() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("task-a", TaskStatus::Pending)).await?;
+        db.insert(&make_task("task-b", TaskStatus::Done)).await?;
+
+        let ids = db.list_ids_by_status(&["done"]).await?;
+        assert_eq!(ids, vec!["task-b".to_string()]);
+
+        let empty = db.list_ids_by_status(&[]).await?;
         assert!(empty.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_done_queries_return_none_for_cancelled_only() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut cancelled = make_task("cancelled", TaskStatus::Cancelled);
+        cancelled.project_root = Some(std::path::PathBuf::from("/repo/a"));
+        cancelled.pr_url = Some("https://github.com/o/r/pull/99".to_string());
+        db.insert(&cancelled).await?;
+
+        assert_eq!(db.latest_done_pr_url().await?, None);
+        assert_eq!(db.latest_done_pr_url_by_project("/repo/a").await?, None);
+        assert!(db.latest_done_pr_urls_all_projects().await?.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn done_failed_counts_return_zero_for_cancelled_only() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut cancelled = make_task("cancelled", TaskStatus::Cancelled);
+        cancelled.project_root = Some(std::path::PathBuf::from("/repo/a"));
+        db.insert(&cancelled).await?;
+
+        let (global_done, global_failed, by_project) = db.count_done_failed_by_project().await?;
+        assert_eq!((global_done, global_failed), (0, 0));
+        assert!(by_project.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupted_statuses_exclude_pending_and_cancelled() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("pending", TaskStatus::Pending))
+            .await?;
+        db.insert(&make_task("implementing", TaskStatus::Implementing))
+            .await?;
+        db.insert(&make_task("cancelled", TaskStatus::Cancelled))
+            .await?;
+
+        let ids = db
+            .list_ids_by_status(TaskStatus::interrupted_for_recovery_statuses())
+            .await?;
+        assert_eq!(ids, vec!["implementing".to_string()]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_statuses_include_cancelled() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("done", TaskStatus::Done)).await?;
+        db.insert(&make_task("failed", TaskStatus::Failed)).await?;
+        db.insert(&make_task("cancelled", TaskStatus::Cancelled))
+            .await?;
+
+        let ids = db
+            .list_ids_by_status(TaskStatus::terminal_statuses())
+            .await?;
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().any(|id| id == "cancelled"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_statuses_exclude_terminal_states() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("pending", TaskStatus::Pending))
+            .await?;
+        db.insert(&make_task("done", TaskStatus::Done)).await?;
+        db.insert(&make_task("failed", TaskStatus::Failed)).await?;
+        db.insert(&make_task("cancelled", TaskStatus::Cancelled))
+            .await?;
+
+        let ids = db.list_ids_by_status(TaskStatus::active_statuses()).await?;
+        assert_eq!(ids, vec!["pending".to_string()]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_roundtrips_in_db() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("cancelled", TaskStatus::Cancelled))
+            .await?;
+        let loaded = db.get("cancelled").await?.expect("task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Cancelled));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_done_failed_ignores_pending_and_reviewing() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut pending = make_task("pending", TaskStatus::Pending);
+        pending.project_root = Some(std::path::PathBuf::from("/repo/a"));
+        db.insert(&pending).await?;
+
+        let mut reviewing = make_task("reviewing", TaskStatus::Reviewing);
+        reviewing.project_root = Some(std::path::PathBuf::from("/repo/a"));
+        db.insert(&reviewing).await?;
+
+        let (global_done, global_failed, by_project) = db.count_done_failed_by_project().await?;
+        assert_eq!((global_done, global_failed), (0, 0));
+        assert!(by_project.is_empty());
+
         Ok(())
     }
 }

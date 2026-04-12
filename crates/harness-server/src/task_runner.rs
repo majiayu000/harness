@@ -56,8 +56,44 @@ pub enum TaskStatus {
     Cancelled,
 }
 
-impl AsRef<str> for TaskStatus {
-    fn as_ref(&self) -> &str {
+impl TaskStatus {
+    pub const ACTIVE_STATUSES: &[&str] = &[
+        "pending",
+        "awaiting_deps",
+        "implementing",
+        "agent_review",
+        "waiting",
+        "reviewing",
+    ];
+
+    pub const TERMINAL_STATUSES: &[&str] = &["done", "failed", "cancelled"];
+
+    pub const DONE_FAILED_STATUSES: &[&str] = &["done", "failed"];
+
+    pub const INTERRUPTED_FOR_RECOVERY_STATUSES: &[&str] =
+        &["implementing", "agent_review", "waiting", "reviewing"];
+
+    pub const DONE_STATUS: &str = "done";
+
+    pub const FAILED_STATUS: &str = "failed";
+
+    pub const CANCELLED_STATUS: &str = "cancelled";
+
+    pub const PENDING_STATUS: &str = "pending";
+
+    pub const AWAITING_DEPS_STATUS: &str = "awaiting_deps";
+
+    pub const IMPLEMENTING_STATUS: &str = "implementing";
+
+    pub const AGENT_REVIEW_STATUS: &str = "agent_review";
+
+    pub const WAITING_STATUS: &str = "waiting";
+
+    pub const REVIEWING_STATUS: &str = "reviewing";
+
+    pub const DONE_ONLY_STATUSES: &[&str] = &[Self::DONE_STATUS];
+
+    pub fn as_str(&self) -> &str {
         match self {
             TaskStatus::Pending => "pending",
             TaskStatus::AwaitingDeps => "awaiting_deps",
@@ -69,6 +105,89 @@ impl AsRef<str> for TaskStatus {
             TaskStatus::Failed => "failed",
             TaskStatus::Cancelled => "cancelled",
         }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+        )
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.is_terminal()
+    }
+
+    pub fn is_interrupted_for_recovery(&self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Implementing
+                | TaskStatus::AgentReview
+                | TaskStatus::Waiting
+                | TaskStatus::Reviewing
+        )
+    }
+
+    pub const fn active_statuses() -> &'static [&'static str] {
+        Self::ACTIVE_STATUSES
+    }
+
+    pub const fn terminal_statuses() -> &'static [&'static str] {
+        Self::TERMINAL_STATUSES
+    }
+
+    pub const fn done_failed_statuses() -> &'static [&'static str] {
+        Self::DONE_FAILED_STATUSES
+    }
+
+    pub const fn done_only_statuses() -> &'static [&'static str] {
+        Self::DONE_ONLY_STATUSES
+    }
+
+    pub const fn interrupted_for_recovery_statuses() -> &'static [&'static str] {
+        Self::INTERRUPTED_FOR_RECOVERY_STATUSES
+    }
+
+    pub const fn done_status() -> &'static str {
+        Self::DONE_STATUS
+    }
+
+    pub const fn failed_status() -> &'static str {
+        Self::FAILED_STATUS
+    }
+
+    pub const fn cancelled_status() -> &'static str {
+        Self::CANCELLED_STATUS
+    }
+
+    pub const fn pending_status() -> &'static str {
+        Self::PENDING_STATUS
+    }
+
+    pub const fn awaiting_deps_status() -> &'static str {
+        Self::AWAITING_DEPS_STATUS
+    }
+
+    pub const fn implementing_status() -> &'static str {
+        Self::IMPLEMENTING_STATUS
+    }
+
+    pub const fn agent_review_status() -> &'static str {
+        Self::AGENT_REVIEW_STATUS
+    }
+
+    pub const fn waiting_status() -> &'static str {
+        Self::WAITING_STATUS
+    }
+
+    pub const fn reviewing_status() -> &'static str {
+        Self::REVIEWING_STATUS
+    }
+}
+
+impl AsRef<str> for TaskStatus {
+    fn as_ref(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -659,15 +778,7 @@ impl TaskStore {
         let persist_locks = DashMap::new();
         // Only load active (non-terminal) tasks into the in-memory cache to prevent
         // unbounded memory growth from historical completed tasks.
-        let active_statuses = &[
-            "pending",
-            "awaiting_deps",
-            "implementing",
-            "agent_review",
-            "waiting",
-            "reviewing",
-        ];
-        for task in db.list_by_status(active_statuses).await? {
+        for task in db.list_by_status(TaskStatus::active_statuses()).await? {
             persist_locks.insert(task.id.clone(), Arc::new(Mutex::new(())));
             cache.insert(task.id.clone(), task);
         }
@@ -726,7 +837,7 @@ impl TaskStore {
     pub async fn list_terminal_ids_from_db(&self) -> anyhow::Result<Vec<TaskId>> {
         let ids = self
             .db
-            .list_ids_by_status(&["done", "failed", "cancelled"])
+            .list_ids_by_status(TaskStatus::terminal_statuses())
             .await?;
         Ok(ids.into_iter().map(harness_core::types::TaskId).collect())
     }
@@ -2102,6 +2213,61 @@ mod tests {
         assert!(state.project_root.is_none());
         assert!(state.issue.is_none());
         assert!(state.description.is_none());
+    }
+
+    #[test]
+    fn task_status_string_roundtrip_and_groups() -> anyhow::Result<()> {
+        let cases = [
+            (TaskStatus::Pending, "pending", false, true, false),
+            (
+                TaskStatus::AwaitingDeps,
+                "awaiting_deps",
+                false,
+                true,
+                false,
+            ),
+            (TaskStatus::Implementing, "implementing", false, true, true),
+            (TaskStatus::AgentReview, "agent_review", false, true, true),
+            (TaskStatus::Waiting, "waiting", false, true, true),
+            (TaskStatus::Reviewing, "reviewing", false, true, true),
+            (TaskStatus::Done, "done", true, false, false),
+            (TaskStatus::Failed, "failed", true, false, false),
+            (TaskStatus::Cancelled, "cancelled", true, false, false),
+        ];
+
+        for (status, expected, terminal, active, resumable) in cases {
+            assert_eq!(status.as_str(), expected);
+            assert_eq!(status.as_ref(), expected);
+            assert_eq!(expected.parse::<TaskStatus>()?.as_str(), expected);
+            assert_eq!(status.is_terminal(), terminal);
+            assert_eq!(status.is_active(), active);
+            assert_eq!(status.is_interrupted_for_recovery(), resumable);
+        }
+
+        Ok::<(), anyhow::Error>(())
+    }
+
+    #[test]
+    fn task_status_semantic_sets_match_expected_strings() {
+        assert_eq!(
+            TaskStatus::active_statuses(),
+            &[
+                "pending",
+                "awaiting_deps",
+                "implementing",
+                "agent_review",
+                "waiting",
+                "reviewing",
+            ]
+        );
+        assert_eq!(
+            TaskStatus::terminal_statuses(),
+            &["done", "failed", "cancelled"]
+        );
+        assert_eq!(
+            TaskStatus::interrupted_for_recovery_statuses(),
+            &["implementing", "agent_review", "waiting", "reviewing"]
+        );
     }
 
     #[tokio::test]
