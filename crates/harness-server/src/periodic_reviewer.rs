@@ -1303,6 +1303,15 @@ async fn poll_task_output(
         if !task.status.is_terminal() {
             continue;
         }
+        if task.status.is_failure() {
+            tracing::error!(
+                task_id = %task_id,
+                error = ?task.error,
+                status = task.status.as_ref(),
+                "poll_task_output: task failed"
+            );
+            return None;
+        }
         let output: String = task
             .rounds
             .iter()
@@ -1709,6 +1718,26 @@ mod tests {
         assert!(!is_skipped(Some("REVIEW_JSON_START\n{}\nREVIEW_JSON_END")));
         // No output at all.
         assert!(!is_skipped(None));
+    }
+
+    #[tokio::test]
+    async fn poll_task_output_returns_none_for_cancelled_tasks() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::task_runner::TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = harness_core::types::TaskId("cancelled-review".to_string());
+        let mut task = crate::task_runner::TaskState::new(task_id.clone());
+        task.status = crate::task_runner::TaskStatus::Cancelled;
+        task.rounds.push(crate::task_runner::RoundResult {
+            turn: 1,
+            action: "review".to_string(),
+            result: "cancelled".to_string(),
+            detail: Some("cancelled output should be ignored".to_string()),
+        });
+        store.insert(&task).await;
+
+        let output = poll_task_output(&store, &task_id, 0).await;
+        assert!(output.is_none(), "cancelled tasks must not yield output");
+        Ok(())
     }
 
     /// On first boot (no prior event, no fallback), since_arg must be the
