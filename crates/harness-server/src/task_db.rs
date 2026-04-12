@@ -19,6 +19,8 @@ const ARTIFACT_MAX_BYTES: usize = 65_536;
 /// v10 – add composite index on (project, status, updated_at).
 /// v11 – add task_checkpoints table for phase recovery.
 /// v12 – add priority column for priority-based task scheduling.
+/// v13 – add review_turns column for tracking review cycles per task.
+/// v14 – add first_output_at column for first-token latency tracking.
 static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -98,6 +100,16 @@ static TASK_MIGRATIONS: &[Migration] = &[
         version: 12,
         description: "add priority column for task scheduling",
         sql: "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+    },
+    Migration {
+        version: 13,
+        description: "add review_turns column for tracking review cycles",
+        sql: "ALTER TABLE tasks ADD COLUMN review_turns INTEGER NOT NULL DEFAULT 0",
+    },
+    Migration {
+        version: 14,
+        description: "add first_output_at column for first-token latency tracking",
+        sql: "ALTER TABLE tasks ADD COLUMN first_output_at TEXT",
     },
 ];
 
@@ -738,6 +750,70 @@ impl TaskDb {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Increment `review_turns` by 1 for the given task.
+    ///
+    /// A "review turn" is a non-LGTM review cycle outcome (i.e. FIXED) that
+    /// requires another round before the task can complete. WAITING outcomes
+    /// (bot not yet responded) are not counted because they do not represent
+    /// agent work.
+    pub async fn increment_review_turns(&self, task_id: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE tasks SET review_turns = review_turns + 1, updated_at = datetime('now') \
+             WHERE id = ?",
+        )
+        .bind(task_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Set `first_output_at` for the given task if it has not been set yet.
+    ///
+    /// Idempotent: subsequent calls are no-ops because the WHERE clause
+    /// requires `first_output_at IS NULL`.
+    pub async fn set_first_output_at(&self, task_id: &str, ts: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE tasks SET first_output_at = ? \
+             WHERE id = ? AND first_output_at IS NULL",
+        )
+        .bind(ts)
+        .bind(task_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return the average `review_turns` across all done tasks, or `None`
+    /// when no done tasks exist.
+    pub async fn avg_review_turns(&self) -> anyhow::Result<Option<f64>> {
+        let row: Option<(Option<f64>,)> = sqlx::query_as(
+            "SELECT AVG(CAST(review_turns AS REAL)) \
+             FROM tasks WHERE status = 'done'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(v,)| v))
+    }
+
+    /// Return the average first-token latency in milliseconds across done tasks
+    /// that have `first_output_at` set, or `None` when no such tasks exist.
+    ///
+    /// Latency is computed as `(first_output_at - created_at)` using SQLite's
+    /// `julianday` function converted to milliseconds. Results clamped to >= 0
+    /// in the query to guard against clock skew.
+    pub async fn avg_first_token_latency_ms(&self) -> anyhow::Result<Option<f64>> {
+        let row: Option<(Option<f64>,)> = sqlx::query_as(
+            "SELECT AVG(MAX(0.0, (julianday(first_output_at) - julianday(created_at)) * 86400000.0)) \
+             FROM tasks \
+             WHERE status = 'done' \
+               AND first_output_at IS NOT NULL \
+               AND created_at IS NOT NULL",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(v,)| v))
     }
 }
 
@@ -1555,6 +1631,73 @@ mod tests {
             .expect_err("unknown status must return an explicit error");
         let message = format!("{err:#}");
         assert!(message.contains("unknown task status"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn increment_review_turns_counts_correctly() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let task = make_task("task-rt", TaskStatus::Done);
+        db.insert(&task).await?;
+
+        // Initially 0.
+        let avg = db.avg_review_turns().await?.unwrap_or(0.0);
+        assert_eq!(avg, 0.0);
+
+        db.increment_review_turns("task-rt").await?;
+        db.increment_review_turns("task-rt").await?;
+        db.increment_review_turns("task-rt").await?;
+
+        let avg = db.avg_review_turns().await?.unwrap_or(0.0);
+        assert_eq!(avg, 3.0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn avg_review_turns_returns_none_when_no_done_tasks() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+        assert!(db.avg_review_turns().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_first_output_at_is_idempotent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-foa", TaskStatus::Done);
+        task.created_at = Some("2026-04-12T10:00:00Z".to_string());
+        db.insert(&task).await?;
+
+        // First write sets the value.
+        db.set_first_output_at("task-foa", "2026-04-12T10:00:02Z")
+            .await?;
+        // Second write is a no-op (WHERE first_output_at IS NULL).
+        db.set_first_output_at("task-foa", "2026-04-12T10:00:99Z")
+            .await?;
+
+        // Latency should reflect the first write (2s = 2000ms), not the second.
+        let latency = db.avg_first_token_latency_ms().await?.unwrap_or(0.0);
+        assert!(
+            (latency - 2000.0).abs() < 100.0,
+            "expected ~2000ms latency, got {latency}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn avg_first_token_latency_null_when_no_output_recorded() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let task = make_task("task-nofoa", TaskStatus::Done);
+        db.insert(&task).await?;
+        // No set_first_output_at call — first_output_at remains NULL.
+
+        assert!(db.avg_first_token_latency_ms().await?.is_none());
         Ok(())
     }
 }

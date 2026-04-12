@@ -1,5 +1,6 @@
-use crate::{http::AppState, task_runner::DashboardCounts};
+use crate::{handlers::token_usage::load_cost_stats, http::AppState, task_runner::DashboardCounts};
 use axum::{extract::State, http::StatusCode, Json};
+use chrono::Utc;
 use harness_core::types::EventFilters;
 use harness_observe::quality::QualityGrader;
 use serde_json::{json, Value};
@@ -38,7 +39,10 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     // Grade from the global quality event store.
     // Derive violation_count from the most recent rule_scan session so we don't
     // permanently depress the grade with historical violations from old scans.
-    let grade: Option<Value> = match state
+    // Also count rule_check events in the rolling 24-hour window as a proxy for
+    // linter/guard feedback (guard_triggers_24h metric).
+    let since_24h = Utc::now() - chrono::Duration::hours(24);
+    let (grade, guard_triggers_24h): (Option<Value>, u64) = match state
         .observability
         .events
         .query(&EventFilters::default())
@@ -57,13 +61,22 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                 })
                 .unwrap_or(0);
             let report = QualityGrader::grade(&events, violation_count);
-            serde_json::to_value(report.grade).ok()
+            let guard_count = events
+                .iter()
+                .filter(|e| e.hook == "rule_check" && e.ts >= since_24h)
+                .count() as u64;
+            (serde_json::to_value(report.grade).ok(), guard_count)
         }
         Err(e) => {
             tracing::warn!("dashboard: failed to query events for grade: {e}");
-            None
+            (None, 0)
         }
     };
+
+    // LLM observability metrics (#624).
+    let avg_review_turns = state.core.tasks.avg_review_turns().await;
+    let avg_first_token_latency_ms = state.core.tasks.avg_first_token_latency_ms().await;
+    let (cost_total_usd, avg_cost_per_task_usd) = load_cost_stats(&state).await;
 
     // Fetch latest PR URLs for all projects in one bulk query to avoid N+1.
     let project_pr_urls = state.core.tasks.latest_done_pr_urls_all_projects().await;
@@ -147,6 +160,16 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
             "grade": grade,
             "runtime_hosts_total": runtime_hosts_total,
             "runtime_hosts_online": runtime_hosts_online,
+            // LLM observability metrics (#624)
+            // null when no completed tasks exist yet.
+            "cost_total_usd": if cost_total_usd == 0.0 { Value::Null } else { json!(cost_total_usd) },
+            "avg_cost_per_task_usd": if avg_cost_per_task_usd == 0.0 { Value::Null } else { json!(avg_cost_per_task_usd) },
+            "avg_review_turns": avg_review_turns,
+            "avg_first_token_latency_ms": avg_first_token_latency_ms,
+            // Proxy for linter feedback: count of guard rule triggers in the last 24 hours.
+            // Label is intentionally "guard_triggers_24h" — these are harness guard checks,
+            // not compiler errors (Claude Code build errors are internal to the agent).
+            "guard_triggers_24h": guard_triggers_24h,
         }
     });
 
@@ -285,6 +308,50 @@ mod tests {
         assert_eq!(
             host["assignment_pressure"], 0.0,
             "idle host must have 0.0 assignment_pressure"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dashboard_global_contains_observability_metric_keys() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-dashboard-obs-")?;
+        let state = Arc::new(make_test_state(dir.path()).await?);
+
+        let app = Router::new()
+            .route("/api/dashboard", get(dashboard))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/api/dashboard")
+            .body(axum::body::Body::empty())?;
+
+        let resp = tower::ServiceExt::oneshot(app, req).await?;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let global = body.get("global").expect("missing global key");
+
+        // All 5 LLM observability metric keys must be present (null is valid when
+        // no completed tasks exist yet).
+        assert!(
+            global.get("cost_total_usd").is_some(),
+            "cost_total_usd key missing"
+        );
+        assert!(
+            global.get("avg_cost_per_task_usd").is_some(),
+            "avg_cost_per_task_usd key missing"
+        );
+        assert!(
+            global.get("avg_review_turns").is_some(),
+            "avg_review_turns key missing"
+        );
+        assert!(
+            global.get("avg_first_token_latency_ms").is_some(),
+            "avg_first_token_latency_ms key missing"
+        );
+        assert!(
+            global.get("guard_triggers_24h").is_some(),
+            "guard_triggers_24h key missing"
         );
         Ok(())
     }

@@ -5,6 +5,7 @@ use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
 use anyhow::Context;
+use chrono::Utc;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::config::agents::CapabilityProfile;
 use harness_core::error::HarnessError;
@@ -462,6 +463,10 @@ async fn run_agent_streaming(
     let mut channel_closed = false;
     let mut output = String::new();
     let mut token_usage = TokenUsage::default();
+    // Capture the RFC3339 timestamp of the first non-empty output chunk for
+    // first-token latency tracking. The DB write is deferred to after the loop
+    // so it does not block the select! inner body.
+    let mut first_output_at: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -474,6 +479,9 @@ async fn run_agent_streaming(
                         store.publish_stream_item(task_id, item.clone());
                         match &item {
                             StreamItem::MessageDelta { text } => {
+                                if !text.is_empty() && first_output_at.is_none() {
+                                    first_output_at = Some(Utc::now().to_rfc3339());
+                                }
                                 output.push_str(text);
                             }
                             StreamItem::ItemCompleted {
@@ -503,6 +511,13 @@ async fn run_agent_streaming(
         if exec_result.is_some() && channel_closed {
             break;
         }
+    }
+
+    // Persist first-token timestamp once the stream is done (deferred from the
+    // select! body to avoid blocking the receive loop).  Only writes if the
+    // value has not been set for this task yet (idempotent DB query).
+    if let Some(ts) = first_output_at {
+        store.set_first_output_at(task_id, &ts).await;
     }
 
     match exec_result.unwrap_or_else(|| {
@@ -1740,6 +1755,13 @@ pub(crate) async fn run_task(
             round,
             result: result_label.to_string(),
         });
+
+        // Count FIXED rounds (non-LGTM outcomes) as review turns for the
+        // avg_review_turns observability metric.  WAITING (bot not ready) rounds
+        // never reach this point because they `continue` earlier in the loop.
+        if !lgtm {
+            store.increment_review_turns(task_id).await;
+        }
 
         // Log pr_review event for observability and GC signal detection.
         let mut ev = Event::new(

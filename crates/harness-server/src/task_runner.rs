@@ -974,6 +974,44 @@ impl TaskStore {
         }
     }
 
+    /// Increment `review_turns` for the given task in the database.
+    /// Logs and swallows errors so that a DB failure does not abort task execution.
+    pub(crate) async fn increment_review_turns(&self, id: &TaskId) {
+        if let Err(e) = self.db.increment_review_turns(id.0.as_str()).await {
+            tracing::warn!(task_id = %id.0, "failed to increment review_turns: {e}");
+        }
+    }
+
+    /// Set `first_output_at` for the given task if not already set.
+    /// Idempotent; logs and swallows errors so that a DB failure does not abort task execution.
+    pub(crate) async fn set_first_output_at(&self, id: &TaskId, ts: &str) {
+        if let Err(e) = self.db.set_first_output_at(id.0.as_str(), ts).await {
+            tracing::warn!(task_id = %id.0, "failed to set first_output_at: {e}");
+        }
+    }
+
+    /// Return the average number of review turns across completed tasks, or `None` when empty.
+    pub(crate) async fn avg_review_turns(&self) -> Option<f64> {
+        match self.db.avg_review_turns().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("avg_review_turns: DB query failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Return the average first-token latency in milliseconds across completed tasks, or `None`.
+    pub(crate) async fn avg_first_token_latency_ms(&self) -> Option<f64> {
+        match self.db.avg_first_token_latency_ms().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("avg_first_token_latency_ms: DB query failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Activate the global rate-limit circuit breaker. All tasks will pause
     /// before their next agent call until `duration` elapses.
     pub async fn set_rate_limit(&self, duration: std::time::Duration) {

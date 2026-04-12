@@ -384,6 +384,10 @@ fn accumulate(dst: &mut UsageBucket, src: &UsageBucket) {
 }
 
 /// Estimate API-equivalent cost at Sonnet 4.6 pricing.
+///
+/// TODO(#624): multi-model pricing — currently hardcoded to Sonnet 4.6 rates.
+/// Supporting per-task model detection requires parsing JSONL session files
+/// per task and is out of scope for this issue.
 fn estimate_cost(usage: &UsageBucket) -> f64 {
     let has_cache = usage.cache_read_tokens > 0 || usage.cache_create_tokens > 0;
     let (eff_input, eff_cache_read) = if has_cache {
@@ -412,6 +416,86 @@ fn parse_timestamp(ts: &str) -> Result<(String, String), String> {
         return Err(format!("invalid timestamp '{ts}': hour is not numeric"));
     }
     Ok((day.to_string(), format!("{day} {hour}:00")))
+}
+
+/// Compute `(total_cost_usd, avg_cost_per_task_usd)` from a per-task usage map.
+///
+/// Returns `(0.0, 0.0)` when the map is empty to avoid division by zero.
+fn aggregate_cost_stats(task_usage: &HashMap<String, UsageBucket>) -> (f64, f64) {
+    if task_usage.is_empty() {
+        return (0.0, 0.0);
+    }
+    let total: f64 = task_usage.values().map(estimate_cost).sum();
+    let avg = total / task_usage.len() as f64;
+    (total, avg)
+}
+
+/// Load per-task cost statistics from Claude CLI session JSONL files.
+///
+/// Returns `(total_cost_usd, avg_cost_per_task_usd)`.  Returns `(0.0, 0.0)`
+/// on any error (missing directory, unreadable files, etc.) so that the
+/// dashboard degrades gracefully without an error response.
+pub(crate) async fn load_cost_stats(state: &Arc<crate::http::AppState>) -> (f64, f64) {
+    let home = match home_dir() {
+        Ok(p) => p,
+        Err(_) => return (0.0, 0.0),
+    };
+    let claude_projects_dir = home.join(".claude").join("projects");
+    if std::fs::metadata(&claude_projects_dir)
+        .map(|m| !m.is_dir())
+        .unwrap_or(true)
+    {
+        return (0.0, 0.0);
+    }
+    let files = match collect_session_files(&claude_projects_dir) {
+        Ok(f) if !f.is_empty() => f,
+        _ => return (0.0, 0.0),
+    };
+
+    let all_tasks = match state.core.tasks.list_all_summaries_with_terminal().await {
+        Ok(t) => t,
+        Err(_) => return (0.0, 0.0),
+    };
+    let task_ids: std::collections::HashSet<String> =
+        all_tasks.iter().map(|t| t.id.0.clone()).collect();
+
+    let mut task_usage: HashMap<String, UsageBucket> = HashMap::new();
+    for file in &files {
+        let task_id = extract_task_id(file);
+        let content = match std::fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut sess = UsageBucket::default();
+        for (idx, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: serde_json::Value = match serde_json::from_str(line) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let ctx = format!("{}:{}", file.display(), idx + 1);
+            let parsed = match parse_usage_record(&entry, &ctx) {
+                Ok(Some(r)) => r,
+                _ => continue,
+            };
+            sess.input_tokens += parsed.input;
+            sess.output_tokens += parsed.output;
+            sess.cache_read_tokens += parsed.cache_read;
+            sess.cache_create_tokens += parsed.cache_create;
+            sess.request_count += 1;
+        }
+        if sess.request_count == 0 {
+            continue;
+        }
+        if let Some(tid) = &task_id {
+            if task_ids.contains(tid) {
+                accumulate(task_usage.entry(tid.clone()).or_default(), &sess);
+            }
+        }
+    }
+    aggregate_cost_stats(&task_usage)
 }
 
 fn collect_session_files(claude_projects_dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -557,5 +641,39 @@ mod tests {
         assert_eq!(parsed.cache_create, 10);
         assert_eq!(parsed.day, "2026-03-26");
         assert_eq!(parsed.hour, "2026-03-26 03:00");
+    }
+
+    #[test]
+    fn aggregate_cost_stats_empty_returns_zero() {
+        let empty: HashMap<String, UsageBucket> = HashMap::new();
+        let (total, avg) = aggregate_cost_stats(&empty);
+        assert_eq!(total, 0.0);
+        assert_eq!(avg, 0.0);
+    }
+
+    #[test]
+    fn aggregate_cost_stats_multiple_tasks() {
+        let mut tasks: HashMap<String, UsageBucket> = HashMap::new();
+        // Each task: 1M output tokens at Sonnet 4.6 pricing ($15/M out) = $15/task.
+        tasks.insert(
+            "task-a".to_string(),
+            UsageBucket {
+                output_tokens: 1_000_000,
+                ..Default::default()
+            },
+        );
+        tasks.insert(
+            "task-b".to_string(),
+            UsageBucket {
+                output_tokens: 1_000_000,
+                ..Default::default()
+            },
+        );
+        let (total, avg) = aggregate_cost_stats(&tasks);
+        assert!(
+            (total - 30.0).abs() < 0.01,
+            "expected ~$30 total, got {total}"
+        );
+        assert!((avg - 15.0).abs() < 0.01, "expected ~$15 avg, got {avg}");
     }
 }
