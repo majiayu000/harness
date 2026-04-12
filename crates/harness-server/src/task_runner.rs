@@ -86,6 +86,15 @@ fn sync_phase_from_status(task: &mut TaskState) {
     task.phase = phase_for_status(&task.status);
 }
 
+fn sync_terminal_phase_from_status(task: &mut TaskState) {
+    if matches!(
+        task.status,
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+    ) {
+        task.phase = TaskPhase::Terminal;
+    }
+}
+
 impl std::str::FromStr for TaskStatus {
     type Err = anyhow::Error;
 
@@ -1848,7 +1857,7 @@ pub(crate) async fn mutate_and_persist(
     if let Some(mut entry) = store.cache.get_mut(id) {
         let task = entry.value_mut();
         f(task);
-        sync_phase_from_status(task);
+        sync_terminal_phase_from_status(task);
     }
     store.persist(id).await
 }
@@ -2894,6 +2903,35 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("reloaded task should exist"))?;
         assert!(matches!(reloaded.status, TaskStatus::Done));
         assert_eq!(reloaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutate_and_persist_preserves_explicit_nonterminal_phase() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = harness_core::types::TaskId("phase-plan-persist-test".to_string());
+        let task = TaskState::new(task_id.clone());
+        store.insert(&task).await;
+
+        mutate_and_persist(&store, &task_id, |state| {
+            state.phase = TaskPhase::Plan;
+        })
+        .await?;
+
+        let cached = store
+            .get(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("task should exist after plan persist"))?;
+        assert!(matches!(cached.status, TaskStatus::Pending));
+        assert_eq!(cached.phase, TaskPhase::Plan);
+
+        let reloaded = store
+            .db
+            .get(task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("reloaded task should exist"))?;
+        assert!(matches!(reloaded.status, TaskStatus::Pending));
+        assert_eq!(reloaded.phase, TaskPhase::Plan);
         Ok(())
     }
 

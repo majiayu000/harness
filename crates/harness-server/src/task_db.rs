@@ -377,15 +377,22 @@ impl TaskDb {
         terminal_status: Option<&str>,
     ) -> anyhow::Result<()> {
         if let Some(status) = terminal_status {
+            let phase = match status {
+                "done" | "failed" | "cancelled" => "terminal",
+                other => anyhow::bail!(
+                    "apply_replayed_state only accepts terminal statuses, got `{other}`"
+                ),
+            };
             // Overwrite to terminal status; only touches tasks still in interrupted states
             // so we never downgrade a task that already reached Done/Failed in the DB.
             sqlx::query(
-                "UPDATE tasks SET status = ?, pr_url = COALESCE(?, pr_url), \
+                "UPDATE tasks SET status = ?, phase = ?, pr_url = COALESCE(?, pr_url), \
                  updated_at = datetime('now') \
                  WHERE id = ? \
                  AND status IN ('implementing', 'agent_review', 'reviewing', 'waiting')",
             )
             .bind(status)
+            .bind(phase)
             .bind(pr_url)
             .bind(task_id)
             .execute(&self.pool)
@@ -454,6 +461,13 @@ impl TaskDb {
             let has_triage = row.triage_output.is_some();
 
             if has_pr || has_plan || has_triage {
+                let resumed_phase = if has_plan {
+                    "plan"
+                } else if has_triage {
+                    "triage"
+                } else {
+                    "implement"
+                };
                 // Resume: set back to pending with a diagnostic error field.
                 let reason = if has_pr {
                     format!(
@@ -486,9 +500,10 @@ impl TaskDb {
 
                 if needs_pr_url_writeback {
                     sqlx::query(
-                        "UPDATE tasks SET status = 'pending', pr_url = ?, error = ?, \
+                        "UPDATE tasks SET status = 'pending', phase = ?, pr_url = ?, error = ?, \
                          updated_at = datetime('now') WHERE id = ?",
                     )
+                    .bind(resumed_phase)
                     .bind(effective_pr_url)
                     .bind(&reason)
                     .bind(&row.id)
@@ -502,15 +517,25 @@ impl TaskDb {
                     );
                 } else {
                     sqlx::query(
-                        "UPDATE tasks SET status = 'pending', error = ?, updated_at = datetime('now') \
+                        "UPDATE tasks SET status = 'pending', phase = ?, error = ?, updated_at = datetime('now') \
                          WHERE id = ?",
                     )
+                    .bind(resumed_phase)
                     .bind(&reason)
                     .bind(&row.id)
                     .execute(&self.pool)
                     .await?;
                 }
                 result.resumed += 1;
+
+                tracing::debug!(
+                    task_id = %row.id,
+                    resumed_phase,
+                    has_pr,
+                    has_plan,
+                    has_triage,
+                    "startup recovery: synced phase with resumed status"
+                );
                 tracing::info!(
                     task_id = %row.id,
                     was = %row.status,
@@ -526,7 +551,7 @@ impl TaskDb {
                     row.task_pr_url.as_deref().unwrap_or("none")
                 );
                 sqlx::query(
-                    "UPDATE tasks SET status = 'failed', error = ?, updated_at = datetime('now') \
+                    "UPDATE tasks SET status = 'failed', phase = 'terminal', error = ?, updated_at = datetime('now') \
                      WHERE id = ?",
                 )
                 .bind(&err)
@@ -544,6 +569,7 @@ impl TaskDb {
         let transient_failed = sqlx::query(
             "UPDATE tasks \
              SET status = 'failed', \
+                 phase = 'terminal', \
                  error = 'recovered after restart (was: pending in transient retry): ' \
                       || COALESCE(error, ''), \
                  updated_at = datetime('now') \
@@ -1608,6 +1634,861 @@ mod tests {
         );
         assert_eq!(loaded.rounds.len(), 1);
         assert_eq!(loaded.rounds[0].action, "implement");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_replayed_state_sets_terminal_phase_for_failed_rows() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("task-replayed-failed", TaskStatus::Reviewing))
+            .await?;
+
+        db.apply_replayed_state("task-replayed-failed", None, Some("failed"))
+            .await?;
+
+        let loaded = db
+            .get("task-replayed-failed")
+            .await?
+            .expect("task should exist after replay update");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_updates_phase_with_status_rewrites() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut resumable = make_task("task-recover-phase-pending", TaskStatus::Implementing);
+        resumable.phase = TaskPhase::Review;
+        resumable.pr_url = Some("https://github.com/owner/repo/pull/77".to_string());
+        db.insert(&resumable).await?;
+
+        let mut failed = make_task("task-recover-phase-failed", TaskStatus::Reviewing);
+        failed.phase = TaskPhase::Review;
+        db.insert(&failed).await?;
+
+        db.recover_in_progress().await?;
+
+        let resumed = db
+            .get("task-recover-phase-pending")
+            .await?
+            .expect("resumed task should exist");
+        assert!(matches!(resumed.status, TaskStatus::Pending));
+        assert_eq!(resumed.phase, TaskPhase::Implement);
+
+        let failed = db
+            .get("task-recover-phase-failed")
+            .await?
+            .expect("failed task should exist");
+        assert!(matches!(failed.status, TaskStatus::Failed));
+        assert_eq!(failed.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_marks_transient_retry_rows_terminal() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-transient-terminal", TaskStatus::Pending);
+        task.phase = TaskPhase::Review;
+        task.error = Some("retrying after transient failure: boom".to_string());
+        db.insert(&task).await?;
+
+        let result = db.recover_in_progress().await?;
+        assert_eq!(result.transient_failed, 1);
+
+        let loaded = db
+            .get("task-transient-terminal")
+            .await?
+            .expect("transient retry task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_preserves_plan_phase_for_resumed_plan_checkpoint(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-recover-plan-phase", TaskStatus::Implementing);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+        db.write_checkpoint(
+            "task-recover-plan-phase",
+            None,
+            Some("## Plan\nStep 1"),
+            None,
+            "plan_done",
+        )
+        .await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-recover-plan-phase")
+            .await?
+            .expect("plan checkpoint task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_preserves_triage_phase_for_resumed_triage_checkpoint(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-recover-triage-phase", TaskStatus::Implementing);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+        db.write_checkpoint(
+            "task-recover-triage-phase",
+            Some("triage output"),
+            None,
+            None,
+            "triage_done",
+        )
+        .await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-recover-triage-phase")
+            .await?
+            .expect("triage checkpoint task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Triage);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_keeps_replayed_terminal_status_phase() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-replayed-done", TaskStatus::Reviewing);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+
+        db.apply_replayed_state(
+            "task-replayed-done",
+            Some("https://github.com/owner/repo/pull/88"),
+            Some("done"),
+        )
+        .await?;
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-replayed-done")
+            .await?
+            .expect("replayed terminal task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Done));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_preserves_plan_phase_on_pr_writeback() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-pr-writeback-phase", TaskStatus::Implementing);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+        db.write_checkpoint(
+            "task-pr-writeback-phase",
+            None,
+            Some("## Plan\nStep 1"),
+            Some("https://github.com/owner/repo/pull/99"),
+            "pr_created",
+        )
+        .await?;
+
+        sqlx::query("UPDATE tasks SET pr_url = ? WHERE id = ?")
+            .bind("not-a-pr-url")
+            .bind("task-pr-writeback-phase")
+            .execute(&db.pool)
+            .await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-pr-writeback-phase")
+            .await?
+            .expect("writeback task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Plan);
+        assert_eq!(
+            loaded.pr_url.as_deref(),
+            Some("https://github.com/owner/repo/pull/99")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_preserves_implement_phase_for_pr_resume_without_checkpoint(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-pr-resume-implement-phase", TaskStatus::AgentReview);
+        task.phase = TaskPhase::Review;
+        task.pr_url = Some("https://github.com/owner/repo/pull/123".to_string());
+        db.insert(&task).await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-pr-resume-implement-phase")
+            .await?
+            .expect("resumed PR task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Implement);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_terminal_phase_for_no_checkpoint_failures(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-recover-failed-terminal", TaskStatus::Implementing);
+        task.phase = TaskPhase::Plan;
+        db.insert(&task).await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-recover-failed-terminal")
+            .await?
+            .expect("failed recovery task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_implement_phase_for_planless_resume() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-recover-implement-phase", TaskStatus::Waiting);
+        task.phase = TaskPhase::Review;
+        task.pr_url = Some("https://github.com/owner/repo/pull/555".to_string());
+        db.insert(&task).await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-recover-implement-phase")
+            .await?
+            .expect("resumed task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Implement);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_preserves_phase_after_terminal_replay_then_pending_resume(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-terminal-replay-phase", TaskStatus::Implementing);
+        task.phase = TaskPhase::Plan;
+        db.insert(&task).await?;
+
+        db.apply_replayed_state("task-terminal-replay-phase", None, Some("failed"))
+            .await?;
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-terminal-replay-phase")
+            .await?
+            .expect("terminal replay task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_preserves_plan_phase_when_checkpoint_and_pr_both_exist(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-plan-pr-phase", TaskStatus::Reviewing);
+        task.phase = TaskPhase::Review;
+        task.pr_url = Some("https://github.com/owner/repo/pull/321".to_string());
+        db.insert(&task).await?;
+        db.write_checkpoint(
+            "task-plan-pr-phase",
+            None,
+            Some("## Plan\nStep 1"),
+            Some("https://github.com/owner/repo/pull/321"),
+            "pr_created",
+        )
+        .await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-plan-pr-phase")
+            .await?
+            .expect("plan+pr task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_preserves_triage_phase_when_no_plan_but_checkpoint_exists(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-triage-only-phase", TaskStatus::AgentReview);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+        db.write_checkpoint(
+            "task-triage-only-phase",
+            Some("triage output"),
+            None,
+            None,
+            "triage_done",
+        )
+        .await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-triage-only-phase")
+            .await?
+            .expect("triage-only task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Triage);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_terminal_phase_for_transient_failure_rows(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-transient-failed-terminal", TaskStatus::Pending);
+        task.phase = TaskPhase::Plan;
+        task.error = Some("retrying after transient failure: network".to_string());
+        db.insert(&task).await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-transient-failed-terminal")
+            .await?
+            .expect("transient failure task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_leaves_terminal_rows_untouched() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-terminal-untouched", TaskStatus::Done);
+        task.phase = TaskPhase::Terminal;
+        db.insert(&task).await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-terminal-untouched")
+            .await?
+            .expect("terminal task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Done));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_preserves_plan_phase_when_last_phase_is_pr_created(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-pr-created-phase", TaskStatus::Waiting);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+        db.write_checkpoint(
+            "task-pr-created-phase",
+            None,
+            Some("## Plan\nStep 1"),
+            Some("https://github.com/owner/repo/pull/404"),
+            "pr_created",
+        )
+        .await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-pr-created-phase")
+            .await?
+            .expect("pr_created task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_terminal_phase_for_replayed_failed_without_resume(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-replayed-failed-terminal", TaskStatus::AgentReview);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+
+        db.apply_replayed_state("task-replayed-failed-terminal", None, Some("failed"))
+            .await?;
+
+        let loaded = db
+            .get("task-replayed-failed-terminal")
+            .await?
+            .expect("replayed failed task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_terminal_phase_for_replayed_done_without_resume(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-replayed-done-terminal", TaskStatus::AgentReview);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+
+        db.apply_replayed_state("task-replayed-done-terminal", None, Some("done"))
+            .await?;
+
+        let loaded = db
+            .get("task-replayed-done-terminal")
+            .await?
+            .expect("replayed done task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Done));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_implement_phase_for_resumed_task_without_checkpoint_even_if_stale_review(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-stale-review-phase", TaskStatus::Reviewing);
+        task.phase = TaskPhase::Review;
+        task.pr_url = Some("https://github.com/owner/repo/pull/808".to_string());
+        db.insert(&task).await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-stale-review-phase")
+            .await?
+            .expect("stale review task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Implement);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_terminal_phase_for_stale_plan_failure() -> anyhow::Result<()>
+    {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-stale-plan-failure", TaskStatus::Waiting);
+        task.phase = TaskPhase::Plan;
+        db.insert(&task).await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-stale-plan-failure")
+            .await?
+            .expect("stale plan failure task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_triage_phase_from_checkpoint_even_with_stale_review(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-stale-review-triage", TaskStatus::Waiting);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+        db.write_checkpoint(
+            "task-stale-review-triage",
+            Some("triage output"),
+            None,
+            None,
+            "triage_done",
+        )
+        .await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-stale-review-triage")
+            .await?
+            .expect("stale review triage task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Triage);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_plan_phase_from_checkpoint_even_with_stale_review(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-stale-review-plan", TaskStatus::Waiting);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+        db.write_checkpoint(
+            "task-stale-review-plan",
+            None,
+            Some("## Plan\nStep 1"),
+            None,
+            "plan_done",
+        )
+        .await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-stale-review-plan")
+            .await?
+            .expect("stale review plan task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_terminal_phase_for_corrupted_pr_failures(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-corrupted-pr-terminal", TaskStatus::Implementing);
+        task.phase = TaskPhase::Plan;
+        task.pr_url = Some("not-a-pr-url".to_string());
+        db.insert(&task).await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-corrupted-pr-terminal")
+            .await?
+            .expect("corrupted PR task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_plan_phase_for_checkpoint_pr_writeback_with_stale_review(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-checkpoint-writeback-stale", TaskStatus::Reviewing);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+        db.write_checkpoint(
+            "task-checkpoint-writeback-stale",
+            None,
+            Some("## Plan\nStep 1"),
+            Some("https://github.com/owner/repo/pull/900"),
+            "pr_created",
+        )
+        .await?;
+        sqlx::query("UPDATE tasks SET pr_url = ? WHERE id = ?")
+            .bind("bad-pr-url")
+            .bind("task-checkpoint-writeback-stale")
+            .execute(&db.pool)
+            .await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-checkpoint-writeback-stale")
+            .await?
+            .expect("checkpoint writeback stale task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_terminal_phase_for_transient_retry_with_stale_plan(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-transient-stale-plan", TaskStatus::Pending);
+        task.phase = TaskPhase::Plan;
+        task.error = Some("retrying after transient failure: timeout".to_string());
+        db.insert(&task).await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-transient-stale-plan")
+            .await?
+            .expect("transient stale plan task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_replayed_state_sets_terminal_phase_for_done_rows() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task(
+            "task-replayed-done-phase",
+            TaskStatus::Reviewing,
+        ))
+        .await?;
+
+        db.apply_replayed_state("task-replayed-done-phase", None, Some("done"))
+            .await?;
+
+        let loaded = db
+            .get("task-replayed-done-phase")
+            .await?
+            .expect("task should exist after replay done update");
+        assert!(matches!(loaded.status, TaskStatus::Done));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_replayed_state_preserves_pr_url_when_marking_terminal() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-replayed-pr-preserve", TaskStatus::Reviewing);
+        task.pr_url = Some("https://github.com/owner/repo/pull/707".to_string());
+        db.insert(&task).await?;
+
+        db.apply_replayed_state(
+            "task-replayed-pr-preserve",
+            Some("https://github.com/owner/repo/pull/707"),
+            Some("failed"),
+        )
+        .await?;
+
+        let loaded = db
+            .get("task-replayed-pr-preserve")
+            .await?
+            .expect("task should exist after replay terminal update");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        assert_eq!(
+            loaded.pr_url.as_deref(),
+            Some("https://github.com/owner/repo/pull/707")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_preserves_plan_phase_when_checkpoint_exists_and_pr_missing(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-checkpoint-no-pr", TaskStatus::AgentReview);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+        db.write_checkpoint(
+            "task-checkpoint-no-pr",
+            None,
+            Some("## Plan\nStep 1"),
+            None,
+            "plan_done",
+        )
+        .await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-checkpoint-no-pr")
+            .await?
+            .expect("checkpoint no-pr task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_preserves_triage_phase_when_checkpoint_exists_and_pr_missing(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-triage-no-pr", TaskStatus::AgentReview);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+        db.write_checkpoint(
+            "task-triage-no-pr",
+            Some("triage output"),
+            None,
+            None,
+            "triage_done",
+        )
+        .await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-triage-no-pr")
+            .await?
+            .expect("triage no-pr task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Pending));
+        assert_eq!(loaded.phase, TaskPhase::Triage);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_terminal_phase_for_agent_review_no_checkpoint(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-agent-review-no-checkpoint", TaskStatus::AgentReview);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-agent-review-no-checkpoint")
+            .await?
+            .expect("agent review no-checkpoint task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_terminal_phase_for_waiting_no_checkpoint(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-waiting-no-checkpoint", TaskStatus::Waiting);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-waiting-no-checkpoint")
+            .await?
+            .expect("waiting no-checkpoint task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_terminal_phase_for_reviewing_no_checkpoint(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-reviewing-no-checkpoint", TaskStatus::Reviewing);
+        task.phase = TaskPhase::Review;
+        db.insert(&task).await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-reviewing-no-checkpoint")
+            .await?
+            .expect("reviewing no-checkpoint task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_sets_terminal_phase_for_implementing_no_checkpoint(
+    ) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-implementing-no-checkpoint", TaskStatus::Implementing);
+        task.phase = TaskPhase::Plan;
+        db.insert(&task).await?;
+
+        db.recover_in_progress().await?;
+
+        let loaded = db
+            .get("task-implementing-no-checkpoint")
+            .await?
+            .expect("implementing no-checkpoint task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_replayed_state_terminal_update_is_authoritative_for_phase() -> anyhow::Result<()>
+    {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task(
+            "task-authoritative-terminal-phase",
+            TaskStatus::Implementing,
+        );
+        task.phase = TaskPhase::Plan;
+        db.insert(&task).await?;
+
+        db.apply_replayed_state("task-authoritative-terminal-phase", None, Some("failed"))
+            .await?;
+
+        let loaded = db
+            .get("task-authoritative-terminal-phase")
+            .await?
+            .expect("authoritative terminal task should exist");
+        assert!(matches!(loaded.status, TaskStatus::Failed));
+        assert_eq!(loaded.phase, TaskPhase::Terminal);
         Ok(())
     }
 
