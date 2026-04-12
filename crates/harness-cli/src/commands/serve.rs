@@ -21,6 +21,43 @@ fn parse_project_entry(s: &str) -> Result<(String, PathBuf)> {
     Ok((name.to_string(), PathBuf::from(path)))
 }
 
+fn startup_default_project_for_root(
+    parsed_projects: &[harness_core::config::ProjectEntry],
+    default_project_id: Option<&str>,
+    project_root: &std::path::Path,
+) -> Option<harness_core::config::ProjectEntry> {
+    default_project_id.and_then(|id| {
+        parsed_projects
+            .iter()
+            .find(|project| project.name == id)
+            .filter(|project| project.root == project_root)
+            .cloned()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_default_project_for_root;
+    use harness_core::config::ProjectEntry;
+    use std::path::Path;
+
+    #[test]
+    fn startup_default_project_ignores_metadata_after_project_root_override() {
+        let project = ProjectEntry {
+            name: "repo-a".to_string(),
+            root: Path::new("/repo-a").to_path_buf(),
+            default: true,
+            default_agent: Some("claude".to_string()),
+            max_concurrent: Some(3),
+        };
+
+        let startup_default =
+            startup_default_project_for_root(&[project], Some("repo-a"), Path::new("/repo-b"));
+
+        assert!(startup_default.is_none());
+    }
+}
+
 pub async fn run(
     config: HarnessConfig,
     transport: Option<String>,
@@ -145,13 +182,11 @@ pub async fn run(
         serve_config.server.project_root = project_root;
     }
 
-    let startup_default_project = default_project_id.as_ref().and_then(|id| {
-        parsed_projects
-            .iter()
-            .find(|project| &project.name == id)
-            .filter(|project| project.root == serve_config.server.project_root)
-            .cloned()
-    });
+    let startup_default_project = startup_default_project_for_root(
+        &parsed_projects,
+        default_project_id.as_deref(),
+        &serve_config.server.project_root,
+    );
 
     let thread_manager = harness_server::thread_manager::ThreadManager::new();
     let mut agent_registry =
