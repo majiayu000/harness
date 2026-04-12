@@ -14,6 +14,7 @@ use axum::{
     Json, Router,
 };
 use dashmap::DashMap;
+use harness_core::config::ProjectEntry;
 use harness_protocol::{methods::RpcRequest, notifications::RpcNotification};
 use serde_json::json;
 use std::net::SocketAddr;
@@ -126,6 +127,36 @@ pub struct AppState {
     pub task_svc: Arc<dyn crate::services::task::TaskService>,
     /// Task enqueue: project resolution, agent dispatch, concurrency, workspace.
     pub execution_svc: Arc<dyn crate::services::execution::ExecutionService>,
+}
+
+fn startup_project_metadata<'a>(
+    config_projects: &'a [ProjectEntry],
+    name: &str,
+    root: &std::path::Path,
+) -> Option<&'a ProjectEntry> {
+    config_projects.iter().find(|entry| {
+        entry.name == name
+            || entry
+                .root
+                .canonicalize()
+                .map(|canonical| canonical == root)
+                .unwrap_or(false)
+    })
+}
+
+fn startup_registry_project(
+    id: String,
+    root: std::path::PathBuf,
+    metadata: Option<&ProjectEntry>,
+) -> crate::project_registry::Project {
+    crate::project_registry::Project {
+        id,
+        root,
+        max_concurrent: metadata.and_then(|entry| entry.max_concurrent),
+        default_agent: metadata.and_then(|entry| entry.default_agent.clone()),
+        active: true,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    }
 }
 
 impl AppState {
@@ -375,27 +406,29 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     )
     .await?;
     // Auto-register the default project from --project-root on startup.
-    let default_project = crate::project_registry::Project {
-        id: "default".to_string(),
-        root: project_root.clone(),
-        max_concurrent: None,
-        default_agent: None,
-        active: true,
-        created_at: chrono::Utc::now().to_rfc3339(),
-    };
+    let default_metadata = server
+        .startup_projects
+        .iter()
+        .find(|(_, path)| path == &project_root)
+        .and_then(|(name, _)| {
+            startup_project_metadata(&server.config.projects, name, &project_root)
+        })
+        .or_else(|| startup_project_metadata(&server.config.projects, "default", &project_root));
+    let default_project = startup_registry_project(
+        "default".to_string(),
+        project_root.clone(),
+        default_metadata,
+    );
     if let Err(e) = project_registry.register(default_project).await {
         tracing::warn!("failed to auto-register default project: {e}");
     }
     // Register any extra named projects supplied via --project CLI flags.
     for (name, path) in &server.startup_projects {
-        let proj = crate::project_registry::Project {
-            id: name.clone(),
-            root: path.clone(),
-            max_concurrent: None,
-            default_agent: None,
-            active: true,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
+        let proj = startup_registry_project(
+            name.clone(),
+            path.clone(),
+            startup_project_metadata(&server.config.projects, name, path),
+        );
         if let Err(e) = project_registry.register(proj).await {
             tracing::warn!(project = %name, "failed to register startup project: {e}");
         }
@@ -2271,6 +2304,72 @@ mod startup_tests {
         Ok(())
         // _env_guard dropped here → HOME restored unconditionally
         // _lock dropped here → next test may proceed
+    }
+
+    #[tokio::test]
+    async fn build_app_state_preserves_configured_project_metadata_in_registry(
+    ) -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
+        let sandbox = tempfile::tempdir()?;
+        let default_root = sandbox.path().join("default-project");
+        let named_root = sandbox.path().join("named-project");
+        std::fs::create_dir_all(default_root.join(".git"))?;
+        std::fs::create_dir_all(named_root.join(".git"))?;
+
+        let fake_home = sandbox.path().join("home");
+        std::fs::create_dir_all(&fake_home)?;
+        let _env_guard = unsafe { HomeGuard::set(&fake_home) };
+
+        let mut config = HarnessConfig::default();
+        config.server.project_root = default_root.clone();
+        config.server.data_dir = sandbox.path().join("data");
+        config.projects = vec![
+            harness_core::config::ProjectEntry {
+                name: "alpha".to_string(),
+                root: default_root.clone(),
+                default: true,
+                default_agent: Some("codex".to_string()),
+                max_concurrent: Some(3),
+            },
+            harness_core::config::ProjectEntry {
+                name: "beta".to_string(),
+                root: named_root.clone(),
+                default: false,
+                default_agent: None,
+                max_concurrent: None,
+            },
+        ];
+
+        let mut server =
+            HarnessServer::new(config, ThreadManager::new(), AgentRegistry::new("test"));
+        server.startup_projects = vec![
+            ("alpha".to_string(), default_root.canonicalize()?),
+            ("beta".to_string(), named_root.canonicalize()?),
+        ];
+        let state = build_app_state(Arc::new(server)).await?;
+        let registry = state
+            .core
+            .project_registry
+            .as_ref()
+            .expect("project registry should be available");
+
+        let default_project = registry
+            .get("default")
+            .await?
+            .expect("default project should be registered");
+        assert_eq!(default_project.root, default_root.canonicalize()?);
+        assert_eq!(default_project.default_agent.as_deref(), Some("codex"));
+        assert_eq!(default_project.max_concurrent, Some(3));
+
+        let named_project = registry
+            .get("beta")
+            .await?
+            .expect("named project should be registered");
+        assert_eq!(named_project.root, named_root.canonicalize()?);
+        assert_eq!(named_project.default_agent, None);
+        assert_eq!(named_project.max_concurrent, None);
+
+        Ok(())
     }
 }
 

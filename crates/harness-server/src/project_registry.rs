@@ -246,4 +246,33 @@ mod tests {
         assert_eq!(loaded.default_agent.as_deref(), Some("claude"));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn survives_reopen_with_partial_metadata() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("projects.db");
+
+        {
+            let registry = ProjectRegistry::open(&db_path).await?;
+            registry
+                .register(Project {
+                    id: "partial".to_string(),
+                    root: PathBuf::from("/tmp/partial"),
+                    max_concurrent: None,
+                    default_agent: None,
+                    active: true,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                })
+                .await?;
+        }
+
+        let registry = ProjectRegistry::open(&db_path).await?;
+        let loaded = registry
+            .get("partial")
+            .await?
+            .expect("should survive reopen");
+        assert_eq!(loaded.max_concurrent, None);
+        assert_eq!(loaded.default_agent, None);
+        Ok(())
+    }
 }
