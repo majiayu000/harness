@@ -657,7 +657,17 @@ impl TaskStore {
 
         let cache = DashMap::new();
         let persist_locks = DashMap::new();
-        for task in db.list().await? {
+        // Only load active (non-terminal) tasks into the in-memory cache to prevent
+        // unbounded memory growth from historical completed tasks.
+        let active_statuses = &[
+            "pending",
+            "awaiting_deps",
+            "implementing",
+            "agent_review",
+            "waiting",
+            "reviewing",
+        ];
+        for task in db.list_by_status(active_statuses).await? {
             persist_locks.insert(task.id.clone(), Arc::new(Mutex::new(())));
             cache.insert(task.id.clone(), task);
         }
@@ -677,12 +687,128 @@ impl TaskStore {
         self.cache.get(id).map(|r| r.value().clone())
     }
 
+    /// Look up a task by ID, checking the in-memory cache first.
+    /// Falls back to the database for terminal tasks that were evicted from
+    /// the cache at startup (Done, Failed, Cancelled).
+    /// Returns `Ok(None)` only when the ID is unknown in both cache and DB.
+    /// Returns `Err` when the database query itself fails.
+    pub async fn get_with_db_fallback(&self, id: &TaskId) -> anyhow::Result<Option<TaskState>> {
+        if let Some(task) = self.cache.get(id) {
+            return Ok(Some(task.value().clone()));
+        }
+        self.db.get(id.0.as_str()).await
+    }
+
+    /// Return the status of a dependency task with a single DB lookup.
+    ///
+    /// Checks the in-memory cache first; falls back to a lightweight
+    /// `SELECT status` query (no `rounds` JSON decode) for terminal tasks
+    /// evicted from the startup cache.  Returns `None` when the task is
+    /// unknown in both cache and DB, or when the DB call fails.
+    async fn dep_status(&self, id: &TaskId) -> Option<TaskStatus> {
+        if let Some(task) = self.cache.get(id) {
+            return Some(task.status.clone());
+        }
+        match self.db.get_status_only(id.0.as_str()).await {
+            Ok(Some(s)) => s.parse::<TaskStatus>().ok(),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(task_id = %id.0, "DB error fetching dep status: {e}; treating as absent");
+                None
+            }
+        }
+    }
+
+    /// Return IDs of terminal tasks (Done, Failed, Cancelled) directly from the database.
+    ///
+    /// Used during startup for worktree cleanup. Only fetches task IDs to avoid
+    /// deserializing the heavy `rounds` column for large historical datasets.
+    pub async fn list_terminal_ids_from_db(&self) -> anyhow::Result<Vec<TaskId>> {
+        let ids = self
+            .db
+            .list_ids_by_status(&["done", "failed", "cancelled"])
+            .await?;
+        Ok(ids.into_iter().map(harness_core::types::TaskId).collect())
+    }
+
     pub fn count(&self) -> usize {
         self.cache.len()
     }
 
+    /// Return all tasks currently in the in-memory cache.
+    ///
+    /// **Semantic note**: since startup only loads active (non-terminal) tasks
+    /// into the cache, this method returns only Pending, AwaitingDeps,
+    /// Implementing, AgentReview, Waiting, and Reviewing tasks.
+    /// To look up a specific completed task use [`get_with_db_fallback`].
+    /// To enumerate all tasks including historical ones use [`list_all_with_terminal`].
     pub fn list_all(&self) -> Vec<TaskState> {
         self.cache.iter().map(|e| e.value().clone()).collect()
+    }
+
+    /// Return all tasks: active ones from cache (most current state) merged
+    /// with terminal tasks from the database (Done, Failed, Cancelled).
+    ///
+    /// Cache entries take precedence over DB rows for the same task ID so that
+    /// in-flight state is always reflected accurately.
+    pub async fn list_all_with_terminal(&self) -> anyhow::Result<Vec<TaskState>> {
+        // DB is the authoritative record of all tasks ever created.
+        let mut by_id: std::collections::HashMap<TaskId, TaskState> = self
+            .db
+            .list()
+            .await?
+            .into_iter()
+            .map(|t| (t.id.clone(), t))
+            .collect();
+        // Override with cache values — these carry the live in-flight state.
+        for entry in self.cache.iter() {
+            by_id.insert(entry.key().clone(), entry.value().clone());
+        }
+        Ok(by_id.into_values().collect())
+    }
+
+    /// Return all tasks as lightweight [`TaskSummary`] values.
+    ///
+    /// Fetches summary columns from the DB (skipping the heavy `rounds` field),
+    /// then overrides with live cache entries so in-flight state is accurate.
+    /// Use this in the `/tasks` list endpoint instead of `list_all_with_terminal`.
+    pub async fn list_all_summaries_with_terminal(&self) -> anyhow::Result<Vec<TaskSummary>> {
+        let mut by_id: std::collections::HashMap<TaskId, TaskSummary> = self
+            .db
+            .list_summaries()
+            .await?
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
+        for entry in self.cache.iter() {
+            by_id.insert(entry.key().clone(), entry.value().summary());
+        }
+        Ok(by_id.into_values().collect())
+    }
+
+    /// Return `(TaskId, TaskStatus)` pairs for all tasks without deserializing `rounds`.
+    ///
+    /// Hot-path callers (skill governance, token usage attribution) that only need
+    /// task status should use this instead of `list_all_with_terminal`.
+    pub async fn list_all_statuses_with_terminal(
+        &self,
+    ) -> anyhow::Result<HashMap<TaskId, TaskStatus>> {
+        let mut by_id: HashMap<TaskId, TaskStatus> = self
+            .db
+            .list_id_status()
+            .await?
+            .into_iter()
+            .filter_map(|(id, status)| {
+                status
+                    .parse::<TaskStatus>()
+                    .ok()
+                    .map(|s| (harness_core::types::TaskId(id), s))
+            })
+            .collect();
+        for entry in self.cache.iter() {
+            by_id.insert(entry.key().clone(), entry.value().status.clone());
+        }
+        Ok(by_id)
     }
 
     /// Run `f` only if the task still exists and is live-`pending`.
@@ -1716,12 +1842,13 @@ pub async fn spawn_task_awaiting_deps(
         anyhow::bail!("circular dependency detected for task {}", task_id.0);
     }
 
-    let all_done = depends_on.iter().all(|dep_id| {
-        store
-            .get(dep_id)
-            .map(|s| matches!(s.status, TaskStatus::Done))
-            .unwrap_or(false)
-    });
+    let mut all_done = true;
+    for dep_id in &depends_on {
+        if !matches!(store.dep_status(dep_id).await, Some(TaskStatus::Done)) {
+            all_done = false;
+            break;
+        }
+    }
 
     let mut state = TaskState::new(task_id.clone());
     state.depends_on = depends_on;
@@ -1744,62 +1871,80 @@ pub async fn spawn_task_awaiting_deps(
 
 /// Check all AwaitingDeps tasks and transition ready ones to Pending.
 /// Returns the IDs of tasks that were transitioned to Pending.
-pub fn check_awaiting_deps(store: &TaskStore) -> Vec<TaskId> {
+///
+/// Async because dependency status checks fall back to the database for
+/// terminal tasks (Done/Failed) that were evicted from the startup cache.
+///
+/// Returns `(ready_ids, newly_failed_ids)`.  Both sets must be persisted by
+/// the caller so that status transitions survive a process restart.
+pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>) {
     let mut ready = Vec::new();
     let mut failed_deps: Vec<(TaskId, TaskId)> = Vec::new();
 
-    for entry in store.cache.iter() {
-        let task = entry.value();
-        if !matches!(task.status, TaskStatus::AwaitingDeps) {
+    // Snapshot AwaitingDeps tasks from cache before async work.
+    let awaiting: Vec<(TaskId, Vec<TaskId>)> = store
+        .cache
+        .iter()
+        .filter_map(|e| {
+            let task = e.value();
+            if matches!(task.status, TaskStatus::AwaitingDeps) {
+                Some((task.id.clone(), task.depends_on.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (task_id, depends_on) in awaiting {
+        // Single pass: one DB lookup per dep (cache-first, then lightweight
+        // `SELECT status` — no `rounds` JSON decode).
+        let mut failed_dep_id = None;
+        let mut all_done = true;
+        for dep_id in &depends_on {
+            match store.dep_status(dep_id).await {
+                Some(TaskStatus::Failed) => {
+                    failed_dep_id = Some(dep_id.clone());
+                    break; // fail-fast — no need to inspect remaining deps
+                }
+                Some(TaskStatus::Done) => {} // this dep is satisfied
+                _ => {
+                    // Pending, Implementing, or unknown — not ready yet.
+                    // Keep scanning in case a later dep is Failed.
+                    all_done = false;
+                }
+            }
+        }
+        if let Some(fd) = failed_dep_id {
+            failed_deps.push((task_id, fd));
             continue;
         }
-        let any_failed = task.depends_on.iter().any(|dep_id| {
-            store
-                .get(dep_id)
-                .map(|s| matches!(s.status, TaskStatus::Failed))
-                .unwrap_or(false)
-        });
-        if any_failed {
-            let Some(failed_dep) = task
-                .depends_on
-                .iter()
-                .find(|dep_id| {
-                    store
-                        .get(dep_id)
-                        .map(|s| matches!(s.status, TaskStatus::Failed))
-                        .unwrap_or(false)
-                })
-                .cloned()
-            else {
-                continue;
-            };
-            failed_deps.push((task.id.clone(), failed_dep));
-            continue;
-        }
-        let all_done = task.depends_on.iter().all(|dep_id| {
-            store
-                .get(dep_id)
-                .map(|s| matches!(s.status, TaskStatus::Done))
-                .unwrap_or(false)
-        });
         if all_done {
-            ready.push(task.id.clone());
+            ready.push(task_id);
         }
     }
 
+    let mut newly_failed: Vec<TaskId> = Vec::new();
     for (task_id, failed_dep_id) in &failed_deps {
         if let Some(mut entry) = store.cache.get_mut(task_id) {
-            entry.status = TaskStatus::Failed;
-            entry.error = Some(format!("dependency {} failed", failed_dep_id.0));
+            // Only overwrite if the task is still AwaitingDeps — a concurrent
+            // cancel or status transition must not be clobbered.
+            if matches!(entry.status, TaskStatus::AwaitingDeps) {
+                entry.status = TaskStatus::Failed;
+                entry.error = Some(format!("dependency {} failed", failed_dep_id.0));
+                newly_failed.push(task_id.clone());
+            }
         }
     }
     for task_id in &ready {
         if let Some(mut entry) = store.cache.get_mut(task_id) {
-            entry.status = TaskStatus::Pending;
+            // Same guard: skip if status changed since we snapshotted.
+            if matches!(entry.status, TaskStatus::AwaitingDeps) {
+                entry.status = TaskStatus::Pending;
+            }
         }
     }
 
-    ready
+    (ready, newly_failed)
 }
 
 #[cfg(test)]
