@@ -213,7 +213,7 @@ test("run validates status-event turn payload before storing snapshot", async ()
   assert.equal(statusPollCount, 2);
 });
 
-test("run preserves unknown turn item types in final snapshot", async () => {
+test("run preserves approval_request id in final snapshot", async () => {
   const mock = createMockFetch((method) => {
     if (method === "thread/start") {
       return { result: { thread_id: "thread-6" } };
@@ -226,6 +226,93 @@ test("run preserves unknown turn item types in final snapshot", async () => {
         result: {
           id: "turn-6",
           thread_id: "thread-6",
+          status: "completed",
+          items: [
+            { type: "user_message", content: "hello" },
+            {
+              type: "approval_request",
+              id: "approval-1",
+              action: "execute_command",
+              approved: null,
+            },
+          ],
+        },
+      };
+    }
+    return { result: {} };
+  });
+
+  const harness = new Harness({
+    fetch: mock.fetch,
+    defaultPollIntervalMs: 1,
+    defaultRunTimeoutMs: 500,
+  });
+  const thread = await harness.startThread({ cwd: "/repo" });
+  const result = await thread.run("Summarize");
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.turn?.items.length, 2);
+  assert.deepEqual(result.turn?.items[1], {
+    type: "approval_request",
+    id: "approval-1",
+    action: "execute_command",
+    approved: null,
+  });
+});
+
+test("run emits timeout event with timeout_ms", async () => {
+  const mock = createMockFetch((method) => {
+    if (method === "thread/start") {
+      return { result: { thread_id: "thread-4" } };
+    }
+    if (method === "turn/start") {
+      return { result: { turn_id: "turn-4" } };
+    }
+    if (method === "turn/status") {
+      return {
+        result: {
+          id: "turn-4",
+          thread_id: "thread-4",
+          status: "running",
+          items: [{ type: "user_message", content: "hello" }],
+        },
+      };
+    }
+    return { result: {} };
+  });
+
+  const harness = new Harness({
+    fetch: mock.fetch,
+    defaultPollIntervalMs: 1,
+    defaultRunTimeoutMs: 5,
+  });
+
+  const thread = await harness.startThread({ cwd: "/repo" });
+  const result = await thread.run("Keep going");
+  const timeoutEvent = result.events.find((event) => event.method === SDK_TURN_TIMEOUT);
+
+  assert.equal(result.threadId, "thread-4");
+  assert.equal(result.turnId, "turn-4");
+  assert.equal(result.status, "running");
+  assert.equal(result.timedOut, true);
+  assert.ok(timeoutEvent);
+  assert.equal(timeoutEvent?.params.timeout_ms, 5);
+  assert.equal("timeout_seconds" in timeoutEvent!.params, false);
+});
+
+test("run preserves unknown turn item types in final snapshot", async () => {
+  const mock = createMockFetch((method) => {
+    if (method === "thread/start") {
+      return { result: { thread_id: "thread-7" } };
+    }
+    if (method === "turn/start") {
+      return { result: { turn_id: "turn-7" } };
+    }
+    if (method === "turn/status") {
+      return {
+        result: {
+          id: "turn-7",
+          thread_id: "thread-7",
           status: "completed",
           items: [
             { type: "user_message", content: "hello" },
