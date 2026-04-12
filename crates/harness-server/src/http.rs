@@ -621,9 +621,18 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                         // task execution. Non-terminal states (Pending, Implementing, etc.)
                         // must not trigger Q-updates — they would incorrectly penalize rules
                         // that are still in the middle of a task.
+                        //
+                        // For Done tasks, gate the merged reward on pr_url presence: a task
+                        // that exits cleanly without creating a PR (e.g. prompt tasks, analysis
+                        // tasks) should not emit REWARD_MERGED, as that would inflate Q-values
+                        // for rules that contributed nothing to an actual PR merge outcome.
                         let reward = match state.status {
                             task_runner::TaskStatus::Done => {
-                                Some(crate::q_value_store::REWARD_MERGED)
+                                if state.pr_url.is_some() {
+                                    Some(crate::q_value_store::REWARD_MERGED)
+                                } else {
+                                    None
+                                }
                             }
                             task_runner::TaskStatus::Failed => {
                                 Some(crate::q_value_store::REWARD_CLOSED)
