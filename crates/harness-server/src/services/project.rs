@@ -2,6 +2,7 @@
 
 use crate::project_registry::{Project, ProjectRegistry};
 use async_trait::async_trait;
+use harness_core::project_identity::ProjectIdentity;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -26,6 +27,9 @@ pub trait ProjectService: Send + Sync {
     /// Resolve a registered project ID to its root path.
     /// Returns `None` when the ID is not found.
     async fn resolve_path(&self, id: &str) -> anyhow::Result<Option<PathBuf>>;
+
+    /// Resolve a registered project ID to its canonical execution identity.
+    async fn resolve_identity(&self, id: &str) -> anyhow::Result<Option<ProjectIdentity>>;
 
     /// The default project root configured at server startup.
     fn default_root(&self) -> &Path;
@@ -64,6 +68,10 @@ impl ProjectService for DefaultProjectService {
 
     async fn resolve_path(&self, id: &str) -> anyhow::Result<Option<PathBuf>> {
         self.registry.resolve_path(id).await
+    }
+
+    async fn resolve_identity(&self, id: &str) -> anyhow::Result<Option<ProjectIdentity>> {
+        self.registry.resolve_identity(id).await
     }
 
     fn default_root(&self) -> &Path {
@@ -113,6 +121,16 @@ mod tests {
 
         async fn resolve_path(&self, id: &str) -> anyhow::Result<Option<PathBuf>> {
             Ok(self.store.read().await.get(id).map(|p| p.root.clone()))
+        }
+
+        async fn resolve_identity(&self, id: &str) -> anyhow::Result<Option<ProjectIdentity>> {
+            Ok(self
+                .store
+                .read()
+                .await
+                .get(id)
+                .cloned()
+                .map(|project| ProjectIdentity::from_registry(project.id, project.root)))
         }
 
         fn default_root(&self) -> &Path {

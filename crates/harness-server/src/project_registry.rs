@@ -1,4 +1,7 @@
-use harness_core::db::{Db, DbEntity};
+use harness_core::{
+    db::{Db, DbEntity},
+    project_identity::ProjectIdentity,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,6 +77,14 @@ impl ProjectRegistry {
     /// Resolve a project ID to its root path. Returns `None` if not found.
     pub async fn resolve_path(&self, id: &str) -> anyhow::Result<Option<PathBuf>> {
         Ok(self.get(id).await?.map(|p| p.root))
+    }
+
+    /// Resolve a project ID to its canonical execution identity.
+    pub async fn resolve_identity(&self, id: &str) -> anyhow::Result<Option<ProjectIdentity>> {
+        Ok(self
+            .get(id)
+            .await?
+            .map(|project| ProjectIdentity::from_registry(project.id, project.root)))
     }
 }
 

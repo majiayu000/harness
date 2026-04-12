@@ -374,6 +374,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         &harness_core::config::dirs::default_db_path(&dir, "projects"),
     )
     .await?;
+    let mut queue_config = server.config.concurrency.clone();
     // Auto-register the default project from --project-root on startup.
     let default_project = crate::project_registry::Project {
         id: "default".to_string(),
@@ -398,6 +399,16 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         };
         if let Err(e) = project_registry.register(proj).await {
             tracing::warn!(project = %name, "failed to register startup project: {e}");
+        }
+        if let Some(limit) = server
+            .config
+            .projects
+            .iter()
+            .find(|entry| entry.name == *name)
+            .and_then(|entry| entry.max_concurrent)
+            .map(|limit| limit as usize)
+        {
+            queue_config.set_project_limit(path, limit);
         }
     }
     let plans_md_dir = dir.join("plans");
@@ -484,18 +495,15 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         }
     }
 
-    let memory_pressure =
-        server
-            .config
-            .concurrency
-            .memory_pressure_threshold_mb
-            .map(|threshold_mb| {
-                let poll_secs = server.config.concurrency.memory_poll_interval_secs;
-                tracing::info!(threshold_mb, poll_secs, "memory pressure monitor enabled");
-                crate::memory_monitor::start(threshold_mb, poll_secs)
-            });
+    let memory_pressure = queue_config
+        .memory_pressure_threshold_mb
+        .map(|threshold_mb| {
+            let poll_secs = queue_config.memory_poll_interval_secs;
+            tracing::info!(threshold_mb, poll_secs, "memory pressure monitor enabled");
+            crate::memory_monitor::start(threshold_mb, poll_secs)
+        });
     let task_queue = Arc::new(crate::task_queue::TaskQueue::new_with_pressure(
-        &server.config.concurrency,
+        &queue_config,
         memory_pressure,
     ));
     tracing::debug!(

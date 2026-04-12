@@ -451,10 +451,7 @@ async fn resolve_project_root_with(
 /// happens inside `spawn_task` once the task is running.
 pub(crate) async fn resolve_canonical_project(project: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     let raw = resolve_project_root_with(project, detect_main_worktree).await?;
-    // Best-effort canonicalize: if the path doesn't exist yet (e.g. in tests
-    // using a path that will be created later) fall back to the raw path so
-    // we at least get a consistent string key.
-    Ok(raw.canonicalize().unwrap_or(raw))
+    Ok(harness_core::project_identity::canonicalize_root(raw))
 }
 
 async fn log_task_failure_event(

@@ -208,6 +208,97 @@ async fn persist_runtime_state_is_serialized() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn build_app_state_applies_startup_project_concurrency_limits_to_canonical_roots(
+) -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let home = tempfile::tempdir()?;
+    let _home_guard = unsafe { crate::test_helpers::HomeGuard::set(home.path()) };
+    let project_root = crate::test_helpers::tempdir_in_home("http-startup-root-")?;
+    let startup_project = crate::test_helpers::tempdir_in_home("http-startup-extra-")?;
+    let data_dir = crate::test_helpers::tempdir_in_home("http-startup-data-")?;
+
+    let startup_alias = startup_project.path().join("nested").join("..");
+    std::fs::create_dir_all(startup_project.path().join("nested"))?;
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.project_root = project_root.path().to_path_buf();
+    config.server.data_dir = data_dir.path().to_path_buf();
+    config.projects.push(harness_core::config::ProjectEntry {
+        name: "demo".to_string(),
+        root: startup_alias,
+        default: false,
+        default_agent: None,
+        max_concurrent: Some(1),
+    });
+
+    let mut agent_registry = harness_agents::registry::AgentRegistry::new("test");
+    agent_registry.register("test", CapturingAgent::new());
+
+    let mut server = crate::server::HarnessServer::new(
+        config,
+        crate::thread_manager::ThreadManager::new(),
+        agent_registry,
+    );
+    server.startup_projects = vec![("demo".to_string(), startup_project.path().canonicalize()?)];
+
+    let state = build_app_state(Arc::new(server)).await?;
+    let canonical = startup_project.path().canonicalize()?;
+    let project_id = canonical.to_string_lossy().into_owned();
+    let permit = state.concurrency.task_queue.acquire(&project_id, 0).await?;
+
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(50),
+        state.concurrency.task_queue.acquire(&project_id, 0),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "startup project limit should use the canonical root as the queue key"
+    );
+
+    drop(permit);
+    Ok(())
+}
+
+#[tokio::test]
+async fn build_app_state_keeps_registry_alias_but_executes_batching_by_canonical_root(
+) -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let home = tempfile::tempdir()?;
+    let _home_guard = unsafe { crate::test_helpers::HomeGuard::set(home.path()) };
+    let project_root = crate::test_helpers::tempdir_in_home("http-default-root-")?;
+    let startup_project = crate::test_helpers::tempdir_in_home("http-default-extra-")?;
+    let data_dir = crate::test_helpers::tempdir_in_home("http-default-data-")?;
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.project_root = project_root.path().to_path_buf();
+    config.server.data_dir = data_dir.path().to_path_buf();
+
+    let mut agent_registry = harness_agents::registry::AgentRegistry::new("test");
+    agent_registry.register("test", CapturingAgent::new());
+
+    let mut server = crate::server::HarnessServer::new(
+        config,
+        crate::thread_manager::ThreadManager::new(),
+        agent_registry,
+    );
+    server.startup_projects = vec![("demo".to_string(), startup_project.path().canonicalize()?)];
+
+    let state = build_app_state(Arc::new(server)).await?;
+    let project = state
+        .core
+        .project_registry
+        .as_ref()
+        .expect("registry should exist")
+        .get("demo")
+        .await?
+        .expect("startup project should stay addressable by alias");
+    assert_eq!(project.id, "demo");
+    assert_eq!(project.root, startup_project.path().canonicalize()?);
+    Ok(())
+}
+
 async fn make_test_state_with_agent(
     dir: &std::path::Path,
     webhook_secret: Option<&str>,

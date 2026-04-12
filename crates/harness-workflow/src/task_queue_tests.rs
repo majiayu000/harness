@@ -144,6 +144,63 @@ async fn per_project_limit_enforced() {
 }
 
 #[tokio::test]
+async fn canonical_and_alias_project_keys_share_limit_bucket() -> anyhow::Result<()> {
+    use std::collections::HashMap;
+
+    let temp = tempfile::tempdir()?;
+    let canonical = temp.path().join("repo");
+    std::fs::create_dir_all(&canonical)?;
+    let alias = temp.path().join("repo-link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&canonical, &alias)?;
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&canonical, &alias)?;
+
+    let canonical_key = canonical.canonicalize()?.display().to_string();
+    let alias_key = alias.display().to_string();
+
+    let mut per_project = HashMap::new();
+    per_project.insert(canonical_key, 1usize);
+    let cfg = ConcurrencyConfig {
+        max_concurrent_tasks: 4,
+        max_queue_size: 16,
+        stall_timeout_secs: 300,
+        per_project,
+        ..ConcurrencyConfig::default()
+    };
+    let q = Arc::new(TaskQueue::new(&cfg));
+
+    let _holder = q.acquire(&alias_key, 0).await.unwrap();
+    let blocked = timeout(Duration::from_millis(50), q.acquire(&alias_key, 0)).await;
+    assert!(
+        blocked.is_err(),
+        "alias key should resolve to the canonical per-project limit bucket"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_and_relative_project_keys_share_queue_stats_bucket() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let project = temp.path().join("repo");
+    std::fs::create_dir_all(&project)?;
+
+    let canonical_key = project.canonicalize()?.display().to_string();
+    let relative_key = project.display().to_string();
+    let q = Arc::new(TaskQueue::new(&config(1, 8)));
+
+    let _holder = q.acquire(&relative_key, 0).await.unwrap();
+    let q2 = q.clone();
+    let _waiter = tokio::spawn(async move { q2.acquire(&relative_key, 0).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let stats = q.project_stats(&canonical_key);
+    assert_eq!(stats.running, 1, "canonical key should see running task");
+    assert_eq!(stats.queued, 1, "canonical key should see queued waiter");
+    Ok(())
+}
+
+#[tokio::test]
 async fn project_cannot_starve_another() {
     use std::collections::HashMap;
     // global=2, proj_a=1 → proj_a can use at most 1 global slot,

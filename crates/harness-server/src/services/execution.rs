@@ -11,7 +11,9 @@ use crate::{
 };
 use async_trait::async_trait;
 use harness_agents::registry::AgentRegistry;
-use harness_core::{config::HarnessConfig, interceptor::TurnInterceptor};
+use harness_core::{
+    config::HarnessConfig, interceptor::TurnInterceptor, project_identity::ProjectIdentity,
+};
 use harness_skills::store::SkillStore;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -109,26 +111,52 @@ impl DefaultExecutionService {
     /// - Existing directory → pass through unchanged.
     /// - Non-directory string → treated as a project ID and looked up in the
     ///   registry. Returns `BadRequest` when the ID is not found.
-    async fn resolve_project(
+    async fn resolve_project_identity(
         &self,
         project: Option<PathBuf>,
-    ) -> Result<Option<PathBuf>, EnqueueTaskError> {
+    ) -> Result<Option<ProjectIdentity>, EnqueueTaskError> {
         match (self.project_registry.as_ref(), project) {
             (Some(registry), Some(project_path)) => {
                 if project_path.is_dir() {
-                    return Ok(Some(project_path));
+                    return Ok(Some(ProjectIdentity::from_root(project_path)));
                 }
                 let id = project_path.to_string_lossy();
-                match registry.resolve_path(&id).await {
-                    Ok(Some(root)) => Ok(Some(root)),
+                match registry.resolve_identity(&id).await {
+                    Ok(Some(identity)) => Ok(Some(identity)),
                     Ok(None) => Err(EnqueueTaskError::BadRequest(format!(
                         "project '{id}' not found in registry and is not a valid directory"
                     ))),
                     Err(e) => Err(EnqueueTaskError::Internal(e.to_string())),
                 }
             }
-            (_, project) => Ok(project),
+            (_, Some(project_path)) => Ok(Some(ProjectIdentity::from_root(project_path))),
+            (_, None) => Ok(None),
         }
+    }
+
+    async fn resolve_execution_identity(
+        &self,
+        project: Option<PathBuf>,
+    ) -> Result<ProjectIdentity, EnqueueTaskError> {
+        match self.resolve_project_identity(project).await? {
+            Some(identity) => Ok(identity),
+            None => task_runner::resolve_canonical_project(None)
+                .await
+                .map(ProjectIdentity::from_root)
+                .map_err(|e| EnqueueTaskError::Internal(e.to_string())),
+        }
+    }
+
+    fn queue_key(identity: &ProjectIdentity) -> String {
+        identity.queue_key()
+    }
+
+    fn apply_execution_identity(req: &mut CreateTaskRequest, identity: &ProjectIdentity) {
+        req.project = Some(identity.canonical_root().to_path_buf());
+    }
+
+    fn queue_project_id(identity: &ProjectIdentity) -> String {
+        Self::queue_key(identity)
     }
 
     /// Validate the request has at least one task specifier and a valid priority.
@@ -181,15 +209,11 @@ impl ExecutionService for DefaultExecutionService {
     async fn enqueue(&self, mut req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError> {
         Self::validate_request(&req)?;
 
-        req.project = self.resolve_project(req.project).await?;
+        let identity = self.resolve_execution_identity(req.project.clone()).await?;
+        self.check_allowed_roots(identity.canonical_root())?;
 
-        let canonical = task_runner::resolve_canonical_project(req.project.clone())
-            .await
-            .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
-        self.check_allowed_roots(&canonical)?;
-
-        let project_id = canonical.to_string_lossy().into_owned();
-        req.project = Some(canonical);
+        let project_id = Self::queue_project_id(&identity);
+        Self::apply_execution_identity(&mut req, &identity);
 
         let permit = self
             .task_queue
@@ -228,7 +252,7 @@ impl ExecutionService for DefaultExecutionService {
     ) -> Result<TaskId, EnqueueTaskError> {
         Self::validate_request(&req)?;
 
-        req.project = self.resolve_project(req.project).await?;
+        let identity = self.resolve_execution_identity(req.project.clone()).await?;
 
         // Resolve agent up-front so validation errors surface immediately.
         let agent = self.select_agent(&req)?;
@@ -238,13 +262,10 @@ impl ExecutionService for DefaultExecutionService {
             agent.name(),
         );
 
-        let canonical = task_runner::resolve_canonical_project(req.project.clone())
-            .await
-            .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
-        self.check_allowed_roots(&canonical)?;
+        self.check_allowed_roots(identity.canonical_root())?;
 
-        let project_id = canonical.to_string_lossy().into_owned();
-        req.project = Some(canonical);
+        let project_id = Self::queue_project_id(&identity);
+        Self::apply_execution_identity(&mut req, &identity);
         task_runner::fill_missing_repo_from_project(&mut req).await;
 
         let server_config = self.server_config.clone();
@@ -374,40 +395,462 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_project_passes_through_none() -> anyhow::Result<()> {
+    async fn resolve_project_identity_none_passes_through() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = TaskStore::open(&dir.path().join("t.db")).await?;
-        let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
-        let svc = make_minimal_svc(store, Some(registry)).await;
-        let result = svc.resolve_project(None).await?;
-        assert!(result.is_none());
+        let svc = make_minimal_svc(store, None).await;
+
+        assert!(svc.resolve_project_identity(None).await?.is_none());
         Ok(())
     }
 
     #[tokio::test]
-    async fn resolve_project_passes_through_existing_dir() -> anyhow::Result<()> {
+    async fn resolve_project_identity_preserves_registry_alias() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = TaskStore::open(&dir.path().join("t.db")).await?;
         let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
+        registry
+            .register(crate::project_registry::Project {
+                id: "alpha".to_string(),
+                root: dir.path().join("repo"),
+                max_concurrent: None,
+                default_agent: None,
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await?;
         let svc = make_minimal_svc(store, Some(registry)).await;
 
-        let path = dir.path().to_path_buf();
-        let result = svc.resolve_project(Some(path.clone())).await?;
-        assert_eq!(result, Some(path));
+        let identity = svc
+            .resolve_project_identity(Some(PathBuf::from("alpha")))
+            .await?
+            .expect("registry project should resolve");
+        assert_eq!(identity.alias_id(), Some("alpha"));
+        assert!(identity.canonical_root().ends_with("repo"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn resolve_project_unknown_id_returns_bad_request() -> anyhow::Result<()> {
+    async fn queue_project_id_uses_canonical_root_for_registry_alias() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+
+        let identity = ProjectIdentity::from_registry("alpha".to_string(), root.clone());
+        assert_eq!(
+            DefaultExecutionService::queue_project_id(&identity),
+            root.canonicalize()?.display().to_string()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_execution_identity_rewrites_request_to_canonical_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let identity = ProjectIdentity::from_registry("alpha".to_string(), root.clone());
+        let mut req = CreateTaskRequest {
+            project: Some(PathBuf::from("alpha")),
+            ..Default::default()
+        };
+
+        DefaultExecutionService::apply_execution_identity(&mut req, &identity);
+        assert_eq!(req.project, Some(root.canonicalize()?));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_execution_identity_canonicalizes_existing_dir() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let svc = make_minimal_svc(store, None).await;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let link = dir.path().join("repo-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, &link)?;
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&root, &link)?;
+
+        let identity = svc.resolve_execution_identity(Some(link)).await?;
+        assert_eq!(identity.canonical_root(), root.canonicalize()?.as_path());
+        assert_eq!(identity.alias_id(), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_execution_identity_uses_detected_worktree_when_missing() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let svc = make_minimal_svc(store, None).await;
+
+        let identity = svc.resolve_execution_identity(None).await?;
+        assert!(
+            identity.canonical_root().is_absolute()
+                || identity.canonical_root() == PathBuf::from(".").as_path()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_project_identity_existing_dir_has_no_alias() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let svc = make_minimal_svc(store, None).await;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+
+        let identity = svc
+            .resolve_project_identity(Some(root.clone()))
+            .await?
+            .expect("existing dir should resolve");
+        assert_eq!(identity.alias_id(), None);
+        assert_eq!(identity.canonical_root(), root.canonicalize()?.as_path());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_project_identity_unknown_id_returns_bad_request() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = TaskStore::open(&dir.path().join("t.db")).await?;
         let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
         let svc = make_minimal_svc(store, Some(registry)).await;
 
         let result = svc
-            .resolve_project(Some(PathBuf::from("nonexistent-id")))
+            .resolve_project_identity(Some(PathBuf::from("nonexistent-id")))
             .await;
         assert!(matches!(result, Err(EnqueueTaskError::BadRequest(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_project_id_matches_task_queue_canonical_bucket() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let link = dir.path().join("repo-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, &link)?;
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&root, &link)?;
+
+        let identity = ProjectIdentity::from_root(link);
+        assert_eq!(
+            DefaultExecutionService::queue_project_id(&identity),
+            harness_core::project_identity::canonical_project_key(&root)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_execution_identity_overwrites_alias_with_canonical_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let identity = ProjectIdentity::from_registry("alpha".to_string(), root.clone());
+        let mut req = CreateTaskRequest {
+            project: Some(PathBuf::from("different")),
+            ..Default::default()
+        };
+        DefaultExecutionService::apply_execution_identity(&mut req, &identity);
+        assert_eq!(req.project, Some(root.canonicalize()?));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_project_id_ignores_registry_alias_text() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let identity = ProjectIdentity::from_registry("some-alias".to_string(), root.clone());
+        assert_ne!(
+            DefaultExecutionService::queue_project_id(&identity),
+            "some-alias"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_execution_identity_from_registry_keeps_alias_and_canonical_root(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        registry
+            .register(crate::project_registry::Project {
+                id: "alpha".to_string(),
+                root: root.clone(),
+                max_concurrent: None,
+                default_agent: None,
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await?;
+        let svc = make_minimal_svc(store, Some(registry)).await;
+
+        let identity = svc
+            .resolve_execution_identity(Some(PathBuf::from("alpha")))
+            .await?;
+        assert_eq!(identity.alias_id(), Some("alpha"));
+        assert_eq!(identity.canonical_root(), root.canonicalize()?.as_path());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_project_identity_from_registry_canonicalizes_symlink_root(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let alias_root = dir.path().join("repo-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, &alias_root)?;
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&root, &alias_root)?;
+        registry
+            .register(crate::project_registry::Project {
+                id: "alpha".to_string(),
+                root: alias_root,
+                max_concurrent: None,
+                default_agent: None,
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await?;
+        let svc = make_minimal_svc(store, Some(registry)).await;
+
+        let identity = svc
+            .resolve_project_identity(Some(PathBuf::from("alpha")))
+            .await?
+            .expect("registry project should resolve");
+        assert_eq!(identity.canonical_root(), root.canonicalize()?.as_path());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_project_identity_non_registry_path_is_canonicalized() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let svc = make_minimal_svc(store, None).await;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let link = dir.path().join("repo-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, &link)?;
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&root, &link)?;
+
+        let identity = svc
+            .resolve_project_identity(Some(link))
+            .await?
+            .expect("path should resolve");
+        assert_eq!(identity.canonical_root(), root.canonicalize()?.as_path());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_project_id_for_existing_dir_matches_canonical_display() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let identity = ProjectIdentity::from_root(root.clone());
+        assert_eq!(
+            DefaultExecutionService::queue_project_id(&identity),
+            root.canonicalize()?.display().to_string()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_project_identity_registry_missing_still_errors() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
+        let svc = make_minimal_svc(store, Some(registry)).await;
+        let result = svc
+            .resolve_project_identity(Some(PathBuf::from("missing")))
+            .await;
+        assert!(matches!(result, Err(EnqueueTaskError::BadRequest(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_execution_identity_none_produces_queueable_identity() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let svc = make_minimal_svc(store, None).await;
+        let identity = svc.resolve_execution_identity(None).await?;
+        assert!(!DefaultExecutionService::queue_project_id(&identity).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_execution_identity_preserves_none_repo_field() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let identity = ProjectIdentity::from_root(root.clone());
+        let mut req = CreateTaskRequest::default();
+        DefaultExecutionService::apply_execution_identity(&mut req, &identity);
+        assert_eq!(req.project, Some(root.canonicalize()?));
+        assert!(req.repo.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_project_id_for_registry_alias_equals_canonical_path_not_alias(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let identity = ProjectIdentity::from_registry("alpha".to_string(), root.clone());
+        let queue_key = DefaultExecutionService::queue_project_id(&identity);
+        assert_eq!(queue_key, root.canonicalize()?.display().to_string());
+        assert_ne!(queue_key, "alpha");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_project_identity_without_registry_uses_from_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let svc = make_minimal_svc(store, None).await;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+
+        let identity = svc
+            .resolve_project_identity(Some(root.clone()))
+            .await?
+            .expect("dir should resolve");
+        assert_eq!(identity, ProjectIdentity::from_root(root));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_project_identity_registry_path_round_trip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        registry
+            .register(crate::project_registry::Project {
+                id: "alpha".to_string(),
+                root: root.clone(),
+                max_concurrent: None,
+                default_agent: None,
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await?;
+        let svc = make_minimal_svc(store, Some(registry)).await;
+
+        let identity = svc
+            .resolve_project_identity(Some(PathBuf::from("alpha")))
+            .await?
+            .expect("should resolve");
+        let mut req = CreateTaskRequest {
+            project: Some(PathBuf::from("alpha")),
+            ..Default::default()
+        };
+        DefaultExecutionService::apply_execution_identity(&mut req, &identity);
+        assert_eq!(req.project, Some(root.canonicalize()?));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_project_identity_prefers_registry_for_non_dir_input() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        registry
+            .register(crate::project_registry::Project {
+                id: "alpha".to_string(),
+                root: root.clone(),
+                max_concurrent: None,
+                default_agent: None,
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await?;
+        let svc = make_minimal_svc(store, Some(registry)).await;
+        let identity = svc
+            .resolve_project_identity(Some(PathBuf::from("alpha")))
+            .await?
+            .expect("registry should win");
+        assert_eq!(identity.alias_id(), Some("alpha"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_project_identity_existing_dir_does_not_require_registry() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
+        let svc = make_minimal_svc(store, Some(registry)).await;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let identity = svc
+            .resolve_project_identity(Some(root.clone()))
+            .await?
+            .expect("dir should resolve");
+        assert_eq!(identity.alias_id(), None);
+        assert_eq!(identity.canonical_root(), root.canonicalize()?.as_path());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_project_id_is_stable_for_canonical_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let identity = ProjectIdentity::from_root(root.clone());
+        let a = DefaultExecutionService::queue_project_id(&identity);
+        let b = DefaultExecutionService::queue_project_id(&identity);
+        assert_eq!(a, b);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_project_identity_registry_and_path_converge_to_same_queue_key(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        registry
+            .register(crate::project_registry::Project {
+                id: "alpha".to_string(),
+                root: root.clone(),
+                max_concurrent: None,
+                default_agent: None,
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await?;
+        let svc = make_minimal_svc(store, Some(registry)).await;
+        let by_id = svc
+            .resolve_project_identity(Some(PathBuf::from("alpha")))
+            .await?
+            .expect("id should resolve");
+        let by_path = svc
+            .resolve_project_identity(Some(root.clone()))
+            .await?
+            .expect("path should resolve");
+        assert_eq!(
+            DefaultExecutionService::queue_project_id(&by_id),
+            DefaultExecutionService::queue_project_id(&by_path)
+        );
         Ok(())
     }
 

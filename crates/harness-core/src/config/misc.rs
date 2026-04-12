@@ -1,7 +1,7 @@
 use crate::types::Grade;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::dirs::dirs_data_dir;
 
@@ -112,6 +112,14 @@ fn default_loop_jaccard_threshold() -> f64 {
 
 fn default_memory_poll_interval_secs() -> u64 {
     5
+}
+
+impl ConcurrencyConfig {
+    /// Add or update a per-project concurrency limit using the canonical project root as the key.
+    pub fn set_project_limit(&mut self, project_root: &Path, limit: usize) {
+        self.per_project
+            .insert(project_root.to_string_lossy().into_owned(), limit);
+    }
 }
 
 impl Default for ConcurrencyConfig {
@@ -453,5 +461,22 @@ mod tests {
         let cfg: ConcurrencyConfig = toml::from_str("").expect("toml parse failed");
         assert!(cfg.memory_pressure_threshold_mb.is_none());
         assert_eq!(cfg.memory_poll_interval_secs, 5);
+    }
+
+    #[test]
+    fn set_project_limit_uses_canonical_root_string_as_key() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+
+        let mut cfg = ConcurrencyConfig::default();
+        cfg.set_project_limit(&root.canonicalize()?, 2);
+
+        assert_eq!(
+            cfg.per_project
+                .get(&root.canonicalize()?.to_string_lossy().into_owned()),
+            Some(&2)
+        );
+        Ok(())
     }
 }

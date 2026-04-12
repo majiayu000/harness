@@ -5,6 +5,7 @@ pub mod db;
 pub mod error;
 pub mod interceptor;
 pub mod lang_detect;
+pub mod project_identity;
 pub mod prompts;
 pub mod shell_safety;
 pub mod tool_isolation;
