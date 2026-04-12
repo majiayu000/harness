@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::OnceLock;
+
+static SQLITE_NON_TRANSACTIONAL_PREFIXES: OnceLock<Vec<&'static str>> = OnceLock::new();
 
 /// Create a SQLite connection pool for the given path.
 ///
@@ -159,6 +163,120 @@ pub struct Migrator<'a> {
     migrations: &'a [Migration],
 }
 
+struct MigrationStatement<'a> {
+    index: usize,
+    sql: &'a str,
+}
+
+fn migration_statements(sql: &str) -> Vec<MigrationStatement<'_>> {
+    sql.split(';')
+        .enumerate()
+        .filter_map(|(index, stmt)| {
+            let stmt = stmt.trim();
+            (!stmt.is_empty()).then_some(MigrationStatement {
+                index: index + 1,
+                sql: stmt,
+            })
+        })
+        .collect()
+}
+
+fn duplicate_add_column_error(statement: &str, error: &sqlx::Error) -> bool {
+    statement.to_ascii_uppercase().contains("ADD COLUMN")
+        && error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("duplicate column name")
+}
+
+fn sqlite_statement_is_transaction_safe(statement: &str) -> bool {
+    let normalized = statement.trim_start().to_ascii_uppercase();
+    !SQLITE_NON_TRANSACTIONAL_PREFIXES
+        .get_or_init(|| vec!["VACUUM", "PRAGMA JOURNAL_MODE", "ATTACH ", "DETACH "])
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn format_migration_error(
+    migration: &Migration,
+    statement: &MigrationStatement<'_>,
+    error: &sqlx::Error,
+    in_transaction: bool,
+) -> anyhow::Error {
+    let mode = if in_transaction {
+        ""
+    } else {
+        " outside transaction"
+    };
+    anyhow::anyhow!(
+        "migration v{} '{}' failed at statement {}{}: {} [sql: {}]",
+        migration.version,
+        migration.description,
+        statement.index,
+        mode,
+        error,
+        statement.sql
+    )
+}
+
+fn pending_migrations<'a>(
+    migrations: &'a [Migration],
+    applied: &HashSet<u32>,
+) -> Vec<&'a Migration> {
+    let mut pending: Vec<&Migration> = migrations
+        .iter()
+        .filter(|migration| !applied.contains(&migration.version))
+        .collect();
+    pending.sort_by_key(|migration| migration.version);
+    pending
+}
+
+async fn apply_migration(pool: &SqlitePool, migration: &Migration) -> anyhow::Result<()> {
+    let statements = migration_statements(migration.sql);
+    let use_transaction = statements
+        .iter()
+        .all(|statement| sqlite_statement_is_transaction_safe(statement.sql));
+
+    if use_transaction {
+        let mut tx = pool.begin().await?;
+        for statement in &statements {
+            if let Err(error) = sqlx::query(statement.sql).execute(&mut *tx).await {
+                if duplicate_add_column_error(statement.sql, &error) {
+                    continue;
+                }
+                return Err(format_migration_error(migration, statement, &error, true));
+            }
+        }
+        sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
+            .bind(migration.version as i64)
+            .bind(migration.description)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    for statement in &statements {
+        if let Err(error) = sqlx::query(statement.sql).execute(pool).await {
+            if duplicate_add_column_error(statement.sql, &error) {
+                continue;
+            }
+            return Err(format_migration_error(migration, statement, &error, false));
+        }
+    }
+
+    sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
+        .bind(migration.version as i64)
+        .bind(migration.description)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+fn applied_versions_set(rows: Vec<(i64,)>) -> HashSet<u32> {
+    rows.into_iter().map(|(version,)| version as u32).collect()
+}
+
 impl<'a> Migrator<'a> {
     pub fn new(pool: &'a SqlitePool, migrations: &'a [Migration]) -> Self {
         Self { pool, migrations }
@@ -181,44 +299,10 @@ impl<'a> Migrator<'a> {
             sqlx::query_as("SELECT version FROM schema_migrations ORDER BY version ASC")
                 .fetch_all(self.pool)
                 .await?;
-        let applied: std::collections::HashSet<u32> =
-            rows.into_iter().map(|(v,)| v as u32).collect();
+        let applied = applied_versions_set(rows);
 
-        // Collect and sort pending migrations.
-        let mut pending: Vec<&Migration> = self
-            .migrations
-            .iter()
-            .filter(|m| !applied.contains(&m.version))
-            .collect();
-        pending.sort_by_key(|m| m.version);
-
-        for migration in pending {
-            for stmt in migration.sql.split(';') {
-                let stmt = stmt.trim();
-                if stmt.is_empty() {
-                    continue;
-                }
-                if let Err(e) = sqlx::query(stmt).execute(self.pool).await {
-                    // Tolerate duplicate-column errors from ALTER TABLE ADD COLUMN
-                    // so that migrating pre-migration-system databases is idempotent.
-                    if stmt.to_uppercase().contains("ADD COLUMN") {
-                        let msg = e.to_string().to_lowercase();
-                        if msg.contains("duplicate column name") {
-                            continue;
-                        }
-                    }
-                    return Err(anyhow::anyhow!(
-                        "migration v{} '{}' failed: {e}",
-                        migration.version,
-                        migration.description
-                    ));
-                }
-            }
-            sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
-                .bind(migration.version as i64)
-                .bind(migration.description)
-                .execute(self.pool)
-                .await?;
+        for migration in pending_migrations(self.migrations, &applied) {
+            apply_migration(self.pool, migration).await?;
         }
         Ok(())
     }
@@ -375,6 +459,29 @@ mod tests {
         },
     ];
 
+    async fn applied_versions(pool: &SqlitePool) -> anyhow::Result<Vec<i64>> {
+        Ok(
+            sqlx::query_as::<_, (i64,)>("SELECT version FROM schema_migrations ORDER BY version")
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .map(|(version,)| version)
+                .collect(),
+        )
+    }
+
+    async fn table_columns(pool: &SqlitePool, table: &str) -> anyhow::Result<Vec<String>> {
+        let pragma = format!("PRAGMA table_info({table})");
+        Ok(
+            sqlx::query_as::<_, (i64, String, String, i64, Option<String>, i64)>(&pragma)
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .map(|(_, name, _, _, _, _)| name)
+                .collect(),
+        )
+    }
+
     #[tokio::test]
     async fn migrator_applies_pending_migrations() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -425,6 +532,86 @@ mod tests {
 
         // Running v2 now must not fail even though the column already exists.
         Migrator::new(&pool, SIMPLE_MIGRATIONS).run().await?;
+        assert_eq!(applied_versions(&pool).await?, vec![1, 2]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failing_multi_statement_migration_is_not_recorded() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = open_pool(&dir.path().join("mig.db")).await?;
+        let migrations = [
+            Migration {
+                version: 1,
+                description: "create items table",
+                sql: "CREATE TABLE items (id TEXT PRIMARY KEY)",
+            },
+            Migration {
+                version: 2,
+                description: "broken migration",
+                sql: "ALTER TABLE items ADD COLUMN tag TEXT; SELECT nope FROM missing_table",
+            },
+        ];
+
+        let err = Migrator::new(&pool, &migrations).run().await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("migration v2 'broken migration' failed"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(applied_versions(&pool).await?, vec![1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failing_multi_statement_migration_does_not_partially_persist() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = open_pool(&dir.path().join("mig.db")).await?;
+        let migrations = [
+            Migration {
+                version: 1,
+                description: "create items table",
+                sql: "CREATE TABLE items (id TEXT PRIMARY KEY)",
+            },
+            Migration {
+                version: 2,
+                description: "broken migration",
+                sql: "ALTER TABLE items ADD COLUMN tag TEXT; SELECT nope FROM missing_table",
+            },
+        ];
+
+        let _ = Migrator::new(&pool, &migrations).run().await;
+
+        assert_eq!(applied_versions(&pool).await?, vec![1]);
+        assert_eq!(table_columns(&pool, "items").await?, vec!["id"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_error_reports_failed_statement_index() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = open_pool(&dir.path().join("mig.db")).await?;
+        let migrations = [
+            Migration {
+                version: 1,
+                description: "create items table",
+                sql: "CREATE TABLE items (id TEXT PRIMARY KEY)",
+            },
+            Migration {
+                version: 2,
+                description: "broken migration",
+                sql: "ALTER TABLE items ADD COLUMN tag TEXT; SELECT nope FROM missing_table",
+            },
+        ];
+
+        let err = Migrator::new(&pool, &migrations).run().await.unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("migration v2 'broken migration' failed at statement 2"),
+            "unexpected error: {message}"
+        );
         Ok(())
     }
 }
