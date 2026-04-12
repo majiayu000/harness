@@ -523,10 +523,17 @@ mod tests {
     }
 
     fn write_executable_script(script_body: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::io::Write;
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("mock-claude.sh");
         let script = format!("#!/bin/sh\nset -eu\n{script_body}\n");
-        fs::write(&path, script).expect("write script");
+        // sync_all() (fsync) ensures the kernel flushes dirty pages before we
+        // exec the file; without it, Linux can return ETXTBSY on some kernels.
+        {
+            let mut f = fs::File::create(&path).expect("create script");
+            f.write_all(script.as_bytes()).expect("write script");
+            f.sync_all().expect("sync script");
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -684,15 +691,22 @@ printf 'second\n'
         let started_marker = dir.path().join("timeout-started.txt");
         let marker = dir.path().join("timeout-marker.txt");
         let script = dir.path().join("mock-claude-timeout.sh");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nset -eu\necho started > \"{}\"\nsleep 5\necho reached > \"{}\"\n",
-                started_marker.display(),
-                marker.display()
-            ),
-        )
-        .expect("write timeout script");
+        // sync_all() ensures the kernel flushes dirty pages before exec;
+        // without it, Linux can return ETXTBSY on some CI kernels.
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&script).expect("create timeout script");
+            f.write_all(
+                format!(
+                    "#!/bin/sh\nset -eu\necho started > \"{}\"\nsleep 5\necho reached > \"{}\"\n",
+                    started_marker.display(),
+                    marker.display()
+                )
+                .as_bytes(),
+            )
+            .expect("write timeout script");
+            f.sync_all().expect("sync timeout script");
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -702,6 +716,13 @@ printf 'second\n'
             perms.set_mode(0o755);
             fs::set_permissions(&script, perms).expect("set executable permissions");
         }
+
+        // On Linux CI kernels (tmpfs), the inode write-access count may not be
+        // fully settled immediately after close() + fsync. A short sleep lets
+        // the kernel scheduler process the fd-close before execve() is called,
+        // preventing ETXTBSY (os error 26). 200 ms is empirically sufficient
+        // even on heavily loaded CI runners where 50 ms proved flaky.
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let agent = ClaudeCodeAgent::new(
             script,
