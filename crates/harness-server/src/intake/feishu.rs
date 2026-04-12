@@ -181,22 +181,44 @@ impl IntakeSource for FeishuIntake {
 /// - For `im.message.receive_v1` events containing the trigger keyword,
 ///   creates a Harness task and replies in the originating chat.
 ///
+pub(crate) fn has_verification_token(
+    config: &harness_core::config::intake::FeishuIntakeConfig,
+) -> bool {
+    config
+        .verification_token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FeishuTokenVerification {
+    Valid,
+    Invalid,
+    Misconfigured,
+}
+
 /// Verify the token field in a Feishu webhook payload against the configured verification_token.
-///
-/// Returns true if no verification_token is configured (open mode) or if the token matches.
 fn verify_feishu_token(
     config: &harness_core::config::intake::FeishuIntakeConfig,
     payload: &serde_json::Value,
-) -> bool {
-    let Some(expected) = &config.verification_token else {
-        return true;
+) -> FeishuTokenVerification {
+    let Some(expected) = config.verification_token.as_deref() else {
+        return FeishuTokenVerification::Misconfigured;
     };
+    if expected.trim().is_empty() {
+        return FeishuTokenVerification::Misconfigured;
+    }
+
     // Challenge payloads carry "token" at root; event payloads carry "header.token".
     let token = payload["token"]
         .as_str()
         .or_else(|| payload["header"]["token"].as_str())
         .unwrap_or("");
-    token.as_bytes().ct_eq(expected.as_bytes()).into()
+    if bool::from(token.as_bytes().ct_eq(expected.as_bytes())) {
+        FeishuTokenVerification::Valid
+    } else {
+        FeishuTokenVerification::Invalid
+    }
 }
 
 pub async fn feishu_webhook(
@@ -211,11 +233,20 @@ pub async fn feishu_webhook(
     };
 
     // 1. Verify token before processing any payload.
-    if !verify_feishu_token(&feishu.config, &payload) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "invalid verification token"})),
-        );
+    match verify_feishu_token(&feishu.config, &payload) {
+        FeishuTokenVerification::Valid => {}
+        FeishuTokenVerification::Invalid => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "invalid verification token"})),
+            );
+        }
+        FeishuTokenVerification::Misconfigured => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Feishu verification token not configured"})),
+            );
+        }
     }
 
     // 2. Handle Feishu verification challenge.
@@ -354,10 +385,24 @@ mod tests {
     }
 
     #[test]
-    fn verify_token_passes_when_no_token_configured() {
+    fn verify_token_rejects_when_no_token_configured() {
         let config = make_feishu_config();
         let payload = serde_json::json!({"challenge": "test"});
-        assert!(verify_feishu_token(&config, &payload));
+        assert_eq!(
+            verify_feishu_token(&config, &payload),
+            FeishuTokenVerification::Misconfigured
+        );
+    }
+
+    #[test]
+    fn verify_token_rejects_when_token_configured_as_empty_string() {
+        let mut config = make_feishu_config();
+        config.verification_token = Some(String::new());
+        let payload = serde_json::json!({"challenge": "test", "token": "secret-123"});
+        assert_eq!(
+            verify_feishu_token(&config, &payload),
+            FeishuTokenVerification::Misconfigured
+        );
     }
 
     #[test]
@@ -365,7 +410,10 @@ mod tests {
         let mut config = make_feishu_config();
         config.verification_token = Some("secret-123".to_string());
         let payload = serde_json::json!({"challenge": "test", "token": "secret-123"});
-        assert!(verify_feishu_token(&config, &payload));
+        assert_eq!(
+            verify_feishu_token(&config, &payload),
+            FeishuTokenVerification::Valid
+        );
     }
 
     #[test]
@@ -375,7 +423,10 @@ mod tests {
         let payload = serde_json::json!({
             "header": { "token": "secret-123", "event_type": "im.message.receive_v1" }
         });
-        assert!(verify_feishu_token(&config, &payload));
+        assert_eq!(
+            verify_feishu_token(&config, &payload),
+            FeishuTokenVerification::Valid
+        );
     }
 
     #[test]
@@ -383,7 +434,10 @@ mod tests {
         let mut config = make_feishu_config();
         config.verification_token = Some("secret-123".to_string());
         let payload = serde_json::json!({"challenge": "test", "token": "wrong"});
-        assert!(!verify_feishu_token(&config, &payload));
+        assert_eq!(
+            verify_feishu_token(&config, &payload),
+            FeishuTokenVerification::Invalid
+        );
     }
 
     #[test]
@@ -391,7 +445,24 @@ mod tests {
         let mut config = make_feishu_config();
         config.verification_token = Some("secret-123".to_string());
         let payload = serde_json::json!({"challenge": "test"});
-        assert!(!verify_feishu_token(&config, &payload));
+        assert_eq!(
+            verify_feishu_token(&config, &payload),
+            FeishuTokenVerification::Invalid
+        );
+    }
+
+    #[test]
+    fn has_verification_token_rejects_empty_string() {
+        let mut config = make_feishu_config();
+        config.verification_token = Some("   ".to_string());
+        assert!(!has_verification_token(&config));
+    }
+
+    #[test]
+    fn has_verification_token_accepts_non_empty_string() {
+        let mut config = make_feishu_config();
+        config.verification_token = Some("secret-123".to_string());
+        assert!(has_verification_token(&config));
     }
 
     #[test]

@@ -505,17 +505,22 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     );
 
     let feishu_intake = server.config.intake.feishu.as_ref().and_then(|cfg| {
-        if cfg.enabled {
-            tracing::info!(
-                trigger_keyword = %cfg.trigger_keyword,
-                "intake: Feishu bot registered"
-            );
-            Some(Arc::new(crate::intake::feishu::FeishuIntake::new(
-                cfg.clone(),
-            )))
-        } else {
-            None
+        if !cfg.enabled {
+            return None;
         }
+        if !crate::intake::feishu::has_verification_token(cfg) {
+            tracing::error!(
+                "intake: Feishu enabled but verification_token is missing; webhook will fail closed"
+            );
+            return None;
+        }
+        tracing::info!(
+            trigger_keyword = %cfg.trigger_keyword,
+            "intake: Feishu bot registered"
+        );
+        Some(Arc::new(crate::intake::feishu::FeishuIntake::new(
+            cfg.clone(),
+        )))
     });
 
     // Build ALL GitHub pollers once. The same Arc instances are shared between

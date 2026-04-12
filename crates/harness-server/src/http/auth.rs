@@ -55,9 +55,10 @@ fn percent_decode(s: &str) -> String {
 
 /// Bearer token authentication middleware.
 ///
-/// Exempts `/health`, `/webhook`, `/webhook/feishu`, and `/signals` (which
-/// have their own HMAC-based protection). All other endpoints require an
-/// `Authorization: Bearer <token>` header when `api_token` is configured.
+/// Exempts `/health`, `/webhook`, `/webhook/feishu`, and `/signals`.
+/// `/webhook/feishu` relies on Feishu verification-token validation and must
+/// fail closed when that token is not configured. All other endpoints require
+/// an `Authorization: Bearer <token>` header when `api_token` is configured.
 /// When no token is configured the middleware is a no-op (backward compat).
 pub(crate) async fn api_auth_middleware(
     State(state): State<Arc<AppState>>,

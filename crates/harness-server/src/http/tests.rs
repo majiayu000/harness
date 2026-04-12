@@ -66,6 +66,10 @@ async fn make_test_state_with(
     config: harness_core::config::HarnessConfig,
     agent_registry: harness_agents::registry::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
+    let feishu_intake = config.intake.feishu.as_ref().and_then(|cfg| {
+        cfg.enabled
+            .then(|| Arc::new(crate::intake::feishu::FeishuIntake::new(cfg.clone())))
+    });
     let thread_manager = crate::thread_manager::ThreadManager::new();
     let server = Arc::new(crate::server::HarnessServer::new(
         config,
@@ -164,7 +168,7 @@ async fn make_test_state_with(
         },
         interceptors: vec![],
         intake: crate::http::IntakeServices {
-            feishu_intake: None,
+            feishu_intake,
             github_pollers: vec![],
             completion_callback: None,
         },
@@ -253,7 +257,80 @@ fn webhook_app(state: Arc<AppState>) -> Router {
             "/webhook",
             post(github_webhook).layer(DefaultBodyLimit::max(body_limit)),
         )
+        .route(
+            "/webhook/feishu",
+            post(crate::intake::feishu::feishu_webhook).layer(DefaultBodyLimit::max(body_limit)),
+        )
         .with_state(state)
+}
+
+fn make_feishu_config(
+    verification_token: Option<&str>,
+) -> harness_core::config::intake::FeishuIntakeConfig {
+    harness_core::config::intake::FeishuIntakeConfig {
+        enabled: true,
+        app_id: None,
+        app_secret: None,
+        verification_token: verification_token.map(ToString::to_string),
+        trigger_keyword: "harness".to_string(),
+        default_repo: None,
+    }
+}
+
+async fn make_test_state_with_feishu(
+    dir: &std::path::Path,
+    verification_token: Option<&str>,
+) -> anyhow::Result<Arc<AppState>> {
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.intake.feishu = Some(make_feishu_config(verification_token));
+    make_test_state_with(
+        dir,
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await
+}
+
+fn feishu_challenge_payload(token: Option<&str>) -> serde_json::Value {
+    match token {
+        Some(token) => serde_json::json!({ "challenge": "challenge-123", "token": token }),
+        None => serde_json::json!({ "challenge": "challenge-123" }),
+    }
+}
+
+fn feishu_event_payload(token: Option<&str>) -> serde_json::Value {
+    let content = serde_json::to_string(&serde_json::json!({ "text": "harness fix login bug" }))
+        .expect("serialize feishu content");
+    match token {
+        Some(token) => serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1", "token": token },
+            "event": {
+                "message": {
+                    "message_id": "msg-001",
+                    "chat_id": "chat-001",
+                    "message_type": "text",
+                    "content": content
+                }
+            }
+        }),
+        None => serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "message": {
+                    "message_id": "msg-001",
+                    "chat_id": "chat-001",
+                    "message_type": "text",
+                    "content": content
+                }
+            }
+        }),
+    }
+}
+
+async fn response_json(response: axum::response::Response) -> anyhow::Result<serde_json::Value> {
+    use http_body_util::BodyExt;
+    let body = response.into_body().collect().await?.to_bytes();
+    Ok(serde_json::from_slice(&body)?)
 }
 
 fn webhook_signature(secret: &str, payload: &[u8]) -> String {
@@ -932,6 +1009,98 @@ async fn dashboard_no_auth_configured_remains_public() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn feishu_webhook_returns_service_unavailable_when_token_missing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_feishu(dir.path(), None).await?;
+    let app = webhook_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook/feishu")
+                .header("content-type", "application/json")
+                .body(Body::from(feishu_challenge_payload(None).to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = response_json(response).await?;
+    assert_eq!(json["error"], "Feishu verification token not configured");
+    Ok(())
+}
+
+#[tokio::test]
+async fn feishu_webhook_returns_service_unavailable_when_token_is_empty() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_feishu(dir.path(), Some("")).await?;
+    let app = webhook_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook/feishu")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    feishu_challenge_payload(Some("secret-123")).to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = response_json(response).await?;
+    assert_eq!(json["error"], "Feishu verification token not configured");
+    Ok(())
+}
+
+#[tokio::test]
+async fn feishu_webhook_accepts_challenge_with_valid_token() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_feishu(dir.path(), Some("secret-123")).await?;
+    let app = webhook_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook/feishu")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    feishu_challenge_payload(Some("secret-123")).to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await?;
+    assert_eq!(json["challenge"], "challenge-123");
+    Ok(())
+}
+
+#[tokio::test]
+async fn feishu_webhook_rejects_invalid_token() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_feishu(dir.path(), Some("secret-123")).await?;
+    let app = webhook_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook/feishu")
+                .header("content-type", "application/json")
+                .body(Body::from(feishu_event_payload(Some("wrong")).to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let json = response_json(response).await?;
+    assert_eq!(json["error"], "invalid verification token");
     Ok(())
 }
 
