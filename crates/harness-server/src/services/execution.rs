@@ -131,12 +131,19 @@ impl DefaultExecutionService {
         }
     }
 
-    /// Validate the request has at least one task specifier.
+    /// Validate the request has at least one task specifier and a valid priority.
     fn validate_request(req: &CreateTaskRequest) -> Result<(), EnqueueTaskError> {
         if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
             return Err(EnqueueTaskError::BadRequest(
                 "at least one of prompt, issue, or pr must be provided".to_string(),
             ));
+        }
+        if req.priority > task_runner::MAX_TASK_PRIORITY {
+            return Err(EnqueueTaskError::BadRequest(format!(
+                "priority {} out of range; maximum is {} (0=normal, 1=high, 2=critical)",
+                req.priority,
+                task_runner::MAX_TASK_PRIORITY,
+            )));
         }
         Ok(())
     }
@@ -186,7 +193,7 @@ impl ExecutionService for DefaultExecutionService {
 
         let permit = self
             .task_queue
-            .acquire(&project_id)
+            .acquire(&project_id, req.priority)
             .await
             .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
 
@@ -255,7 +262,7 @@ impl ExecutionService for DefaultExecutionService {
         let completion_callback = self.completion_callback.clone();
         let task_id2 = task_id.clone();
         tokio::spawn(async move {
-            match task_queue.acquire(&project_id).await {
+            match task_queue.acquire(&project_id, req.priority).await {
                 Ok(permit) => {
                     task_runner::spawn_preregistered_task(
                         task_id2,

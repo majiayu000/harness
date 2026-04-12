@@ -141,6 +141,10 @@ pub struct TaskState {
     /// ISO 8601 creation timestamp. Set at spawn time and persisted to the tasks DB.
     #[serde(default)]
     pub created_at: Option<String>,
+    /// Scheduling priority: 0 = normal (default), 1 = high, 2 = critical.
+    /// Persisted to DB and used by TaskQueue::acquire to skip lower-priority waiters.
+    #[serde(default)]
+    pub priority: u8,
     /// Current pipeline phase. Defaults to Implement for backward compatibility.
     #[serde(default)]
     pub phase: TaskPhase,
@@ -208,6 +212,7 @@ impl TaskState {
             issue: None,
             description: None,
             created_at: Some(chrono::Utc::now().to_rfc3339()),
+            priority: 0,
             phase: TaskPhase::default(),
             triage_output: None,
             plan_output: None,
@@ -238,6 +243,11 @@ impl TaskState {
         }
     }
 }
+
+/// Maximum allowed scheduling priority. Values above this are rejected at the
+/// API boundary to prevent scheduler-level starvation of normal-priority tasks.
+/// `0` = normal (default), `1` = high, `2` = critical.
+pub const MAX_TASK_PRIORITY: u8 = 2;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateTaskRequest {
@@ -294,6 +304,10 @@ pub struct CreateTaskRequest {
     /// Task IDs that must complete (Done) before this task starts.
     #[serde(default)]
     pub depends_on: Vec<TaskId>,
+    /// Scheduling priority: 0 = normal (default), 1 = high, 2 = critical.
+    /// Higher values are served first when multiple tasks are waiting for a slot.
+    #[serde(default)]
+    pub priority: u8,
 }
 
 impl Default for CreateTaskRequest {
@@ -317,6 +331,7 @@ impl Default for CreateTaskRequest {
             repo: None,
             parent_task_id: None,
             depends_on: Vec::new(),
+            priority: 0,
         }
     }
 }
@@ -1198,6 +1213,7 @@ pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskReques
     state.repo = req.repo.clone();
     state.parent_id = req.parent_task_id.clone();
     state.depends_on = req.depends_on.clone();
+    state.priority = req.priority;
     state.issue = req.issue;
     state.description = summarize_request_description(req);
     store.insert(&state).await;
@@ -1273,6 +1289,7 @@ where
         state.source = req.source.clone();
         state.external_id = req.external_id.clone();
         state.repo = req.repo.clone();
+        state.priority = req.priority;
         store.insert(&state).await;
         // Register stream channel before spawning so SSE clients can subscribe immediately.
         store.register_task_stream(&task_id);
@@ -1705,6 +1722,7 @@ pub async fn spawn_task_awaiting_deps(
     state.source = req.source.clone();
     state.external_id = req.external_id.clone();
     state.repo = req.repo.clone();
+    state.priority = req.priority;
     if let Some(parent) = req.parent_task_id.clone() {
         state.parent_id = Some(parent);
     }
@@ -2053,7 +2071,7 @@ mod tests {
 
         let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
         let queue = crate::task_queue::TaskQueue::unbounded();
-        let permit = queue.acquire("test").await?;
+        let permit = queue.acquire("test", 0).await?;
         spawn_task(
             store,
             agent_clone,
@@ -2127,7 +2145,7 @@ mod tests {
         };
 
         let queue = crate::task_queue::TaskQueue::unbounded();
-        let permit = queue.acquire("test").await?;
+        let permit = queue.acquire("test", 0).await?;
         let task_id = spawn_task(
             store.clone(),
             agent,
@@ -2216,7 +2234,7 @@ mod tests {
         };
 
         let queue = crate::task_queue::TaskQueue::unbounded();
-        let permit = queue.acquire("test").await?;
+        let permit = queue.acquire("test", 0).await?;
         let task_id = spawn_task_with_worktree_detector(
             store.clone(),
             agent,
@@ -2397,7 +2415,7 @@ mod tests {
         };
 
         let queue = crate::task_queue::TaskQueue::unbounded();
-        let permit = queue.acquire("test").await?;
+        let permit = queue.acquire("test", 0).await?;
         spawn_task(
             store,
             agent_clone,
@@ -2454,7 +2472,7 @@ mod tests {
         };
 
         let queue = crate::task_queue::TaskQueue::unbounded();
-        let permit = queue.acquire("test").await?;
+        let permit = queue.acquire("test", 0).await?;
         spawn_task(
             store,
             agent_clone,

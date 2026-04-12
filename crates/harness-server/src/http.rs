@@ -1194,7 +1194,12 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
                     // Issue 1: acquire permit here inside the spawned future so serve()
                     // is never blocked waiting for a concurrency slot.
-                    let permit = match state.concurrency.task_queue.acquire(&project_id).await {
+                    let permit = match state
+                        .concurrency
+                        .task_queue
+                        .acquire(&project_id, task.priority)
+                        .await
+                    {
                         Ok(p) => p,
                         Err(e) => {
                             tracing::error!(

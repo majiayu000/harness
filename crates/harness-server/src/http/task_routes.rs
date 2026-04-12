@@ -43,6 +43,13 @@ pub(crate) async fn enqueue_task(
             "at least one of prompt, issue, or pr must be provided".to_string(),
         ));
     }
+    if req.priority > task_runner::MAX_TASK_PRIORITY {
+        return Err(EnqueueTaskError::BadRequest(format!(
+            "priority {} out of range; maximum is {} (0=normal, 1=high, 2=critical)",
+            req.priority,
+            task_runner::MAX_TASK_PRIORITY,
+        )));
+    }
 
     // Resolve project: if the supplied path does not exist as a directory,
     // treat it as a project ID and look it up in the registry.
@@ -78,7 +85,7 @@ pub(crate) async fn enqueue_task(
     let permit = state
         .concurrency
         .task_queue
-        .acquire(&project_id)
+        .acquire(&project_id, req.priority)
         .await
         .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
 
@@ -218,6 +225,13 @@ async fn enqueue_task_background(
             "at least one of prompt, issue, or pr must be provided".to_string(),
         ));
     }
+    if req.priority > task_runner::MAX_TASK_PRIORITY {
+        return Err(EnqueueTaskError::BadRequest(format!(
+            "priority {} out of range; maximum is {} (0=normal, 1=high, 2=critical)",
+            req.priority,
+            task_runner::MAX_TASK_PRIORITY,
+        )));
+    }
 
     // Resolve project: if the supplied path does not exist as a directory,
     // treat it as a project ID and look it up in the registry.
@@ -290,7 +304,12 @@ async fn enqueue_task_background(
             } else {
                 None
             };
-            match state.concurrency.task_queue.acquire(&project_id).await {
+            match state
+                .concurrency
+                .task_queue
+                .acquire(&project_id, req.priority)
+                .await
+            {
                 Ok(permit) => {
                     task_runner::spawn_preregistered_task(
                         task_id2,
