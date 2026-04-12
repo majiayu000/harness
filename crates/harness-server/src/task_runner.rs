@@ -1811,6 +1811,15 @@ pub(crate) async fn update_status(
 ) -> anyhow::Result<()> {
     let status_str = status.as_ref().to_string();
     mutate_and_persist(store, task_id, |s| {
+        s.phase = match status {
+            TaskStatus::Pending | TaskStatus::AwaitingDeps | TaskStatus::Implementing => {
+                TaskPhase::Implement
+            }
+            TaskStatus::AgentReview | TaskStatus::Waiting | TaskStatus::Reviewing => {
+                TaskPhase::Review
+            }
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled => TaskPhase::Terminal,
+        };
         s.status = status;
         s.turn = turn;
     })
@@ -2817,6 +2826,38 @@ mod tests {
         assert!(is_non_decomposable_prompt_source(Some("sprint_planner")));
         assert!(!is_non_decomposable_prompt_source(Some("github")));
         assert!(!is_non_decomposable_prompt_source(None));
+    }
+
+    #[tokio::test]
+    async fn update_status_syncs_phase_for_review_and_terminal_states() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = harness_core::types::TaskId("phase-sync-test".to_string());
+        let task = TaskState::new(task_id.clone());
+        store.insert(&task).await;
+
+        update_status(&store, &task_id, TaskStatus::Waiting, 1).await?;
+        let waiting = store
+            .get(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("task should exist after waiting update"))?;
+        assert!(matches!(waiting.status, TaskStatus::Waiting));
+        assert_eq!(waiting.phase, TaskPhase::Review);
+
+        update_status(&store, &task_id, TaskStatus::Done, 2).await?;
+        let done = store
+            .get(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("task should exist after done update"))?;
+        assert!(matches!(done.status, TaskStatus::Done));
+        assert_eq!(done.phase, TaskPhase::Terminal);
+
+        let reloaded = store
+            .db
+            .get(task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("reloaded task should exist"))?;
+        assert!(matches!(reloaded.status, TaskStatus::Done));
+        assert_eq!(reloaded.phase, TaskPhase::Terminal);
+        Ok(())
     }
 
     #[tokio::test]

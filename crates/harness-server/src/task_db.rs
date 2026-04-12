@@ -293,9 +293,18 @@ impl TaskDb {
         let rows = sqlx::query_as::<_, TaskSummaryRow>(&sql)
             .fetch_all(&self.pool)
             .await?;
-        rows.into_iter()
-            .map(TaskSummaryRow::try_into_summary)
-            .collect()
+        let mut summaries = Vec::with_capacity(rows.len());
+        for row in rows {
+            match row.try_into_summary() {
+                Ok(summary) => summaries.push(summary),
+                Err(error) => {
+                    tracing::error!(
+                        "task_db.list_summaries: skipping malformed summary row: {error}"
+                    );
+                }
+            }
+        }
+        Ok(summaries)
     }
 
     /// Return `(id, status)` pairs for all tasks — skips all heavy columns.
@@ -1163,9 +1172,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_summaries_returns_invalid_phase_error() -> anyhow::Result<()> {
+    async fn list_summaries_skips_invalid_phase_rows() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let good = make_task_with_metadata("task-good-summary");
+        db.insert(&good).await?;
 
         sqlx::query(
             "INSERT INTO tasks (id, status, turn, rounds, depends_on, description, phase) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1180,10 +1192,35 @@ mod tests {
         .execute(&db.pool)
         .await?;
 
-        let err = db
-            .list_summaries()
-            .await
-            .expect_err("invalid phase must fail loudly");
+        let summaries = db.list_summaries().await?;
+        let good_summary = summaries
+            .iter()
+            .find(|summary| summary.id.0 == "task-good-summary")
+            .expect("valid summary should still be returned");
+        assert_eq!(
+            good_summary.description.as_deref(),
+            Some("persisted task description")
+        );
+        assert_eq!(good_summary.phase, TaskPhase::Review);
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| summary.id.0 != "task-bad-summary"),
+            "invalid summary row should be skipped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_summaries_invalid_phase_error_is_distinguishable() -> anyhow::Result<()> {
+        let row = build_task_summary_row("[]");
+        let mut bad_row = row;
+        bad_row.id = "task-bad-summary".to_string();
+        bad_row.phase = "bogus".to_string();
+
+        let err = bad_row
+            .try_into_summary()
+            .expect_err("invalid phase must still decode as a distinguishable row error");
         let decode_error = err
             .downcast_ref::<TaskDbDecodeError>()
             .expect("error should expose task-db decode type");
