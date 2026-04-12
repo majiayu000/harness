@@ -832,9 +832,17 @@ async fn run_review_tick(
         // while secondary/synthesis agents are in flight.  The DB-backed
         // periodic_review event is only written after a successful parse (below),
         // so a server restart resets fallback_ts and the DB remains authoritative.
-        if secondary_review_id.is_some() {
-            fallback_ts_for_poll.lock().await.fallback_ts = Some(scan_ts);
-        }
+        // We capture the pre-advance value so it can be restored if
+        // parse_review_output later fails (prevents silent commit-window loss).
+        let pre_speculative_fallback_ts: Option<Option<DateTime<Utc>>> =
+            if secondary_review_id.is_some() {
+                let mut guard = fallback_ts_for_poll.lock().await;
+                let prev = guard.fallback_ts;
+                guard.fallback_ts = Some(scan_ts);
+                Some(prev)
+            } else {
+                None
+            };
 
         if let (Some(secondary_id), Some(secondary_name)) =
             (secondary_review_id.as_ref(), secondary_agent_name.as_ref())
@@ -1205,6 +1213,16 @@ async fn run_review_tick(
             }
             Err(e) => {
                 tracing::error!("scheduler: failed to parse review output as JSON: {e}");
+                // Rollback the speculative in-memory watermark advance (Cross
+                // mode) so the next tick retries this commit window instead of
+                // permanently skipping it due to a parse failure.
+                if let Some(prev_ts) = pre_speculative_fallback_ts {
+                    fallback_ts_for_poll.lock().await.fallback_ts = prev_ts;
+                    tracing::warn!(
+                        "scheduler: rolled back speculative fallback_ts after parse failure; \
+                         next tick will retry this commit window"
+                    );
+                }
             }
         }
     });
