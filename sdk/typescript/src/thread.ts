@@ -274,8 +274,10 @@ function parseTurnItem(value: unknown): TurnItem | undefined {
         return undefined;
       }
       return {
+        ...value,
         type: "approval_request",
         action: value.action,
+        ...(typeof value.id === "string" || value.id === null ? { id: value.id } : {}),
         ...(typeof value.approved === "boolean" || value.approved === null
           ? { approved: value.approved }
           : {}),

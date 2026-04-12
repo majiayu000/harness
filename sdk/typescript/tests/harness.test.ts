@@ -250,7 +250,54 @@ test("run preserves unknown turn item types in final snapshot", async () => {
   assert.equal(result.turn?.items[1]?.type, "future_item");
 });
 
-test("run handles timeout when turn never reaches terminal status", async () => {
+test("run preserves approval request ids and extra fields in final snapshot", async () => {
+  const mock = createMockFetch((method) => {
+    if (method === "thread/start") {
+      return { result: { thread_id: "thread-approval" } };
+    }
+    if (method === "turn/start") {
+      return { result: { turn_id: "turn-approval" } };
+    }
+    if (method === "turn/status") {
+      return {
+        result: {
+          id: "turn-approval",
+          thread_id: "thread-approval",
+          status: "completed",
+          items: [
+            {
+              type: "approval_request",
+              id: "approval-1",
+              action: "Bash(ls -la)",
+              approved: null,
+              extra_field: "preserve-me",
+            },
+          ],
+        },
+      };
+    }
+    return { result: {} };
+  });
+
+  const harness = new Harness({
+    fetch: mock.fetch,
+    defaultPollIntervalMs: 1,
+    defaultRunTimeoutMs: 500,
+  });
+  const thread = await harness.startThread({ cwd: "/repo" });
+  const result = await thread.run("Summarize");
+
+  assert.equal(result.status, "completed");
+  assert.deepEqual(result.turn?.items[0], {
+    type: "approval_request",
+    id: "approval-1",
+    action: "Bash(ls -la)",
+    approved: null,
+    extra_field: "preserve-me",
+  });
+});
+
+test("run emits timeout events with timeout_ms payload", async () => {
   const mock = createMockFetch((method) => {
     if (method === "thread/start") {
       return { result: { thread_id: "thread-4" } };
@@ -284,7 +331,9 @@ test("run handles timeout when turn never reaches terminal status", async () => 
   assert.equal(result.turnId, "turn-4");
   assert.equal(result.status, "running");
   assert.equal(result.timedOut, true);
-  assert.ok(result.events.some((event) => event.method === SDK_TURN_TIMEOUT));
+  const timeoutEvent = result.events.find((event) => event.method === SDK_TURN_TIMEOUT);
+  assert.ok(timeoutEvent);
+  assert.equal(timeoutEvent.params.timeout_ms, 5);
 });
 
 test("raises HarnessRpcError when server returns JSON-RPC error", async () => {

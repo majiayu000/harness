@@ -8,11 +8,14 @@ export {
   SDK_TURN_TIMEOUT,
 } from "./thread";
 export type {
+  ApprovalRequestItem,
   HarnessOptions,
   RunOptions,
   RunResult,
   StartThreadOptions,
   ThreadEvent,
+  ThreadTimeoutEvent,
+  TurnItem,
   TurnStatus,
   TurnSnapshot,
 } from "./types";

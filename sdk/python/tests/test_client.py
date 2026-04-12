@@ -108,6 +108,53 @@ class HarnessSdkTests(unittest.TestCase):
         )
         self.assertGreaterEqual(len(emitted), 3)
 
+    def test_run_preserves_approval_request_fields_in_turn_snapshot(self) -> None:
+        def rpc_handler(method: str, params: dict[str, Any]) -> Any:
+            del params
+            if method == "thread/start":
+                return {"thread_id": "thread-approval"}
+            if method == "turn/start":
+                return {"turn_id": "turn-approval"}
+            if method == "turn/status":
+                return {
+                    "id": "turn-approval",
+                    "thread_id": "thread-approval",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "approval_request",
+                            "id": "approval-1",
+                            "action": "Bash(ls -la)",
+                            "approved": None,
+                            "extra_field": "preserve-me",
+                        }
+                    ],
+                }
+            raise AssertionError(f"unexpected RPC method: {method}")
+
+        harness = Harness(rpc_handler=rpc_handler, cwd="/repo")
+        thread = harness.start_thread()
+        result = thread.run("Summarize repository", timeout_seconds=1.0, poll_interval_seconds=0.01)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(
+            result.turn,
+            {
+                "id": "turn-approval",
+                "thread_id": "thread-approval",
+                "status": "completed",
+                "items": [
+                    {
+                        "type": "approval_request",
+                        "id": "approval-1",
+                        "action": "Bash(ls -la)",
+                        "approved": None,
+                        "extra_field": "preserve-me",
+                    }
+                ],
+            },
+        )
+
     def test_run_returns_timeout_when_turn_never_completes(self) -> None:
         mock = MockRpc()
         harness = Harness(rpc_handler=mock.run_timeout, cwd="/repo")
@@ -123,7 +170,11 @@ class HarnessSdkTests(unittest.TestCase):
         self.assertEqual(result.turn_id, "turn-2")
         self.assertEqual(result.status, "running")
         self.assertTrue(result.timed_out)
-        self.assertTrue(any(event["method"] == "sdk:turn/timeout" for event in result.events))
+        timeout_event = next(
+            event for event in result.events if event["method"] == "sdk:turn/timeout"
+        )
+        self.assertEqual(timeout_event["params"]["timeout_ms"], 50)
+        self.assertNotIn("timeout_seconds", timeout_event["params"])
 
     def test_extract_output_handles_multiple_item_shapes(self) -> None:
         turn = {

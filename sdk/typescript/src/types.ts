@@ -97,8 +97,10 @@ export interface ToolCallItem {
 
 export interface ApprovalRequestItem {
   type: "approval_request";
+  id?: string | null;
   action: string;
   approved?: boolean | null;
+  [key: string]: unknown;
 }
 
 export interface ErrorItem {
