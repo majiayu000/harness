@@ -26,36 +26,25 @@ fn startup_default_project_for_root(
     default_project_id: Option<&str>,
     project_root: &std::path::Path,
 ) -> Option<harness_core::config::ProjectEntry> {
+    let canonical_project_root = project_root.canonicalize().ok();
     default_project_id.and_then(|id| {
         parsed_projects
             .iter()
             .find(|project| project.name == id)
-            .filter(|project| project.root == project_root)
+            .filter(|project| {
+                canonical_project_root
+                    .as_ref()
+                    .and_then(|canonical_root| {
+                        project
+                            .root
+                            .canonicalize()
+                            .ok()
+                            .map(|root| root == *canonical_root)
+                    })
+                    .unwrap_or_else(|| project.root == project_root)
+            })
             .cloned()
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::startup_default_project_for_root;
-    use harness_core::config::ProjectEntry;
-    use std::path::Path;
-
-    #[test]
-    fn startup_default_project_ignores_metadata_after_project_root_override() {
-        let project = ProjectEntry {
-            name: "repo-a".to_string(),
-            root: Path::new("/repo-a").to_path_buf(),
-            default: true,
-            default_agent: Some("claude".to_string()),
-            max_concurrent: Some(3),
-        };
-
-        let startup_default =
-            startup_default_project_for_root(&[project], Some("repo-a"), Path::new("/repo-b"));
-
-        assert!(startup_default.is_none());
-    }
 }
 
 pub async fn run(
@@ -255,4 +244,50 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_default_project_for_root;
+    use harness_core::config::ProjectEntry;
+    use std::path::Path;
+
+    #[test]
+    fn startup_default_project_ignores_metadata_after_project_root_override() {
+        let project = ProjectEntry {
+            name: "repo-a".to_string(),
+            root: Path::new("/repo-a").to_path_buf(),
+            default: true,
+            default_agent: Some("claude".to_string()),
+            max_concurrent: Some(3),
+        };
+
+        let startup_default =
+            startup_default_project_for_root(&[project], Some("repo-a"), Path::new("/repo-b"));
+
+        assert!(startup_default.is_none());
+    }
+
+    #[test]
+    fn startup_default_project_matches_same_root_via_relative_path_alias() {
+        let canonical_root = std::env::current_dir()
+            .expect("cwd")
+            .canonicalize()
+            .expect("canonical root");
+        let project = ProjectEntry {
+            name: "repo-a".to_string(),
+            root: canonical_root,
+            default: true,
+            default_agent: Some("claude".to_string()),
+            max_concurrent: Some(3),
+        };
+
+        let startup_default =
+            startup_default_project_for_root(&[project], Some("repo-a"), Path::new("."));
+
+        assert_eq!(
+            startup_default.map(|project| project.name),
+            Some("repo-a".to_string())
+        );
+    }
 }
