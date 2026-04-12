@@ -1274,6 +1274,7 @@ impl TaskStore {
             if let Some(status) = new_status {
                 if let Some(mut entry) = self.cache.get_mut(&task_id) {
                     entry.status = status;
+                    sync_terminal_phase_from_status(entry.value_mut());
                 }
                 // Persist before invoking the callback. If persist fails the task
                 // remains `pending` in SQLite; firing the callback anyway would push
@@ -1990,6 +1991,7 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
             // cancel or status transition must not be clobbered.
             if matches!(entry.status, TaskStatus::AwaitingDeps) {
                 entry.status = TaskStatus::Failed;
+                sync_terminal_phase_from_status(entry.value_mut());
                 entry.error = Some(format!("dependency {} failed", failed_dep_id.0));
                 newly_failed.push(task_id.clone());
             }
@@ -2932,6 +2934,42 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("reloaded task should exist"))?;
         assert!(matches!(reloaded.status, TaskStatus::Pending));
         assert_eq!(reloaded.phase, TaskPhase::Plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_awaiting_deps_syncs_failed_phase_before_persist() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let failed_dep_id = harness_core::types::TaskId("failed-dep".to_string());
+        let mut failed_dep = TaskState::new(failed_dep_id.clone());
+        failed_dep.status = TaskStatus::Failed;
+        failed_dep.phase = TaskPhase::Terminal;
+        store.insert(&failed_dep).await;
+
+        let blocked_id = harness_core::types::TaskId("blocked-by-failed-dep".to_string());
+        let mut blocked = TaskState::new(blocked_id.clone());
+        blocked.status = TaskStatus::AwaitingDeps;
+        blocked.depends_on = vec![failed_dep_id];
+        store.insert(&blocked).await;
+
+        let (_ready, failed_ids) = check_awaiting_deps(&store).await;
+        assert_eq!(failed_ids, vec![blocked_id.clone()]);
+
+        store.persist(&blocked_id).await?;
+
+        let reloaded = store
+            .db
+            .get(blocked_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("reloaded blocked task should exist"))?;
+        assert!(matches!(reloaded.status, TaskStatus::Failed));
+        assert_eq!(reloaded.phase, TaskPhase::Terminal);
+        assert_eq!(
+            reloaded.error.as_deref(),
+            Some("dependency failed-dep failed")
+        );
         Ok(())
     }
 
