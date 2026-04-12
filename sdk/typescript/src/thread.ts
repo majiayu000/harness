@@ -273,8 +273,9 @@ function parseTurnItem(value: unknown): TurnItem | undefined {
       if (typeof value.action !== "string") {
         return undefined;
       }
+      const { type: _type, action: _action, id: _id, approved: _approved, ...rest } = value;
       return {
-        ...value,
+        ...rest,
         type: "approval_request",
         action: value.action,
         ...(typeof value.id === "string" || value.id === null ? { id: value.id } : {}),

@@ -297,6 +297,51 @@ test("run preserves approval request ids and extra fields in final snapshot", as
   });
 });
 
+test("run drops invalid approval request optional fields from final snapshot", async () => {
+  const mock = createMockFetch((method) => {
+    if (method === "thread/start") {
+      return { result: { thread_id: "thread-approval-invalid" } };
+    }
+    if (method === "turn/start") {
+      return { result: { turn_id: "turn-approval-invalid" } };
+    }
+    if (method === "turn/status") {
+      return {
+        result: {
+          id: "turn-approval-invalid",
+          thread_id: "thread-approval-invalid",
+          status: "completed",
+          items: [
+            {
+              type: "approval_request",
+              id: 42,
+              action: "Bash(ls -la)",
+              approved: "yes",
+              extra_field: "preserve-me",
+            },
+          ],
+        },
+      };
+    }
+    return { result: {} };
+  });
+
+  const harness = new Harness({
+    fetch: mock.fetch,
+    defaultPollIntervalMs: 1,
+    defaultRunTimeoutMs: 500,
+  });
+  const thread = await harness.startThread({ cwd: "/repo" });
+  const result = await thread.run("Summarize");
+
+  assert.equal(result.status, "completed");
+  assert.deepEqual(result.turn?.items[0], {
+    type: "approval_request",
+    action: "Bash(ls -la)",
+    extra_field: "preserve-me",
+  });
+});
+
 test("run emits timeout events with timeout_ms payload", async () => {
   const mock = createMockFetch((method) => {
     if (method === "thread/start") {
