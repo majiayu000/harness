@@ -46,6 +46,7 @@ for event in thread.run_stream("Diagnose failing tests"):
 Events are SDK-synthesized polling lifecycle events:
 `sdk:turn/started`, `sdk:turn/status`, `sdk:turn/completed`, `sdk:turn/timeout`.
 
+Timeout events use `event["params"]["timeout_seconds"]`.
 This SDK uses synchronous polling; calls block the current thread.
 
 ## Publish to PyPI

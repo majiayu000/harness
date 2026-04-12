@@ -48,6 +48,9 @@ for await (const event of thread.runStream("Diagnose failing tests")) {
 Events are SDK-synthesized polling lifecycle events:
 `sdk:turn/started`, `sdk:turn/status`, `sdk:turn/completed`, `sdk:turn/timeout`.
 
+Timeout events use `event.params.timeout_seconds`.
+Turn snapshots preserve server fields such as `approval_request.id`.
+
 ## Publish to npm
 
 ```bash

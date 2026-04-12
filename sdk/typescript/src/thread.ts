@@ -133,7 +133,7 @@ export class HarnessThread {
             params: {
               thread_id: this.id,
               turn_id: turnId,
-              timeout_ms: timeoutMs,
+              timeout_seconds: timeoutMs / 1000,
               source: "sdk-poll",
               server_method: "turn/status",
             },
@@ -276,6 +276,7 @@ function parseTurnItem(value: unknown): TurnItem | undefined {
       return {
         type: "approval_request",
         action: value.action,
+        ...(typeof value.id === "string" || value.id === null ? { id: value.id } : {}),
         ...(typeof value.approved === "boolean" || value.approved === null
           ? { approved: value.approved }
           : {}),
