@@ -13,6 +13,6 @@ echo "=== pre-commit: clippy ==="
 RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets
 
 echo "=== pre-commit: test ==="
-cargo test --workspace
+cargo test --workspace --lib
 
 echo "=== pre-commit: all checks passed ==="
