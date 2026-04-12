@@ -136,12 +136,16 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
         let svc = DefaultProjectService::new(registry, dir.path().to_path_buf());
+        let project_root = dir.path().join("alpha-root");
+        std::fs::create_dir_all(&project_root)?;
+        let canonical_root = project_root.canonicalize()?;
 
-        svc.register(make_project("alpha", "/tmp/alpha")).await?;
+        svc.register(make_project("alpha", canonical_root.to_str().unwrap()))
+            .await?;
 
         let loaded = svc.get("alpha").await?.expect("should exist");
         assert_eq!(loaded.id, "alpha");
-        assert_eq!(loaded.root, PathBuf::from("/tmp/alpha"));
+        assert_eq!(loaded.root, canonical_root);
         Ok(())
     }
 
@@ -150,14 +154,14 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
         let svc = DefaultProjectService::new(registry, dir.path().to_path_buf());
+        let project_root = dir.path().join("beta-root");
+        std::fs::create_dir_all(&project_root)?;
+        let canonical_root = project_root.canonicalize()?;
 
-        svc.register(make_project("beta", "/home/user/beta"))
+        svc.register(make_project("beta", canonical_root.to_str().unwrap()))
             .await?;
 
-        assert_eq!(
-            svc.resolve_path("beta").await?,
-            Some(PathBuf::from("/home/user/beta"))
-        );
+        assert_eq!(svc.resolve_path("beta").await?, Some(canonical_root));
         assert_eq!(svc.resolve_path("missing").await?, None);
         Ok(())
     }
@@ -167,8 +171,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
         let svc = DefaultProjectService::new(registry, dir.path().to_path_buf());
+        let project_root = dir.path().join("gamma-root");
+        std::fs::create_dir_all(&project_root)?;
+        let canonical_root = project_root.canonicalize()?;
 
-        svc.register(make_project("gamma", "/tmp/gamma")).await?;
+        svc.register(make_project("gamma", canonical_root.to_str().unwrap()))
+            .await?;
         assert!(svc.remove("gamma").await?);
         assert!(!svc.remove("gamma").await?);
         assert!(svc.get("gamma").await?.is_none());

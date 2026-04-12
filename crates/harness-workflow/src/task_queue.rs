@@ -420,6 +420,7 @@ impl TaskQueue {
     ) -> Self {
         let project_limits: DashMap<String, usize> = config
             .per_project
+            .by_id()
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();

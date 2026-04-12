@@ -34,6 +34,47 @@ async fn resolve_project_from_registry(
     }
 }
 
+async fn resolve_queue_identity(
+    state: &Arc<AppState>,
+    project: Option<std::path::PathBuf>,
+) -> Result<(String, std::path::PathBuf), EnqueueTaskError> {
+    if let Some(registry) = state.core.project_registry.as_deref() {
+        let resolved = registry
+            .resolve_project(project.as_deref(), &state.core.project_root)
+            .await
+            .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+        return Ok((resolved.id, resolved.root));
+    }
+
+    let canonical_project = task_runner::resolve_canonical_project(project)
+        .await
+        .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+    Ok((
+        canonical_project.to_string_lossy().into_owned(),
+        canonical_project,
+    ))
+}
+
+async fn resolve_request_project(
+    state: &Arc<AppState>,
+    project: Option<std::path::PathBuf>,
+) -> Result<(String, std::path::PathBuf), EnqueueTaskError> {
+    let project =
+        resolve_project_from_registry(state.core.project_registry.as_deref(), project).await?;
+    resolve_queue_identity(state, project).await
+}
+
+fn enforce_allowed_roots(
+    state: &Arc<AppState>,
+    canonical_project: &std::path::Path,
+) -> Result<(), EnqueueTaskError> {
+    check_allowed_roots(
+        canonical_project,
+        &state.core.server.config.server.allowed_project_roots,
+    )
+    .map_err(EnqueueTaskError::BadRequest)
+}
+
 pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
     mut req: task_runner::CreateTaskRequest,
@@ -51,34 +92,10 @@ pub(crate) async fn enqueue_task(
         )));
     }
 
-    // Resolve project: if the supplied path does not exist as a directory,
-    // treat it as a project ID and look it up in the registry.
-    req.project =
-        resolve_project_from_registry(state.core.project_registry.as_deref(), req.project).await?;
-
-    // Resolve and canonicalize the project root BEFORE acquiring the
-    // concurrency permit so that:
-    //   (a) None is mapped to the real worktree path rather than the literal
-    //       "default" key, so per_project config for that path is respected.
-    //   (b) Symlinked / relative / differently-spelled paths are normalised
-    //       to the same canonical bucket, preventing limit bypass.
-    // Overwrite req.project with the resolved path so spawn_task does not
-    // re-detect the worktree inside the spawned future.
-    let canonical_project = task_runner::resolve_canonical_project(req.project.clone())
-        .await
-        .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
-
-    // Enforce allowed_project_roots allowlist on the resolved canonical path so
-    // callers cannot bypass it by supplying a real directory path directly
-    // instead of registering the project first.
-    check_allowed_roots(
-        &canonical_project,
-        &state.core.server.config.server.allowed_project_roots,
-    )
-    .map_err(EnqueueTaskError::BadRequest)?;
-
-    let project_id = canonical_project.to_string_lossy().into_owned();
-    req.project = Some(canonical_project);
+    // Resolve project input once into the canonical queue identity + execution root.
+    let (project_id, project_root) = resolve_request_project(state, req.project).await?;
+    enforce_allowed_roots(state, &project_root)?;
+    req.project = Some(project_root);
 
     // Acquire concurrency permit before spawning. Blocks if all slots are
     // occupied; rejects immediately if the waiting queue is full.
@@ -233,10 +250,9 @@ async fn enqueue_task_background(
         )));
     }
 
-    // Resolve project: if the supplied path does not exist as a directory,
-    // treat it as a project ID and look it up in the registry.
-    req.project =
-        resolve_project_from_registry(state.core.project_registry.as_deref(), req.project).await?;
+    let (project_id, project_root) = resolve_request_project(&state, req.project).await?;
+    enforce_allowed_roots(&state, &project_root)?;
+    req.project = Some(project_root);
 
     // Resolve agent up-front (fast, no I/O) so we can return an error immediately
     // if the agent name is invalid, before registering the task.
@@ -265,20 +281,6 @@ async fn enqueue_task_background(
         agent.name(),
     );
 
-    // Resolve canonical project for per-project concurrency limits.
-    let canonical_project = task_runner::resolve_canonical_project(req.project.clone())
-        .await
-        .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
-
-    // Enforce allowed_project_roots allowlist (same guard as enqueue_task).
-    check_allowed_roots(
-        &canonical_project,
-        &state.core.server.config.server.allowed_project_roots,
-    )
-    .map_err(EnqueueTaskError::BadRequest)?;
-
-    let project_id = canonical_project.to_string_lossy().into_owned();
-    req.project = Some(canonical_project);
     task_runner::fill_missing_repo_from_project(&mut req).await;
 
     let server_config = std::sync::Arc::new(state.core.server.config.clone());
@@ -569,6 +571,148 @@ pub(super) async fn cancel_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::{
+        ConcurrencyServices, CoreServices, EngineServices, IntakeServices, NotificationServices,
+        ObservabilityServices,
+    };
+    use crate::project_registry::{Project, ProjectRegistry};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::time::Duration;
+
+    async fn make_state_with_registry_and_queue_limit(
+        dir: &std::path::Path,
+        per_project_key: &str,
+        limit: usize,
+    ) -> anyhow::Result<(Arc<AppState>, PathBuf)> {
+        let thread_manager = crate::thread_manager::ThreadManager::new();
+        let mut config = harness_core::config::HarnessConfig::default();
+        config
+            .concurrency
+            .per_project
+            .by_id_mut()
+            .insert(per_project_key.to_string(), limit);
+        let server = Arc::new(crate::server::HarnessServer::new(
+            config,
+            thread_manager,
+            harness_agents::registry::AgentRegistry::new("test"),
+        ));
+        let tasks = crate::task_runner::TaskStore::open(
+            &harness_core::config::dirs::default_db_path(dir, "tasks"),
+        )
+        .await?;
+        let events = Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
+        let signal_detector = harness_gc::signal_detector::SignalDetector::new(
+            server.config.gc.signal_thresholds.clone().into(),
+            harness_core::types::ProjectId::new(),
+        );
+        let draft_store = harness_gc::draft_store::DraftStore::new(dir)?;
+        let gc_agent = Arc::new(harness_gc::gc_agent::GcAgent::new(
+            server.config.gc.clone(),
+            signal_detector,
+            draft_store,
+            dir.to_path_buf(),
+        ));
+        let thread_db = crate::thread_db::ThreadDb::open(
+            &harness_core::config::dirs::default_db_path(dir, "threads"),
+        )
+        .await?;
+        let registry = ProjectRegistry::open(&dir.join("projects.db")).await?;
+        let named_root = dir.join("named-project");
+        std::fs::create_dir_all(&named_root)?;
+        let canonical_root = named_root.canonicalize()?;
+        registry
+            .register(Project {
+                id: "named".to_string(),
+                root: canonical_root.clone(),
+                max_concurrent: None,
+                default_agent: None,
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await?;
+        let project_svc = crate::services::project::DefaultProjectService::new(
+            ProjectRegistry::open(&dir.join("projects-service.db")).await?,
+            dir.to_path_buf(),
+        );
+        let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+        let task_queue = Arc::new(crate::task_queue::TaskQueue::new(
+            &server.config.concurrency,
+        ));
+        let execution_svc = crate::services::execution::DefaultExecutionService::new(
+            tasks.clone(),
+            server.agent_registry.clone(),
+            Arc::new(server.config.clone()),
+            Default::default(),
+            events.clone(),
+            vec![],
+            None,
+            task_queue.clone(),
+            None,
+            None,
+            vec![],
+        );
+        let state = Arc::new(AppState {
+            core: CoreServices {
+                server,
+                project_root: dir.to_path_buf(),
+                home_dir: dir.to_path_buf(),
+                tasks,
+                thread_db: Some(thread_db),
+                plan_db: None,
+                plan_cache: Arc::new(dashmap::DashMap::new()),
+                project_registry: Some(registry),
+                runtime_state_store: None,
+                q_values: None,
+            },
+            engines: EngineServices {
+                skills: Arc::new(tokio::sync::RwLock::new(
+                    harness_skills::store::SkillStore::new(),
+                )),
+                rules: Arc::new(tokio::sync::RwLock::new(
+                    harness_rules::engine::RuleEngine::new(),
+                )),
+                gc_agent,
+            },
+            observability: ObservabilityServices {
+                events,
+                signal_rate_limiter: Arc::new(crate::http::rate_limit::SignalRateLimiter::new(100)),
+                password_reset_rate_limiter: Arc::new(
+                    crate::http::rate_limit::PasswordResetRateLimiter::new(5),
+                ),
+                review_store: None,
+            },
+            concurrency: ConcurrencyServices {
+                task_queue,
+                workspace_mgr: None,
+            },
+            runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
+            runtime_project_cache: Arc::new(
+                crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
+            ),
+            runtime_state_persist_lock: tokio::sync::Mutex::new(()),
+            runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
+            notifications: NotificationServices {
+                notification_tx: tokio::sync::broadcast::channel(32).0,
+                notification_lagged_total: Arc::new(AtomicU64::new(0)),
+                notification_lag_log_every: 1,
+                notify_tx: None,
+                initializing: Arc::new(AtomicBool::new(true)),
+                initialized: Arc::new(AtomicBool::new(true)),
+                ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            },
+            interceptors: vec![],
+            intake: IntakeServices {
+                feishu_intake: None,
+                github_pollers: vec![],
+                completion_callback: None,
+            },
+            project_svc,
+            task_svc,
+            execution_svc,
+        });
+        Ok((state, canonical_root))
+    }
 
     #[test]
     fn batch_request_deserializes_issues_format() {
@@ -666,10 +810,13 @@ mod tests {
         let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
             .await
             .unwrap();
+        let project_root = dir.path().join("my-repo");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let canonical_root = project_root.canonicalize().unwrap();
         registry
             .register(crate::project_registry::Project {
                 id: "my-repo".to_string(),
-                root: std::path::PathBuf::from("/home/user/my-repo"),
+                root: canonical_root.clone(),
                 max_concurrent: None,
                 default_agent: None,
                 active: true,
@@ -683,10 +830,32 @@ mod tests {
             Some(std::path::PathBuf::from("my-repo")),
         )
         .await;
-        assert_eq!(
-            result.unwrap(),
-            Some(std::path::PathBuf::from("/home/user/my-repo"))
-        );
+        assert_eq!(result.unwrap(), Some(canonical_root));
+    }
+
+    #[tokio::test]
+    async fn resolve_project_from_registry_resolves_registered_root_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
+            .await
+            .unwrap();
+        let root_dir = tempfile::tempdir().unwrap();
+        let canonical_root = root_dir.path().canonicalize().unwrap();
+        registry
+            .register(crate::project_registry::Project {
+                id: "my-repo".to_string(),
+                root: canonical_root.clone(),
+                max_concurrent: None,
+                default_agent: None,
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let result =
+            resolve_project_from_registry(Some(&registry), Some(canonical_root.clone())).await;
+        assert_eq!(result.unwrap(), Some(canonical_root));
     }
 
     #[tokio::test]
@@ -702,6 +871,36 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(EnqueueTaskError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn enqueue_task_should_bucket_registered_project_id_and_root_alias_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, canonical_root) =
+            make_state_with_registry_and_queue_limit(dir.path(), "named", 1)
+                .await
+                .unwrap();
+
+        let holder = state
+            .concurrency
+            .task_queue
+            .acquire("named", 0)
+            .await
+            .unwrap();
+        let req = crate::task_runner::CreateTaskRequest {
+            prompt: Some("fix bug".to_string()),
+            project: Some(canonical_root.clone()),
+            ..Default::default()
+        };
+
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(50), enqueue_task(&state, req)).await;
+        drop(holder);
+
+        assert!(
+            blocked.is_err(),
+            "root alias should block behind the named project bucket"
+        );
     }
 
     #[test]

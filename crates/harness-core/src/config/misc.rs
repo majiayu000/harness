@@ -52,6 +52,59 @@ impl Default for WorkspaceConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TypedPerProjectConcurrencyLimits {
+    /// Limits keyed by canonical project id.
+    #[serde(default)]
+    pub by_id: HashMap<String, usize>,
+    /// Transitional limits keyed by canonical project root path string.
+    #[serde(default)]
+    pub by_root: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PerProjectConcurrencyLimits {
+    Legacy(HashMap<String, usize>),
+    Typed(TypedPerProjectConcurrencyLimits),
+}
+
+impl Default for PerProjectConcurrencyLimits {
+    fn default() -> Self {
+        Self::Typed(TypedPerProjectConcurrencyLimits::default())
+    }
+}
+
+impl PerProjectConcurrencyLimits {
+    pub fn by_id_mut(&mut self) -> &mut HashMap<String, usize> {
+        match self {
+            Self::Legacy(map) => map,
+            Self::Typed(typed) => &mut typed.by_id,
+        }
+    }
+
+    pub fn by_id(&self) -> &HashMap<String, usize> {
+        match self {
+            Self::Legacy(map) => map,
+            Self::Typed(typed) => &typed.by_id,
+        }
+    }
+
+    pub fn by_root(&self) -> Option<&HashMap<String, usize>> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Typed(typed) => Some(&typed.by_root),
+        }
+    }
+
+    pub fn legacy(&self) -> Option<&HashMap<String, usize>> {
+        match self {
+            Self::Legacy(map) => Some(map),
+            Self::Typed(_) => None,
+        }
+    }
+}
+
 /// Concurrency limiting configuration for task execution.
 ///
 /// Controls how many tasks run simultaneously and how many can wait
@@ -67,10 +120,11 @@ pub struct ConcurrencyConfig {
     /// Seconds of silence from the agent stream before declaring a stall. Default: 300.
     #[serde(default = "default_stall_timeout_secs")]
     pub stall_timeout_secs: u64,
-    /// Per-project concurrency limits. Maps project path string → max concurrent tasks.
-    /// Projects not listed here use the global `max_concurrent_tasks` limit.
+    /// Per-project concurrency limits. Legacy configs may still use a flat
+    /// map keyed by raw project strings; new configs should prefer `by_id`
+    /// and only use `by_root` during migration.
     #[serde(default)]
-    pub per_project: HashMap<String, usize>,
+    pub per_project: PerProjectConcurrencyLimits,
     /// Maximum total agent API calls across all phases (implementation + validation retries +
     /// review rounds). `None` = unlimited. Counts every call including validation retries.
     /// Recommended production value: 20.
@@ -120,7 +174,7 @@ impl Default for ConcurrencyConfig {
             max_concurrent_tasks: default_max_concurrent_tasks(),
             max_queue_size: default_max_queue_size(),
             stall_timeout_secs: default_stall_timeout_secs(),
-            per_project: HashMap::new(),
+            per_project: PerProjectConcurrencyLimits::default(),
             max_turns: None,
             loop_jaccard_threshold: default_loop_jaccard_threshold(),
             memory_pressure_threshold_mb: None,
@@ -446,6 +500,36 @@ mod tests {
         let cfg: ConcurrencyConfig = toml::from_str(toml).expect("toml parse failed");
         assert_eq!(cfg.memory_pressure_threshold_mb, Some(512));
         assert_eq!(cfg.memory_poll_interval_secs, 10);
+    }
+
+    #[test]
+    fn concurrency_config_accepts_legacy_per_project_map() {
+        let toml = r#"
+            [per_project]
+            harness = 2
+        "#;
+        let cfg: ConcurrencyConfig = toml::from_str(toml).expect("toml parse failed");
+        assert_eq!(cfg.per_project.by_id().get("harness"), Some(&2));
+        assert!(cfg.per_project.by_root().is_none());
+    }
+
+    #[test]
+    fn concurrency_config_accepts_typed_per_project_map() {
+        let toml = r#"
+            [per_project.by_id]
+            harness = 2
+
+            [per_project.by_root]
+            "/tmp/harness" = 1
+        "#;
+        let cfg: ConcurrencyConfig = toml::from_str(toml).expect("toml parse failed");
+        assert_eq!(cfg.per_project.by_id().get("harness"), Some(&2));
+        assert_eq!(
+            cfg.per_project
+                .by_root()
+                .and_then(|by_root| by_root.get("/tmp/harness")),
+            Some(&1)
+        );
     }
 
     #[test]
