@@ -6,11 +6,17 @@ use crate::{
     thread_manager::ThreadManager,
 };
 use harness_agents::registry::AgentRegistry;
-use harness_core::config::HarnessConfig;
+use harness_core::{
+    agent::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest},
+    config::HarnessConfig,
+};
 use harness_protocol::{methods::Method, methods::RpcRequest, methods::INTERNAL_ERROR};
 use serde_json::json;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::time::{timeout, Duration};
 
 async fn make_test_state_with_config_and_registry(
@@ -1515,11 +1521,7 @@ async fn run_turn_lifecycle_registers_active_adapter_from_descriptor() -> anyhow
         loop {
             if server
                 .thread_manager
-                .respond_approval_on_turn(
-                    &turn_id,
-                    "req-1".to_string(),
-                    harness_core::agent::ApprovalDecision::Accept,
-                )
+                .respond_approval_on_turn(&turn_id, "req-1".to_string(), ApprovalDecision::Accept)
                 .await
                 .is_ok()
             {
@@ -1532,6 +1534,210 @@ async fn run_turn_lifecycle_registers_active_adapter_from_descriptor() -> anyhow
 
     lifecycle.await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn run_turn_lifecycle_starts_codex_style_adapter_for_live_controls() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut registry = AgentRegistry::new("codex");
+    let adapter = Arc::new(RecordingAdapter::new());
+    registry.register_with_adapter(
+        "codex",
+        Arc::new(TestAgent::new("codex")),
+        Some(adapter.clone()),
+    );
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), HarnessConfig::default(), registry)
+            .await?;
+    let server = state.core.server.clone();
+    let thread_id = server.thread_manager.start_thread(dir.path().to_path_buf());
+    let turn_id = server.thread_manager.start_turn(
+        &thread_id,
+        "prompt".to_string(),
+        harness_core::types::AgentId::new(),
+    )?;
+
+    let lifecycle = tokio::spawn(crate::task_executor::run_turn_lifecycle(
+        server.clone(),
+        state.core.thread_db.clone(),
+        state.notifications.notify_tx.clone(),
+        state.notifications.notification_tx.clone(),
+        thread_id.clone(),
+        turn_id.clone(),
+        "prompt".to_string(),
+        "codex".to_string(),
+    ));
+
+    adapter.wait_until_started().await?;
+
+    server
+        .thread_manager
+        .steer_active_turn(&thread_id, &turn_id, "please adjust".to_string())
+        .await?;
+    server
+        .thread_manager
+        .respond_approval_on_turn(&turn_id, "req-1".to_string(), ApprovalDecision::Accept)
+        .await?;
+
+    lifecycle.await?;
+
+    assert!(
+        adapter.started.load(Ordering::SeqCst),
+        "adapter start_turn must be invoked for live-controlled turns"
+    );
+    assert_eq!(
+        adapter.take_steers().await,
+        vec!["please adjust".to_string()],
+        "steer should reach the live adapter"
+    );
+    assert_eq!(
+        adapter.take_approvals().await,
+        vec![("req-1".to_string(), ApprovalDecision::Accept)],
+        "approval should reach the live adapter"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_turn_lifecycle_does_not_expose_unstarted_adapter_controls() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut registry = AgentRegistry::new("codex");
+    registry.register_with_adapter(
+        "codex",
+        Arc::new(TestAgent::new("codex")),
+        Some(Arc::new(crate::test_helpers::NoopTestAdapter::new("codex"))),
+    );
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), HarnessConfig::default(), registry)
+            .await?;
+    let server = state.core.server.clone();
+    let thread_id = server.thread_manager.start_thread(dir.path().to_path_buf());
+    let turn_id = server.thread_manager.start_turn(
+        &thread_id,
+        "prompt".to_string(),
+        harness_core::types::AgentId::new(),
+    )?;
+
+    crate::task_executor::run_turn_lifecycle(
+        server.clone(),
+        state.core.thread_db.clone(),
+        state.notifications.notify_tx.clone(),
+        state.notifications.notification_tx.clone(),
+        thread_id.clone(),
+        turn_id.clone(),
+        "prompt".to_string(),
+        "codex".to_string(),
+    )
+    .await;
+
+    let steer_err = server
+        .thread_manager
+        .steer_active_turn(&thread_id, &turn_id, "please adjust".to_string())
+        .await
+        .expect_err("completed turn must not retain active adapter control");
+    assert!(
+        steer_err.to_string().contains("no active adapter"),
+        "expected no-active-adapter error, got: {steer_err}"
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct RecordingState {
+    steers: Vec<String>,
+    approvals: Vec<(String, ApprovalDecision)>,
+}
+
+struct RecordingAdapter {
+    started: AtomicBool,
+    state: Mutex<RecordingState>,
+    started_tx: Mutex<Option<oneshot::Sender<()>>>,
+    started_rx: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl RecordingAdapter {
+    fn new() -> Self {
+        let (started_tx, started_rx) = oneshot::channel();
+        Self {
+            started: AtomicBool::new(false),
+            state: Mutex::new(RecordingState::default()),
+            started_tx: Mutex::new(Some(started_tx)),
+            started_rx: Mutex::new(Some(started_rx)),
+        }
+    }
+
+    async fn wait_until_started(&self) -> anyhow::Result<()> {
+        if self.started.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut receiver = self.started_rx.lock().await;
+        let Some(rx) = receiver.take() else {
+            anyhow::bail!("start notification receiver missing")
+        };
+        rx.await.map_err(|err| anyhow::anyhow!(err.to_string()))
+    }
+
+    async fn take_steers(&self) -> Vec<String> {
+        let mut state = self.state.lock().await;
+        std::mem::take(&mut state.steers)
+    }
+
+    async fn take_approvals(&self) -> Vec<(String, ApprovalDecision)> {
+        let mut state = self.state.lock().await;
+        std::mem::take(&mut state.approvals)
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentAdapter for RecordingAdapter {
+    fn name(&self) -> &str {
+        "recording"
+    }
+
+    async fn start_turn(
+        &self,
+        _req: TurnRequest,
+        tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> harness_core::error::Result<()> {
+        self.started.store(true, Ordering::SeqCst);
+        if let Some(started_tx) = self.started_tx.lock().await.take() {
+            let _ = started_tx.send(());
+        }
+        tx.send(AgentEvent::TurnStarted)
+            .await
+            .map_err(|err| harness_core::error::HarnessError::AgentExecution(err.to_string()))?;
+        tx.send(AgentEvent::ApprovalRequest {
+            id: "req-1".to_string(),
+            command: "echo test".to_string(),
+        })
+        .await
+        .map_err(|err| harness_core::error::HarnessError::AgentExecution(err.to_string()))?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(AgentEvent::TurnCompleted {
+            output: "done".to_string(),
+        })
+        .await
+        .map_err(|err| harness_core::error::HarnessError::AgentExecution(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+
+    async fn steer(&self, text: String) -> harness_core::error::Result<()> {
+        self.state.lock().await.steers.push(text);
+        Ok(())
+    }
+
+    async fn respond_approval(
+        &self,
+        id: String,
+        decision: ApprovalDecision,
+    ) -> harness_core::error::Result<()> {
+        self.state.lock().await.approvals.push((id, decision));
+        Ok(())
+    }
 }
 
 #[tokio::test]

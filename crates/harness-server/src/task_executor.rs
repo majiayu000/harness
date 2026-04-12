@@ -195,6 +195,7 @@ pub(crate) async fn run_turn_lifecycle(
         return;
     };
     let agent = descriptor.code_agent();
+    let adapter = descriptor.adapter();
 
     // RAII guard: ensures the adapter is deregistered when the turn scope exits,
     // even if the task is cancelled before reaching the end of this function.
@@ -210,73 +211,203 @@ pub(crate) async fn run_turn_lifecycle(
         }
     }
 
-    // Register adapter for this turn if one is configured for this descriptor.
-    // Enables turn/steer and turn/respond_approval to reach the live process.
-    let _adapter_guard = descriptor.adapter().map(|adapter_arc| {
-        server
-            .thread_manager
-            .register_active_adapter(&turn_id, adapter_arc.clone());
-        AdapterGuard {
-            server: server.clone(),
-            turn_id: turn_id.clone(),
-        }
-    });
-
     let req = AgentRequest {
-        prompt,
-        project_root,
+        prompt: prompt.clone(),
+        project_root: project_root.clone(),
         ..Default::default()
     };
 
+    let turn_req = harness_core::agent::TurnRequest {
+        prompt,
+        project_root,
+        model: None,
+        allowed_tools: Vec::new(),
+        context: Vec::new(),
+        timeout_secs: None,
+    };
+
     let stall_timeout = Duration::from_secs(server.config.concurrency.stall_timeout_secs);
-    let (stream_tx, mut stream_rx) = mpsc::channel(128);
-    let mut execution = std::pin::pin!(agent.execute_stream(req, stream_tx));
     let mut stream_closed = false;
     let mut execution_result: Option<harness_core::error::Result<()>> = None;
     let mut last_activity = Instant::now();
 
-    'outer: while execution_result.is_none() || !stream_closed {
-        tokio::select! {
-            result = &mut execution, if execution_result.is_none() => {
-                execution_result = Some(result);
-            }
-            incoming = stream_rx.recv(), if !stream_closed => {
-                match incoming {
-                    Some(item) => {
-                        last_activity = Instant::now();
-                        process_stream_item(
-                            &server,
-                            &thread_db,
-                            &notify_tx,
-                            &notification_tx,
-                            &thread_id,
-                            &turn_id,
-                            item,
-                        ).await;
-                    }
-                    None => {
-                        stream_closed = true;
+    if let Some(adapter_arc) = adapter {
+        server
+            .thread_manager
+            .register_active_adapter(&turn_id, adapter_arc.clone());
+        let _adapter_guard = AdapterGuard {
+            server: server.clone(),
+            turn_id: turn_id.clone(),
+        };
+
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let mut execution = std::pin::pin!(adapter_arc.start_turn(turn_req, event_tx));
+
+        'outer: while execution_result.is_none() || !stream_closed {
+            tokio::select! {
+                result = &mut execution, if execution_result.is_none() => {
+                    execution_result = Some(result);
+                }
+                incoming = event_rx.recv(), if !stream_closed => {
+                    match incoming {
+                        Some(event) => {
+                            last_activity = Instant::now();
+                            match event {
+                                harness_core::agent::AgentEvent::TurnStarted => {}
+                                harness_core::agent::AgentEvent::ItemStarted { item_type } => {
+                                    process_stream_item(
+                                        &server,
+                                        &thread_db,
+                                        &notify_tx,
+                                        &notification_tx,
+                                        &thread_id,
+                                        &turn_id,
+                                        StreamItem::ItemStarted {
+                                            item: harness_core::types::Item::AgentReasoning {
+                                                content: format!("started: {item_type}"),
+                                            },
+                                        },
+                                    ).await;
+                                }
+                                harness_core::agent::AgentEvent::MessageDelta { text } => {
+                                    process_stream_item(
+                                        &server,
+                                        &thread_db,
+                                        &notify_tx,
+                                        &notification_tx,
+                                        &thread_id,
+                                        &turn_id,
+                                        StreamItem::MessageDelta { text },
+                                    ).await;
+                                }
+                                harness_core::agent::AgentEvent::ToolCall { name, input } => {
+                                    process_stream_item(
+                                        &server,
+                                        &thread_db,
+                                        &notify_tx,
+                                        &notification_tx,
+                                        &thread_id,
+                                        &turn_id,
+                                        StreamItem::ItemCompleted {
+                                            item: harness_core::types::Item::ToolCall {
+                                                name,
+                                                input,
+                                                output: None,
+                                            },
+                                        },
+                                    ).await;
+                                }
+                                harness_core::agent::AgentEvent::ApprovalRequest { id, command } => {
+                                    process_stream_item(
+                                        &server,
+                                        &thread_db,
+                                        &notify_tx,
+                                        &notification_tx,
+                                        &thread_id,
+                                        &turn_id,
+                                        StreamItem::ApprovalRequest { id, command },
+                                    ).await;
+                                }
+                                harness_core::agent::AgentEvent::ItemCompleted => {}
+                                harness_core::agent::AgentEvent::TurnCompleted { output } => {
+                                    process_stream_item(
+                                        &server,
+                                        &thread_db,
+                                        &notify_tx,
+                                        &notification_tx,
+                                        &thread_id,
+                                        &turn_id,
+                                        StreamItem::ItemCompleted {
+                                            item: harness_core::types::Item::AgentReasoning { content: output },
+                                        },
+                                    ).await;
+                                }
+                                harness_core::agent::AgentEvent::Error { message } => {
+                                    process_stream_item(
+                                        &server,
+                                        &thread_db,
+                                        &notify_tx,
+                                        &notification_tx,
+                                        &thread_id,
+                                        &turn_id,
+                                        StreamItem::Error { message },
+                                    ).await;
+                                }
+                            }
+                        }
+                        None => {
+                            stream_closed = true;
+                        }
                     }
                 }
-            }
-            _ = tokio::time::sleep_until(last_activity + stall_timeout) => {
-                let elapsed = last_activity.elapsed();
-                tracing::warn!(
-                    thread_id = %thread_id,
-                    turn_id = %turn_id,
-                    elapsed_secs = elapsed.as_secs(),
-                    "agent stream stall detected; no output for {}s",
-                    stall_timeout.as_secs()
-                );
-                // Store the stall reason as the execution result so the Err branch
-                // below appends a stall-specific Item::Error before marking failed.
-                execution_result = Some(Err(HarnessError::AgentExecution(format!(
-                    "Agent stream stalled: no output for {}s",
-                    stall_timeout.as_secs()
-                ))));
-                break 'outer;
+                _ = tokio::time::sleep_until(last_activity + stall_timeout) => {
+                    let elapsed = last_activity.elapsed();
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        turn_id = %turn_id,
+                        elapsed_secs = elapsed.as_secs(),
+                        "agent stream stall detected; no output for {}s",
+                        stall_timeout.as_secs()
+                    );
+                    execution_result = Some(Err(HarnessError::AgentExecution(format!(
+                        "Agent stream stalled: no output for {}s",
+                        stall_timeout.as_secs()
+                    ))));
+                    break 'outer;
+                }
             }
         }
+    } else {
+        let (stream_tx, mut stream_rx) = mpsc::channel(128);
+        let mut execution = std::pin::pin!(agent.execute_stream(req, stream_tx));
+
+        'outer: while execution_result.is_none() || !stream_closed {
+            tokio::select! {
+                result = &mut execution, if execution_result.is_none() => {
+                    execution_result = Some(result);
+                }
+                incoming = stream_rx.recv(), if !stream_closed => {
+                    match incoming {
+                        Some(item) => {
+                            last_activity = Instant::now();
+                            process_stream_item(
+                                &server,
+                                &thread_db,
+                                &notify_tx,
+                                &notification_tx,
+                                &thread_id,
+                                &turn_id,
+                                item,
+                            ).await;
+                        }
+                        None => {
+                            stream_closed = true;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(last_activity + stall_timeout) => {
+                    let elapsed = last_activity.elapsed();
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        turn_id = %turn_id,
+                        elapsed_secs = elapsed.as_secs(),
+                        "agent stream stall detected; no output for {}s",
+                        stall_timeout.as_secs()
+                    );
+                    // Store the stall reason as the execution result so the Err branch
+                    // below appends a stall-specific Item::Error before marking failed.
+                    execution_result = Some(Err(HarnessError::AgentExecution(format!(
+                        "Agent stream stalled: no output for {}s",
+                        stall_timeout.as_secs()
+                    ))));
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    if execution_result.is_none() {
+        execution_result = Some(Ok(()));
     }
 
     match execution_result.unwrap_or_else(|| {
