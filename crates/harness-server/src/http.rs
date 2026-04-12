@@ -804,8 +804,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         }
     };
     if let Some(store) = runtime_state_store.as_ref() {
-        match store.load_snapshot().await {
-            Ok(Some(snapshot)) => {
+        match store.try_load_snapshot().await {
+            Ok((Some(snapshot), crate::runtime_state_store::LoadSnapshotOutcome::Loaded)) => {
                 let restored_hosts = runtime_hosts.restore_state(snapshot.hosts, snapshot.leases);
                 let restored_project_caches =
                     runtime_project_cache.restore_state(snapshot.project_caches);
@@ -816,7 +816,28 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                     "runtime state restored from persistent snapshot"
                 );
             }
-            Ok(None) => {}
+            Ok((None, crate::runtime_state_store::LoadSnapshotOutcome::NotFound)) => {
+                tracing::info!("no runtime state snapshot found on startup");
+            }
+            Ok((
+                None,
+                crate::runtime_state_store::LoadSnapshotOutcome::SchemaMismatch { found, expected },
+            )) => {
+                tracing::warn!(
+                    found_schema_version = found,
+                    expected_schema_version = expected,
+                    "runtime state snapshot skipped on startup due to schema mismatch"
+                );
+            }
+            Ok((None, crate::runtime_state_store::LoadSnapshotOutcome::Loaded)) => {
+                tracing::warn!("runtime state snapshot load returned loaded outcome without data");
+            }
+            Ok((Some(_), outcome)) => {
+                tracing::warn!(
+                    ?outcome,
+                    "runtime state snapshot load returned unexpected outcome"
+                );
+            }
             Err(e) => {
                 tracing::warn!("failed to load runtime state snapshot on startup: {e}");
             }
