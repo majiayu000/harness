@@ -719,6 +719,44 @@ impl TaskStore {
         }
     }
 
+    /// Find an active (pending/running) task for the same project + external_id.
+    ///
+    /// Checks the in-memory cache first, falls back to DB. Used by the enqueue
+    /// path to prevent duplicate tasks for the same issue/PR.
+    pub async fn find_active_duplicate(&self, project: &str, external_id: &str) -> Option<TaskId> {
+        // Check in-memory cache first (covers tasks not yet persisted).
+        for entry in self.cache.iter() {
+            let state = entry.value();
+            let is_active = matches!(
+                state.status,
+                TaskStatus::Pending
+                    | TaskStatus::AwaitingDeps
+                    | TaskStatus::Implementing
+                    | TaskStatus::AgentReview
+                    | TaskStatus::Waiting
+                    | TaskStatus::Reviewing
+            );
+            if is_active
+                && state.external_id.as_deref() == Some(external_id)
+                && state
+                    .project_root
+                    .as_ref()
+                    .is_some_and(|p| p.to_string_lossy() == project)
+            {
+                return Some(state.id.clone());
+            }
+        }
+        // Fall back to DB for tasks not in cache.
+        match self.db.find_active_duplicate(project, external_id).await {
+            Ok(Some(id)) => Some(harness_core::types::TaskId(id)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("dedup DB lookup failed (non-fatal): {e}");
+                None
+            }
+        }
+    }
+
     /// Return IDs of terminal tasks (Done, Failed, Cancelled) directly from the database.
     ///
     /// Used during startup for worktree cleanup. Only fetches task IDs to avoid
@@ -1347,6 +1385,7 @@ pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskReques
     state.depends_on = req.depends_on.clone();
     state.priority = req.priority;
     state.issue = req.issue;
+    state.project_root = req.project.clone();
     state.description = summarize_request_description(req);
     store.insert(&state).await;
     // Register stream channel now so SSE clients can subscribe before execution begins.

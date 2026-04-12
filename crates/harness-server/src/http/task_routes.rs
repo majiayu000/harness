@@ -80,6 +80,32 @@ pub(crate) async fn enqueue_task(
     let project_id = canonical_project.to_string_lossy().into_owned();
     req.project = Some(canonical_project);
 
+    // Auto-populate external_id from issue/pr for deduplication.
+    if req.external_id.is_none() {
+        if let Some(issue) = req.issue {
+            req.external_id = Some(format!("issue:{issue}"));
+        } else if let Some(pr) = req.pr {
+            req.external_id = Some(format!("pr:{pr}"));
+        }
+    }
+
+    // Dedup: reject if an active task already exists for this project + external_id.
+    if let Some(ext_id) = &req.external_id {
+        if let Some(existing_id) = state
+            .core
+            .tasks
+            .find_active_duplicate(&project_id, ext_id)
+            .await
+        {
+            tracing::info!(
+                existing_task = %existing_id.0,
+                external_id = %ext_id,
+                "dedup: returning existing active task instead of creating duplicate"
+            );
+            return Ok(existing_id);
+        }
+    }
+
     // Acquire concurrency permit before spawning. Blocks if all slots are
     // occupied; rejects immediately if the waiting queue is full.
     let permit = state
@@ -280,6 +306,32 @@ async fn enqueue_task_background(
     let project_id = canonical_project.to_string_lossy().into_owned();
     req.project = Some(canonical_project);
     task_runner::fill_missing_repo_from_project(&mut req).await;
+
+    // Auto-populate external_id from issue/pr for deduplication.
+    if req.external_id.is_none() {
+        if let Some(issue) = req.issue {
+            req.external_id = Some(format!("issue:{issue}"));
+        } else if let Some(pr) = req.pr {
+            req.external_id = Some(format!("pr:{pr}"));
+        }
+    }
+
+    // Dedup: reject if an active task already exists for this project + external_id.
+    if let Some(ext_id) = &req.external_id {
+        if let Some(existing_id) = state
+            .core
+            .tasks
+            .find_active_duplicate(&project_id, ext_id)
+            .await
+        {
+            tracing::info!(
+                existing_task = %existing_id.0,
+                external_id = %ext_id,
+                "dedup: returning existing active task instead of creating duplicate (batch)"
+            );
+            return Ok(existing_id);
+        }
+    }
 
     let server_config = std::sync::Arc::new(state.core.server.config.clone());
 
