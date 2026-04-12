@@ -135,7 +135,8 @@ pub struct TaskState {
     pub issue: Option<u64>,
     /// Repository slug (e.g. "owner/repo"). Persisted for traceability.
     pub repo: Option<String>,
-    /// Short description derived from the task prompt or issue number. Set at spawn time; not persisted.
+    /// Short description derived from the task prompt or issue number.
+    /// Persisted in the tasks table so DB fallback and summaries preserve the real value.
     #[serde(skip)]
     pub description: Option<String>,
     /// ISO 8601 creation timestamp. Set at spawn time and persisted to the tasks DB.
@@ -145,7 +146,8 @@ pub struct TaskState {
     /// Persisted to DB and used by TaskQueue::acquire to skip lower-priority waiters.
     #[serde(default)]
     pub priority: u8,
-    /// Current pipeline phase. Defaults to Implement for backward compatibility.
+    /// Current pipeline phase.
+    /// Persisted in the tasks table; the tasks.phase column is the authoritative source on reload.
     #[serde(default)]
     pub phase: TaskPhase,
     /// Output from the Triage phase (Tech Lead assessment). Not persisted to DB.
@@ -175,12 +177,13 @@ pub struct TaskSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     /// Short description derived from the task prompt or issue number.
+    /// Loaded from the tasks table for DB-backed summaries.
     #[serde(default)]
     pub description: Option<String>,
     /// ISO 8601 creation timestamp.
     #[serde(default)]
     pub created_at: Option<String>,
-    /// Current pipeline phase.
+    /// Current pipeline phase loaded from the tasks table.
     #[serde(default)]
     pub phase: TaskPhase,
     /// Task IDs that must reach Done before this task may start.
@@ -597,7 +600,7 @@ pub struct DashboardCounts {
 
 pub struct TaskStore {
     pub(crate) cache: DashMap<TaskId, TaskState>,
-    db: TaskDb,
+    pub(crate) db: TaskDb,
     persist_locks: DashMap<TaskId, Arc<Mutex<()>>>,
     /// Per-task broadcast channels for real-time stream forwarding to SSE clients.
     stream_txs: DashMap<TaskId, broadcast::Sender<StreamItem>>,

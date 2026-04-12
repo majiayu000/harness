@@ -100,6 +100,8 @@ pub enum TaskDbDecodeError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("failed to decode phase `{phase}` for task `{task_id}`")]
+    InvalidPhase { task_id: String, phase: String },
 }
 
 pub type Error = HarnessError;
