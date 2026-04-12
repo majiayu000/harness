@@ -127,7 +127,7 @@ class HarnessSdkTests(unittest.TestCase):
         self.assertEqual(result.status, "running")
         self.assertTrue(result.timed_out)
         self.assertEqual(timeout_event["params"]["timeout_ms"], 50)
-        self.assertNotIn("timeout_seconds", timeout_event["params"])
+        self.assertEqual(timeout_event["params"]["timeout_seconds"], 0.05)
 
     def test_extract_output_handles_multiple_item_shapes(self) -> None:
         turn = {

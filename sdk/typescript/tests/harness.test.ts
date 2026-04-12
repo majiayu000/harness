@@ -260,6 +260,52 @@ test("run preserves approval_request id in final snapshot", async () => {
   });
 });
 
+test("run preserves legacy approval_request items without id", async () => {
+  const mock = createMockFetch((method) => {
+    if (method === "thread/start") {
+      return { result: { thread_id: "thread-legacy" } };
+    }
+    if (method === "turn/start") {
+      return { result: { turn_id: "turn-legacy" } };
+    }
+    if (method === "turn/status") {
+      return {
+        result: {
+          id: "turn-legacy",
+          thread_id: "thread-legacy",
+          status: "completed",
+          items: [
+            { type: "user_message", content: "hello" },
+            {
+              type: "approval_request",
+              action: "execute_command",
+              approved: null,
+            },
+          ],
+        },
+      };
+    }
+    return { result: {} };
+  });
+
+  const harness = new Harness({
+    fetch: mock.fetch,
+    defaultPollIntervalMs: 1,
+    defaultRunTimeoutMs: 500,
+  });
+  const thread = await harness.startThread({ cwd: "/repo" });
+  const result = await thread.run("Summarize");
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.turn?.items.length, 2);
+  assert.deepEqual(result.turn?.items[1], {
+    type: "approval_request",
+    action: "execute_command",
+    approved: null,
+  });
+});
+
+
 test("run emits timeout event with timeout_ms", async () => {
   const mock = createMockFetch((method) => {
     if (method === "thread/start") {
