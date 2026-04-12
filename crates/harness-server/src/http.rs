@@ -375,27 +375,35 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     )
     .await?;
     // Auto-register the default project from --project-root on startup.
-    let default_project_metadata = server.startup_default_project.as_ref().or_else(|| {
-        server
-            .startup_projects
-            .iter()
-            .find(|project| project.default)
-            .or_else(|| {
-                project_root
+    let canonical_project_root = project_root.canonicalize().ok();
+    let project_matches_root = |project: &harness_core::config::ProjectEntry| {
+        canonical_project_root
+            .as_ref()
+            .and_then(|canonical_root| {
+                project
+                    .root
                     .canonicalize()
                     .ok()
-                    .as_ref()
-                    .and_then(|canonical_root| {
-                        server.startup_projects.iter().find(|project| {
-                            project
-                                .root
-                                .canonicalize()
-                                .map(|root| root == *canonical_root)
-                                .unwrap_or(false)
-                        })
-                    })
+                    .map(|root| root == *canonical_root)
             })
-    });
+            .unwrap_or_else(|| project.root == project_root)
+    };
+    let default_project_metadata = server
+        .startup_default_project
+        .as_ref()
+        .filter(|project| project_matches_root(project))
+        .or_else(|| {
+            server
+                .startup_projects
+                .iter()
+                .find(|project| project.default && project_matches_root(project))
+                .or_else(|| {
+                    server
+                        .startup_projects
+                        .iter()
+                        .find(|project| project_matches_root(project))
+                })
+        });
     let default_project = crate::project_registry::Project {
         id: "default".to_string(),
         root: project_root.clone(),
@@ -2307,6 +2315,49 @@ mod startup_tests {
             .expect("startup project should be registered");
 
         assert_eq!(project.default_agent.as_deref(), Some("claude"));
+        assert_eq!(project.max_concurrent, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_app_state_ignores_stale_default_project_metadata_for_different_root(
+    ) -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
+        let sandbox = tempfile::tempdir()?;
+        let startup_root = sandbox.path().join("startup-project");
+        let override_root = sandbox.path().join("override-project");
+        std::fs::create_dir_all(&startup_root)?;
+        std::fs::create_dir_all(&override_root)?;
+
+        let mut config = HarnessConfig::default();
+        config.server.project_root = override_root.clone();
+        config.server.data_dir = sandbox.path().join("data");
+
+        let mut server =
+            HarnessServer::new(config, ThreadManager::new(), AgentRegistry::new("test"));
+        let startup_default_project = harness_core::config::ProjectEntry {
+            name: "configured-default".to_string(),
+            root: startup_root.clone(),
+            default: true,
+            default_agent: Some("claude".to_string()),
+            max_concurrent: Some(3),
+        };
+        server.startup_projects = vec![startup_default_project.clone()];
+        server.startup_default_project = Some(startup_default_project);
+
+        let state = build_app_state(Arc::new(server)).await?;
+        let registry = state
+            .core
+            .project_registry
+            .as_ref()
+            .expect("project registry should be initialized");
+        let project = registry
+            .get("default")
+            .await?
+            .expect("default project should be registered");
+
+        assert_eq!(project.root.canonicalize()?, override_root.canonicalize()?);
+        assert_eq!(project.default_agent, None);
         assert_eq!(project.max_concurrent, None);
         Ok(())
     }

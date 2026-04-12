@@ -133,13 +133,6 @@ pub async fn run(
         None
     };
 
-    let startup_default_project = default_project_id.as_ref().and_then(|id| {
-        parsed_projects
-            .iter()
-            .find(|project| &project.name == id)
-            .cloned()
-    });
-
     let mut serve_config = config.clone();
     // When --project entries are provided, set project_root to the default project's path
     // so existing single-project behaviour is preserved.
@@ -151,6 +144,14 @@ pub async fn run(
     if let Some(project_root) = project_root {
         serve_config.server.project_root = project_root;
     }
+
+    let startup_default_project = default_project_id.as_ref().and_then(|id| {
+        parsed_projects
+            .iter()
+            .find(|project| &project.name == id)
+            .filter(|project| project.root == serve_config.server.project_root)
+            .cloned()
+    });
 
     let thread_manager = harness_server::thread_manager::ThreadManager::new();
     let mut agent_registry =
