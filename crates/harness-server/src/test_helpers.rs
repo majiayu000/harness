@@ -41,7 +41,47 @@ impl Drop for HomeGuard {
 
 use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
 use harness_agents::registry::AgentRegistry;
-use harness_core::config::HarnessConfig;
+use harness_core::{
+    agent::{AgentAdapter, AgentEvent, TurnRequest},
+    config::HarnessConfig,
+};
+
+pub struct NoopTestAdapter {
+    name: String,
+}
+
+impl NoopTestAdapter {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentAdapter for NoopTestAdapter {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn start_turn(
+        &self,
+        _req: TurnRequest,
+        _tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+
+    async fn respond_approval(
+        &self,
+        _id: String,
+        _decision: harness_core::agent::ApprovalDecision,
+    ) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+}
 
 /// Create a temp directory under a writable base path without mutating
 /// global state (`HOME` env var).  Tries `$HOME` first; falls back to

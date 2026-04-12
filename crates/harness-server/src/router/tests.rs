@@ -8,8 +8,10 @@ use crate::{
 use harness_agents::registry::AgentRegistry;
 use harness_core::config::HarnessConfig;
 use harness_protocol::{methods::Method, methods::RpcRequest, methods::INTERNAL_ERROR};
+use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::time::{timeout, Duration};
 
 async fn make_test_state_with_config_and_registry(
     dir: &std::path::Path,
@@ -1441,6 +1443,241 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         task_svc,
         execution_svc,
     })
+}
+
+#[tokio::test]
+async fn agent_list_returns_registered_agents_once_in_order() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut registry = AgentRegistry::new("alpha");
+    registry.register("alpha", Arc::new(TestAgent::new("alpha")));
+    registry.register_with_adapter(
+        "beta",
+        Arc::new(TestAgent::new("beta")),
+        Some(Arc::new(crate::test_helpers::NoopTestAdapter::new("beta"))),
+    );
+    registry.register("alpha", Arc::new(TestAgent::new("alpha")));
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), HarnessConfig::default(), registry)
+            .await?;
+
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(1)),
+        method: Method::AgentList,
+    };
+    let resp = handle_request(&state, req)
+        .await
+        .expect("expected response for agent list");
+
+    assert!(
+        resp.error.is_none(),
+        "agent list should succeed: {:?}",
+        resp.error
+    );
+    assert_eq!(resp.result.unwrap()["agents"], json!(["alpha", "beta"]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_turn_lifecycle_registers_active_adapter_from_descriptor() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut registry = AgentRegistry::new("streaming");
+    registry.register_with_adapter(
+        "streaming",
+        Arc::new(TestAgent::new("streaming")),
+        Some(Arc::new(crate::test_helpers::NoopTestAdapter::new(
+            "streaming",
+        ))),
+    );
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), HarnessConfig::default(), registry)
+            .await?;
+    let server = state.core.server.clone();
+    let thread_id = server.thread_manager.start_thread(dir.path().to_path_buf());
+    let turn_id = server.thread_manager.start_turn(
+        &thread_id,
+        "prompt".to_string(),
+        harness_core::types::AgentId::new(),
+    )?;
+
+    let lifecycle = tokio::spawn(crate::task_executor::run_turn_lifecycle(
+        server.clone(),
+        state.core.thread_db.clone(),
+        state.notifications.notify_tx.clone(),
+        state.notifications.notification_tx.clone(),
+        thread_id.clone(),
+        turn_id.clone(),
+        "prompt".to_string(),
+        "streaming".to_string(),
+    ));
+
+    timeout(Duration::from_millis(200), async {
+        loop {
+            if server
+                .thread_manager
+                .respond_approval_on_turn(
+                    &turn_id,
+                    "req-1".to_string(),
+                    harness_core::agent::ApprovalDecision::Accept,
+                )
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    lifecycle.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_turn_lifecycle_without_adapter_leaves_approval_unsupported() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut registry = AgentRegistry::new("plain");
+    registry.register("plain", Arc::new(TestAgent::new("plain")));
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), HarnessConfig::default(), registry)
+            .await?;
+    let server = state.core.server.clone();
+    let thread_id = server.thread_manager.start_thread(dir.path().to_path_buf());
+    let turn_id = server.thread_manager.start_turn(
+        &thread_id,
+        "prompt".to_string(),
+        harness_core::types::AgentId::new(),
+    )?;
+
+    crate::task_executor::run_turn_lifecycle(
+        server.clone(),
+        state.core.thread_db.clone(),
+        state.notifications.notify_tx.clone(),
+        state.notifications.notification_tx.clone(),
+        thread_id,
+        turn_id.clone(),
+        "prompt".to_string(),
+        "plain".to_string(),
+    )
+    .await;
+
+    let result = server
+        .thread_manager
+        .respond_approval_on_turn(
+            &turn_id,
+            "req-1".to_string(),
+            harness_core::agent::ApprovalDecision::Accept,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "plain agent should not register an active adapter"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_turn_lifecycle_unknown_agent_records_not_found_error() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_config_and_registry(
+        dir.path(),
+        HarnessConfig::default(),
+        AgentRegistry::new("missing"),
+    )
+    .await?;
+    let server = state.core.server.clone();
+    let thread_id = server.thread_manager.start_thread(dir.path().to_path_buf());
+    let turn_id = server.thread_manager.start_turn(
+        &thread_id,
+        "prompt".to_string(),
+        harness_core::types::AgentId::new(),
+    )?;
+
+    crate::task_executor::run_turn_lifecycle(
+        server.clone(),
+        state.core.thread_db.clone(),
+        state.notifications.notify_tx.clone(),
+        state.notifications.notification_tx.clone(),
+        thread_id.clone(),
+        turn_id.clone(),
+        "prompt".to_string(),
+        "missing".to_string(),
+    )
+    .await;
+
+    let thread = server
+        .thread_manager
+        .get_thread(&thread_id)
+        .expect("thread should exist");
+    let turn = thread
+        .turns
+        .iter()
+        .find(|turn| turn.id == turn_id)
+        .expect("turn should exist");
+    assert!(turn.items.iter().any(|item| matches!(
+        item,
+        harness_core::types::Item::Error { message, .. }
+        if message.contains("agent `missing` not found in registry")
+    )));
+    Ok(())
+}
+
+struct TestAgent {
+    name: &'static str,
+}
+
+impl TestAgent {
+    fn new(name: &'static str) -> Self {
+        Self { name }
+    }
+}
+
+#[async_trait::async_trait]
+impl harness_core::agent::CodeAgent for TestAgent {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn capabilities(&self) -> Vec<harness_core::types::Capability> {
+        vec![]
+    }
+
+    async fn execute(
+        &self,
+        _req: harness_core::agent::AgentRequest,
+    ) -> harness_core::error::Result<harness_core::agent::AgentResponse> {
+        Ok(harness_core::agent::AgentResponse {
+            output: String::new(),
+            stderr: String::new(),
+            items: vec![],
+            token_usage: harness_core::types::TokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                cost_usd: 0.0,
+            },
+            model: self.name.to_string(),
+            exit_code: Some(0),
+        })
+    }
+
+    async fn execute_stream(
+        &self,
+        _req: harness_core::agent::AgentRequest,
+        tx: tokio::sync::mpsc::Sender<harness_core::agent::StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        tx.send(harness_core::agent::StreamItem::ApprovalRequest {
+            id: "req-1".to_string(),
+            command: "echo test".to_string(),
+        })
+        .await
+        .map_err(|err| harness_core::error::HarnessError::AgentExecution(err.to_string()))?;
+        tx.send(harness_core::agent::StreamItem::Done)
+            .await
+            .map_err(|err| harness_core::error::HarnessError::AgentExecution(err.to_string()))?;
+        Ok(())
+    }
 }
 
 #[tokio::test]

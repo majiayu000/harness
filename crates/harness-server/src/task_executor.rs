@@ -170,7 +170,7 @@ pub(crate) async fn run_turn_lifecycle(
         return;
     };
 
-    let Some(agent) = server.agent_registry.get(&agent_name) else {
+    let Some(descriptor) = server.agent_registry.descriptor(&agent_name) else {
         let msg = format!("agent `{agent_name}` not found in registry");
         if let Err(e) = server.thread_manager.add_item(
             &thread_id,
@@ -194,6 +194,7 @@ pub(crate) async fn run_turn_lifecycle(
         .await;
         return;
     };
+    let agent = descriptor.code_agent();
 
     // RAII guard: ensures the adapter is deregistered when the turn scope exits,
     // even if the task is cancelled before reaching the end of this function.
@@ -209,10 +210,9 @@ pub(crate) async fn run_turn_lifecycle(
         }
     }
 
-    // Register adapter for this turn if one is configured for this agent name.
+    // Register adapter for this turn if one is configured for this descriptor.
     // Enables turn/steer and turn/respond_approval to reach the live process.
-    // Gracefully no-ops when no adapter is registered (adapter_registry is empty by default).
-    let _adapter_guard = server.adapter_registry.get(&agent_name).map(|adapter_arc| {
+    let _adapter_guard = descriptor.adapter().map(|adapter_arc| {
         server
             .thread_manager
             .register_active_adapter(&turn_id, adapter_arc.clone());

@@ -561,29 +561,26 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             .agent_registry
             .resolved_default_agent_name()
             .map(|s| s.to_owned());
-        let all_names: Vec<String> = server
+        let challenger = server
             .agent_registry
-            .list()
-            .iter()
-            .map(|&s| s.to_owned())
-            .collect();
-        let challenger = all_names.iter().find_map(|name| {
-            if Some(name.as_str()) == default_name.as_deref() {
-                return None;
-            }
-            let agent = server.agent_registry.get(name)?;
-            if agent.capabilities().iter().any(|c| {
-                matches!(
-                    c,
-                    harness_core::types::Capability::Write
-                        | harness_core::types::Capability::Execute
-                )
-            }) {
-                None
-            } else {
-                Some(agent)
-            }
-        });
+            .list_descriptors()
+            .into_iter()
+            .find_map(|descriptor| {
+                if Some(descriptor.name.as_str()) == default_name.as_deref() {
+                    return None;
+                }
+                if descriptor.capabilities.iter().any(|c| {
+                    matches!(
+                        c,
+                        harness_core::types::Capability::Write
+                            | harness_core::types::Capability::Execute
+                    )
+                }) {
+                    None
+                } else {
+                    Some(descriptor.code_agent())
+                }
+            });
         Arc::new(crate::quality_trigger::QualityTrigger::new(
             events.clone(),
             gc_agent.clone(),
@@ -1104,12 +1101,10 @@ pub(crate) fn resolve_reviewer(
         return (None, config.clone());
     }
 
-    // Auto-select: first agent != implementor
-    for name in registry.list() {
-        if name != implementor_name {
-            if let Some(agent) = registry.get(name) {
-                return (Some(agent), config.clone());
-            }
+    // Auto-select: first registered descriptor != implementor
+    for descriptor in registry.list_descriptors() {
+        if descriptor.name != implementor_name {
+            return (Some(descriptor.code_agent()), config.clone());
         }
     }
 

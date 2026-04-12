@@ -160,7 +160,7 @@ impl DefaultExecutionService {
         req: &CreateTaskRequest,
     ) -> Result<Arc<dyn harness_core::agent::CodeAgent>, EnqueueTaskError> {
         if let Some(name) = &req.agent {
-            self.agent_registry.get(name).ok_or_else(|| {
+            self.agent_registry.get_code_agent(name).ok_or_else(|| {
                 EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
             })
         } else {

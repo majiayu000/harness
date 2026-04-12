@@ -1,5 +1,8 @@
 use anyhow::Context;
-use harness_agents::{claude::ClaudeCodeAgent, codex::CodexAgent, registry::AgentRegistry};
+use harness_agents::{
+    claude::ClaudeCodeAgent, claude_adapter::ClaudeAdapter, codex::CodexAgent,
+    codex_adapter::CodexAdapter, registry::AgentRegistry,
+};
 use harness_core::{agent::AgentRequest, config::HarnessConfig, prompts, types::ThreadId};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -43,8 +46,8 @@ impl PromptExecutor for RegistryExecutor {
         project_root: PathBuf,
         prompt: String,
     ) -> anyhow::Result<String> {
-        let code_agent = self.agent_registry.get(agent).with_context(|| {
-            let available = self.agent_registry.list().join(", ");
+        let code_agent = self.agent_registry.get_code_agent(agent).with_context(|| {
+            let available = self.agent_registry.list_names().join(", ");
             format!("unknown agent `{agent}` (available: [{available}])")
         })?;
 
@@ -485,7 +488,7 @@ async fn write_json_line(stdout: &mut tokio::io::Stdout, value: &Value) -> anyho
 pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
     let mut agent_registry = AgentRegistry::new(&config.agents.default_agent);
     agent_registry.set_complexity_preferences(config.agents.complexity_preferred_agents.clone());
-    agent_registry.register(
+    agent_registry.register_with_adapter(
         "claude",
         Arc::new(
             ClaudeCodeAgent::new(
@@ -496,13 +499,20 @@ pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
             .with_no_session_persistence_probe()
             .with_stream_timeout(config.agents.stream_timeout_secs),
         ),
+        Some(Arc::new(ClaudeAdapter::new(
+            config.agents.claude.cli_path.clone(),
+            config.agents.claude.default_model.clone(),
+        ))),
     );
-    agent_registry.register(
+    agent_registry.register_with_adapter(
         "codex",
         Arc::new(
             CodexAgent::from_config(config.agents.codex.clone(), config.agents.sandbox_mode)
                 .with_stream_timeout(config.agents.stream_timeout_secs),
         ),
+        Some(Arc::new(CodexAdapter::new(
+            config.agents.codex.cli_path.clone(),
+        ))),
     );
 
     let default_agent_name = agent_registry

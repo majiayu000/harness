@@ -193,7 +193,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
 
         // === Agent management ===
         Method::AgentList => {
-            let agents = state.core.server.agent_registry.list();
+            let agents = state.core.server.agent_registry.list_names();
             Some(RpcResponse::success(
                 id,
                 serde_json::json!({ "agents": agents }),
