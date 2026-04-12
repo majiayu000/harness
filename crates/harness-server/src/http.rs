@@ -1826,7 +1826,7 @@ async fn intake_status(State(state): State<Arc<AppState>>) -> Json<serde_json::V
 
     let feishu_channel = json!({
         "name": "feishu",
-        "enabled": intake_config.feishu.as_ref().map(|c| c.enabled).unwrap_or(false),
+        "enabled": state.intake.feishu_intake.is_some(),
         "keyword": intake_config.feishu.as_ref().map(|c| c.trigger_keyword.as_str()).unwrap_or(""),
         "active": feishu_active,
     });

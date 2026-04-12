@@ -67,7 +67,7 @@ async fn make_test_state_with(
     agent_registry: harness_agents::registry::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
     let feishu_intake = config.intake.feishu.as_ref().and_then(|cfg| {
-        cfg.enabled
+        (cfg.enabled && crate::intake::feishu::has_verification_token(cfg))
             .then(|| Arc::new(crate::intake::feishu::FeishuIntake::new(cfg.clone())))
     });
     let thread_manager = crate::thread_manager::ThreadManager::new();
@@ -910,6 +910,31 @@ async fn intake_status_recent_dispatches_empty_initially() -> anyhow::Result<()>
     Ok(())
 }
 
+#[tokio::test]
+async fn intake_status_disables_feishu_when_verification_token_missing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_feishu(dir.path(), None).await?;
+    let app = intake_app(state);
+
+    use http_body_util::BodyExt;
+    let response = app
+        .oneshot(Request::builder().uri("/api/intake").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await?.to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    let feishu = json["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "feishu")
+        .expect("feishu channel present");
+    assert_eq!(feishu["enabled"], false);
+    assert_eq!(feishu["keyword"], "harness");
+    Ok(())
+}
+
 /// Build a minimal router that includes the auth middleware, mirroring how the
 /// real server wires up the dashboard and tasks endpoints.
 fn authed_app(state: Arc<AppState>) -> Router {
@@ -1030,7 +1055,7 @@ async fn feishu_webhook_returns_service_unavailable_when_token_missing() -> anyh
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let json = response_json(response).await?;
-    assert_eq!(json["error"], "Feishu verification token not configured");
+    assert_eq!(json["error"], "Feishu intake not configured");
     Ok(())
 }
 
@@ -1054,7 +1079,7 @@ async fn feishu_webhook_returns_service_unavailable_when_token_is_empty() -> any
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let json = response_json(response).await?;
-    assert_eq!(json["error"], "Feishu verification token not configured");
+    assert_eq!(json["error"], "Feishu intake not configured");
     Ok(())
 }
 
