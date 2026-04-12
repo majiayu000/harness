@@ -301,7 +301,7 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
         .server
         .startup_projects
         .iter()
-        .map(|(n, p)| (n.as_str(), p))
+        .map(|project| (project.name.as_str(), &project.root))
         .collect();
 
     // Pre-fetch live registry roots so that a runtime `POST /projects` upsert
@@ -503,30 +503,33 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
 
     // P1-1: Also include startup_projects entries not already covered by config
     // or registry, in case the registry registration failed at startup.
-    for (name, path) in state.core.server.startup_projects.iter() {
-        if seen_names.contains(name.as_str()) {
+    for project in state.core.server.startup_projects.iter() {
+        if seen_names.contains(project.name.as_str()) {
             continue;
         }
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-        if seen_roots.contains(path) || seen_roots.contains(&canonical) {
+        let canonical = project
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| project.root.clone());
+        if seen_roots.contains(&project.root) || seen_roots.contains(&canonical) {
             continue;
         }
-        if !path.exists() {
+        if !project.root.exists() {
             tracing::warn!(
-                project = %name,
-                root = %path.display(),
+                project = %project.name,
+                root = %project.root.display(),
                 "scheduler: startup project root does not exist on disk, skipping"
             );
             continue;
         }
-        let (review_type, opted_out) = match load_project_config(path) {
+        let (review_type, opted_out) = match load_project_config(&project.root) {
             Ok(cfg) => {
                 let opted_out = cfg.review.as_ref().and_then(|r| r.enabled) == Some(false);
                 (cfg.review_type, opted_out)
             }
             Err(e) => {
                 tracing::warn!(
-                    project = %name,
+                    project = %project.name,
                     error = %e,
                     "scheduler: failed to load startup project config, skipping"
                 );
@@ -535,17 +538,17 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
         };
         if opted_out {
             tracing::debug!(
-                project = %name,
+                project = %project.name,
                 "scheduler: startup project opted out of periodic review, skipping"
             );
             continue;
         }
-        seen_names.insert(name.clone());
-        seen_roots.insert(path.clone());
+        seen_names.insert(project.name.clone());
+        seen_roots.insert(project.root.clone());
         seen_roots.insert(canonical);
         result.push(ProjectInfo {
-            name: name.clone(),
-            root: path.clone(),
+            name: project.name.clone(),
+            root: project.root.clone(),
             review_type,
         });
     }

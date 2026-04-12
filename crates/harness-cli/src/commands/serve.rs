@@ -49,7 +49,7 @@ pub async fn run(
     }
 
     // Collect projects from config file `[[projects]]` entries.
-    let mut parsed_projects: Vec<(String, PathBuf)> = Vec::new();
+    let mut parsed_projects: Vec<harness_core::config::ProjectEntry> = Vec::new();
     let mut config_default_name: Option<String> = None;
     for entry in &config.projects {
         if entry.name.is_empty() {
@@ -58,7 +58,10 @@ pub async fn run(
         if entry.name == "default" {
             anyhow::bail!("[[projects]] name 'default' is reserved; choose a different name");
         }
-        if parsed_projects.iter().any(|(n, _)| n == &entry.name) {
+        if parsed_projects
+            .iter()
+            .any(|project| project.name == entry.name)
+        {
             anyhow::bail!(
                 "[[projects]] name '{}' is duplicated; each project name must be unique",
                 entry.name
@@ -77,15 +80,19 @@ pub async fn run(
         if entry.default {
             config_default_name = Some(entry.name.clone());
         }
-        parsed_projects.push((entry.name.clone(), canonical));
+        let mut project = entry.clone();
+        project.root = canonical;
+        parsed_projects.push(project);
     }
 
     // Merge CLI --project flags (override config entries with same name).
     for raw in &projects {
         let (name, path) = parse_project_entry(raw)?;
-        if parsed_projects.iter().any(|(n, _)| n == &name) {
-            parsed_projects.retain(|(n, _)| n != &name);
-        }
+        let existing = parsed_projects
+            .iter()
+            .find(|project| project.name == name)
+            .cloned();
+        parsed_projects.retain(|project| project.name != name);
         let canonical = path.canonicalize().map_err(|e| {
             anyhow::anyhow!(
                 "--project {name}: path '{}' is not accessible: {e}",
@@ -95,7 +102,15 @@ pub async fn run(
         if let Err(reason) = validate_project_root(&canonical) {
             anyhow::bail!("--project {name}: {reason}");
         }
-        parsed_projects.push((name, canonical));
+        let mut project = existing.unwrap_or(harness_core::config::ProjectEntry {
+            name,
+            root: canonical.clone(),
+            default: false,
+            default_agent: None,
+            max_concurrent: None,
+        });
+        project.root = canonical;
+        parsed_projects.push(project);
     }
 
     // Determine the default project id: CLI --default-project > config `default = true` > first entry.
@@ -103,9 +118,12 @@ pub async fn run(
         let id = default_project
             .clone()
             .or(config_default_name)
-            .unwrap_or_else(|| parsed_projects[0].0.clone());
-        if !parsed_projects.iter().any(|(n, _)| n == &id) {
-            let known: Vec<&str> = parsed_projects.iter().map(|(n, _)| n.as_str()).collect();
+            .unwrap_or_else(|| parsed_projects[0].name.clone());
+        if !parsed_projects.iter().any(|project| project.name == id) {
+            let known: Vec<&str> = parsed_projects
+                .iter()
+                .map(|project| project.name.as_str())
+                .collect();
             anyhow::bail!(
                 "default project {id:?} does not match any project name; known names: {known:?}"
             );
@@ -115,12 +133,19 @@ pub async fn run(
         None
     };
 
+    let startup_default_project = default_project_id.as_ref().and_then(|id| {
+        parsed_projects
+            .iter()
+            .find(|project| &project.name == id)
+            .cloned()
+    });
+
     let mut serve_config = config.clone();
     // When --project entries are provided, set project_root to the default project's path
     // so existing single-project behaviour is preserved.
     if let Some(ref id) = default_project_id {
-        if let Some((_, path)) = parsed_projects.iter().find(|(n, _)| n == id) {
-            serve_config.server.project_root = path.clone();
+        if let Some(project) = parsed_projects.iter().find(|project| &project.name == id) {
+            serve_config.server.project_root = project.root.clone();
         }
     }
     if let Some(project_root) = project_root {
@@ -170,6 +195,7 @@ pub async fn run(
         agent_registry,
     );
     server.startup_projects = parsed_projects;
+    server.startup_default_project = startup_default_project;
 
     let effective_transport = match transport.as_deref() {
         Some("stdio") => harness_core::config::server::Transport::Stdio,

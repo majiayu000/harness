@@ -312,18 +312,18 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     }
     // Load guards from each named startup project so non-default projects are
     // not silently unprotected.
-    for (name, path) in &server.startup_projects {
-        match rule_engine.auto_register_project_guards(&path.join(".harness/guards")) {
+    for project in &server.startup_projects {
+        match rule_engine.auto_register_project_guards(&project.root.join(".harness/guards")) {
             Ok(registered) => {
                 tracing::debug!(
-                    project = %name,
+                    project = %project.name,
                     registered_guard_count = registered,
                     total_guard_count = rule_engine.guards().len(),
                     "rules: startup project guard auto-registration completed"
                 );
             }
             Err(e) => {
-                tracing::warn!(project = %name, "failed to auto-register startup project guards: {e}");
+                tracing::warn!(project = %project.name, "failed to auto-register startup project guards: {e}");
             }
         }
     }
@@ -375,29 +375,51 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     )
     .await?;
     // Auto-register the default project from --project-root on startup.
+    let default_project_metadata = server.startup_default_project.as_ref().or_else(|| {
+        server
+            .startup_projects
+            .iter()
+            .find(|project| project.default)
+            .or_else(|| {
+                project_root
+                    .canonicalize()
+                    .ok()
+                    .as_ref()
+                    .and_then(|canonical_root| {
+                        server.startup_projects.iter().find(|project| {
+                            project
+                                .root
+                                .canonicalize()
+                                .map(|root| root == *canonical_root)
+                                .unwrap_or(false)
+                        })
+                    })
+            })
+    });
     let default_project = crate::project_registry::Project {
         id: "default".to_string(),
         root: project_root.clone(),
-        max_concurrent: None,
-        default_agent: None,
+        max_concurrent: default_project_metadata.and_then(|project| project.max_concurrent),
+        default_agent: default_project_metadata.and_then(|project| project.default_agent.clone()),
         active: true,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
+
     if let Err(e) = project_registry.register(default_project).await {
         tracing::warn!("failed to auto-register default project: {e}");
     }
-    // Register any extra named projects supplied via --project CLI flags.
-    for (name, path) in &server.startup_projects {
+    // Register any extra named projects supplied via config or --project CLI flags.
+    for project in &server.startup_projects {
         let proj = crate::project_registry::Project {
-            id: name.clone(),
-            root: path.clone(),
-            max_concurrent: None,
-            default_agent: None,
+            id: project.name.clone(),
+            root: project.root.clone(),
+            max_concurrent: project.max_concurrent,
+            default_agent: project.default_agent.clone(),
             active: true,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         if let Err(e) = project_registry.register(proj).await {
-            tracing::warn!(project = %name, "failed to register startup project: {e}");
+            tracing::warn!(project = %project.name, "failed to register startup project: {e}");
         }
     }
     let plans_md_dir = dir.join("plans");
@@ -2173,6 +2195,119 @@ mod startup_tests {
                 .any(|guard| guard.id.as_str() == harness_rules::engine::BUILTIN_BASELINE_GUARD_ID),
             "expected build_app_state to auto-register builtin guard"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_app_state_registers_startup_project_metadata() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
+        let sandbox = tempfile::tempdir()?;
+        let project_root = sandbox.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+
+        let mut config = HarnessConfig::default();
+        config.server.project_root = project_root.clone();
+        config.server.data_dir = sandbox.path().join("data");
+
+        let mut server =
+            HarnessServer::new(config, ThreadManager::new(), AgentRegistry::new("test"));
+        server.startup_projects = vec![harness_core::config::ProjectEntry {
+            name: "named".to_string(),
+            root: project_root.clone(),
+            default: false,
+            default_agent: Some("codex".to_string()),
+            max_concurrent: Some(7),
+        }];
+
+        let state = build_app_state(Arc::new(server)).await?;
+        let registry = state
+            .core
+            .project_registry
+            .as_ref()
+            .expect("project registry should be initialized");
+        let project = registry
+            .get("named")
+            .await?
+            .expect("startup project should be registered");
+
+        assert_eq!(project.default_agent.as_deref(), Some("codex"));
+        assert_eq!(project.max_concurrent, Some(7));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_app_state_registers_default_project_metadata_from_startup_entry(
+    ) -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
+        let sandbox = tempfile::tempdir()?;
+        let project_root = sandbox.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+
+        let mut config = HarnessConfig::default();
+        config.server.project_root = project_root.clone();
+        config.server.data_dir = sandbox.path().join("data");
+
+        let mut server =
+            HarnessServer::new(config, ThreadManager::new(), AgentRegistry::new("test"));
+        server.startup_projects = vec![harness_core::config::ProjectEntry {
+            name: "configured-default".to_string(),
+            root: project_root.clone(),
+            default: true,
+            default_agent: Some("claude".to_string()),
+            max_concurrent: Some(3),
+        }];
+
+        let state = build_app_state(Arc::new(server)).await?;
+        let registry = state
+            .core
+            .project_registry
+            .as_ref()
+            .expect("project registry should be initialized");
+        let project = registry
+            .get("default")
+            .await?
+            .expect("default project should be registered");
+
+        assert_eq!(project.root.canonicalize()?, project_root.canonicalize()?);
+        assert_eq!(project.default_agent.as_deref(), Some("claude"));
+        assert_eq!(project.max_concurrent, Some(3));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_app_state_preserves_partial_startup_project_metadata() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
+        let sandbox = tempfile::tempdir()?;
+        let project_root = sandbox.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+
+        let mut config = HarnessConfig::default();
+        config.server.project_root = project_root.clone();
+        config.server.data_dir = sandbox.path().join("data");
+
+        let mut server =
+            HarnessServer::new(config, ThreadManager::new(), AgentRegistry::new("test"));
+        server.startup_projects = vec![harness_core::config::ProjectEntry {
+            name: "partial".to_string(),
+            root: project_root,
+            default: false,
+            default_agent: Some("claude".to_string()),
+            max_concurrent: None,
+        }];
+
+        let state = build_app_state(Arc::new(server)).await?;
+        let registry = state
+            .core
+            .project_registry
+            .as_ref()
+            .expect("project registry should be initialized");
+        let project = registry
+            .get("partial")
+            .await?
+            .expect("startup project should be registered");
+
+        assert_eq!(project.default_agent.as_deref(), Some("claude"));
+        assert_eq!(project.max_concurrent, None);
         Ok(())
     }
 

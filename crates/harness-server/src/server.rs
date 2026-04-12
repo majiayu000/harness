@@ -1,6 +1,6 @@
 use crate::thread_manager::ThreadManager;
 use harness_agents::registry::{AdapterRegistry, AgentRegistry};
-use harness_core::config::HarnessConfig;
+use harness_core::config::{HarnessConfig, ProjectEntry};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -9,8 +9,10 @@ pub struct HarnessServer {
     pub thread_manager: ThreadManager,
     pub agent_registry: Arc<AgentRegistry>,
     pub adapter_registry: Arc<AdapterRegistry>,
-    /// Extra projects to register in the project registry at startup (from --project CLI flags).
-    pub startup_projects: Vec<(String, std::path::PathBuf)>,
+    /// Projects to register in the project registry at startup.
+    pub startup_projects: Vec<ProjectEntry>,
+    /// The startup project selected as the effective default project root.
+    pub startup_default_project: Option<ProjectEntry>,
 }
 
 impl HarnessServer {
@@ -25,6 +27,7 @@ impl HarnessServer {
             agent_registry: Arc::new(agent_registry),
             adapter_registry: Arc::new(AdapterRegistry::new("")),
             startup_projects: Vec::new(),
+            startup_default_project: None,
         }
     }
 
