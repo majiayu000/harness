@@ -861,7 +861,16 @@ pub(crate) async fn run_task(
             // it and fail-close it (no pr_url → mark failed), rather than leaving it stuck
             // as a plain 'pending' that is never re-dispatched.
             update_status(store, task_id, TaskStatus::Implementing, 1).await?;
-            run_plan_for_prompt(agent, store, task_id, &cargo_env, &project, req).await?
+            let result =
+                run_plan_for_prompt(agent, store, task_id, &cargo_env, &project, req).await?;
+            // Re-stamp execution_started_at to the moment planning finishes so that
+            // avg_first_token_latency_ms measures implementation latency only, not
+            // planning time.  Uses an unconditional overwrite because the earlier
+            // update_status call already set it.
+            store
+                .force_execution_started_at(task_id, &chrono::Utc::now().to_rfc3339())
+                .await;
+            result
         } else {
             (None, prompts::TriageComplexity::Medium, 0u32)
         }

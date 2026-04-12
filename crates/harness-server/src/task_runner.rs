@@ -984,6 +984,15 @@ impl TaskStore {
 
     /// Set `execution_started_at` for the given task if not already set.
     /// Idempotent; logs and swallows errors so that a DB failure does not abort task execution.
+    /// Overwrite `execution_started_at` unconditionally.  Call this after a
+    /// forced planning phase so the timestamp marks implementation start, not
+    /// planning start, keeping `avg_first_token_latency_ms` accurate.
+    pub(crate) async fn force_execution_started_at(&self, id: &TaskId, ts: &str) {
+        if let Err(e) = self.db.force_execution_started_at(id.0.as_str(), ts).await {
+            tracing::warn!(task_id = %id.0, "failed to force execution_started_at: {e}");
+        }
+    }
+
     pub(crate) async fn set_execution_started_at(&self, id: &TaskId, ts: &str) {
         if let Err(e) = self.db.set_execution_started_at(id.0.as_str(), ts).await {
             tracing::warn!(task_id = %id.0, "failed to set execution_started_at: {e}");

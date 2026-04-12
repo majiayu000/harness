@@ -793,6 +793,20 @@ impl TaskDb {
         Ok(())
     }
 
+    /// Unconditionally overwrite `execution_started_at` for the given task.
+    ///
+    /// Used after a forced planning phase completes so that the timestamp
+    /// reflects the start of actual implementation rather than the start of
+    /// planning, keeping `avg_first_token_latency_ms` accurate.
+    pub async fn force_execution_started_at(&self, task_id: &str, ts: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE tasks SET execution_started_at = ? WHERE id = ?")
+            .bind(ts)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Set `first_output_at` for the given task if it has not been set yet.
     ///
     /// Idempotent: subsequent calls are no-ops because the WHERE clause

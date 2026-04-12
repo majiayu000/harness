@@ -452,29 +452,30 @@ fn aggregate_cost_stats(task_usage: &HashMap<String, UsageBucket>) -> (f64, f64)
 /// Results are cached for [`COST_CACHE_TTL`] to avoid re-scanning all JSONL
 /// files on every dashboard poll.  Returns `(0.0, 0.0)` on any error so that
 /// the dashboard degrades gracefully without an error response.
+///
+/// Single-flight: the mutex is held for the entire check+compute+update cycle,
+/// so concurrent callers after TTL expiry wait on the lock rather than each
+/// starting an independent full-tree scan.
 pub(crate) async fn load_cost_stats(state: &Arc<crate::http::AppState>) -> (f64, f64) {
+    let mut guard = cost_cache().lock().await;
+
     // Fast path: return cached result if still fresh.
-    {
-        let guard = cost_cache().lock().await;
-        if let Some(ref c) = *guard {
-            if c.expires > Instant::now() {
-                return (c.total, c.avg);
-            }
+    if let Some(ref c) = *guard {
+        if c.expires > Instant::now() {
+            return (c.total, c.avg);
         }
     }
 
-    let result = load_cost_stats_uncached(state).await;
-
+    // Slow path (single caller at a time): recompute then update cache.
     // Update cache regardless of success/failure so repeated errors don't
     // cause a thundering herd.
-    {
-        let mut guard = cost_cache().lock().await;
-        *guard = Some(CostStatsCache {
-            total: result.0,
-            avg: result.1,
-            expires: Instant::now() + COST_CACHE_TTL,
-        });
-    }
+    let result = load_cost_stats_uncached(state).await;
+
+    *guard = Some(CostStatsCache {
+        total: result.0,
+        avg: result.1,
+        expires: Instant::now() + COST_CACHE_TTL,
+    });
 
     result
 }
@@ -485,23 +486,36 @@ async fn load_cost_stats_uncached(state: &Arc<crate::http::AppState>) -> (f64, f
         Err(_) => return (0.0, 0.0),
     };
     let claude_projects_dir = home.join(".claude").join("projects");
-    if std::fs::metadata(&claude_projects_dir)
-        .map(|m| !m.is_dir())
-        .unwrap_or(true)
-    {
-        return (0.0, 0.0);
-    }
-    let files = match collect_session_files(&claude_projects_dir) {
-        Ok(f) if !f.is_empty() => f,
-        _ => return (0.0, 0.0),
-    };
 
+    // Fetch known task IDs via async DB query before entering the blocking section.
     let all_tasks = match state.core.tasks.list_all_summaries_with_terminal().await {
         Ok(t) => t,
         Err(_) => return (0.0, 0.0),
     };
     let task_ids: std::collections::HashSet<String> =
         all_tasks.iter().map(|t| t.id.0.clone()).collect();
+
+    // Offload all blocking filesystem I/O (directory walk + file reads) to a
+    // dedicated blocking thread so Tokio async workers are never stalled.
+    tokio::task::spawn_blocking(move || scan_cost_files_blocking(&claude_projects_dir, task_ids))
+        .await
+        .unwrap_or((0.0, 0.0))
+}
+
+fn scan_cost_files_blocking(
+    claude_projects_dir: &Path,
+    task_ids: std::collections::HashSet<String>,
+) -> (f64, f64) {
+    if std::fs::metadata(claude_projects_dir)
+        .map(|m| !m.is_dir())
+        .unwrap_or(true)
+    {
+        return (0.0, 0.0);
+    }
+    let files = match collect_session_files(claude_projects_dir) {
+        Ok(f) if !f.is_empty() => f,
+        _ => return (0.0, 0.0),
+    };
 
     let mut task_usage: HashMap<String, UsageBucket> = HashMap::new();
     for file in &files {
