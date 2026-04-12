@@ -59,7 +59,7 @@ pub(crate) async fn run_skill_governance_tick(
             Some(status) if status.is_success() => {
                 entry.success = entry.success.saturating_add(1);
             }
-            Some(status) if status.is_failure() => {
+            Some(TaskStatus::Failed) => {
                 entry.fail = entry.fail.saturating_add(1);
             }
             Some(_) | None => entry.unknown = entry.unknown.saturating_add(1),
@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn governance_tick_treats_cancelled_as_failure() -> anyhow::Result<()> {
+    async fn governance_tick_treats_cancelled_as_unknown() -> anyhow::Result<()> {
         let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
         let data_dir = crate::test_helpers::tempdir_in_home("harness-skill-gov-cancel-data-")?;
         let project_root =
@@ -273,13 +273,17 @@ mod tests {
         state.observability.events.log(&used).await?;
 
         let report = run_skill_governance_tick(&state).await?;
-        assert_eq!(report.skills_scored, 1);
-        assert_eq!(report.samples, 1);
+        assert_eq!(report.skills_scored, 0);
+        assert_eq!(report.samples, 0);
+        assert_eq!(report.activated, 0);
+        assert_eq!(report.watched, 0);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(report.retired, 0);
 
         let store = state.engines.skills.read().await;
         let skill = store.get(&skill_id).expect("skill should exist");
-        assert_eq!(skill.scored_samples, 1);
-        assert!(skill.quality_score < 0.5);
+        assert_eq!(skill.scored_samples, 0);
+        assert_eq!(skill.quality_score, 0.5);
         Ok(())
     }
 

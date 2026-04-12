@@ -229,9 +229,9 @@ impl IntakeSource for GitHubIssuesPoller {
         external_id: &str,
         result: &TaskCompletionResult,
     ) -> anyhow::Result<()> {
-        // Only remove from dispatched on failure to allow retry.
-        // Done tasks remain in dispatched so re-labeled open issues are not re-processed.
-        if matches!(result.status, TaskStatus::Failed) {
+        // Remove failed or cancelled issues from dispatched so the poller can retry
+        // them later if they remain open. Done tasks stay dispatched to avoid re-processing.
+        if matches!(result.status, TaskStatus::Failed | TaskStatus::Cancelled) {
             self.dispatched.remove(external_id);
             self.persist_dispatched();
         }
@@ -353,6 +353,32 @@ mod tests {
         assert!(parsed.open_issue_ids.contains("20"));
         // Issue 5 is NOT in open_issue_ids — caller can evict it.
         assert!(!parsed.open_issue_ids.contains("5"));
+    }
+
+    #[test]
+    fn on_task_complete_removes_cancelled_issue_from_dispatched() {
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: None,
+        };
+        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
+        let external_id = "42";
+        poller.dispatched.insert(
+            external_id.to_string(),
+            harness_core::types::TaskId("task-42".to_string()),
+        );
+
+        let result = TaskCompletionResult {
+            status: TaskStatus::Cancelled,
+            pr_url: None,
+            error: Some("cancelled".to_string()),
+            summary: "cancelled".to_string(),
+        };
+
+        futures::executor::block_on(poller.on_task_complete(external_id, &result)).unwrap();
+
+        assert!(!poller.dispatched.contains_key(external_id));
     }
 
     #[test]

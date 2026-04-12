@@ -442,6 +442,7 @@ async fn run_repo_sprint(
         // Wait for any running task to complete.
         tokio::time::sleep(TASK_POLL_INTERVAL).await;
         let mut newly_done = Vec::new();
+        let mut cancelled = Vec::new();
         for (&issue_num, task_id) in &running {
             if let Some(task) = state.core.tasks.get(task_id) {
                 if task.status.is_terminal() {
@@ -452,13 +453,29 @@ async fn run_repo_sprint(
                         status = task.status.as_ref(),
                         "intake: task finished"
                     );
-                    newly_done.push(issue_num);
+                    if status_unblocks_dependents(&task.status) {
+                        newly_done.push(issue_num);
+                    } else if matches!(task.status, TaskStatus::Cancelled) {
+                        cancelled.push(issue_num);
+                    }
                 }
             }
+        }
+
+        let had_completed = !newly_done.is_empty();
+        for issue_num in cancelled {
+            running.remove(&issue_num);
         }
         for issue_num in newly_done {
             running.remove(&issue_num);
             completed.insert(issue_num);
+        }
+        if running.is_empty() {
+            continue;
+        }
+
+        if had_completed {
+            continue;
         }
     }
 
@@ -500,6 +517,10 @@ fn build_issue_summary(issues: &[(Arc<dyn IntakeSource>, IncomingIssue)]) -> Str
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn status_unblocks_dependents(status: &TaskStatus) -> bool {
+    matches!(status, TaskStatus::Done | TaskStatus::Failed)
 }
 
 /// Poll a task until terminal state, return its output.
@@ -719,6 +740,17 @@ mod tests {
         // Simulates the caller filtering out dep 10 (a skipped issue) before calling validate_dag.
         let deps = make_deps(&[(1, &[]), (2, &[])]);
         assert!(validate_dag(&issues, &deps).is_ok());
+    }
+
+    #[test]
+    fn cancelled_tasks_do_not_count_as_completed_dependencies() {
+        assert!(!status_unblocks_dependents(&TaskStatus::Cancelled));
+    }
+
+    #[test]
+    fn done_and_failed_tasks_still_count_as_completed_dependencies() {
+        assert!(status_unblocks_dependents(&TaskStatus::Done));
+        assert!(status_unblocks_dependents(&TaskStatus::Failed));
     }
 
     // --- existing tests ---
