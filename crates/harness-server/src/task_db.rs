@@ -16,6 +16,9 @@ const ARTIFACT_MAX_BYTES: usize = 65_536;
 /// v2/v3/v4 – additive ALTER TABLE for databases that predate v1 tracking;
 ///   duplicate-column errors are silently ignored by the Migrator.
 /// v5 – add task_artifacts table for persisting agent output per task turn.
+/// v10 – add composite index on (project, status, updated_at).
+/// v11 – add task_checkpoints table for phase recovery.
+/// v12 – add priority column for priority-based task scheduling.
 static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -74,6 +77,12 @@ static TASK_MIGRATIONS: &[Migration] = &[
         sql: "ALTER TABLE tasks ADD COLUMN project TEXT",
     },
     Migration {
+        version: 10,
+        description: "add index on tasks(project, status, updated_at) for dashboard queries",
+        sql: "CREATE INDEX IF NOT EXISTS idx_tasks_project_status_updated \
+              ON tasks(project, status, updated_at DESC)",
+    },
+    Migration {
         version: 11,
         description: "create task_checkpoints table for phase recovery",
         sql: "CREATE TABLE IF NOT EXISTS task_checkpoints (
@@ -86,13 +95,7 @@ static TASK_MIGRATIONS: &[Migration] = &[
         )",
     },
     Migration {
-        version: 10,
-        description: "add index on tasks(project, status, updated_at) for dashboard queries",
-        sql: "CREATE INDEX IF NOT EXISTS idx_tasks_project_status_updated \
-              ON tasks(project, status, updated_at DESC)",
-    },
-    Migration {
-        version: 11,
+        version: 12,
         description: "add priority column for task scheduling",
         sql: "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
     },
