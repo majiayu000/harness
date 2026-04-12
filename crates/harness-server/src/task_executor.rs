@@ -4,7 +4,7 @@ pub(crate) mod pr_detection;
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::config::agents::CapabilityProfile;
 use harness_core::error::HarnessError;
@@ -776,17 +776,36 @@ pub(crate) async fn run_task(
     // Load checkpoint and task state to determine if we can skip phases.
     // This is the duplicate-PR prevention gate: if the task already has a PR,
     // we skip triage/plan/implement and jump directly to agent review.
+    //
+    // Check task store for an existing pr_url first — this survives checkpoint
+    // read failures (e.g. transient SQLite contention) and lets us safely
+    // resume review even when the checkpoint row is temporarily unreadable.
+    let task_pr_url: Option<String> = store.get(task_id).and_then(|t| t.pr_url);
     let checkpoint = match store.load_checkpoint(task_id).await {
-        Ok(ck) => ck,
+        Ok(cp) => cp,
         Err(e) => {
-            tracing::error!(task_id = %task_id, error = %e, "failed to load checkpoint");
-            return Err(anyhow!("failed to load checkpoint: {e}"));
+            if task_pr_url.is_some() {
+                // Task state already records a pr_url — safe to resume review
+                // without the checkpoint; log the failure for observability.
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "checkpoint load failed but task already has pr_url; resuming review without checkpoint"
+                );
+                None
+            } else {
+                // No pr_url in task state — fail closed to prevent duplicate PR.
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to load checkpoint for task {}; aborting to prevent duplicate PR",
+                        task_id
+                    )
+                });
+            }
         }
     };
-    let resumed_pr_url: Option<String> = store
-        .get(task_id)
-        .and_then(|t| t.pr_url)
-        .or_else(|| checkpoint.as_ref().and_then(|c| c.pr_url.clone()));
+    let resumed_pr_url: Option<String> =
+        task_pr_url.or_else(|| checkpoint.as_ref().and_then(|c| c.pr_url.clone()));
     let resumed_plan: Option<String> = checkpoint.and_then(|c| c.plan_output);
 
     // --- Pipeline: Triage → Plan → Implement ---

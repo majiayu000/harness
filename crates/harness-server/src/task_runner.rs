@@ -493,6 +493,11 @@ const TRANSIENT_PATTERNS: &[&str] = &[
     "stream stall",
     "ECONNRESET",
     "ETIMEDOUT",
+    // SQLite transient contention — SQLITE_BUSY / SQLITE_LOCKED
+    "database is locked",
+    "database table is locked",
+    "SQLITE_BUSY",
+    "SQLITE_LOCKED",
 ];
 
 /// Pattern indicating the CLI account-level usage limit has been reached.
@@ -1532,11 +1537,11 @@ where
             match result {
                 ok @ Ok(()) => break ok,
                 Err(ref e)
-                    if is_transient_error(&e.to_string())
+                    if is_transient_error(&format!("{:#}", e))
                         && transient_attempts < MAX_TRANSIENT_RETRIES =>
                 {
                     transient_attempts += 1;
-                    let reason = e.to_string();
+                    let reason = format!("{:#}", e);
 
                     // Account-level limit: activate global circuit breaker (60 min pause)
                     // so all other tasks stop burning turns.
