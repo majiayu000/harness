@@ -213,6 +213,7 @@ fn migration_statements(sql: &str) -> Vec<MigrationStatement<'_>> {
     let mut in_line_comment = false;
     let mut in_block_comment = false;
     let mut trigger_begin_depth = 0usize;
+    let mut trigger_case_depth = 0usize;
     let mut statement_tokens = Vec::new();
     let mut current_statement_is_trigger = false;
 
@@ -315,10 +316,23 @@ fn migration_statements(sql: &str) -> Vec<MigrationStatement<'_>> {
 
             match token.as_str() {
                 "BEGIN" if current_statement_is_trigger => trigger_begin_depth += 1,
+                "CASE" if current_statement_is_trigger && trigger_begin_depth > 0 => {
+                    trigger_case_depth += 1;
+                }
+                "END"
+                    if current_statement_is_trigger
+                        && trigger_begin_depth > 0
+                        && trigger_case_depth > 0 =>
+                {
+                    trigger_case_depth -= 1;
+                }
                 "END" if current_statement_is_trigger && trigger_begin_depth > 0 => {
                     trigger_begin_depth -= 1;
                 }
                 _ => {}
+            }
+            if trigger_begin_depth == 0 {
+                trigger_case_depth = 0;
             }
             continue;
         }
@@ -925,6 +939,38 @@ mod tests {
         );
         assert_eq!(statements[2].sql, "INSERT INTO items VALUES (1)");
         assert_eq!(statements[3].sql, "COMMIT");
+    }
+
+    #[test]
+    fn migration_statements_keep_case_end_inside_trigger_body() {
+        let statements = migration_statements(
+            "CREATE TRIGGER items_touch AFTER INSERT ON items BEGIN\n\
+             UPDATE items\n\
+             SET id = CASE WHEN NEW.id IS NULL THEN OLD.id ELSE NEW.id END;\n\
+             INSERT INTO items_log DEFAULT VALUES;\n\
+             END;",
+        );
+
+        assert_eq!(statements.len(), 1);
+        assert!(
+            statements[0]
+                .sql
+                .contains("CASE WHEN NEW.id IS NULL THEN OLD.id ELSE NEW.id END;"),
+            "unexpected trigger statement: {}",
+            statements[0].sql
+        );
+        assert!(
+            statements[0]
+                .sql
+                .contains("INSERT INTO items_log DEFAULT VALUES;"),
+            "unexpected trigger statement: {}",
+            statements[0].sql
+        );
+        assert!(
+            statements[0].sql.ends_with("END"),
+            "unexpected trigger statement: {}",
+            statements[0].sql
+        );
     }
 
     #[tokio::test]
