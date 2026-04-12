@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::{pool::PoolConnection, Sqlite};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -198,20 +200,168 @@ pub struct Migrator<'a> {
 
 struct MigrationStatement<'a> {
     index: usize,
-    sql: &'a str,
+    sql: Cow<'a, str>,
 }
 
 fn migration_statements(sql: &str) -> Vec<MigrationStatement<'_>> {
-    sql.split(';')
-        .enumerate()
-        .filter_map(|(index, stmt)| {
-            let stmt = stmt.trim();
-            (!stmt.is_empty()).then_some(MigrationStatement {
-                index: index + 1,
-                sql: stmt,
-            })
-        })
-        .collect()
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut index = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut trigger_begin_depth = 0usize;
+
+    while let Some(ch) = chars.next() {
+        let next = chars.peek().copied();
+
+        if in_line_comment {
+            current.push(ch);
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+
+        if in_block_comment {
+            current.push(ch);
+            if ch == '*' && next == Some('/') {
+                current.push(chars.next().expect("peeked slash must exist"));
+                in_block_comment = false;
+            }
+            continue;
+        }
+
+        if in_single_quote {
+            current.push(ch);
+            if ch == '\'' {
+                if next == Some('\'') {
+                    current.push(chars.next().expect("peeked quote must exist"));
+                } else {
+                    in_single_quote = false;
+                }
+            }
+            continue;
+        }
+
+        if in_double_quote {
+            current.push(ch);
+            if ch == '"' {
+                if next == Some('"') {
+                    current.push(chars.next().expect("peeked quote must exist"));
+                } else {
+                    in_double_quote = false;
+                }
+            }
+            continue;
+        }
+
+        if ch == '-' && next == Some('-') {
+            current.push(ch);
+            current.push(chars.next().expect("peeked dash must exist"));
+            in_line_comment = true;
+            continue;
+        }
+
+        if ch == '/' && next == Some('*') {
+            current.push(ch);
+            current.push(chars.next().expect("peeked star must exist"));
+            in_block_comment = true;
+            continue;
+        }
+
+        if ch == '\'' {
+            current.push(ch);
+            in_single_quote = true;
+            continue;
+        }
+
+        if ch == '"' {
+            current.push(ch);
+            in_double_quote = true;
+            continue;
+        }
+
+        current.push(ch);
+
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let mut token = String::from(ch);
+            while let Some(peek) = chars.peek().copied() {
+                if peek.is_ascii_alphanumeric() || peek == '_' {
+                    token.push(chars.next().expect("peeked token char must exist"));
+                    current.push(*token.as_bytes().last().unwrap() as char);
+                } else {
+                    break;
+                }
+            }
+
+            match token.to_ascii_uppercase().as_str() {
+                "BEGIN" => trigger_begin_depth += 1,
+                "END" if trigger_begin_depth > 0 => trigger_begin_depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+
+        if ch == ';' && trigger_begin_depth == 0 {
+            let statement = current[..current.len() - 1].trim();
+            if !statement.is_empty() {
+                index += 1;
+                statements.push(MigrationStatement {
+                    index,
+                    sql: Cow::Owned(statement.to_string()),
+                });
+            }
+            current.clear();
+        }
+    }
+
+    let trailing = current.trim();
+    if !trailing.is_empty() {
+        index += 1;
+        statements.push(MigrationStatement {
+            index,
+            sql: Cow::Owned(trailing.to_string()),
+        });
+    }
+
+    statements
+}
+
+async fn apply_statements_on_connection(
+    conn: &mut PoolConnection<Sqlite>,
+    migration: &Migration,
+    statements: &[MigrationStatement<'_>],
+) -> anyhow::Result<()> {
+    for statement in statements {
+        if let Err(error) = sqlx::query(statement.sql.as_ref())
+            .execute(conn.as_mut())
+            .await
+        {
+            if duplicate_add_column_error(statement.sql.as_ref(), &error) {
+                continue;
+            }
+            return Err(format_migration_error(migration, statement, &error, false));
+        }
+    }
+
+    sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
+        .bind(migration.version as i64)
+        .bind(migration.description)
+        .execute(conn.as_mut())
+        .await?;
+    Ok(())
+}
+
+async fn apply_outside_transaction(
+    pool: &SqlitePool,
+    migration: &Migration,
+    statements: &[MigrationStatement<'_>],
+) -> anyhow::Result<()> {
+    let mut conn = pool.acquire().await?;
+    apply_statements_on_connection(&mut conn, migration, statements).await
 }
 
 fn duplicate_add_column_error(statement: &str, error: &sqlx::Error) -> bool {
@@ -267,13 +417,13 @@ async fn apply_migration(pool: &SqlitePool, migration: &Migration) -> anyhow::Re
     let statements = migration_statements(migration.sql);
     let use_transaction = statements
         .iter()
-        .all(|statement| sqlite_statement_is_transaction_safe(statement.sql));
+        .all(|statement| sqlite_statement_is_transaction_safe(statement.sql.as_ref()));
 
     if use_transaction {
         let mut tx = pool.begin().await?;
         for statement in &statements {
-            if let Err(error) = sqlx::query(statement.sql).execute(&mut *tx).await {
-                if duplicate_add_column_error(statement.sql, &error) {
+            if let Err(error) = sqlx::query(statement.sql.as_ref()).execute(&mut *tx).await {
+                if duplicate_add_column_error(statement.sql.as_ref(), &error) {
                     continue;
                 }
                 return Err(format_migration_error(migration, statement, &error, true));
@@ -288,21 +438,7 @@ async fn apply_migration(pool: &SqlitePool, migration: &Migration) -> anyhow::Re
         return Ok(());
     }
 
-    for statement in &statements {
-        if let Err(error) = sqlx::query(statement.sql).execute(pool).await {
-            if duplicate_add_column_error(statement.sql, &error) {
-                continue;
-            }
-            return Err(format_migration_error(migration, statement, &error, false));
-        }
-    }
-
-    sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
-        .bind(migration.version as i64)
-        .bind(migration.description)
-        .execute(pool)
-        .await?;
-    Ok(())
+    apply_outside_transaction(pool, migration, &statements).await
 }
 
 fn applied_versions_set(rows: Vec<(i64,)>) -> HashSet<u32> {
@@ -720,6 +856,59 @@ mod tests {
             message.contains("outside transaction"),
             "unexpected error: {message}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_statements_keep_trigger_body_intact() {
+        let statements = migration_statements(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY);\n\
+             CREATE TRIGGER items_touch AFTER INSERT ON items BEGIN\n\
+             UPDATE items SET id = NEW.id;\n\
+             INSERT INTO items_log DEFAULT VALUES;\n\
+             END;",
+        );
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            statements[0].sql,
+            "CREATE TABLE items (id INTEGER PRIMARY KEY)"
+        );
+        assert!(
+            statements[1]
+                .sql
+                .starts_with("CREATE TRIGGER items_touch AFTER INSERT ON items BEGIN"),
+            "unexpected trigger statement: {}",
+            statements[1].sql
+        );
+        assert!(
+            statements[1].sql.ends_with("END"),
+            "unexpected trigger statement: {}",
+            statements[1].sql
+        );
+    }
+
+    #[tokio::test]
+    async fn pragma_style_migration_keeps_connection_local_state_on_one_connection(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("mig.db").display());
+        let pool = SqlitePoolOptions::new()
+            .min_connections(2)
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect(&url)
+            .await?;
+        let migrations = [Migration {
+            version: 1,
+            description: "temp table migration",
+            sql: "CREATE TEMP TABLE migration_temp (id INTEGER); \
+                  INSERT INTO migration_temp VALUES (1); \
+                  SELECT * FROM migration_temp",
+        }];
+
+        Migrator::new(&pool, &migrations).run().await?;
+        assert_eq!(applied_versions(&pool).await?, vec![1]);
         Ok(())
     }
 }
