@@ -10,6 +10,14 @@ use std::path::{Path, PathBuf};
 /// Maximum artifact content size in bytes before truncation.
 const ARTIFACT_MAX_BYTES: usize = 65_536;
 
+/// Column list for `query_as::<_, TaskRow>` — single source of truth.
+///
+/// Every SELECT that maps to `TaskRow` MUST use this constant.
+/// When adding a field to `TaskRow`, add the column here once and all queries
+/// pick it up automatically.  The `task_row_columns_match_struct` test below
+/// will fail if this list drifts from the struct definition.
+const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority";
+
 /// Versioned migrations for the tasks table.
 ///
 /// v1 – baseline schema (all columns including those added in later iterations)
@@ -224,23 +232,19 @@ impl TaskDb {
     }
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
-        let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority
-             FROM tasks WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let sql = format!("SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE id = ?");
+        let row = sqlx::query_as::<_, TaskRow>(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         row.map(TaskRow::try_into_task_state).transpose()
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
-        let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority
-             FROM tasks ORDER BY created_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let sql = format!("SELECT {TASK_ROW_COLUMNS} FROM tasks ORDER BY created_at DESC");
+        let rows = sqlx::query_as::<_, TaskRow>(&sql)
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 
@@ -256,8 +260,7 @@ impl TaskDb {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project
-             FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at DESC"
+            "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at DESC"
         );
         let mut q = sqlx::query_as::<_, TaskRow>(&sql);
         for status in statuses {
@@ -679,13 +682,13 @@ impl TaskDb {
 
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
-        let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority
-             FROM tasks WHERE parent_id = ? ORDER BY created_at DESC",
-        )
-        .bind(parent_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let sql = format!(
+            "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE parent_id = ? ORDER BY created_at DESC"
+        );
+        let rows = sqlx::query_as::<_, TaskRow>(&sql)
+            .bind(parent_id)
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 
@@ -1555,6 +1558,68 @@ mod tests {
             .expect_err("unknown status must return an explicit error");
         let message = format!("{err:#}");
         assert!(message.contains("unknown task status"));
+        Ok(())
+    }
+
+    /// Guard: TASK_ROW_COLUMNS must list exactly the same fields as TaskRow.
+    /// If a field is added to TaskRow but not to the constant, this test fails
+    /// at compile time (struct construction) or at runtime (count mismatch).
+    #[test]
+    fn task_row_columns_match_struct() {
+        let columns: Vec<&str> = super::TASK_ROW_COLUMNS.split(", ").collect();
+
+        // Build a TaskRow using every column name — compile error if a field is missing.
+        let _row = TaskRow {
+            id: String::new(),
+            status: String::new(),
+            turn: 0,
+            pr_url: None,
+            rounds: String::new(),
+            error: None,
+            source: None,
+            external_id: None,
+            parent_id: None,
+            created_at: None,
+            repo: None,
+            depends_on: String::new(),
+            project: None,
+            priority: 0,
+        };
+
+        // Count must match — catches column added to constant but not struct (or vice versa).
+        assert_eq!(
+            columns.len(),
+            14, // bump this when adding a field
+            "TASK_ROW_COLUMNS has {} entries but expected 14 — update both the constant and this test",
+            columns.len()
+        );
+    }
+
+    /// Regression: list_by_status must map to TaskRow correctly (including priority).
+    /// This was the exact crash path: startup calls list_by_status to load active tasks.
+    #[tokio::test]
+    async fn list_by_status_returns_matching_tasks() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-pending", TaskStatus::Pending);
+        task.priority = 2;
+        db.insert(&task).await?;
+        db.insert(&make_task("task-done", TaskStatus::Done)).await?;
+
+        let pending = db.list_by_status(&["pending"]).await?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id.0, "task-pending");
+        assert_eq!(
+            pending[0].priority, 2,
+            "priority must survive list_by_status roundtrip"
+        );
+
+        let multi = db.list_by_status(&["pending", "done"]).await?;
+        assert_eq!(multi.len(), 2);
+
+        let empty = db.list_by_status(&[]).await?;
+        assert!(empty.is_empty());
         Ok(())
     }
 }
