@@ -5,6 +5,11 @@ use harness_observe::{quality::QualityGrader, stats};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+/// Rolling window for dashboard event queries. Keeps each `/api/dashboard` poll
+/// from doing a full-history scan — the browser polls every 5 s and the event
+/// store materialises all matching rows into memory on every call.
+const DASHBOARD_EVENT_WINDOW_DAYS: i64 = 30;
+
 /// Server start time. Initialized once in `serve()` before accepting connections,
 /// so `uptime_secs` reflects true server uptime rather than time since first dashboard hit.
 pub(crate) static SERVER_START: std::sync::OnceLock<std::time::Instant> =
@@ -38,10 +43,14 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     // Grade from the global quality event store.
     // Derive violation_count from the most recent rule_scan session so we don't
     // permanently depress the grade with historical violations from old scans.
+    let events_since = chrono::Utc::now() - chrono::Duration::days(DASHBOARD_EVENT_WINDOW_DAYS);
     let grade: Option<Value> = match state
         .observability
         .events
-        .query(&EventFilters::default())
+        .query(&EventFilters {
+            since: Some(events_since),
+            ..Default::default()
+        })
         .await
     {
         Ok(events) => {
@@ -92,12 +101,15 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         } else {
             Some(latencies[latencies.len() / 2])
         };
-        // total_linter_feedback from events already queried above
+        // total_linter_feedback from events already queried above.
+        // Bounded to the same rolling window as the grade query to avoid a
+        // full-history scan on every 5-second dashboard poll.
         let total_linter_feedback = match state
             .observability
             .events
             .query(&EventFilters {
                 hook: Some("rule_check".to_string()),
+                since: Some(events_since),
                 ..Default::default()
             })
             .await

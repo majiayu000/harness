@@ -485,6 +485,13 @@ async fn run_agent_streaming(
                             StreamItem::ItemCompleted {
                                 item: Item::AgentReasoning { content },
                             } => {
+                                // Adapters that emit ItemCompleted instead of MessageDelta
+                                // (e.g. AnthropicApiAdapter) never trigger the MessageDelta arm
+                                // above, so capture first-token latency here as well.
+                                if first_token_latency_ms.is_none() {
+                                    first_token_latency_ms =
+                                        Some(turn_start.elapsed().as_millis() as u64);
+                                }
                                 // Prefer the full content over accumulated deltas.
                                 output = content.clone();
                             }

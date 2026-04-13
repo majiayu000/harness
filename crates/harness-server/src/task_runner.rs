@@ -1075,11 +1075,17 @@ impl TaskStore {
         let mut first_token_latencies: Vec<u64> = Vec::new();
         for entry in self.cache.iter() {
             let task = entry.value();
+            // Skip the synthetic resumed_checkpoint round injected at recovery time,
+            // then find the first round that actually received a response token.
+            // Using find_map (instead of find + and_then) means transient_retry rounds
+            // whose first_token_latency_ms is None are also skipped, so a task with
+            // one or more transient failures before a successful round is still included
+            // in p50 using the latency of that successful round.
             if let Some(latency) = task
                 .rounds
                 .iter()
-                .find(|r| r.result != "resumed_checkpoint")
-                .and_then(|r| r.first_token_latency_ms)
+                .filter(|r| r.result != "resumed_checkpoint")
+                .find_map(|r| r.first_token_latency_ms)
             {
                 first_token_latencies.push(latency);
             }
