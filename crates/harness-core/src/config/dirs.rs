@@ -63,40 +63,46 @@ pub fn find_config_file() -> Option<PathBuf> {
 fn config_candidates() -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
+    // Reject relative env-var values: accepting them would make harness probe
+    // paths relative to the process CWD, turning any directory an operator
+    // starts harness from into a config boundary and potentially loading
+    // attacker-controlled or accidental local config files.
+    let abs_home: Option<PathBuf> = std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute());
+
     // 1. $XDG_CONFIG_HOME/harness/config.toml
     //    Per the XDG Base Directory Specification, XDG_CONFIG_HOME MUST be an
-    //    absolute path. Relative values are silently discarded: accepting them
-    //    would make harness probe paths relative to the process CWD, turning any
-    //    directory an operator starts harness from into a config boundary and
-    //    potentially loading attacker-controlled or accidental local config files.
+    //    absolute path. Relative values are silently discarded.
     if let Some(xdg) = std::env::var("XDG_CONFIG_HOME")
         .ok()
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".config"))
-        })
+        .or_else(|| abs_home.as_ref().map(|h| h.join(".config")))
     {
         candidates.push(xdg.join("harness").join("config.toml"));
     }
 
     // 2. macOS: $HOME/Library/Application Support/harness/config.toml
     #[cfg(target_os = "macos")]
-    if let Ok(home) = std::env::var("HOME") {
+    if let Some(home) = &abs_home {
         candidates.push(
-            PathBuf::from(home)
-                .join("Library/Application Support")
+            home.join("Library/Application Support")
                 .join("harness")
                 .join("config.toml"),
         );
     }
 
     // 3. Windows: %APPDATA%\harness\config.toml
+    //    APPDATA must be absolute for the same reason as XDG_CONFIG_HOME.
     #[cfg(target_os = "windows")]
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        candidates.push(PathBuf::from(appdata).join("harness").join("config.toml"));
+    if let Some(appdata) = std::env::var("APPDATA")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        candidates.push(appdata.join("harness").join("config.toml"));
     }
 
     candidates

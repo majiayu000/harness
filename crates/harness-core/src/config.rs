@@ -77,6 +77,13 @@ impl HarnessConfig {
                 *path = base.join(&*path);
             }
         }
+        fn rebase_opt(path: &mut Option<PathBuf>, base: &std::path::Path) {
+            if let Some(p) = path {
+                if p.is_relative() {
+                    *p = base.join(&*p);
+                }
+            }
+        }
         rebase(&mut self.server.data_dir, base);
         rebase(&mut self.server.project_root, base);
         for p in &mut self.server.allowed_project_roots {
@@ -85,6 +92,15 @@ impl HarnessConfig {
         for entry in &mut self.projects {
             rebase(&mut entry.root, base);
         }
+        for p in &mut self.rules.discovery_paths {
+            rebase(p, base);
+        }
+        rebase_opt(&mut self.rules.builtin_path, base);
+        for p in &mut self.rules.exec_policy_paths {
+            rebase(p, base);
+        }
+        rebase_opt(&mut self.rules.requirements_path, base);
+        rebase(&mut self.workspace.root, base);
     }
 }
 
