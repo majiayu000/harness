@@ -1193,7 +1193,9 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     }
 
     // Re-dispatch tasks that were recovered to pending after server restart.
-    // These had PRs when the server crashed and need their review loop re-started.
+    // Two categories:
+    // 1. Tasks with PRs — continue the review loop
+    // 2. Tasks with checkpoints but no PR (triage/plan only) — resume from saved phase
     // Without this, recovered tasks silently hang in pending forever.
     //
     // Each task is re-dispatched in a background tokio task so that permit
@@ -1205,62 +1207,108 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             .tasks
             .list_all()
             .into_iter()
-            .filter(|t| matches!(t.status, task_runner::TaskStatus::Pending) && t.pr_url.is_some())
+            .filter(|t| {
+                matches!(t.status, task_runner::TaskStatus::Pending)
+                    && (t.pr_url.is_some()
+                        || t.error
+                            .as_deref()
+                            .map_or(false, |e| e.contains("resumed after restart")))
+            })
             .collect();
         if !recovered.is_empty() {
             tracing::info!(
                 count = recovered.len(),
-                "startup: re-dispatching recovered pending task(s) with PRs"
+                "startup: re-dispatching recovered pending task(s)"
             );
             for task in recovered {
                 let state = state.clone();
                 tokio::spawn(async move {
-                    let pr_url = task.pr_url.as_deref().unwrap_or("");
-                    // Issue 4: robust parsing handles /pull/42/files and #fragment suffixes
-                    let pr_num = match parse_pr_num_from_url(pr_url) {
-                        Some(n) => n,
-                        None => {
-                            // pr_url is present but unparseable (empty, corrupted, or
-                            // non-standard).  Simply returning would leave the task stuck in
-                            // 'pending' forever — fail-close it instead so operators can see
-                            // it and the re-dispatch filter never picks it up again.
+                    // Determine dispatch mode: PR-based or issue/checkpoint-based.
+                    let pr_num = task
+                        .pr_url
+                        .as_deref()
+                        .and_then(parse_pr_num_from_url);
+                    let issue_num = task
+                        .external_id
+                        .as_deref()
+                        .and_then(|eid| eid.parse::<u64>().ok());
+
+                    // Fail-close: PR URL present but unparseable.
+                    if task.pr_url.is_some() && pr_num.is_none() {
+                        let bad_url = task.pr_url.as_deref().unwrap_or("").to_owned();
+                        tracing::error!(
+                            task_id = ?task.id,
+                            pr_url = %bad_url,
+                            "startup recovery: cannot parse PR number from URL — marking task failed"
+                        );
+                        if let Err(e) = task_runner::mutate_and_persist(
+                            &state.core.tasks,
+                            &task.id,
+                            move |s| {
+                                s.status = task_runner::TaskStatus::Failed;
+                                s.error = Some(format!(
+                                    "startup recovery: unparseable pr_url: {bad_url}"
+                                ));
+                            },
+                        )
+                        .await
+                        {
                             tracing::error!(
                                 task_id = ?task.id,
-                                pr_url,
-                                "startup recovery: cannot parse PR number from URL — marking task failed"
+                                "startup recovery: failed to persist failed status: {e}"
                             );
-                            let bad_url = pr_url.to_owned();
-                            if let Err(e) = task_runner::mutate_and_persist(
-                                &state.core.tasks,
-                                &task.id,
-                                move |s| {
-                                    s.status = task_runner::TaskStatus::Failed;
-                                    s.error = Some(format!(
-                                        "startup recovery: unparseable pr_url: {bad_url}"
-                                    ));
-                                },
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    task_id = ?task.id,
-                                    "startup recovery: failed to persist failed status: {e}"
-                                );
-                            }
-                            // Fire completion callback so intake sources (e.g. GitHub Issues
-                            // poller) remove this task from their `dispatched` map. Without
-                            // this the issue stays marked as dispatched forever and will never
-                            // be re-queued, causing a silent production deadlock.
-                            if let Some(cb) = &state.intake.completion_callback {
-                                if let Some(final_state) = state.core.tasks.get(&task.id) {
-                                    cb(final_state).await;
-                                }
-                            }
-                            return;
                         }
-                    };
+                        if let Some(cb) = &state.intake.completion_callback {
+                            if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                cb(final_state).await;
+                            }
+                        }
+                        return;
+                    }
 
-                    // Issues 2 & 3: resolve canonical project path from repo name so that
+                    // Fail-close: no PR and no issue number — cannot re-dispatch.
+                    if pr_num.is_none() && issue_num.is_none() {
+                        tracing::warn!(
+                            task_id = ?task.id,
+                            source = ?task.source,
+                            "startup recovery: checkpoint task has no PR or issue number — marking failed"
+                        );
+                        if let Err(e) = task_runner::mutate_and_persist(
+                            &state.core.tasks,
+                            &task.id,
+                            |s| {
+                                s.status = task_runner::TaskStatus::Failed;
+                                s.error = Some(
+                                    "startup recovery: no PR or issue to re-dispatch checkpoint task"
+                                        .into(),
+                                );
+                            },
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to persist failed status: {e}"
+                            );
+                        }
+                        if let Some(cb) = &state.intake.completion_callback {
+                            if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                cb(final_state).await;
+                            }
+                        }
+                        return;
+                    }
+
+                    let mode = if pr_num.is_some() { "pr" } else { "checkpoint" };
+                    tracing::info!(
+                        task_id = ?task.id,
+                        mode,
+                        pr = ?pr_num,
+                        issue = ?issue_num,
+                        "startup recovery: re-dispatching"
+                    );
+
+                    // Resolve canonical project path from repo name so that
                     // (a) the correct per-project concurrency bucket is used, and
                     // (b) req.project is populated so the agent runs in the right worktree.
                     let project_path = match task.repo.as_deref() {
@@ -1298,8 +1346,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     };
                     let project_id = canonical.to_string_lossy().into_owned();
 
-                    // Issue 1: acquire permit here inside the spawned future so serve()
-                    // is never blocked waiting for a concurrency slot.
+                    // Acquire permit inside the spawned future so serve() is never blocked.
                     let permit = match state
                         .concurrency
                         .task_queue
@@ -1316,15 +1363,37 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         }
                     };
 
-                    let req = task_runner::CreateTaskRequest {
-                        pr: Some(pr_num),
-                        project: Some(canonical),
-                        repo: task.repo.clone(),
-                        source: task.source.clone(),
-                        external_id: task.external_id.clone(),
-                        ..Default::default()
+                    // Build request based on dispatch mode.
+                    let (req, classification) = if let Some(pr) = pr_num {
+                        (
+                            task_runner::CreateTaskRequest {
+                                pr: Some(pr),
+                                project: Some(canonical),
+                                repo: task.repo.clone(),
+                                source: task.source.clone(),
+                                external_id: task.external_id.clone(),
+                                ..Default::default()
+                            },
+                            crate::complexity_router::classify("", None, Some(pr)),
+                        )
+                    } else {
+                        (
+                            task_runner::CreateTaskRequest {
+                                issue: issue_num,
+                                project: Some(canonical),
+                                repo: task.repo.clone(),
+                                source: task.source.clone(),
+                                external_id: task.external_id.clone(),
+                                ..Default::default()
+                            },
+                            crate::complexity_router::classify(
+                                &issue_num.map(|n| format!("issue #{n}")).unwrap_or_default(),
+                                issue_num,
+                                None,
+                            ),
+                        )
                     };
-                    let classification = crate::complexity_router::classify("", None, Some(pr_num));
+
                     let agent = match state.core.server.agent_registry.dispatch(&classification) {
                         Ok(a) => a,
                         Err(e) => {
