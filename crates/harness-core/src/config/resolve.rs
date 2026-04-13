@@ -25,6 +25,21 @@ pub struct ResolvedConfig {
     pub review_max_rounds: Option<u32>,
 }
 
+/// Extract the effective default agent name for a project.
+///
+/// Returns the project-level `agent.default` when explicitly set; otherwise
+/// falls back to the server-level `agents.default_agent`.  This is a pure
+/// extraction of the same merge logic used inside [`resolve_config`] so that
+/// the enqueue path can check project preference without constructing a full
+/// [`ResolvedConfig`].
+pub fn resolve_default_agent(server: &HarnessConfig, project: &ProjectConfig) -> String {
+    project
+        .agent
+        .as_ref()
+        .and_then(|a| a.default.clone())
+        .unwrap_or_else(|| server.agents.default_agent.clone())
+}
+
 /// Merge server-level defaults with per-project overrides.
 ///
 /// Fields present in `project` (i.e. `Some`) override the corresponding

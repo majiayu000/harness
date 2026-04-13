@@ -3,6 +3,7 @@ use crate::{
     project_registry::check_allowed_roots, services::execution::EnqueueTaskError, task_runner,
 };
 use axum::{extract::State, http::StatusCode, Json};
+use harness_core::agent::CodeAgent;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -17,16 +18,16 @@ use std::sync::Arc;
 async fn resolve_project_from_registry(
     registry: Option<&crate::project_registry::ProjectRegistry>,
     project: Option<std::path::PathBuf>,
-) -> Result<Option<std::path::PathBuf>, EnqueueTaskError> {
+) -> Result<(Option<std::path::PathBuf>, Option<String>), EnqueueTaskError> {
     let (Some(registry), Some(project_path)) = (registry, project.clone()) else {
-        return Ok(project);
+        return Ok((project, None));
     };
     if project_path.is_dir() {
-        return Ok(Some(project_path));
+        return Ok((Some(project_path), None));
     }
     let id = project_path.to_string_lossy();
-    match registry.resolve_path(&id).await {
-        Ok(Some(root)) => Ok(Some(root)),
+    match registry.get(&id).await {
+        Ok(Some(p)) => Ok((Some(p.root), p.default_agent)),
         Ok(None) => Err(EnqueueTaskError::BadRequest(format!(
             "project '{id}' not found in registry and is not a valid directory"
         ))),
@@ -82,6 +83,70 @@ async fn check_duplicate(
     Some(existing_id)
 }
 
+/// Three-tier agent selection: request override > project default > complexity dispatch.
+///
+/// Tier 1: `req.agent` is `Some` — use the named agent directly (unchanged behaviour).
+/// Tier 2a: project root is known — load `.harness/config.toml`, resolve its
+///          `agent.default` field. The sentinel value `"auto"` means "fall through".
+/// Tier 2b: `registry_agent` is `Some` — the project registry record has a
+///          `default_agent` configured via `POST /api/projects`. Also treats `"auto"` as
+///          fall-through so callers can explicitly opt in to complexity dispatch.
+/// Tier 3: fall back to complexity-based dispatch via [`crate::complexity_router`].
+///
+/// Calling this helper from both enqueue paths ensures the three tiers are
+/// enforced identically and cannot drift apart.
+fn select_agent(
+    req: &task_runner::CreateTaskRequest,
+    registry: &harness_agents::registry::AgentRegistry,
+    registry_agent: Option<&str>,
+) -> Result<Arc<dyn CodeAgent>, EnqueueTaskError> {
+    // Tier 1: explicit agent override from the request.
+    if let Some(name) = &req.agent {
+        return registry
+            .get(name)
+            .ok_or_else(|| EnqueueTaskError::BadRequest(format!("agent '{name}' not registered")));
+    }
+
+    // Tier 2a: project-level default agent from .harness/config.toml.
+    // Honor the explicit setting unconditionally — even when it matches the
+    // server default — so that a project pinning the global default agent name
+    // still bypasses complexity dispatch (tier 3).
+    // The sentinel value "auto" means "fall through to complexity dispatch".
+    if let Some(project_root) = &req.project {
+        let project_cfg = harness_core::config::project::load_project_config(project_root)
+            .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+        if let Some(agent_name) = project_cfg.agent.as_ref().and_then(|a| a.default.as_ref()) {
+            if agent_name != "auto" {
+                return registry.get(agent_name).ok_or_else(|| {
+                    EnqueueTaskError::BadRequest(format!("agent '{agent_name}' not registered"))
+                });
+            }
+            // "auto" => fall through to tier 2b / tier 3
+        }
+    }
+
+    // Tier 2b: project registry default agent (configured via POST /api/projects).
+    // Also treats "auto" as a fall-through sentinel.
+    if let Some(name) = registry_agent {
+        if name != "auto" {
+            return registry.get(name).ok_or_else(|| {
+                EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
+            });
+        }
+        // "auto" => fall through to tier 3
+    }
+
+    // Tier 3: complexity-based dispatch (global fallback).
+    let classification = crate::complexity_router::classify(
+        req.prompt.as_deref().unwrap_or_default(),
+        req.issue,
+        req.pr,
+    );
+    registry
+        .dispatch(&classification)
+        .map_err(|e| EnqueueTaskError::Internal(e.to_string()))
+}
+
 pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
     mut req: task_runner::CreateTaskRequest,
@@ -101,8 +166,9 @@ pub(crate) async fn enqueue_task(
 
     // Resolve project: if the supplied path does not exist as a directory,
     // treat it as a project ID and look it up in the registry.
-    req.project =
+    let (resolved_project, registry_default_agent) =
         resolve_project_from_registry(state.core.project_registry.as_deref(), req.project).await?;
+    req.project = resolved_project;
 
     // Resolve and canonicalize the project root BEFORE acquiring the
     // concurrency permit so that:
@@ -144,24 +210,11 @@ pub(crate) async fn enqueue_task(
         .await
         .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
 
-    let agent =
-        if let Some(name) = &req.agent {
-            state.core.server.agent_registry.get(name).ok_or_else(|| {
-                EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
-            })?
-        } else {
-            let classification = crate::complexity_router::classify(
-                req.prompt.as_deref().unwrap_or_default(),
-                req.issue,
-                req.pr,
-            );
-            state
-                .core
-                .server
-                .agent_registry
-                .dispatch(&classification)
-                .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?
-        };
+    let agent = select_agent(
+        &req,
+        &state.core.server.agent_registry,
+        registry_default_agent.as_deref(),
+    )?;
 
     let (reviewer, _review_config) = resolve_reviewer(
         &state.core.server.agent_registry,
@@ -290,37 +343,15 @@ async fn enqueue_task_background(
 
     // Resolve project: if the supplied path does not exist as a directory,
     // treat it as a project ID and look it up in the registry.
-    req.project =
+    let (resolved_project, registry_default_agent) =
         resolve_project_from_registry(state.core.project_registry.as_deref(), req.project).await?;
+    req.project = resolved_project;
 
-    // Resolve agent up-front (fast, no I/O) so we can return an error immediately
-    // if the agent name is invalid, before registering the task.
-    let agent =
-        if let Some(name) = &req.agent {
-            state.core.server.agent_registry.get(name).ok_or_else(|| {
-                EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
-            })?
-        } else {
-            let classification = crate::complexity_router::classify(
-                req.prompt.as_deref().unwrap_or_default(),
-                req.issue,
-                req.pr,
-            );
-            state
-                .core
-                .server
-                .agent_registry
-                .dispatch(&classification)
-                .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?
-        };
-
-    let (reviewer, _review_config) = resolve_reviewer(
-        &state.core.server.agent_registry,
-        &state.core.server.config.agents.review,
-        agent.name(),
-    );
-
-    // Resolve canonical project for per-project concurrency limits.
+    // Canonicalize the project root (detects worktree when project is None) BEFORE
+    // the security check and BEFORE reading any per-project config files, so that:
+    //   (a) The detected worktree root is exposed to select_agent's tier-2 lookup.
+    //   (b) An untrusted caller cannot read .harness/config.toml from an arbitrary
+    //       path before the allowlist check rejects the request.
     let canonical_project = task_runner::resolve_canonical_project(req.project.clone())
         .await
         .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
@@ -335,6 +366,21 @@ async fn enqueue_task_background(
     let project_id = canonical_project.to_string_lossy().into_owned();
     req.project = Some(canonical_project);
     task_runner::fill_missing_repo_from_project(&mut req).await;
+
+    // Resolve agent after the canonical project path is written into req.project,
+    // so that tier-2 (project config) and the security boundary both see the
+    // fully-resolved path.
+    let agent = select_agent(
+        &req,
+        &state.core.server.agent_registry,
+        registry_default_agent.as_deref(),
+    )?;
+
+    let (reviewer, _review_config) = resolve_reviewer(
+        &state.core.server.agent_registry,
+        &state.core.server.config.agents.review,
+        agent.name(),
+    );
 
     // Auto-populate external_id and check for duplicates.
     populate_external_id(&mut req);
@@ -698,7 +744,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_project_from_registry_passes_through_none() {
         let result = resolve_project_from_registry(None, None).await;
-        assert!(result.unwrap().is_none());
+        assert!(result.unwrap().0.is_none());
     }
 
     #[tokio::test]
@@ -706,7 +752,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let result = resolve_project_from_registry(None, Some(path.clone())).await;
-        assert_eq!(result.unwrap(), Some(path));
+        assert_eq!(result.unwrap().0, Some(path));
     }
 
     #[tokio::test]
@@ -715,7 +761,7 @@ mod tests {
         // (downstream canonicalization handles them).
         let path = std::path::PathBuf::from("/nonexistent/path");
         let result = resolve_project_from_registry(None, Some(path.clone())).await;
-        assert_eq!(result.unwrap(), Some(path));
+        assert_eq!(result.unwrap().0, Some(path));
     }
 
     #[tokio::test]
@@ -741,10 +787,40 @@ mod tests {
             Some(std::path::PathBuf::from("my-repo")),
         )
         .await;
+        let (path, agent) = result.unwrap();
+        assert_eq!(path, Some(std::path::PathBuf::from("/home/user/my-repo")));
+        assert_eq!(agent, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_project_from_registry_returns_default_agent_from_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
+            .await
+            .unwrap();
+        registry
+            .register(crate::project_registry::Project {
+                id: "pinned-repo".to_string(),
+                root: std::path::PathBuf::from("/home/user/pinned-repo"),
+                max_concurrent: None,
+                default_agent: Some("opus".to_string()),
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let result = resolve_project_from_registry(
+            Some(&registry),
+            Some(std::path::PathBuf::from("pinned-repo")),
+        )
+        .await;
+        let (path, agent) = result.unwrap();
         assert_eq!(
-            result.unwrap(),
-            Some(std::path::PathBuf::from("/home/user/my-repo"))
+            path,
+            Some(std::path::PathBuf::from("/home/user/pinned-repo"))
         );
+        assert_eq!(agent.as_deref(), Some("opus"));
     }
 
     #[tokio::test]
@@ -825,5 +901,242 @@ mod tests {
         let groups = build_conflict_groups(&refs);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0], vec![0]);
+    }
+
+    // ── select_agent three-tier precedence tests ─────────────────────────────
+
+    use harness_agents::registry::AgentRegistry;
+    use harness_core::{
+        agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem},
+        config::HarnessConfig,
+        types::{Capability, TokenUsage},
+    };
+
+    struct StubAgent {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl CodeAgent for StubAgent {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+        async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+            Ok(AgentResponse {
+                output: String::new(),
+                stderr: String::new(),
+                items: vec![],
+                token_usage: TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    cost_usd: 0.0,
+                },
+                model: self.name.to_string(),
+                exit_code: Some(0),
+            })
+        }
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            _tx: tokio::sync::mpsc::Sender<StreamItem>,
+        ) -> harness_core::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn registry_with(default: &str, names: &[&'static str]) -> AgentRegistry {
+        let mut reg = AgentRegistry::new(default);
+        for &n in names {
+            reg.register(n, Arc::new(StubAgent { name: n }));
+        }
+        reg
+    }
+
+    fn req_with_agent(
+        agent: Option<&str>,
+        project: Option<std::path::PathBuf>,
+    ) -> task_runner::CreateTaskRequest {
+        let mut req = task_runner::CreateTaskRequest::default();
+        req.agent = agent.map(str::to_owned);
+        req.project = project;
+        req.prompt = Some("do something".to_string());
+        req
+    }
+
+    #[test]
+    fn agent_override_wins() {
+        let reg = registry_with("auto", &["opus", "claude"]);
+        let mut server = HarnessConfig::default();
+        server.agents.default_agent = "claude".to_string();
+
+        // Build a temp project dir with no .harness/config.toml
+        let dir = tempfile::tempdir().unwrap();
+        let req = req_with_agent(Some("opus"), Some(dir.path().to_path_buf()));
+
+        let agent = select_agent(&req, &reg, None).unwrap();
+        assert_eq!(agent.name(), "opus");
+    }
+
+    #[test]
+    fn project_default_used() {
+        let reg = registry_with("auto", &["claude", "sonnet"]);
+        let mut server = HarnessConfig::default();
+        server.agents.default_agent = "auto".to_string();
+
+        // Write a project config that sets agent.default = "claude"
+        let dir = tempfile::tempdir().unwrap();
+        let harness_dir = dir.path().join(".harness");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("config.toml"),
+            "[agent]\ndefault = \"claude\"\n",
+        )
+        .unwrap();
+
+        let req = req_with_agent(None, Some(dir.path().to_path_buf()));
+        let agent = select_agent(&req, &reg, None).unwrap();
+        assert_eq!(agent.name(), "claude");
+    }
+
+    #[test]
+    fn global_fallback_when_no_project_config() {
+        let reg = registry_with("sonnet", &["sonnet"]);
+        let mut server = HarnessConfig::default();
+        server.agents.default_agent = "sonnet".to_string();
+
+        // No .harness/config.toml in the temp dir
+        let dir = tempfile::tempdir().unwrap();
+        let req = req_with_agent(None, Some(dir.path().to_path_buf()));
+
+        let agent = select_agent(&req, &reg, None).unwrap();
+        assert_eq!(agent.name(), "sonnet");
+    }
+
+    #[test]
+    fn global_fallback_when_project_config_has_no_agent_field() {
+        let reg = registry_with("sonnet", &["sonnet"]);
+        let mut server = HarnessConfig::default();
+        server.agents.default_agent = "sonnet".to_string();
+
+        let dir = tempfile::tempdir().unwrap();
+        let harness_dir = dir.path().join(".harness");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        // Config file exists but has no [agent] section
+        std::fs::write(
+            harness_dir.join("config.toml"),
+            "[git]\nbase_branch = \"main\"\n",
+        )
+        .unwrap();
+
+        let req = req_with_agent(None, Some(dir.path().to_path_buf()));
+        let agent = select_agent(&req, &reg, None).unwrap();
+        assert_eq!(agent.name(), "sonnet");
+    }
+
+    // Regression for issue #2: a project that explicitly pins the same agent
+    // name as the server default must still honor tier 2 (i.e. bypass tier 3
+    // complexity dispatch). Previously the textual equality check
+    // `if &resolved != server_default` caused tier 2 to be silently skipped,
+    // allowing complex tasks to be rerouted by the complexity router.
+    #[test]
+    fn project_pinning_same_agent_as_server_default_bypasses_complexity_dispatch() {
+        // Registry has two agents; complexity dispatch would pick "opus" for
+        // complex tasks, but the project explicitly pins "claude" (same as
+        // server default) — tier 2 must win.
+        let reg = registry_with("claude", &["claude", "opus"]);
+        let mut server = HarnessConfig::default();
+        server.agents.default_agent = "claude".to_string();
+
+        let dir = tempfile::tempdir().unwrap();
+        let harness_dir = dir.path().join(".harness");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        // Explicitly pin the same agent as the server default.
+        std::fs::write(
+            harness_dir.join("config.toml"),
+            "[agent]\ndefault = \"claude\"\n",
+        )
+        .unwrap();
+
+        let req = req_with_agent(None, Some(dir.path().to_path_buf()));
+        let agent = select_agent(&req, &reg, None).unwrap();
+        // Must be "claude" (explicit project pin), not whatever complexity
+        // dispatch would have chosen.
+        assert_eq!(agent.name(), "claude");
+    }
+
+    #[test]
+    fn unknown_agent_in_project_config_returns_bad_request() {
+        let reg = registry_with("auto", &["sonnet"]);
+        let mut server = HarnessConfig::default();
+        server.agents.default_agent = "auto".to_string();
+
+        let dir = tempfile::tempdir().unwrap();
+        let harness_dir = dir.path().join(".harness");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("config.toml"),
+            "[agent]\ndefault = \"nonexistent\"\n",
+        )
+        .unwrap();
+
+        let req = req_with_agent(None, Some(dir.path().to_path_buf()));
+        let result = select_agent(&req, &reg, None);
+        assert!(matches!(result, Err(EnqueueTaskError::BadRequest(_))));
+    }
+
+    // Regression for Issue 1: `[agent] default = "auto"` in .harness/config.toml
+    // must NOT be treated as a literal agent name (which would 400). It is a
+    // sentinel meaning "fall through to complexity dispatch (tier 3)".
+    #[test]
+    fn config_toml_auto_falls_through_to_complexity_dispatch() {
+        let reg = registry_with("sonnet", &["sonnet"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let harness_dir = dir.path().join(".harness");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("config.toml"),
+            "[agent]\ndefault = \"auto\"\n",
+        )
+        .unwrap();
+
+        let req = req_with_agent(None, Some(dir.path().to_path_buf()));
+        // "auto" must not 400; it must fall through to complexity dispatch which
+        // returns the registry default ("sonnet").
+        let agent = select_agent(&req, &reg, None).unwrap();
+        assert_eq!(agent.name(), "sonnet");
+    }
+
+    // Regression for Issue 2: project registry default_agent (configured via
+    // POST /api/projects) must be honoured when .harness/config.toml has no
+    // [agent] section.
+    #[test]
+    fn registry_default_agent_used_when_config_toml_has_no_agent_section() {
+        let reg = registry_with("sonnet", &["sonnet", "opus"]);
+
+        // No .harness/config.toml → config.toml tier produces no agent.
+        let dir = tempfile::tempdir().unwrap();
+        let req = req_with_agent(None, Some(dir.path().to_path_buf()));
+
+        // Registry record says to use "opus".
+        let agent = select_agent(&req, &reg, Some("opus")).unwrap();
+        assert_eq!(agent.name(), "opus");
+    }
+
+    // "auto" in registry default_agent must also fall through to complexity
+    // dispatch (tier 3), not 400.
+    #[test]
+    fn registry_auto_agent_falls_through_to_complexity_dispatch() {
+        let reg = registry_with("sonnet", &["sonnet"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let req = req_with_agent(None, Some(dir.path().to_path_buf()));
+
+        let agent = select_agent(&req, &reg, Some("auto")).unwrap();
+        assert_eq!(agent.name(), "sonnet");
     }
 }
