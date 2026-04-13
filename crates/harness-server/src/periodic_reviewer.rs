@@ -1345,6 +1345,21 @@ async fn poll_task_output(
         ) {
             continue;
         }
+        // Interceptor-blocked tasks fail before the agent runs (0 rounds,
+        // non-empty error).  Treat as a permanent failure — retrying the
+        // same project will hit the same guard violations.
+        if matches!(task.status, crate::task_runner::TaskStatus::Failed) {
+            if let Some(ref err) = task.error {
+                if err.contains("Blocked by interceptor") {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        error = %err.chars().take(200).collect::<String>(),
+                        "poll_task_output: blocked by interceptor, treating as skip"
+                    );
+                    return Some("REVIEW_SKIPPED".to_string());
+                }
+            }
+        }
         let output: String = task
             .rounds
             .iter()
