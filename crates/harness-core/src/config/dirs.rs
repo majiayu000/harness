@@ -64,9 +64,15 @@ fn config_candidates() -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     // 1. $XDG_CONFIG_HOME/harness/config.toml
+    //    Per the XDG Base Directory Specification, XDG_CONFIG_HOME MUST be an
+    //    absolute path. Relative values are silently discarded: accepting them
+    //    would make harness probe paths relative to the process CWD, turning any
+    //    directory an operator starts harness from into a config boundary and
+    //    potentially loading attacker-controlled or accidental local config files.
     if let Some(xdg) = std::env::var("XDG_CONFIG_HOME")
         .ok()
         .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
         .or_else(|| {
             std::env::var("HOME")
                 .ok()
@@ -218,6 +224,21 @@ mod tests {
             || {
                 let found = find_config_file();
                 assert_eq!(found.as_deref(), Some(xdg_config.as_path()));
+            },
+        );
+    }
+
+    /// Relative XDG_CONFIG_HOME values must be rejected (XDG spec requires absolute paths).
+    #[test]
+    fn find_config_file_rejects_relative_xdg_config_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home_str = dir.path().to_str().unwrap().to_owned();
+        // XDG_CONFIG_HOME is relative ("relative/path") — must be ignored and fall
+        // through to HOME-based ~/.config which does not exist in this temp dir.
+        with_env_vars(
+            &[("XDG_CONFIG_HOME", "relative/path"), ("HOME", &home_str)],
+            || {
+                assert!(find_config_file().is_none());
             },
         );
     }

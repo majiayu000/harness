@@ -64,6 +64,28 @@ impl HarnessConfig {
         self.server.apply_env_overrides()?;
         Ok(())
     }
+
+    /// Rebase all relative `PathBuf` fields against `base`.
+    ///
+    /// Call this immediately after loading a config from a discovered file so
+    /// that relative paths (e.g. `project_root = "."`) resolve against the
+    /// config file's parent directory rather than the process working directory.
+    /// Paths that are already absolute are left unchanged.
+    pub fn rebase_relative_paths(&mut self, base: &std::path::Path) {
+        fn rebase(path: &mut PathBuf, base: &std::path::Path) {
+            if path.is_relative() {
+                *path = base.join(&*path);
+            }
+        }
+        rebase(&mut self.server.data_dir, base);
+        rebase(&mut self.server.project_root, base);
+        for p in &mut self.server.allowed_project_roots {
+            rebase(p, base);
+        }
+        for entry in &mut self.projects {
+            rebase(&mut entry.root, base);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -524,6 +546,49 @@ mod tests {
     fn invalid_toml_returns_parse_error() {
         let result = toml::from_str::<HarnessConfig>("not valid toml {{{}}}");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rebase_relative_paths_resolves_against_base() {
+        let mut config = HarnessConfig::default();
+        config.server.data_dir = PathBuf::from("data");
+        config.server.project_root = PathBuf::from("repo");
+        config.server.allowed_project_roots = vec![PathBuf::from("allowed")];
+        config.projects = vec![ProjectEntry {
+            name: "p".into(),
+            root: PathBuf::from("projects/p"),
+            default: false,
+            default_agent: None,
+            max_concurrent: None,
+        }];
+
+        config.rebase_relative_paths(std::path::Path::new("/etc/harness"));
+
+        assert_eq!(config.server.data_dir, PathBuf::from("/etc/harness/data"));
+        assert_eq!(
+            config.server.project_root,
+            PathBuf::from("/etc/harness/repo")
+        );
+        assert_eq!(
+            config.server.allowed_project_roots,
+            vec![PathBuf::from("/etc/harness/allowed")]
+        );
+        assert_eq!(
+            config.projects[0].root,
+            PathBuf::from("/etc/harness/projects/p")
+        );
+    }
+
+    #[test]
+    fn rebase_relative_paths_leaves_absolute_paths_unchanged() {
+        let mut config = HarnessConfig::default();
+        config.server.data_dir = PathBuf::from("/absolute/data");
+        config.server.project_root = PathBuf::from("/absolute/repo");
+
+        config.rebase_relative_paths(std::path::Path::new("/etc/harness"));
+
+        assert_eq!(config.server.data_dir, PathBuf::from("/absolute/data"));
+        assert_eq!(config.server.project_root, PathBuf::from("/absolute/repo"));
     }
 
     #[test]

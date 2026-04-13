@@ -281,7 +281,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     } else if let Some(discovered) = harness_core::config::dirs::find_config_file() {
         let content = std::fs::read_to_string(&discovered)?;
         tracing::info!("config loaded from {}", discovered.display());
-        toml::from_str(&content)?
+        let mut cfg: harness_core::config::HarnessConfig = toml::from_str(&content)?;
+        // Rebase relative paths against the config file's directory so that a
+        // global config like `project_root = "."` resolves relative to the
+        // config file rather than the operator's working directory.
+        if let Some(dir) = discovered.parent() {
+            cfg.rebase_relative_paths(dir);
+        }
+        cfg
     } else {
         tracing::warn!("no config file found, using built-in defaults");
         harness_core::config::HarnessConfig::default()
