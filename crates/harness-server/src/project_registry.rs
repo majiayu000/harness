@@ -265,7 +265,7 @@ pub fn resolve_project_input(
             }
 
             Ok(ResolvedProject {
-                id: DEFAULT_PROJECT_ID.to_string(),
+                id: canonical_root_alias(&canonical_root),
                 root: canonical_root,
                 max_concurrent: None,
                 default_agent: None,
@@ -338,11 +338,7 @@ impl ProjectRegistry {
 
     /// List all registered projects ordered by creation time (newest first).
     pub async fn list(&self) -> anyhow::Result<Vec<Project>> {
-        let mut projects = self.db.list().await?;
-        for project in &mut projects {
-            project.root = canonicalize_root(&project.root)?;
-        }
-        Ok(projects)
+        self.db.list().await
     }
 
     /// Get a project by ID or canonical root alias.
@@ -1344,7 +1340,11 @@ mod tests {
         assert_eq!(implicit.id, DEFAULT_PROJECT_ID);
         assert_eq!(implicit.root, canonical_default_root);
         assert_eq!(default_id, implicit);
-        assert_eq!(default_alias, implicit);
+        assert_eq!(
+            default_alias.id,
+            canonical_root_alias(&canonical_default_root)
+        );
+        assert_eq!(default_alias.root, canonical_default_root);
         Ok(())
     }
 
@@ -1379,6 +1379,74 @@ mod tests {
             .resolve_limits(default_root.path(), &limits)
             .await?;
         assert_eq!(resolved.get("named"), Some(&2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_registered_root_does_not_break_other_project_lookups() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let registry = ProjectRegistry::open(&dir.path().join("projects.db")).await?;
+        let live_root = tempfile::tempdir()?;
+        let deleted_root = tempfile::tempdir()?;
+        let live_canonical_root = live_root.path().canonicalize()?;
+        let deleted_canonical_root = deleted_root.path().canonicalize()?;
+
+        registry
+            .register(test_project(live_canonical_root.clone(), "live-project"))
+            .await?;
+        registry
+            .register(test_project(deleted_canonical_root, "stale-project"))
+            .await?;
+        drop(deleted_root);
+
+        let loaded = registry
+            .get("live-project")
+            .await?
+            .expect("live project should still resolve");
+        assert_eq!(loaded.root, live_canonical_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unregistered_directory_keeps_its_own_canonical_queue_identity() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let registry = ProjectRegistry::open(&dir.path().join("projects.db")).await?;
+        let default_root = tempfile::tempdir()?;
+        let repo_root = tempfile::tempdir()?;
+        let canonical_repo_root = repo_root.path().canonicalize()?;
+
+        let resolved = registry
+            .resolve_project(Some(canonical_repo_root.as_path()), default_root.path())
+            .await?;
+
+        assert_eq!(resolved.root, canonical_repo_root);
+        assert_eq!(resolved.id, canonical_repo_root.to_string_lossy());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_limits_maps_by_root_entries_for_registered_projects() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let registry = ProjectRegistry::open(&dir.path().join("projects.db")).await?;
+        let default_root = tempfile::tempdir()?;
+        let project_root = tempfile::tempdir()?;
+        let canonical_project_root = project_root.path().canonicalize()?;
+
+        registry
+            .register(test_project(canonical_project_root.clone(), "named"))
+            .await?;
+
+        let mut limits = harness_core::config::misc::PerProjectConcurrencyLimits::default();
+        if let harness_core::config::misc::PerProjectConcurrencyLimits::Typed(typed) = &mut limits {
+            typed
+                .by_root
+                .insert(canonical_project_root.to_string_lossy().into_owned(), 3);
+        }
+
+        let resolved = registry
+            .resolve_limits(default_root.path(), &limits)
+            .await?;
+        assert_eq!(resolved.get("named"), Some(&3));
         Ok(())
     }
 }

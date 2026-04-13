@@ -43,6 +43,22 @@ fn typed_per_project_limit_config(project_id: &str, limit: usize) -> Concurrency
     per_project_limit_config(project_id, limit)
 }
 
+fn typed_by_root_only_config(project_root: &str, limit: usize) -> ConcurrencyConfig {
+    let mut config = ConcurrencyConfig {
+        max_concurrent_tasks: 4,
+        max_queue_size: 16,
+        stall_timeout_secs: 300,
+        per_project: Default::default(),
+        ..ConcurrencyConfig::default()
+    };
+    if let harness_core::config::misc::PerProjectConcurrencyLimits::Typed(typed) =
+        &mut config.per_project
+    {
+        typed.by_root.insert(project_root.to_string(), limit);
+    }
+    config
+}
+
 #[tokio::test]
 async fn acquire_and_release_single_permit() {
     let q = TaskQueue::new(&config(2, 8));
@@ -2056,8 +2072,6 @@ async fn issue_684_queue_tests_verify_final_contract_legacy() {
 
 #[tokio::test]
 async fn project_cannot_starve_another() {
-    // global=2, proj_a=1 → proj_a can use at most 1 global slot,
-    // leaving at least 1 for proj_b.
     let cfg = legacy_per_project_limit_config("proj_a", 1);
     let cfg = ConcurrencyConfig {
         max_concurrent_tasks: 2,
@@ -2067,10 +2081,8 @@ async fn project_cannot_starve_another() {
     };
     let q = Arc::new(TaskQueue::new(&cfg));
 
-    // proj_a fills its project slot (limit=1).
     let _pa = q.acquire("proj_a", 0).await.unwrap();
 
-    // proj_a cannot take another slot even though 1 global slot remains.
     let q2 = q.clone();
     let blocked = timeout(Duration::from_millis(50), q2.acquire("proj_a", 0)).await;
     assert!(
@@ -2078,7 +2090,6 @@ async fn project_cannot_starve_another() {
         "proj_a blocked at project limit while global slot is free"
     );
 
-    // proj_b can still acquire the remaining global slot.
     let pb = timeout(Duration::from_millis(100), q.acquire("proj_b", 0)).await;
     assert!(pb.is_ok(), "proj_b should get the remaining global slot");
 }
@@ -2092,7 +2103,6 @@ async fn project_stats_reflect_running_and_queued() {
     assert_eq!(stats.running, 1);
     assert_eq!(stats.queued, 0);
 
-    // Queue a waiter by capping project limit to 1.
     let cfg2 = typed_per_project_limit_config("capped", 1);
     let q2 = Arc::new(TaskQueue::new(&cfg2));
     let _holder = q2.acquire("capped", 0).await.unwrap();
@@ -2105,12 +2115,8 @@ async fn project_stats_reflect_running_and_queued() {
     assert_eq!(stats2.queued, 1);
 }
 
-// --- Priority tests ---
-
 #[tokio::test]
 async fn high_priority_acquired_before_low_when_slots_full() {
-    // 1 slot: hold it, then enqueue priority=0 then priority=1.
-    // When the slot is released, priority=1 should unblock first.
     let q = Arc::new(TaskQueue::new(&config(1, 16)));
     let holder = q.acquire("proj", 0).await.unwrap();
 
@@ -2123,7 +2129,6 @@ async fn high_priority_acquired_before_low_when_slots_full() {
         let _ = tx1.send(0);
     });
 
-    // Small delay to ensure priority=0 waiter is registered first.
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let q2 = q.clone();
@@ -2135,7 +2140,6 @@ async fn high_priority_acquired_before_low_when_slots_full() {
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    // Release the holder; the priority=1 waiter should unblock first.
     drop(holder);
     tokio::time::sleep(Duration::from_millis(30)).await;
 
@@ -2145,8 +2149,6 @@ async fn high_priority_acquired_before_low_when_slots_full() {
 
 #[tokio::test]
 async fn same_priority_is_fifo() {
-    // 1 slot: hold it, then enqueue three priority=1 waiters in order.
-    // They should unblock in enqueue order (FIFO).
     let q = Arc::new(TaskQueue::new(&config(1, 16)));
     let holder = q.acquire("proj", 1).await.unwrap();
 
@@ -2158,14 +2160,11 @@ async fn same_priority_is_fifo() {
         tokio::spawn(async move {
             let _p = q_i.acquire("proj", 1).await.unwrap();
             let _ = tx_i.send(i);
-            // Hold slot briefly so ordering is observable.
             tokio::time::sleep(Duration::from_millis(20)).await;
         });
-        // Stagger enqueue so seq ordering is deterministic.
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    // Release the holder.
     drop(holder);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -2183,12 +2182,8 @@ async fn priority_zero_default_compiles() {
     assert!(p.is_ok());
 }
 
-// --- running_count correctness ---
-
 #[tokio::test]
 async fn running_count_correct_with_global_waiters() {
-    // limit=2; fill both slots, add a waiter in the global queue.
-    // running_count must still report 2 — waiters do not reduce available_permits.
     let q = Arc::new(TaskQueue::new(&config(2, 16)));
     let _p1 = q.acquire("proj", 0).await.unwrap();
     let _p2 = q.acquire("proj", 0).await.unwrap();
@@ -2205,29 +2200,23 @@ async fn running_count_correct_with_global_waiters() {
     );
 }
 
-// --- Cancellation-safety tests ---
-
 #[tokio::test]
 async fn cancelled_project_wait_does_not_leak_queued_count() {
-    // 1 project slot; hold it so the next acquire blocks at project-wait.
     let cfg = typed_per_project_limit_config("proj", 1);
     let q = Arc::new(TaskQueue::new(&cfg));
     let _holder = q.acquire("proj", 0).await.unwrap();
 
     assert_eq!(q.queued_count(), 0);
 
-    // Spawn an acquire that will block at the project-level wait.
     let q2 = q.clone();
     let handle = tokio::spawn(async move { q2.acquire("proj", 0).await });
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(q.queued_count(), 1);
 
-    // Cancel the waiting future by aborting the task.
     handle.abort();
     assert!(matches!(handle.await, Err(ref e) if e.is_cancelled()));
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // queued_count must return to 0 after cancellation.
     assert_eq!(
         q.queued_count(),
         0,
@@ -2237,36 +2226,28 @@ async fn cancelled_project_wait_does_not_leak_queued_count() {
 
 #[tokio::test]
 async fn cancelled_global_wait_releases_project_permit() {
-    // project limit=2, global limit=1; hold global so the next acquire
-    // passes project-wait then blocks at global-wait.
     let cfg = ConcurrencyConfig {
         max_concurrent_tasks: 1,
         ..typed_per_project_limit_config("proj", 2)
     };
     let q = Arc::new(TaskQueue::new(&cfg));
-    // Hold the single global slot.
     let _global_holder = q.acquire("proj", 0).await.unwrap();
 
-    // This acquire will pass project-wait (limit=2) but block at global-wait.
     let q2 = q.clone();
     let handle = tokio::spawn(async move { q2.acquire("proj", 0).await });
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(q.queued_count(), 1);
 
-    // Cancel the waiting future.
     handle.abort();
     assert!(matches!(handle.await, Err(ref e) if e.is_cancelled()));
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // queued_count must return to 0.
     assert_eq!(
         q.queued_count(),
         0,
         "queued_count leaked after global-wait cancellation"
     );
 
-    // The released project permit must allow a new acquisition once the
-    // global slot becomes free.
     drop(_global_holder);
     let result = timeout(Duration::from_millis(100), q.acquire("proj", 0)).await;
     assert!(
@@ -2275,32 +2256,22 @@ async fn cancelled_global_wait_releases_project_permit() {
     );
 }
 
-// --- Mid-send cancellation race regression tests (Issues 1 & 2) ---
-
-/// Regression: project permit must not be permanently lost when the future is
-/// cancelled *after* `release()` sends the signal but *before* `rx.await`
-/// completes (the "mid-send" race on the project queue).
 #[tokio::test]
 async fn project_permit_not_leaked_on_mid_send_cancellation() {
     let cfg = typed_per_project_limit_config("proj", 1);
     let q = Arc::new(TaskQueue::new(&cfg));
 
-    // Hold the single project slot.
     let holder = q.acquire("proj", 0).await.unwrap();
 
-    // Waiter registers in the project queue.
     let q2 = q.clone();
     let handle = tokio::spawn(async move { q2.acquire("proj", 0).await });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // Release holder (sends the permit signal) then immediately cancel the
-    // waiter — exercises the race where cancellation happens mid-send.
     drop(holder);
     handle.abort();
     let _ = handle.await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // A new task must succeed; the project slot must have been returned.
     let result = timeout(Duration::from_millis(100), q.acquire("proj", 0)).await;
     assert!(
         result.is_ok(),
@@ -2308,9 +2279,6 @@ async fn project_permit_not_leaked_on_mid_send_cancellation() {
     );
 }
 
-/// Regression: global permit must not be permanently lost when the future is
-/// cancelled *after* `release()` sends the global signal but *before*
-/// `rx.await` completes (the "mid-send" race on the global queue).
 #[tokio::test]
 async fn global_permit_not_leaked_on_mid_send_cancellation() {
     let cfg = ConcurrencyConfig {
@@ -2319,21 +2287,17 @@ async fn global_permit_not_leaked_on_mid_send_cancellation() {
     };
     let q = Arc::new(TaskQueue::new(&cfg));
 
-    // Hold the single global slot.
     let global_holder = q.acquire("proj", 0).await.unwrap();
 
-    // Waiter passes project-wait (project limit=2) and blocks at global-wait.
     let q2 = q.clone();
     let handle = tokio::spawn(async move { q2.acquire("proj", 0).await });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // Release global holder (sends the global signal) then cancel the waiter.
     drop(global_holder);
     handle.abort();
     let _ = handle.await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // A new task must succeed; the global slot must have been returned.
     let result = timeout(Duration::from_millis(100), q.acquire("proj", 0)).await;
     assert!(
         result.is_ok(),
@@ -2365,4 +2329,35 @@ async fn task_admission_succeeds_no_pressure() {
         result.is_ok(),
         "acquire must succeed when pressure flag is false"
     );
+}
+
+#[tokio::test]
+async fn issue_712_root_only_config_does_not_limit_resolved_project_ids() {
+    let q = TaskQueue::new(&typed_by_root_only_config("/repo-a", 1));
+    assert_eq!(q.project_stats("project-a").limit, 4);
+}
+
+#[tokio::test]
+async fn issue_712_resolved_limit_map_applies_project_id_limits() {
+    let mut resolved = std::collections::HashMap::new();
+    resolved.insert("project-a".to_string(), 1usize);
+    let q = Arc::new(TaskQueue::new_with_project_limits(
+        &typed_by_root_only_config("/repo-a", 1),
+        resolved,
+    ));
+    let _holder = q.acquire("project-a", 0).await.unwrap();
+    let blocked = timeout(Duration::from_millis(50), q.clone().acquire("project-a", 0)).await;
+    let other = timeout(Duration::from_millis(50), q.clone().acquire("project-b", 0)).await;
+    assert!(blocked.is_err());
+    assert!(other.is_ok());
+}
+
+#[tokio::test]
+async fn issue_712_raw_root_keys_remain_distinct() {
+    let q = Arc::new(TaskQueue::new(&typed_per_project_limit_config(
+        "/repo-a", 1,
+    )));
+    let _holder = q.acquire("/repo-a", 0).await.unwrap();
+    let other = timeout(Duration::from_millis(50), q.clone().acquire("/repo-b", 0)).await;
+    assert!(other.is_ok());
 }

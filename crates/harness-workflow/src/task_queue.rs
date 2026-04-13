@@ -408,7 +408,32 @@ pub struct TaskQueue {
 
 impl TaskQueue {
     pub fn new(config: &ConcurrencyConfig) -> Self {
-        Self::new_with_pressure(config, None)
+        let project_limits: DashMap<String, usize> = config
+            .per_project
+            .by_id()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        Self::new_with_limits(config, project_limits, None)
+    }
+
+    pub fn new_with_project_limits(
+        config: &ConcurrencyConfig,
+        project_limits: std::collections::HashMap<String, usize>,
+    ) -> Self {
+        Self::new_with_project_limits_and_pressure(config, project_limits, None)
+    }
+
+    pub fn new_with_project_limits_and_pressure(
+        config: &ConcurrencyConfig,
+        project_limits: std::collections::HashMap<String, usize>,
+        memory_pressure: Option<Arc<AtomicBool>>,
+    ) -> Self {
+        Self::new_with_limits(
+            config,
+            project_limits.into_iter().collect(),
+            memory_pressure,
+        )
     }
 
     /// Like [`TaskQueue::new`] but wires in an optional memory-pressure flag.
@@ -424,6 +449,14 @@ impl TaskQueue {
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
+        Self::new_with_limits(config, project_limits, memory_pressure)
+    }
+
+    fn new_with_limits(
+        config: &ConcurrencyConfig,
+        project_limits: DashMap<String, usize>,
+        memory_pressure: Option<Arc<AtomicBool>>,
+    ) -> Self {
         Self {
             global_queue: Arc::new(Mutex::new(PriorityPermitQueue::new(
                 config.max_concurrent_tasks,
