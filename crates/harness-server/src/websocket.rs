@@ -103,10 +103,35 @@ async fn authenticate_ws_first_message(
     token.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
+/// Returns true when the HTTP upgrade request carries a valid Bearer token.
+///
+/// This lets non-dashboard WS clients (CLI tools, automation) authenticate via
+/// the standard `Authorization: Bearer <token>` header on the upgrade request
+/// instead of sending a first-frame `{"type":"auth","token":"..."}` message.
+/// When no token is configured on the server the function returns false so that
+/// `handle_socket` takes its normal no-auth fast-path.
+fn bearer_pre_authed(headers: &HeaderMap, state: &Arc<AppState>) -> bool {
+    let Some(expected) = crate::http::auth::resolve_api_token(&state.core.server.config.server)
+    else {
+        return false;
+    };
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|tok| tok.as_bytes().ct_eq(expected.as_bytes()).into())
+        .unwrap_or(false)
+}
+
 /// Axum handler that upgrades the HTTP connection to WebSocket.
 ///
 /// Validates the Origin header to prevent Cross-Site WebSocket Hijacking (CSWH).
 /// CLI clients that omit the Origin header are always allowed.
+///
+/// If the upgrade request includes a valid `Authorization: Bearer <token>`
+/// header the connection is considered pre-authenticated and the first-frame
+/// handshake is skipped, preserving backwards-compatibility with existing WS
+/// clients that do not send the JSON auth frame.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
@@ -126,7 +151,8 @@ pub async fn ws_handler(
         }
         return StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    let pre_authed = bearer_pre_authed(&headers, &state);
+    ws.on_upgrade(move |socket| handle_socket(socket, state, pre_authed))
 }
 
 /// Handle a single WebSocket connection.
@@ -140,23 +166,27 @@ pub async fn ws_handler(
 ///   is treated as stale and closed.
 /// - When the server signals graceful shutdown via `ws_shutdown_tx`, a Close
 ///   frame is sent and the handler exits.
-async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
+async fn handle_socket(ws: WebSocket, state: Arc<AppState>, pre_authed: bool) {
     let (mut ws_sink, mut ws_stream) = ws.split();
 
-    // First-message auth gate: when a token is configured, the client must
-    // send `{"type":"auth","token":"<tok>"}` as its very first frame.  If it
-    // does not (wrong token, timeout, or malformed message), close with 4401.
-    if let Some(expected) = crate::http::auth::resolve_api_token(&state.core.server.config.server) {
-        let ok = authenticate_ws_first_message(&mut ws_stream, &expected).await;
-        if !ok {
-            ws_sink
-                .send(Message::Close(Some(CloseFrame {
-                    code: WS_CLOSE_UNAUTHORIZED,
-                    reason: "unauthorized".into(),
-                })))
-                .await
-                .ok();
-            return;
+    // First-message auth gate: when a token is configured AND the client has
+    // not already authenticated via the HTTP upgrade Bearer header, the client
+    // must send `{"type":"auth","token":"<tok>"}` as its very first frame.
+    if !pre_authed {
+        if let Some(expected) =
+            crate::http::auth::resolve_api_token(&state.core.server.config.server)
+        {
+            let ok = authenticate_ws_first_message(&mut ws_stream, &expected).await;
+            if !ok {
+                ws_sink
+                    .send(Message::Close(Some(CloseFrame {
+                        code: WS_CLOSE_UNAUTHORIZED,
+                        reason: "unauthorized".into(),
+                    })))
+                    .await
+                    .ok();
+                return;
+            }
         }
     }
 

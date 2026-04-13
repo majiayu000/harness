@@ -1250,10 +1250,15 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                 tokio::spawn(async move {
                     // Determine dispatch mode: PR-based or issue/checkpoint-based.
                     let pr_num = task.pr_url.as_deref().and_then(parse_pr_num_from_url);
-                    let issue_num = task
-                        .external_id
-                        .as_deref()
-                        .and_then(|eid| eid.parse::<u64>().ok());
+                    // external_id canonical format is "issue:<n>" / "pr:<n>".
+                    // Fall back to raw numeric parsing for pre-canonical records.
+                    let issue_num = task.external_id.as_deref().and_then(|eid| {
+                        if let Some(n) = eid.strip_prefix("issue:") {
+                            n.parse::<u64>().ok()
+                        } else {
+                            eid.parse::<u64>().ok()
+                        }
+                    });
 
                     // Fail-close: PR URL present but unparseable.
                     if task.pr_url.is_some() && pr_num.is_none() {

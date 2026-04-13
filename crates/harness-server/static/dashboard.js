@@ -910,11 +910,11 @@ function renderTokenTaskTable(tasks) {
 // --- Init ---
 
 function initTokenAuth() {
-  if (sessionStorage.getItem("harness_token") === null) {
-    showTokenPrompt(null);
-  } else {
-    connectWebSocket();
-  }
+  // Always attempt to connect immediately. For no-auth deployments this works
+  // without any user action. For auth-required deployments the server will
+  // close the socket with code 4401, which triggers showTokenPrompt via the
+  // ws.onclose handler — avoiding a blocking prompt on fresh no-auth installs.
+  connectWebSocket();
 }
 
 function init() {
