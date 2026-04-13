@@ -288,6 +288,32 @@ impl TaskDb {
         Ok(row.map(|r| r.0))
     }
 
+    /// Find the most recent `done` task for the same project + external_id that has
+    /// a non-null `pr_url`.
+    ///
+    /// Returns `(task_id, pr_url)` when found.  Only matches `done` — failed/cancelled
+    /// tasks are excluded because a failed task's PR may be stale/abandoned and a
+    /// cancelled task should always allow retry.
+    ///
+    /// **Known limitation**: does not verify whether the PR is still open on GitHub.
+    /// A follow-up can add liveness checking via the GitHub REST API.
+    pub async fn find_terminal_with_pr(
+        &self,
+        project: &str,
+        external_id: &str,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, pr_url FROM tasks \
+             WHERE project = ? AND external_id = ? AND status = 'done' AND pr_url IS NOT NULL \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(project)
+        .bind(external_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Return all tasks as lightweight summaries, skipping the heavy `rounds` column.
     ///
     /// Used by the `/tasks` list endpoint to avoid deserializing large round histories
@@ -1703,6 +1729,68 @@ mod tests {
         db.insert(&task).await?;
         let dup = db.find_active_duplicate("/repo/foo", "issue:99").await?;
         assert_eq!(dup, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_terminal_with_pr_returns_done_task_with_pr_url() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+        let mut task = make_task("task-done-pr", TaskStatus::Done);
+        task.external_id = Some("issue:42".to_string());
+        task.project_root = Some(std::path::PathBuf::from("/repo/foo"));
+        task.pr_url = Some("https://github.com/org/repo/pull/10".to_string());
+        db.insert(&task).await?;
+        let result = db.find_terminal_with_pr("/repo/foo", "issue:42").await?;
+        assert_eq!(
+            result,
+            Some((
+                "task-done-pr".to_string(),
+                "https://github.com/org/repo/pull/10".to_string()
+            ))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_terminal_with_pr_ignores_done_task_without_pr_url() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+        let mut task = make_task("task-done-nopr", TaskStatus::Done);
+        task.external_id = Some("issue:42".to_string());
+        task.project_root = Some(std::path::PathBuf::from("/repo/foo"));
+        // pr_url is None
+        db.insert(&task).await?;
+        let result = db.find_terminal_with_pr("/repo/foo", "issue:42").await?;
+        assert_eq!(result, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_terminal_with_pr_ignores_failed_task() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+        let mut task = make_task("task-failed-pr", TaskStatus::Failed);
+        task.external_id = Some("issue:42".to_string());
+        task.project_root = Some(std::path::PathBuf::from("/repo/foo"));
+        task.pr_url = Some("https://github.com/org/repo/pull/11".to_string());
+        db.insert(&task).await?;
+        let result = db.find_terminal_with_pr("/repo/foo", "issue:42").await?;
+        assert_eq!(result, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_terminal_with_pr_ignores_cancelled_task() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+        let mut task = make_task("task-cancelled-pr", TaskStatus::Cancelled);
+        task.external_id = Some("issue:42".to_string());
+        task.project_root = Some(std::path::PathBuf::from("/repo/foo"));
+        task.pr_url = Some("https://github.com/org/repo/pull/12".to_string());
+        db.insert(&task).await?;
+        let result = db.find_terminal_with_pr("/repo/foo", "issue:42").await?;
+        assert_eq!(result, None);
         Ok(())
     }
 }

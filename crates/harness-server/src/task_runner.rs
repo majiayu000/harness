@@ -777,6 +777,43 @@ impl TaskStore {
         }
     }
 
+    /// Check whether a terminal (`Done`) task already exists for the same
+    /// project + external_id and has a `pr_url` set.
+    ///
+    /// Returns `(TaskId, pr_url)` when found. Cache-first, DB fallback.
+    /// Fail-open: DB errors produce a `warn` log and return `None` so the
+    /// caller creates a new task rather than silently dropping it.
+    pub async fn find_terminal_pr_duplicate(
+        &self,
+        project_id: &str,
+        external_id: &str,
+    ) -> Option<(TaskId, String)> {
+        // Cache scan: look for a Done task with matching key and pr_url set.
+        for entry in self.cache.iter() {
+            let task = entry.value();
+            let same_key = task.external_id.as_deref() == Some(external_id)
+                && task
+                    .project_root
+                    .as_ref()
+                    .map(|p| p.to_string_lossy() == project_id)
+                    .unwrap_or(false);
+            if same_key && matches!(task.status, TaskStatus::Done) {
+                if let Some(ref url) = task.pr_url {
+                    return Some((task.id.clone(), url.clone()));
+                }
+            }
+        }
+        // DB fallback: Done tasks are evicted from cache after completion.
+        match self.db.find_terminal_with_pr(project_id, external_id).await {
+            Ok(Some((id, url))) => Some((harness_core::types::TaskId(id), url)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("dedup: terminal PR DB lookup failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Return all tasks currently in the in-memory cache.
     ///
     /// **Semantic note**: since startup only loads active (non-terminal) tasks
