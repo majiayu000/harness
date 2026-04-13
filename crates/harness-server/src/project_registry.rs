@@ -51,6 +51,40 @@ fn matches_alias(project: &Project, alias: &Path) -> bool {
     project.root == alias || project.root.ends_with(alias)
 }
 
+fn find_exact_root_match<'a>(projects: &'a [Project], root: &Path) -> Option<&'a Project> {
+    projects.iter().find(|project| project.root == root)
+}
+
+fn canonical_or_raw_root_key(path: &Path) -> String {
+    canonicalize_root(path)
+        .map(|root| canonical_root_alias(&root))
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+}
+
+fn resolve_configured_limit_key(
+    projects: &[Project],
+    default_root: &Path,
+    key: &str,
+) -> anyhow::Result<String> {
+    if key == DEFAULT_PROJECT_ID {
+        return Ok(resolve_default_from_projects(projects, default_root)?.id);
+    }
+
+    if let Some(project) = resolve_from_projects(projects, key)? {
+        return Ok(project.id);
+    }
+
+    Ok(canonical_or_raw_root_key(Path::new(key)))
+}
+
+fn map_duplicate_root_conflict(existing: &[Project], project: &Project) -> anyhow::Error {
+    if let Some(existing_project) = existing.iter().find(|entry| entry.root == project.root) {
+        duplicate_root_error(&project.id, &project.root, &existing_project.id)
+    } else {
+        duplicate_root_error(&project.id, &project.root, "unknown")
+    }
+}
+
 fn invalid_project_id(id: &str) -> anyhow::Error {
     anyhow::anyhow!("project id '{id}' conflicts with a canonical root alias")
 }
@@ -205,36 +239,15 @@ pub fn resolve_configured_project_limits(
     let mut resolved = limits.by_id().clone();
     if let Some(legacy) = limits.legacy() {
         for (key, value) in legacy {
-            let resolved_project = if key == DEFAULT_PROJECT_ID {
-                resolve_default_from_projects(projects, default_root)?
-            } else {
-                resolve_from_projects(projects, key)?
-                    .map(ResolvedProject::from_project)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "legacy per_project entry '{key}' does not resolve to a project"
-                        )
-                    })?
-            };
-            resolved.entry(resolved_project.id).or_insert(*value);
+            let resolved_key = resolve_configured_limit_key(projects, default_root, key)?;
+            resolved.entry(resolved_key).or_insert(*value);
         }
     }
 
     if let Some(by_root) = limits.by_root() {
         for (key, value) in by_root {
-            let alias_path = Path::new(key);
-            let resolved_project = if alias_path == default_root {
-                resolve_default_from_projects(projects, default_root)?
-            } else {
-                resolve_from_projects(projects, key)?
-                    .map(ResolvedProject::from_project)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "per_project.by_root entry '{key}' does not resolve to a project"
-                        )
-                    })?
-            };
-            resolved.entry(resolved_project.id).or_insert(*value);
+            let resolved_key = resolve_configured_limit_key(projects, default_root, key)?;
+            resolved.entry(resolved_key).or_insert(*value);
         }
     }
 
@@ -253,15 +266,14 @@ pub fn resolve_project_input(
                 return resolve_default_from_projects(projects, default_root);
             }
 
-            if let Some(project) = resolve_from_projects(projects, &path.to_string_lossy())? {
-                return Ok(ResolvedProject::from_project(project));
+            let raw = path.to_string_lossy();
+            if let Some(project) = projects.iter().find(|project| project.id == raw) {
+                return Ok(ResolvedProject::from_project(clone_project_root(project)));
             }
 
             let canonical_root = canonicalize_root(path)?;
-            if let Some(project) =
-                resolve_from_projects(projects, &canonical_root.to_string_lossy())?
-            {
-                return Ok(ResolvedProject::from_project(project));
+            if let Some(project) = find_exact_root_match(projects, &canonical_root) {
+                return Ok(ResolvedProject::from_project(clone_project_root(project)));
             }
 
             Ok(ResolvedProject {
@@ -323,9 +335,21 @@ pub struct ProjectRegistry {
 }
 
 impl ProjectRegistry {
+    async fn ensure_indexes(&self) -> anyhow::Result<()> {
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_canonical_root \
+             ON projects(json_extract(data, '$.root'))",
+        )
+        .execute(self.db.pool())
+        .await?;
+        Ok(())
+    }
+
     pub async fn open(path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
         let db = Db::open(path).await?;
-        Ok(Arc::new(Self { db }))
+        let registry = Arc::new(Self { db });
+        registry.ensure_indexes().await?;
+        Ok(registry)
     }
 
     /// Register or update a project.
@@ -333,7 +357,18 @@ impl ProjectRegistry {
         let project = normalize_project(project)?;
         let existing = self.db.list().await?;
         project_list_alias_guard(&existing, &project)?;
-        self.db.upsert(&project).await
+        match self.db.upsert(&project).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("idx_projects_canonical_root")
+                    || message.contains("json_extract(data, '$.root')")
+                {
+                    return Err(map_duplicate_root_conflict(&existing, &project));
+                }
+                Err(error)
+            }
+        }
     }
 
     /// List all registered projects ordered by creation time (newest first).
@@ -1132,6 +1167,8 @@ pub fn validate_project_root(root: &std::path::Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn test_project(root: PathBuf, id: &str) -> Project {
         Project {
             id: id.to_string(),
@@ -1447,6 +1484,122 @@ mod tests {
             .resolve_limits(default_root.path(), &limits)
             .await?;
         assert_eq!(resolved.get("named"), Some(&3));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relative_directory_input_does_not_resolve_to_registered_suffix_alias(
+    ) -> anyhow::Result<()> {
+        let _cwd_guard = CWD_LOCK.lock().unwrap();
+        let original_cwd = std::env::current_dir()?;
+
+        let result = (|| -> anyhow::Result<()> {
+            let project_root = tempfile::tempdir()?;
+            let canonical_project_root = project_root.path().canonicalize()?;
+            let nested = canonical_project_root.join("foo");
+            std::fs::create_dir(&nested)?;
+            std::env::set_current_dir(project_root.path())?;
+
+            let registered_root = tempfile::tempdir()?;
+            let registered_root = registered_root.path().join("parent").join("foo");
+            std::fs::create_dir_all(&registered_root)?;
+            let registered_root = registered_root.canonicalize()?;
+
+            let project = resolve_project_input(
+                &[test_project(registered_root, "registered")],
+                Some(Path::new("foo")),
+                project_root.path(),
+            )?;
+
+            assert_eq!(project.root, nested.canonicalize()?);
+            assert_eq!(project.id, nested.to_string_lossy());
+            Ok(())
+        })();
+
+        std::env::set_current_dir(original_cwd)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn resolve_limits_keeps_unregistered_raw_root_entries() -> anyhow::Result<()> {
+        let default_root = tempfile::tempdir()?;
+        let unregistered_root = tempfile::tempdir()?;
+        let canonical_unregistered_root = unregistered_root.path().canonicalize()?;
+        let projects = vec![test_project(
+            default_root.path().canonicalize()?,
+            DEFAULT_PROJECT_ID,
+        )];
+
+        let mut limits = harness_core::config::misc::PerProjectConcurrencyLimits::Legacy(
+            std::collections::HashMap::new(),
+        );
+        if let harness_core::config::misc::PerProjectConcurrencyLimits::Legacy(legacy) = &mut limits
+        {
+            legacy.insert(
+                canonical_unregistered_root.to_string_lossy().into_owned(),
+                4,
+            );
+        }
+
+        let resolved = resolve_configured_project_limits(&projects, default_root.path(), &limits)?;
+        assert_eq!(
+            resolved.get(&canonical_unregistered_root.to_string_lossy().into_owned()),
+            Some(&4)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_limits_keeps_unregistered_by_root_entries() -> anyhow::Result<()> {
+        let default_root = tempfile::tempdir()?;
+        let unregistered_root = tempfile::tempdir()?;
+        let canonical_unregistered_root = unregistered_root.path().canonicalize()?;
+        let projects = vec![test_project(
+            default_root.path().canonicalize()?,
+            DEFAULT_PROJECT_ID,
+        )];
+
+        let mut limits = harness_core::config::misc::PerProjectConcurrencyLimits::default();
+        if let harness_core::config::misc::PerProjectConcurrencyLimits::Typed(typed) = &mut limits {
+            typed.by_root.insert(
+                canonical_unregistered_root.to_string_lossy().into_owned(),
+                5,
+            );
+        }
+
+        let resolved = resolve_configured_project_limits(&projects, default_root.path(), &limits)?;
+        assert_eq!(
+            resolved.get(&canonical_unregistered_root.to_string_lossy().into_owned()),
+            Some(&5)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn register_rejects_duplicate_root_under_concurrency() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let registry = ProjectRegistry::open(&dir.path().join("projects.db")).await?;
+        let root_dir = tempfile::tempdir()?;
+        let canonical_root = root_dir.path().canonicalize()?;
+
+        let first = registry.register(test_project(canonical_root.clone(), "alpha"));
+        let second = registry.register(test_project(canonical_root, "beta"));
+        let (first_result, second_result) = tokio::join!(first, second);
+
+        let success_count = [first_result.is_ok(), second_result.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(success_count, 1);
+
+        let failure = first_result
+            .err()
+            .or_else(|| second_result.err())
+            .expect("one registration must fail");
+        assert!(failure.to_string().contains("canonical root"));
+
+        let projects = registry.list().await?;
+        assert_eq!(projects.len(), 1);
         Ok(())
     }
 }
