@@ -107,6 +107,13 @@ pub(crate) async fn enqueue_task(
     let project_id = canonical_project.to_string_lossy().into_owned();
     req.project = Some(canonical_project);
 
+    // Auto-populate external_id and check for duplicates before acquiring
+    // a concurrency permit (same dedup as enqueue_task_background).
+    populate_external_id(&mut req);
+    if let Some(existing_id) = check_duplicate(&state.core.tasks, &project_id, &req).await {
+        return Ok(existing_id);
+    }
+
     // Acquire concurrency permit before spawning. Blocks if all slots are
     // occupied; rejects immediately if the waiting queue is full.
     let permit = state

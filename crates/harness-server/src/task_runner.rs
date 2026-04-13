@@ -742,21 +742,30 @@ impl TaskStore {
         project_id: &str,
         external_id: &str,
     ) -> Option<TaskId> {
+        let mut found_terminal_in_cache = false;
         for entry in self.cache.iter() {
             let task = entry.value();
-            if task.external_id.as_deref() == Some(external_id)
+            let same_key = task.external_id.as_deref() == Some(external_id)
                 && task
                     .project_root
                     .as_ref()
                     .map(|p| p.to_string_lossy() == project_id)
-                    .unwrap_or(false)
-                && !matches!(
-                    task.status,
-                    TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
-                )
-            {
+                    .unwrap_or(false);
+            if !same_key {
+                continue;
+            }
+            if !matches!(
+                task.status,
+                TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+            ) {
                 return Some(task.id.clone());
             }
+            // Cache has a terminal match — skip DB fallback since cache is
+            // more authoritative and the DB row may be stale.
+            found_terminal_in_cache = true;
+        }
+        if found_terminal_in_cache {
+            return None;
         }
         match self.db.find_active_duplicate(project_id, external_id).await {
             Ok(Some(id)) => Some(harness_core::types::TaskId(id)),
