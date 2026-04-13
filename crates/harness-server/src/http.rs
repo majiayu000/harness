@@ -1237,7 +1237,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     && (t.pr_url.is_some()
                         || t.error
                             .as_deref()
-                            .map_or(false, |e| e.contains("resumed after restart")))
+                            .is_some_and(|e| e.contains("resumed after restart")))
             })
             .collect();
         if !recovered.is_empty() {
@@ -1249,10 +1249,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                 let state = state.clone();
                 tokio::spawn(async move {
                     // Determine dispatch mode: PR-based or issue/checkpoint-based.
-                    let pr_num = task
-                        .pr_url
-                        .as_deref()
-                        .and_then(parse_pr_num_from_url);
+                    let pr_num = task.pr_url.as_deref().and_then(parse_pr_num_from_url);
                     let issue_num = task
                         .external_id
                         .as_deref()
@@ -1266,17 +1263,14 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                             pr_url = %bad_url,
                             "startup recovery: cannot parse PR number from URL — marking task failed"
                         );
-                        if let Err(e) = task_runner::mutate_and_persist(
-                            &state.core.tasks,
-                            &task.id,
-                            move |s| {
+                        if let Err(e) =
+                            task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
                                 s.status = task_runner::TaskStatus::Failed;
                                 s.error = Some(format!(
                                     "startup recovery: unparseable pr_url: {bad_url}"
                                 ));
-                            },
-                        )
-                        .await
+                            })
+                            .await
                         {
                             tracing::error!(
                                 task_id = ?task.id,

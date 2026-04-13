@@ -28,51 +28,24 @@ pub(crate) fn resolve_api_token(
         })
 }
 
-/// Decode `%XX` percent-encoded sequences in a query-parameter value.
-///
-/// `encodeURIComponent` in JavaScript encodes all reserved characters, so the
-/// raw query string value must be decoded before constant-time comparison with
-/// the stored token.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut result: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                result.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        result.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&result).into_owned()
-}
-
 /// Bearer token authentication middleware.
 ///
-/// Exempts `/health`, `/webhook`, `/webhook/feishu`, and `/signals`.
-/// `/webhook/feishu` relies on Feishu verification-token validation and must
-/// fail closed when that token is not configured. All other endpoints require
-/// an `Authorization: Bearer <token>` header when `api_token` is configured.
-/// When no token is configured the middleware is a no-op (backward compat).
+/// Exempts `/health`, `/webhook`, `/webhook/feishu`, `/signals`, `/favicon.ico`,
+/// `/auth/reset-password`, `/` (dashboard HTML), and `/ws` (WebSocket upgrade).
+/// The dashboard and WebSocket are public at the HTTP level; the WebSocket uses
+/// a first-message token handshake (see `websocket.rs`) when auth is configured.
+/// All other endpoints require an `Authorization: Bearer <token>` header when
+/// `api_token` is configured. When no token is configured the middleware is a
+/// no-op (backward compat).
 pub(crate) async fn api_auth_middleware(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    // Exempt paths that carry their own authentication or must stay public.
-    // /health, /webhook*, and /signals have their own protection or must stay
-    // fully public. /favicon.ico is a static asset with no sensitive data.
-    // The dashboard HTML (/) is NOT exempt: it embeds the API token as a JS
-    // variable, so it must only be served to callers who already know the token.
-    // Browsers access the dashboard via /?token=<tok> since they cannot set
-    // Authorization headers on a navigation request.
+    // Exempt paths: static assets, public health probes, and paths with their
+    // own auth mechanism (/ws uses first-message handshake; / has no sensitive
+    // data and auth is handled by the WS layer).
     if matches!(
         path,
         "/health"
@@ -81,37 +54,23 @@ pub(crate) async fn api_auth_middleware(
             | "/signals"
             | "/favicon.ico"
             | "/auth/reset-password"
+            | "/"
+            | "/ws"
     ) {
         return next.run(req).await;
     }
-
-    // Browser clients cannot set Authorization headers on WebSocket upgrades or
-    // on top-level navigation requests (/). Accept a ?token= query parameter
-    // as a fallback for these two paths; percent-decode it because the JS
-    // client always calls encodeURIComponent() before appending to the URL.
-    let query_token: Option<String> = if path == "/ws" || path == "/" {
-        req.uri().query().and_then(|q| {
-            q.split('&')
-                .find_map(|kv| kv.strip_prefix("token=").map(percent_decode))
-        })
-    } else {
-        None
-    };
 
     let Some(expected) = resolve_api_token(&state.core.server.config.server) else {
         // No token configured — skip auth for backward compatibility.
         return next.run(req).await;
     };
 
-    let header_token = req
+    let provided = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(str::to_string);
-
-    // Accept either the Authorization header token or the query-param token.
-    let provided = header_token.or(query_token);
 
     let authorized = provided
         .as_deref()
@@ -131,37 +90,353 @@ pub(crate) async fn api_auth_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::percent_decode;
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        middleware,
+        routing::get,
+        Router,
+    };
+    use harness_agents::registry::AgentRegistry;
+    use harness_core::config::HarnessConfig;
+    use tower::ServiceExt;
 
-    #[test]
-    fn percent_decode_plain_text_unchanged() {
-        assert_eq!(percent_decode("mytoken123"), "mytoken123");
+    async fn make_state_with_token(
+        dir: &std::path::Path,
+        token: &str,
+    ) -> anyhow::Result<std::sync::Arc<AppState>> {
+        let mut config = HarnessConfig::default();
+        config.server.api_token = Some(token.to_string());
+        let thread_manager = crate::thread_manager::ThreadManager::new();
+        let server = std::sync::Arc::new(crate::server::HarnessServer::new(
+            config,
+            thread_manager,
+            AgentRegistry::new("test"),
+        ));
+        let tasks = crate::task_runner::TaskStore::open(
+            &harness_core::config::dirs::default_db_path(dir, "tasks"),
+        )
+        .await?;
+        let events = std::sync::Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
+        let signal_detector = harness_gc::signal_detector::SignalDetector::new(
+            server.config.gc.signal_thresholds.clone().into(),
+            harness_core::types::ProjectId::new(),
+        );
+        let draft_store = harness_gc::draft_store::DraftStore::new(dir)?;
+        let gc_agent = std::sync::Arc::new(harness_gc::gc_agent::GcAgent::new(
+            server.config.gc.clone(),
+            signal_detector,
+            draft_store,
+            dir.to_path_buf(),
+        ));
+        let thread_db = crate::thread_db::ThreadDb::open(
+            &harness_core::config::dirs::default_db_path(dir, "threads"),
+        )
+        .await?;
+        let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
+            &harness_core::config::dirs::default_db_path(dir, "projects"),
+        )
+        .await?;
+        let project_svc = crate::services::project::DefaultProjectService::new(
+            _project_svc_tmp,
+            dir.to_path_buf(),
+        );
+        let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+        let execution_svc = crate::services::execution::DefaultExecutionService::new(
+            tasks.clone(),
+            server.agent_registry.clone(),
+            std::sync::Arc::new(server.config.clone()),
+            Default::default(),
+            events.clone(),
+            vec![],
+            None,
+            std::sync::Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            None,
+            None,
+            vec![],
+        );
+        Ok(std::sync::Arc::new(AppState {
+            core: crate::http::CoreServices {
+                server,
+                project_root: dir.to_path_buf(),
+                home_dir: std::env::var("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| dir.to_path_buf()),
+                tasks,
+                thread_db: Some(thread_db),
+                plan_db: None,
+                plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+                project_registry: None,
+                runtime_state_store: None,
+                q_values: None,
+            },
+            engines: crate::http::EngineServices {
+                skills: std::sync::Arc::new(tokio::sync::RwLock::new(
+                    harness_skills::store::SkillStore::new(),
+                )),
+                rules: std::sync::Arc::new(tokio::sync::RwLock::new(
+                    harness_rules::engine::RuleEngine::new(),
+                )),
+                gc_agent,
+            },
+            observability: crate::http::ObservabilityServices {
+                events,
+                signal_rate_limiter: std::sync::Arc::new(
+                    crate::http::rate_limit::SignalRateLimiter::new(100),
+                ),
+                password_reset_rate_limiter: std::sync::Arc::new(
+                    crate::http::rate_limit::PasswordResetRateLimiter::new(5),
+                ),
+                review_store: None,
+            },
+            concurrency: crate::http::ConcurrencyServices {
+                task_queue: std::sync::Arc::new(crate::task_queue::TaskQueue::new(
+                    &Default::default(),
+                )),
+                workspace_mgr: None,
+            },
+            runtime_hosts: std::sync::Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
+            runtime_project_cache: std::sync::Arc::new(
+                crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
+            ),
+            runtime_state_persist_lock: tokio::sync::Mutex::new(()),
+            runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
+            notifications: crate::http::NotificationServices {
+                notification_tx: tokio::sync::broadcast::channel(32).0,
+                notification_lagged_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                    0,
+                )),
+                notification_lag_log_every: 1,
+                notify_tx: None,
+                initializing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                initialized: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            },
+            interceptors: vec![],
+            intake: crate::http::IntakeServices {
+                feishu_intake: None,
+                github_pollers: vec![],
+                completion_callback: None,
+            },
+            project_svc,
+            task_svc,
+            execution_svc,
+        }))
     }
 
-    #[test]
-    fn percent_decode_slash_encoded() {
-        assert_eq!(percent_decode("tok%2Fwith%2Fslashes"), "tok/with/slashes");
+    fn make_router(state: std::sync::Arc<AppState>) -> Router {
+        Router::new()
+            .route("/", get(|| async { "dashboard" }))
+            .route("/ws", get(|| async { "ws" }))
+            .route("/tasks", get(|| async { "tasks" }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                api_auth_middleware,
+            ))
+            .with_state(state)
     }
 
-    #[test]
-    fn percent_decode_equals_and_plus() {
-        assert_eq!(percent_decode("base64%3D%3D"), "base64==");
-        assert_eq!(percent_decode("a%2Bb"), "a+b");
+    #[tokio::test]
+    async fn auth_middleware_exempts_dashboard() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_state_with_token(dir.path(), "secret").await?;
+        let app = make_router(state);
+
+        let resp = app
+            .oneshot(Request::builder().uri("/").body(Body::empty())?)
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
     }
 
-    #[test]
-    fn percent_decode_percent_encoded_percent() {
-        assert_eq!(percent_decode("100%25"), "100%");
+    #[tokio::test]
+    async fn auth_middleware_exempts_ws() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_state_with_token(dir.path(), "secret").await?;
+        let app = make_router(state);
+
+        let resp = app
+            .oneshot(Request::builder().uri("/ws").body(Body::empty())?)
+            .await?;
+        // Router returns 200 here (no real WS upgrade in unit test); the key
+        // point is it does NOT return 401.
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
     }
 
-    #[test]
-    fn percent_decode_incomplete_sequence_passed_through() {
-        assert_eq!(percent_decode("abc%2"), "abc%2");
-        assert_eq!(percent_decode("abc%"), "abc%");
+    #[tokio::test]
+    async fn auth_middleware_rejects_missing_token() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_state_with_token(dir.path(), "secret").await?;
+        let app = make_router(state);
+
+        let resp = app
+            .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+            .await?;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
     }
 
-    #[test]
-    fn percent_decode_invalid_hex_passed_through() {
-        assert_eq!(percent_decode("abc%ZZdef"), "abc%ZZdef");
+    #[tokio::test]
+    async fn auth_middleware_rejects_query_token() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_state_with_token(dir.path(), "secret").await?;
+        let app = make_router(state);
+
+        // Query-param token must no longer be accepted for non-exempt paths.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks?token=secret")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_accepts_bearer_header() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = make_state_with_token(dir.path(), "secret").await?;
+        let app = make_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks")
+                    .header("Authorization", "Bearer secret")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_no_token_configured_allows_all() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let thread_manager = crate::thread_manager::ThreadManager::new();
+        let server = std::sync::Arc::new(crate::server::HarnessServer::new(
+            HarnessConfig::default(),
+            thread_manager,
+            AgentRegistry::new("test"),
+        ));
+        let tasks = crate::task_runner::TaskStore::open(
+            &harness_core::config::dirs::default_db_path(dir.path(), "tasks"),
+        )
+        .await?;
+        let events =
+            std::sync::Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
+        let signal_detector = harness_gc::signal_detector::SignalDetector::new(
+            server.config.gc.signal_thresholds.clone().into(),
+            harness_core::types::ProjectId::new(),
+        );
+        let draft_store = harness_gc::draft_store::DraftStore::new(dir.path())?;
+        let gc_agent = std::sync::Arc::new(harness_gc::gc_agent::GcAgent::new(
+            server.config.gc.clone(),
+            signal_detector,
+            draft_store,
+            dir.path().to_path_buf(),
+        ));
+        let thread_db = crate::thread_db::ThreadDb::open(
+            &harness_core::config::dirs::default_db_path(dir.path(), "threads"),
+        )
+        .await?;
+        let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
+            &harness_core::config::dirs::default_db_path(dir.path(), "projects"),
+        )
+        .await?;
+        let project_svc = crate::services::project::DefaultProjectService::new(
+            _project_svc_tmp,
+            dir.path().to_path_buf(),
+        );
+        let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+        let execution_svc = crate::services::execution::DefaultExecutionService::new(
+            tasks.clone(),
+            server.agent_registry.clone(),
+            std::sync::Arc::new(server.config.clone()),
+            Default::default(),
+            events.clone(),
+            vec![],
+            None,
+            std::sync::Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            None,
+            None,
+            vec![],
+        );
+        let state = std::sync::Arc::new(AppState {
+            core: crate::http::CoreServices {
+                server,
+                project_root: dir.path().to_path_buf(),
+                home_dir: dir.path().to_path_buf(),
+                tasks,
+                thread_db: Some(thread_db),
+                plan_db: None,
+                plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+                project_registry: None,
+                runtime_state_store: None,
+                q_values: None,
+            },
+            engines: crate::http::EngineServices {
+                skills: std::sync::Arc::new(tokio::sync::RwLock::new(
+                    harness_skills::store::SkillStore::new(),
+                )),
+                rules: std::sync::Arc::new(tokio::sync::RwLock::new(
+                    harness_rules::engine::RuleEngine::new(),
+                )),
+                gc_agent,
+            },
+            observability: crate::http::ObservabilityServices {
+                events,
+                signal_rate_limiter: std::sync::Arc::new(
+                    crate::http::rate_limit::SignalRateLimiter::new(100),
+                ),
+                password_reset_rate_limiter: std::sync::Arc::new(
+                    crate::http::rate_limit::PasswordResetRateLimiter::new(5),
+                ),
+                review_store: None,
+            },
+            concurrency: crate::http::ConcurrencyServices {
+                task_queue: std::sync::Arc::new(crate::task_queue::TaskQueue::new(
+                    &Default::default(),
+                )),
+                workspace_mgr: None,
+            },
+            runtime_hosts: std::sync::Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
+            runtime_project_cache: std::sync::Arc::new(
+                crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
+            ),
+            runtime_state_persist_lock: tokio::sync::Mutex::new(()),
+            runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
+            notifications: crate::http::NotificationServices {
+                notification_tx: tokio::sync::broadcast::channel(32).0,
+                notification_lagged_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                    0,
+                )),
+                notification_lag_log_every: 1,
+                notify_tx: None,
+                initializing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                initialized: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            },
+            interceptors: vec![],
+            intake: crate::http::IntakeServices {
+                feishu_intake: None,
+                github_pollers: vec![],
+                completion_callback: None,
+            },
+            project_svc,
+            task_svc,
+            execution_svc,
+        });
+        let app = make_router(state);
+
+        let resp = app
+            .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
     }
 }

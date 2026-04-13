@@ -1,6 +1,6 @@
 use crate::{http::AppState, router};
 use axum::body::Bytes;
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use axum::{
     extract::{State, WebSocketUpgrade},
     http::{HeaderMap, StatusCode},
@@ -9,7 +9,16 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use harness_protocol::{codec, methods::RpcResponse};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::sync::broadcast::error::RecvError;
+
+/// Seconds to wait for the client to send the auth first-message before
+/// closing the connection with close code 4401.
+const WS_AUTH_TIMEOUT_SECS: u64 = 10;
+
+/// WebSocket close code used when the first-message auth handshake fails.
+/// 4000-4999 is the private-use range defined by RFC 6455.
+const WS_CLOSE_UNAUTHORIZED: u16 = 4401;
 
 /// Returns true if the origin is a localhost origin (safe for local dev tools).
 ///
@@ -57,6 +66,43 @@ fn validate_origin_header(headers: &HeaderMap) -> Result<(), OriginValidationErr
     }
 }
 
+/// Read the first WebSocket text frame (with a timeout) and verify it carries
+/// the expected API token in `{"type":"auth","token":"<tok>"}` form.
+///
+/// Returns `true` iff the handshake succeeds.  A timeout, a non-text first
+/// frame, malformed JSON, wrong `type`, or a mismatched token all return
+/// `false` — the caller must close the connection with code 4401.
+async fn authenticate_ws_first_message(
+    ws_stream: &mut futures::stream::SplitStream<WebSocket>,
+    expected: &str,
+) -> bool {
+    let text = match tokio::time::timeout(
+        tokio::time::Duration::from_secs(WS_AUTH_TIMEOUT_SECS),
+        ws_stream.next(),
+    )
+    .await
+    {
+        Ok(Some(Ok(Message::Text(t)))) => t,
+        _ => return false,
+    };
+
+    let val = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    if val.get("type").and_then(|v| v.as_str()) != Some("auth") {
+        return false;
+    }
+
+    let token = match val.get("token").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    token.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
 /// Axum handler that upgrades the HTTP connection to WebSocket.
 ///
 /// Validates the Origin header to prevent Cross-Site WebSocket Hijacking (CSWH).
@@ -96,6 +142,23 @@ pub async fn ws_handler(
 ///   frame is sent and the handler exits.
 async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
     let (mut ws_sink, mut ws_stream) = ws.split();
+
+    // First-message auth gate: when a token is configured, the client must
+    // send `{"type":"auth","token":"<tok>"}` as its very first frame.  If it
+    // does not (wrong token, timeout, or malformed message), close with 4401.
+    if let Some(expected) = crate::http::auth::resolve_api_token(&state.core.server.config.server) {
+        let ok = authenticate_ws_first_message(&mut ws_stream, &expected).await;
+        if !ok {
+            ws_sink
+                .send(Message::Close(Some(CloseFrame {
+                    code: WS_CLOSE_UNAUTHORIZED,
+                    reason: "unauthorized".into(),
+                })))
+                .await
+                .ok();
+            return;
+        }
+    }
 
     // Internal channel: both the request handler and the notification forwarder
     // write messages here; the sender task drains them to the WebSocket.

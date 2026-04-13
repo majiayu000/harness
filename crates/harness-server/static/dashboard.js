@@ -22,7 +22,7 @@ let historyFilter = "all";
 function $(sel) { return document.querySelector(sel); }
 
 function authHeaders() {
-  const tok = window.__HARNESS_TOKEN__;
+  const tok = sessionStorage.getItem("harness_token");
   return tok ? { "Authorization": "Bearer " + tok } : {};
 }
 
@@ -490,16 +490,73 @@ function initTabs() {
   });
 }
 
+// --- Token auth prompt ---
+
+function showTokenPrompt(errorMsg) {
+  let overlay = document.getElementById("token-auth-overlay");
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.id = "token-auth-overlay";
+    overlay.style.cssText =
+      "position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;" +
+      "align-items:center;justify-content:center;z-index:1000";
+    overlay.innerHTML =
+      '<div style="background:var(--surface,#1e1e2e);border:1px solid var(--border,#333);' +
+      'border-radius:12px;padding:2rem;min-width:320px;max-width:90vw">' +
+        '<h2 style="margin:0 0 .5rem;font-size:1.1rem">Harness Dashboard</h2>' +
+        '<p style="margin:0 0 1rem;color:var(--muted,#888);font-size:.875rem">' +
+          'Enter your API token to connect.</p>' +
+        '<div id="token-auth-error" style="display:none;color:#ef4444;font-size:.875rem;' +
+          'margin-bottom:.75rem"></div>' +
+        '<input id="token-auth-input" type="password" placeholder="API token"' +
+          ' autocomplete="current-password"' +
+          ' style="width:100%;box-sizing:border-box;margin-bottom:.75rem;' +
+            'padding:.5rem .75rem;border-radius:6px;' +
+            'background:var(--surface2,#2a2a3e);border:1px solid var(--border,#333);' +
+            'color:inherit;font-size:.9rem" />' +
+        '<button id="token-auth-btn"' +
+          ' style="padding:.5rem 1.25rem;border-radius:6px;border:none;' +
+            'background:var(--accent,#3b82f6);color:#fff;cursor:pointer;font-size:.9rem">' +
+          'Connect</button>' +
+      '</div>';
+    document.body.appendChild(overlay);
+    const btn = document.getElementById("token-auth-btn");
+    const input = document.getElementById("token-auth-input");
+    function submit() {
+      sessionStorage.setItem("harness_token", input.value);
+      overlay.style.display = "none";
+      connectWebSocket();
+    }
+    btn.addEventListener("click", submit);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+  }
+  overlay.style.display = "flex";
+  const errEl = document.getElementById("token-auth-error");
+  if (errorMsg) {
+    errEl.textContent = errorMsg;
+    errEl.style.display = "";
+  } else {
+    errEl.style.display = "none";
+  }
+  const input = document.getElementById("token-auth-input");
+  input.value = "";
+  setTimeout(() => input.focus(), 0);
+}
+
 // --- WebSocket ---
 
 function connectWebSocket() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const tok = window.__HARNESS_TOKEN__;
-  const url = tok
-    ? `${proto}//${location.host}/ws?token=${encodeURIComponent(tok)}`
-    : `${proto}//${location.host}/ws`;
+  const url = `${proto}//${location.host}/ws`;
   try { ws = new WebSocket(url); } catch { return; }
-  ws.onopen = () => { fetchTasks(); fetchIntake(); };
+  ws.onopen = () => {
+    const tok = sessionStorage.getItem("harness_token");
+    if (tok) {
+      ws.send(JSON.stringify({ type: "auth", token: tok }));
+    }
+    fetchTasks();
+    fetchIntake();
+  };
   ws.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
@@ -510,7 +567,14 @@ function connectWebSocket() {
       }
     } catch {}
   };
-  ws.onclose = () => { ws = null; setTimeout(connectWebSocket, WS_RECONNECT_MS); };
+  ws.onclose = (event) => {
+    ws = null;
+    if (event.code === 4401) {
+      showTokenPrompt("Invalid token. Please try again.");
+    } else {
+      setTimeout(connectWebSocket, WS_RECONNECT_MS);
+    }
+  };
   ws.onerror = () => { if (ws) ws.close(); };
 }
 
@@ -845,13 +909,21 @@ function renderTokenTaskTable(tasks) {
 
 // --- Init ---
 
+function initTokenAuth() {
+  if (sessionStorage.getItem("harness_token") === null) {
+    showTokenPrompt(null);
+  } else {
+    connectWebSocket();
+  }
+}
+
 function init() {
   initTabs();
   fetchTasks();
   fetchIntake();
   fetchDashboardSummary();
   fetchTokenUsage();
-  connectWebSocket();
+  initTokenAuth();
   initForm();
   initHistoryControls();
   document.addEventListener("keydown", (e) => {

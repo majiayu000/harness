@@ -23,8 +23,7 @@ use crate::config::project::GitConfig;
 /// Modeled after Claude Code's `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`. Content before
 /// this marker is stable across calls of the same prompt type and can be cached
 /// at the API level (prefix caching). Content after changes per invocation.
-pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str =
-    "\n\n---\n<!-- dynamic context below -->\n";
+pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "\n\n---\n<!-- dynamic context below -->\n";
 
 /// A prompt decomposed into its static, semi-static, and dynamic layers.
 ///

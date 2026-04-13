@@ -1,21 +1,10 @@
-use axum::extract::State;
 use axum::http::header;
 use axum::response::{Html, IntoResponse};
-use std::sync::Arc;
 
 const CSS: &str = include_str!("../static/dashboard.css");
 const JS: &str = include_str!("../static/dashboard.js");
 
-pub async fn index(State(state): State<Arc<crate::http::AppState>>) -> impl IntoResponse {
-    // When API auth is configured, inject the token as a JS variable so the
-    // browser client can attach it to fetch requests and the WebSocket URL.
-    // The dashboard HTML itself is exempt from auth (it contains no sensitive
-    // data), and the individual API endpoints remain protected.
-    let token_script = match crate::http::auth::resolve_api_token(&state.core.server.config.server)
-    {
-        Some(tok) => format!("<script>window.__HARNESS_TOKEN__={:?};</script>", tok),
-        None => String::new(),
-    };
+pub async fn index() -> impl IntoResponse {
     Html(format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -24,7 +13,7 @@ pub async fn index(State(state): State<Arc<crate::http::AppState>>) -> impl Into
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Harness Dashboard</title>
 <style>{CSS}</style>
-{token_script}</head>
+</head>
 <body>
 <main class="app-shell">
 <section class="dashboard-shell">

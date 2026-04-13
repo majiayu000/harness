@@ -169,9 +169,7 @@ impl TurnInterceptor for RuleEnforcer {
         // Critical and High get a detailed summary; Medium and below are logged only.
         let actionable: Vec<_> = violations
             .iter()
-            .filter(|v| {
-                matches!(v.severity, Severity::Critical | Severity::High)
-            })
+            .filter(|v| matches!(v.severity, Severity::Critical | Severity::High))
             .collect();
 
         if !actionable.is_empty() {
@@ -299,11 +297,7 @@ mod tests {
         let enforcer = RuleEnforcer::new(rules);
         let result = enforcer.pre_execute(&make_req(&project)).await;
 
-        assert_eq!(
-            result.decision,
-            Decision::Warn,
-            "high violation must warn"
-        );
+        assert_eq!(result.decision, Decision::Warn, "high violation must warn");
         Ok(())
     }
 
