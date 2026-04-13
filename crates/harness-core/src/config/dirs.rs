@@ -52,12 +52,9 @@ pub fn default_db_path(dir: &Path, name: &str) -> PathBuf {
 ///
 /// Returns `None` if none of the candidates exist as a regular file.
 pub fn find_config_file() -> Option<PathBuf> {
-    for candidate in config_candidates() {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    config_candidates()
+        .into_iter()
+        .find(|candidate| candidate.is_file())
 }
 
 fn config_candidates() -> Vec<PathBuf> {

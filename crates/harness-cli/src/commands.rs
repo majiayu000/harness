@@ -277,7 +277,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             "config loaded from --config flag: {}",
             config_path.display()
         );
-        toml::from_str(&content)?
+        let mut cfg: harness_core::config::HarnessConfig = toml::from_str(&content)?;
+        if let Some(dir) = config_path.parent() {
+            cfg.rebase_relative_paths(dir);
+        }
+        cfg
     } else if let Some(discovered) = harness_core::config::dirs::find_config_file() {
         let content = std::fs::read_to_string(&discovered)?;
         tracing::info!("config loaded from {}", discovered.display());
