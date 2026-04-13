@@ -501,17 +501,22 @@ pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
         ),
         None,
     );
-    agent_registry.register_with_adapter(
+    let codex_cli_path = config.agents.codex.cli_path.clone();
+    let codex_sandbox_mode = config.agents.sandbox_mode;
+    let codex_cloud = config.agents.codex.cloud.clone();
+    agent_registry.register_with_fresh_adapter(
         "codex",
         Arc::new(
             CodexAgent::from_config(config.agents.codex.clone(), config.agents.sandbox_mode)
                 .with_stream_timeout(config.agents.stream_timeout_secs),
         ),
-        Some(Arc::new(CodexAdapter::new(
-            config.agents.codex.cli_path.clone(),
-            config.agents.sandbox_mode,
-            config.agents.codex.cloud.clone(),
-        ))),
+        move || {
+            CodexAdapter::new(
+                codex_cli_path.clone(),
+                codex_sandbox_mode,
+                codex_cloud.clone(),
+            )
+        },
     );
 
     let default_agent_name = agent_registry

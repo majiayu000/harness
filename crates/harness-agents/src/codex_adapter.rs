@@ -145,11 +145,10 @@ impl AgentAdapter for CodexAdapter {
         tx: mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
         let mut state = self.state.lock().await;
-        if state.child.is_some() {
-            return Err(harness_core::error::HarnessError::AgentExecution(
-                "codex adapter cannot reuse an existing app-server process across turns"
-                    .to_string(),
-            ));
+        if let Some(mut old_child) = state.child.take() {
+            tracing::warn!("killing stale codex process from previous turn");
+            let _ = old_child.kill().await;
+            state.stdin = None;
         }
 
         if self.cloud.enabled {
@@ -210,14 +209,11 @@ impl AgentAdapter for CodexAdapter {
         let mut thread_id: Option<String> = None;
 
         // Loop until we find the thread/start response containing the thread id.
-        // codex app-server may emit intermediate notifications (e.g. thread/started)
-        // before the RPC response, so a fixed read count can miss the id.
-        let mut init_lines_read = 0u32;
-        const MAX_INIT_LINES: u32 = 20;
-        while thread_id.is_none() && init_lines_read < MAX_INIT_LINES {
+        // Forward intermediate notifications (e.g. thread/started) so they are not lost.
+        // No line count limit — loop until the id or EOF.
+        while thread_id.is_none() {
             match lines.next_line().await {
                 Ok(Some(line)) => {
-                    init_lines_read += 1;
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
                         if let Some(id) = value
                             .get("result")
@@ -228,9 +224,11 @@ impl AgentAdapter for CodexAdapter {
                             thread_id = Some(id.to_string());
                         }
                     }
+                    if let Some(event) = parse_codex_message(&line) {
+                        let _ = tx.send(event).await;
+                    }
                 }
-                Ok(None) => break,
-                Err(_) => break,
+                Ok(None) | Err(_) => break,
             }
         }
 
@@ -253,25 +251,21 @@ impl AgentAdapter for CodexAdapter {
         .await?;
 
         // Consume lines until we see the RPC response for turn/start (matched by id).
-        // An unconditional single-line drop can lose early notifications that arrive
-        // before the turn/start ACK when JSON-RPC traffic is interleaved.
+        // Forward intermediate notifications so events emitted before the ack are not lost.
         let mut turn_start_acked = false;
-        let mut ack_lines_read = 0u32;
-        const MAX_ACK_LINES: u32 = 20;
-        while !turn_start_acked && ack_lines_read < MAX_ACK_LINES {
+        while !turn_start_acked {
             match lines.next_line().await {
                 Ok(Some(line)) => {
-                    ack_lines_read += 1;
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
                         if value.get("id").and_then(|v| v.as_u64()) == Some(turn_start_id) {
                             turn_start_acked = true;
                         }
-                        // Notifications arriving before the ack are intentionally skipped;
-                        // the main event loop below handles all subsequent notifications.
+                    }
+                    if let Some(event) = parse_codex_message(&line) {
+                        let _ = tx.send(event).await;
                     }
                 }
-                Ok(None) => break,
-                Err(_) => break,
+                Ok(None) | Err(_) => break,
             }
         }
 
