@@ -275,7 +275,7 @@ impl TaskDb {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project
+            "SELECT id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority
              FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at DESC"
         );
         let mut q = sqlx::query_as::<_, TaskRow>(&sql);
