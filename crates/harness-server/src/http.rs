@@ -1035,11 +1035,15 @@ fn build_completion_callback(
                 return;
             };
             let Some(external_id) = task.external_id.as_deref() else {
-                tracing::warn!(
-                    task_id = ?task.id,
-                    source = source_name,
-                    "completion_callback: task missing external_id, skipping"
-                );
+                // periodic_review tasks are internally spawned and have no
+                // intake source to notify — missing external_id is expected.
+                if source_name != "periodic_review" {
+                    tracing::warn!(
+                        task_id = ?task.id,
+                        source = source_name,
+                        "completion_callback: task missing external_id, skipping"
+                    );
+                }
                 return;
             };
             // For GitHub tasks, route to the specific repo's poller using

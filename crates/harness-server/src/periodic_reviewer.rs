@@ -46,7 +46,16 @@ struct ReviewState {
     /// (without abort) when a new cycle starts so the old task can still run
     /// to completion and persist its findings (issue #448).
     poll_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Consecutive ticks where the agent produced no output (OOM/rate-limit/
+    /// timeout).  After [`MAX_EMPTY_OUTPUT_STREAK`] consecutive failures the
+    /// watermark is forcibly advanced to prevent an infinite retry loop.
+    empty_output_streak: u32,
 }
+
+/// Maximum consecutive empty-output ticks before the watermark is forcibly
+/// advanced.  Keeps the retry window for transient failures while preventing
+/// a permanent stuck state.
+const MAX_EMPTY_OUTPUT_STREAK: u32 = 3;
 
 /// Spawn the periodic review loop as a background task.
 ///
@@ -922,11 +931,29 @@ async fn run_review_tick(
         }
 
         let Some(output) = final_output else {
-            tracing::error!(
-                task_id = %final_task_id,
-                "scheduler: review produced no output (agent may have OOM/rate-limited/timed out) \
-                 — watermark NOT advanced; will retry next tick"
-            );
+            let mut guard = fallback_ts_for_poll.lock().await;
+            guard.empty_output_streak += 1;
+            if guard.empty_output_streak >= MAX_EMPTY_OUTPUT_STREAK {
+                tracing::error!(
+                    task_id = %final_task_id,
+                    streak = guard.empty_output_streak,
+                    "scheduler: review produced no output {} times consecutively \
+                     — forcibly advancing watermark to unblock review loop",
+                    guard.empty_output_streak,
+                );
+                guard.fallback_ts = Some(scan_ts);
+                guard.empty_output_streak = 0;
+            } else {
+                tracing::error!(
+                    task_id = %final_task_id,
+                    streak = guard.empty_output_streak,
+                    max = MAX_EMPTY_OUTPUT_STREAK,
+                    "scheduler: review produced no output — watermark NOT advanced; \
+                     will retry next tick ({}/{})",
+                    guard.empty_output_streak,
+                    MAX_EMPTY_OUTPUT_STREAK,
+                );
+            }
             return;
         };
 
@@ -946,7 +973,11 @@ async fn run_review_tick(
                 // during synthesis latency.  Falls back to scan_ts for
                 // Single-strategy paths where no synthesis step exists.
                 let watermark_ts = review_bound_ts.unwrap_or(scan_ts);
-                fallback_ts_for_poll.lock().await.fallback_ts = Some(watermark_ts);
+                {
+                    let mut guard = fallback_ts_for_poll.lock().await;
+                    guard.fallback_ts = Some(watermark_ts);
+                    guard.empty_output_streak = 0;
+                }
                 // Set the event's ts to watermark_ts (not Utc::now()) so that next
                 // tick's db_last_review_ts = max(event.ts) == watermark_ts.  If we
                 // used Utc::now() here, db_last_review_ts >> watermark_ts, and the

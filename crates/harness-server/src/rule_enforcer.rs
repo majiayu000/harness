@@ -4,7 +4,7 @@ use harness_core::agent::AgentRequest;
 use harness_core::interceptor::{InterceptResult, TurnInterceptor};
 use harness_core::types::Severity;
 use harness_rules::engine::RuleEngine;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -17,7 +17,10 @@ use tokio::sync::RwLock;
 /// and apply to all managed projects.
 pub struct RuleEnforcer {
     rules: Arc<RwLock<RuleEngine>>,
-    /// Per-workspace violation count from the previous scan, used to compute deltas.
+    /// Per-project violation count from the previous scan, used to compute deltas.
+    /// Keys are canonical project identifiers (git remote URL for workspace clones,
+    /// raw path otherwise) so delta tracking works across ephemeral per-task
+    /// workspace directories.
     prev_counts: DashMap<PathBuf, usize>,
 }
 
@@ -28,6 +31,60 @@ impl RuleEnforcer {
             prev_counts: DashMap::new(),
         }
     }
+}
+
+/// Derive a stable project key from a potentially ephemeral workspace path.
+///
+/// Harness workspace directories (`<data>/workspaces/<task-uuid>`) are per-task
+/// clones.  Using them directly in `prev_counts` means every task starts with
+/// zero baseline, so `violations_new` always equals `violations_total`.
+///
+/// Reads the git remote origin URL from `.git/config` (handling both regular
+/// clones and worktrees) to produce a key shared across tasks targeting the
+/// same repository.
+fn canonical_project_key(project_root: &Path) -> PathBuf {
+    if !project_root
+        .components()
+        .any(|c| c.as_os_str() == "workspaces")
+    {
+        return project_root.to_path_buf();
+    }
+    resolve_git_remote(project_root).unwrap_or_else(|| project_root.to_path_buf())
+}
+
+/// Read the `[remote "origin"]` URL from git config, handling both regular
+/// repos (`.git/` directory) and worktrees (`.git` file with `gitdir:` pointer).
+fn resolve_git_remote(project_root: &Path) -> Option<PathBuf> {
+    let dot_git = project_root.join(".git");
+    let config_path = if dot_git.is_dir() {
+        dot_git.join("config")
+    } else if dot_git.is_file() {
+        let content = std::fs::read_to_string(&dot_git).ok()?;
+        let gitdir = content.trim().strip_prefix("gitdir: ")?;
+        let abs = if Path::new(gitdir).is_absolute() {
+            PathBuf::from(gitdir)
+        } else {
+            project_root.join(gitdir)
+        };
+        abs.join("../../config").canonicalize().ok()?
+    } else {
+        return None;
+    };
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let mut in_origin = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[remote \"origin\"]" {
+            in_origin = true;
+        } else if trimmed.starts_with('[') {
+            in_origin = false;
+        } else if in_origin {
+            if let Some(url) = trimmed.strip_prefix("url = ") {
+                return Some(PathBuf::from(url.trim()));
+            }
+        }
+    }
+    None
 }
 
 #[async_trait]
@@ -67,14 +124,15 @@ impl TurnInterceptor for RuleEnforcer {
         }
 
         let total = violations.len();
+        let canonical_key = canonical_project_key(&req.project_root);
         let prev = self
             .prev_counts
-            .get(&req.project_root)
+            .get(&canonical_key)
             .map(|v| *v)
             .unwrap_or(0);
         let new_violations = total.saturating_sub(prev);
         let fixed_violations = prev.saturating_sub(total);
-        self.prev_counts.insert(req.project_root.clone(), total);
+        self.prev_counts.insert(canonical_key, total);
 
         // Only log at INFO when the count changes; repeat-same scans go to DEBUG.
         let delta_zero = new_violations == 0 && fixed_violations == 0 && prev > 0;
