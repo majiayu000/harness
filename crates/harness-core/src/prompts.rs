@@ -83,6 +83,13 @@ pub fn triage_prompt(issue: u64) -> PromptParts {
     PromptParts {
         static_instructions: format!(
             "You are a Tech Lead evaluating GitHub issue #{issue} before any code is written.\n\n\
+             **CRITICAL FIRST STEP — duplicate PR check:**\n\
+             Before anything else, run: `gh pr list --repo $(gh repo view --json nameWithOwner -q .nameWithOwner) --search \"{issue}\" --state open --json number,title,url`\n\
+             If ANY open PR already references this issue (in title or body), output:\n\
+             COMPLEXITY=low\n\
+             TRIAGE=SKIP\n\
+             with the reason: \"open PR #<number> already targets this issue\".\n\
+             Do NOT proceed with assessment if an open PR exists.\n\n\
              Your job is to THINK before committing engineering effort. Read the issue carefully, then assess:\n\n\
              1. **Complexity**: Is this trivial (typo, config, 1-file change), moderate (2-3 files, \
              clear scope), or complex (4+ files, new API surface, architectural change)?\n\

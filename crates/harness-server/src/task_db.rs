@@ -308,6 +308,27 @@ impl TaskDb {
         Ok(row.map(|r| r.0))
     }
 
+    /// Find a `done` task for the same project + external_id that has a non-null `pr_url`.
+    ///
+    /// Returns `(task_id, pr_url)` when found. Only matches `done` — failed/cancelled
+    /// tasks are excluded so that retries after failure are always permitted.
+    pub async fn find_terminal_with_pr(
+        &self,
+        project: &str,
+        external_id: &str,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, pr_url FROM tasks \
+             WHERE project = ? AND external_id = ? AND status = 'done' AND pr_url IS NOT NULL \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(project)
+        .bind(external_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Return all tasks as lightweight summaries, skipping the heavy `rounds` column.
     ///
     /// Used by the `/tasks` list endpoint to avoid deserializing large round histories

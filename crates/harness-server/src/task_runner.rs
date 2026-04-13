@@ -822,6 +822,37 @@ impl TaskStore {
         }
     }
 
+    /// Check whether a `done` task with a PR URL already exists for the same
+    /// project + external_id. Cache-first, DB fallback. Fail-open on DB errors.
+    pub async fn find_terminal_pr_duplicate(
+        &self,
+        project_id: &str,
+        external_id: &str,
+    ) -> Option<(TaskId, String)> {
+        for entry in self.cache.iter() {
+            let task = entry.value();
+            let same_key = task.external_id.as_deref() == Some(external_id)
+                && task
+                    .project_root
+                    .as_ref()
+                    .map(|p| p.to_string_lossy() == project_id)
+                    .unwrap_or(false);
+            if same_key && matches!(task.status, TaskStatus::Done) {
+                if let Some(ref url) = task.pr_url {
+                    return Some((task.id.clone(), url.clone()));
+                }
+            }
+        }
+        match self.db.find_terminal_with_pr(project_id, external_id).await {
+            Ok(Some((id, url))) => Some((harness_core::types::TaskId(id), url)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("dedup: terminal PR DB lookup failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Return all tasks currently in the in-memory cache.
     ///
     /// **Semantic note**: since startup only loads active (non-terminal) tasks

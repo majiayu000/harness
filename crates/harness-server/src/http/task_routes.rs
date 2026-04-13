@@ -83,6 +83,25 @@ async fn check_duplicate(
     Some(existing_id)
 }
 
+/// Return existing terminal TaskId if a `done` task with a PR URL matches project + external_id.
+/// This is the second dedup layer — catches cases where a previous task completed with a PR
+/// but a re-submission would create a duplicate.
+async fn check_pr_duplicate(
+    tasks: &Arc<crate::task_runner::TaskStore>,
+    project_id: &str,
+    req: &task_runner::CreateTaskRequest,
+) -> Option<task_runner::TaskId> {
+    let ext_id = req.external_id.as_deref()?;
+    let (existing_id, pr_url) = tasks.find_terminal_pr_duplicate(project_id, ext_id).await?;
+    tracing::info!(
+        existing_task = %existing_id.0,
+        external_id = %ext_id,
+        pr_url = %pr_url,
+        "dedup: terminal task already created PR, returning existing task instead of creating duplicate"
+    );
+    Some(existing_id)
+}
+
 /// Three-tier agent selection: request override > project default > complexity dispatch.
 ///
 /// Tier 1: `req.agent` is `Some` — use the named agent directly (unchanged behaviour).
@@ -198,6 +217,9 @@ pub(crate) async fn enqueue_task(
     // a concurrency permit (same dedup as enqueue_task_background).
     populate_external_id(&mut req);
     if let Some(existing_id) = check_duplicate(&state.core.tasks, &project_id, &req).await {
+        return Ok(existing_id);
+    }
+    if let Some(existing_id) = check_pr_duplicate(&state.core.tasks, &project_id, &req).await {
         return Ok(existing_id);
     }
 
@@ -385,6 +407,9 @@ async fn enqueue_task_background(
     // Auto-populate external_id and check for duplicates.
     populate_external_id(&mut req);
     if let Some(existing_id) = check_duplicate(&state.core.tasks, &project_id, &req).await {
+        return Ok(existing_id);
+    }
+    if let Some(existing_id) = check_pr_duplicate(&state.core.tasks, &project_id, &req).await {
         return Ok(existing_id);
     }
 
