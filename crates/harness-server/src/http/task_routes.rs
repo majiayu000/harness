@@ -1,31 +1,31 @@
 use super::{resolve_reviewer, AppState};
 use crate::{
-    project_registry::check_allowed_roots, services::execution::EnqueueTaskError, task_runner,
+    project_registry::check_allowed_roots,
+    services::{execution::EnqueueTaskError, project::ProjectService},
+    task_runner,
 };
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-/// Resolve a project path-or-ID through the registry.
+/// Resolve a project path-or-ID through the service layer.
 ///
 /// If `project` is `None` or already points to an existing directory it is
-/// returned unchanged.  If it is not a directory and a `registry` is
-/// available, the value is treated as a project ID and looked up; a missing
-/// ID is a `BadRequest` error.  When no registry is available the raw value
-/// is passed through so downstream canonicalization can handle it.
-async fn resolve_project_from_registry(
-    registry: Option<&crate::project_registry::ProjectRegistry>,
+/// returned unchanged.  Otherwise the value is treated as a project ID and
+/// looked up via the service; a missing ID is a `BadRequest` error.
+async fn resolve_project_via_service(
+    svc: &dyn ProjectService,
     project: Option<std::path::PathBuf>,
 ) -> Result<Option<std::path::PathBuf>, EnqueueTaskError> {
-    let (Some(registry), Some(project_path)) = (registry, project.clone()) else {
+    let Some(project_path) = project.clone() else {
         return Ok(project);
     };
     if project_path.is_dir() {
         return Ok(Some(project_path));
     }
     let id = project_path.to_string_lossy();
-    match registry.resolve_path(&id).await {
+    match svc.resolve_path(&id).await {
         Ok(Some(root)) => Ok(Some(root)),
         Ok(None) => Err(EnqueueTaskError::BadRequest(format!(
             "project '{id}' not found in registry and is not a valid directory"
@@ -100,9 +100,8 @@ pub(crate) async fn enqueue_task(
     }
 
     // Resolve project: if the supplied path does not exist as a directory,
-    // treat it as a project ID and look it up in the registry.
-    req.project =
-        resolve_project_from_registry(state.core.project_registry.as_deref(), req.project).await?;
+    // treat it as a project ID and look it up via the service layer.
+    req.project = resolve_project_via_service(state.project_svc.as_ref(), req.project).await?;
 
     // Resolve and canonicalize the project root BEFORE acquiring the
     // concurrency permit so that:
@@ -290,8 +289,7 @@ async fn enqueue_task_background(
 
     // Resolve project: if the supplied path does not exist as a directory,
     // treat it as a project ID and look it up in the registry.
-    req.project =
-        resolve_project_from_registry(state.core.project_registry.as_deref(), req.project).await?;
+    req.project = resolve_project_via_service(state.project_svc.as_ref(), req.project).await?;
 
     // Resolve agent up-front (fast, no I/O) so we can return an error immediately
     // if the agent name is invalid, before registering the task.
@@ -580,7 +578,7 @@ pub(super) async fn cancel_task(
 
     let task_id = harness_core::types::TaskId(id);
 
-    let task = match state.core.tasks.get_with_db_fallback(&task_id).await {
+    let task = match state.task_svc.get_with_db_fallback(&task_id).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             return (
@@ -699,30 +697,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_project_from_registry_passes_through_none() {
-        let result = resolve_project_from_registry(None, None).await;
+    async fn resolve_project_via_service_passes_through_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
+            .await
+            .unwrap();
+        let svc = crate::services::project::DefaultProjectService::new(
+            registry,
+            dir.path().to_path_buf(),
+        );
+        let result = resolve_project_via_service(svc.as_ref(), None).await;
         assert!(result.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn resolve_project_from_registry_passes_through_existing_dir() {
+    async fn resolve_project_via_service_passes_through_existing_dir() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
-        let result = resolve_project_from_registry(None, Some(path.clone())).await;
+        let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
+            .await
+            .unwrap();
+        let svc = crate::services::project::DefaultProjectService::new(
+            registry,
+            dir.path().to_path_buf(),
+        );
+        let result = resolve_project_via_service(svc.as_ref(), Some(path.clone())).await;
         assert_eq!(result.unwrap(), Some(path));
     }
 
     #[tokio::test]
-    async fn resolve_project_from_registry_no_registry_passes_through_nondir() {
-        // When no registry is available, non-dir paths are returned as-is
-        // (downstream canonicalization handles them).
-        let path = std::path::PathBuf::from("/nonexistent/path");
-        let result = resolve_project_from_registry(None, Some(path.clone())).await;
-        assert_eq!(result.unwrap(), Some(path));
-    }
-
-    #[tokio::test]
-    async fn resolve_project_from_registry_resolves_id() {
+    async fn resolve_project_via_service_resolves_id() {
         let dir = tempfile::tempdir().unwrap();
         let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
             .await
@@ -738,12 +742,13 @@ mod tests {
             })
             .await
             .unwrap();
-
-        let result = resolve_project_from_registry(
-            Some(&registry),
-            Some(std::path::PathBuf::from("my-repo")),
-        )
-        .await;
+        let svc = crate::services::project::DefaultProjectService::new(
+            registry,
+            dir.path().to_path_buf(),
+        );
+        let result =
+            resolve_project_via_service(svc.as_ref(), Some(std::path::PathBuf::from("my-repo")))
+                .await;
         assert_eq!(
             result.unwrap(),
             Some(std::path::PathBuf::from("/home/user/my-repo"))
@@ -751,14 +756,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_project_from_registry_unknown_id_returns_bad_request() {
+    async fn resolve_project_via_service_unknown_id_returns_bad_request() {
         let dir = tempfile::tempdir().unwrap();
         let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
             .await
             .unwrap();
-
-        let result = resolve_project_from_registry(
-            Some(&registry),
+        let svc = crate::services::project::DefaultProjectService::new(
+            registry,
+            dir.path().to_path_buf(),
+        );
+        let result = resolve_project_via_service(
+            svc.as_ref(),
             Some(std::path::PathBuf::from("unknown-repo")),
         )
         .await;

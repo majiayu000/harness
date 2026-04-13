@@ -32,12 +32,18 @@ pub struct CoreServices {
     /// Home directory captured at startup to avoid TOCTOU when validating
     /// project roots against `$HOME` in concurrent requests.
     pub home_dir: std::path::PathBuf,
+    /// **Deprecated** — use `AppState::task_svc` for new read operations.
+    /// Write operations (spawn, mutate, abort) still use this store directly
+    /// via `task_runner` helpers until the service layer is extended.
     pub tasks: Arc<task_runner::TaskStore>,
     pub thread_db: Option<crate::thread_db::ThreadDb>,
     pub plan_db: Option<crate::plan_db::PlanDb>,
     /// In-memory plan cache hydrated from `plan_db` on startup.
     /// Write-through: every mutation must also persist via `plan_db`.
     pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
+    /// **Deprecated** — use `AppState::project_svc` for new code.
+    /// Retained for handlers not yet migrated to the service layer (GC,
+    /// thread, config domains). Will be removed once all consumers migrate.
     pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
     pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
     /// Q-value store for MemRL rule utility tracking. None when unavailable.

@@ -30,6 +30,11 @@ pub trait TaskService: Send + Sync {
     /// Subscribe to the real-time stream of a running task.
     /// Returns `None` when no stream channel is registered for the task.
     fn subscribe_stream(&self, id: &TaskId) -> Option<broadcast::Receiver<StreamItem>>;
+
+    /// Retrieve a task snapshot by ID, checking in-memory first then the
+    /// database for terminal tasks evicted from the startup cache.
+    /// Returns `Ok(None)` only when the ID is unknown in both.
+    async fn get_with_db_fallback(&self, id: &TaskId) -> anyhow::Result<Option<TaskState>>;
 }
 
 /// Production implementation backed by [`TaskStore`].
@@ -73,6 +78,10 @@ impl TaskService for DefaultTaskService {
 
     fn subscribe_stream(&self, id: &TaskId) -> Option<broadcast::Receiver<StreamItem>> {
         self.store.subscribe_task_stream(id)
+    }
+
+    async fn get_with_db_fallback(&self, id: &TaskId) -> anyhow::Result<Option<TaskState>> {
+        self.store.get_with_db_fallback(id).await
     }
 }
 
