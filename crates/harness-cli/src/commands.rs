@@ -273,8 +273,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Load config
     let mut config: harness_core::config::HarnessConfig = if let Some(config_path) = &cli.config {
         let content = std::fs::read_to_string(config_path)?;
+        tracing::info!(
+            "config loaded from --config flag: {}",
+            config_path.display()
+        );
+        toml::from_str(&content)?
+    } else if let Some(discovered) = harness_core::config::dirs::find_config_file() {
+        let content = std::fs::read_to_string(&discovered)?;
+        tracing::info!("config loaded from {}", discovered.display());
         toml::from_str(&content)?
     } else {
+        tracing::warn!("no config file found, using built-in defaults");
         harness_core::config::HarnessConfig::default()
     };
     // Apply env var overrides for all subcommands so that HARNESS_DATA_DIR,

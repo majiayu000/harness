@@ -43,6 +43,59 @@ pub fn default_db_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.db"))
 }
 
+/// Probe OS-standard config locations and return the first that exists as a file.
+///
+/// Search order:
+/// 1. `$XDG_CONFIG_HOME/harness/config.toml` (or `~/.config/harness/config.toml`)
+/// 2. macOS: `$HOME/Library/Application Support/harness/config.toml`
+/// 3. Windows: `%APPDATA%\harness\config.toml`
+///
+/// Returns `None` if none of the candidates exist as a regular file.
+pub fn find_config_file() -> Option<PathBuf> {
+    for candidate in config_candidates() {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn config_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 1. $XDG_CONFIG_HOME/harness/config.toml
+    if let Some(xdg) = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".config"))
+        })
+    {
+        candidates.push(xdg.join("harness").join("config.toml"));
+    }
+
+    // 2. macOS: $HOME/Library/Application Support/harness/config.toml
+    #[cfg(target_os = "macos")]
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(
+            PathBuf::from(home)
+                .join("Library/Application Support")
+                .join("harness")
+                .join("config.toml"),
+        );
+    }
+
+    // 3. Windows: %APPDATA%\harness\config.toml
+    #[cfg(target_os = "windows")]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        candidates.push(PathBuf::from(appdata).join("harness").join("config.toml"));
+    }
+
+    candidates
+}
+
 fn data_local_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -74,6 +127,7 @@ fn data_local_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     /// `dirs_data_dir()` must never return `"."` and must never panic,
     /// even when platform env vars (HOME / LOCALAPPDATA) are absent.
@@ -89,5 +143,94 @@ mod tests {
             PathBuf::from("."),
             "dirs_data_dir must not fall back to \".\""
         );
+    }
+
+    // Serialize env-var tests to prevent races when cargo runs tests in parallel.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // Save originals.
+        let saved: Vec<(&str, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        for (k, v) in vars {
+            // SAFETY: test-only, serialized by ENV_MUTEX.
+            unsafe { std::env::set_var(k, v) };
+        }
+        f();
+        // Restore.
+        for (k, orig) in &saved {
+            match orig {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+
+    /// When no config paths exist, `find_config_file` returns `None`.
+    #[test]
+    fn find_config_file_returns_none_when_nothing_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_str().unwrap().to_owned();
+        with_env_vars(&[("XDG_CONFIG_HOME", &dir_str), ("HOME", &dir_str)], || {
+            assert!(find_config_file().is_none());
+        });
+    }
+
+    /// When `$XDG_CONFIG_HOME/harness/config.toml` exists, it is returned.
+    #[test]
+    fn find_config_file_finds_xdg_config_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("harness").join("config.toml");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, "").unwrap();
+        let dir_str = dir.path().to_str().unwrap().to_owned();
+        with_env_vars(&[("XDG_CONFIG_HOME", &dir_str), ("HOME", &dir_str)], || {
+            let found = find_config_file();
+            assert_eq!(found.as_deref(), Some(config_path.as_path()));
+        });
+    }
+
+    /// XDG path is preferred over the `~/.config` fallback.
+    #[test]
+    fn find_config_file_prefers_xdg_over_home() {
+        let xdg_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+
+        let xdg_config = xdg_dir.path().join("harness").join("config.toml");
+        fs::create_dir_all(xdg_config.parent().unwrap()).unwrap();
+        fs::write(&xdg_config, "# xdg").unwrap();
+
+        let home_config = home_dir
+            .path()
+            .join(".config")
+            .join("harness")
+            .join("config.toml");
+        fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+        fs::write(&home_config, "# home").unwrap();
+
+        let xdg_str = xdg_dir.path().to_str().unwrap().to_owned();
+        let home_str = home_dir.path().to_str().unwrap().to_owned();
+        with_env_vars(
+            &[("XDG_CONFIG_HOME", &xdg_str), ("HOME", &home_str)],
+            || {
+                let found = find_config_file();
+                assert_eq!(found.as_deref(), Some(xdg_config.as_path()));
+            },
+        );
+    }
+
+    /// A directory at the candidate path must be skipped (not treated as a file).
+    #[test]
+    fn find_config_file_skips_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("harness").join("config.toml");
+        fs::create_dir_all(&config_dir).unwrap();
+        let dir_str = dir.path().to_str().unwrap().to_owned();
+        with_env_vars(&[("XDG_CONFIG_HOME", &dir_str), ("HOME", &dir_str)], || {
+            assert!(find_config_file().is_none());
+        });
     }
 }
