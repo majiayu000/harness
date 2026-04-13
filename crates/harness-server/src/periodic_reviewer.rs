@@ -392,9 +392,10 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
             };
             // Respect explicit opt-out via `.harness/config.toml` [review] enabled = false.
             // Note: `review.enabled = false` disables both PR auto-review and periodic
-            // health checks.  Emit a warning so operators are aware of this coupling.
+            // health checks.  Use debug level — this is a deliberate opt-out, not an error,
+            // and collect_projects() is called on every scheduler tick.
             if project_cfg.review.as_ref().and_then(|r| r.enabled) == Some(false) {
-                tracing::warn!(
+                tracing::debug!(
                     project = %entry.name,
                     "scheduler: `review.enabled = false` suppresses periodic health checks \
                      in addition to PR auto-review; skipping project"
@@ -472,7 +473,7 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
                         }
                     };
                     if opted_out {
-                        tracing::warn!(
+                        tracing::debug!(
                             project = %proj.id,
                             "scheduler: `review.enabled = false` suppresses periodic health checks \
                              in addition to PR auto-review; skipping registry project"
@@ -539,7 +540,7 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
             }
         };
         if opted_out {
-            tracing::warn!(
+            tracing::debug!(
                 project = %project.name,
                 "scheduler: `review.enabled = false` suppresses periodic health checks \
                  in addition to PR auto-review; skipping startup project"
