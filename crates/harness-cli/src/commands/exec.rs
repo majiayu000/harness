@@ -353,18 +353,17 @@ pub async fn run(
     let mut agent_registry =
         harness_agents::registry::AgentRegistry::new(&config.agents.default_agent);
     agent_registry.set_complexity_preferences(config.agents.complexity_preferred_agents.clone());
-    agent_registry.register(
-        "claude",
-        Arc::new(
-            harness_agents::claude::ClaudeCodeAgent::new(
-                config.agents.claude.cli_path.clone(),
-                config.agents.claude.default_model.clone(),
-                runtime_sandbox_mode,
-            )
-            .with_no_session_persistence_probe()
-            .with_stream_timeout(config.agents.stream_timeout_secs),
-        ),
-    );
+    let mut claude_agent = harness_agents::claude::ClaudeCodeAgent::new(
+        config.agents.claude.cli_path.clone(),
+        config.agents.claude.default_model.clone(),
+        runtime_sandbox_mode,
+    )
+    .with_no_session_persistence_probe()
+    .with_stream_timeout(config.agents.stream_timeout_secs);
+    if let Some(budget) = config.agents.claude.reasoning_budget.clone() {
+        claude_agent = claude_agent.with_reasoning_budget(budget);
+    }
+    agent_registry.register("claude", Arc::new(claude_agent));
     agent_registry.register(
         "codex",
         Arc::new(

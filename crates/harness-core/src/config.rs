@@ -132,7 +132,7 @@ mod tests {
             cli_path = "codex"
             [anthropic_api]
             base_url = "https://api.anthropic.com"
-            default_model = "claude-sonnet-4-20250514"
+            default_model = "claude-sonnet-4-6"
             [review]
             enabled = true
             reviewer_agent = "codex"
@@ -149,7 +149,7 @@ mod tests {
     fn anthropic_api_config_deserializes_configured_max_tokens() {
         let toml_str = r#"
             base_url = "https://api.anthropic.com"
-            default_model = "claude-sonnet-4-20250514"
+            default_model = "claude-sonnet-4-6"
             max_tokens = 8192
         "#;
         let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
@@ -180,7 +180,7 @@ mod tests {
             cli_path = "codex"
             [anthropic_api]
             base_url = "https://api.anthropic.com"
-            default_model = "claude-sonnet-4-20250514"
+            default_model = "claude-sonnet-4-6"
         "#;
         let config: AgentsConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.approval_policy, ApprovalPolicy::FullAuto);
@@ -198,7 +198,7 @@ mod tests {
             cli_path = "codex"
             [anthropic_api]
             base_url = "https://api.anthropic.com"
-            default_model = "claude-sonnet-4-20250514"
+            default_model = "claude-sonnet-4-6"
         "#;
         let config: AgentsConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.sandbox_mode, SandboxMode::DangerFullAccess);
@@ -208,7 +208,7 @@ mod tests {
     fn anthropic_api_config_defaults_max_tokens_when_missing() {
         let toml_str = r#"
             base_url = "https://api.anthropic.com"
-            default_model = "claude-sonnet-4-20250514"
+            default_model = "claude-sonnet-4-6"
         "#;
         let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.max_tokens, 4096);
@@ -287,7 +287,7 @@ mod tests {
             cli_path = "codex"
             [agents.anthropic_api]
             base_url = "https://api.anthropic.com"
-            default_model = "claude-sonnet-4-20250514"
+            default_model = "claude-sonnet-4-6"
 
             [gc]
             max_drafts_per_run = 5

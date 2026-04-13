@@ -578,6 +578,17 @@ pub enum ExecutionPhase {
     Validation,
 }
 
+impl ExecutionPhase {
+    /// Returns the Claude Code CLI `--effort` level for this phase.
+    pub fn effort_level(self) -> &'static str {
+        match self {
+            ExecutionPhase::Planning => "max",
+            ExecutionPhase::Execution => "high",
+            ExecutionPhase::Validation => "max",
+        }
+    }
+}
+
 /// Per-phase model selection configuration.
 ///
 /// Maps each `ExecutionPhase` to a `BudgetTier`, then maps tiers to model identifiers.
@@ -616,13 +627,13 @@ fn default_validation_tier() -> BudgetTier {
     BudgetTier::XHigh
 }
 fn default_xhigh_model() -> String {
-    "claude-opus-4-20250514".to_string()
+    "claude-opus-4-6".to_string()
 }
 fn default_high_model() -> String {
-    "claude-sonnet-4-20250514".to_string()
+    "claude-sonnet-4-6".to_string()
 }
 fn default_medium_model() -> String {
-    "claude-haiku-4-20250514".to_string()
+    "claude-haiku-4-5-20251001".to_string()
 }
 
 impl Default for ReasoningBudget {
@@ -769,16 +780,16 @@ mod tests {
         // Planning and Validation use XHigh → opus
         assert_eq!(
             budget.model_for_phase(ExecutionPhase::Planning),
-            "claude-opus-4-20250514"
+            "claude-opus-4-6"
         );
         assert_eq!(
             budget.model_for_phase(ExecutionPhase::Validation),
-            "claude-opus-4-20250514"
+            "claude-opus-4-6"
         );
         // Execution uses High → sonnet
         assert_eq!(
             budget.model_for_phase(ExecutionPhase::Execution),
-            "claude-sonnet-4-20250514"
+            "claude-sonnet-4-6"
         );
     }
 

@@ -106,6 +106,11 @@ impl ClaudeCodeAgent {
             base_args.push(OsString::from(tools.join(",")));
         }
 
+        if let Some(phase) = req.execution_phase {
+            base_args.push(OsString::from("--effort"));
+            base_args.push(OsString::from(phase.effort_level()));
+        }
+
         if let Some(budget) = req.max_budget_usd {
             base_args.push(OsString::from("--max-budget-usd"));
             base_args.push(OsString::from(budget.to_string()));
@@ -473,14 +478,14 @@ mod tests {
         };
         let req_no_phase = AgentRequest::default();
 
-        assert_eq!(agent.resolve_model(&req_planning), "claude-opus-4-20250514");
+        assert_eq!(agent.resolve_model(&req_planning), "claude-opus-4-6");
         assert_eq!(
             agent.resolve_model(&req_execution),
-            "claude-sonnet-4-20250514"
+            "claude-sonnet-4-6"
         );
         assert_eq!(
             agent.resolve_model(&req_validation),
-            "claude-opus-4-20250514"
+            "claude-opus-4-6"
         );
         // No phase → falls back to default_model
         assert_eq!(agent.resolve_model(&req_no_phase), "default-model");

@@ -253,7 +253,7 @@ mod tests {
     fn from_config_wires_all_anthropic_settings() {
         let config = AnthropicApiConfig {
             base_url: "https://api.anthropic.com".to_string(),
-            default_model: "claude-sonnet-4-20250514".to_string(),
+            default_model: "claude-sonnet-4-6".to_string(),
             max_tokens: 3072,
         };
 

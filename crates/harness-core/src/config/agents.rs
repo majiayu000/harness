@@ -232,7 +232,7 @@ impl Default for ClaudeAgentConfig {
         Self {
             cli_path: PathBuf::from("claude"),
             default_model: "sonnet".to_string(),
-            reasoning_budget: None,
+            reasoning_budget: Some(ReasoningBudget::default()),
         }
     }
 }
@@ -296,7 +296,7 @@ impl Default for AnthropicApiConfig {
     fn default() -> Self {
         Self {
             base_url: "https://api.anthropic.com".to_string(),
-            default_model: "claude-sonnet-4-20250514".to_string(),
+            default_model: "claude-sonnet-4-6".to_string(),
             max_tokens: default_anthropic_api_max_tokens(),
         }
     }
