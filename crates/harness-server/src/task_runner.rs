@@ -56,6 +56,46 @@ pub enum TaskStatus {
     Cancelled,
 }
 
+const TERMINAL_TASK_STATUSES: &[&str] = &["done", "failed", "cancelled"];
+const RESUMABLE_TASK_STATUSES: &[&str] = &["implementing", "agent_review", "waiting", "reviewing"];
+
+impl TaskStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
+
+    pub fn is_inflight(&self) -> bool {
+        matches!(
+            self,
+            Self::Implementing | Self::AgentReview | Self::Waiting | Self::Reviewing
+        )
+    }
+
+    pub fn is_resumable_after_restart(&self) -> bool {
+        self.is_inflight()
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Done)
+    }
+
+    pub fn is_failure(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+
+    pub fn terminal_statuses() -> &'static [&'static str] {
+        TERMINAL_TASK_STATUSES
+    }
+
+    pub fn resumable_statuses() -> &'static [&'static str] {
+        RESUMABLE_TASK_STATUSES
+    }
+}
+
 impl AsRef<str> for TaskStatus {
     fn as_ref(&self) -> &str {
         match self {
@@ -901,7 +941,7 @@ impl TaskStore {
         }
     }
 
-    /// Return all active (Pending or Implementing) tasks on the same project, excluding `exclude_id`.
+    /// Return all inflight sibling tasks on the same project, excluding `exclude_id`.
     ///
     /// Used by `run_task` to build sibling-awareness context before starting implementation,
     /// so each agent knows what other agents are working on and avoids touching their files.
@@ -912,13 +952,7 @@ impl TaskStore {
             .filter(|e| {
                 let task = e.value();
                 &task.id != exclude_id
-                    && matches!(
-                        task.status,
-                        TaskStatus::Pending
-                            | TaskStatus::Implementing
-                            | TaskStatus::Reviewing
-                            | TaskStatus::AgentReview
-                    )
+                    && (matches!(task.status, TaskStatus::Pending) || task.status.is_inflight())
                     && task.project_root.as_deref() == Some(project)
             })
             .map(|e| e.value().clone())
@@ -1165,16 +1199,9 @@ impl TaskStore {
             self.db.update(&state).await?;
 
             // Persist a checkpoint to the DB so that recover_in_progress() can
-            // restore the task if the server is killed mid-flight.  Only written
-            // for statuses that can be interrupted (matches recover_in_progress
-            // query predicate).
-            if matches!(
-                state.status,
-                TaskStatus::Implementing
-                    | TaskStatus::AgentReview
-                    | TaskStatus::Reviewing
-                    | TaskStatus::Waiting
-            ) {
+            // restore the task if the server is killed mid-flight. Only written
+            // for statuses that can be resumed after restart.
+            if state.status.is_resumable_after_restart() {
                 let phase_str = format!("{:?}", state.phase);
                 if let Err(e) = self
                     .db
@@ -2858,6 +2885,91 @@ mod tests {
         assert!(!is_non_decomposable_prompt_source(None));
     }
 
+    #[test]
+    fn task_status_semantics_are_centralized() {
+        let cases = [
+            (
+                TaskStatus::Pending,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                TaskStatus::AwaitingDeps,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                TaskStatus::Implementing,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                TaskStatus::AgentReview,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (TaskStatus::Waiting, false, true, true, false, false, false),
+            (
+                TaskStatus::Reviewing,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (TaskStatus::Done, true, false, false, true, false, false),
+            (TaskStatus::Failed, true, false, false, false, true, false),
+            (
+                TaskStatus::Cancelled,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+            ),
+        ];
+
+        for (status, terminal, inflight, resumable, success, failure, cancelled) in cases {
+            assert_eq!(status.is_terminal(), terminal, "{status:?} terminal");
+            assert_eq!(status.is_inflight(), inflight, "{status:?} inflight");
+            assert_eq!(
+                status.is_resumable_after_restart(),
+                resumable,
+                "{status:?} resumable"
+            );
+            assert_eq!(status.is_success(), success, "{status:?} success");
+            assert_eq!(status.is_failure(), failure, "{status:?} failure");
+            assert_eq!(status.is_cancelled(), cancelled, "{status:?} cancelled");
+        }
+
+        assert_eq!(
+            TaskStatus::terminal_statuses(),
+            &["done", "failed", "cancelled"]
+        );
+        assert_eq!(
+            TaskStatus::resumable_statuses(),
+            &["implementing", "agent_review", "waiting", "reviewing"]
+        );
+    }
+
     #[tokio::test]
     async fn count_by_project_empty() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -2895,9 +3007,11 @@ mod tests {
             ("a1", &root_a, TaskStatus::Done),
             ("a2", &root_a, TaskStatus::Done),
             ("a3", &root_a, TaskStatus::Failed),
+            ("a4", &root_a, TaskStatus::Cancelled),
             ("b1", &root_b, TaskStatus::Done),
             ("b2", &root_b, TaskStatus::Failed),
             ("b3", &root_b, TaskStatus::Failed),
+            ("b4", &root_b, TaskStatus::Cancelled),
         ] {
             let mut task = TaskState::new(harness_core::types::TaskId(id.to_string()));
             task.status = status;
@@ -2916,6 +3030,32 @@ mod tests {
         assert!(counts.contains_key(&key_b), "beta counts missing");
         assert_eq!(counts[&key_b].done, 1, "beta done");
         assert_eq!(counts[&key_b].failed, 2, "beta failed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_by_project_excludes_cancelled_from_failed_totals() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let root = std::path::PathBuf::from("/projects/alpha");
+        for (id, status) in [
+            ("done", TaskStatus::Done),
+            ("failed", TaskStatus::Failed),
+            ("cancelled", TaskStatus::Cancelled),
+        ] {
+            let mut task = TaskState::new(harness_core::types::TaskId(id.to_string()));
+            task.status = status;
+            task.project_root = Some(root.clone());
+            store.insert(&task).await;
+        }
+
+        let counts = store.count_for_dashboard().await;
+        assert_eq!(counts.global_done, 1);
+        assert_eq!(counts.global_failed, 1);
+        let key = root.to_string_lossy().into_owned();
+        assert_eq!(counts.by_project[&key].done, 1);
+        assert_eq!(counts.by_project[&key].failed, 1);
         Ok(())
     }
 }

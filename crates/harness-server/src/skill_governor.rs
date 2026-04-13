@@ -56,8 +56,12 @@ pub(crate) async fn run_skill_governance_tick(
         }
         let entry = outcomes.entry(skill_id).or_default();
         match task_statuses.get(task_id.as_str()) {
-            Some(TaskStatus::Done) => entry.success = entry.success.saturating_add(1),
-            Some(TaskStatus::Failed) => entry.fail = entry.fail.saturating_add(1),
+            Some(status) if status.is_success() => {
+                entry.success = entry.success.saturating_add(1);
+            }
+            Some(status) if status.is_failure() => {
+                entry.fail = entry.fail.saturating_add(1);
+            }
             Some(_) | None => entry.unknown = entry.unknown.saturating_add(1),
         }
     }
@@ -219,6 +223,67 @@ mod tests {
         assert_eq!(skill.governance_status, SkillGovernanceStatus::Quarantine);
         assert!(skill.quality_score < 0.45);
         assert_eq!(skill.canary_ratio, 0.1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn governance_tick_treats_cancelled_as_unknown() -> anyhow::Result<()> {
+        let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let data_dir = crate::test_helpers::tempdir_in_home("harness-skill-gov-cancel-data-")?;
+        let project_root =
+            crate::test_helpers::tempdir_in_home("harness-skill-gov-cancel-project-")?;
+        let state = crate::test_helpers::make_test_state_with_project_root(
+            data_dir.path(),
+            project_root.path(),
+        )
+        .await?;
+
+        let skill_id = {
+            let mut store = state.engines.skills.write().await;
+            store.create(
+                "cancel-skill".to_string(),
+                "# cancel\n<!-- trigger-patterns: cancel -->".to_string(),
+            );
+            store
+                .get_by_name("cancel-skill")
+                .expect("skill should exist")
+                .id
+                .clone()
+        };
+
+        let req = CreateTaskRequest {
+            prompt: Some("cancel me".to_string()),
+            project: Some(project_root.path().to_path_buf()),
+            ..Default::default()
+        };
+        let task_id = register_pending_task(state.core.tasks.clone(), &req).await;
+        update_status(&state.core.tasks, &task_id, TaskStatus::Cancelled, 1).await?;
+
+        let mut used = Event::new(
+            SessionId::new(),
+            "skill_used",
+            "task_runner",
+            Decision::Pass,
+        );
+        used.detail = Some(format!(
+            "task_id={} skill_id={}",
+            task_id.as_str(),
+            skill_id.as_str()
+        ));
+        state.observability.events.log(&used).await?;
+
+        let report = run_skill_governance_tick(&state).await?;
+        assert_eq!(report.skills_scored, 0);
+        assert_eq!(report.samples, 0);
+        assert_eq!(report.activated, 0);
+        assert_eq!(report.watched, 0);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(report.retired, 0);
+
+        let store = state.engines.skills.read().await;
+        let skill = store.get(&skill_id).expect("skill should exist");
+        assert_eq!(skill.scored_samples, 0);
+        assert_eq!(skill.quality_score, 0.5);
         Ok(())
     }
 

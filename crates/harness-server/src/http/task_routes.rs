@@ -597,10 +597,7 @@ pub(super) async fn cancel_task(
         }
     };
 
-    if matches!(
-        task.status,
-        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
-    ) {
+    if task.status.is_terminal() {
         return (
             StatusCode::CONFLICT,
             Json(json!({ "error": "task already in terminal state" })),
