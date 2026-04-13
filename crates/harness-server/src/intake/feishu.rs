@@ -157,7 +157,10 @@ impl IntakeSource for FeishuIntake {
         };
 
         if let Some(text) = text {
-            if let Some(chat_id) = self.chat_ids.get(external_id) {
+            // Clone the chat_id to drop the DashMap Ref before the await point,
+            // avoiding a held shard lock during async I/O.
+            let chat_id = self.chat_ids.get(external_id).map(|r| r.value().clone());
+            if let Some(chat_id) = chat_id {
                 if let Err(e) = self.send_message(&chat_id, &text).await {
                     tracing::warn!(
                         message_id = %external_id,
