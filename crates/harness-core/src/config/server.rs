@@ -72,11 +72,12 @@ impl ServerConfig {
     /// this call in the serve command and always win).
     ///
     /// Supported variables:
-    /// - `HARNESS_HTTP_ADDR`    — `http_addr` (parsed as `SocketAddr`)
-    /// - `HARNESS_DATA_DIR`     — `data_dir`
-    /// - `HARNESS_PROJECT_ROOT` — `project_root`
-    /// - `HARNESS_API_TOKEN`    — `api_token`
-    /// - `GITHUB_TOKEN`         — `github_token`
+    /// - `HARNESS_HTTP_ADDR`       — `http_addr` (parsed as `SocketAddr`)
+    /// - `HARNESS_DATA_DIR`        — `data_dir`
+    /// - `HARNESS_PROJECT_ROOT`    — `project_root`
+    /// - `HARNESS_API_TOKEN`       — `api_token`
+    /// - `GITHUB_TOKEN`            — `github_token`
+    /// - `GITHUB_WEBHOOK_SECRET`   — `github_webhook_secret`
     pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
         if let Ok(v) = std::env::var("HARNESS_DATA_DIR") {
             if !v.is_empty() {
@@ -96,6 +97,11 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("GITHUB_TOKEN") {
             if !v.is_empty() {
                 self.github_token = Some(v);
+            }
+        }
+        if let Ok(v) = std::env::var("GITHUB_WEBHOOK_SECRET") {
+            if !v.is_empty() {
+                self.github_webhook_secret = Some(v);
             }
         }
         Ok(())
@@ -337,6 +343,27 @@ mod tests {
             };
             cfg.apply_env_overrides().unwrap();
             assert_eq!(cfg.github_token, Some("gh-real".to_string()));
+        });
+    }
+
+    #[test]
+    fn env_override_github_webhook_secret() {
+        temp_env::with_vars([("GITHUB_WEBHOOK_SECRET", Some("wh-secret-env"))], || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.github_webhook_secret, Some("wh-secret-env".to_string()));
+        });
+    }
+
+    #[test]
+    fn env_override_empty_github_webhook_secret_does_not_override_toml_secret() {
+        temp_env::with_vars([("GITHUB_WEBHOOK_SECRET", Some(""))], || {
+            let mut cfg = ServerConfig {
+                github_webhook_secret: Some("wh-real".to_string()),
+                ..ServerConfig::default()
+            };
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.github_webhook_secret, Some("wh-real".to_string()));
         });
     }
 
