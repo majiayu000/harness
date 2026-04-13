@@ -30,28 +30,32 @@ Harness is a Rust-native platform that wraps AI coding agents (Claude Code, Code
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Harness CLI                          │
-│              serve · exec · gc · rule · skill               │
-├──────────┬──────────┬───────────────────────────────────────┤
-│  stdio   │   HTTP   │  WebSocket   │  MCP Server  │ Webhook│
-├──────────┴──────────┴──────────┴───┴──────────────┴────────┤
-│                    JSON-RPC Router (30 methods)             │
-├────────────┬─────────────┬────────────┬────────────────────┤
-│   Threads  │    Tasks    │   Turns    │    ExecPlans       │
-├────────────┴─────────────┴────────────┴────────────────────┤
-│  harness-agents    │  harness-rules   │  harness-skills    │
-│  (Claude/Codex/API)│  (Starlark exec) │  (discovery/dedup) │
-├────────────────────┼──────────────────┼────────────────────┤
-│  harness-gc        │  harness-observe │  harness-exec      │
-│  (signal/drafts)   │  (events/OTLP)  │  (plan lifecycle)  │
-├────────────────────┴──────────────────┴────────────────────┤
-│                    harness-core                             │
-│          config · prompts · domain types · traits           │
-├────────────────────────────────────────────────────────────┤
-│                    harness-protocol                         │
-│       JSON-RPC envelopes · method definitions · codecs      │
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                          Harness CLI                              │
+│    serve · mcp-server · exec · gc · rule · execpolicy · skill    │
+│                    pr · plan · version                            │
+├──────────┬──────────┬────────────────────────────────────────────┤
+│  stdio   │   HTTP   │  WebSocket   │  MCP Server  │  Webhook    │
+├──────────┴──────────┴──────────┴───┴──────────────┴─────────────┤
+│                    JSON-RPC Router (42 methods)                   │
+├────────────┬─────────────┬────────────┬─────────────────────────┤
+│   Threads  │    Tasks    │   Turns    │    ExecPlans            │
+├────────────┴─────────────┴────────────┴─────────────────────────┤
+│  harness-agents    │  harness-rules   │  harness-skills         │
+│  (Claude/Codex/API)│  (Starlark exec) │  (discovery/dedup)      │
+├────────────────────┼──────────────────┼─────────────────────────┤
+│  harness-gc        │  harness-observe │  harness-exec           │
+│  (signal/drafts)   │  (events/OTLP)  │  (plan lifecycle)       │
+├────────────────────┼──────────────────┼─────────────────────────┤
+│  harness-sandbox   │  harness-workflow│  harness-api            │
+│  (isolation modes) │  (workflow engine)│  (stable Rust facade)  │
+├────────────────────┴──────────────────┴─────────────────────────┤
+│                    harness-core                                   │
+│          config · prompts · domain types · traits                 │
+├──────────────────────────────────────────────────────────────────┤
+│                    harness-protocol                               │
+│       JSON-RPC envelopes · method definitions · codecs            │
+└──────────────────────────────────────────────────────────────────┘
         ▼               ▼                ▼
    Claude Code CLI   Codex CLI    Anthropic API
 ```
@@ -71,7 +75,7 @@ Harness is a Rust-native platform that wraps AI coding agents (Claude Code, Code
 ```bash
 git clone https://github.com/majiayu000/harness.git
 cd harness
-cargo build
+cargo build --release
 ```
 
 ### Rust API Facade
@@ -99,23 +103,29 @@ track internal crate layout changes.
 
 ### Run
 
-**HTTP server:**
+**HTTP server (recommended — use config file):**
 
 ```bash
-cargo run -p harness-cli -- serve --transport http --port 9800
+./target/release/harness serve --config config/harness.toml
 curl http://127.0.0.1:9800/health
+```
+
+**HTTP server (inline flags):**
+
+```bash
+./target/release/harness serve --transport http --port 9800
 ```
 
 **Stdio (for MCP integration):**
 
 ```bash
-cargo run -p harness-cli -- serve --transport stdio
+./target/release/harness serve --transport stdio
 ```
 
 **One-shot execution:**
 
 ```bash
-cargo run -p harness-cli -- exec "Fix the failing test in src/lib.rs"
+./target/release/harness exec "Fix the failing test in src/lib.rs"
 ```
 
 ### Common Workflows
@@ -127,34 +137,36 @@ curl -X POST http://127.0.0.1:9800/tasks \
   -d '{"prompt": "Add input validation to the API handler"}'
 
 # Rule engine
-cargo run -p harness-cli -- rule load .
-cargo run -p harness-cli -- rule check .
+harness rule load .
+harness rule check .
 
 # GC cycle — detect signals and generate remediation drafts
-cargo run -p harness-cli -- gc run .
+harness gc run .
 
 # Skill discovery
-cargo run -p harness-cli -- skill list
+harness skill list
 
 # ExecPlan lifecycle
-cargo run -p harness-cli -- plan init ./spec.md
-cargo run -p harness-cli -- plan status ./exec-plan-<id>.md
+harness plan init ./spec.md
+harness plan status ./exec-plan-<id>.md
+
+# PR orchestration — implement issue and manage review loop
+harness pr --issue 42 --project my-project
 ```
 
 ## Configuration
 
-All settings are declarative TOML. Pass `--config <path>` or use the defaults in [`config/default.toml`](config/default.toml).
+All settings are declarative TOML. Pass `--config <path>` or copy [`config/default.toml.example`](config/default.toml.example) to get started.
 
 ```toml
 [server]
-transport = "stdio"
+transport = "http"
 http_addr = "127.0.0.1:9800"
 data_dir = "~/.local/share/harness"
 project_root = "."
 
 [agents]
-default_agent = "auto"
-# complexity_preferred_agents = ["codex", "claude"]
+default_agent = "claude"
 sandbox_mode = "danger-full-access"
 
 [agents.claude]
@@ -167,7 +179,6 @@ cli_path = "codex"
 [agents.anthropic_api]
 base_url = "https://api.anthropic.com"
 default_model = "claude-sonnet-4-20250514"
-max_tokens = 4096
 
 [agents.review]
 enabled = true
@@ -178,7 +189,6 @@ max_rounds = 3
 max_drafts_per_run = 5
 budget_per_signal_usd = 0.50
 total_budget_usd = 5.0
-draft_ttl_hours = 72
 
 [observe]
 log_retention_days = 90
@@ -333,11 +343,11 @@ curl http://127.0.0.1:9800/health
 **Important:** Always start the server from a standalone terminal, not from within Claude Code or other agent sessions. Agent environment variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`) propagate to spawned subprocesses and cause SIGTRAP.
 
 ```bash
-# Single project (backward compatible)
-./target/release/harness serve --transport http --port 9800 --project-root /path/to/project
-
 # Multi-project via config file (recommended)
-./target/release/harness serve --transport http --port 9800 --config config/default.toml
+./target/release/harness serve --config config/harness.toml
+
+# Single project (inline flags)
+./target/release/harness serve --transport http --port 9800 --project-root /path/to/project
 
 # Multi-project via CLI flags
 ./target/release/harness serve --transport http --port 9800 \
@@ -345,7 +355,7 @@ curl http://127.0.0.1:9800/health
   --project litellm=/path/to/litellm
 
 # With GitHub token for auto-review
-GITHUB_TOKEN=ghp_xxx ./target/release/harness serve --transport http --port 9800 --config config/default.toml
+GITHUB_TOKEN=ghp_xxx ./target/release/harness serve --config config/harness.toml
 ```
 
 ## Task Execution Flow
@@ -368,24 +378,27 @@ Each task runs in an isolated git worktree, so multiple agents can work on the s
 | `harness-protocol` | JSON-RPC method definitions, envelopes, notifications, codecs |
 | `harness-server` | App Server runtime (HTTP + stdio + WebSocket), routing, handlers, task/thread stores |
 | `harness-agents` | Agent adapters (Claude CLI, Codex CLI, Anthropic API) and registry |
+| `harness-api` | Stable Rust import facade over core, protocol, sandbox, and exec crates |
+| `harness-sandbox` | Sandbox mode definitions and workspace isolation |
+| `harness-workflow` | Workflow engine for multi-step agent orchestration |
 | `harness-gc` | Signal detection and draft remediation generation/adoption |
 | `harness-rules` | Rule loading/parsing, Starlark execution policy engine |
 | `harness-skills` | Skill discovery, deduplication, search, and persistence |
 | `harness-exec` | ExecPlan model plus Markdown serialization/deserialization |
 | `harness-observe` | Event storage, quality grading, health/stat aggregation, OTLP export |
-| `harness-cli` | `harness` binary with serve/exec/gc/rule/skill/plan commands |
+| `harness-cli` | `harness` binary with serve/mcp-server/exec/gc/rule/execpolicy/skill/plan/pr commands |
 
 ## JSON-RPC API
 
-Harness exposes 38 methods over JSON-RPC 2.0 (stdio, HTTP, or WebSocket):
+Harness exposes 42 methods over JSON-RPC 2.0 (stdio, HTTP, or WebSocket):
 
 | Category | Methods |
 |---|---|
 | Lifecycle | `initialize`, `initialized` |
 | Threads | `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/delete`, `thread/compact` |
-| Turns | `turn/start`, `turn/steer`, `turn/cancel`, `turn/status` |
+| Turns | `turn/start`, `turn/steer`, `turn/cancel`, `turn/status`, `turn/respond_approval` |
 | GC | `gc/run`, `gc/status`, `gc/drafts`, `gc/adopt`, `gc/reject` |
-| Skills | `skill/create`, `skill/list`, `skill/get`, `skill/delete` |
+| Skills | `skill/create`, `skill/list`, `skill/get`, `skill/delete`, `skill/governance_view`, `skill/governance_history`, `skill/stale` |
 | Rules | `rule/load`, `rule/check` |
 | ExecPlan | `exec_plan/init`, `exec_plan/update`, `exec_plan/status` |
 | Observability | `event/log`, `event/query`, `metrics/collect`, `metrics/query` |
