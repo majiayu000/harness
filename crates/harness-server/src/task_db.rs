@@ -1134,6 +1134,7 @@ mod tests {
             action: "implement".to_string(),
             result: "created PR".to_string(),
             detail: None,
+            first_token_latency_ms: None,
         });
         db.update(&task).await?;
 

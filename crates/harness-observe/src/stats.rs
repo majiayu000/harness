@@ -162,6 +162,28 @@ pub fn aggregate_rule_stats(events: &[Event]) -> Vec<RuleStats> {
     stats
 }
 
+/// Count linter/compiler feedback events (Block or Escalate) from `rule_check` events.
+///
+/// High values indicate the agent is in a "hallucination loop" with repeated build failures.
+pub fn linter_feedback_count(events: &[Event]) -> u32 {
+    events
+        .iter()
+        .filter(|e| e.hook == "rule_check")
+        .filter(|e| matches!(e.decision, Decision::Block | Decision::Escalate))
+        .count() as u32
+}
+
+/// Compute the p50 (median) of a slice of turn counts.
+/// Returns `None` for an empty slice.
+pub fn p50_turns(turn_counts: &[u32]) -> Option<u32> {
+    if turn_counts.is_empty() {
+        return None;
+    }
+    let mut sorted = turn_counts.to_vec();
+    sorted.sort_unstable();
+    Some(sorted[sorted.len() / 2])
+}
+
 pub fn compute_rule_trends(events: &[Event], period_days: u32) -> Vec<RuleTrend> {
     let rule_events: Vec<&Event> = events.iter().filter(|e| e.hook == "rule_check").collect();
     if rule_events.is_empty() {
@@ -332,5 +354,52 @@ mod tests {
     fn compute_rule_trends_empty_when_no_rule_events() {
         let trends = compute_rule_trends(&[make_event("h", Decision::Pass)], 7);
         assert!(trends.is_empty());
+    }
+
+    #[test]
+    fn linter_feedback_count_returns_zero_for_empty_events() {
+        assert_eq!(linter_feedback_count(&[]), 0);
+    }
+
+    #[test]
+    fn linter_feedback_count_counts_only_block_and_escalate() {
+        let events = vec![
+            make_rule_event("SEC-01", Decision::Block),
+            make_rule_event("SEC-01", Decision::Escalate),
+            make_rule_event("SEC-02", Decision::Pass),
+            make_rule_event("SEC-03", Decision::Warn),
+            make_event("other_hook", Decision::Block), // not rule_check
+        ];
+        assert_eq!(linter_feedback_count(&events), 2);
+    }
+
+    #[test]
+    fn linter_feedback_count_zero_when_all_pass() {
+        let events = vec![
+            make_rule_event("SEC-01", Decision::Pass),
+            make_rule_event("SEC-02", Decision::Complete),
+        ];
+        assert_eq!(linter_feedback_count(&events), 0);
+    }
+
+    #[test]
+    fn p50_turns_returns_none_for_empty_slice() {
+        assert_eq!(p50_turns(&[]), None);
+    }
+
+    #[test]
+    fn p50_turns_single_element() {
+        assert_eq!(p50_turns(&[5]), Some(5));
+    }
+
+    #[test]
+    fn p50_turns_odd_count() {
+        assert_eq!(p50_turns(&[1, 3, 5, 7, 9]), Some(5));
+    }
+
+    #[test]
+    fn p50_turns_even_count_returns_lower_median() {
+        // sorted: [1, 2, 3, 4] — index len/2 = 2 → 3
+        assert_eq!(p50_turns(&[4, 1, 3, 2]), Some(3));
     }
 }

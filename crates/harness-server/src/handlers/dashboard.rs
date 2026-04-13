@@ -1,7 +1,7 @@
 use crate::{http::AppState, task_runner::DashboardCounts};
 use axum::{extract::State, http::StatusCode, Json};
 use harness_core::types::EventFilters;
-use harness_observe::quality::QualityGrader;
+use harness_observe::{quality::QualityGrader, stats};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -63,6 +63,56 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
             tracing::warn!("dashboard: failed to query events for grade: {e}");
             None
         }
+    };
+
+    // LLM-specific metrics derived from in-memory task state and event store.
+    let llm_metrics: Value = {
+        let all_tasks = state.core.tasks.list_all();
+        // avg_turns: mean of task.turn across all non-zero tasks
+        let turn_counts: Vec<u32> = all_tasks
+            .iter()
+            .filter(|t| t.turn > 0)
+            .map(|t| t.turn)
+            .collect();
+        let avg_turns: Option<f64> = if turn_counts.is_empty() {
+            None
+        } else {
+            Some(turn_counts.iter().map(|&t| t as f64).sum::<f64>() / turn_counts.len() as f64)
+        };
+        let p50_turns = stats::p50_turns(&turn_counts);
+        // p50_first_token_latency_ms: from first round of each task
+        let mut latencies: Vec<u64> = all_tasks
+            .iter()
+            .filter_map(|t| t.rounds.first().and_then(|r| r.first_token_latency_ms))
+            .collect();
+        latencies.sort_unstable();
+        let p50_first_token_latency_ms: Option<u64> = if latencies.is_empty() {
+            None
+        } else {
+            Some(latencies[latencies.len() / 2])
+        };
+        // total_linter_feedback from events already queried above
+        let total_linter_feedback = match state
+            .observability
+            .events
+            .query(&EventFilters {
+                hook: Some("rule_check".to_string()),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(evts) => stats::linter_feedback_count(&evts),
+            Err(e) => {
+                tracing::warn!("dashboard: failed to query rule_check events: {e}");
+                0
+            }
+        };
+        json!({
+            "avg_turns": avg_turns,
+            "p50_turns": p50_turns,
+            "total_linter_feedback": total_linter_feedback,
+            "p50_first_token_latency_ms": p50_first_token_latency_ms,
+        })
     };
 
     // Fetch latest PR URLs for all projects in one bulk query to avoid N+1.
@@ -136,6 +186,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     let body = json!({
         "projects": projects,
         "runtime_hosts": runtime_hosts,
+        "llm_metrics": llm_metrics,
         "global": {
             "running": tq.running_count(),
             "queued": tq.queued_count(),

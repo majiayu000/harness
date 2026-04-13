@@ -1742,6 +1742,7 @@ mod tests {
             action: "review".to_string(),
             result: "cancelled".to_string(),
             detail: Some("cancelled output should be ignored".to_string()),
+            first_token_latency_ms: None,
         });
         store.insert(&task).await;
 

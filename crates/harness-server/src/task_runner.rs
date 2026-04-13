@@ -139,6 +139,9 @@ pub struct RoundResult {
     /// Raw output from the reviewer agent, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Time from agent launch to first output token (milliseconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_latency_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1698,6 +1701,7 @@ where
                                     "failed".into()
                                 },
                                 detail,
+                                first_token_latency_ms: None,
                             });
                         }
                         if succeeded {
@@ -1837,6 +1841,7 @@ where
                                 "attempt {transient_attempts}/{MAX_TRANSIENT_RETRIES}"
                             ),
                             detail: Some(reason.clone()),
+                            first_token_latency_ms: None,
                         });
                         s.status = TaskStatus::Pending;
                         s.error = Some(format!(
