@@ -1,24 +1,43 @@
 //! Prompt templates and output parsers shared across CLI and HTTP entries.
+//!
+//! ## Caching architecture (inspired by Claude Code's prompt design)
+//!
+//! Prompts are split into three layers with a boundary marker between static and
+//! dynamic content. When the CLI eventually supports prefix-based prompt caching,
+//! the static portion will be cached across calls.
+//!
+//! ```text
+//! ┌──────────────────────────────┐
+//! │  static_instructions         │  ← Cacheable: role, workflow, output format
+//! │  (identical across calls)    │
+//! ├──────────────────────────────┤  ← SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+//! │  context                     │  ← Semi-static: project rules, git config
+//! │  dynamic_payload             │  ← Per-call: issue number, triage output
+//! └──────────────────────────────┘
+//! ```
 
 use crate::config::project::GitConfig;
 
-/// A prompt decomposed into its static, semi-static, and dynamic layers.
+/// Marker separating cacheable static content from per-invocation dynamic content.
 ///
-/// This structure prepares prompts for future API-level prompt caching by separating
-/// stable content (instructions, output format) from dynamic content (issue body, diff).
+/// Modeled after Claude Code's `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`. Content before
+/// this marker is stable across calls of the same prompt type and can be cached
+/// at the API level (prefix caching). Content after changes per invocation.
+pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str =
+    "\n\n---\n<!-- dynamic context below -->\n";
+
+/// A prompt decomposed into its static, semi-static, and dynamic layers.
 ///
 /// ## Layers
 /// - `static_instructions`: Role description, workflow steps, output format — identical
-///   across all tasks of the same type. Highest cache hit rate.
+///   across all tasks of the same type. **Must not contain per-call data** (issue numbers,
+///   triage output, etc.) to maximize cache hit rate.
 /// - `context`: Project-level configuration (git config, rules, sibling tasks) — stable
-///   within a session but varies per project.
+///   within a session but varies per project. Wrapped with [`wrap_system_context`].
 /// - `dynamic_payload`: Issue body, PR diff, review comments — unique per invocation.
-///
-/// Call [`to_prompt_string`](PromptParts::to_prompt_string) to concatenate all parts into
-/// the final prompt string. The result is identical to what the previous `String`-returning
-/// functions produced.
 pub struct PromptParts {
     /// Role description, workflow steps, and output format — same for all tasks of this type.
+    /// **Do not embed dynamic data** (issue numbers, triage output) here.
     pub static_instructions: String,
     /// Project conventions, git config, sibling task warnings, rules — semi-static per session.
     pub context: String,
@@ -27,16 +46,44 @@ pub struct PromptParts {
 }
 
 impl PromptParts {
-    /// Concatenate all three layers into the final prompt string.
+    /// Concatenate all three layers with a dynamic boundary marker.
     ///
-    /// The output is identical to the `String` that was previously returned directly by
-    /// the prompt-building function. Callers that previously stored the return value as a
-    /// `String` should call this method to obtain it.
+    /// Layout: `static_instructions` + BOUNDARY + `context` + `dynamic_payload`
+    ///
+    /// The boundary separates content that is identical across calls (cacheable)
+    /// from per-invocation content.
     pub fn to_prompt_string(&self) -> String {
-        format!(
-            "{}{}{}",
-            self.static_instructions, self.context, self.dynamic_payload
-        )
+        let has_dynamic = !self.context.is_empty() || !self.dynamic_payload.is_empty();
+        if has_dynamic {
+            format!(
+                "{}{}{}{}",
+                self.static_instructions,
+                SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+                self.context,
+                self.dynamic_payload
+            )
+        } else {
+            self.static_instructions.clone()
+        }
+    }
+}
+
+/// Trait for prompt components that can contribute their own documentation.
+///
+/// Inspired by Claude Code's `Tool.prompt()` pattern where each tool generates
+/// its own usage documentation dynamically. Implementors contribute a section
+/// to the assembled prompt.
+pub trait PromptContributor {
+    /// A short identifier for this section (used in cache keys and logging).
+    fn section_name(&self) -> &str;
+
+    /// Generate the prompt section content. Returns empty string if nothing to contribute.
+    fn prompt_section(&self) -> String;
+
+    /// Whether this section is cacheable across calls (static content).
+    /// Default: true. Override to false for sections with per-call dynamic data.
+    fn is_cacheable(&self) -> bool {
+        true
     }
 }
 
@@ -81,28 +128,34 @@ pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str, repo: &str
 /// - `TRIAGE=SKIP` — not worth doing, out of scope, or duplicate
 pub fn triage_prompt(issue: u64) -> PromptParts {
     PromptParts {
-        static_instructions: format!(
-            "You are a Tech Lead evaluating GitHub issue #{issue} before any code is written.\n\n\
-             Your job is to THINK before committing engineering effort. Read the issue carefully, then assess:\n\n\
-             1. **Complexity**: Is this trivial (typo, config, 1-file change), moderate (2-3 files, \
-             clear scope), or complex (4+ files, new API surface, architectural change)?\n\
-             2. **Clarity**: Are the requirements specific enough to implement without guessing? \
-             What assumptions would an engineer have to make?\n\
-             3. **Risk**: What could go wrong in production? Are there edge cases, \
-             backward compatibility concerns, or security implications?\n\
-             4. **Scope**: Does this issue try to do too much? Should it be split?\n\n\
-             Based on your assessment, choose ONE recommendation:\n\
-             - PROCEED — trivial/clear change, no planning needed, go straight to implementation\n\
-             - PROCEED_WITH_PLAN — non-trivial change that needs an implementation plan first\n\
-             - NEEDS_CLARIFICATION — issue is ambiguous; list the specific questions that must be answered\n\
-             - SKIP — not worth doing (explain why: duplicate, out of scope, or fundamentally flawed)\n\n\
-             Output format: Write your assessment (2-5 sentences), then on the second-to-last line print:\n\
-             COMPLEXITY=<low|medium|high> (low=typo/doc fix, medium=single-module change, high=cross-file refactor)\n\
-             Then on the LAST line print:\n\
-             TRIAGE=<recommendation>"
-        ),
+        // Static: role + workflow + rubric + output format. No per-call data here.
+        static_instructions: "\
+            You are a Tech Lead evaluating a GitHub issue before any code is written.\n\n\
+            Step 1: Read the target issue (number below) with `gh issue view <number>` and \
+            check for duplicates with `gh issue list --state all --search '<key terms>'`.\n\
+            Step 2: Skim the affected code area with Grep/Read to understand scope.\n\
+            Step 3: Assess these dimensions:\n\n\
+            1. **Complexity**: How many files/modules are affected?\n\
+            2. **Clarity**: Are requirements specific enough to implement without guessing?\n\
+            3. **Risk**: What could go wrong — edge cases, backward compatibility, security?\n\
+            4. **Scope**: Does this issue try to do too much? Should it be split?\n\
+            5. **Dependencies**: Are there cross-module or external dependencies?\n\n\
+            Step 4: Choose ONE recommendation using these decision rules:\n\
+            - PROCEED — complexity=low AND clarity=high AND risk=low (typo, config, 1-file <50 LOC)\n\
+            - PROCEED_WITH_PLAN — complexity>=medium OR risk>=medium OR scope needs split\n\
+            - NEEDS_CLARIFICATION — requirements ambiguous OR missing acceptance criteria\n\
+            - SKIP — duplicate of existing issue, out of scope, or effort >> value\n\n\
+            Complexity rubric:\n\
+            - low: typo fix, doc update, config change, 1 file <50 LOC\n\
+            - medium: 2-3 files, clear scope, no new API surface\n\
+            - high: 4+ files, new endpoint, DB migration, cross-module refactor\n\n\
+            IMPORTANT: Your output MUST end with exactly these two lines and nothing after them:\n\
+            COMPLEXITY=<low|medium|high>\n\
+            TRIAGE=<PROCEED|PROCEED_WITH_PLAN|NEEDS_CLARIFICATION|SKIP>"
+            .to_string(),
         context: String::new(),
-        dynamic_payload: String::new(),
+        // Dynamic: per-call target issue number.
+        dynamic_payload: format!("\nTarget: GitHub issue #{issue}"),
     }
 }
 
@@ -110,25 +163,28 @@ pub fn triage_prompt(issue: u64) -> PromptParts {
 ///
 /// Takes the triage output as context. Outputs `PLAN=READY` on the last line.
 pub fn plan_prompt(issue: u64, triage_assessment: &str) -> PromptParts {
-    let safe_triage = wrap_external_data(triage_assessment);
+    let safe_triage = wrap_system_context(triage_assessment);
     PromptParts {
-        static_instructions: format!(
-            "You are a Software Architect designing the implementation plan for GitHub issue #{issue}.\n\n\
-             A Tech Lead already assessed this issue and recommended it needs a plan:\n\
-             {safe_triage}\n\n\
-             Create a concise implementation plan:\n\n\
-             1. **Files to modify** — list each file with a one-line rationale\n\
-             2. **Files to create** — only if truly needed (prefer modifying existing files)\n\
-             3. **Key changes** — the 2-3 most important code changes (function signatures, \
-             types, data flow)\n\
-             4. **Test plan** — what to test, key edge cases, expected test count\n\
-             5. **Risks** — what could go wrong, how to mitigate\n\n\
-             Keep the plan actionable. An engineer should be able to follow it without asking questions.\n\
-             Do NOT write any code — only describe what to do.\n\n\
-             On the LAST line, print: PLAN=READY"
-        ),
-        context: String::new(),
-        dynamic_payload: String::new(),
+        // Static: role + plan structure + output format.
+        static_instructions: "\
+            You are a Software Architect designing an implementation plan.\n\n\
+            A Tech Lead already assessed the target issue and recommended it needs a plan.\n\
+            Their assessment is provided below.\n\n\
+            Create a concise implementation plan:\n\n\
+            1. **Files to modify** — list each file with a one-line rationale\n\
+            2. **Files to create** — only if truly needed (prefer modifying existing files)\n\
+            3. **Key changes** — the 2-3 most important code changes (function signatures, \
+            types, data flow)\n\
+            4. **Test plan** — what to test, key edge cases, expected test count\n\
+            5. **Risks** — what could go wrong, how to mitigate\n\n\
+            Keep the plan actionable. An engineer should be able to follow it without asking questions.\n\
+            Do NOT write any code — only describe what to do.\n\n\
+            On the LAST line, print: PLAN=READY"
+            .to_string(),
+        // Context: triage assessment from the previous pipeline phase (system-generated).
+        context: format!("\nTriage assessment:\n{safe_triage}\n"),
+        // Dynamic: target issue number.
+        dynamic_payload: format!("\nTarget: GitHub issue #{issue}"),
     }
 }
 
@@ -230,6 +286,19 @@ pub fn check_existing_pr(
 pub fn wrap_external_data(content: &str) -> String {
     let escaped = content.replace("</external_data>", "<\\/external_data>");
     format!("<external_data>\n{}\n</external_data>", escaped)
+}
+
+/// Wrap system-generated context in `<system-reminder>` tags.
+///
+/// Inspired by Claude Code's injection defense pattern. Content wrapped in these
+/// tags is treated as authoritative system information, distinct from both user
+/// input and untrusted external data (`<external_data>`).
+///
+/// Use for: triage assessments passed to plan phase, plan output passed to
+/// implement phase, project metadata, constraint sets.
+pub fn wrap_system_context(content: &str) -> String {
+    let escaped = content.replace("</system-reminder>", "<\\/system-reminder>");
+    format!("<system-reminder>\n{}\n</system-reminder>", escaped)
 }
 
 /// Build a git instruction line from optional GitConfig.
@@ -855,7 +924,7 @@ pub enum TriageDecision {
 pub fn parse_triage(output: &str) -> Option<TriageDecision> {
     let last = last_non_empty_line(output)?;
     let value = last.strip_prefix("TRIAGE=")?;
-    match value.trim() {
+    match value.trim().to_ascii_uppercase().as_str() {
         "PROCEED" => Some(TriageDecision::Proceed),
         "PROCEED_WITH_PLAN" => Some(TriageDecision::ProceedWithPlan),
         "NEEDS_CLARIFICATION" => Some(TriageDecision::NeedsClarification),
@@ -1851,6 +1920,26 @@ PR_URL=https://github.com/owner/repo/pull/269";
         assert_eq!(
             parse_triage("Not worth it.\nTRIAGE=SKIP"),
             Some(TriageDecision::Skip)
+        );
+    }
+
+    #[test]
+    fn test_parse_triage_case_insensitive() {
+        assert_eq!(
+            parse_triage("done\nTRIAGE=proceed"),
+            Some(TriageDecision::Proceed)
+        );
+        assert_eq!(
+            parse_triage("done\nTRIAGE=Proceed_With_Plan"),
+            Some(TriageDecision::ProceedWithPlan)
+        );
+        assert_eq!(
+            parse_triage("done\nTRIAGE=skip"),
+            Some(TriageDecision::Skip)
+        );
+        assert_eq!(
+            parse_triage("done\nTRIAGE=Needs_Clarification"),
+            Some(TriageDecision::NeedsClarification)
         );
     }
 

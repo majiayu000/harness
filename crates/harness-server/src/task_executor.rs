@@ -621,6 +621,12 @@ async fn run_triage_plan_pipeline(
         project_root: project.to_path_buf(),
         env_vars: cargo_env.clone(),
         execution_phase: Some(ExecutionPhase::Planning),
+        allowed_tools: Some(vec![
+            "Read".into(),
+            "Glob".into(),
+            "Grep".into(),
+            "Bash".into(),
+        ]),
         ..Default::default()
     };
 
@@ -858,7 +864,7 @@ pub(crate) async fn run_task(
     let (triage_default_rounds, skip_agent_review) = match triage_complexity {
         prompts::TriageComplexity::Low => (2u32, false),
         prompts::TriageComplexity::Medium => (8u32, false),
-        prompts::TriageComplexity::High => (8u32, false),
+        prompts::TriageComplexity::High => (12u32, false),
     };
     let effective_max_rounds = req.max_rounds.unwrap_or(triage_default_rounds);
     // max_turns: per-request override wins; global config is the fallback.
