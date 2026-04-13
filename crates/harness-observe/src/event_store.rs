@@ -121,7 +121,7 @@ impl EventStore {
             let result = sqlx::query(
                 "DELETE FROM events WHERE id IN (
                     SELECT id FROM events
-                    WHERE ts < ? AND hook NOT LIKE 'periodic_review:%'
+                    WHERE ts < ? AND hook NOT GLOB 'periodic_review:*'
                     LIMIT 500
                 )",
             )
@@ -143,7 +143,7 @@ impl EventStore {
             let result = sqlx::query(
                 "DELETE FROM events WHERE id IN (
                     SELECT e.id FROM events e
-                    WHERE e.hook LIKE 'periodic_review:%'
+                    WHERE e.hook GLOB 'periodic_review:*'
                     AND e.ts < (
                         SELECT MAX(e2.ts) FROM events e2 WHERE e2.hook = e.hook
                     )
