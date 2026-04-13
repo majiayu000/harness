@@ -209,18 +209,28 @@ impl AgentAdapter for CodexAdapter {
         let mut lines = reader.lines();
         let mut thread_id: Option<String> = None;
 
-        for _ in 0..2 {
-            if let Ok(Some(line)) = lines.next_line().await {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(id) = value
-                        .get("result")
-                        .and_then(|result| result.get("thread"))
-                        .and_then(|thread| thread.get("id"))
-                        .and_then(|id| id.as_str())
-                    {
-                        thread_id = Some(id.to_string());
+        // Loop until we find the thread/start response containing the thread id.
+        // codex app-server may emit intermediate notifications (e.g. thread/started)
+        // before the RPC response, so a fixed read count can miss the id.
+        let mut init_lines_read = 0u32;
+        const MAX_INIT_LINES: u32 = 20;
+        while thread_id.is_none() && init_lines_read < MAX_INIT_LINES {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    init_lines_read += 1;
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if let Some(id) = value
+                            .get("result")
+                            .and_then(|result| result.get("thread"))
+                            .and_then(|thread| thread.get("id"))
+                            .and_then(|id| id.as_str())
+                        {
+                            thread_id = Some(id.to_string());
+                        }
                     }
                 }
+                Ok(None) => break,
+                Err(_) => break,
             }
         }
 
@@ -231,7 +241,7 @@ impl AgentAdapter for CodexAdapter {
                 "codex thread/start did not return thread id".into(),
             )
         })?;
-        Self::send_request(
+        let turn_start_id = Self::send_request(
             &mut state,
             "turn/start",
             json!({
@@ -242,8 +252,27 @@ impl AgentAdapter for CodexAdapter {
         )
         .await?;
 
-        if let Ok(Some(_line)) = lines.next_line().await {
-            // Consume turn/start response before notifications.
+        // Consume lines until we see the RPC response for turn/start (matched by id).
+        // An unconditional single-line drop can lose early notifications that arrive
+        // before the turn/start ACK when JSON-RPC traffic is interleaved.
+        let mut turn_start_acked = false;
+        let mut ack_lines_read = 0u32;
+        const MAX_ACK_LINES: u32 = 20;
+        while !turn_start_acked && ack_lines_read < MAX_ACK_LINES {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    ack_lines_read += 1;
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if value.get("id").and_then(|v| v.as_u64()) == Some(turn_start_id) {
+                            turn_start_acked = true;
+                        }
+                        // Notifications arriving before the ack are intentionally skipped;
+                        // the main event loop below handles all subsequent notifications.
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
         }
 
         drop(state);
