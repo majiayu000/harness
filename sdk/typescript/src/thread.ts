@@ -270,11 +270,15 @@ function parseTurnItem(value: unknown): TurnItem | undefined {
         output: value.output,
       };
     case "approval_request": {
-      if (typeof value.action !== "string") {
+      if (
+        (typeof value.id !== "string" && typeof value.id !== "undefined") ||
+        typeof value.action !== "string"
+      ) {
         return undefined;
       }
       return {
         type: "approval_request",
+        ...(typeof value.id === "string" ? { id: value.id } : {}),
         action: value.action,
         ...(typeof value.approved === "boolean" || value.approved === null
           ? { approved: value.approved }

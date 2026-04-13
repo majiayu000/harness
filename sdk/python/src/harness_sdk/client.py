@@ -233,6 +233,7 @@ class HarnessThread:
                     {
                         "thread_id": self.id,
                         "turn_id": turn_id,
+                        "timeout_ms": int(timeout * 1000),
                         "timeout_seconds": timeout,
                         "source": "sdk-poll",
                         "server_method": "turn/status",
@@ -288,6 +289,7 @@ class HarnessThread:
                     {
                         "thread_id": self.id,
                         "turn_id": turn_id,
+                        "timeout_ms": int(timeout * 1000),
                         "timeout_seconds": timeout,
                         "source": "sdk-poll",
                         "server_method": "turn/status",
