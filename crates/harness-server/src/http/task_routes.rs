@@ -86,13 +86,13 @@ async fn check_duplicate(
 ///
 /// This is the second dedup layer — it catches cases where the first batch completed
 /// (task is Done + pr_url set) but a re-submission would create a duplicate PR.
-async fn check_pr_duplicate(
+fn check_pr_duplicate(
     tasks: &Arc<crate::task_runner::TaskStore>,
     project_id: &str,
     req: &task_runner::CreateTaskRequest,
 ) -> Option<task_runner::TaskId> {
     let ext_id = req.external_id.as_deref()?;
-    let (existing_id, pr_url) = tasks.find_terminal_pr_duplicate(project_id, ext_id).await?;
+    let (existing_id, pr_url) = tasks.find_terminal_pr_duplicate(project_id, ext_id)?;
     tracing::info!(
         existing_task = %existing_id.0,
         external_id = %ext_id,
@@ -154,7 +154,7 @@ pub(crate) async fn enqueue_task(
     if let Some(existing_id) = check_duplicate(&state.core.tasks, &project_id, &req).await {
         return Ok(existing_id);
     }
-    if let Some(existing_id) = check_pr_duplicate(&state.core.tasks, &project_id, &req).await {
+    if let Some(existing_id) = check_pr_duplicate(&state.core.tasks, &project_id, &req) {
         return Ok(existing_id);
     }
 
@@ -364,7 +364,7 @@ async fn enqueue_task_background(
     if let Some(existing_id) = check_duplicate(&state.core.tasks, &project_id, &req).await {
         return Ok(existing_id);
     }
-    if let Some(existing_id) = check_pr_duplicate(&state.core.tasks, &project_id, &req).await {
+    if let Some(existing_id) = check_pr_duplicate(&state.core.tasks, &project_id, &req) {
         return Ok(existing_id);
     }
 

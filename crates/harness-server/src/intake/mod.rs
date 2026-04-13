@@ -443,7 +443,19 @@ async fn run_repo_sprint(
         tokio::time::sleep(TASK_POLL_INTERVAL).await;
         let mut newly_done = Vec::new();
         for (&issue_num, task_id) in &running {
-            if let Some(task) = state.core.tasks.get(task_id) {
+            // Use DB fallback so that terminal tasks returned by the dedup
+            // layer (not in cache after a restart) are still detected as done
+            // and do not occupy a running slot indefinitely.
+            let task_opt = state
+                .core
+                .tasks
+                .get_with_db_fallback(task_id)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(task_id = %task_id.0, "intake: DB lookup error during poll: {e}");
+                    None
+                });
+            if let Some(task) = task_opt {
                 if matches!(task.status, TaskStatus::Done | TaskStatus::Failed) {
                     tracing::info!(
                         repo,

@@ -780,15 +780,20 @@ impl TaskStore {
     /// Check whether a terminal (`Done`) task already exists for the same
     /// project + external_id and has a `pr_url` set.
     ///
-    /// Returns `(TaskId, pr_url)` when found. Cache-first, DB fallback.
-    /// Fail-open: DB errors produce a `warn` log and return `None` so the
-    /// caller creates a new task rather than silently dropping it.
-    pub async fn find_terminal_pr_duplicate(
+    /// Returns `(TaskId, pr_url)` when found. Cache scan only — no DB fallback.
+    ///
+    /// Intentionally omits the DB fallback: terminal tasks evicted from cache
+    /// (e.g. after a server restart or from a previous session) must not block
+    /// re-dispatch indefinitely.  A reopened GitHub issue or a task whose
+    /// prior PR was closed without merge should always be allowed to create
+    /// new work.  The intake's persistent `dispatched` map is the correct
+    /// cross-session guard for GitHub-originated tasks; the DB-level block was
+    /// over-broad and caused a production regression.
+    pub fn find_terminal_pr_duplicate(
         &self,
         project_id: &str,
         external_id: &str,
     ) -> Option<(TaskId, String)> {
-        // Cache scan: look for a Done task with matching key and pr_url set.
         for entry in self.cache.iter() {
             let task = entry.value();
             let same_key = task.external_id.as_deref() == Some(external_id)
@@ -803,15 +808,7 @@ impl TaskStore {
                 }
             }
         }
-        // DB fallback: Done tasks are evicted from cache after completion.
-        match self.db.find_terminal_with_pr(project_id, external_id).await {
-            Ok(Some((id, url))) => Some((harness_core::types::TaskId(id), url)),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!("dedup: terminal PR DB lookup failed: {e}");
-                None
-            }
-        }
+        None
     }
 
     /// Return all tasks currently in the in-memory cache.
