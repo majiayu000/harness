@@ -111,8 +111,10 @@ static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 13,
         description: "add description and phase columns to tasks",
-        sql: "ALTER TABLE tasks ADD COLUMN description TEXT;
-              ALTER TABLE tasks ADD COLUMN phase TEXT NOT NULL DEFAULT 'implement'",
+        sql: "ALTER TABLE tasks ADD COLUMN description TEXT; \
+              ALTER TABLE tasks ADD COLUMN phase TEXT NOT NULL DEFAULT 'implement'; \
+              UPDATE tasks SET phase = 'terminal' WHERE status IN ('done', 'failed', 'cancelled'); \
+              UPDATE tasks SET phase = 'review' WHERE status IN ('agent_review', 'reviewing', 'waiting')",
     },
 ];
 
