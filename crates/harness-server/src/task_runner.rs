@@ -337,17 +337,17 @@ impl Default for CreateTaskRequest {
 }
 
 fn summarize_request_description(req: &CreateTaskRequest) -> Option<String> {
-    req.issue.map(|n| format!("issue #{n}")).or_else(|| {
-        req.prompt.as_ref().map(|p| {
-            let s = p.trim();
-            let cutoff = s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len());
-            if cutoff < s.len() {
-                format!("{}...", &s[..cutoff])
-            } else {
-                s.to_string()
-            }
-        })
-    })
+    // Only persist structured safe labels (issue/PR IDs).
+    // Prompt text is deliberately excluded: it may contain credentials or customer
+    // data that must not be durably stored or exposed cross-task via the dashboard
+    // or sibling-awareness prompts.
+    if let Some(n) = req.issue {
+        return Some(format!("issue #{n}"));
+    }
+    if let Some(n) = req.pr {
+        return Some(format!("PR #{n}"));
+    }
+    None
 }
 
 pub(crate) async fn fill_missing_repo_from_project(req: &mut CreateTaskRequest) {
