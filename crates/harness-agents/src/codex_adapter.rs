@@ -23,6 +23,8 @@ struct AdapterState {
     child: Option<tokio::process::Child>,
     stdin: Option<tokio::process::ChildStdin>,
     next_id: u64,
+    /// Thread ID returned by `thread/start`; required for subsequent `turn/start` calls.
+    thread_id: Option<String>,
 }
 
 impl AdapterState {
@@ -31,6 +33,7 @@ impl AdapterState {
             child: None,
             stdin: None,
             next_id: 1,
+            thread_id: None,
         }
     }
 
@@ -158,23 +161,51 @@ impl AgentAdapter for CodexAdapter {
             })?;
             state.child = Some(child);
 
-            // Initialize handshake
+            // Step 1: initialize
             Self::send_request(&mut state, "initialize", json!({})).await?;
 
-            // Read initialize response (blocking on first line)
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = reader.lines();
 
-            // Read init response
+            // Read initialize response
             if let Ok(Some(line)) = lines.next_line().await {
                 tracing::debug!(line = %line, "codex initialize response");
             }
 
-            // Send initialized notification
+            // Step 2: initialized notification
             Self::send_notification(&mut state, "initialized").await?;
 
-            // Send turn/start
-            Self::send_request(&mut state, "turn/start", json!({ "text": req.prompt })).await?;
+            // Step 3: thread/start — must complete before any turn/start
+            Self::send_request(
+                &mut state,
+                "thread/start",
+                json!({ "workdir": req.project_root.to_string_lossy() }),
+            )
+            .await?;
+
+            let thread_id = if let Ok(Some(line)) = lines.next_line().await {
+                tracing::debug!(line = %line, "codex thread/start response");
+                serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("result")
+                            .and_then(|r| r.get("id"))
+                            .and_then(|id| id.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            state.thread_id = Some(thread_id.clone());
+
+            // Step 4: turn/start with thread_id
+            let turn_params = if thread_id.is_empty() {
+                json!({ "text": req.prompt })
+            } else {
+                json!({ "thread_id": thread_id, "text": req.prompt })
+            };
+            Self::send_request(&mut state, "turn/start", turn_params).await?;
 
             // Release lock before reading event stream
             drop(state);
@@ -183,8 +214,12 @@ impl AgentAdapter for CodexAdapter {
                 return Ok(());
             }
 
-            // Read event stream until turn completes
+            // Read event stream until turn completes or error.
+            // Track whether a terminal turn/completed event was received.
+            // If the process disconnects (EOF) without sending it, that is an
+            // execution failure — not a success.
             let mut output_buf = String::new();
+            let mut turn_completed_received = false;
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.trim().is_empty() {
                     continue;
@@ -198,6 +233,10 @@ impl AgentAdapter for CodexAdapter {
                     let is_turn_completed = matches!(event, AgentEvent::TurnCompleted { .. });
                     let is_error = matches!(event, AgentEvent::Error { .. });
 
+                    if is_turn_completed {
+                        turn_completed_received = true;
+                    }
+
                     if tx.send(event).await.is_err() {
                         break;
                     }
@@ -207,9 +246,33 @@ impl AgentAdapter for CodexAdapter {
                     }
                 }
             }
+
+            // EOF without a terminal turn/completed means the codex process
+            // crashed or disconnected mid-turn — surface this as an error
+            // instead of silently recording a successful (possibly empty) turn.
+            if !turn_completed_received {
+                tracing::error!(
+                    output_so_far = %output_buf,
+                    "codex disconnected before turn/completed — treating as execution failure"
+                );
+                let _ = tx
+                    .send(AgentEvent::Error {
+                        message: "codex process disconnected before turn/completed".into(),
+                    })
+                    .await;
+                return Err(harness_core::error::HarnessError::AgentExecution(
+                    "codex process disconnected before turn/completed".into(),
+                ));
+            }
         } else {
-            // Already running — just send a new turn
-            Self::send_request(&mut state, "turn/start", json!({ "text": req.prompt })).await?;
+            // Already running — send a new turn using the stored thread_id
+            let thread_id = state.thread_id.clone().unwrap_or_default();
+            let turn_params = if thread_id.is_empty() {
+                json!({ "text": req.prompt })
+            } else {
+                json!({ "thread_id": thread_id, "text": req.prompt })
+            };
+            Self::send_request(&mut state, "turn/start", turn_params).await?;
             drop(state);
 
             if let Err(e) = tx.send(AgentEvent::TurnStarted).await {
@@ -326,37 +389,117 @@ fn parse_notification(method: &str, params: &serde_json::Value) -> Option<AgentE
             Some(AgentEvent::ItemStarted { item_type })
         }
         "message/delta" | "message_delta" => {
+            // Current protocol: params.delta.text
+            // Legacy protocol: params.text
             let text = params
-                .get("text")
+                .get("delta")
+                .and_then(|d| d.get("text"))
                 .and_then(|t| t.as_str())
+                .or_else(|| params.get("text").and_then(|t| t.as_str()))
                 .unwrap_or("")
                 .to_string();
             Some(AgentEvent::MessageDelta { text })
         }
         "item/completed" | "item_completed" => Some(AgentEvent::ItemCompleted),
         "turn/completed" | "turn_completed" => {
-            let output = params
-                .get("output")
-                .and_then(|o| o.as_str())
-                .unwrap_or("")
-                .to_string();
+            let output = assemble_turn_output(params);
             Some(AgentEvent::TurnCompleted { output })
         }
         "approval/request" | "approval_request" => {
-            let id = params
-                .get("id")
-                .and_then(|i| i.as_str())
-                .unwrap_or("")
-                .to_string();
-            let command = params
-                .get("command")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
+            let (id, command) = extract_approval_fields(params);
             Some(AgentEvent::ApprovalRequest { id, command })
+        }
+        // Rich item events: tool calls emitted as named tool invocations
+        "tool/call" | "tool_call" => {
+            let name = params
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let input = params
+                .get("input")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            Some(AgentEvent::ToolCall { name, input })
         }
         _ => None,
     }
+}
+
+/// Assemble a turn's text output from a `turn/completed` params object.
+///
+/// Current protocol: `params.items` is an array of output items; message items
+/// carry content blocks with `text` fields.
+/// Legacy protocol: `params.output` is a plain string.
+fn assemble_turn_output(params: &serde_json::Value) -> String {
+    if let Some(items) = params.get("items").and_then(|i| i.as_array()) {
+        let parts: Vec<String> = items
+            .iter()
+            .filter_map(|item| {
+                let item_type = item.get("type").and_then(|t| t.as_str())?;
+                if item_type == "message" {
+                    item.get("content")
+                        .and_then(|c| c.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|block| block.get("text"))
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !parts.is_empty() {
+            return parts.join("\n");
+        }
+    }
+    // Legacy fallback
+    params
+        .get("output")
+        .and_then(|o| o.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Extract `(id, command)` from an `approval/request` params object.
+///
+/// Current protocol: fields nested under `params.request`.
+/// Command may be an array of strings (argv) or a plain string.
+/// Legacy protocol: `params.id` and `params.command` at the top level.
+fn extract_approval_fields(params: &serde_json::Value) -> (String, String) {
+    if let Some(req_obj) = params.get("request") {
+        let id = req_obj
+            .get("id")
+            .and_then(|i| i.as_str())
+            .unwrap_or("")
+            .to_string();
+        let command = req_obj
+            .get("command")
+            .map(|c| {
+                if let Some(arr) = c.as_array() {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    c.as_str().unwrap_or("").to_string()
+                }
+            })
+            .unwrap_or_default();
+        return (id, command);
+    }
+    // Legacy fallback
+    let id = params
+        .get("id")
+        .and_then(|i| i.as_str())
+        .unwrap_or("")
+        .to_string();
+    let command = params
+        .get("command")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    (id, command)
 }
 
 #[cfg(test)]
@@ -380,13 +523,26 @@ mod tests {
         }
     }
 
+    // Legacy shape: params.text
     #[test]
-    fn parse_message_delta_notification() {
+    fn parse_message_delta_legacy_shape() {
         let line =
             r#"{"jsonrpc":"2.0","method":"message/delta","params":{"text":"Let me check..."}}"#;
         let event = parse_codex_message(line).unwrap();
         match event {
             AgentEvent::MessageDelta { text } => assert_eq!(text, "Let me check..."),
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+    }
+
+    // Current shape: params.delta.text
+    #[test]
+    fn parse_message_delta_current_shape() {
+        let line =
+            r#"{"jsonrpc":"2.0","method":"message/delta","params":{"delta":{"text":"Hello"}}}"#;
+        let event = parse_codex_message(line).unwrap();
+        match event {
+            AgentEvent::MessageDelta { text } => assert_eq!(text, "Hello"),
             other => panic!("expected MessageDelta, got {other:?}"),
         }
     }
@@ -398,8 +554,9 @@ mod tests {
         assert!(matches!(event, AgentEvent::ItemCompleted));
     }
 
+    // Legacy shape: params.output string
     #[test]
-    fn parse_turn_completed_notification() {
+    fn parse_turn_completed_legacy_shape() {
         let line =
             r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"output":"Bug fixed."}}"#;
         let event = parse_codex_message(line).unwrap();
@@ -409,8 +566,20 @@ mod tests {
         }
     }
 
+    // Current shape: params.items array of message items
     #[test]
-    fn parse_approval_request_notification() {
+    fn parse_turn_completed_items_shape() {
+        let line = r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"items":[{"type":"message","content":[{"type":"text","text":"All done."}]}]}}"#;
+        let event = parse_codex_message(line).unwrap();
+        match event {
+            AgentEvent::TurnCompleted { output } => assert_eq!(output, "All done."),
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
+
+    // Legacy shape: params.id and params.command at top level
+    #[test]
+    fn parse_approval_request_legacy_shape() {
         let line = r#"{"jsonrpc":"2.0","method":"approval/request","params":{"id":"req-42","command":"rm -rf /tmp/test"}}"#;
         let event = parse_codex_message(line).unwrap();
         match event {
@@ -419,6 +588,47 @@ mod tests {
                 assert_eq!(command, "rm -rf /tmp/test");
             }
             other => panic!("expected ApprovalRequest, got {other:?}"),
+        }
+    }
+
+    // Current shape: params.request.{id, command} with command as argv array
+    #[test]
+    fn parse_approval_request_current_shape() {
+        let line = r#"{"jsonrpc":"2.0","method":"approval/request","params":{"request":{"id":"req-7","command":["git","push","origin","main"]}}}"#;
+        let event = parse_codex_message(line).unwrap();
+        match event {
+            AgentEvent::ApprovalRequest { id, command } => {
+                assert_eq!(id, "req-7");
+                assert_eq!(command, "git push origin main");
+            }
+            other => panic!("expected ApprovalRequest, got {other:?}"),
+        }
+    }
+
+    // Current shape: params.request.command as plain string
+    #[test]
+    fn parse_approval_request_current_shape_string_command() {
+        let line = r#"{"jsonrpc":"2.0","method":"approval/request","params":{"request":{"id":"req-8","command":"cargo test"}}}"#;
+        let event = parse_codex_message(line).unwrap();
+        match event {
+            AgentEvent::ApprovalRequest { id, command } => {
+                assert_eq!(id, "req-8");
+                assert_eq!(command, "cargo test");
+            }
+            other => panic!("expected ApprovalRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_call_notification() {
+        let line = r#"{"jsonrpc":"2.0","method":"tool/call","params":{"name":"bash","input":{"cmd":"ls -la"}}}"#;
+        let event = parse_codex_message(line).unwrap();
+        match event {
+            AgentEvent::ToolCall { name, input } => {
+                assert_eq!(name, "bash");
+                assert_eq!(input["cmd"], "ls -la");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
         }
     }
 
@@ -462,5 +672,31 @@ mod tests {
     async fn interrupt_noop_when_no_child() {
         let adapter = CodexAdapter::new(PathBuf::from("codex"));
         adapter.interrupt().await.unwrap();
+    }
+
+    #[test]
+    fn assemble_turn_output_prefers_items_over_output() {
+        let params = serde_json::json!({
+            "output": "legacy",
+            "items": [{"type": "message", "content": [{"type": "text", "text": "current"}]}]
+        });
+        assert_eq!(assemble_turn_output(&params), "current");
+    }
+
+    #[test]
+    fn assemble_turn_output_falls_back_to_output_field() {
+        let params = serde_json::json!({ "output": "fallback" });
+        assert_eq!(assemble_turn_output(&params), "fallback");
+    }
+
+    #[test]
+    fn assemble_turn_output_skips_non_message_items() {
+        let params = serde_json::json!({
+            "items": [
+                {"type": "tool_call", "name": "bash"},
+                {"type": "message", "content": [{"type": "text", "text": "done"}]}
+            ]
+        });
+        assert_eq!(assemble_turn_output(&params), "done");
     }
 }
