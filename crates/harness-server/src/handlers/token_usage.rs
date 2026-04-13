@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::http::AppState;
+use crate::task_runner::TaskStatus;
 
 /// Cached result of the last full JSONL cost scan with its expiry time.
 struct CostStatsCache {
@@ -491,9 +492,19 @@ async fn load_cost_stats_uncached(state: &Arc<crate::http::AppState>) -> (f64, f
     // Fetch known task IDs via async DB query before entering the blocking section.
     // list_all_statuses_with_terminal is lighter than list_all_summaries_with_terminal
     // because it only deserializes IDs and status strings, not full dependency lists.
+    //
+    // Only include Done tasks: in-flight (Implementing, Reviewing, …) and Failed/
+    // Cancelled tasks must be excluded so that cost_total_usd / avg_cost_per_task_usd
+    // reflect completed work only, matching the dashboard contract ("null when no
+    // completed tasks exist yet").  Including partial or failed sessions would cause
+    // the metric to fluctuate as tasks progress, contradicting its definition.
     let task_ids: std::collections::HashSet<String> =
         match state.core.tasks.list_all_statuses_with_terminal().await {
-            Ok(statuses) => statuses.into_keys().map(|id| id.0).collect(),
+            Ok(statuses) => statuses
+                .into_iter()
+                .filter(|(_, status)| matches!(status, TaskStatus::Done))
+                .map(|(id, _)| id.0)
+                .collect(),
             Err(_) => return (0.0, 0.0),
         };
 

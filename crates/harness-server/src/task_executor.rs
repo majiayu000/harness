@@ -487,12 +487,15 @@ async fn run_agent_streaming(
                             StreamItem::ItemCompleted {
                                 item: Item::AgentReasoning { content },
                             } => {
-                                // Also capture first-token timestamp for backends that emit
-                                // ItemCompleted directly without MessageDelta chunks
-                                // (e.g. AnthropicApiAgent).
-                                if first_output_at.is_none() {
-                                    first_output_at = Some(Utc::now().to_rfc3339());
-                                }
+                                // Do NOT set first_output_at here: backends that emit
+                                // ItemCompleted without any prior MessageDelta (e.g.
+                                // AnthropicApiAgent) only produce this event after the
+                                // entire blocking execute() call returns, so recording
+                                // it as first-token latency would measure full-turn
+                                // completion time instead.  first_output_at is only
+                                // meaningful for genuinely streaming backends (set in
+                                // the MessageDelta arm above).
+                                //
                                 // Prefer the full content over accumulated deltas.
                                 output = content.clone();
                             }
