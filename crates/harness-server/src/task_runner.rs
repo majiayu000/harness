@@ -175,8 +175,8 @@ pub struct TaskState {
     pub issue: Option<u64>,
     /// Repository slug (e.g. "owner/repo"). Persisted for traceability.
     pub repo: Option<String>,
-    /// Short description derived from the task prompt or issue number. Set at spawn time; not persisted.
-    #[serde(skip)]
+    /// Short description derived from the task prompt or issue number.
+    #[serde(default)]
     pub description: Option<String>,
     /// ISO 8601 creation timestamp. Set at spawn time and persisted to the tasks DB.
     #[serde(default)]
@@ -377,17 +377,22 @@ impl Default for CreateTaskRequest {
 }
 
 fn summarize_request_description(req: &CreateTaskRequest) -> Option<String> {
-    req.issue.map(|n| format!("issue #{n}")).or_else(|| {
-        req.prompt.as_ref().map(|p| {
-            let s = p.trim();
-            let cutoff = s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len());
-            if cutoff < s.len() {
-                format!("{}...", &s[..cutoff])
-            } else {
-                s.to_string()
-            }
-        })
-    })
+    // Only persist structured safe labels — never raw prompt text, which may contain
+    // credentials or customer data.
+    if let Some(n) = req.issue {
+        return Some(format!("issue #{n}"));
+    }
+    if let Some(n) = req.pr {
+        return Some(format!("PR #{n}"));
+    }
+    // Prompt-only tasks: store a generic label so that:
+    //   (a) sibling-awareness can include them (prevents parallel agents stomping the same files),
+    //   (b) operators can identify crashed tasks in the DB/dashboard after a restart.
+    // The prompt itself is deliberately not stored.
+    if req.prompt.is_some() {
+        return Some("prompt task".to_string());
+    }
+    None
 }
 
 pub(crate) async fn fill_missing_repo_from_project(req: &mut CreateTaskRequest) {
