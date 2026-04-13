@@ -48,16 +48,26 @@ impl PromptParts {
 pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str, repo: &str) -> String {
     format!(
         "GitHub issue #{issue} already has an open PR #{pr_number} on branch `{branch}`.\n\n\
+         IMPORTANT: Never run `git checkout` or `git stash` in the main repository working tree.\n\
+         All work must be done in an isolated worktree.\n\n\
          Steps:\n\
-         1. `git fetch origin {branch} && git checkout {branch}`\n\
+         1. Create an isolated worktree:\n\
+            ```\n\
+            git fetch origin {branch}\n\
+            git worktree prune\n\
+            git worktree add /tmp/harness-pr-{pr_number} {branch}\n\
+            ```\n\
          2. Read the PR diff and any review comments:\n\
             - `gh pr diff {pr_number}`\n\
             - `gh api repos/{repo}/pulls/{pr_number}/comments`\n\
             - `gh api repos/{repo}/pulls/{pr_number}/reviews`\n\
          3. Read the original issue requirements: `gh issue view {issue}`\n\
-         4. Fix any unresolved review comments and continue the implementation if incomplete\n\
-         5. Run `cargo check` and `cargo test`\n\
-         6. Commit and push to the SAME branch `{branch}` — do NOT create a new PR\n\n\
+         4. Fix any unresolved review comments and continue the implementation if incomplete.\n\
+            All editing must happen inside `/tmp/harness-pr-{pr_number}`.\n\
+         5. Run `cd /tmp/harness-pr-{pr_number} && cargo check && cargo test`\n\
+         6. Commit and push from the worktree to the SAME branch `{branch}` — do NOT create a new PR:\n\
+            `cd /tmp/harness-pr-{pr_number} && git push origin {branch}`\n\
+         7. Clean up: `git worktree remove /tmp/harness-pr-{pr_number}`\n\n\
          On the last line of your output, print PR_URL=https://github.com/{repo}/pull/{pr_number}"
     )
 }
@@ -348,6 +358,14 @@ pub fn review_prompt(
 
     format!(
         "{context}\
+         IMPORTANT: Never run `git checkout` or `git stash` in the main repository working tree.\n\
+         If you need to modify files, first create an isolated worktree:\n\
+           git fetch origin <branch>\n\
+           git worktree prune\n\
+           git worktree add /tmp/harness-review-{pr} <branch>\n\
+         Then do all editing, testing, and pushing from /tmp/harness-review-{pr},\n\
+         and remove it when done: git worktree remove /tmp/harness-review-{pr}\n\
+         (The branch name can be obtained with: gh pr view {pr} --json headRefName --jq .headRefName)\n\n\
          Steps:\n\
          1. Run `gh pr view {pr} --json statusCheckRollup` and parse the JSON. \
          CI passes only if the `state` field in the `statusCheckRollup` object is `SUCCESS`\n\
@@ -1082,6 +1100,10 @@ mod tests {
         assert!(p.contains("do NOT create a new PR"));
         assert!(p.contains("PR_URL=https://github.com/owner/repo/pull/50"));
         assert!(p.contains("repos/owner/repo/pulls/50/comments"));
+        // Worktree isolation: must use worktree, must not bare-checkout in main repo
+        assert!(p.contains("worktree add /tmp/harness-pr-50"));
+        assert!(p.contains("worktree remove /tmp/harness-pr-50"));
+        assert!(!p.contains("git checkout fix/issue-29"));
     }
 
     #[test]
@@ -1192,6 +1214,9 @@ mod tests {
         assert!(p.contains("issue #5"));
         assert!(p.contains("PR #10"));
         assert!(p.contains("medium")); // round 2 includes medium
+                                       // Worktree isolation: must prohibit git checkout in main repo
+        assert!(p.contains("Never run `git checkout`"));
+        assert!(p.contains("worktree add /tmp/harness-review-10"));
     }
 
     #[test]
