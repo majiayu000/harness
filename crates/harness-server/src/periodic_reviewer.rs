@@ -391,12 +391,14 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
                 }
             };
             // Respect explicit opt-out via `.harness/config.toml` [review] enabled = false.
-            // TODO(#617): add a separate `periodic_review_enabled` field to avoid dual-use
-            // of the PR-review `enabled` flag.
+            // Note: `review.enabled = false` disables both PR auto-review and periodic
+            // health checks.  Use debug level — this is a deliberate opt-out, not an error,
+            // and collect_projects() is called on every scheduler tick.
             if project_cfg.review.as_ref().and_then(|r| r.enabled) == Some(false) {
                 tracing::debug!(
                     project = %entry.name,
-                    "scheduler: project opted out of periodic review, skipping"
+                    "scheduler: `review.enabled = false` suppresses periodic health checks \
+                     in addition to PR auto-review; skipping project"
                 );
                 continue;
             }
@@ -473,7 +475,8 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
                     if opted_out {
                         tracing::debug!(
                             project = %proj.id,
-                            "scheduler: registry project opted out of periodic review, skipping"
+                            "scheduler: `review.enabled = false` suppresses periodic health checks \
+                             in addition to PR auto-review; skipping registry project"
                         );
                         continue;
                     }
@@ -539,7 +542,8 @@ async fn collect_projects(state: &Arc<AppState>) -> Vec<ProjectInfo> {
         if opted_out {
             tracing::debug!(
                 project = %project.name,
-                "scheduler: startup project opted out of periodic review, skipping"
+                "scheduler: `review.enabled = false` suppresses periodic health checks \
+                 in addition to PR auto-review; skipping startup project"
             );
             continue;
         }
