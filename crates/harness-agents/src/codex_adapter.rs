@@ -182,7 +182,7 @@ impl AgentAdapter for CodexAdapter {
         })?;
         state.child = Some(child);
 
-        Self::send_request(
+        let init_id = Self::send_request(
             &mut state,
             "initialize",
             json!({
@@ -194,7 +194,36 @@ impl AgentAdapter for CodexAdapter {
             }),
         )
         .await?;
-        Self::send_request(
+
+        let reader = tokio::io::BufReader::new(stdout);
+        let mut lines = reader.lines();
+
+        // Wait for the initialize response before sending `initialized`.
+        // Forward any intermediate notifications so no events are lost.
+        let mut init_acked = false;
+        while !init_acked {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if value.get("id").and_then(|v| v.as_u64()) == Some(init_id) {
+                            init_acked = true;
+                        }
+                    }
+                    if let Some(event) = parse_codex_message(&line) {
+                        if tx.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        // Correct handshake order: `initialized` must follow the initialize response
+        // and precede `thread/start` (per app-server protocol spec).
+        Self::send_notification(&mut state, "initialized").await?;
+
+        let thread_start_id = Self::send_request(
             &mut state,
             "thread/start",
             json!({
@@ -204,8 +233,6 @@ impl AgentAdapter for CodexAdapter {
         )
         .await?;
 
-        let reader = tokio::io::BufReader::new(stdout);
-        let mut lines = reader.lines();
         let mut thread_id: Option<String> = None;
 
         // Loop until we find the thread/start response containing the thread id.
@@ -215,24 +242,26 @@ impl AgentAdapter for CodexAdapter {
             match lines.next_line().await {
                 Ok(Some(line)) => {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                        if let Some(id) = value
-                            .get("result")
-                            .and_then(|result| result.get("thread"))
-                            .and_then(|thread| thread.get("id"))
-                            .and_then(|id| id.as_str())
-                        {
-                            thread_id = Some(id.to_string());
+                        if value.get("id").and_then(|v| v.as_u64()) == Some(thread_start_id) {
+                            if let Some(id) = value
+                                .get("result")
+                                .and_then(|result| result.get("thread"))
+                                .and_then(|thread| thread.get("id"))
+                                .and_then(|id| id.as_str())
+                            {
+                                thread_id = Some(id.to_string());
+                            }
                         }
                     }
                     if let Some(event) = parse_codex_message(&line) {
-                        let _ = tx.send(event).await;
+                        if tx.send(event).await.is_err() {
+                            break;
+                        }
                     }
                 }
                 Ok(None) | Err(_) => break,
             }
         }
-
-        Self::send_notification(&mut state, "initialized").await?;
 
         let thread_id = thread_id.ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(
@@ -262,7 +291,9 @@ impl AgentAdapter for CodexAdapter {
                         }
                     }
                     if let Some(event) = parse_codex_message(&line) {
-                        let _ = tx.send(event).await;
+                        if tx.send(event).await.is_err() {
+                            break;
+                        }
                     }
                 }
                 Ok(None) | Err(_) => break,
@@ -272,35 +303,50 @@ impl AgentAdapter for CodexAdapter {
         drop(state);
 
         let mut turn_started_sent = false;
-        while let Ok(Some(line)) = lines.next_line().await {
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            if let Some(event) = parse_codex_message(&line) {
-                if !turn_started_sent {
-                    if tx.send(AgentEvent::TurnStarted).await.is_err() {
-                        break;
+        let mut turn_terminal_seen = false;
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    if line.trim().is_empty() {
+                        continue;
                     }
-                    turn_started_sent = true;
-                }
 
-                let is_turn_completed = matches!(event, AgentEvent::TurnCompleted { .. });
-                let is_error = matches!(event, AgentEvent::Error { .. });
+                    if let Some(event) = parse_codex_message(&line) {
+                        if !turn_started_sent {
+                            if tx.send(AgentEvent::TurnStarted).await.is_err() {
+                                break;
+                            }
+                            turn_started_sent = true;
+                        }
 
-                if tx.send(event).await.is_err() {
-                    break;
-                }
+                        let is_turn_completed = matches!(event, AgentEvent::TurnCompleted { .. });
+                        let is_error = matches!(event, AgentEvent::Error { .. });
 
-                if is_turn_completed || is_error {
-                    break;
+                        if tx.send(event).await.is_err() {
+                            break;
+                        }
+
+                        if is_turn_completed || is_error {
+                            turn_terminal_seen = true;
+                            break;
+                        }
+                    }
                 }
+                Ok(None) | Err(_) => break,
             }
         }
 
         let mut state = self.state.lock().await;
         state.stdin = None;
         state.child = None;
+
+        if !turn_terminal_seen {
+            return Err(harness_core::error::HarnessError::AgentExecution(
+                "codex app-server stream ended without a terminal event (TurnCompleted or Error)"
+                    .into(),
+            ));
+        }
+
         Ok(())
     }
 
