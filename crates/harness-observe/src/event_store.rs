@@ -91,15 +91,22 @@ impl EventStore {
     ///
     /// Returns the number of rows deleted.  A `days` value of 0 is a no-op.
     ///
-    /// `periodic_review:*` events are intentionally excluded: they serve as
-    /// watermark cursors for the periodic reviewer and must survive even when
-    /// the retention window is shorter than the review cadence.  Deleting them
-    /// would cause the reviewer to fall back to epoch and re-review the entire
-    /// history.
+    /// Runs in two phases:
     ///
-    /// The delete runs in batches of 500 rows to avoid holding the SQLite
-    /// writer lock long enough to starve concurrent `log()` calls.  A 10 ms
-    /// yield between batches gives waiting writers a chance to proceed.
+    /// **Phase 1** — regular events: deletes rows older than the retention
+    /// window, excluding `periodic_review:*` hooks so that the watermark
+    /// cursors used by the periodic reviewer are not wiped by a short
+    /// retention window.
+    ///
+    /// **Phase 2** — watermark trimming: keeps only the single newest
+    /// `periodic_review:*` row per hook and deletes all older ones.  Without
+    /// this pass the watermark history grows without bound because Phase 1
+    /// spares every watermark row while the scheduler appends a fresh one on
+    /// every successful tick.
+    ///
+    /// Both phases run in batches of 500 rows with a 10 ms yield between
+    /// batches to avoid holding the SQLite writer lock long enough to starve
+    /// concurrent `log()` calls.
     pub async fn purge_old_events(&self, days: u32) -> anyhow::Result<u64> {
         if days == 0 {
             return Ok(0);
@@ -107,6 +114,9 @@ impl EventStore {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
         let cutoff_str = cutoff.to_rfc3339();
         let mut total_deleted: u64 = 0;
+
+        // Phase 1: delete regular (non-watermark) events older than the
+        // retention window.
         loop {
             let result = sqlx::query(
                 "DELETE FROM events WHERE id IN (
@@ -127,6 +137,29 @@ impl EventStore {
             // writer lock without hitting the 5 s busy_timeout.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+
+        // Phase 2: trim watermark history — keep only the newest row per hook.
+        loop {
+            let result = sqlx::query(
+                "DELETE FROM events WHERE id IN (
+                    SELECT e.id FROM events e
+                    WHERE e.hook LIKE 'periodic_review:%'
+                    AND e.ts < (
+                        SELECT MAX(e2.ts) FROM events e2 WHERE e2.hook = e.hook
+                    )
+                    LIMIT 500
+                )",
+            )
+            .execute(&self.pool)
+            .await?;
+            let batch = result.rows_affected();
+            total_deleted += batch;
+            if batch == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
         if total_deleted > 0 {
             tracing::info!(
                 deleted = total_deleted,
@@ -1101,6 +1134,41 @@ mod tests {
         let results = store.query(&EventFilters::default()).await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, old_watermark.id);
+        store.close().await;
+        Ok(())
+    }
+
+    /// Watermark history grows without bound if every `periodic_review:*` row is
+    /// spared forever.  Phase 2 of the purge must keep only the newest row per
+    /// hook and delete all older ones regardless of the retention window age.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_trims_old_watermarks_keeps_newest() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path()).await?;
+
+        let hook = "periodic_review:my-project";
+
+        // Three watermarks logged at different times (oldest → newest).
+        let mut wm_old = make_event(hook, Decision::Pass);
+        wm_old.ts = chrono::Utc::now() - chrono::Duration::days(200);
+        store.log(&wm_old).await?;
+
+        let mut wm_mid = make_event(hook, Decision::Pass);
+        wm_mid.ts = chrono::Utc::now() - chrono::Duration::days(100);
+        store.log(&wm_mid).await?;
+
+        let mut wm_new = make_event(hook, Decision::Pass);
+        wm_new.ts = chrono::Utc::now() - chrono::Duration::days(1);
+        store.log(&wm_new).await?;
+
+        // Purge with a 90-day window.  Phase 1 skips all watermarks; Phase 2
+        // must trim the two older ones and keep only the newest.
+        let deleted = store.purge_old_events(90).await?;
+        assert_eq!(deleted, 2, "two older watermarks should be trimmed");
+
+        let results = store.query(&EventFilters::default()).await?;
+        assert_eq!(results.len(), 1, "only the newest watermark should remain");
+        assert_eq!(results[0].id, wm_new.id);
         store.close().await;
         Ok(())
     }
