@@ -28,7 +28,7 @@ async fn resolve_project_from_registry(
     } else {
         project_root.join(&project_path)
     };
-    if explicit_path.exists() {
+    if explicit_path.is_dir() {
         return Ok(Some(project_path));
     }
 

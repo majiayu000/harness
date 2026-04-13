@@ -262,7 +262,10 @@ pub fn resolve_project_input(
     match requested {
         None => resolve_default_from_projects(projects, default_root),
         Some(path) => {
-            if path == Path::new(DEFAULT_PROJECT_ID) {
+            // Only treat the literal string "default" as the default-project
+            // sentinel when it is not an actual directory on disk.  A relative
+            // directory named "default" must go through normal path resolution.
+            if path == Path::new(DEFAULT_PROJECT_ID) && !path.is_dir() {
                 return resolve_default_from_projects(projects, default_root);
             }
 
@@ -336,6 +339,19 @@ pub struct ProjectRegistry {
 
 impl ProjectRegistry {
     async fn ensure_indexes(&self) -> anyhow::Result<()> {
+        // Deduplicate rows with the same canonical root before enforcing the
+        // unique constraint so that upgrading from an older DB that allowed
+        // duplicate roots does not cause a startup outage.  Keep the row with
+        // the lowest rowid (oldest entry) for each root value.
+        sqlx::query(
+            "DELETE FROM projects WHERE rowid NOT IN (\
+                SELECT MIN(rowid) FROM projects \
+                GROUP BY json_extract(data, '$.root')\
+            )",
+        )
+        .execute(self.db.pool())
+        .await?;
+
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_canonical_root \
              ON projects(json_extract(data, '$.root'))",
