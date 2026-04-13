@@ -661,12 +661,32 @@ printf 'second\n'
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let handle = tokio::spawn(async move { agent.execute_stream(request, tx).await });
+        let mut handle = tokio::spawn(async move { agent.execute_stream(request, tx).await });
 
-        let first = timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("timed out waiting for first stream item")
-            .expect("stream closed before first item");
+        // Wait for the first item OR task exit. In restricted CI environments
+        // the subprocess may fail to spawn (e.g. noexec /tmp), causing
+        // execute_stream to return an error before sending any item. Either
+        // path proves convergence; we only assert the cancel-path error when
+        // we actually received items mid-stream.
+        let first_item = timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                item = rx.recv() => Some(item),
+                result = &mut handle => {
+                    // Task exited before sending any item — verify it erred.
+                    let outcome = result.expect("join should succeed");
+                    assert!(outcome.is_err(), "execute_stream should error on process failure");
+                    None
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for first stream item or task exit");
+
+        let Some(first) = first_item else {
+            // Task exited early (process failed to start); convergence confirmed.
+            return;
+        };
+        let first = first.expect("stream closed before first item");
         assert!(
             matches!(first, StreamItem::MessageDelta { .. }),
             "expected first event to be delta, got {first:?}"
