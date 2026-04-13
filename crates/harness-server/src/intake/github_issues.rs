@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::{IncomingIssue, IntakeSource, TaskCompletionResult};
-use crate::task_runner::{TaskId, TaskStatus};
+use crate::task_runner::TaskId;
 
 pub struct GitHubIssuesPoller {
     repo: String,
@@ -242,6 +242,7 @@ impl IntakeSource for GitHubIssuesPoller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_runner::TaskStatus;
 
     fn make_dispatched(ids: &[&str]) -> DashMap<String, TaskId> {
         let map = DashMap::new();
