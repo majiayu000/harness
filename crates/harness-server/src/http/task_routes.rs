@@ -34,6 +34,33 @@ async fn resolve_project_from_registry(
     }
 }
 
+/// Auto-populate external_id from issue/pr for deduplication.
+fn populate_external_id(req: &mut task_runner::CreateTaskRequest) {
+    if req.external_id.is_none() {
+        if let Some(issue) = req.issue {
+            req.external_id = Some(format!("issue:{issue}"));
+        } else if let Some(pr) = req.pr {
+            req.external_id = Some(format!("pr:{pr}"));
+        }
+    }
+}
+
+/// Return existing active TaskId if one matches project + external_id.
+async fn check_duplicate(
+    tasks: &Arc<crate::task_runner::TaskStore>,
+    project_id: &str,
+    req: &task_runner::CreateTaskRequest,
+) -> Option<task_runner::TaskId> {
+    let ext_id = req.external_id.as_deref()?;
+    let existing_id = tasks.find_active_duplicate(project_id, ext_id).await?;
+    tracing::info!(
+        existing_task = %existing_id.0,
+        external_id = %ext_id,
+        "dedup: returning existing active task instead of creating duplicate"
+    );
+    Some(existing_id)
+}
+
 pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
     mut req: task_runner::CreateTaskRequest,
@@ -280,6 +307,12 @@ async fn enqueue_task_background(
     let project_id = canonical_project.to_string_lossy().into_owned();
     req.project = Some(canonical_project);
     task_runner::fill_missing_repo_from_project(&mut req).await;
+
+    // Auto-populate external_id and check for duplicates.
+    populate_external_id(&mut req);
+    if let Some(existing_id) = check_duplicate(&state.core.tasks, &project_id, &req).await {
+        return Ok(existing_id);
+    }
 
     let server_config = std::sync::Arc::new(state.core.server.config.clone());
 

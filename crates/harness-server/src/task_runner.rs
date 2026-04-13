@@ -735,6 +735,39 @@ impl TaskStore {
         self.cache.len()
     }
 
+    /// Check whether an active (non-terminal) task already exists for the same
+    /// project + external_id. Cache-first, DB fallback.
+    pub async fn find_active_duplicate(
+        &self,
+        project_id: &str,
+        external_id: &str,
+    ) -> Option<TaskId> {
+        for entry in self.cache.iter() {
+            let task = entry.value();
+            if task.external_id.as_deref() == Some(external_id)
+                && task
+                    .project_root
+                    .as_ref()
+                    .map(|p| p.to_string_lossy() == project_id)
+                    .unwrap_or(false)
+                && !matches!(
+                    task.status,
+                    TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+                )
+            {
+                return Some(task.id.clone());
+            }
+        }
+        match self.db.find_active_duplicate(project_id, external_id).await {
+            Ok(Some(id)) => Some(harness_core::types::TaskId(id)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("dedup: DB lookup failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Return all tasks currently in the in-memory cache.
     ///
     /// **Semantic note**: since startup only loads active (non-terminal) tasks
