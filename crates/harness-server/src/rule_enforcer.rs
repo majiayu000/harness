@@ -11,10 +11,10 @@ use tokio::sync::RwLock;
 /// Pre-turn interceptor that enforces rules loaded into the `RuleEngine`.
 ///
 /// On every `pre_execute` call the enforcer scans the project root using all
-/// registered guards.  Critical violations block the turn; high-severity
-/// violations produce a warning that is injected into the prompt context.
-/// Rule enforcement only applies to projects that opt in via
-/// `{project_root}/.harness/guards`.
+/// centrally registered guards.  Critical violations block the turn;
+/// high-severity violations produce a warning injected into prompt context.
+/// Guards are loaded once at startup from harness's `.harness/guards/`
+/// and apply to all managed projects.
 pub struct RuleEnforcer {
     rules: Arc<RwLock<RuleEngine>>,
     /// Per-workspace violation count from the previous scan, used to compute deltas.
@@ -39,29 +39,15 @@ impl TurnInterceptor for RuleEnforcer {
     async fn pre_execute(&self, req: &AgentRequest) -> InterceptResult {
         let engine = self.rules.read().await;
 
-        // Only enforce rules on projects that have opted in by providing their
-        // own `.harness/guards` directory.  Guards loaded at startup are scoped
-        // to the projects they belong to; scanning unrelated projects produces
-        // false positives (e.g. SEC-02 on test constants in external repos).
-        let guard_dir = req.project_root.join(".harness").join("guards");
-        if !guard_dir.is_dir() {
+        // Guards are loaded centrally at startup from harness's own
+        // .harness/guards/ directory.  All managed projects are scanned
+        // using the central guard set — no per-project opt-in required.
+        if engine.guards().is_empty() {
             tracing::debug!(
                 project_root = %req.project_root.display(),
-                "rule_enforcer: project has no .harness/guards, skipping enforcement"
+                "rule_enforcer: no guards registered, skipping enforcement"
             );
             return InterceptResult::pass();
-        }
-
-        // Opted-in project but no registered guards is a hard configuration error.
-        if engine.guards().is_empty() {
-            tracing::error!(
-                project_root = %req.project_root.display(),
-                guard_dir = %guard_dir.display(),
-                "rule_enforcer: project opted in but no guards are registered"
-            );
-            return InterceptResult::block(
-                "rule_enforcer: no guards registered for opted-in project".to_string(),
-            );
         }
 
         let violations = match engine.scan(&req.project_root).await {
@@ -207,11 +193,10 @@ mod tests {
     async fn blocks_on_critical_violation() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let project = dir.path().join("project");
-        std::fs::create_dir_all(project.join(".harness").join("guards"))?;
+        std::fs::create_dir_all(&project)?;
 
         let rules = engine_with_guard(dir.path(), "SEC-01", "critical")?;
         {
-            // Load a rule so the engine can resolve severity from the guard output.
             let mut engine = rules.write().await;
             engine.add_rule(harness_rules::engine::Rule {
                 id: harness_core::types::RuleId::from_str("SEC-01"),
@@ -244,7 +229,7 @@ mod tests {
     async fn warns_on_high_violation() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let project = dir.path().join("project");
-        std::fs::create_dir_all(project.join(".harness").join("guards"))?;
+        std::fs::create_dir_all(&project)?;
 
         let rules = engine_with_guard(dir.path(), "SEC-04", "high")?;
         {
@@ -281,32 +266,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocks_when_opted_in_project_has_no_registered_guards() -> anyhow::Result<()> {
+    async fn blocks_when_scan_fails() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let project = dir.path().join("project");
-        std::fs::create_dir_all(project.join(".harness").join("guards"))?;
-
-        let engine = Arc::new(RwLock::new(RuleEngine::new()));
-        let enforcer = RuleEnforcer::new(engine);
-        let result = enforcer.pre_execute(&make_req(&project)).await;
-        assert_eq!(result.decision, Decision::Block);
-        assert!(
-            result
-                .reason
-                .as_deref()
-                .unwrap_or("")
-                .contains("no guards registered"),
-            "expected config error reason, got: {:?}",
-            result.reason
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn blocks_when_scan_fails_on_opted_in_project() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let project = dir.path().join("project");
-        std::fs::create_dir_all(project.join(".harness").join("guards"))?;
+        std::fs::create_dir_all(&project)?;
 
         let mut engine = RuleEngine::new();
         engine.register_guard(Guard {
@@ -335,9 +298,8 @@ mod tests {
     async fn passes_when_guard_emits_no_violations() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let project = dir.path().join("project");
-        std::fs::create_dir_all(project.join(".harness").join("guards"))?;
+        std::fs::create_dir_all(&project)?;
 
-        // Guard that emits nothing.
         let script = dir.path().join("noop.sh");
         std::fs::write(&script, "#!/usr/bin/env bash\nexit 0\n")?;
         #[cfg(unix)]
@@ -374,7 +336,7 @@ mod tests {
     async fn passes_on_medium_violation() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let project = dir.path().join("project");
-        std::fs::create_dir_all(project.join(".harness").join("guards"))?;
+        std::fs::create_dir_all(&project)?;
 
         let rules = engine_with_guard(dir.path(), "U-16", "medium")?;
         {
