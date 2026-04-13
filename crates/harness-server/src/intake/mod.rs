@@ -444,7 +444,10 @@ async fn run_repo_sprint(
         let mut newly_done = Vec::new();
         for (&issue_num, task_id) in &running {
             if let Some(task) = state.core.tasks.get(task_id) {
-                if matches!(task.status, TaskStatus::Done | TaskStatus::Failed) {
+                if matches!(
+                    task.status,
+                    TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+                ) {
                     tracing::info!(
                         repo,
                         external_id = issue_num,
@@ -517,10 +520,13 @@ async fn poll_task_output(
         let Some(task) = store.get(task_id) else {
             continue;
         };
-        if !matches!(task.status, TaskStatus::Done | TaskStatus::Failed) {
+        if !matches!(
+            task.status,
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
             continue;
         }
-        if matches!(task.status, TaskStatus::Failed) {
+        if matches!(task.status, TaskStatus::Failed | TaskStatus::Cancelled) {
             tracing::error!(task_id = %task_id, error = ?task.error, "intake: task failed");
             return None;
         }

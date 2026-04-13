@@ -343,6 +343,8 @@ pub async fn feishu_webhook(
     let req = crate::task_runner::CreateTaskRequest {
         prompt: Some(prompt),
         project: Some(state.core.project_root.clone()),
+        source: Some("feishu".to_string()),
+        external_id: Some(message_id.clone()),
         ..Default::default()
     };
 
