@@ -784,6 +784,14 @@ async fn run_review_tick(
                 task_id = %primary_review_id,
                 "scheduler: agent reported REVIEW_SKIPPED — no new commits"
             );
+            // REVIEW_SKIPPED is a deliberate successful skip, not an error.
+            // Reset the streak so lingering failures from prior ticks do not
+            // accumulate across intentional skips and prematurely trigger the
+            // forced-watermark-advance safety net.
+            {
+                let mut guard = fallback_ts_for_poll.lock().await;
+                guard.empty_output_streak = 0;
+            }
             return;
         }
 
