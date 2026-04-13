@@ -78,16 +78,15 @@ impl ServerConfig {
     /// - `HARNESS_API_TOKEN`    — `api_token`
     /// - `GITHUB_TOKEN`         — `github_token`
     pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
-        if let Ok(v) = std::env::var("HARNESS_HTTP_ADDR") {
-            self.http_addr = v.parse().map_err(|e| {
-                anyhow::anyhow!("HARNESS_HTTP_ADDR={v:?} is not a valid SocketAddr: {e}")
-            })?;
-        }
         if let Ok(v) = std::env::var("HARNESS_DATA_DIR") {
-            self.data_dir = std::path::PathBuf::from(v);
+            if !v.is_empty() {
+                self.data_dir = std::path::PathBuf::from(v);
+            }
         }
         if let Ok(v) = std::env::var("HARNESS_PROJECT_ROOT") {
-            self.project_root = std::path::PathBuf::from(v);
+            if !v.is_empty() {
+                self.project_root = std::path::PathBuf::from(v);
+            }
         }
         if let Ok(v) = std::env::var("HARNESS_API_TOKEN") {
             if !v.is_empty() {
@@ -97,6 +96,25 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("GITHUB_TOKEN") {
             if !v.is_empty() {
                 self.github_token = Some(v);
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the `HARNESS_HTTP_ADDR` env var override.
+    ///
+    /// This is intentionally separated from [`apply_env_overrides`] because
+    /// `HARNESS_HTTP_ADDR` is only meaningful for the `serve` subcommand.
+    /// Parsing it eagerly for every subcommand (e.g. `harness exec`,
+    /// `harness version`) would make a server-side misconfiguration (blank
+    /// value, or a hostname like `localhost:9800` that `SocketAddr` rejects)
+    /// brick completely unrelated commands.
+    pub fn apply_serve_env_overrides(&mut self) -> anyhow::Result<()> {
+        if let Ok(v) = std::env::var("HARNESS_HTTP_ADDR") {
+            if !v.is_empty() {
+                self.http_addr = v.parse().map_err(|e| {
+                    anyhow::anyhow!("HARNESS_HTTP_ADDR={v:?} is not a valid SocketAddr: {e}")
+                })?;
             }
         }
         Ok(())
@@ -227,8 +245,17 @@ mod tests {
     fn env_override_http_addr() {
         temp_env::with_vars([("HARNESS_HTTP_ADDR", Some("127.0.0.1:9801"))], || {
             let mut cfg = ServerConfig::default();
-            cfg.apply_env_overrides().unwrap();
+            cfg.apply_serve_env_overrides().unwrap();
             assert_eq!(cfg.http_addr.port(), 9801);
+        });
+    }
+
+    #[test]
+    fn env_override_http_addr_empty_leaves_default() {
+        temp_env::with_vars([("HARNESS_HTTP_ADDR", Some(""))], || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_serve_env_overrides().unwrap();
+            assert_eq!(cfg.http_addr.port(), 9800);
         });
     }
 
@@ -238,6 +265,26 @@ mod tests {
             let mut cfg = ServerConfig::default();
             cfg.apply_env_overrides().unwrap();
             assert_eq!(cfg.data_dir, std::path::PathBuf::from("/tmp/testdir"));
+        });
+    }
+
+    #[test]
+    fn env_override_empty_data_dir_does_not_override() {
+        temp_env::with_vars([("HARNESS_DATA_DIR", Some(""))], || {
+            let default = ServerConfig::default();
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.data_dir, default.data_dir);
+        });
+    }
+
+    #[test]
+    fn env_override_empty_project_root_does_not_override() {
+        temp_env::with_vars([("HARNESS_PROJECT_ROOT", Some(""))], || {
+            let default = ServerConfig::default();
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.project_root, default.project_root);
         });
     }
 
@@ -263,7 +310,7 @@ mod tests {
     fn env_override_invalid_addr_returns_error() {
         temp_env::with_vars([("HARNESS_HTTP_ADDR", Some("not-an-addr"))], || {
             let mut cfg = ServerConfig::default();
-            let result = cfg.apply_env_overrides();
+            let result = cfg.apply_serve_env_overrides();
             assert!(result.is_err());
         });
     }

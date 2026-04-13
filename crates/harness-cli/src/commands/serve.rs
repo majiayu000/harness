@@ -160,6 +160,10 @@ pub async fn run(
     };
 
     let mut serve_config = config.clone();
+    // Apply serve-only env var overrides (HARNESS_HTTP_ADDR) here rather than
+    // in the global apply_env_overrides(), so a misconfigured bind-address env
+    // var does not break unrelated subcommands like `harness exec` or `harness version`.
+    serve_config.server.apply_serve_env_overrides()?;
     // When --project entries are provided, set project_root to the default project's path
     // so existing single-project behaviour is preserved.
     if let Some(ref id) = default_project_id {
