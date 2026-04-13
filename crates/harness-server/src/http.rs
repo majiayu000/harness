@@ -20,6 +20,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::time::Duration;
 
 pub(crate) mod auth;
 pub(crate) mod rate_limit;
@@ -343,6 +344,19 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         )
         .await?,
     );
+
+    let retention = server.config.observe.log_retention_days;
+    if retention > 0 {
+        let purge_events = Arc::clone(&events);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+                if let Err(e) = purge_events.purge_old_events(retention).await {
+                    tracing::warn!("event store: periodic purge failed: {e}");
+                }
+            }
+        });
+    }
 
     let signal_detector = harness_gc::signal_detector::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
