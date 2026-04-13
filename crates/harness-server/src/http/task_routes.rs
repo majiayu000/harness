@@ -544,11 +544,10 @@ pub(super) async fn create_tasks_batch(
                 crate::parallel_dispatch::extract_file_refs(p)
             } else if t.issue.is_some() {
                 // Issue-only task: no prompt to extract file refs from.
-                // Use a sentinel so all such tasks in this batch are placed in
-                // the same conflict group and serialised (conservative: we
-                // cannot know which files they will touch without fetching the
-                // issue body).
-                vec!["__unresolved_issue__".to_string()]
+                // Treat as independent (empty refs → singleton group) so batch
+                // submissions run in parallel. Real conflicts are caught by git
+                // worktree isolation and GitHub merge conflict detection.
+                Vec::new()
             } else {
                 Vec::new()
             }
