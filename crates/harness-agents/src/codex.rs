@@ -69,7 +69,10 @@ impl CodexAgent {
             OsString::from("-m"),
             OsString::from(model),
             OsString::from("-c"),
-            OsString::from(format!("model_reasoning_effort=\"{}\"", self.reasoning_effort)),
+            OsString::from(format!(
+                "model_reasoning_effort=\"{}\"",
+                self.reasoning_effort
+            )),
             OsString::from("-s"),
             OsString::from(codex_sandbox_mode(self.sandbox_mode)),
         ];

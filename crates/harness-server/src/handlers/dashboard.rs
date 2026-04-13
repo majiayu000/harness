@@ -29,11 +29,11 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         global_done,
         global_failed,
         by_project: project_counts,
-    } = state.core.tasks.count_for_dashboard().await;
+    } = state.task_svc.count_for_dashboard().await;
 
     // Most recent completed task with a PR URL, queried from the DB which is
     // ordered by updated_at DESC — reflects completion time, not creation time.
-    let latest_pr: Option<String> = state.core.tasks.latest_done_pr_url().await;
+    let latest_pr: Option<String> = state.task_svc.latest_done_pr_url().await;
 
     // Grade from the global quality event store.
     // Derive violation_count from the most recent rule_scan session so we don't
@@ -66,41 +66,38 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     };
 
     // Fetch latest PR URLs for all projects in one bulk query to avoid N+1.
-    let project_pr_urls = state.core.tasks.latest_done_pr_urls_all_projects().await;
+    let project_pr_urls = state.task_svc.latest_done_pr_urls_all_projects().await;
 
     // Build per-project entries from the registry.
-    let projects: Vec<Value> = match state.core.project_registry.as_ref() {
-        None => vec![],
-        Some(registry) => match registry.list().await {
-            Err(e) => {
-                tracing::warn!("dashboard: failed to list projects: {e}");
-                vec![]
+    let projects: Vec<Value> = match state.project_svc.list().await {
+        Err(e) => {
+            tracing::warn!("dashboard: failed to list projects: {e}");
+            vec![]
+        }
+        Ok(projects) => {
+            let mut entries = Vec::with_capacity(projects.len());
+            for p in projects {
+                // Task queue keys are canonical project root paths as strings.
+                let key = p.root.to_string_lossy().into_owned();
+                let qs = tq.project_stats(&key);
+                let counts = project_counts.get(&key);
+                let done = counts.map_or(0, |c| c.done);
+                let failed = counts.map_or(0, |c| c.failed);
+                let latest_pr = project_pr_urls.get(&key);
+                entries.push(json!({
+                    "id": p.id,
+                    "root": p.root,
+                    "tasks": {
+                        "running": qs.running,
+                        "queued": qs.queued,
+                        "done": done,
+                        "failed": failed,
+                    },
+                    "latest_pr": latest_pr,
+                }));
             }
-            Ok(projects) => {
-                let mut entries = Vec::with_capacity(projects.len());
-                for p in projects {
-                    // Task queue keys are canonical project root paths as strings.
-                    let key = p.root.to_string_lossy().into_owned();
-                    let qs = tq.project_stats(&key);
-                    let counts = project_counts.get(&key);
-                    let done = counts.map_or(0, |c| c.done);
-                    let failed = counts.map_or(0, |c| c.failed);
-                    let latest_pr = project_pr_urls.get(&key);
-                    entries.push(json!({
-                        "id": p.id,
-                        "root": p.root,
-                        "tasks": {
-                            "running": qs.running,
-                            "queued": qs.queued,
-                            "done": done,
-                            "failed": failed,
-                        },
-                        "latest_pr": latest_pr,
-                    }));
-                }
-                entries
-            }
-        },
+            entries
+        }
     };
 
     let runtime_hosts: Vec<Value> = state
