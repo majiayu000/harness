@@ -176,9 +176,8 @@ impl AppState {
 /// Build an AppState with all stores. Used by both HTTP and stdio transports.
 pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppState> {
     let bootstrap = crate::startup::bootstrap(&server)?;
-    let stores = crate::startup::init_persistence(&server, &bootstrap).await?;
-    let engines =
-        crate::startup::init_rules_and_skills(&server, &bootstrap, stores.q_values.clone())?;
+    let stores = crate::startup::init_persistence(&bootstrap).await?;
+    let engines = crate::startup::init_rules_and_skills(&server, &bootstrap)?;
     let observability = crate::startup::init_observability(&server, &bootstrap).await?;
     let cache = crate::startup::hydrate_caches_and_projects(&server, &bootstrap, &stores).await?;
     let concurrency = crate::startup::init_concurrency(&server, &bootstrap, &stores.tasks).await?;

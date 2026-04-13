@@ -114,9 +114,7 @@ pub(crate) fn bootstrap(server: &Arc<HarnessServer>) -> anyhow::Result<StartupBo
         );
     }
 
-    let home_dir = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| project_root.clone());
+    let home_dir = system_home_dir().unwrap_or_else(|| project_root.clone());
 
     Ok(StartupBootstrap {
         data_dir,
@@ -130,7 +128,6 @@ pub(crate) fn bootstrap(server: &Arc<HarnessServer>) -> anyhow::Result<StartupBo
 }
 
 pub(crate) async fn init_persistence(
-    _server: &Arc<HarnessServer>,
     bootstrap: &StartupBootstrap,
 ) -> anyhow::Result<PersistenceStores> {
     let db_path = harness_core::config::dirs::default_db_path(&bootstrap.data_dir, "tasks");
@@ -176,7 +173,6 @@ pub(crate) async fn init_persistence(
 pub(crate) fn init_rules_and_skills(
     server: &Arc<HarnessServer>,
     bootstrap: &StartupBootstrap,
-    _q_values: Option<Arc<crate::q_value_store::QValueStore>>,
 ) -> anyhow::Result<EngineStartup> {
     let mut rule_engine = harness_rules::engine::RuleEngine::new();
     rule_engine.configure_sources(
@@ -799,15 +795,19 @@ fn resolve_project_root(configured_root: &Path) -> anyhow::Result<PathBuf> {
     Ok(project_root)
 }
 
+fn system_home_dir() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(PathBuf::from)
+}
+
 pub(crate) fn expand_tilde(path: &Path) -> PathBuf {
     if let Some(s) = path.to_str() {
         if let Some(rest) = s.strip_prefix("~/") {
-            if let Ok(home) = std::env::var("HOME") {
-                return PathBuf::from(home).join(rest);
+            if let Some(home) = system_home_dir() {
+                return home.join(rest);
             }
         } else if s == "~" {
-            if let Ok(home) = std::env::var("HOME") {
-                return PathBuf::from(home);
+            if let Some(home) = system_home_dir() {
+                return home;
             }
         }
     }

@@ -66,7 +66,7 @@ async fn init_persistence_tolerates_q_value_store_failure() -> anyhow::Result<()
     let server = make_server(project_root, data_dir);
     let bootstrap = bootstrap(&server)?;
 
-    let stores = init_persistence(&server, &bootstrap).await?;
+    let stores = init_persistence(&bootstrap).await?;
 
     assert!(stores.q_values.is_none());
     Ok(())
@@ -81,8 +81,7 @@ async fn init_rules_and_skills_loads_builtin_guard() -> anyhow::Result<()> {
     let server = make_server(project_root, data_dir);
     let bootstrap = bootstrap(&server)?;
 
-    let stores = init_persistence(&server, &bootstrap).await?;
-    let engines = init_rules_and_skills(&server, &bootstrap, stores.q_values.clone())?;
+    let engines = init_rules_and_skills(&server, &bootstrap)?;
     let rules = engines.rules.read().await;
 
     assert!(rules
@@ -128,7 +127,7 @@ async fn hydrate_caches_registers_startup_projects() -> anyhow::Result<()> {
     let server = Arc::new(server);
 
     let bootstrap = bootstrap(&server)?;
-    let stores = init_persistence(&server, &bootstrap).await?;
+    let stores = init_persistence(&bootstrap).await?;
     let cache = hydrate_caches_and_projects(&server, &bootstrap, &stores).await?;
 
     let default = stores
@@ -167,7 +166,7 @@ async fn init_concurrency_tolerates_workspace_manager_failure() -> anyhow::Resul
         AgentRegistry::new("test"),
     ));
     let bootstrap = bootstrap(&server)?;
-    let stores = init_persistence(&server, &bootstrap).await?;
+    let stores = init_persistence(&bootstrap).await?;
 
     std::fs::remove_dir_all(&workspace_root)?;
     std::fs::write(&workspace_root, b"not a directory")?;
