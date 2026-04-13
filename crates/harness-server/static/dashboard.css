@@ -766,6 +766,18 @@ body {
 
 .detail-link:hover { color: var(--accent); }
 
+.detail-title-link {
+  color: inherit;
+  text-decoration: none;
+}
+.detail-title-link:hover { color: var(--accent); }
+
+.task-ext-link {
+  color: inherit;
+  text-decoration: none;
+}
+.task-ext-link:hover { color: var(--accent-ink); text-decoration: underline; }
+
 /* --- Tab bar --- */
 
 .tab-bar {

@@ -37,6 +37,20 @@ function relativeTime(ts) {
   return Math.floor(diff / 86400) + "d ago";
 }
 
+function githubUrl(repo, externalId) {
+  if (!repo) return null;
+  const base = "https://github.com/" + repo;
+  if (!externalId) return base;
+  const s = String(externalId);
+  const m = s.match(/^(issue|pr)[:#]?(\d+)$/i);
+  if (m) {
+    const kind = m[1].toLowerCase() === "pr" ? "pull" : "issues";
+    return base + "/" + kind + "/" + m[2];
+  }
+  if (/^\d+$/.test(s)) return base + "/issues/" + s;
+  return base;
+}
+
 // --- Data fetching ---
 
 async function fetchTasks() {
@@ -301,7 +315,15 @@ function renderCard(task, status) {
 
   const metaParts = [];
   if (task.turn > 0) metaParts.push("Turn " + task.turn);
-  if (task.external_id != null) metaParts.push("#" + escapeHtml(String(task.external_id)));
+  if (task.external_id != null) {
+    const extCardUrl = githubUrl(task.repo, task.external_id);
+    const extLabel = "#" + escapeHtml(String(task.external_id));
+    if (extCardUrl) {
+      metaParts.push(`<a href="${escapeHtml(extCardUrl)}" target="_blank" class="task-ext-link" onclick="event.stopPropagation()">${extLabel}</a>`);
+    } else {
+      metaParts.push(extLabel);
+    }
+  }
   const timeAgo = relativeTime(task.created_at);
   if (timeAgo) metaParts.push(timeAgo);
   if (metaParts.length > 0) {
@@ -348,7 +370,11 @@ function showDetail(task) {
   const timeAgo = relativeTime(task.created_at);
   const createdStr = task.created_at ? new Date(task.created_at).toLocaleString() : null;
 
-  let body = `<h2 class="detail-title">${escapeHtml(task.description || task.id || "")}</h2>`;
+  const titleText = escapeHtml(task.description || task.id || "");
+  const titleUrl = githubUrl(task.repo, task.external_id);
+  let body = titleUrl
+    ? `<h2 class="detail-title"><a href="${escapeHtml(titleUrl)}" target="_blank" class="detail-title-link">${titleText} \u2197</a></h2>`
+    : `<h2 class="detail-title">${titleText}</h2>`;
 
   body += `<div class="detail-badges">`;
   body += `<span class="state-badge badge-${escapeHtml(status)}">${escapeHtml(status.replace("_", " "))}</span>`;
@@ -363,8 +389,17 @@ function showDetail(task) {
 
   body += `<table class="detail-table">`;
   body += `<tr><th>ID</th><td><code class="detail-code">${escapeHtml(task.id || "")}</code></td></tr>`;
-  if (task.repo) body += `<tr><th>Repo</th><td>${escapeHtml(task.repo)}</td></tr>`;
-  if (task.external_id != null) body += `<tr><th>External ID</th><td>${escapeHtml(String(task.external_id))}</td></tr>`;
+  if (task.repo) {
+    const repoUrl = "https://github.com/" + escapeHtml(task.repo);
+    body += `<tr><th>Repo</th><td><a href="${repoUrl}" target="_blank" class="detail-link">${escapeHtml(task.repo)} \u2197</a></td></tr>`;
+  }
+  if (task.external_id != null) {
+    const extUrl = githubUrl(task.repo, task.external_id);
+    const extText = escapeHtml(String(task.external_id));
+    body += extUrl
+      ? `<tr><th>External ID</th><td><a href="${escapeHtml(extUrl)}" target="_blank" class="detail-link">${extText} \u2197</a></td></tr>`
+      : `<tr><th>External ID</th><td>${extText}</td></tr>`;
+  }
   if (task.source) body += `<tr><th>Source</th><td>${escapeHtml(task.source)}</td></tr>`;
   if (task.phase) body += `<tr><th>Phase</th><td>${escapeHtml(task.phase)}</td></tr>`;
   if (task.turn > 0) body += `<tr><th>Turn</th><td>${escapeHtml(String(task.turn))}</td></tr>`;
