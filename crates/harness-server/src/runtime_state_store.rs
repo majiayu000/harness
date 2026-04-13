@@ -58,6 +58,19 @@ pub struct RuntimeStateStore {
     inner: Db<RuntimeStateSnapshot>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadSnapshotOutcome {
+    NotFound,
+    Loaded,
+    SchemaMismatch { found: u32, expected: u32 },
+}
+
+impl LoadSnapshotOutcome {
+    pub fn is_schema_mismatch(self) -> bool {
+        matches!(self, Self::SchemaMismatch { .. })
+    }
+}
+
 impl RuntimeStateStore {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         Ok(Self {
@@ -66,7 +79,34 @@ impl RuntimeStateStore {
     }
 
     pub async fn load_snapshot(&self) -> anyhow::Result<Option<RuntimeStateSnapshot>> {
-        self.inner.get(SNAPSHOT_ID).await
+        Ok(self.try_load_snapshot().await?.0)
+    }
+
+    pub async fn try_load_snapshot(
+        &self,
+    ) -> anyhow::Result<(Option<RuntimeStateSnapshot>, LoadSnapshotOutcome)> {
+        let snapshot = match self.inner.get(SNAPSHOT_ID).await? {
+            Some(snapshot) => snapshot,
+            None => return Ok((None, LoadSnapshotOutcome::NotFound)),
+        };
+
+        if snapshot.schema_version != SNAPSHOT_SCHEMA_VERSION {
+            tracing::warn!(
+                snapshot_id = SNAPSHOT_ID,
+                found_schema_version = snapshot.schema_version,
+                expected_schema_version = SNAPSHOT_SCHEMA_VERSION,
+                "runtime state snapshot schema mismatch; skipping restore"
+            );
+            return Ok((
+                None,
+                LoadSnapshotOutcome::SchemaMismatch {
+                    found: snapshot.schema_version,
+                    expected: SNAPSHOT_SCHEMA_VERSION,
+                },
+            ));
+        }
+
+        Ok((Some(snapshot), LoadSnapshotOutcome::Loaded))
     }
 
     pub async fn persist_snapshot(
@@ -83,6 +123,8 @@ impl RuntimeStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::db::open_pool;
+    use sqlx::Row;
 
     #[tokio::test]
     async fn runtime_state_store_roundtrip() -> anyhow::Result<()> {
@@ -100,6 +142,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_state_store_rejects_older_schema_snapshot() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("runtime_state.db");
+        let store = RuntimeStateStore::open(&db_path).await?;
+        store.persist_snapshot(vec![], vec![], vec![]).await?;
+
+        overwrite_schema_version(&db_path, SNAPSHOT_SCHEMA_VERSION - 1).await?;
+
+        let snapshot = store.load_snapshot().await?;
+        assert!(snapshot.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_state_store_rejects_newer_schema_snapshot_after_reopen() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("runtime_state.db");
+
+        {
+            let store = RuntimeStateStore::open(&db_path).await?;
+            store.persist_snapshot(vec![], vec![], vec![]).await?;
+        }
+
+        overwrite_schema_version(&db_path, SNAPSHOT_SCHEMA_VERSION + 1).await?;
+
+        let reopened = RuntimeStateStore::open(&db_path).await?;
+        let snapshot = reopened.load_snapshot().await?;
+        assert!(snapshot.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runtime_state_store_survives_reopen() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("runtime_state.db");
@@ -112,6 +187,24 @@ mod tests {
         let reopened = RuntimeStateStore::open(&db_path).await?;
         let snapshot = reopened.load_snapshot().await?;
         assert!(snapshot.is_some());
+        Ok(())
+    }
+
+    async fn overwrite_schema_version(path: &Path, schema_version: u32) -> anyhow::Result<()> {
+        let pool = open_pool(path).await?;
+        let row = sqlx::query("SELECT data FROM runtime_state WHERE id = ?")
+            .bind(SNAPSHOT_ID)
+            .fetch_one(&pool)
+            .await?;
+        let data: String = row.try_get("data")?;
+        let mut snapshot: RuntimeStateSnapshot = serde_json::from_str(&data)?;
+        snapshot.schema_version = schema_version;
+        let updated_data = serde_json::to_string(&snapshot)?;
+        sqlx::query("UPDATE runtime_state SET data = ? WHERE id = ?")
+            .bind(updated_data)
+            .bind(SNAPSHOT_ID)
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 }
