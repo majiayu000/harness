@@ -90,21 +90,51 @@ impl EventStore {
     /// Delete all events whose timestamp is older than `days` days.
     ///
     /// Returns the number of rows deleted.  A `days` value of 0 is a no-op.
+    ///
+    /// `periodic_review:*` events are intentionally excluded: they serve as
+    /// watermark cursors for the periodic reviewer and must survive even when
+    /// the retention window is shorter than the review cadence.  Deleting them
+    /// would cause the reviewer to fall back to epoch and re-review the entire
+    /// history.
+    ///
+    /// The delete runs in batches of 500 rows to avoid holding the SQLite
+    /// writer lock long enough to starve concurrent `log()` calls.  A 10 ms
+    /// yield between batches gives waiting writers a chance to proceed.
     pub async fn purge_old_events(&self, days: u32) -> anyhow::Result<u64> {
         if days == 0 {
             return Ok(0);
         }
         let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
         let cutoff_str = cutoff.to_rfc3339();
-        let result = sqlx::query("DELETE FROM events WHERE ts < ?")
+        let mut total_deleted: u64 = 0;
+        loop {
+            let result = sqlx::query(
+                "DELETE FROM events WHERE id IN (
+                    SELECT id FROM events
+                    WHERE ts < ? AND hook NOT LIKE 'periodic_review:%'
+                    LIMIT 500
+                )",
+            )
             .bind(&cutoff_str)
             .execute(&self.pool)
             .await?;
-        let deleted = result.rows_affected();
-        if deleted > 0 {
-            tracing::info!(deleted, days, "event store: purged old events");
+            let batch = result.rows_affected();
+            total_deleted += batch;
+            if batch == 0 {
+                break;
+            }
+            // Yield between batches so concurrent log() calls can acquire the
+            // writer lock without hitting the 5 s busy_timeout.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        Ok(deleted)
+        if total_deleted > 0 {
+            tracing::info!(
+                deleted = total_deleted,
+                days,
+                "event store: purged old events"
+            );
+        }
+        Ok(total_deleted)
     }
 
     pub async fn with_policies_and_otel(
@@ -1043,6 +1073,34 @@ mod tests {
         let results = store.query(&EventFilters::default()).await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, recent_event.id);
+        store.close().await;
+        Ok(())
+    }
+
+    /// `periodic_review:*` events must survive purge regardless of age because
+    /// the periodic reviewer uses them as watermark cursors.  Deleting them
+    /// would cause the reviewer to fall back to epoch and re-review history.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_spares_periodic_review_watermarks() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path()).await?;
+
+        // Old regular event — should be deleted.
+        let mut old_regular = make_event("pre_tool_use", Decision::Pass);
+        old_regular.ts = chrono::Utc::now() - chrono::Duration::days(101);
+        store.log(&old_regular).await?;
+
+        // Old watermark event — must survive.
+        let mut old_watermark = make_event("periodic_review:my-project", Decision::Pass);
+        old_watermark.ts = chrono::Utc::now() - chrono::Duration::days(101);
+        store.log(&old_watermark).await?;
+
+        let deleted = store.purge_old_events(90).await?;
+        assert_eq!(deleted, 1, "only the regular old event should be purged");
+
+        let results = store.query(&EventFilters::default()).await?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, old_watermark.id);
         store.close().await;
         Ok(())
     }
