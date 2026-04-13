@@ -505,17 +505,22 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     );
 
     let feishu_intake = server.config.intake.feishu.as_ref().and_then(|cfg| {
-        if cfg.enabled {
-            tracing::info!(
-                trigger_keyword = %cfg.trigger_keyword,
-                "intake: Feishu bot registered"
-            );
-            Some(Arc::new(crate::intake::feishu::FeishuIntake::new(
-                cfg.clone(),
-            )))
-        } else {
-            None
+        if !cfg.enabled {
+            return None;
         }
+        if !crate::intake::feishu::has_verification_token(cfg) {
+            tracing::error!(
+                "intake: Feishu enabled but verification_token is missing; webhook will fail closed"
+            );
+            return None;
+        }
+        tracing::info!(
+            trigger_keyword = %cfg.trigger_keyword,
+            "intake: Feishu bot registered"
+        );
+        Some(Arc::new(crate::intake::feishu::FeishuIntake::new(
+            cfg.clone(),
+        )))
     });
 
     // Build ALL GitHub pollers once. The same Arc instances are shared between
@@ -1821,7 +1826,7 @@ async fn intake_status(State(state): State<Arc<AppState>>) -> Json<serde_json::V
 
     let feishu_channel = json!({
         "name": "feishu",
-        "enabled": intake_config.feishu.as_ref().map(|c| c.enabled).unwrap_or(false),
+        "enabled": state.intake.feishu_intake.is_some(),
         "keyword": intake_config.feishu.as_ref().map(|c| c.trigger_keyword.as_str()).unwrap_or(""),
         "active": feishu_active,
     });

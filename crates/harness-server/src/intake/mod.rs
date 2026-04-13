@@ -578,13 +578,19 @@ pub fn build_orchestrator(
 
     if let Some(feishu_config) = &config.feishu {
         if feishu_config.enabled {
-            let intake = feishu_intake
-                .unwrap_or_else(|| Arc::new(feishu::FeishuIntake::new(feishu_config.clone())));
-            sources.push(intake);
-            tracing::info!(
-                trigger_keyword = %feishu_config.trigger_keyword,
-                "intake: Feishu bot registered in orchestrator"
-            );
+            if !feishu::has_verification_token(feishu_config) {
+                tracing::error!(
+                    "intake: Feishu enabled but verification_token is missing; orchestrator skipped registration"
+                );
+            } else {
+                let intake = feishu_intake
+                    .unwrap_or_else(|| Arc::new(feishu::FeishuIntake::new(feishu_config.clone())));
+                sources.push(intake);
+                tracing::info!(
+                    trigger_keyword = %feishu_config.trigger_keyword,
+                    "intake: Feishu bot registered in orchestrator"
+                );
+            }
         }
     }
 
@@ -800,5 +806,21 @@ mod tests {
         assert_eq!(orchestrator.sources.len(), 1);
         assert_eq!(orchestrator.sources[0].name(), "github");
         assert_eq!(orchestrator.poll_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn build_orchestrator_skips_feishu_when_verification_token_missing() {
+        let mut config = harness_core::config::intake::IntakeConfig::default();
+        config.feishu = Some(harness_core::config::intake::FeishuIntakeConfig {
+            enabled: true,
+            app_id: None,
+            app_secret: None,
+            verification_token: None,
+            trigger_keyword: "harness".to_string(),
+            default_repo: None,
+        });
+
+        let orchestrator = build_orchestrator(&config, None, None, vec![]);
+        assert!(orchestrator.sources.is_empty());
     }
 }
