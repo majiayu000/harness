@@ -16,7 +16,7 @@ const ARTIFACT_MAX_BYTES: usize = 65_536;
 /// When adding a field to `TaskRow`, add the column here once and all queries
 /// pick it up automatically.  The `task_row_columns_match_struct` test below
 /// will fail if this list drifts from the struct definition.
-const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority";
+const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description";
 
 /// Versioned migrations for the tasks table.
 ///
@@ -27,6 +27,8 @@ const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source,
 /// v10 – add composite index on (project, status, updated_at).
 /// v11 – add task_checkpoints table for phase recovery.
 /// v12 – add priority column for priority-based task scheduling.
+/// v13 – add phase column for consistent phase persistence across cache/DB paths.
+/// v14 – add description column for task observability after restart.
 static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -107,6 +109,16 @@ static TASK_MIGRATIONS: &[Migration] = &[
         description: "add priority column for task scheduling",
         sql: "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
     },
+    Migration {
+        version: 13,
+        description: "add phase column for consistent phase persistence",
+        sql: r#"ALTER TABLE tasks ADD COLUMN phase TEXT NOT NULL DEFAULT '"implement"'"#,
+    },
+    Migration {
+        version: 14,
+        description: "add description column for task observability",
+        sql: "ALTER TABLE tasks ADD COLUMN description TEXT",
+    },
 ];
 
 /// A single persisted artifact captured from agent output during task execution.
@@ -176,9 +188,10 @@ impl TaskDb {
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let status = state.status.as_ref();
+        let phase_json = serde_json::to_string(&state.phase)?;
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, ?)",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -194,6 +207,8 @@ impl TaskDb {
         .bind(&depends_on_json)
         .bind(state.project_root.as_ref().map(|p| p.to_string_lossy().into_owned()))
         .bind(state.priority as i64)
+        .bind(&phase_json)
+        .bind(state.description.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -202,11 +217,12 @@ impl TaskDb {
     pub async fn update(&self, state: &TaskState) -> anyhow::Result<()> {
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
+        let phase_json = serde_json::to_string(&state.phase)?;
         let status = state.status.as_ref();
         sqlx::query(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
                     source = ?, external_id = ?, repo = ?, depends_on = ?, project = ?,
-                    priority = ?, updated_at = datetime('now')
+                    priority = ?, phase = ?, description = ?, updated_at = datetime('now')
              WHERE id = ?",
         )
         .bind(status)
@@ -225,6 +241,8 @@ impl TaskDb {
                 .map(|p| p.to_string_lossy().into_owned()),
         )
         .bind(state.priority as i64)
+        .bind(&phase_json)
+        .bind(state.description.as_deref())
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -295,7 +313,7 @@ impl TaskDb {
     pub async fn list_summaries(&self) -> anyhow::Result<Vec<crate::task_runner::TaskSummary>> {
         let rows = sqlx::query_as::<_, TaskSummaryRow>(
             "SELECT id, status, turn, pr_url, error, source, external_id, parent_id, \
-             created_at, repo, depends_on, project \
+             created_at, repo, depends_on, project, phase, description \
              FROM tasks ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -778,6 +796,8 @@ struct TaskRow {
     depends_on: String,
     project: Option<String>,
     priority: i64,
+    phase: String,
+    description: Option<String>,
 }
 
 impl TaskRow {
@@ -797,6 +817,8 @@ impl TaskRow {
             depends_on,
             project,
             priority,
+            phase,
+            description,
         } = self;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
@@ -811,6 +833,13 @@ impl TaskRow {
                 source,
             }
         })?;
+        let decoded_phase =
+            serde_json::from_str::<crate::task_runner::TaskPhase>(&phase).map_err(|source| {
+                TaskDbDecodeError::PhaseDeserialize {
+                    task_id: id.clone(),
+                    source,
+                }
+            })?;
 
         Ok(TaskState {
             id: harness_core::types::TaskId(id),
@@ -826,10 +855,10 @@ impl TaskRow {
             subtask_ids: Vec::new(),
             project_root: project.map(PathBuf::from),
             issue: None,
-            description: None,
+            description,
             created_at,
             priority: priority.clamp(0, 255) as u8,
-            phase: crate::task_runner::TaskPhase::default(),
+            phase: decoded_phase,
             triage_output: None,
             plan_output: None,
             repo,
@@ -852,6 +881,8 @@ struct TaskSummaryRow {
     repo: Option<String>,
     depends_on: String,
     project: Option<String>,
+    phase: String,
+    description: Option<String>,
 }
 
 impl TaskSummaryRow {
@@ -863,6 +894,13 @@ impl TaskSummaryRow {
                 source,
             }
         })?;
+        let decoded_phase = serde_json::from_str::<crate::task_runner::TaskPhase>(&self.phase)
+            .map_err(
+                |source| harness_core::error::TaskDbDecodeError::PhaseDeserialize {
+                    task_id: self.id.clone(),
+                    source,
+                },
+            )?;
         Ok(crate::task_runner::TaskSummary {
             id: TaskId(self.id),
             status: self.status.parse::<crate::task_runner::TaskStatus>()?,
@@ -873,9 +911,9 @@ impl TaskSummaryRow {
             parent_id: self.parent_id.map(TaskId),
             external_id: self.external_id,
             repo: self.repo,
-            description: None,
+            description: self.description,
             created_at: self.created_at,
-            phase: crate::task_runner::TaskPhase::default(),
+            phase: decoded_phase,
             depends_on,
             subtask_ids: Vec::new(),
             project: self.project,
@@ -905,6 +943,8 @@ mod tests {
             depends_on: depends_on.to_string(),
             project: None,
             priority: 0,
+            phase: r#""implement""#.to_string(),
+            description: None,
         }
     }
 
@@ -1602,13 +1642,15 @@ mod tests {
             depends_on: String::new(),
             project: None,
             priority: 0,
+            phase: String::new(),
+            description: None,
         };
 
         // Count must match — catches column added to constant but not struct (or vice versa).
         assert_eq!(
             columns.len(),
-            14, // bump this when adding a field
-            "TASK_ROW_COLUMNS has {} entries but expected 14 — update both the constant and this test",
+            16, // bump this when adding a field
+            "TASK_ROW_COLUMNS has {} entries but expected 16 — update both the constant and this test",
             columns.len()
         );
     }
@@ -1703,6 +1745,93 @@ mod tests {
         db.insert(&task).await?;
         let dup = db.find_active_duplicate("/repo/foo", "issue:99").await?;
         assert_eq!(dup, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phase_round_trips_through_db() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-phase-rt", TaskStatus::Implementing);
+        task.phase = crate::task_runner::TaskPhase::Review;
+        db.insert(&task).await?;
+
+        let loaded = db
+            .get("task-phase-rt")
+            .await?
+            .expect("inserted task should exist");
+        assert_eq!(loaded.phase, crate::task_runner::TaskPhase::Review);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn description_round_trips_through_db() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-desc-rt", TaskStatus::Pending);
+        task.description = Some("fix: crash on empty input".to_string());
+        db.insert(&task).await?;
+
+        let loaded = db
+            .get("task-desc-rt")
+            .await?
+            .expect("inserted task should exist");
+        assert_eq!(
+            loaded.description.as_deref(),
+            Some("fix: crash on empty input")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_summaries_includes_phase_and_description() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-summary-pd", TaskStatus::Pending);
+        task.phase = crate::task_runner::TaskPhase::Plan;
+        task.description = Some("architect PR #5".to_string());
+        db.insert(&task).await?;
+
+        let summaries = db.list_summaries().await?;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].phase, crate::task_runner::TaskPhase::Plan);
+        assert_eq!(summaries[0].description.as_deref(), Some("architect PR #5"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phase_defaults_for_legacy_rows() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        // Insert a row without supplying phase/description — SQLite uses column defaults.
+        sqlx::query(
+            "INSERT INTO tasks (id, status, turn, rounds, depends_on) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("task-legacy")
+        .bind("pending")
+        .bind(0_i64)
+        .bind("[]")
+        .bind("[]")
+        .execute(&db.pool)
+        .await?;
+
+        let loaded = db
+            .get("task-legacy")
+            .await?
+            .expect("legacy task should exist");
+        assert_eq!(
+            loaded.phase,
+            crate::task_runner::TaskPhase::default(),
+            "phase should default to Implement for legacy rows"
+        );
+        assert!(
+            loaded.description.is_none(),
+            "description should be None for legacy rows"
+        );
         Ok(())
     }
 }

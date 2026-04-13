@@ -135,8 +135,8 @@ pub struct TaskState {
     pub issue: Option<u64>,
     /// Repository slug (e.g. "owner/repo"). Persisted for traceability.
     pub repo: Option<String>,
-    /// Short description derived from the task prompt or issue number. Set at spawn time; not persisted.
-    #[serde(skip)]
+    /// Short description derived from the task prompt or issue number.
+    #[serde(default)]
     pub description: Option<String>,
     /// ISO 8601 creation timestamp. Set at spawn time and persisted to the tasks DB.
     #[serde(default)]
