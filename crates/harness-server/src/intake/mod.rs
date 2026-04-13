@@ -315,6 +315,8 @@ async fn run_repo_sprint(
     // 3. DAG slot-filling execution.
     // Track: which issues are completed, which are running, which are waiting.
     let mut completed: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Cancelled tasks: terminal but do not unblock dependents; excluded from re-dispatch.
+    let mut cancelled_sprint: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut running: std::collections::HashMap<u64, TaskId> = std::collections::HashMap::new();
     let all_task_issues: std::collections::HashSet<u64> =
         plan.tasks.iter().map(|t| t.issue).collect();
@@ -347,12 +349,10 @@ async fn run_repo_sprint(
 
     loop {
         // All done?
-        if completed.len() + plan.skip.len() >= all_task_issues.len() + plan.skip.len()
-            && running.is_empty()
-        {
+        if completed.len() + cancelled_sprint.len() >= all_task_issues.len() && running.is_empty() {
             break;
         }
-        if completed.len() >= all_task_issues.len() {
+        if completed.len() + cancelled_sprint.len() >= all_task_issues.len() {
             break;
         }
         if start.elapsed() > TASK_TIMEOUT {
@@ -360,11 +360,12 @@ async fn run_repo_sprint(
             break;
         }
 
-        // Find ready tasks: not started, not completed, all deps satisfied.
+        // Find ready tasks: not started, not completed, not cancelled, all deps satisfied.
         let ready: Vec<u64> = all_task_issues
             .iter()
             .filter(|&&issue| {
                 !completed.contains(&issue)
+                    && !cancelled_sprint.contains(&issue)
                     && !running.contains_key(&issue)
                     && deps
                         .get(&issue)
@@ -425,10 +426,13 @@ async fn run_repo_sprint(
             }
         }
 
-        // Detect deadlock: no running tasks but unresolved tasks still pending.
+        // Detect deadlock: no running tasks but unresolved, non-cancelled tasks still pending.
         if running.is_empty() {
-            let pending: std::collections::HashSet<u64> =
-                all_task_issues.difference(&completed).copied().collect();
+            let pending: std::collections::HashSet<u64> = all_task_issues
+                .difference(&completed)
+                .copied()
+                .filter(|i| !cancelled_sprint.contains(i))
+                .collect();
             if !pending.is_empty() {
                 tracing::error!(
                     repo,
@@ -462,9 +466,10 @@ async fn run_repo_sprint(
             }
         }
 
-        let had_completed = !newly_done.is_empty();
+        let had_completed = !newly_done.is_empty() || !cancelled.is_empty();
         for issue_num in cancelled {
             running.remove(&issue_num);
+            cancelled_sprint.insert(issue_num);
         }
         for issue_num in newly_done {
             running.remove(&issue_num);
@@ -479,8 +484,11 @@ async fn run_repo_sprint(
         }
     }
 
-    let stranded: std::collections::HashSet<u64> =
-        all_task_issues.difference(&completed).copied().collect();
+    let stranded: std::collections::HashSet<u64> = all_task_issues
+        .difference(&completed)
+        .copied()
+        .filter(|i| !cancelled_sprint.contains(i))
+        .collect();
 
     tracing::info!(
         repo,
