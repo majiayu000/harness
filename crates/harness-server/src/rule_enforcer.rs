@@ -8,13 +8,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Pre-turn interceptor that enforces rules loaded into the `RuleEngine`.
+/// Pre-turn interceptor that scans projects with the `RuleEngine` and injects
+/// violation summaries into the agent's prompt context.
 ///
-/// On every `pre_execute` call the enforcer scans the project root using all
-/// centrally registered guards.  Critical violations block the turn;
-/// high-severity violations produce a warning injected into prompt context.
-/// Guards are loaded once at startup from harness's `.harness/guards/`
-/// and apply to all managed projects.
+/// ## Design (2026 consensus — advisory, not blocking)
+///
+/// All violations are **advisory warnings** injected into the agent's context,
+/// never hard blocks.  The agent sees the violations and self-corrects during
+/// its implementation loop.  This follows the industry pattern established by
+/// OpenAI Codex CLI (fail-open hooks), Anthropic Claude Code (PostToolUse
+/// feedback), and the broader "quality = post-execution validation" consensus.
+///
+/// **Rationale**: Pre-execution blocking on code quality rules causes:
+/// - False positives blocking entire tasks (SEC-02 on test constants)
+/// - Agent deadlocks (can't proceed, can't fix the pre-existing issue)
+/// - Wasted retry budget on interceptor-blocked tasks
+///
+/// Hard blocking is reserved for the OS-level sandbox and command-level policy
+/// (outside this interceptor), not for code quality scanning.
 pub struct RuleEnforcer {
     rules: Arc<RwLock<RuleEngine>>,
     /// Per-project violation count from the previous scan, used to compute deltas.
@@ -96,26 +107,25 @@ impl TurnInterceptor for RuleEnforcer {
     async fn pre_execute(&self, req: &AgentRequest) -> InterceptResult {
         let engine = self.rules.read().await;
 
-        // Guards are loaded centrally at startup from harness's own
-        // .harness/guards/ directory.  All managed projects are scanned
-        // using the central guard set — no per-project opt-in required.
         if engine.guards().is_empty() {
             tracing::debug!(
                 project_root = %req.project_root.display(),
-                "rule_enforcer: no guards registered, skipping enforcement"
+                "rule_enforcer: no guards registered, skipping"
             );
             return InterceptResult::pass();
         }
 
+        // Fail-open: guard scan errors produce a warning, never block the agent.
+        // A broken guard script should not prevent task execution.
         let violations = match engine.scan(&req.project_root).await {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!(
+                tracing::warn!(
                     error = %e,
                     project_root = %req.project_root.display(),
-                    "rule_enforcer: scan failed on opted-in project"
+                    "rule_enforcer: scan failed (fail-open, agent proceeds)"
                 );
-                return InterceptResult::block(format!("rule_enforcer: scan failed: {e}"));
+                return InterceptResult::pass();
             }
         };
 
@@ -134,7 +144,6 @@ impl TurnInterceptor for RuleEnforcer {
         let fixed_violations = prev.saturating_sub(total);
         self.prev_counts.insert(canonical_key, total);
 
-        // Only log at INFO when the count changes; repeat-same scans go to DEBUG.
         let delta_zero = new_violations == 0 && fixed_violations == 0 && prev > 0;
         if delta_zero {
             tracing::debug!(
@@ -156,13 +165,17 @@ impl TurnInterceptor for RuleEnforcer {
             );
         }
 
-        let critical: Vec<_> = violations
+        // All violations are advisory — injected into agent context as warnings.
+        // Critical and High get a detailed summary; Medium and below are logged only.
+        let actionable: Vec<_> = violations
             .iter()
-            .filter(|v| v.severity == Severity::Critical)
+            .filter(|v| {
+                matches!(v.severity, Severity::Critical | Severity::High)
+            })
             .collect();
 
-        if !critical.is_empty() {
-            let summary = critical
+        if !actionable.is_empty() {
+            let summary = actionable
                 .iter()
                 .map(|v| {
                     let loc = v
@@ -173,26 +186,9 @@ impl TurnInterceptor for RuleEnforcer {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            return InterceptResult::block(format!(
-                "rule_enforcer: {} critical violation(s) must be fixed before proceeding:\n{summary}",
-                critical.len()
-            ));
-        }
-
-        let high: Vec<_> = violations
-            .iter()
-            .filter(|v| v.severity == Severity::High)
-            .collect();
-
-        if !high.is_empty() {
-            let summary = high
-                .iter()
-                .map(|v| format!("[{}] {}", v.rule_id, v.message))
-                .collect::<Vec<_>>()
-                .join("\n");
             return InterceptResult::warn(format!(
-                "rule_enforcer: {} high-severity violation(s) detected:\n{summary}",
-                high.len()
+                "rule_enforcer: {} violation(s) detected (advisory — fix if applicable):\n{summary}",
+                actionable.len()
             ));
         }
 
@@ -214,15 +210,12 @@ mod tests {
         }
     }
 
-    /// Build a guard script that always emits one violation with the given
-    /// severity keyword and rule ID, then register it in a fresh RuleEngine.
     fn engine_with_guard(
         guard_dir: &std::path::Path,
         rule_id: &str,
         severity_keyword: &str,
     ) -> anyhow::Result<Arc<RwLock<RuleEngine>>> {
         let script = guard_dir.join("test-guard.sh");
-        // Output format: FILE:LINE:RULE_ID:MESSAGE
         std::fs::write(
             &script,
             format!(
@@ -248,7 +241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocks_on_critical_violation() -> anyhow::Result<()> {
+    async fn warns_on_critical_violation() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project)?;
@@ -272,12 +265,12 @@ mod tests {
 
         assert_eq!(
             result.decision,
-            Decision::Block,
-            "critical violation must block"
+            Decision::Warn,
+            "critical violation should warn (advisory), not block"
         );
         assert!(
-            result.reason.as_deref().unwrap_or("").contains("critical"),
-            "block reason should mention severity: {:?}",
+            result.reason.as_deref().unwrap_or("").contains("advisory"),
+            "warn reason should mention advisory: {:?}",
             result.reason
         );
         Ok(())
@@ -309,7 +302,7 @@ mod tests {
         assert_eq!(
             result.decision,
             Decision::Warn,
-            "high violation must warn, not block"
+            "high violation must warn"
         );
         Ok(())
     }
@@ -324,7 +317,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocks_when_scan_fails() -> anyhow::Result<()> {
+    async fn passes_when_scan_fails_fail_open() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project)?;
@@ -339,15 +332,10 @@ mod tests {
         let enforcer = RuleEnforcer::new(Arc::new(RwLock::new(engine)));
 
         let result = enforcer.pre_execute(&make_req(&project)).await;
-        assert_eq!(result.decision, Decision::Block);
-        assert!(
-            result
-                .reason
-                .as_deref()
-                .unwrap_or("")
-                .contains("scan failed"),
-            "expected scan failure reason, got: {:?}",
-            result.reason
+        assert_eq!(
+            result.decision,
+            Decision::Pass,
+            "scan failure must fail-open (pass), not block"
         );
         Ok(())
     }
