@@ -15,6 +15,8 @@ use tokio::process::Command;
 
 pub struct CodexAgent {
     pub cli_path: PathBuf,
+    pub default_model: String,
+    pub reasoning_effort: String,
     pub cloud: CodexCloudConfig,
     pub sandbox_mode: SandboxMode,
     /// Maximum seconds of idle silence on the output stream before the
@@ -34,6 +36,8 @@ impl CodexAgent {
     ) -> Self {
         Self {
             cli_path,
+            default_model: "gpt-5.4".to_string(),
+            reasoning_effort: "high".to_string(),
             cloud,
             sandbox_mode,
             stream_timeout_secs: Some(1800),
@@ -41,7 +45,10 @@ impl CodexAgent {
     }
 
     pub fn from_config(config: CodexAgentConfig, sandbox_mode: SandboxMode) -> Self {
-        Self::with_cloud(config.cli_path, config.cloud, sandbox_mode)
+        let mut agent = Self::with_cloud(config.cli_path, config.cloud, sandbox_mode);
+        agent.default_model = config.default_model;
+        agent.reasoning_effort = config.reasoning_effort;
+        agent
     }
 
     /// Set the per-line idle timeout for stream zombie detection.
@@ -55,9 +62,14 @@ impl CodexAgent {
     }
 
     fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
+        let model = req.model.as_deref().unwrap_or(&self.default_model);
         let mut args = vec![
             OsString::from("exec"),
             OsString::from("--skip-git-repo-check"),
+            OsString::from("-m"),
+            OsString::from(model),
+            OsString::from("-c"),
+            OsString::from(format!("model_reasoning_effort=\"{}\"", self.reasoning_effort)),
             OsString::from("-s"),
             OsString::from(codex_sandbox_mode(self.sandbox_mode)),
         ];

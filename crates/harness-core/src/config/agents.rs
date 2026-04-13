@@ -240,6 +240,10 @@ impl Default for ClaudeAgentConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexAgentConfig {
     pub cli_path: PathBuf,
+    #[serde(default = "default_codex_model")]
+    pub default_model: String,
+    #[serde(default = "default_codex_reasoning_effort")]
+    pub reasoning_effort: String,
     #[serde(default)]
     pub cloud: CodexCloudConfig,
 }
@@ -271,10 +275,20 @@ fn default_codex_cloud_cache_ttl_hours() -> u64 {
     12
 }
 
+fn default_codex_model() -> String {
+    "gpt-5.4".to_string()
+}
+
+fn default_codex_reasoning_effort() -> String {
+    "high".to_string()
+}
+
 impl Default for CodexAgentConfig {
     fn default() -> Self {
         Self {
             cli_path: PathBuf::from("codex"),
+            default_model: default_codex_model(),
+            reasoning_effort: default_codex_reasoning_effort(),
             cloud: CodexCloudConfig::default(),
         }
     }
