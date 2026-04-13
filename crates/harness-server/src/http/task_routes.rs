@@ -34,6 +34,54 @@ async fn resolve_project_from_registry(
     }
 }
 
+/// Auto-populate and normalize external_id for deduplication.
+///
+/// Canonical format is `"issue:N"` / `"pr:N"`.  GitHub intake sets a raw
+/// numeric string (`"42"`) while API submissions leave it empty; this
+/// function normalizes both paths to the same canonical form so that
+/// verbatim comparison in `find_active_duplicate` matches correctly.
+fn populate_external_id(req: &mut task_runner::CreateTaskRequest) {
+    match &req.external_id {
+        None => {
+            if let Some(issue) = req.issue {
+                req.external_id = Some(format!("issue:{issue}"));
+            } else if let Some(pr) = req.pr {
+                req.external_id = Some(format!("pr:{pr}"));
+            }
+        }
+        Some(id) => {
+            // Already canonical — nothing to do.
+            if id.starts_with("issue:") || id.starts_with("pr:") {
+                return;
+            }
+            // Raw numeric ID from intake — normalize to canonical form.
+            if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
+                if req.issue.is_some() {
+                    req.external_id = Some(format!("issue:{id}"));
+                } else if req.pr.is_some() {
+                    req.external_id = Some(format!("pr:{id}"));
+                }
+            }
+        }
+    }
+}
+
+/// Return existing active TaskId if one matches project + external_id.
+async fn check_duplicate(
+    tasks: &Arc<crate::task_runner::TaskStore>,
+    project_id: &str,
+    req: &task_runner::CreateTaskRequest,
+) -> Option<task_runner::TaskId> {
+    let ext_id = req.external_id.as_deref()?;
+    let existing_id = tasks.find_active_duplicate(project_id, ext_id).await?;
+    tracing::info!(
+        existing_task = %existing_id.0,
+        external_id = %ext_id,
+        "dedup: returning existing active task instead of creating duplicate"
+    );
+    Some(existing_id)
+}
+
 pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
     mut req: task_runner::CreateTaskRequest,
@@ -79,6 +127,13 @@ pub(crate) async fn enqueue_task(
 
     let project_id = canonical_project.to_string_lossy().into_owned();
     req.project = Some(canonical_project);
+
+    // Auto-populate external_id and check for duplicates before acquiring
+    // a concurrency permit (same dedup as enqueue_task_background).
+    populate_external_id(&mut req);
+    if let Some(existing_id) = check_duplicate(&state.core.tasks, &project_id, &req).await {
+        return Ok(existing_id);
+    }
 
     // Acquire concurrency permit before spawning. Blocks if all slots are
     // occupied; rejects immediately if the waiting queue is full.
@@ -280,6 +335,12 @@ async fn enqueue_task_background(
     let project_id = canonical_project.to_string_lossy().into_owned();
     req.project = Some(canonical_project);
     task_runner::fill_missing_repo_from_project(&mut req).await;
+
+    // Auto-populate external_id and check for duplicates.
+    populate_external_id(&mut req);
+    if let Some(existing_id) = check_duplicate(&state.core.tasks, &project_id, &req).await {
+        return Ok(existing_id);
+    }
 
     let server_config = std::sync::Arc::new(state.core.server.config.clone());
 

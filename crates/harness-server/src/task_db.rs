@@ -270,6 +270,24 @@ impl TaskDb {
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 
+    /// Find an active (non-terminal) task for the same project + external_id.
+    pub async fn find_active_duplicate(
+        &self,
+        project: &str,
+        external_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM tasks WHERE project = ? AND external_id = ? \
+             AND status IN ('pending', 'awaiting_deps', 'implementing', 'agent_review', 'waiting', 'reviewing') \
+             LIMIT 1",
+        )
+        .bind(project)
+        .bind(external_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0))
+    }
+
     /// Return all tasks as lightweight summaries, skipping the heavy `rounds` column.
     ///
     /// Used by the `/tasks` list endpoint to avoid deserializing large round histories
@@ -1620,6 +1638,71 @@ mod tests {
 
         let empty = db.list_by_status(&[]).await?;
         assert!(empty.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_active_duplicate_returns_pending_task() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+        let mut task = make_task("task-issue-42", TaskStatus::Pending);
+        task.external_id = Some("issue:42".to_string());
+        task.project_root = Some(std::path::PathBuf::from("/repo/foo"));
+        db.insert(&task).await?;
+        let dup = db.find_active_duplicate("/repo/foo", "issue:42").await?;
+        assert_eq!(dup, Some("task-issue-42".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_active_duplicate_returns_implementing_task() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+        let mut task = make_task("task-impl-43", TaskStatus::Implementing);
+        task.external_id = Some("issue:43".to_string());
+        task.project_root = Some(std::path::PathBuf::from("/repo/foo"));
+        db.insert(&task).await?;
+        let dup = db.find_active_duplicate("/repo/foo", "issue:43").await?;
+        assert_eq!(dup, Some("task-impl-43".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_active_duplicate_ignores_terminal_tasks() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+        let mut task = make_task("task-done-42", TaskStatus::Done);
+        task.external_id = Some("issue:42".to_string());
+        task.project_root = Some(std::path::PathBuf::from("/repo/foo"));
+        db.insert(&task).await?;
+        let dup = db.find_active_duplicate("/repo/foo", "issue:42").await?;
+        assert_eq!(dup, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_active_duplicate_different_project_no_match() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+        let mut task = make_task("task-proj-a", TaskStatus::Pending);
+        task.external_id = Some("issue:42".to_string());
+        task.project_root = Some(std::path::PathBuf::from("/repo/a"));
+        db.insert(&task).await?;
+        let dup = db.find_active_duplicate("/repo/b", "issue:42").await?;
+        assert_eq!(dup, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_active_duplicate_different_external_id_no_match() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+        let mut task = make_task("task-issue-42", TaskStatus::Pending);
+        task.external_id = Some("issue:42".to_string());
+        task.project_root = Some(std::path::PathBuf::from("/repo/foo"));
+        db.insert(&task).await?;
+        let dup = db.find_active_duplicate("/repo/foo", "issue:99").await?;
+        assert_eq!(dup, None);
         Ok(())
     }
 }
