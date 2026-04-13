@@ -80,7 +80,11 @@ impl TaskStatus {
     }
 
     pub fn is_failure(&self) -> bool {
-        matches!(self, Self::Failed | Self::Cancelled)
+        matches!(self, Self::Failed)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
     }
 
     pub fn terminal_statuses() -> &'static [&'static str] {
@@ -2842,18 +2846,18 @@ mod tests {
     #[test]
     fn task_status_semantics_are_centralized() {
         let cases = [
-            (TaskStatus::Pending, false, false, false, false, false),
-            (TaskStatus::AwaitingDeps, false, false, false, false, false),
-            (TaskStatus::Implementing, false, true, true, false, false),
-            (TaskStatus::AgentReview, false, true, true, false, false),
-            (TaskStatus::Waiting, false, true, true, false, false),
-            (TaskStatus::Reviewing, false, true, true, false, false),
-            (TaskStatus::Done, true, false, false, true, false),
-            (TaskStatus::Failed, true, false, false, false, true),
-            (TaskStatus::Cancelled, true, false, false, false, true),
+            (TaskStatus::Pending, false, false, false, false, false, false),
+            (TaskStatus::AwaitingDeps, false, false, false, false, false, false),
+            (TaskStatus::Implementing, false, true, true, false, false, false),
+            (TaskStatus::AgentReview, false, true, true, false, false, false),
+            (TaskStatus::Waiting, false, true, true, false, false, false),
+            (TaskStatus::Reviewing, false, true, true, false, false, false),
+            (TaskStatus::Done, true, false, false, true, false, false),
+            (TaskStatus::Failed, true, false, false, false, true, false),
+            (TaskStatus::Cancelled, true, false, false, false, false, true),
         ];
 
-        for (status, terminal, inflight, resumable, success, failure) in cases {
+        for (status, terminal, inflight, resumable, success, failure, cancelled) in cases {
             assert_eq!(status.is_terminal(), terminal, "{status:?} terminal");
             assert_eq!(status.is_inflight(), inflight, "{status:?} inflight");
             assert_eq!(
@@ -2863,6 +2867,7 @@ mod tests {
             );
             assert_eq!(status.is_success(), success, "{status:?} success");
             assert_eq!(status.is_failure(), failure, "{status:?} failure");
+            assert_eq!(status.is_cancelled(), cancelled, "{status:?} cancelled");
         }
 
         assert_eq!(

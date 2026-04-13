@@ -59,7 +59,7 @@ pub(crate) async fn run_skill_governance_tick(
             Some(status) if status.is_success() => {
                 entry.success = entry.success.saturating_add(1);
             }
-            Some(TaskStatus::Failed) => {
+            Some(status) if status.is_failure() => {
                 entry.fail = entry.fail.saturating_add(1);
             }
             Some(_) | None => entry.unknown = entry.unknown.saturating_add(1),

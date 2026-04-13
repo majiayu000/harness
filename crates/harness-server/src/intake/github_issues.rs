@@ -231,7 +231,7 @@ impl IntakeSource for GitHubIssuesPoller {
     ) -> anyhow::Result<()> {
         // Remove failed or cancelled issues from dispatched so the poller can retry
         // them later if they remain open. Done tasks stay dispatched to avoid re-processing.
-        if matches!(result.status, TaskStatus::Failed | TaskStatus::Cancelled) {
+        if result.status.is_failure() || result.status.is_cancelled() {
             self.dispatched.remove(external_id);
             self.persist_dispatched();
         }

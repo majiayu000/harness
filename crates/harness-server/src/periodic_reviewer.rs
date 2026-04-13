@@ -1303,6 +1303,9 @@ async fn poll_task_output(
         if !task.status.is_terminal() {
             continue;
         }
+        if task.status.is_cancelled() {
+            return None;
+        }
         if task.status.is_failure() {
             tracing::error!(
                 task_id = %task_id,
