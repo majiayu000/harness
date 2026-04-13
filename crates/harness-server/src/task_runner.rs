@@ -643,6 +643,20 @@ pub struct DashboardCounts {
     pub by_project: HashMap<String, ProjectCounts>,
 }
 
+/// Lightweight inputs collected for LLM metrics computation.
+///
+/// Turn counts span all tasks (active + terminal) via DB summaries so the
+/// queue-idle case returns real numbers.  Latencies come from the active
+/// cache only (no full `TaskState` clone) and skip synthetic
+/// `resumed_checkpoint` rounds so resumed tasks are not silently excluded.
+#[derive(Debug)]
+pub struct LlmMetricsInputs {
+    /// Non-zero turn counts across all tasks, active and terminal.
+    pub turn_counts: Vec<u32>,
+    /// First real first-token latency per active task (milliseconds).
+    pub first_token_latencies: Vec<u64>,
+}
+
 pub struct TaskStore {
     pub(crate) cache: DashMap<TaskId, TaskState>,
     db: TaskDb,
@@ -1024,6 +1038,56 @@ impl TaskStore {
                     by_project: HashMap::new(),
                 }
             }
+        }
+    }
+
+    /// Collect lightweight inputs for LLM metrics computation.
+    ///
+    /// **Turn counts** are fetched from `list_all_summaries_with_terminal` so
+    /// they include both active and historical terminal tasks.  When the queue
+    /// is idle this avoids reporting zeros that would misrepresent overall
+    /// throughput.
+    ///
+    /// **First-token latencies** are read directly from the in-memory cache
+    /// entries using `DashMap` references — no full `TaskState` is cloned, so
+    /// large `rounds.detail` strings are never materialised on the heap.
+    /// Rounds whose `result` is `"resumed_checkpoint"` are skipped: they are
+    /// synthetic markers with no real latency data and would silently exclude
+    /// the recovered task from the p50 calculation.
+    pub async fn collect_llm_metrics_inputs(&self) -> LlmMetricsInputs {
+        // Turn counts: DB summaries are lightweight (no rounds field) and cover
+        // terminal tasks that have already left the in-memory cache.
+        let turn_counts = match self.list_all_summaries_with_terminal().await {
+            Ok(summaries) => summaries
+                .into_iter()
+                .filter(|s| s.turn > 0)
+                .map(|s| s.turn)
+                .collect(),
+            Err(e) => {
+                tracing::warn!("collect_llm_metrics_inputs: summaries query failed: {e}");
+                vec![]
+            }
+        };
+
+        // Latencies: iterate cache refs in-place; never clone full TaskState.
+        // Find the first round that is not the synthetic resume marker and take
+        // its latency — that is the real "cold-start" latency for the task.
+        let mut first_token_latencies: Vec<u64> = Vec::new();
+        for entry in self.cache.iter() {
+            let task = entry.value();
+            if let Some(latency) = task
+                .rounds
+                .iter()
+                .find(|r| r.result != "resumed_checkpoint")
+                .and_then(|r| r.first_token_latency_ms)
+            {
+                first_token_latencies.push(latency);
+            }
+        }
+
+        LlmMetricsInputs {
+            turn_counts,
+            first_token_latencies,
         }
     }
 

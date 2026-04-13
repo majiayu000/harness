@@ -66,25 +66,26 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     };
 
     // LLM-specific metrics derived from in-memory task state and event store.
+    //
+    // collect_llm_metrics_inputs() avoids two pitfalls:
+    // 1. Performance: does NOT call list_all() which would clone full TaskState
+    //    values (including large rounds.detail strings) on every 5-second poll.
+    //    Turn counts come from lightweight DB summaries; latencies are read
+    //    in-place from cache refs without any full-TaskState allocation.
+    // 2. Correctness: turn counts include terminal tasks from the DB so the
+    //    metrics are not zero when the queue is idle.  Latency computation skips
+    //    the synthetic "resumed_checkpoint" round injected at recovery time so
+    //    resumed tasks are not silently excluded from the p50.
     let llm_metrics: Value = {
-        let all_tasks = state.core.tasks.list_all();
-        // avg_turns: mean of task.turn across all non-zero tasks
-        let turn_counts: Vec<u32> = all_tasks
-            .iter()
-            .filter(|t| t.turn > 0)
-            .map(|t| t.turn)
-            .collect();
+        let inputs = state.core.tasks.collect_llm_metrics_inputs().await;
+        let turn_counts = inputs.turn_counts;
         let avg_turns: Option<f64> = if turn_counts.is_empty() {
             None
         } else {
             Some(turn_counts.iter().map(|&t| t as f64).sum::<f64>() / turn_counts.len() as f64)
         };
         let p50_turns = stats::p50_turns(&turn_counts);
-        // p50_first_token_latency_ms: from first round of each task
-        let mut latencies: Vec<u64> = all_tasks
-            .iter()
-            .filter_map(|t| t.rounds.first().and_then(|r| r.first_token_latency_ms))
-            .collect();
+        let mut latencies = inputs.first_token_latencies;
         latencies.sort_unstable();
         let p50_first_token_latency_ms: Option<u64> = if latencies.is_empty() {
             None
