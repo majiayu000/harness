@@ -34,13 +34,34 @@ async fn resolve_project_from_registry(
     }
 }
 
-/// Auto-populate external_id from issue/pr for deduplication.
+/// Auto-populate and normalize external_id for deduplication.
+///
+/// Canonical format is `"issue:N"` / `"pr:N"`.  GitHub intake sets a raw
+/// numeric string (`"42"`) while API submissions leave it empty; this
+/// function normalizes both paths to the same canonical form so that
+/// verbatim comparison in `find_active_duplicate` matches correctly.
 fn populate_external_id(req: &mut task_runner::CreateTaskRequest) {
-    if req.external_id.is_none() {
-        if let Some(issue) = req.issue {
-            req.external_id = Some(format!("issue:{issue}"));
-        } else if let Some(pr) = req.pr {
-            req.external_id = Some(format!("pr:{pr}"));
+    match &req.external_id {
+        None => {
+            if let Some(issue) = req.issue {
+                req.external_id = Some(format!("issue:{issue}"));
+            } else if let Some(pr) = req.pr {
+                req.external_id = Some(format!("pr:{pr}"));
+            }
+        }
+        Some(id) => {
+            // Already canonical — nothing to do.
+            if id.starts_with("issue:") || id.starts_with("pr:") {
+                return;
+            }
+            // Raw numeric ID from intake — normalize to canonical form.
+            if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
+                if req.issue.is_some() {
+                    req.external_id = Some(format!("issue:{id}"));
+                } else if req.pr.is_some() {
+                    req.external_id = Some(format!("pr:{id}"));
+                }
+            }
         }
     }
 }
