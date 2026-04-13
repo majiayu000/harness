@@ -54,8 +54,8 @@ pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str, repo: &str
          1. Create an isolated worktree:\n\
             ```\n\
             git fetch origin {branch}\n\
-            git worktree prune\n\
-            rm -rf /tmp/harness-pr-{pr_number} 2>/dev/null || true\n\
+            git worktree remove --force /tmp/harness-pr-{pr_number} 2>/dev/null || true\n\
+            git worktree prune 2>/dev/null || true\n\
             git worktree add /tmp/harness-pr-{pr_number} {branch}\n\
             ```\n\
          2. Read the PR diff and any review comments:\n\
@@ -362,8 +362,8 @@ pub fn review_prompt(
          IMPORTANT: Never run `git checkout` or `git stash` in the main repository working tree.\n\
          If you need to modify files, first create an isolated worktree:\n\
            git fetch origin <branch>\n\
-           git worktree prune\n\
-           rm -rf /tmp/harness-review-{pr} 2>/dev/null || true\n\
+           git worktree remove --force /tmp/harness-review-{pr} 2>/dev/null || true\n\
+           git worktree prune 2>/dev/null || true\n\
            git worktree add /tmp/harness-review-{pr} <branch>\n\
          Then do all editing, testing, and pushing from /tmp/harness-review-{pr},\n\
          and remove it when done: git worktree remove /tmp/harness-review-{pr}\n\
