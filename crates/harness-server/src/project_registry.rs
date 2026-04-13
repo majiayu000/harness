@@ -152,6 +152,12 @@ fn ensure_unique_identity(
                 &entry.id,
             ));
         }
+        // Inverse check: new project's ID must not equal an existing project's
+        // canonical root alias, or resolve_project_input would hijack path
+        // lookups for that existing project to the new one.
+        if project.id == canonical_root_alias(&entry.root) {
+            return Err(invalid_project_id(&project.id));
+        }
     }
 
     Ok(())
@@ -236,7 +242,17 @@ pub fn resolve_configured_project_limits(
     default_root: &Path,
     limits: &harness_core::config::misc::PerProjectConcurrencyLimits,
 ) -> anyhow::Result<std::collections::HashMap<String, usize>> {
-    let mut resolved = limits.by_id().clone();
+    let mut resolved = std::collections::HashMap::new();
+
+    // For the Typed variant, by_id keys are already project IDs — copy directly
+    // without resolution.  Skip this for the Legacy variant because by_id() and
+    // legacy() return the *same* underlying map there; copying first and then
+    // resolving again in the legacy branch would leave raw path keys alongside
+    // their resolved counterparts.
+    if limits.legacy().is_none() {
+        resolved.extend(limits.by_id().iter().map(|(k, v)| (k.clone(), *v)));
+    }
+
     if let Some(legacy) = limits.legacy() {
         for (key, value) in legacy {
             let resolved_key = resolve_configured_limit_key(projects, default_root, key)?;
@@ -262,10 +278,19 @@ pub fn resolve_project_input(
     match requested {
         None => resolve_default_from_projects(projects, default_root),
         Some(path) => {
+            // Resolve relative paths against default_root, not the process CWD,
+            // so behaviour is deterministic regardless of where the binary was
+            // launched from.
+            let full_path: std::borrow::Cow<'_, Path> = if path.is_absolute() {
+                std::borrow::Cow::Borrowed(path)
+            } else {
+                std::borrow::Cow::Owned(default_root.join(path))
+            };
+
             // Only treat the literal string "default" as the default-project
             // sentinel when it is not an actual directory on disk.  A relative
             // directory named "default" must go through normal path resolution.
-            if path == Path::new(DEFAULT_PROJECT_ID) && !path.is_dir() {
+            if path == Path::new(DEFAULT_PROJECT_ID) && !full_path.is_dir() {
                 return resolve_default_from_projects(projects, default_root);
             }
 
@@ -274,7 +299,7 @@ pub fn resolve_project_input(
                 return Ok(ResolvedProject::from_project(clone_project_root(project)));
             }
 
-            let canonical_root = canonicalize_root(path)?;
+            let canonical_root = canonicalize_root(&full_path)?;
             if let Some(project) = find_exact_root_match(projects, &canonical_root) {
                 return Ok(ResolvedProject::from_project(clone_project_root(project)));
             }
@@ -343,7 +368,7 @@ impl ProjectRegistry {
         // unique constraint so that upgrading from an older DB that allowed
         // duplicate roots does not cause a startup outage.  Keep the row with
         // the lowest rowid (oldest entry) for each root value.
-        sqlx::query(
+        let delete_result = sqlx::query(
             "DELETE FROM projects WHERE rowid NOT IN (\
                 SELECT MIN(rowid) FROM projects \
                 GROUP BY json_extract(data, '$.root')\
@@ -351,6 +376,14 @@ impl ProjectRegistry {
         )
         .execute(self.db.pool())
         .await?;
+        let deleted = delete_result.rows_affected();
+        if deleted > 0 {
+            tracing::warn!(
+                deleted_rows = deleted,
+                "removed duplicate project rows during startup deduplication; \
+                 only the oldest row per canonical root was kept"
+            );
+        }
 
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_canonical_root \
@@ -1185,6 +1218,19 @@ mod tests {
 
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// RAII guard that restores the process working directory on drop.
+    struct CwdGuard(std::path::PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            if let Err(e) = std::env::set_current_dir(&self.0) {
+                eprintln!(
+                    "CwdGuard: failed to restore working directory to {}: {e}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+
     fn test_project(root: PathBuf, id: &str) -> Project {
         Project {
             id: id.to_string(),
@@ -1506,33 +1552,32 @@ mod tests {
     #[tokio::test]
     async fn relative_directory_input_does_not_resolve_to_registered_suffix_alias(
     ) -> anyhow::Result<()> {
-        let _cwd_guard = CWD_LOCK.lock().unwrap();
-        let original_cwd = std::env::current_dir()?;
+        let _lock = CWD_LOCK.lock().unwrap();
+        let _cwd = CwdGuard(std::env::current_dir()?);
 
-        let result = (|| -> anyhow::Result<()> {
-            let project_root = tempfile::tempdir()?;
-            let canonical_project_root = project_root.path().canonicalize()?;
-            let nested = canonical_project_root.join("foo");
-            std::fs::create_dir(&nested)?;
-            std::env::set_current_dir(project_root.path())?;
+        let project_root = tempfile::tempdir()?;
+        let canonical_project_root = project_root.path().canonicalize()?;
+        let nested = canonical_project_root.join("foo");
+        std::fs::create_dir(&nested)?;
+        // Set CWD so that the test mirrors a realistic server launch context;
+        // resolve_project_input now anchors relative paths to default_root
+        // rather than CWD, so this does not affect the outcome.
+        std::env::set_current_dir(project_root.path())?;
 
-            let registered_root = tempfile::tempdir()?;
-            let registered_root = registered_root.path().join("parent").join("foo");
-            std::fs::create_dir_all(&registered_root)?;
-            let registered_root = registered_root.canonicalize()?;
+        let registered_root = tempfile::tempdir()?;
+        let registered_root = registered_root.path().join("parent").join("foo");
+        std::fs::create_dir_all(&registered_root)?;
+        let registered_root = registered_root.canonicalize()?;
 
-            let project = resolve_project_input(
-                &[test_project(registered_root, "registered")],
-                Some(Path::new("foo")),
-                project_root.path(),
-            )?;
+        let project = resolve_project_input(
+            &[test_project(registered_root, "registered")],
+            Some(Path::new("foo")),
+            project_root.path(),
+        )?;
 
-            assert_eq!(project.root, nested.canonicalize()?);
-            assert_eq!(project.id, nested.to_string_lossy());
-            Ok(())
-        })();
-
-        std::env::set_current_dir(original_cwd)?;
+        assert_eq!(project.root, nested.canonicalize()?);
+        assert_eq!(project.id, nested.to_string_lossy());
+        let result: anyhow::Result<()> = Ok(());
         result
     }
 

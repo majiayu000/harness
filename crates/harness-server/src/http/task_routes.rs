@@ -7,41 +7,6 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-/// Resolve a project path-or-ID through the registry.
-///
-/// If `project` is `None` or already points to an existing directory it is
-/// returned unchanged.  If it is not a directory and a `registry` is
-/// available, the value is treated as a project ID and looked up; a missing
-/// ID is a `BadRequest` error.  When no registry is available the raw value
-/// is passed through so downstream canonicalization can handle it.
-async fn resolve_project_from_registry(
-    registry: Option<&crate::project_registry::ProjectRegistry>,
-    project_root: &std::path::Path,
-    project: Option<std::path::PathBuf>,
-) -> Result<Option<std::path::PathBuf>, EnqueueTaskError> {
-    let (Some(registry), Some(project_path)) = (registry, project.clone()) else {
-        return Ok(project);
-    };
-
-    let explicit_path = if project_path.is_absolute() {
-        project_path.clone()
-    } else {
-        project_root.join(&project_path)
-    };
-    if explicit_path.is_dir() {
-        return Ok(Some(project_path));
-    }
-
-    let id = project_path.to_string_lossy();
-    match registry.resolve_path(&id).await {
-        Ok(Some(root)) => Ok(Some(root)),
-        Ok(None) => Err(EnqueueTaskError::BadRequest(format!(
-            "project '{id}' not found in registry and is not a valid directory"
-        ))),
-        Err(e) => Err(EnqueueTaskError::Internal(e.to_string())),
-    }
-}
-
 fn normalize_request_project_path(
     project_root: &std::path::Path,
     project: Option<std::path::PathBuf>,
@@ -80,12 +45,11 @@ async fn resolve_request_project(
     state: &Arc<AppState>,
     project: Option<std::path::PathBuf>,
 ) -> Result<(String, std::path::PathBuf), EnqueueTaskError> {
-    let project = resolve_project_from_registry(
-        state.core.project_registry.as_deref(),
-        &state.core.project_root,
-        project,
-    )
-    .await?;
+    if state.core.project_registry.is_some() {
+        // registry.resolve_project handles ID lookup, path canonicalization, and
+        // relative-path anchoring in one pass — no pre-resolution step needed.
+        return resolve_queue_identity(state, project).await;
+    }
     let project = normalize_request_project_path(&state.core.project_root, project);
     resolve_queue_identity(state, project).await
 }
@@ -822,107 +786,6 @@ mod tests {
         let json = r#"{"issues": [1]}"#;
         let req: BatchCreateTaskRequest = serde_json::from_str(json).unwrap();
         assert!(req.project.is_none());
-    }
-
-    #[tokio::test]
-    async fn resolve_project_from_registry_passes_through_none() {
-        let result = resolve_project_from_registry(None, std::path::Path::new("."), None).await;
-        assert!(result.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn resolve_project_from_registry_passes_through_existing_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        let result =
-            resolve_project_from_registry(None, std::path::Path::new("."), Some(path.clone()))
-                .await;
-        assert_eq!(result.unwrap(), Some(path));
-    }
-
-    #[tokio::test]
-    async fn resolve_project_from_registry_no_registry_passes_through_nondir() {
-        // When no registry is available, non-dir paths are returned as-is
-        // (downstream canonicalization handles them).
-        let path = std::path::PathBuf::from("/nonexistent/path");
-        let result =
-            resolve_project_from_registry(None, std::path::Path::new("."), Some(path.clone()))
-                .await;
-        assert_eq!(result.unwrap(), Some(path));
-    }
-
-    #[tokio::test]
-    async fn resolve_project_from_registry_resolves_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
-            .await
-            .unwrap();
-        let project_root = tempfile::tempdir().unwrap();
-        let canonical_root = project_root.path().canonicalize().unwrap();
-        registry
-            .register(crate::project_registry::Project {
-                id: "my-repo".to_string(),
-                root: canonical_root.clone(),
-                max_concurrent: None,
-                default_agent: None,
-                active: true,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-            })
-            .await
-            .unwrap();
-
-        let result = resolve_project_from_registry(
-            Some(&registry),
-            dir.path(),
-            Some(std::path::PathBuf::from("my-repo")),
-        )
-        .await;
-        assert_eq!(result.unwrap(), Some(canonical_root));
-    }
-
-    #[tokio::test]
-    async fn resolve_project_from_registry_resolves_registered_root_alias() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
-            .await
-            .unwrap();
-        let root_dir = tempfile::tempdir().unwrap();
-        let canonical_root = root_dir.path().canonicalize().unwrap();
-        registry
-            .register(crate::project_registry::Project {
-                id: "my-repo".to_string(),
-                root: canonical_root.clone(),
-                max_concurrent: None,
-                default_agent: None,
-                active: true,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-            })
-            .await
-            .unwrap();
-
-        let result = resolve_project_from_registry(
-            Some(&registry),
-            dir.path(),
-            Some(canonical_root.clone()),
-        )
-        .await;
-        assert_eq!(result.unwrap(), Some(canonical_root));
-    }
-
-    #[tokio::test]
-    async fn resolve_project_from_registry_unknown_id_returns_bad_request() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
-            .await
-            .unwrap();
-
-        let result = resolve_project_from_registry(
-            Some(&registry),
-            dir.path(),
-            Some(std::path::PathBuf::from("unknown-repo")),
-        )
-        .await;
-        assert!(matches!(result, Err(EnqueueTaskError::BadRequest(_))));
     }
 
     #[tokio::test]
