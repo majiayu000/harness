@@ -337,15 +337,20 @@ impl Default for CreateTaskRequest {
 }
 
 fn summarize_request_description(req: &CreateTaskRequest) -> Option<String> {
-    // Only persist structured safe labels (issue/PR IDs).
-    // Prompt text is deliberately excluded: it may contain credentials or customer
-    // data that must not be durably stored or exposed cross-task via the dashboard
-    // or sibling-awareness prompts.
+    // Only persist structured safe labels — never raw prompt text, which may contain
+    // credentials or customer data.
     if let Some(n) = req.issue {
         return Some(format!("issue #{n}"));
     }
     if let Some(n) = req.pr {
         return Some(format!("PR #{n}"));
+    }
+    // Prompt-only tasks: store a generic label so that:
+    //   (a) sibling-awareness can include them (prevents parallel agents stomping the same files),
+    //   (b) operators can identify crashed tasks in the DB/dashboard after a restart.
+    // The prompt itself is deliberately not stored.
+    if req.prompt.is_some() {
+        return Some("prompt task".to_string());
     }
     None
 }
