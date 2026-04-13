@@ -48,16 +48,13 @@ fn startup_default_project_for_root(
 }
 
 pub async fn run(
-    mut config: HarnessConfig,
+    config: HarnessConfig,
     transport: Option<String>,
     port: Option<u16>,
     project_root: Option<PathBuf>,
     projects: Vec<String>,
     default_project: Option<String>,
 ) -> Result<()> {
-    // Apply env var overrides before CLI flags so CLI always wins.
-    config.apply_env_overrides()?;
-
     // On macOS, sandbox-exec (Seatbelt) with deny-default policy causes SIGTRAP
     // in Claude Code CLI. Only enforce danger-full-access when a Claude path
     // is actually configured to run.

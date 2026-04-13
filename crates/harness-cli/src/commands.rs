@@ -271,12 +271,16 @@ fn configured_skill_store(
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Load config
-    let config = if let Some(config_path) = &cli.config {
+    let mut config: harness_core::config::HarnessConfig = if let Some(config_path) = &cli.config {
         let content = std::fs::read_to_string(config_path)?;
         toml::from_str(&content)?
     } else {
         harness_core::config::HarnessConfig::default()
     };
+    // Apply env var overrides for all subcommands so that HARNESS_DATA_DIR,
+    // HARNESS_PROJECT_ROOT, etc. are respected by gc, rule check, and skill
+    // commands — not just `serve`.
+    config.apply_env_overrides()?;
 
     match cli.command {
         Command::Serve {

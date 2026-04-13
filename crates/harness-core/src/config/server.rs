@@ -90,10 +90,14 @@ impl ServerConfig {
             self.project_root = std::path::PathBuf::from(v);
         }
         if let Ok(v) = std::env::var("HARNESS_API_TOKEN") {
-            self.api_token = Some(v);
+            if !v.is_empty() {
+                self.api_token = Some(v);
+            }
         }
         if let Ok(v) = std::env::var("GITHUB_TOKEN") {
-            self.github_token = Some(v);
+            if !v.is_empty() {
+                self.github_token = Some(v);
+            }
         }
         Ok(())
     }
@@ -261,6 +265,31 @@ mod tests {
             let mut cfg = ServerConfig::default();
             let result = cfg.apply_env_overrides();
             assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn env_override_empty_api_token_does_not_override_toml_token() {
+        temp_env::with_vars([("HARNESS_API_TOKEN", Some(""))], || {
+            let mut cfg = ServerConfig {
+                api_token: Some("real-token".to_string()),
+                ..ServerConfig::default()
+            };
+            cfg.apply_env_overrides().unwrap();
+            // Empty env var must not overwrite a valid TOML token.
+            assert_eq!(cfg.api_token, Some("real-token".to_string()));
+        });
+    }
+
+    #[test]
+    fn env_override_empty_github_token_does_not_override_toml_token() {
+        temp_env::with_vars([("GITHUB_TOKEN", Some(""))], || {
+            let mut cfg = ServerConfig {
+                github_token: Some("gh-real".to_string()),
+                ..ServerConfig::default()
+            };
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.github_token, Some("gh-real".to_string()));
         });
     }
 
