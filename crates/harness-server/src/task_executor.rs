@@ -487,15 +487,14 @@ async fn run_agent_streaming(
                             StreamItem::ItemCompleted {
                                 item: Item::AgentReasoning { content },
                             } => {
-                                // Do NOT set first_output_at here: backends that emit
-                                // ItemCompleted without any prior MessageDelta (e.g.
-                                // AnthropicApiAgent) only produce this event after the
-                                // entire blocking execute() call returns, so recording
-                                // it as first-token latency would measure full-turn
-                                // completion time instead.  first_output_at is only
-                                // meaningful for genuinely streaming backends (set in
-                                // the MessageDelta arm above).
-                                //
+                                // For non-streaming backends (e.g. AnthropicApiAgent)
+                                // that never emit MessageDelta, capture first_output_at
+                                // here so the latency metric is not permanently null for
+                                // those backends.  Streaming backends set it in the
+                                // MessageDelta arm above, so this is a no-op for them.
+                                if first_output_at.is_none() {
+                                    first_output_at = Some(Utc::now().to_rfc3339());
+                                }
                                 // Prefer the full content over accumulated deltas.
                                 output = content.clone();
                             }
@@ -845,6 +844,15 @@ pub(crate) async fn run_task(
         (None, prompts::TriageComplexity::Medium, 0u32)
     } else if let Some(plan) = resumed_plan {
         // Plan checkpoint found — use saved plan, skip triage/plan pipeline.
+        // Re-stamp execution_started_at so avg_first_token_latency_ms measures
+        // implementation latency only.  This also closes the crash window: if the
+        // server died after writing the plan_done checkpoint but before the
+        // force_execution_started_at() call in the normal path, the idempotent
+        // set_execution_started_at() in update_status() would not repair the stale
+        // pre-planning timestamp.
+        store
+            .force_execution_started_at(task_id, &chrono::Utc::now().to_rfc3339())
+            .await;
         tracing::info!(task_id = %task_id, "checkpoint resume: using saved plan, skipping triage/plan");
         (Some(plan), prompts::TriageComplexity::Medium, 0u32)
     } else if let Some(issue) = req.issue {
