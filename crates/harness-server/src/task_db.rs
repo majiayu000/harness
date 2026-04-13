@@ -297,10 +297,12 @@ impl TaskDb {
             .await?;
         let mut summaries = Vec::with_capacity(rows.len());
         for row in rows {
+            let task_id = row.id.clone();
             match row.try_into_summary() {
                 Ok(summary) => summaries.push(summary),
                 Err(error) => {
                     tracing::error!(
+                        task_id = %task_id,
                         "task_db.list_summaries: skipping malformed summary row: {error}"
                     );
                 }
@@ -463,10 +465,15 @@ impl TaskDb {
             let has_triage = row.triage_output.is_some();
 
             if has_pr || has_plan || has_triage {
-                let resumed_phase = if has_plan {
-                    "plan"
+                // Phase represents the next step to execute, not the checkpoint that was found.
+                // PR takes highest precedence: if a PR exists, resume at review phase.
+                // Plan checkpoint means implementation is next. Triage means planning is next.
+                let resumed_phase = if has_pr {
+                    "review"
+                } else if has_plan {
+                    "implement"
                 } else if has_triage {
-                    "triage"
+                    "plan"
                 } else {
                     "implement"
                 };
@@ -1680,7 +1687,8 @@ mod tests {
             .await?
             .expect("resumed task should exist");
         assert!(matches!(resumed.status, TaskStatus::Pending));
-        assert_eq!(resumed.phase, TaskPhase::Implement);
+        // PR exists → resume at review phase
+        assert_eq!(resumed.phase, TaskPhase::Review);
 
         let failed = db
             .get("task-recover-phase-failed")
@@ -1714,7 +1722,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_in_progress_preserves_plan_phase_for_resumed_plan_checkpoint(
+    async fn recover_in_progress_sets_implement_phase_for_resumed_plan_checkpoint(
     ) -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
@@ -1738,12 +1746,13 @@ mod tests {
             .await?
             .expect("plan checkpoint task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Plan);
+        // plan checkpoint means the next step is implementation
+        assert_eq!(loaded.phase, TaskPhase::Implement);
         Ok(())
     }
 
     #[tokio::test]
-    async fn recover_in_progress_preserves_triage_phase_for_resumed_triage_checkpoint(
+    async fn recover_in_progress_sets_plan_phase_for_resumed_triage_checkpoint(
     ) -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
@@ -1767,7 +1776,8 @@ mod tests {
             .await?
             .expect("triage checkpoint task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Triage);
+        // triage checkpoint means the next step is planning
+        assert_eq!(loaded.phase, TaskPhase::Plan);
         Ok(())
     }
 
@@ -1827,7 +1837,8 @@ mod tests {
             .await?
             .expect("writeback task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Plan);
+        // PR takes precedence over plan checkpoint: next step is review
+        assert_eq!(loaded.phase, TaskPhase::Review);
         assert_eq!(
             loaded.pr_url.as_deref(),
             Some("https://github.com/owner/repo/pull/99")
@@ -1836,7 +1847,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_in_progress_preserves_implement_phase_for_pr_resume_without_checkpoint(
+    async fn recover_in_progress_sets_review_phase_for_pr_resume_without_checkpoint(
     ) -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
@@ -1853,7 +1864,8 @@ mod tests {
             .await?
             .expect("resumed PR task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Implement);
+        // PR exists → resume at review phase
+        assert_eq!(loaded.phase, TaskPhase::Review);
         Ok(())
     }
 
@@ -1879,7 +1891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_in_progress_sets_implement_phase_for_planless_resume() -> anyhow::Result<()> {
+    async fn recover_in_progress_sets_review_phase_for_planless_resume() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
 
@@ -1895,7 +1907,8 @@ mod tests {
             .await?
             .expect("resumed task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Implement);
+        // PR exists → resume at review phase
+        assert_eq!(loaded.phase, TaskPhase::Review);
         Ok(())
     }
 
@@ -1923,7 +1936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_in_progress_preserves_plan_phase_when_checkpoint_and_pr_both_exist(
+    async fn recover_in_progress_sets_review_phase_when_checkpoint_and_pr_both_exist(
     ) -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
@@ -1948,7 +1961,8 @@ mod tests {
             .await?
             .expect("plan+pr task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Plan);
+        // PR takes precedence over plan checkpoint: resume at review
+        assert_eq!(loaded.phase, TaskPhase::Review);
         Ok(())
     }
 
@@ -1977,7 +1991,8 @@ mod tests {
             .await?
             .expect("triage-only task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Triage);
+        // triage checkpoint means next step is planning
+        assert_eq!(loaded.phase, TaskPhase::Plan);
         Ok(())
     }
 
@@ -2024,7 +2039,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_in_progress_preserves_plan_phase_when_last_phase_is_pr_created(
+    async fn recover_in_progress_sets_review_phase_when_last_phase_is_pr_created(
     ) -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
@@ -2048,7 +2063,8 @@ mod tests {
             .await?
             .expect("pr_created task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Plan);
+        // PR (from checkpoint) takes precedence over plan: resume at review
+        assert_eq!(loaded.phase, TaskPhase::Review);
         Ok(())
     }
 
@@ -2114,7 +2130,8 @@ mod tests {
             .await?
             .expect("stale review task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Implement);
+        // PR exists → resume at review phase
+        assert_eq!(loaded.phase, TaskPhase::Review);
         Ok(())
     }
 
@@ -2164,7 +2181,8 @@ mod tests {
             .await?
             .expect("stale review triage task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Triage);
+        // triage checkpoint means next step is planning
+        assert_eq!(loaded.phase, TaskPhase::Plan);
         Ok(())
     }
 
@@ -2193,7 +2211,8 @@ mod tests {
             .await?
             .expect("stale review plan task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Plan);
+        // plan checkpoint means next step is implementation
+        assert_eq!(loaded.phase, TaskPhase::Implement);
         Ok(())
     }
 
@@ -2249,7 +2268,8 @@ mod tests {
             .await?
             .expect("checkpoint writeback stale task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Plan);
+        // PR (from checkpoint) takes precedence over plan: resume at review
+        assert_eq!(loaded.phase, TaskPhase::Review);
         Ok(())
     }
 
@@ -2352,7 +2372,8 @@ mod tests {
             .await?
             .expect("checkpoint no-pr task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Plan);
+        // plan checkpoint, no PR: next step is implementation
+        assert_eq!(loaded.phase, TaskPhase::Implement);
         Ok(())
     }
 
@@ -2381,7 +2402,8 @@ mod tests {
             .await?
             .expect("triage no-pr task should exist");
         assert!(matches!(loaded.status, TaskStatus::Pending));
-        assert_eq!(loaded.phase, TaskPhase::Triage);
+        // triage checkpoint, no PR: next step is planning
+        assert_eq!(loaded.phase, TaskPhase::Plan);
         Ok(())
     }
 
