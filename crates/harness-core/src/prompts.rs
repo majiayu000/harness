@@ -51,12 +51,12 @@ pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str, repo: &str
          IMPORTANT: Never run `git checkout` or `git stash` in the main repository working tree.\n\
          All work must be done in an isolated worktree.\n\n\
          Steps:\n\
-         1. Create an isolated worktree:\n\
+         1. Create an isolated worktree with a unique path to avoid collisions with concurrent runs:\n\
             ```\n\
             git fetch origin {branch}\n\
-            git worktree remove --force /tmp/harness-pr-{pr_number} 2>/dev/null || true\n\
-            git worktree prune 2>/dev/null || true\n\
-            git worktree add /tmp/harness-pr-{pr_number} {branch}\n\
+            WORKTREE=$(mktemp -d /tmp/harness-pr-{pr_number}-XXXXXX)\n\
+            rmdir \"$WORKTREE\"\n\
+            git worktree add \"$WORKTREE\" {branch}\n\
             ```\n\
          2. Read the PR diff and any review comments:\n\
             - `gh pr diff {pr_number}`\n\
@@ -64,11 +64,11 @@ pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str, repo: &str
             - `gh api repos/{repo}/pulls/{pr_number}/reviews`\n\
          3. Read the original issue requirements: `gh issue view {issue}`\n\
          4. Fix any unresolved review comments and continue the implementation if incomplete.\n\
-            All editing must happen inside `/tmp/harness-pr-{pr_number}`.\n\
-         5. Run `cd /tmp/harness-pr-{pr_number} && cargo check && cargo test`\n\
+            All editing must happen inside `$WORKTREE`.\n\
+         5. Run `cd \"$WORKTREE\" && cargo check && cargo test`\n\
          6. Commit and push from the worktree to the SAME branch `{branch}` — do NOT create a new PR:\n\
-            `cd /tmp/harness-pr-{pr_number} && git push origin {branch}`\n\
-         7. Clean up: `git worktree remove /tmp/harness-pr-{pr_number}`\n\n\
+            `cd \"$WORKTREE\" && git push origin {branch}`\n\
+         7. Clean up: `git worktree remove \"$WORKTREE\"`\n\n\
          On the last line of your output, print PR_URL=https://github.com/{repo}/pull/{pr_number}"
     )
 }
@@ -360,13 +360,14 @@ pub fn review_prompt(
     format!(
         "{context}\
          IMPORTANT: Never run `git checkout` or `git stash` in the main repository working tree.\n\
-         If you need to modify files, first create an isolated worktree:\n\
+         If you need to modify files, first create an isolated worktree with a unique path to avoid\n\
+         collisions with concurrent runs:\n\
            git fetch origin <branch>\n\
-           git worktree remove --force /tmp/harness-review-{pr} 2>/dev/null || true\n\
-           git worktree prune 2>/dev/null || true\n\
-           git worktree add /tmp/harness-review-{pr} <branch>\n\
-         Then do all editing, testing, and pushing from /tmp/harness-review-{pr},\n\
-         and remove it when done: git worktree remove /tmp/harness-review-{pr}\n\
+           WORKTREE=$(mktemp -d /tmp/harness-review-{pr}-XXXXXX)\n\
+           rmdir \"$WORKTREE\"\n\
+           git worktree add \"$WORKTREE\" <branch>\n\
+         Then do all editing, testing, and pushing from \"$WORKTREE\",\n\
+         and remove it when done: git worktree remove \"$WORKTREE\"\n\
          (The branch name can be obtained with: gh pr view {pr} --json headRefName --jq .headRefName)\n\n\
          Steps:\n\
          1. Run `gh pr view {pr} --json statusCheckRollup` and parse the JSON. \
@@ -1102,9 +1103,10 @@ mod tests {
         assert!(p.contains("do NOT create a new PR"));
         assert!(p.contains("PR_URL=https://github.com/owner/repo/pull/50"));
         assert!(p.contains("repos/owner/repo/pulls/50/comments"));
-        // Worktree isolation: must use worktree, must not bare-checkout in main repo
-        assert!(p.contains("worktree add /tmp/harness-pr-50"));
-        assert!(p.contains("worktree remove /tmp/harness-pr-50"));
+        // Worktree isolation: must use unique per-run path, must not bare-checkout in main repo
+        assert!(p.contains("mktemp -d /tmp/harness-pr-50-"));
+        assert!(p.contains("worktree add \"$WORKTREE\""));
+        assert!(p.contains("worktree remove \"$WORKTREE\""));
         assert!(!p.contains("git checkout fix/issue-29"));
     }
 
@@ -1216,9 +1218,9 @@ mod tests {
         assert!(p.contains("issue #5"));
         assert!(p.contains("PR #10"));
         assert!(p.contains("medium")); // round 2 includes medium
-                                       // Worktree isolation: must prohibit git checkout in main repo
+                                       // Worktree isolation: unique per-run path, no bare checkout
         assert!(p.contains("Never run `git checkout`"));
-        assert!(p.contains("worktree add /tmp/harness-review-10"));
+        assert!(p.contains("mktemp -d /tmp/harness-review-10-"));
     }
 
     #[test]
