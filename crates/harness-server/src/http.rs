@@ -1050,6 +1050,12 @@ fn build_completion_callback(
                 task_runner::TaskStatus::Failed => {
                     task.error.as_deref().unwrap_or("unknown error").to_string()
                 }
+                // Forward Cancelled so intake sources can release their
+                // in-memory tracking (dispatched / chat_ids) and avoid leaks.
+                // Each source is responsible for deciding whether to notify or
+                // silently clean up — GitHub keeps the entry in `dispatched` to
+                // prevent the issue from being re-enqueued; Feishu removes it.
+                task_runner::TaskStatus::Cancelled => String::new(),
                 _ => {
                     tracing::warn!(
                         task_id = ?task.id,

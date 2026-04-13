@@ -140,35 +140,38 @@ impl IntakeSource for FeishuIntake {
         external_id: &str,
         result: &TaskCompletionResult,
     ) -> anyhow::Result<()> {
-        let text = match result.status {
+        // Build a notification message for Done/Failed; Cancelled is silent but
+        // still requires cleanup of dispatched/chat_ids to avoid a permanent leak.
+        let text: Option<String> = match result.status {
             TaskStatus::Done => match &result.pr_url {
-                Some(pr_url) => format!("Task complete. PR: {pr_url}\n\n{}", result.summary),
-                None => format!("Task complete.\n\n{}", result.summary),
+                Some(pr_url) => Some(format!("Task complete. PR: {pr_url}\n\n{}", result.summary)),
+                None => Some(format!("Task complete.\n\n{}", result.summary)),
             },
-            TaskStatus::Failed => format!(
+            TaskStatus::Failed => Some(format!(
                 "Task failed: {}",
                 result.error.as_deref().unwrap_or("unknown error")
-            ),
-            TaskStatus::Cancelled => return Ok(()),
+            )),
+            // Cancelled: clean up maps but send no notification.
+            TaskStatus::Cancelled => None,
             _ => return Ok(()),
         };
 
-        if let Some(chat_id) = self.chat_ids.get(external_id) {
-            if let Err(e) = self.send_message(&chat_id, &text).await {
-                tracing::warn!(
-                    message_id = %external_id,
-                    "feishu: failed to send task-complete reply: {e}"
-                );
+        if let Some(text) = text {
+            if let Some(chat_id) = self.chat_ids.get(external_id) {
+                if let Err(e) = self.send_message(&chat_id, &text).await {
+                    tracing::warn!(
+                        message_id = %external_id,
+                        "feishu: failed to send task-complete reply: {e}"
+                    );
+                }
             }
         }
 
-        if matches!(
-            result.status,
-            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
-        ) {
-            self.dispatched.remove(external_id);
-            self.chat_ids.remove(external_id);
-        }
+        // Always remove terminal entries from the in-memory maps so they do not
+        // leak across restarts and so that cancellation is handled consistently
+        // with Done/Failed.
+        self.dispatched.remove(external_id);
+        self.chat_ids.remove(external_id);
 
         Ok(())
     }
@@ -606,5 +609,49 @@ mod tests {
             Some("fix login bug\nUsers cannot log in after password reset.")
         );
         assert_eq!(issue.labels, vec!["feishu"]);
+    }
+
+    /// Cancelling a task must release both `dispatched` and `chat_ids` so the
+    /// in-memory maps don't grow without bound across task lifecycles.
+    #[tokio::test]
+    async fn cancelled_task_cleans_up_dispatched_and_chat_ids() -> anyhow::Result<()> {
+        use crate::intake::{IntakeSource, TaskCompletionResult};
+        use crate::task_runner::TaskStatus;
+        use harness_core::types::TaskId;
+
+        let intake = FeishuIntake::new(make_feishu_config());
+
+        // Simulate the full Feishu webhook path: store chat_id then mark dispatched.
+        let msg_id = "om_cancel_test_001";
+        let task_id = TaskId("task-cancel-001".to_string());
+        intake.store_chat_id(msg_id, "oc_chat_cancel");
+        intake
+            .dispatched
+            .insert(msg_id.to_string(), task_id.clone());
+
+        // Sanity check: both maps are populated.
+        assert!(intake.dispatched.contains_key(msg_id));
+        assert!(intake.chat_ids.contains_key(msg_id));
+
+        // Fire on_task_complete with Cancelled status (as the completion
+        // callback in http.rs now forwards for cleanup).
+        let result = TaskCompletionResult {
+            status: TaskStatus::Cancelled,
+            pr_url: None,
+            error: None,
+            summary: String::new(),
+        };
+        intake.on_task_complete(msg_id, &result).await?;
+
+        // Both maps must be cleared — no permanent leak.
+        assert!(
+            !intake.dispatched.contains_key(msg_id),
+            "dispatched should be cleared after Cancelled"
+        );
+        assert!(
+            !intake.chat_ids.contains_key(msg_id),
+            "chat_ids should be cleared after Cancelled"
+        );
+        Ok(())
     }
 }
