@@ -96,7 +96,6 @@ async fn check_duplicate(
 fn select_agent(
     req: &task_runner::CreateTaskRequest,
     registry: &harness_agents::registry::AgentRegistry,
-    server_config: &harness_core::config::HarnessConfig,
 ) -> Result<Arc<dyn CodeAgent>, EnqueueTaskError> {
     // Tier 1: explicit agent override from the request.
     if let Some(name) = &req.agent {
@@ -106,15 +105,15 @@ fn select_agent(
     }
 
     // Tier 2: project-level default agent from .harness/config.toml.
+    // Honor the explicit setting unconditionally — even when it matches the
+    // server default — so that a project pinning the global default agent name
+    // still bypasses complexity dispatch (tier 3).
     if let Some(project_root) = &req.project {
         let project_cfg = harness_core::config::project::load_project_config(project_root)
             .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
-        let server_default = &server_config.agents.default_agent;
-        let resolved =
-            harness_core::config::resolve::resolve_default_agent(server_config, &project_cfg);
-        if &resolved != server_default {
-            return registry.get(&resolved).ok_or_else(|| {
-                EnqueueTaskError::BadRequest(format!("agent '{resolved}' not registered"))
+        if let Some(agent_name) = project_cfg.agent.as_ref().and_then(|a| a.default.as_ref()) {
+            return registry.get(agent_name).ok_or_else(|| {
+                EnqueueTaskError::BadRequest(format!("agent '{agent_name}' not registered"))
             });
         }
     }
@@ -192,11 +191,7 @@ pub(crate) async fn enqueue_task(
         .await
         .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
 
-    let agent = select_agent(
-        &req,
-        &state.core.server.agent_registry,
-        &state.core.server.config,
-    )?;
+    let agent = select_agent(&req, &state.core.server.agent_registry)?;
 
     let (reviewer, _review_config) = resolve_reviewer(
         &state.core.server.agent_registry,
@@ -328,23 +323,11 @@ async fn enqueue_task_background(
     req.project =
         resolve_project_from_registry(state.core.project_registry.as_deref(), req.project).await?;
 
-    // Resolve agent up-front so we can return an error immediately if the agent
-    // name (request or project config) is invalid, before registering the task.
-    // req.project is already registry-resolved at this point, so load_project_config
-    // can locate .harness/config.toml correctly.
-    let agent = select_agent(
-        &req,
-        &state.core.server.agent_registry,
-        &state.core.server.config,
-    )?;
-
-    let (reviewer, _review_config) = resolve_reviewer(
-        &state.core.server.agent_registry,
-        &state.core.server.config.agents.review,
-        agent.name(),
-    );
-
-    // Resolve canonical project for per-project concurrency limits.
+    // Canonicalize the project root (detects worktree when project is None) BEFORE
+    // the security check and BEFORE reading any per-project config files, so that:
+    //   (a) The detected worktree root is exposed to select_agent's tier-2 lookup.
+    //   (b) An untrusted caller cannot read .harness/config.toml from an arbitrary
+    //       path before the allowlist check rejects the request.
     let canonical_project = task_runner::resolve_canonical_project(req.project.clone())
         .await
         .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
@@ -359,6 +342,17 @@ async fn enqueue_task_background(
     let project_id = canonical_project.to_string_lossy().into_owned();
     req.project = Some(canonical_project);
     task_runner::fill_missing_repo_from_project(&mut req).await;
+
+    // Resolve agent after the canonical project path is written into req.project,
+    // so that tier-2 (project config) and the security boundary both see the
+    // fully-resolved path.
+    let agent = select_agent(&req, &state.core.server.agent_registry)?;
+
+    let (reviewer, _review_config) = resolve_reviewer(
+        &state.core.server.agent_registry,
+        &state.core.server.config.agents.review,
+        agent.name(),
+    );
 
     // Auto-populate external_id and check for duplicates.
     populate_external_id(&mut req);
@@ -928,7 +922,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let req = req_with_agent(Some("opus"), Some(dir.path().to_path_buf()));
 
-        let agent = select_agent(&req, &reg, &server).unwrap();
+        let agent = select_agent(&req, &reg).unwrap();
         assert_eq!(agent.name(), "opus");
     }
 
@@ -949,7 +943,7 @@ mod tests {
         .unwrap();
 
         let req = req_with_agent(None, Some(dir.path().to_path_buf()));
-        let agent = select_agent(&req, &reg, &server).unwrap();
+        let agent = select_agent(&req, &reg).unwrap();
         assert_eq!(agent.name(), "claude");
     }
 
@@ -963,7 +957,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let req = req_with_agent(None, Some(dir.path().to_path_buf()));
 
-        let agent = select_agent(&req, &reg, &server).unwrap();
+        let agent = select_agent(&req, &reg).unwrap();
         assert_eq!(agent.name(), "sonnet");
     }
 
@@ -984,8 +978,39 @@ mod tests {
         .unwrap();
 
         let req = req_with_agent(None, Some(dir.path().to_path_buf()));
-        let agent = select_agent(&req, &reg, &server).unwrap();
+        let agent = select_agent(&req, &reg).unwrap();
         assert_eq!(agent.name(), "sonnet");
+    }
+
+    // Regression for issue #2: a project that explicitly pins the same agent
+    // name as the server default must still honor tier 2 (i.e. bypass tier 3
+    // complexity dispatch). Previously the textual equality check
+    // `if &resolved != server_default` caused tier 2 to be silently skipped,
+    // allowing complex tasks to be rerouted by the complexity router.
+    #[test]
+    fn project_pinning_same_agent_as_server_default_bypasses_complexity_dispatch() {
+        // Registry has two agents; complexity dispatch would pick "opus" for
+        // complex tasks, but the project explicitly pins "claude" (same as
+        // server default) — tier 2 must win.
+        let reg = registry_with("claude", &["claude", "opus"]);
+        let mut server = HarnessConfig::default();
+        server.agents.default_agent = "claude".to_string();
+
+        let dir = tempfile::tempdir().unwrap();
+        let harness_dir = dir.path().join(".harness");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        // Explicitly pin the same agent as the server default.
+        std::fs::write(
+            harness_dir.join("config.toml"),
+            "[agent]\ndefault = \"claude\"\n",
+        )
+        .unwrap();
+
+        let req = req_with_agent(None, Some(dir.path().to_path_buf()));
+        let agent = select_agent(&req, &reg).unwrap();
+        // Must be "claude" (explicit project pin), not whatever complexity
+        // dispatch would have chosen.
+        assert_eq!(agent.name(), "claude");
     }
 
     #[test]
@@ -1004,7 +1029,7 @@ mod tests {
         .unwrap();
 
         let req = req_with_agent(None, Some(dir.path().to_path_buf()));
-        let result = select_agent(&req, &reg, &server);
+        let result = select_agent(&req, &reg);
         assert!(matches!(result, Err(EnqueueTaskError::BadRequest(_))));
     }
 }
