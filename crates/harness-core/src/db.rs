@@ -1,6 +1,45 @@
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::{pool::PoolConnection, Sqlite};
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::OnceLock;
+
+static SQLITE_TRANSACTIONAL_PREFIXES: OnceLock<Vec<&'static str>> = OnceLock::new();
+
+fn sqlite_transactional_prefixes() -> &'static [&'static str] {
+    SQLITE_TRANSACTIONAL_PREFIXES.get_or_init(|| {
+        vec![
+            "CREATE TABLE",
+            "CREATE INDEX",
+            "CREATE UNIQUE INDEX",
+            "CREATE VIEW",
+            "CREATE TRIGGER",
+            "ALTER TABLE",
+            "DROP TABLE",
+            "DROP INDEX",
+            "DROP VIEW",
+            "DROP TRIGGER",
+            "INSERT INTO",
+            "UPDATE ",
+            "DELETE FROM",
+            "REPLACE INTO",
+            "SELECT ",
+            "WITH ",
+        ]
+    })
+}
+
+fn normalized_sqlite_statement_prefix(statement: &str) -> String {
+    statement
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("--"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase()
+}
 
 /// Create a SQLite connection pool for the given path.
 ///
@@ -159,6 +198,294 @@ pub struct Migrator<'a> {
     migrations: &'a [Migration],
 }
 
+struct MigrationStatement<'a> {
+    index: usize,
+    sql: Cow<'a, str>,
+}
+
+fn migration_statements(sql: &str) -> Vec<MigrationStatement<'_>> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut index = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut trigger_begin_depth = 0usize;
+    let mut trigger_case_depth = 0usize;
+    let mut statement_tokens = Vec::new();
+    let mut current_statement_is_trigger = false;
+
+    while let Some(ch) = chars.next() {
+        let next = chars.peek().copied();
+
+        if in_line_comment {
+            current.push(ch);
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+
+        if in_block_comment {
+            current.push(ch);
+            if ch == '*' && next == Some('/') {
+                current.push(chars.next().expect("peeked slash must exist"));
+                in_block_comment = false;
+            }
+            continue;
+        }
+
+        if in_single_quote {
+            current.push(ch);
+            if ch == '\'' {
+                if next == Some('\'') {
+                    current.push(chars.next().expect("peeked quote must exist"));
+                } else {
+                    in_single_quote = false;
+                }
+            }
+            continue;
+        }
+
+        if in_double_quote {
+            current.push(ch);
+            if ch == '"' {
+                if next == Some('"') {
+                    current.push(chars.next().expect("peeked quote must exist"));
+                } else {
+                    in_double_quote = false;
+                }
+            }
+            continue;
+        }
+
+        if ch == '-' && next == Some('-') {
+            current.push(ch);
+            current.push(chars.next().expect("peeked dash must exist"));
+            in_line_comment = true;
+            continue;
+        }
+
+        if ch == '/' && next == Some('*') {
+            current.push(ch);
+            current.push(chars.next().expect("peeked star must exist"));
+            in_block_comment = true;
+            continue;
+        }
+
+        if ch == '\'' {
+            current.push(ch);
+            in_single_quote = true;
+            continue;
+        }
+
+        if ch == '"' {
+            current.push(ch);
+            in_double_quote = true;
+            continue;
+        }
+
+        current.push(ch);
+
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let mut token = String::from(ch);
+            while let Some(peek) = chars.peek().copied() {
+                if peek.is_ascii_alphanumeric() || peek == '_' {
+                    token.push(chars.next().expect("peeked token char must exist"));
+                    current.push(*token.as_bytes().last().unwrap() as char);
+                } else {
+                    break;
+                }
+            }
+
+            let token = token.to_ascii_uppercase();
+            if statement_tokens.len() < 3 {
+                statement_tokens.push(token.clone());
+                current_statement_is_trigger |= match statement_tokens.as_slice() {
+                    [first, second] => first == "CREATE" && second == "TRIGGER",
+                    [first, second, third] => {
+                        first == "CREATE"
+                            && (second == "TEMP" || second == "TEMPORARY")
+                            && third == "TRIGGER"
+                    }
+                    _ => false,
+                };
+            }
+
+            match token.as_str() {
+                "BEGIN" if current_statement_is_trigger => trigger_begin_depth += 1,
+                "CASE" if current_statement_is_trigger && trigger_begin_depth > 0 => {
+                    trigger_case_depth += 1;
+                }
+                "END"
+                    if current_statement_is_trigger
+                        && trigger_begin_depth > 0
+                        && trigger_case_depth > 0 =>
+                {
+                    trigger_case_depth -= 1;
+                }
+                "END" if current_statement_is_trigger && trigger_begin_depth > 0 => {
+                    trigger_begin_depth -= 1;
+                }
+                _ => {}
+            }
+            if trigger_begin_depth == 0 {
+                trigger_case_depth = 0;
+            }
+            continue;
+        }
+
+        if ch == ';' && trigger_begin_depth == 0 {
+            let statement = current[..current.len() - 1].trim();
+            if !statement.is_empty() {
+                index += 1;
+                statements.push(MigrationStatement {
+                    index,
+                    sql: Cow::Owned(statement.to_string()),
+                });
+            }
+            current.clear();
+            statement_tokens.clear();
+            current_statement_is_trigger = false;
+        }
+    }
+
+    let trailing = current.trim();
+    if !trailing.is_empty() {
+        index += 1;
+        statements.push(MigrationStatement {
+            index,
+            sql: Cow::Owned(trailing.to_string()),
+        });
+    }
+
+    statements
+}
+
+async fn apply_statements_on_connection(
+    conn: &mut PoolConnection<Sqlite>,
+    migration: &Migration,
+    statements: &[MigrationStatement<'_>],
+) -> anyhow::Result<()> {
+    for statement in statements {
+        if let Err(error) = sqlx::query(statement.sql.as_ref())
+            .execute(conn.as_mut())
+            .await
+        {
+            if duplicate_add_column_error(statement.sql.as_ref(), &error) {
+                continue;
+            }
+            return Err(format_migration_error(migration, statement, &error, false));
+        }
+    }
+
+    sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
+        .bind(migration.version as i64)
+        .bind(migration.description)
+        .execute(conn.as_mut())
+        .await?;
+    Ok(())
+}
+
+async fn apply_outside_transaction(
+    pool: &SqlitePool,
+    migration: &Migration,
+    statements: &[MigrationStatement<'_>],
+) -> anyhow::Result<()> {
+    let mut conn = pool.acquire().await?;
+    let result = apply_statements_on_connection(&mut conn, migration, statements).await;
+    if result.is_err() {
+        // Close rather than return to pool: connection-scoped state set by a
+        // partially-executed migration (e.g. PRAGMA changes) must not leak to
+        // future pool borrowers.
+        let _ = conn.close().await;
+    }
+    result
+}
+
+fn duplicate_add_column_error(statement: &str, error: &sqlx::Error) -> bool {
+    statement.to_ascii_uppercase().contains("ADD COLUMN")
+        && error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("duplicate column name")
+}
+
+fn sqlite_statement_is_transaction_safe(statement: &str) -> bool {
+    let normalized = normalized_sqlite_statement_prefix(statement);
+    sqlite_transactional_prefixes()
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn format_migration_error(
+    migration: &Migration,
+    statement: &MigrationStatement<'_>,
+    error: &sqlx::Error,
+    in_transaction: bool,
+) -> anyhow::Error {
+    let mode = if in_transaction {
+        ""
+    } else {
+        " outside transaction"
+    };
+    anyhow::anyhow!(
+        "migration v{} '{}' failed at statement {}{}: {} [sql: {}]",
+        migration.version,
+        migration.description,
+        statement.index,
+        mode,
+        error,
+        statement.sql
+    )
+}
+
+fn pending_migrations<'a>(
+    migrations: &'a [Migration],
+    applied: &HashSet<u32>,
+) -> Vec<&'a Migration> {
+    let mut pending: Vec<&Migration> = migrations
+        .iter()
+        .filter(|migration| !applied.contains(&migration.version))
+        .collect();
+    pending.sort_by_key(|migration| migration.version);
+    pending
+}
+
+async fn apply_migration(pool: &SqlitePool, migration: &Migration) -> anyhow::Result<()> {
+    let statements = migration_statements(migration.sql);
+    let use_transaction = statements
+        .iter()
+        .all(|statement| sqlite_statement_is_transaction_safe(statement.sql.as_ref()));
+
+    if use_transaction {
+        let mut tx = pool.begin().await?;
+        for statement in &statements {
+            if let Err(error) = sqlx::query(statement.sql.as_ref()).execute(&mut *tx).await {
+                if duplicate_add_column_error(statement.sql.as_ref(), &error) {
+                    continue;
+                }
+                return Err(format_migration_error(migration, statement, &error, true));
+            }
+        }
+        sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
+            .bind(migration.version as i64)
+            .bind(migration.description)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    apply_outside_transaction(pool, migration, &statements).await
+}
+
+fn applied_versions_set(rows: Vec<(i64,)>) -> HashSet<u32> {
+    rows.into_iter().map(|(version,)| version as u32).collect()
+}
+
 impl<'a> Migrator<'a> {
     pub fn new(pool: &'a SqlitePool, migrations: &'a [Migration]) -> Self {
         Self { pool, migrations }
@@ -181,44 +508,10 @@ impl<'a> Migrator<'a> {
             sqlx::query_as("SELECT version FROM schema_migrations ORDER BY version ASC")
                 .fetch_all(self.pool)
                 .await?;
-        let applied: std::collections::HashSet<u32> =
-            rows.into_iter().map(|(v,)| v as u32).collect();
+        let applied = applied_versions_set(rows);
 
-        // Collect and sort pending migrations.
-        let mut pending: Vec<&Migration> = self
-            .migrations
-            .iter()
-            .filter(|m| !applied.contains(&m.version))
-            .collect();
-        pending.sort_by_key(|m| m.version);
-
-        for migration in pending {
-            for stmt in migration.sql.split(';') {
-                let stmt = stmt.trim();
-                if stmt.is_empty() {
-                    continue;
-                }
-                if let Err(e) = sqlx::query(stmt).execute(self.pool).await {
-                    // Tolerate duplicate-column errors from ALTER TABLE ADD COLUMN
-                    // so that migrating pre-migration-system databases is idempotent.
-                    if stmt.to_uppercase().contains("ADD COLUMN") {
-                        let msg = e.to_string().to_lowercase();
-                        if msg.contains("duplicate column name") {
-                            continue;
-                        }
-                    }
-                    return Err(anyhow::anyhow!(
-                        "migration v{} '{}' failed: {e}",
-                        migration.version,
-                        migration.description
-                    ));
-                }
-            }
-            sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
-                .bind(migration.version as i64)
-                .bind(migration.description)
-                .execute(self.pool)
-                .await?;
+        for migration in pending_migrations(self.migrations, &applied) {
+            apply_migration(self.pool, migration).await?;
         }
         Ok(())
     }
@@ -375,6 +668,29 @@ mod tests {
         },
     ];
 
+    async fn applied_versions(pool: &SqlitePool) -> anyhow::Result<Vec<i64>> {
+        Ok(
+            sqlx::query_as::<_, (i64,)>("SELECT version FROM schema_migrations ORDER BY version")
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .map(|(version,)| version)
+                .collect(),
+        )
+    }
+
+    async fn table_columns(pool: &SqlitePool, table: &str) -> anyhow::Result<Vec<String>> {
+        let pragma = format!("PRAGMA table_info({table})");
+        Ok(
+            sqlx::query_as::<_, (i64, String, String, i64, Option<String>, i64)>(&pragma)
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .map(|(_, name, _, _, _, _)| name)
+                .collect(),
+        )
+    }
+
     #[tokio::test]
     async fn migrator_applies_pending_migrations() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -425,6 +741,266 @@ mod tests {
 
         // Running v2 now must not fail even though the column already exists.
         Migrator::new(&pool, SIMPLE_MIGRATIONS).run().await?;
+        assert_eq!(applied_versions(&pool).await?, vec![1, 2]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failing_multi_statement_migration_is_not_recorded() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = open_pool(&dir.path().join("mig.db")).await?;
+        let migrations = [
+            Migration {
+                version: 1,
+                description: "create items table",
+                sql: "CREATE TABLE items (id TEXT PRIMARY KEY)",
+            },
+            Migration {
+                version: 2,
+                description: "broken migration",
+                sql: "ALTER TABLE items ADD COLUMN tag TEXT; SELECT nope FROM missing_table",
+            },
+        ];
+
+        let err = Migrator::new(&pool, &migrations).run().await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("migration v2 'broken migration' failed"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(applied_versions(&pool).await?, vec![1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failing_multi_statement_migration_does_not_partially_persist() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = open_pool(&dir.path().join("mig.db")).await?;
+        let migrations = [
+            Migration {
+                version: 1,
+                description: "create items table",
+                sql: "CREATE TABLE items (id TEXT PRIMARY KEY)",
+            },
+            Migration {
+                version: 2,
+                description: "broken migration",
+                sql: "ALTER TABLE items ADD COLUMN tag TEXT; SELECT nope FROM missing_table",
+            },
+        ];
+
+        let _ = Migrator::new(&pool, &migrations).run().await;
+
+        assert_eq!(applied_versions(&pool).await?, vec![1]);
+        assert_eq!(table_columns(&pool, "items").await?, vec!["id"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_error_reports_failed_statement_index() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = open_pool(&dir.path().join("mig.db")).await?;
+        let migrations = [
+            Migration {
+                version: 1,
+                description: "create items table",
+                sql: "CREATE TABLE items (id TEXT PRIMARY KEY)",
+            },
+            Migration {
+                version: 2,
+                description: "broken migration",
+                sql: "ALTER TABLE items ADD COLUMN tag TEXT; SELECT nope FROM missing_table",
+            },
+        ];
+
+        let err = Migrator::new(&pool, &migrations).run().await.unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("migration v2 'broken migration' failed at statement 2"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pragma_foreign_keys_migration_runs_outside_transaction() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = open_pool(&dir.path().join("mig.db")).await?;
+        let migrations = [
+            Migration {
+                version: 1,
+                description: "create items table",
+                sql: "CREATE TABLE items (id TEXT PRIMARY KEY)",
+            },
+            Migration {
+                version: 2,
+                description: "pragma migration",
+                sql: "PRAGMA foreign_keys = OFF; SELECT nope FROM missing_table",
+            },
+        ];
+
+        let err = Migrator::new(&pool, &migrations).run().await.unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("outside transaction"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiline_create_table_migration_stays_transactional() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = open_pool(&dir.path().join("mig.db")).await?;
+        let migrations = [Migration {
+            version: 1,
+            description: "broken multiline create table",
+            sql: "CREATE\nTABLE items (id TEXT PRIMARY KEY); SELECT nope FROM missing_table",
+        }];
+
+        let err = Migrator::new(&pool, &migrations).run().await.unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            !message.contains("outside transaction"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(applied_versions(&pool).await?, Vec::<i64>::new());
+        assert_eq!(table_columns(&pool, "items").await?, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pragma_defer_foreign_keys_migration_runs_outside_transaction() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = open_pool(&dir.path().join("mig.db")).await?;
+        let migrations = [
+            Migration {
+                version: 1,
+                description: "create items table",
+                sql: "CREATE TABLE items (id TEXT PRIMARY KEY)",
+            },
+            Migration {
+                version: 2,
+                description: "pragma defer migration",
+                sql: "PRAGMA defer_foreign_keys = ON; SELECT nope FROM missing_table",
+            },
+        ];
+
+        let err = Migrator::new(&pool, &migrations).run().await.unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("outside transaction"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_statements_keep_trigger_body_intact() {
+        let statements = migration_statements(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY);\n\
+             CREATE TRIGGER items_touch AFTER INSERT ON items BEGIN\n\
+             UPDATE items SET id = NEW.id;\n\
+             INSERT INTO items_log DEFAULT VALUES;\n\
+             END;",
+        );
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            statements[0].sql,
+            "CREATE TABLE items (id INTEGER PRIMARY KEY)"
+        );
+        assert!(
+            statements[1]
+                .sql
+                .starts_with("CREATE TRIGGER items_touch AFTER INSERT ON items BEGIN"),
+            "unexpected trigger statement: {}",
+            statements[1].sql
+        );
+        assert!(
+            statements[1].sql.ends_with("END"),
+            "unexpected trigger statement: {}",
+            statements[1].sql
+        );
+    }
+
+    #[test]
+    fn migration_statements_split_explicit_transaction_control() {
+        let statements = migration_statements(
+            "BEGIN;\n\
+             CREATE TABLE items (id INTEGER PRIMARY KEY);\n\
+             INSERT INTO items VALUES (1);\n\
+             COMMIT;",
+        );
+
+        assert_eq!(statements.len(), 4);
+        assert_eq!(statements[0].sql, "BEGIN");
+        assert_eq!(
+            statements[1].sql,
+            "CREATE TABLE items (id INTEGER PRIMARY KEY)"
+        );
+        assert_eq!(statements[2].sql, "INSERT INTO items VALUES (1)");
+        assert_eq!(statements[3].sql, "COMMIT");
+    }
+
+    #[test]
+    fn migration_statements_keep_case_end_inside_trigger_body() {
+        let statements = migration_statements(
+            "CREATE TRIGGER items_touch AFTER INSERT ON items BEGIN\n\
+             UPDATE items\n\
+             SET id = CASE WHEN NEW.id IS NULL THEN OLD.id ELSE NEW.id END;\n\
+             INSERT INTO items_log DEFAULT VALUES;\n\
+             END;",
+        );
+
+        assert_eq!(statements.len(), 1);
+        assert!(
+            statements[0]
+                .sql
+                .contains("CASE WHEN NEW.id IS NULL THEN OLD.id ELSE NEW.id END;"),
+            "unexpected trigger statement: {}",
+            statements[0].sql
+        );
+        assert!(
+            statements[0]
+                .sql
+                .contains("INSERT INTO items_log DEFAULT VALUES;"),
+            "unexpected trigger statement: {}",
+            statements[0].sql
+        );
+        assert!(
+            statements[0].sql.ends_with("END"),
+            "unexpected trigger statement: {}",
+            statements[0].sql
+        );
+    }
+
+    #[tokio::test]
+    async fn pragma_style_migration_keeps_connection_local_state_on_one_connection(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("mig.db").display());
+        let pool = SqlitePoolOptions::new()
+            .min_connections(2)
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect(&url)
+            .await?;
+        let migrations = [Migration {
+            version: 1,
+            description: "temp table migration",
+            sql: "CREATE TEMP TABLE migration_temp (id INTEGER); \
+                  INSERT INTO migration_temp VALUES (1); \
+                  SELECT * FROM migration_temp",
+        }];
+
+        Migrator::new(&pool, &migrations).run().await?;
+        assert_eq!(applied_versions(&pool).await?, vec![1]);
         Ok(())
     }
 }
