@@ -395,7 +395,14 @@ async fn apply_outside_transaction(
     statements: &[MigrationStatement<'_>],
 ) -> anyhow::Result<()> {
     let mut conn = pool.acquire().await?;
-    apply_statements_on_connection(&mut conn, migration, statements).await
+    let result = apply_statements_on_connection(&mut conn, migration, statements).await;
+    if result.is_err() {
+        // Close rather than return to pool: connection-scoped state set by a
+        // partially-executed migration (e.g. PRAGMA changes) must not leak to
+        // future pool borrowers.
+        let _ = conn.close().await;
+    }
+    result
 }
 
 fn duplicate_add_column_error(statement: &str, error: &sqlx::Error) -> bool {
