@@ -54,6 +54,18 @@ pub struct HarnessConfig {
     pub projects: Vec<ProjectEntry>,
 }
 
+impl HarnessConfig {
+    /// Apply environment variable overrides to all sub-configs.
+    ///
+    /// Call this after loading from a TOML file (or using `Default`) and
+    /// before applying CLI flags so that CLI flags retain the highest
+    /// precedence.
+    pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
+        self.server.apply_env_overrides()?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -64,6 +64,63 @@ pub struct ServerConfig {
     pub github_token: Option<String>,
 }
 
+impl ServerConfig {
+    /// Apply environment variable overrides to this config.
+    ///
+    /// Reads a fixed set of env vars and overwrites the corresponding fields.
+    /// Precedence: TOML file → env vars → CLI flags (CLI flags are applied after
+    /// this call in the serve command and always win).
+    ///
+    /// Supported variables:
+    /// - `HARNESS_HTTP_ADDR`    — `http_addr` (parsed as `SocketAddr`)
+    /// - `HARNESS_DATA_DIR`     — `data_dir`
+    /// - `HARNESS_PROJECT_ROOT` — `project_root`
+    /// - `HARNESS_API_TOKEN`    — `api_token`
+    /// - `GITHUB_TOKEN`         — `github_token`
+    pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
+        if let Ok(v) = std::env::var("HARNESS_DATA_DIR") {
+            if !v.is_empty() {
+                self.data_dir = std::path::PathBuf::from(v);
+            }
+        }
+        if let Ok(v) = std::env::var("HARNESS_PROJECT_ROOT") {
+            if !v.is_empty() {
+                self.project_root = std::path::PathBuf::from(v);
+            }
+        }
+        if let Ok(v) = std::env::var("HARNESS_API_TOKEN") {
+            if !v.is_empty() {
+                self.api_token = Some(v);
+            }
+        }
+        if let Ok(v) = std::env::var("GITHUB_TOKEN") {
+            if !v.is_empty() {
+                self.github_token = Some(v);
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the `HARNESS_HTTP_ADDR` env var override.
+    ///
+    /// This is intentionally separated from [`apply_env_overrides`] because
+    /// `HARNESS_HTTP_ADDR` is only meaningful for the `serve` subcommand.
+    /// Parsing it eagerly for every subcommand (e.g. `harness exec`,
+    /// `harness version`) would make a server-side misconfiguration (blank
+    /// value, or a hostname like `localhost:9800` that `SocketAddr` rejects)
+    /// brick completely unrelated commands.
+    pub fn apply_serve_env_overrides(&mut self) -> anyhow::Result<()> {
+        if let Ok(v) = std::env::var("HARNESS_HTTP_ADDR") {
+            if !v.is_empty() {
+                self.http_addr = v.parse().map_err(|e| {
+                    anyhow::anyhow!("HARNESS_HTTP_ADDR={v:?} is not a valid SocketAddr: {e}")
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Debug for ServerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Exhaustive destructure: compiler error if a new field is added but omitted here.
@@ -181,6 +238,131 @@ fn default_constitution_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- env override tests ---
+
+    #[test]
+    fn env_override_http_addr() {
+        temp_env::with_vars([("HARNESS_HTTP_ADDR", Some("127.0.0.1:9801"))], || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_serve_env_overrides().unwrap();
+            assert_eq!(cfg.http_addr.port(), 9801);
+        });
+    }
+
+    #[test]
+    fn env_override_http_addr_empty_leaves_default() {
+        temp_env::with_vars([("HARNESS_HTTP_ADDR", Some(""))], || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_serve_env_overrides().unwrap();
+            assert_eq!(cfg.http_addr.port(), 9800);
+        });
+    }
+
+    #[test]
+    fn env_override_data_dir() {
+        temp_env::with_vars([("HARNESS_DATA_DIR", Some("/tmp/testdir"))], || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.data_dir, std::path::PathBuf::from("/tmp/testdir"));
+        });
+    }
+
+    #[test]
+    fn env_override_empty_data_dir_does_not_override() {
+        temp_env::with_vars([("HARNESS_DATA_DIR", Some(""))], || {
+            let default = ServerConfig::default();
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.data_dir, default.data_dir);
+        });
+    }
+
+    #[test]
+    fn env_override_empty_project_root_does_not_override() {
+        temp_env::with_vars([("HARNESS_PROJECT_ROOT", Some(""))], || {
+            let default = ServerConfig::default();
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.project_root, default.project_root);
+        });
+    }
+
+    #[test]
+    fn env_override_api_token() {
+        temp_env::with_vars([("HARNESS_API_TOKEN", Some("tok-test"))], || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.api_token, Some("tok-test".to_string()));
+        });
+    }
+
+    #[test]
+    fn env_override_github_token_fallback() {
+        temp_env::with_vars([("GITHUB_TOKEN", Some("gh-test"))], || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.github_token, Some("gh-test".to_string()));
+        });
+    }
+
+    #[test]
+    fn env_override_invalid_addr_returns_error() {
+        temp_env::with_vars([("HARNESS_HTTP_ADDR", Some("not-an-addr"))], || {
+            let mut cfg = ServerConfig::default();
+            let result = cfg.apply_serve_env_overrides();
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn env_override_empty_api_token_does_not_override_toml_token() {
+        temp_env::with_vars([("HARNESS_API_TOKEN", Some(""))], || {
+            let mut cfg = ServerConfig {
+                api_token: Some("real-token".to_string()),
+                ..ServerConfig::default()
+            };
+            cfg.apply_env_overrides().unwrap();
+            // Empty env var must not overwrite a valid TOML token.
+            assert_eq!(cfg.api_token, Some("real-token".to_string()));
+        });
+    }
+
+    #[test]
+    fn env_override_empty_github_token_does_not_override_toml_token() {
+        temp_env::with_vars([("GITHUB_TOKEN", Some(""))], || {
+            let mut cfg = ServerConfig {
+                github_token: Some("gh-real".to_string()),
+                ..ServerConfig::default()
+            };
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.github_token, Some("gh-real".to_string()));
+        });
+    }
+
+    #[test]
+    fn env_override_absent_vars_leave_defaults() {
+        temp_env::with_vars(
+            [
+                ("HARNESS_HTTP_ADDR", None::<&str>),
+                ("HARNESS_DATA_DIR", None::<&str>),
+                ("HARNESS_PROJECT_ROOT", None::<&str>),
+                ("HARNESS_API_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None::<&str>),
+            ],
+            || {
+                let default = ServerConfig::default();
+                let mut cfg = ServerConfig::default();
+                cfg.apply_env_overrides().unwrap();
+                assert_eq!(cfg.http_addr, default.http_addr);
+                assert_eq!(cfg.data_dir, default.data_dir);
+                assert_eq!(cfg.api_token, default.api_token);
+                assert_eq!(cfg.github_token, default.github_token);
+            },
+        );
+    }
+
+    // --- existing tests ---
 
     #[test]
     fn server_config_debug_redacts_secrets() {
