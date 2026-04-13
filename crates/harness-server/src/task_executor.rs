@@ -487,6 +487,12 @@ async fn run_agent_streaming(
                             StreamItem::ItemCompleted {
                                 item: Item::AgentReasoning { content },
                             } => {
+                                // Also capture first-token timestamp for backends that emit
+                                // ItemCompleted directly without MessageDelta chunks
+                                // (e.g. AnthropicApiAgent).
+                                if first_output_at.is_none() {
+                                    first_output_at = Some(Utc::now().to_rfc3339());
+                                }
                                 // Prefer the full content over accumulated deltas.
                                 output = content.clone();
                             }
@@ -514,10 +520,14 @@ async fn run_agent_streaming(
     }
 
     // Persist first-token timestamp once the stream is done (deferred from the
-    // select! body to avoid blocking the receive loop).  Only writes if the
-    // value has not been set for this task yet (idempotent DB query).
-    if let Some(ts) = first_output_at {
-        store.set_first_output_at(task_id, &ts).await;
+    // select! body to avoid blocking the receive loop).  Only write for the
+    // implementation turn (turn == 1) so that triage/plan tokens don't lock in
+    // the timestamp before execution_started_at is set; that would make the DB
+    // latency expression negative and get clamped to 0.
+    if turn == 1 {
+        if let Some(ts) = first_output_at {
+            store.set_first_output_at(task_id, &ts).await;
+        }
     }
 
     match exec_result.unwrap_or_else(|| {
@@ -1765,10 +1775,11 @@ pub(crate) async fn run_task(
             result: result_label.to_string(),
         });
 
-        // Count FIXED rounds (non-LGTM outcomes) as review turns for the
-        // avg_review_turns observability metric.  WAITING (bot not ready) rounds
-        // never reach this point because they `continue` earlier in the loop.
-        if !lgtm {
+        // Count only genuine FIXED rounds (non-LGTM, non-WAITING outcomes) for
+        // avg_review_turns.  When waiting_count >= MAX_CONSECUTIVE_WAITS the code
+        // falls through here with `waiting == true` to consume a round and reset
+        // the counter — that is not a real review cycle, so exclude it.
+        if !lgtm && !waiting {
             store.increment_review_turns(task_id).await;
         }
 

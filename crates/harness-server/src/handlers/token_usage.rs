@@ -2,6 +2,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -488,12 +489,13 @@ async fn load_cost_stats_uncached(state: &Arc<crate::http::AppState>) -> (f64, f
     let claude_projects_dir = home.join(".claude").join("projects");
 
     // Fetch known task IDs via async DB query before entering the blocking section.
-    let all_tasks = match state.core.tasks.list_all_summaries_with_terminal().await {
-        Ok(t) => t,
-        Err(_) => return (0.0, 0.0),
-    };
+    // list_all_statuses_with_terminal is lighter than list_all_summaries_with_terminal
+    // because it only deserializes IDs and status strings, not full dependency lists.
     let task_ids: std::collections::HashSet<String> =
-        all_tasks.iter().map(|t| t.id.0.clone()).collect();
+        match state.core.tasks.list_all_statuses_with_terminal().await {
+            Ok(statuses) => statuses.into_keys().map(|id| id.0).collect(),
+            Err(_) => return (0.0, 0.0),
+        };
 
     // Offload all blocking filesystem I/O (directory walk + file reads) to a
     // dedicated blocking thread so Tokio async workers are never stalled.
@@ -520,16 +522,21 @@ fn scan_cost_files_blocking(
     let mut task_usage: HashMap<String, UsageBucket> = HashMap::new();
     for file in &files {
         let task_id = extract_task_id(file);
-        let content = match std::fs::read_to_string(file) {
-            Ok(c) => c,
+        let f = match std::fs::File::open(file) {
+            Ok(f) => f,
             Err(_) => continue,
         };
+        let reader = std::io::BufReader::new(f);
         let mut sess = UsageBucket::default();
-        for (idx, line) in content.lines().enumerate() {
+        for (idx, line) in reader.lines().enumerate() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: serde_json::Value = match serde_json::from_str(line) {
+            let entry: serde_json::Value = match serde_json::from_str(&line) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
