@@ -46,7 +46,7 @@ impl PromptParts {
 /// creating a duplicate PR, the agent checks out the existing branch, reads
 /// review feedback, continues the implementation, and pushes to the same branch.
 pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str, repo: &str) -> String {
-    let repo_slug = repo.replace('/', "-");
+    let repo_slug = repo.replace('/', "+");
     let worktree_path = format!("/tmp/harness-pr-{repo_slug}-{pr_number}");
     format!(
         "GitHub issue #{issue} already has an open PR #{pr_number} on branch `{branch}`.\n\n\
@@ -57,7 +57,7 @@ pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str, repo: &str
             ```\n\
             git fetch origin {branch}\n\
             rm -rf {worktree_path} 2>/dev/null || true\n\
-            git worktree prune\n\
+            git worktree prune --expire now\n\
             git worktree add {worktree_path} {branch}\n\
             ```\n\
          2. Read the PR diff and any review comments:\n\
@@ -359,7 +359,7 @@ pub fn review_prompt(
         String::new()
     };
 
-    let repo_slug = repo.replace('/', "-");
+    let repo_slug = repo.replace('/', "+");
     let worktree_path = format!("/tmp/harness-review-{repo_slug}-{pr}");
     format!(
         "{context}\
@@ -367,7 +367,7 @@ pub fn review_prompt(
          If you need to modify files, first create an isolated worktree:\n\
            git fetch origin <branch>\n\
            rm -rf {worktree_path} 2>/dev/null || true\n\
-           git worktree prune\n\
+           git worktree prune --expire now\n\
            git worktree add {worktree_path} <branch>\n\
          Then do all editing, testing, and pushing from {worktree_path},\n\
          and remove it when done: git worktree remove {worktree_path}\n\
@@ -1107,8 +1107,8 @@ mod tests {
         assert!(p.contains("PR_URL=https://github.com/owner/repo/pull/50"));
         assert!(p.contains("repos/owner/repo/pulls/50/comments"));
         // Worktree isolation: must use worktree, must not bare-checkout in main repo
-        assert!(p.contains("worktree add /tmp/harness-pr-owner-repo-50"));
-        assert!(p.contains("worktree remove /tmp/harness-pr-owner-repo-50"));
+        assert!(p.contains("worktree add /tmp/harness-pr-owner+repo-50"));
+        assert!(p.contains("worktree remove /tmp/harness-pr-owner+repo-50"));
         assert!(!p.contains("git checkout fix/issue-29"));
     }
 
@@ -1222,7 +1222,7 @@ mod tests {
         assert!(p.contains("medium")); // round 2 includes medium
                                        // Worktree isolation: must prohibit git checkout in main repo
         assert!(p.contains("Never run `git checkout`"));
-        assert!(p.contains("worktree add /tmp/harness-review-owner-repo-10"));
+        assert!(p.contains("worktree add /tmp/harness-review-owner+repo-10"));
     }
 
     #[test]
