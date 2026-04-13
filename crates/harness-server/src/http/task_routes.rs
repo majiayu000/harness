@@ -67,19 +67,56 @@ fn populate_external_id(req: &mut task_runner::CreateTaskRequest) {
 }
 
 /// Return existing active TaskId if one matches project + external_id.
+///
+/// Passes `req.project` as the canonical path fallback so that legacy DB rows
+/// (whose `project_id` column is NULL) can still be matched by their path.
 async fn check_duplicate(
     tasks: &Arc<crate::task_runner::TaskStore>,
     project_id: &str,
     req: &task_runner::CreateTaskRequest,
 ) -> Option<task_runner::TaskId> {
     let ext_id = req.external_id.as_deref()?;
-    let existing_id = tasks.find_active_duplicate(project_id, ext_id).await?;
+    let path_string = req
+        .project
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    let existing_id = tasks
+        .find_active_duplicate(project_id, ext_id, path_string.as_deref())
+        .await?;
     tracing::info!(
         existing_task = %existing_id.0,
         external_id = %ext_id,
         "dedup: returning existing active task instead of creating duplicate"
     );
     Some(existing_id)
+}
+
+/// Resolve `canonical_project` to a semantic project ID via the registry.
+///
+/// Falls back to the path string when the project is unregistered or the
+/// registry is unavailable. The returned string is used as the uniform key
+/// for queue limits, dedup, and DB storage.
+async fn resolve_project_id(
+    registry: Option<&crate::project_registry::ProjectRegistry>,
+    canonical_project: &std::path::Path,
+) -> String {
+    let Some(registry) = registry else {
+        return canonical_project.to_string_lossy().into_owned();
+    };
+    match registry.resolve_id_for_path(canonical_project).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            tracing::warn!(
+                path = %canonical_project.display(),
+                "project path not in registry; using path string as project_id"
+            );
+            canonical_project.to_string_lossy().into_owned()
+        }
+        Err(e) => {
+            tracing::warn!("registry resolve_id_for_path failed: {e}; falling back to path string");
+            canonical_project.to_string_lossy().into_owned()
+        }
+    }
 }
 
 pub(crate) async fn enqueue_task(
@@ -125,8 +162,12 @@ pub(crate) async fn enqueue_task(
     )
     .map_err(EnqueueTaskError::BadRequest)?;
 
-    let project_id = canonical_project.to_string_lossy().into_owned();
+    // Resolve canonical path to semantic project ID so that queue limits
+    // (keyed by semantic name in TOML) and dedup are consistent.
+    let project_id =
+        resolve_project_id(state.core.project_registry.as_deref(), &canonical_project).await;
     req.project = Some(canonical_project);
+    req.project_id = project_id.clone();
 
     // Auto-populate external_id and check for duplicates before acquiring
     // a concurrency permit (same dedup as enqueue_task_background).
@@ -332,8 +373,12 @@ async fn enqueue_task_background(
     )
     .map_err(EnqueueTaskError::BadRequest)?;
 
-    let project_id = canonical_project.to_string_lossy().into_owned();
+    // Resolve canonical path to semantic project ID so that queue limits
+    // (keyed by semantic name in TOML) and dedup are consistent.
+    let project_id =
+        resolve_project_id(state.core.project_registry.as_deref(), &canonical_project).await;
     req.project = Some(canonical_project);
+    req.project_id = project_id.clone();
     task_runner::fill_missing_repo_from_project(&mut req).await;
 
     // Auto-populate external_id and check for duplicates.

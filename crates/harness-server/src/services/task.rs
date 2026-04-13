@@ -120,6 +120,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             repo: None,
+            project_id: String::new(),
         };
         state.source = Some("github".to_string());
         store.insert(&state).await;
@@ -160,6 +161,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             repo: None,
+            project_id: String::new(),
         };
         store.insert(&parent_state).await;
 
@@ -184,6 +186,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             repo: None,
+            project_id: String::new(),
         };
         store.insert(&child_state).await;
 

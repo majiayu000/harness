@@ -16,7 +16,7 @@ const ARTIFACT_MAX_BYTES: usize = 65_536;
 /// When adding a field to `TaskRow`, add the column here once and all queries
 /// pick it up automatically.  The `task_row_columns_match_struct` test below
 /// will fail if this list drifts from the struct definition.
-const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority";
+const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, project_id";
 
 /// Versioned migrations for the tasks table.
 ///
@@ -27,6 +27,7 @@ const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source,
 /// v10 – add composite index on (project, status, updated_at).
 /// v11 – add task_checkpoints table for phase recovery.
 /// v12 – add priority column for priority-based task scheduling.
+/// v13 – add project_id column for semantic project identity (registry alias).
 static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -107,6 +108,11 @@ static TASK_MIGRATIONS: &[Migration] = &[
         description: "add priority column for task scheduling",
         sql: "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
     },
+    Migration {
+        version: 13,
+        description: "add project_id column for semantic project identity",
+        sql: "ALTER TABLE tasks ADD COLUMN project_id TEXT",
+    },
 ];
 
 /// A single persisted artifact captured from agent output during task execution.
@@ -176,9 +182,14 @@ impl TaskDb {
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let status = state.status.as_ref();
+        let project_id = if state.project_id.is_empty() {
+            None
+        } else {
+            Some(state.project_id.as_str())
+        };
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, project_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?)",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -194,6 +205,7 @@ impl TaskDb {
         .bind(&depends_on_json)
         .bind(state.project_root.as_ref().map(|p| p.to_string_lossy().into_owned()))
         .bind(state.priority as i64)
+        .bind(project_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -203,10 +215,15 @@ impl TaskDb {
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let status = state.status.as_ref();
+        let project_id = if state.project_id.is_empty() {
+            None
+        } else {
+            Some(state.project_id.as_str())
+        };
         sqlx::query(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
                     source = ?, external_id = ?, repo = ?, depends_on = ?, project = ?,
-                    priority = ?, updated_at = datetime('now')
+                    priority = ?, project_id = ?, updated_at = datetime('now')
              WHERE id = ?",
         )
         .bind(status)
@@ -225,6 +242,7 @@ impl TaskDb {
                 .map(|p| p.to_string_lossy().into_owned()),
         )
         .bind(state.priority as i64)
+        .bind(project_id)
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -271,18 +289,27 @@ impl TaskDb {
     }
 
     /// Find an active (non-terminal) task for the same project + external_id.
+    ///
+    /// Matches on `project_id` (semantic ID) first. For legacy rows where
+    /// `project_id` is NULL or empty, falls back to matching on the `project`
+    /// path column using `canonical_path`. When `canonical_path` is `None`,
+    /// `project_id` is used as the fallback (handles unregistered path projects).
     pub async fn find_active_duplicate(
         &self,
-        project: &str,
+        project_id: &str,
         external_id: &str,
+        canonical_path: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
+        let fallback = canonical_path.unwrap_or(project_id);
         let row: Option<(String,)> = sqlx::query_as(
-            "SELECT id FROM tasks WHERE project = ? AND external_id = ? \
+            "SELECT id FROM tasks WHERE external_id = ? \
+             AND (project_id = ? OR ((project_id IS NULL OR project_id = '') AND project = ?)) \
              AND status IN ('pending', 'awaiting_deps', 'implementing', 'agent_review', 'waiting', 'reviewing') \
              LIMIT 1",
         )
-        .bind(project)
         .bind(external_id)
+        .bind(project_id)
+        .bind(fallback)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.0))
@@ -778,6 +805,7 @@ struct TaskRow {
     depends_on: String,
     project: Option<String>,
     priority: i64,
+    project_id: Option<String>,
 }
 
 impl TaskRow {
@@ -797,6 +825,7 @@ impl TaskRow {
             depends_on,
             project,
             priority,
+            project_id,
         } = self;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
@@ -825,6 +854,7 @@ impl TaskRow {
             depends_on: decoded_depends_on,
             subtask_ids: Vec::new(),
             project_root: project.map(PathBuf::from),
+            project_id: project_id.unwrap_or_default(),
             issue: None,
             description: None,
             created_at,
@@ -905,6 +935,7 @@ mod tests {
             depends_on: depends_on.to_string(),
             project: None,
             priority: 0,
+            project_id: None,
         }
     }
 
@@ -1005,6 +1036,7 @@ mod tests {
             depends_on: vec![],
             subtask_ids: vec![],
             project_root: None,
+            project_id: String::new(),
             issue: None,
             description: None,
             created_at: None,
@@ -1602,13 +1634,14 @@ mod tests {
             depends_on: String::new(),
             project: None,
             priority: 0,
+            project_id: None,
         };
 
         // Count must match — catches column added to constant but not struct (or vice versa).
         assert_eq!(
             columns.len(),
-            14, // bump this when adding a field
-            "TASK_ROW_COLUMNS has {} entries but expected 14 — update both the constant and this test",
+            15, // bump this when adding a field
+            "TASK_ROW_COLUMNS has {} entries but expected 15 — update both the constant and this test",
             columns.len()
         );
     }
@@ -1649,7 +1682,9 @@ mod tests {
         task.external_id = Some("issue:42".to_string());
         task.project_root = Some(std::path::PathBuf::from("/repo/foo"));
         db.insert(&task).await?;
-        let dup = db.find_active_duplicate("/repo/foo", "issue:42").await?;
+        let dup = db
+            .find_active_duplicate("/repo/foo", "issue:42", None)
+            .await?;
         assert_eq!(dup, Some("task-issue-42".to_string()));
         Ok(())
     }
@@ -1662,7 +1697,9 @@ mod tests {
         task.external_id = Some("issue:43".to_string());
         task.project_root = Some(std::path::PathBuf::from("/repo/foo"));
         db.insert(&task).await?;
-        let dup = db.find_active_duplicate("/repo/foo", "issue:43").await?;
+        let dup = db
+            .find_active_duplicate("/repo/foo", "issue:43", None)
+            .await?;
         assert_eq!(dup, Some("task-impl-43".to_string()));
         Ok(())
     }
@@ -1675,7 +1712,9 @@ mod tests {
         task.external_id = Some("issue:42".to_string());
         task.project_root = Some(std::path::PathBuf::from("/repo/foo"));
         db.insert(&task).await?;
-        let dup = db.find_active_duplicate("/repo/foo", "issue:42").await?;
+        let dup = db
+            .find_active_duplicate("/repo/foo", "issue:42", None)
+            .await?;
         assert_eq!(dup, None);
         Ok(())
     }
@@ -1688,7 +1727,9 @@ mod tests {
         task.external_id = Some("issue:42".to_string());
         task.project_root = Some(std::path::PathBuf::from("/repo/a"));
         db.insert(&task).await?;
-        let dup = db.find_active_duplicate("/repo/b", "issue:42").await?;
+        let dup = db
+            .find_active_duplicate("/repo/b", "issue:42", None)
+            .await?;
         assert_eq!(dup, None);
         Ok(())
     }
@@ -1701,7 +1742,9 @@ mod tests {
         task.external_id = Some("issue:42".to_string());
         task.project_root = Some(std::path::PathBuf::from("/repo/foo"));
         db.insert(&task).await?;
-        let dup = db.find_active_duplicate("/repo/foo", "issue:99").await?;
+        let dup = db
+            .find_active_duplicate("/repo/foo", "issue:99", None)
+            .await?;
         assert_eq!(dup, None);
         Ok(())
     }

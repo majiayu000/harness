@@ -130,6 +130,11 @@ pub struct TaskState {
     /// Used by sibling-awareness lookups and exposed via TaskSummary for observability.
     #[serde(skip)]
     pub project_root: Option<PathBuf>,
+    /// Semantic project identifier (e.g. "harness", "vibeguard") from the project registry.
+    /// Used as the canonical key for queue limits and dedup. Falls back to the canonical
+    /// path string when the project is not in the registry. Empty on legacy DB rows.
+    #[serde(default)]
+    pub project_id: String,
     /// GitHub issue number if this is an issue-based task. Set at spawn time; not persisted.
     #[serde(skip)]
     pub issue: Option<u64>,
@@ -209,6 +214,7 @@ impl TaskState {
             depends_on: Vec::new(),
             subtask_ids: Vec::new(),
             project_root: None,
+            project_id: String::new(),
             issue: None,
             description: None,
             created_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -308,6 +314,10 @@ pub struct CreateTaskRequest {
     /// Higher values are served first when multiple tasks are waiting for a slot.
     #[serde(default)]
     pub priority: u8,
+    /// Resolved semantic project ID. Set internally by task_routes after registry
+    /// lookup; not part of the public JSON API.
+    #[serde(skip)]
+    pub project_id: String,
 }
 
 impl Default for CreateTaskRequest {
@@ -332,6 +342,7 @@ impl Default for CreateTaskRequest {
             parent_task_id: None,
             depends_on: Vec::new(),
             priority: 0,
+            project_id: String::new(),
         }
     }
 }
@@ -737,20 +748,33 @@ impl TaskStore {
 
     /// Check whether an active (non-terminal) task already exists for the same
     /// project + external_id. Cache-first, DB fallback.
+    ///
+    /// `project_id` is the canonical identity (semantic ID or path string).
+    /// `canonical_path` is the filesystem path string used as a fallback for
+    /// legacy DB rows whose `project_id` column is NULL or empty.
     pub async fn find_active_duplicate(
         &self,
         project_id: &str,
         external_id: &str,
+        canonical_path: Option<&str>,
     ) -> Option<TaskId> {
         let mut found_terminal_in_cache = false;
         for entry in self.cache.iter() {
             let task = entry.value();
-            let same_key = task.external_id.as_deref() == Some(external_id)
-                && task
-                    .project_root
+            // Match by semantic project_id for new tasks; fall back to
+            // project_root path comparison for legacy cache entries.
+            let project_matches = if !task.project_id.is_empty() {
+                task.project_id == project_id
+            } else {
+                task.project_root
                     .as_ref()
-                    .map(|p| p.to_string_lossy() == project_id)
-                    .unwrap_or(false);
+                    .map(|p| {
+                        let path_str = p.to_string_lossy();
+                        path_str == project_id || canonical_path.is_some_and(|cp| path_str == cp)
+                    })
+                    .unwrap_or(false)
+            };
+            let same_key = task.external_id.as_deref() == Some(external_id) && project_matches;
             if !same_key {
                 continue;
             }
@@ -767,7 +791,11 @@ impl TaskStore {
         if found_terminal_in_cache {
             return None;
         }
-        match self.db.find_active_duplicate(project_id, external_id).await {
+        match self
+            .db
+            .find_active_duplicate(project_id, external_id, canonical_path)
+            .await
+        {
             Ok(Some(id)) => Some(harness_core::types::TaskId(id)),
             Ok(None) => None,
             Err(e) => {
@@ -1388,6 +1416,7 @@ pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskReques
     state.parent_id = req.parent_task_id.clone();
     state.depends_on = req.depends_on.clone();
     state.priority = req.priority;
+    state.project_id = req.project_id.clone();
     state.issue = req.issue;
     state.description = summarize_request_description(req);
     store.insert(&state).await;
@@ -1464,6 +1493,7 @@ where
         state.external_id = req.external_id.clone();
         state.repo = req.repo.clone();
         state.priority = req.priority;
+        state.project_id = req.project_id.clone();
         store.insert(&state).await;
         // Register stream channel before spawning so SSE clients can subscribe immediately.
         store.register_task_stream(&task_id);

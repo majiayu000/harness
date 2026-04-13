@@ -32,6 +32,7 @@ fn make_task(id: &str, status: TaskStatus) -> TaskState {
         triage_output: None,
         plan_output: None,
         repo: None,
+        project_id: String::new(),
     }
 }
 

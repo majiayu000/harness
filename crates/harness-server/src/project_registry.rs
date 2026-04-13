@@ -75,6 +75,17 @@ impl ProjectRegistry {
     pub async fn resolve_path(&self, id: &str) -> anyhow::Result<Option<PathBuf>> {
         Ok(self.get(id).await?.map(|p| p.root))
     }
+
+    /// Reverse-lookup: given a canonical filesystem path, return the semantic
+    /// project ID registered for that root. Returns `None` for unregistered
+    /// paths — not an error; callers should fall back to the path string.
+    pub async fn resolve_id_for_path(
+        &self,
+        path: &std::path::Path,
+    ) -> anyhow::Result<Option<String>> {
+        let projects = self.list().await?;
+        Ok(projects.into_iter().find(|p| p.root == path).map(|p| p.id))
+    }
 }
 
 /// Check that `canonical_root` falls under at least one of the
@@ -193,6 +204,34 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let registry = ProjectRegistry::open(&dir.path().join("projects.db")).await?;
         assert!(!registry.remove("nonexistent").await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_id_for_path_returns_semantic_id() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let registry = ProjectRegistry::open(&dir.path().join("projects.db")).await?;
+
+        registry
+            .register(Project {
+                id: "harness".to_string(),
+                root: PathBuf::from("/home/user/harness"),
+                max_concurrent: None,
+                default_agent: None,
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await?;
+
+        let id = registry
+            .resolve_id_for_path(&PathBuf::from("/home/user/harness"))
+            .await?;
+        assert_eq!(id, Some("harness".to_string()));
+
+        let none = registry
+            .resolve_id_for_path(&PathBuf::from("/home/user/unknown"))
+            .await?;
+        assert!(none.is_none());
         Ok(())
     }
 

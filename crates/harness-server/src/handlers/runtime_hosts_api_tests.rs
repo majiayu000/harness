@@ -91,6 +91,7 @@ async fn claim_endpoint_blocks_double_claim() -> anyhow::Result<()> {
         phase: crate::task_runner::TaskPhase::default(),
         triage_output: None,
         plan_output: None,
+        project_id: String::new(),
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -180,6 +181,7 @@ async fn claim_endpoint_honors_project_filter() -> anyhow::Result<()> {
         phase: crate::task_runner::TaskPhase::default(),
         triage_output: None,
         plan_output: None,
+        project_id: String::new(),
     };
     let task_b = crate::task_runner::TaskState {
         id: crate::task_runner::TaskId::new(),
@@ -202,6 +204,7 @@ async fn claim_endpoint_honors_project_filter() -> anyhow::Result<()> {
         phase: crate::task_runner::TaskPhase::default(),
         triage_output: None,
         plan_output: None,
+        project_id: String::new(),
     };
     let task_b_id = task_b.id.clone();
 
@@ -275,6 +278,7 @@ async fn claim_endpoint_rejects_out_of_range_lease_secs() -> anyhow::Result<()> 
         phase: crate::task_runner::TaskPhase::default(),
         triage_output: None,
         plan_output: None,
+        project_id: String::new(),
     };
     state.core.tasks.insert(&task).await;
     let app = runtime_hosts_app(state);
@@ -339,6 +343,7 @@ async fn claim_endpoint_rejects_overflowing_lease_ttl() -> anyhow::Result<()> {
         phase: crate::task_runner::TaskPhase::default(),
         triage_output: None,
         plan_output: None,
+        project_id: String::new(),
     };
     state.core.tasks.insert(&task).await;
     let app = runtime_hosts_app(state);
