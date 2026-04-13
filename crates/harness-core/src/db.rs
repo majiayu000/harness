@@ -193,12 +193,13 @@ impl<'a> Migrator<'a> {
         pending.sort_by_key(|m| m.version);
 
         for migration in pending {
+            let mut tx = self.pool.begin().await?;
             for stmt in migration.sql.split(';') {
                 let stmt = stmt.trim();
                 if stmt.is_empty() {
                     continue;
                 }
-                if let Err(e) = sqlx::query(stmt).execute(self.pool).await {
+                if let Err(e) = sqlx::query(stmt).execute(&mut *tx).await {
                     // Tolerate duplicate-column errors from ALTER TABLE ADD COLUMN
                     // so that migrating pre-migration-system databases is idempotent.
                     if stmt.to_uppercase().contains("ADD COLUMN") {
@@ -208,7 +209,7 @@ impl<'a> Migrator<'a> {
                         }
                     }
                     return Err(anyhow::anyhow!(
-                        "migration v{} '{}' failed: {e}",
+                        "migration v{} '{}' failed (transaction rolled back): {e}",
                         migration.version,
                         migration.description
                     ));
@@ -217,8 +218,9 @@ impl<'a> Migrator<'a> {
             sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
                 .bind(migration.version as i64)
                 .bind(migration.description)
-                .execute(self.pool)
+                .execute(&mut *tx)
                 .await?;
+            tx.commit().await?;
         }
         Ok(())
     }
@@ -425,6 +427,47 @@ mod tests {
 
         // Running v2 now must not fail even though the column already exists.
         Migrator::new(&pool, SIMPLE_MIGRATIONS).run().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migrator_rolls_back_partial_migration_on_failure() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pool = open_pool(&dir.path().join("mig.db")).await?;
+
+        // A migration whose first statement succeeds but second statement fails.
+        let bad_migrations: &[Migration] = &[Migration {
+            version: 1,
+            description: "create table then fail",
+            sql: "CREATE TABLE IF NOT EXISTS things (id TEXT PRIMARY KEY);\
+                  THIS IS NOT VALID SQL AND WILL FAIL",
+        }];
+
+        let result = Migrator::new(&pool, bad_migrations).run().await;
+        assert!(result.is_err(), "migration should fail");
+        assert!(
+            result.unwrap_err().to_string().contains("rolled back"),
+            "error should mention rollback"
+        );
+
+        // The table created by the first statement must not exist (rolled back).
+        let table_exists: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='things'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(table_exists.0, 0, "table should not exist after rollback");
+
+        // No version record should have been inserted.
+        let rows: Vec<(i64,)> =
+            sqlx::query_as("SELECT version FROM schema_migrations ORDER BY version")
+                .fetch_all(&pool)
+                .await?;
+        assert!(
+            rows.is_empty(),
+            "version should not be recorded after rollback"
+        );
+
         Ok(())
     }
 }
