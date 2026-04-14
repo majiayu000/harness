@@ -128,6 +128,24 @@ static REVIEW_MIGRATIONS: &[Migration] = &[
         CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_dedup
         ON review_findings(rule_id, file, status)",
     },
+    Migration {
+        version: 5,
+        description: "normalize legacy claimed_at values to RFC3339 format",
+        // Old code wrote claimed_at using SQL CURRENT_TIMESTAMP which produces
+        // 'YYYY-MM-DD HH:MM:SS' (space separator).  recover_stale_pending_claims
+        // compares claimed_at against an RFC3339 cutoff ('YYYY-MM-DDTHH:MM:SSZ',
+        // T separator).  Because SQLite/Postgres use lexicographic string order,
+        // space (' ') sorts before 'T', so any space-format claimed_at is always
+        // less than any RFC3339 cutoff — causing every legacy pending claim to
+        // appear stale on first startup after upgrade and triggering spurious
+        // re-spawns.  Setting them to the RFC3339 epoch marks them as stale
+        // (correct: they predate task-status tracking) without corrupting new rows.
+        sql: "UPDATE review_findings
+              SET claimed_at = '2000-01-01T00:00:00Z'
+              WHERE task_id = 'pending'
+                AND claimed_at IS NOT NULL
+                AND claimed_at NOT LIKE '%T%'",
+    },
 ];
 
 /// Persists review findings to SQLite.
