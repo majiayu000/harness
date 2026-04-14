@@ -1,4 +1,5 @@
-use harness_core::db::open_pool;
+use chrono::Utc;
+use harness_core::db::{open_pool, rewrite_placeholders, Dialect, Migration, Migrator};
 use serde::{Deserialize, Serialize};
 use sqlx::AnyPool;
 use std::path::Path;
@@ -54,118 +55,86 @@ pub struct ReviewOutput {
     pub summary: ReviewSummary,
 }
 
+static REVIEW_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "create review_findings table",
+        sql: "CREATE TABLE IF NOT EXISTS review_findings (
+            id          TEXT NOT NULL,
+            review_id   TEXT NOT NULL,
+            rule_id     TEXT NOT NULL,
+            priority    TEXT NOT NULL,
+            impact      INTEGER NOT NULL,
+            confidence  INTEGER NOT NULL,
+            effort      INTEGER NOT NULL,
+            file        TEXT NOT NULL,
+            line        INTEGER NOT NULL DEFAULT 0,
+            title       TEXT NOT NULL,
+            description TEXT NOT NULL,
+            action      TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'open',
+            created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            task_id     TEXT,
+            PRIMARY KEY (review_id, id)
+        )",
+    },
+    Migration {
+        version: 2,
+        description: "add claimed_at column and backfill stuck pending rows",
+        sql: "ALTER TABLE review_findings ADD COLUMN claimed_at TEXT;
+              UPDATE review_findings
+              SET claimed_at = CURRENT_TIMESTAMP
+              WHERE task_id = 'pending' AND claimed_at IS NULL",
+    },
+    Migration {
+        version: 3,
+        description: "add real_task_id column",
+        sql: "ALTER TABLE review_findings ADD COLUMN real_task_id TEXT",
+    },
+    Migration {
+        version: 4,
+        description: "deduplicate findings and add unique index",
+        sql: "WITH ranked AS (
+            SELECT review_id, id,
+                   ROW_NUMBER() OVER (PARTITION BY rule_id, file, status ORDER BY created_at DESC) AS rn
+            FROM review_findings
+        )
+        DELETE FROM review_findings
+        WHERE (review_id, id) IN (SELECT review_id, id FROM ranked WHERE rn > 1);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_dedup
+        ON review_findings(rule_id, file, status)",
+    },
+];
+
 /// Persists review findings to SQLite.
 pub struct ReviewStore {
     pool: AnyPool,
+    dialect: Dialect,
 }
 
 impl ReviewStore {
     pub async fn open(db_path: &Path) -> anyhow::Result<Self> {
         let pool = open_pool(db_path).await?;
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS review_findings (
-                id          TEXT NOT NULL,
-                review_id   TEXT NOT NULL,
-                rule_id     TEXT NOT NULL,
-                priority    TEXT NOT NULL,
-                impact      INTEGER NOT NULL,
-                confidence  INTEGER NOT NULL,
-                effort      INTEGER NOT NULL,
-                file        TEXT NOT NULL,
-                line        INTEGER NOT NULL DEFAULT 0,
-                title       TEXT NOT NULL,
-                description TEXT NOT NULL,
-                action      TEXT NOT NULL,
-                status      TEXT NOT NULL DEFAULT 'open',
-                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-                task_id     TEXT,
-                PRIMARY KEY (review_id, id)
-            )",
-        )
-        .execute(&pool)
-        .await?;
-        // Migrate existing databases: add task_id / claimed_at columns if absent.
-        // PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk).
-        let columns: Vec<(i32, String, String, i32, Option<String>, i32)> =
-            sqlx::query_as("PRAGMA table_info(review_findings)")
-                .fetch_all(&pool)
-                .await?;
-        let has_task_id = columns
-            .iter()
-            .any(|(_, name, _, _, _, _)| name == "task_id");
-        if !has_task_id {
-            sqlx::query("ALTER TABLE review_findings ADD COLUMN task_id TEXT")
-                .execute(&pool)
-                .await?;
-        }
-        let has_claimed_at = columns
-            .iter()
-            .any(|(_, name, _, _, _, _)| name == "claimed_at");
-        if !has_claimed_at {
-            sqlx::query("ALTER TABLE review_findings ADD COLUMN claimed_at TEXT")
-                .execute(&pool)
-                .await?;
-            // Backfill pre-upgrade rows that are already stuck in task_id='pending'.
-            // ALTER TABLE sets claimed_at = NULL for all existing rows, but the
-            // recovery query requires `claimed_at IS NOT NULL`, so without this
-            // backfill those rows would remain permanently dead-lettered.
-            // Use datetime('now') so they enter the time-based fallback path in
-            // recover_stale_pending_claims.  The caller uses a 3900 s threshold
-            // (≥ one full turn timeout), which prevents immediate duplicate-task
-            // spawning if any pre-upgrade task was still running at upgrade time.
-            sqlx::query(
-                "UPDATE review_findings \
-                 SET claimed_at = datetime('now') \
-                 WHERE task_id = 'pending' AND claimed_at IS NULL",
-            )
-            .execute(&pool)
-            .await?;
-        }
-        // Migrate: add real_task_id column for confirmed-stale recovery (issue #611).
-        // Populated when both confirm_task_spawned attempts fail; allows recovery to
-        // gate on actual task completion rather than a fixed time threshold.
-        let has_real_task_id = columns
-            .iter()
-            .any(|(_, name, _, _, _, _)| name == "real_task_id");
-        if !has_real_task_id {
-            sqlx::query("ALTER TABLE review_findings ADD COLUMN real_task_id TEXT")
-                .execute(&pool)
-                .await?;
-        }
-        // Remove duplicate (rule_id, file, status) rows that may exist from
-        // before this unique index was introduced; keep the most recent row per group.
-        sqlx::query(
-            "DELETE FROM review_findings \
-             WHERE rowid NOT IN ( \
-                 SELECT MAX(rowid) FROM review_findings GROUP BY rule_id, file, status \
-             )",
-        )
-        .execute(&pool)
-        .await?;
-        // Unique index enables specific-conflict INSERT deduplication without a
-        // TOCTOU race between a SELECT check and an INSERT.
-        sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_dedup \
-             ON review_findings(rule_id, file, status)",
-        )
-        .execute(&pool)
-        .await?;
-        Ok(Self { pool })
+        Migrator::new(&pool, REVIEW_MIGRATIONS).run().await?;
+        Ok(Self {
+            pool,
+            dialect: Dialect::Sqlite,
+        })
     }
 
     /// Persist findings from a review run, deduplicating against existing open findings.
     ///
     /// Same-batch PK duplicates (same id within one review) are caught eagerly and
-    /// returned as an error rather than silently dropped by INSERT OR IGNORE.
+    /// returned as an error rather than silently dropped by INSERT ... ON CONFLICT DO NOTHING.
     /// Cross-review dedup (same rule_id+file already open) is handled atomically by
-    /// INSERT OR IGNORE + conditional UPDATE, eliminating the TOCTOU race.
+    /// INSERT ... ON CONFLICT DO NOTHING + conditional UPDATE, eliminating the TOCTOU race.
     pub async fn persist_findings(
         &self,
         review_id: &str,
         findings: &[ReviewFinding],
     ) -> anyhow::Result<usize> {
         // Detect PK duplicates within the batch before touching the DB.
-        // INSERT OR IGNORE would silently drop them; surface an explicit error instead.
+        // INSERT ... ON CONFLICT DO NOTHING would silently drop them; surface an explicit error instead.
         let mut seen_ids = std::collections::HashSet::with_capacity(findings.len());
         for f in findings {
             if !seen_ids.insert(f.id.as_str()) {
@@ -178,41 +147,45 @@ impl ReviewStore {
         }
         let mut tx = self.pool.begin().await?;
         let mut inserted = 0;
+        let insert_sql = rewrite_placeholders(
+            "INSERT INTO review_findings \
+             (id, review_id, rule_id, priority, impact, confidence, effort, \
+              file, line, title, description, action) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            self.dialect,
+        );
+        let update_sql = rewrite_placeholders(
+            "UPDATE review_findings SET review_id = ? \
+             WHERE rule_id = ? AND file = ? AND status = 'open'",
+            self.dialect,
+        );
         for f in findings {
-            let result = sqlx::query(
-                "INSERT OR IGNORE INTO review_findings \
-                 (id, review_id, rule_id, priority, impact, confidence, effort, \
-                  file, line, title, description, action) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&f.id)
-            .bind(review_id)
-            .bind(&f.rule_id)
-            .bind(&f.priority)
-            .bind(f.impact)
-            .bind(f.confidence)
-            .bind(f.effort)
-            .bind(&f.file)
-            .bind(f.line)
-            .bind(&f.title)
-            .bind(&f.description)
-            .bind(&f.action)
-            .execute(&mut *tx)
-            .await?;
+            let result = sqlx::query(&insert_sql)
+                .bind(&f.id)
+                .bind(review_id)
+                .bind(&f.rule_id)
+                .bind(&f.priority)
+                .bind(f.impact)
+                .bind(f.confidence)
+                .bind(f.effort)
+                .bind(&f.file)
+                .bind(f.line)
+                .bind(&f.title)
+                .bind(&f.description)
+                .bind(&f.action)
+                .execute(&mut *tx)
+                .await?;
 
             if result.rows_affected() == 1 {
                 inserted += 1;
             } else {
                 // Existing open finding for the same rule_id+file — mark as recurring.
-                sqlx::query(
-                    "UPDATE review_findings SET review_id = ? \
-                     WHERE rule_id = ? AND file = ? AND status = 'open'",
-                )
-                .bind(review_id)
-                .bind(&f.rule_id)
-                .bind(&f.file)
-                .execute(&mut *tx)
-                .await?;
+                sqlx::query(&update_sql)
+                    .bind(review_id)
+                    .bind(&f.rule_id)
+                    .bind(&f.file)
+                    .execute(&mut *tx)
+                    .await?;
             }
         }
         tx.commit().await?;
@@ -221,7 +194,7 @@ impl ReviewStore {
 
     /// List all open findings, ordered by priority then impact.
     pub async fn list_open(&self) -> anyhow::Result<Vec<ReviewFinding>> {
-        let rows: Vec<FindingRow> = sqlx::query_as(
+        let sql = rewrite_placeholders(
             "SELECT id, rule_id, priority, impact, confidence, effort, \
                     file, line, title, description, action, task_id \
              FROM review_findings WHERE status = 'open' \
@@ -229,9 +202,9 @@ impl ReviewStore {
                CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 \
                              WHEN 'P2' THEN 2 WHEN 'P3' THEN 3 ELSE 4 END, \
                impact DESC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+            self.dialect,
+        );
+        let rows: Vec<FindingRow> = sqlx::query_as(&sql).fetch_all(&self.pool).await?;
 
         Ok(Self::rows_to_findings(rows))
     }
@@ -255,13 +228,14 @@ impl ReviewStore {
             .map(|_| "?")
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!(
+        let raw = format!(
             "SELECT id, rule_id, priority, impact, confidence, effort, \
                     file, line, title, description, action, task_id \
              FROM review_findings \
              WHERE review_id = ? AND priority IN ({placeholders}) \
                AND status = 'open' AND task_id IS NULL"
         );
+        let sql = rewrite_placeholders(&raw, self.dialect);
         let mut query = sqlx::query_as::<_, FindingRow>(&sql).bind(review_id.to_owned());
         for p in priorities {
             query = query.bind(p.to_string());
@@ -284,14 +258,16 @@ impl ReviewStore {
     ///
     /// Returns `true` if this caller won the claim, `false` if already claimed.
     pub async fn try_claim_finding(&self, rule_id: &str, file: &str) -> anyhow::Result<bool> {
-        let result = sqlx::query(
-            "UPDATE review_findings SET task_id = 'pending', claimed_at = datetime('now') \
+        let sql = rewrite_placeholders(
+            "UPDATE review_findings SET task_id = 'pending', claimed_at = CURRENT_TIMESTAMP \
              WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id IS NULL",
-        )
-        .bind(rule_id)
-        .bind(file)
-        .execute(&self.pool)
-        .await?;
+            self.dialect,
+        );
+        let result = sqlx::query(&sql)
+            .bind(rule_id)
+            .bind(file)
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -319,43 +295,50 @@ impl ReviewStore {
         is_task_done: impl Fn(&str) -> bool,
     ) -> anyhow::Result<u64> {
         // Strategy 1: recover rows whose real underlying task has terminated.
-        let with_real_id: Vec<(String, String, String)> = sqlx::query_as(
+        let select_sql = rewrite_placeholders(
             "SELECT rule_id, file, real_task_id \
              FROM review_findings \
              WHERE task_id = 'pending' AND status = 'open' \
                AND claimed_at IS NOT NULL AND real_task_id IS NOT NULL",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+            self.dialect,
+        );
+        let with_real_id: Vec<(String, String, String)> =
+            sqlx::query_as(&select_sql).fetch_all(&self.pool).await?;
 
         let mut recovered = 0u64;
+        let update_real_sql = rewrite_placeholders(
+            "UPDATE review_findings \
+             SET task_id = NULL, claimed_at = NULL, real_task_id = NULL \
+             WHERE rule_id = ? AND file = ? AND status = 'open' \
+               AND task_id = 'pending' AND real_task_id = ?",
+            self.dialect,
+        );
         for (rule_id, file, real_tid) in with_real_id {
             if is_task_done(&real_tid) {
-                let res = sqlx::query(
-                    "UPDATE review_findings \
-                     SET task_id = NULL, claimed_at = NULL, real_task_id = NULL \
-                     WHERE rule_id = ? AND file = ? AND status = 'open' \
-                       AND task_id = 'pending' AND real_task_id = ?",
-                )
-                .bind(&rule_id)
-                .bind(&file)
-                .bind(&real_tid)
-                .execute(&self.pool)
-                .await?;
+                let res = sqlx::query(&update_real_sql)
+                    .bind(&rule_id)
+                    .bind(&file)
+                    .bind(&real_tid)
+                    .execute(&self.pool)
+                    .await?;
                 recovered += res.rows_affected();
             }
         }
 
         // Strategy 2: recover mid-claim rows (no real task id yet) via time threshold.
-        let result = sqlx::query(
+        let cutoff = Utc::now() - chrono::Duration::seconds(stale_secs);
+        let cutoff_str = cutoff.to_rfc3339();
+        let cutoff_sql = rewrite_placeholders(
             "UPDATE review_findings SET task_id = NULL, claimed_at = NULL \
              WHERE task_id = 'pending' AND status = 'open' \
                AND claimed_at IS NOT NULL AND real_task_id IS NULL \
-               AND claimed_at < datetime('now', '-' || cast(? as text) || ' seconds')",
-        )
-        .bind(stale_secs)
-        .execute(&self.pool)
-        .await?;
+               AND claimed_at < ?",
+            self.dialect,
+        );
+        let result = sqlx::query(&cutoff_sql)
+            .bind(&cutoff_str)
+            .execute(&self.pool)
+            .await?;
         recovered += result.rows_affected();
 
         Ok(recovered)
@@ -371,15 +354,17 @@ impl ReviewStore {
         file: &str,
         real_task_id: &str,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        let sql = rewrite_placeholders(
             "UPDATE review_findings SET real_task_id = ? \
              WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id = 'pending'",
-        )
-        .bind(real_task_id)
-        .bind(rule_id)
-        .bind(file)
-        .execute(&self.pool)
-        .await?;
+            self.dialect,
+        );
+        sqlx::query(&sql)
+            .bind(real_task_id)
+            .bind(rule_id)
+            .bind(file)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -391,15 +376,17 @@ impl ReviewStore {
         file: &str,
         task_id: &str,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        let sql = rewrite_placeholders(
             "UPDATE review_findings SET task_id = ? \
              WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id = 'pending'",
-        )
-        .bind(task_id)
-        .bind(rule_id)
-        .bind(file)
-        .execute(&self.pool)
-        .await?;
+            self.dialect,
+        );
+        sqlx::query(&sql)
+            .bind(task_id)
+            .bind(rule_id)
+            .bind(file)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -408,14 +395,16 @@ impl ReviewStore {
     /// Called when task enqueue fails after a successful `try_claim_finding`,
     /// allowing the next poll cycle to retry spawning for this finding.
     pub async fn release_claim(&self, rule_id: &str, file: &str) -> anyhow::Result<()> {
-        sqlx::query(
+        let sql = rewrite_placeholders(
             "UPDATE review_findings SET task_id = NULL \
              WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id = 'pending'",
-        )
-        .bind(rule_id)
-        .bind(file)
-        .execute(&self.pool)
-        .await?;
+            self.dialect,
+        );
+        sqlx::query(&sql)
+            .bind(rule_id)
+            .bind(file)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

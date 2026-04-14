@@ -1,6 +1,6 @@
 use crate::http::parse_pr_num_from_url;
 use crate::task_runner::{TaskState, TaskStatus};
-use harness_core::db::{open_pool, Migration, Migrator};
+use harness_core::db::{open_pool, rewrite_placeholders, Dialect, Migration, Migrator};
 use harness_core::error::TaskDbDecodeError;
 use serde::{Deserialize, Serialize};
 use sqlx::AnyPool;
@@ -41,8 +41,8 @@ static TASK_MIGRATIONS: &[Migration] = &[
             pr_url      TEXT,
             rounds      TEXT NOT NULL DEFAULT '[]',
             error       TEXT,
-            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     },
     Migration {
@@ -69,7 +69,7 @@ static TASK_MIGRATIONS: &[Migration] = &[
             turn          INTEGER NOT NULL DEFAULT 0,
             artifact_type TEXT NOT NULL,
             content       TEXT NOT NULL,
-            created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     },
     Migration {
@@ -181,6 +181,7 @@ struct RecoveryRow {
 
 pub struct TaskDb {
     pool: AnyPool,
+    dialect: Dialect,
 }
 
 impl TaskDb {
@@ -190,7 +191,10 @@ impl TaskDb {
 
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let pool = open_pool(path).await?;
-        let db = Self { pool };
+        let db = Self {
+            pool,
+            dialect: Dialect::Sqlite,
+        };
         Migrator::new(&db.pool, TASK_MIGRATIONS).run().await?;
         Ok(db)
     }
@@ -200,28 +204,35 @@ impl TaskDb {
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let status = state.status.as_ref();
         let phase_json = serde_json::to_string(&state.phase)?;
-        sqlx::query(
+        let sql = rewrite_placeholders(
             "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&state.id.0)
-        .bind(status)
-        .bind(state.turn as i64)
-        .bind(&state.pr_url)
-        .bind(&rounds_json)
-        .bind(&state.error)
-        .bind(&state.source)
-        .bind(&state.external_id)
-        .bind(state.parent_id.as_ref().map(|id| &id.0))
-        .bind(&state.created_at)
-        .bind(&state.repo)
-        .bind(&depends_on_json)
-        .bind(state.project_root.as_ref().map(|p| p.to_string_lossy().into_owned()))
-        .bind(state.priority as i64)
-        .bind(&phase_json)
-        .bind(state.description.as_deref())
-        .execute(&self.pool)
-        .await?;
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?)",
+            self.dialect,
+        );
+        sqlx::query(&sql)
+            .bind(&state.id.0)
+            .bind(status)
+            .bind(state.turn as i64)
+            .bind(&state.pr_url)
+            .bind(&rounds_json)
+            .bind(&state.error)
+            .bind(&state.source)
+            .bind(&state.external_id)
+            .bind(state.parent_id.as_ref().map(|id| &id.0))
+            .bind(&state.created_at)
+            .bind(&state.repo)
+            .bind(&depends_on_json)
+            .bind(
+                state
+                    .project_root
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+            )
+            .bind(state.priority as i64)
+            .bind(&phase_json)
+            .bind(state.description.as_deref())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -230,38 +241,43 @@ impl TaskDb {
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let phase_json = serde_json::to_string(&state.phase)?;
         let status = state.status.as_ref();
-        sqlx::query(
+        let sql = rewrite_placeholders(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
                     source = ?, external_id = ?, repo = ?, depends_on = ?, project = ?,
-                    priority = ?, phase = ?, description = ?, updated_at = datetime('now')
+                    priority = ?, phase = ?, description = ?, updated_at = CURRENT_TIMESTAMP
              WHERE id = ?",
-        )
-        .bind(status)
-        .bind(state.turn as i64)
-        .bind(&state.pr_url)
-        .bind(&rounds_json)
-        .bind(&state.error)
-        .bind(&state.source)
-        .bind(&state.external_id)
-        .bind(&state.repo)
-        .bind(&depends_on_json)
-        .bind(
-            state
-                .project_root
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-        )
-        .bind(state.priority as i64)
-        .bind(&phase_json)
-        .bind(state.description.as_deref())
-        .bind(&state.id.0)
-        .execute(&self.pool)
-        .await?;
+            self.dialect,
+        );
+        sqlx::query(&sql)
+            .bind(status)
+            .bind(state.turn as i64)
+            .bind(&state.pr_url)
+            .bind(&rounds_json)
+            .bind(&state.error)
+            .bind(&state.source)
+            .bind(&state.external_id)
+            .bind(&state.repo)
+            .bind(&depends_on_json)
+            .bind(
+                state
+                    .project_root
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+            )
+            .bind(state.priority as i64)
+            .bind(&phase_json)
+            .bind(state.description.as_deref())
+            .bind(&state.id.0)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
-        let sql = format!("SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE id = ?");
+        let sql = rewrite_placeholders(
+            &format!("SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE id = ?"),
+            self.dialect,
+        );
         let row = sqlx::query_as::<_, TaskRow>(&sql)
             .bind(id)
             .fetch_optional(&self.pool)
@@ -286,8 +302,9 @@ impl TaskDb {
             return Ok(Vec::new());
         }
         let placeholders = Self::status_placeholders(statuses.len());
-        let sql = format!(
-            "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at DESC"
+        let sql = rewrite_placeholders(
+            &format!("SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at DESC"),
+            self.dialect,
         );
         let mut q = sqlx::query_as::<_, TaskRow>(&sql);
         for status in statuses {
@@ -303,15 +320,17 @@ impl TaskDb {
         project: &str,
         external_id: &str,
     ) -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as(
+        let sql = rewrite_placeholders(
             "SELECT id FROM tasks WHERE project = ? AND external_id = ? \
              AND status IN ('pending', 'awaiting_deps', 'implementing', 'agent_review', 'waiting', 'reviewing') \
              LIMIT 1",
-        )
-        .bind(project)
-        .bind(external_id)
-        .fetch_optional(&self.pool)
-        .await?;
+            self.dialect,
+        );
+        let row: Option<(String,)> = sqlx::query_as(&sql)
+            .bind(project)
+            .bind(external_id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.map(|r| r.0))
     }
 
@@ -324,15 +343,17 @@ impl TaskDb {
         project: &str,
         external_id: &str,
     ) -> anyhow::Result<Option<(String, String)>> {
-        let row: Option<(String, String)> = sqlx::query_as(
+        let sql = rewrite_placeholders(
             "SELECT id, pr_url FROM tasks \
              WHERE project = ? AND external_id = ? AND status = 'done' AND pr_url IS NOT NULL \
              ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(project)
-        .bind(external_id)
-        .fetch_optional(&self.pool)
-        .await?;
+            self.dialect,
+        );
+        let row: Option<(String, String)> = sqlx::query_as(&sql)
+            .bind(project)
+            .bind(external_id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row)
     }
 
@@ -437,7 +458,10 @@ impl TaskDb {
             return Ok(Vec::new());
         }
         let placeholders = Self::status_placeholders(statuses.len());
-        let sql = format!("SELECT id FROM tasks WHERE status IN ({placeholders})");
+        let sql = rewrite_placeholders(
+            &format!("SELECT id FROM tasks WHERE status IN ({placeholders})"),
+            self.dialect,
+        );
         let mut q = sqlx::query_as::<_, (String,)>(&sql);
         for status in statuses {
             q = q.bind(*status);
@@ -452,7 +476,8 @@ impl TaskDb {
     /// Used by `check_awaiting_deps` to resolve dependency status with a single
     /// DB round-trip instead of a full row fetch.
     pub async fn get_status_only(&self, id: &str) -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM tasks WHERE id = ?")
+        let sql = rewrite_placeholders("SELECT status FROM tasks WHERE id = ?", self.dialect);
+        let row: Option<(String,)> = sqlx::query_as(&sql)
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -461,7 +486,8 @@ impl TaskDb {
 
     /// Return `true` if a task row with the given ID exists in the database.
     pub async fn exists_by_id(&self, id: &str) -> anyhow::Result<bool> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT id FROM tasks WHERE id = ?")
+        let sql = rewrite_placeholders("SELECT id FROM tasks WHERE id = ?", self.dialect);
+        let row: Option<(String,)> = sqlx::query_as(&sql)
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -486,12 +512,15 @@ impl TaskDb {
         if let Some(status) = terminal_status {
             // Overwrite to terminal status; only touches tasks still in interrupted states
             // so we never downgrade a task that already reached Done/Failed in the DB.
-            let sql = format!(
-                "UPDATE tasks SET status = ?, pr_url = COALESCE(?, pr_url), \
-                 updated_at = datetime('now') \
-                 WHERE id = ? \
-                 AND status IN ({})",
-                Self::status_placeholders(TaskStatus::resumable_statuses().len())
+            let sql = rewrite_placeholders(
+                &format!(
+                    "UPDATE tasks SET status = ?, pr_url = COALESCE(?, pr_url), \
+                     updated_at = CURRENT_TIMESTAMP \
+                     WHERE id = ? \
+                     AND status IN ({})",
+                    Self::status_placeholders(TaskStatus::resumable_statuses().len())
+                ),
+                self.dialect,
             );
             let query = sqlx::query(&sql).bind(status).bind(pr_url).bind(task_id);
             let query = TaskStatus::resumable_statuses()
@@ -500,14 +529,15 @@ impl TaskDb {
             query.execute(&self.pool).await?;
         } else if let Some(url) = pr_url {
             // Write pr_url back only when the DB row currently has no pr_url.
-            sqlx::query(
-                "UPDATE tasks SET pr_url = ? \
-                 WHERE id = ? AND pr_url IS NULL",
-            )
-            .bind(url)
-            .bind(task_id)
-            .execute(&self.pool)
-            .await?;
+            let sql = rewrite_placeholders(
+                "UPDATE tasks SET pr_url = ? WHERE id = ? AND pr_url IS NULL",
+                self.dialect,
+            );
+            sqlx::query(&sql)
+                .bind(url)
+                .bind(task_id)
+                .execute(&self.pool)
+                .await?;
         }
         Ok(())
     }
@@ -534,13 +564,16 @@ impl TaskDb {
     pub async fn recover_in_progress(&self) -> anyhow::Result<RecoveryResult> {
         // Collect all interrupted tasks with their checkpoint data via LEFT JOIN.
         let rows = {
-            let sql = format!(
-                "SELECT t.id, t.status, t.turn, t.pr_url AS task_pr_url,
-                        c.triage_output, c.plan_output, c.pr_url AS ck_pr_url
-                 FROM tasks t
-                 LEFT JOIN task_checkpoints c ON t.id = c.task_id
-                 WHERE t.status IN ({})",
-                Self::status_placeholders(TaskStatus::resumable_statuses().len())
+            let sql = rewrite_placeholders(
+                &format!(
+                    "SELECT t.id, t.status, t.turn, t.pr_url AS task_pr_url,
+                            c.triage_output, c.plan_output, c.pr_url AS ck_pr_url
+                     FROM tasks t
+                     LEFT JOIN task_checkpoints c ON t.id = c.task_id
+                     WHERE t.status IN ({})",
+                    Self::status_placeholders(TaskStatus::resumable_statuses().len())
+                ),
+                self.dialect,
             );
             let query = TaskStatus::resumable_statuses()
                 .iter()
@@ -600,14 +633,17 @@ impl TaskDb {
                 let needs_pr_url_writeback = !task_pr_url_valid && effective_pr_url.is_some();
 
                 if needs_pr_url_writeback {
-                    sqlx::query(
-                        "UPDATE tasks SET status = 'pending', error = NULL, pr_url = ?, \
-                         updated_at = datetime('now') WHERE id = ?",
-                    )
-                    .bind(effective_pr_url)
-                    .bind(&row.id)
-                    .execute(&self.pool)
-                    .await?;
+                    let sql = rewrite_placeholders(
+                        "UPDATE tasks SET status = 'pending', pr_url = ?, error = ?, \
+                         updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        self.dialect,
+                    );
+                    sqlx::query(&sql)
+                        .bind(effective_pr_url)
+                        .bind(&reason)
+                        .bind(&row.id)
+                        .execute(&self.pool)
+                        .await?;
                     tracing::info!(
                         task_id = %row.id,
                         was = %row.status,
@@ -615,13 +651,16 @@ impl TaskDb {
                         "startup recovery: wrote back pr_url from checkpoint"
                     );
                 } else {
-                    sqlx::query(
-                        "UPDATE tasks SET status = 'pending', error = NULL, \
-                         updated_at = datetime('now') WHERE id = ?",
-                    )
-                    .bind(&row.id)
-                    .execute(&self.pool)
-                    .await?;
+                    let sql = rewrite_placeholders(
+                        "UPDATE tasks SET status = 'pending', error = ?, updated_at = CURRENT_TIMESTAMP \
+                         WHERE id = ?",
+                        self.dialect,
+                    );
+                    sqlx::query(&sql)
+                        .bind(&reason)
+                        .bind(&row.id)
+                        .execute(&self.pool)
+                        .await?;
                 }
                 result.resumed += 1;
                 tracing::info!(
@@ -638,14 +677,16 @@ impl TaskDb {
                     row.turn,
                     row.task_pr_url.as_deref().unwrap_or("none")
                 );
-                sqlx::query(
-                    "UPDATE tasks SET status = 'failed', error = ?, updated_at = datetime('now') \
+                let sql = rewrite_placeholders(
+                    "UPDATE tasks SET status = 'failed', error = ?, updated_at = CURRENT_TIMESTAMP \
                      WHERE id = ?",
-                )
-                .bind(&err)
-                .bind(&row.id)
-                .execute(&self.pool)
-                .await?;
+                    self.dialect,
+                );
+                sqlx::query(&sql)
+                    .bind(&err)
+                    .bind(&row.id)
+                    .execute(&self.pool)
+                    .await?;
                 result.failed += 1;
             }
         }
@@ -659,7 +700,7 @@ impl TaskDb {
              SET status = 'failed', \
                  error = 'recovered after restart (was: pending in transient retry): ' \
                       || COALESCE(error, ''), \
-                 updated_at = datetime('now') \
+                 updated_at = CURRENT_TIMESTAMP \
              WHERE status = 'pending' \
                AND error LIKE 'retrying after transient failure%'",
         )
@@ -691,36 +732,40 @@ impl TaskDb {
         pr_url: Option<&str>,
         last_phase: &str,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        let sql = rewrite_placeholders(
             "INSERT INTO task_checkpoints \
                  (task_id, triage_output, plan_output, pr_url, last_phase, updated_at) \
-             VALUES (?, ?, ?, ?, ?, datetime('now')) \
+             VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
              ON CONFLICT(task_id) DO UPDATE SET \
                  triage_output = COALESCE(excluded.triage_output, task_checkpoints.triage_output), \
                  plan_output   = COALESCE(excluded.plan_output,   task_checkpoints.plan_output), \
                  pr_url        = COALESCE(excluded.pr_url,        task_checkpoints.pr_url), \
                  last_phase    = excluded.last_phase, \
                  updated_at    = excluded.updated_at",
-        )
-        .bind(task_id)
-        .bind(triage_output)
-        .bind(plan_output)
-        .bind(pr_url)
-        .bind(last_phase)
-        .execute(&self.pool)
-        .await?;
+            self.dialect,
+        );
+        sqlx::query(&sql)
+            .bind(task_id)
+            .bind(triage_output)
+            .bind(plan_output)
+            .bind(pr_url)
+            .bind(last_phase)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     /// Load the checkpoint for `task_id`, or `None` if no checkpoint exists.
     pub async fn load_checkpoint(&self, task_id: &str) -> anyhow::Result<Option<TaskCheckpoint>> {
-        let row = sqlx::query_as::<_, TaskCheckpoint>(
+        let sql = rewrite_placeholders(
             "SELECT task_id, triage_output, plan_output, pr_url, last_phase, updated_at \
              FROM task_checkpoints WHERE task_id = ?",
-        )
-        .bind(task_id)
-        .fetch_optional(&self.pool)
-        .await?;
+            self.dialect,
+        );
+        let row = sqlx::query_as::<_, TaskCheckpoint>(&sql)
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row)
     }
 
@@ -780,11 +825,14 @@ impl TaskDb {
         &self,
     ) -> anyhow::Result<(u64, u64, Vec<(String, u64, u64)>)> {
         let outcome_statuses = [TaskStatus::Done.as_ref(), TaskStatus::Failed.as_ref()];
-        let global_sql = format!(
-            "SELECT COUNT(CASE WHEN status = 'done' THEN 1 END), \
-                    COUNT(CASE WHEN status = 'failed' THEN 1 END) \
-             FROM tasks WHERE status IN ({})",
-            Self::status_placeholders(outcome_statuses.len())
+        let global_sql = rewrite_placeholders(
+            &format!(
+                "SELECT COUNT(CASE WHEN status = 'done' THEN 1 END), \
+                        COUNT(CASE WHEN status = 'failed' THEN 1 END) \
+                 FROM tasks WHERE status IN ({})",
+                Self::status_placeholders(outcome_statuses.len())
+            ),
+            self.dialect,
         );
         let global: (i64, i64) = outcome_statuses
             .iter()
@@ -794,14 +842,17 @@ impl TaskDb {
             .fetch_one(&self.pool)
             .await?;
 
-        let rows_sql = format!(
-            "SELECT project, \
-                    COUNT(CASE WHEN status = 'done' THEN 1 END), \
-                    COUNT(CASE WHEN status = 'failed' THEN 1 END) \
-             FROM tasks \
-             WHERE status IN ({}) AND project IS NOT NULL \
-             GROUP BY project",
-            Self::status_placeholders(outcome_statuses.len())
+        let rows_sql = rewrite_placeholders(
+            &format!(
+                "SELECT project, \
+                        COUNT(CASE WHEN status = 'done' THEN 1 END), \
+                        COUNT(CASE WHEN status = 'failed' THEN 1 END) \
+                 FROM tasks \
+                 WHERE status IN ({}) AND project IS NOT NULL \
+                 GROUP BY project",
+                Self::status_placeholders(outcome_statuses.len())
+            ),
+            self.dialect,
         );
         let rows: Vec<(String, i64, i64)> = outcome_statuses
             .iter()
@@ -820,8 +871,11 @@ impl TaskDb {
 
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
-        let sql = format!(
-            "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE parent_id = ? ORDER BY created_at DESC"
+        let sql = rewrite_placeholders(
+            &format!(
+                "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE parent_id = ? ORDER BY created_at DESC"
+            ),
+            self.dialect,
         );
         let rows = sqlx::query_as::<_, TaskRow>(&sql)
             .bind(parent_id)
@@ -856,28 +910,32 @@ impl TaskDb {
             content.to_string()
         };
 
-        sqlx::query(
+        let sql = rewrite_placeholders(
             "INSERT INTO task_artifacts (task_id, turn, artifact_type, content)
              VALUES (?, ?, ?, ?)",
-        )
-        .bind(task_id)
-        .bind(turn as i64)
-        .bind(artifact_type)
-        .bind(&stored)
-        .execute(&self.pool)
-        .await?;
+            self.dialect,
+        );
+        sqlx::query(&sql)
+            .bind(task_id)
+            .bind(turn as i64)
+            .bind(artifact_type)
+            .bind(&stored)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     /// Return all artifacts for a task ordered by insertion time.
     pub async fn list_artifacts(&self, task_id: &str) -> anyhow::Result<Vec<TaskArtifact>> {
-        let rows = sqlx::query_as::<_, TaskArtifact>(
+        let sql = rewrite_placeholders(
             "SELECT task_id, turn, artifact_type, content, created_at
              FROM task_artifacts WHERE task_id = ? ORDER BY id ASC",
-        )
-        .bind(task_id)
-        .fetch_all(&self.pool)
-        .await?;
+            self.dialect,
+        );
+        let rows = sqlx::query_as::<_, TaskArtifact>(&sql)
+            .bind(task_id)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 }

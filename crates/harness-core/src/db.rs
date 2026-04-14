@@ -53,8 +53,12 @@ pub enum Dialect {
 
 impl Dialect {
     /// Detect dialect from a connection URL prefix.
+    ///
+    /// Accepts both `postgres://` and `postgresql://` (both are valid DSN schemes
+    /// recognised by sqlx; checking only `"postgres"` mis-classifies `postgresql://`
+    /// as SQLite and causes startup failures when PRAGMAs are executed against Postgres).
     pub fn from_url(url: &str) -> Self {
-        if url.starts_with("postgres") {
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
             Self::Postgres
         } else {
             Self::Sqlite
@@ -150,8 +154,8 @@ pub trait DbEntity: Serialize + for<'de> Deserialize<'de> + Send + Unpin + 'stat
 /// CREATE TABLE IF NOT EXISTS <table_name> (
 ///     id         TEXT PRIMARY KEY,
 ///     data       TEXT NOT NULL,
-///     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-///     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+///     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+///     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 /// )
 /// ```
 ///
@@ -160,6 +164,7 @@ pub trait DbEntity: Serialize + for<'de> Deserialize<'de> + Send + Unpin + 'stat
 /// keep a specialised store and call [`open_pool`] for pool creation.
 pub struct Db<T: DbEntity> {
     pub(crate) pool: AnyPool,
+    dialect: Dialect,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -168,6 +173,7 @@ impl<T: DbEntity> Db<T> {
         let pool = open_pool(path).await?;
         let db = Self {
             pool,
+            dialect: Dialect::Sqlite,
             _phantom: std::marker::PhantomData,
         };
         db.migrate().await?;
@@ -184,12 +190,13 @@ impl<T: DbEntity> Db<T> {
     /// Insert or update an entity (upsert by id).
     pub async fn upsert(&self, entity: &T) -> anyhow::Result<()> {
         let data = serde_json::to_string(entity)?;
-        let sql = format!(
+        let raw = format!(
             "INSERT INTO {table} (id, data) VALUES (?, ?)
              ON CONFLICT(id) DO UPDATE SET data = excluded.data,
-                 updated_at = datetime('now')",
+                 updated_at = CURRENT_TIMESTAMP",
             table = T::table_name()
         );
+        let sql = rewrite_placeholders(&raw, self.dialect);
         sqlx::query(&sql)
             .bind(entity.id())
             .bind(&data)
@@ -199,7 +206,8 @@ impl<T: DbEntity> Db<T> {
     }
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<T>> {
-        let sql = format!("SELECT data FROM {} WHERE id = ?", T::table_name());
+        let raw = format!("SELECT data FROM {} WHERE id = ?", T::table_name());
+        let sql = rewrite_placeholders(&raw, self.dialect);
         let row: Option<(String,)> = sqlx::query_as(&sql)
             .bind(id)
             .fetch_optional(&self.pool)
@@ -222,7 +230,8 @@ impl<T: DbEntity> Db<T> {
     }
 
     pub async fn delete(&self, id: &str) -> anyhow::Result<bool> {
-        let sql = format!("DELETE FROM {} WHERE id = ?", T::table_name());
+        let raw = format!("DELETE FROM {} WHERE id = ?", T::table_name());
+        let sql = rewrite_placeholders(&raw, self.dialect);
         let result = sqlx::query(&sql).bind(id).execute(&self.pool).await?;
         Ok(result.rows_affected() > 0)
     }
@@ -269,6 +278,7 @@ pub struct Migration {
 pub struct Migrator<'a> {
     pool: &'a AnyPool,
     migrations: &'a [Migration],
+    dialect: Dialect,
 }
 
 struct MigrationStatement<'a> {
@@ -441,6 +451,7 @@ async fn apply_statements_on_connection(
     conn: &mut PoolConnection<Any>,
     migration: &Migration,
     statements: &[MigrationStatement<'_>],
+    dialect: Dialect,
 ) -> anyhow::Result<()> {
     for statement in statements {
         if let Err(error) = sqlx::query(statement.sql.as_ref())
@@ -454,7 +465,11 @@ async fn apply_statements_on_connection(
         }
     }
 
-    sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
+    let insert_sql = rewrite_placeholders(
+        "INSERT INTO schema_migrations (version, description) VALUES (?, ?)",
+        dialect,
+    );
+    sqlx::query(&insert_sql)
         .bind(migration.version as i64)
         .bind(migration.description)
         .execute(conn.as_mut())
@@ -466,9 +481,10 @@ async fn apply_outside_transaction(
     pool: &AnyPool,
     migration: &Migration,
     statements: &[MigrationStatement<'_>],
+    dialect: Dialect,
 ) -> anyhow::Result<()> {
     let mut conn = pool.acquire().await?;
-    let result = apply_statements_on_connection(&mut conn, migration, statements).await;
+    let result = apply_statements_on_connection(&mut conn, migration, statements, dialect).await;
     if result.is_err() {
         // Close rather than return to pool: connection-scoped state set by a
         // partially-executed migration (e.g. PRAGMA changes) must not leak to
@@ -529,7 +545,11 @@ fn pending_migrations<'a>(
     pending
 }
 
-async fn apply_migration(pool: &AnyPool, migration: &Migration) -> anyhow::Result<()> {
+async fn apply_migration(
+    pool: &AnyPool,
+    migration: &Migration,
+    dialect: Dialect,
+) -> anyhow::Result<()> {
     let statements = migration_statements(migration.sql);
     let use_transaction = statements
         .iter()
@@ -545,7 +565,11 @@ async fn apply_migration(pool: &AnyPool, migration: &Migration) -> anyhow::Resul
                 return Err(format_migration_error(migration, statement, &error, true));
             }
         }
-        sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
+        let insert_sql = rewrite_placeholders(
+            "INSERT INTO schema_migrations (version, description) VALUES (?, ?)",
+            dialect,
+        );
+        sqlx::query(&insert_sql)
             .bind(migration.version as i64)
             .bind(migration.description)
             .execute(&mut *tx)
@@ -554,7 +578,7 @@ async fn apply_migration(pool: &AnyPool, migration: &Migration) -> anyhow::Resul
         return Ok(());
     }
 
-    apply_outside_transaction(pool, migration, &statements).await
+    apply_outside_transaction(pool, migration, &statements, dialect).await
 }
 
 fn applied_versions_set(rows: Vec<(i64,)>) -> HashSet<u32> {
@@ -563,7 +587,11 @@ fn applied_versions_set(rows: Vec<(i64,)>) -> HashSet<u32> {
 
 impl<'a> Migrator<'a> {
     pub fn new(pool: &'a AnyPool, migrations: &'a [Migration]) -> Self {
-        Self { pool, migrations }
+        Self {
+            pool,
+            migrations,
+            dialect: Dialect::Sqlite,
+        }
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -572,7 +600,7 @@ impl<'a> Migrator<'a> {
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                 version     INTEGER PRIMARY KEY,
                 description TEXT NOT NULL,
-                applied_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                applied_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
         )
         .execute(self.pool)
@@ -586,7 +614,7 @@ impl<'a> Migrator<'a> {
         let applied = applied_versions_set(rows);
 
         for migration in pending_migrations(self.migrations, &applied) {
-            apply_migration(self.pool, migration).await?;
+            apply_migration(self.pool, migration, self.dialect).await?;
         }
         Ok(())
     }
@@ -625,8 +653,8 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS notes (
                 id         TEXT PRIMARY KEY,
                 data       TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )"
         }
     }

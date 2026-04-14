@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use harness_core::config::misc::OtelConfig;
-use harness_core::db::{open_pool, Migration, Migrator};
+use harness_core::db::{open_pool, rewrite_placeholders, Dialect, Migration, Migrator};
 use harness_core::types::{
     AutoFixReport, Decision, Event, EventFilters, EventId, ExternalSignal, ExternalSignalId, Grade,
     SessionId, Severity, Violation,
@@ -49,6 +49,7 @@ pub struct EventStore {
     /// Number of seconds of inactivity before a new session is considered started.
     /// Exposed via `session_renewal_secs()` for callers that need to group events.
     session_renewal_secs: u64,
+    dialect: Dialect,
 }
 
 impl EventStore {
@@ -69,6 +70,7 @@ impl EventStore {
             data_dir,
             otel_pipeline: Mutex::new(None),
             session_renewal_secs: 1800,
+            dialect: Dialect::Sqlite,
         };
 
         store.migrate_from_jsonl().await;
@@ -118,16 +120,18 @@ impl EventStore {
         // Phase 1: delete regular (non-watermark) events older than the
         // retention window.
         loop {
-            let result = sqlx::query(
+            let sql = rewrite_placeholders(
                 "DELETE FROM events WHERE id IN (
                     SELECT id FROM events
-                    WHERE ts < ? AND hook NOT GLOB 'periodic_review:*'
+                    WHERE ts < ? AND hook NOT LIKE 'periodic_review:%'
                     LIMIT 500
                 )",
-            )
-            .bind(&cutoff_str)
-            .execute(&self.pool)
-            .await?;
+                self.dialect,
+            );
+            let result = sqlx::query(&sql)
+                .bind(&cutoff_str)
+                .execute(&self.pool)
+                .await?;
             let batch = result.rows_affected();
             total_deleted += batch;
             if batch == 0 {
@@ -140,18 +144,18 @@ impl EventStore {
 
         // Phase 2: trim watermark history — keep only the newest row per hook.
         loop {
-            let result = sqlx::query(
+            let sql = rewrite_placeholders(
                 "DELETE FROM events WHERE id IN (
                     SELECT e.id FROM events e
-                    WHERE e.hook GLOB 'periodic_review:*'
+                    WHERE e.hook LIKE 'periodic_review:%'
                     AND e.ts < (
                         SELECT MAX(e2.ts) FROM events e2 WHERE e2.hook = e.hook
                     )
                     LIMIT 500
                 )",
-            )
-            .execute(&self.pool)
-            .await?;
+                self.dialect,
+            );
+            let result = sqlx::query(&sql).execute(&self.pool).await?;
             let batch = result.rows_affected();
             total_deleted += batch;
             if batch == 0 {
@@ -257,23 +261,25 @@ impl EventStore {
         let decision = serde_json::to_string(&event.decision)?;
         let decision = decision.trim_matches('"');
         let ts = event.ts.to_rfc3339();
-        sqlx::query(
-            "INSERT OR IGNORE INTO events
+        let sql = rewrite_placeholders(
+            "INSERT INTO events
                 (id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, content)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(event.id.as_str())
-        .bind(&ts)
-        .bind(event.session_id.as_str())
-        .bind(&event.hook)
-        .bind(&event.tool)
-        .bind(decision)
-        .bind(&event.reason)
-        .bind(&event.detail)
-        .bind(event.duration_ms.map(|v| v as i64))
-        .bind(&event.content)
-        .execute(&self.pool)
-        .await?;
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            self.dialect,
+        );
+        sqlx::query(&sql)
+            .bind(event.id.as_str())
+            .bind(&ts)
+            .bind(event.session_id.as_str())
+            .bind(&event.hook)
+            .bind(&event.tool)
+            .bind(decision)
+            .bind(&event.reason)
+            .bind(&event.detail)
+            .bind(event.duration_ms.map(|v| v as i64))
+            .bind(&event.content)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -328,6 +334,7 @@ impl EventStore {
             sql.push_str(&format!(" LIMIT {limit}"));
         }
 
+        let sql = rewrite_placeholders(&sql, self.dialect);
         let mut q = sqlx::query(&sql);
 
         if let Some(ref sid) = filters.session_id {

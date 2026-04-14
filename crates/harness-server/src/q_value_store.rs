@@ -22,7 +22,7 @@
 //! - `closed`        → 0.0 (PR rejected/abandoned)
 //! - `unknown_closed`→ 0.2 (terminal state but outcome unclear)
 
-use harness_core::db::{open_pool, Migration, Migrator};
+use harness_core::db::{open_pool, rewrite_placeholders, Dialect, Migration, Migrator};
 use sqlx::AnyPool;
 use std::path::Path;
 
@@ -47,7 +47,7 @@ static Q_VALUE_MIGRATIONS: &[Migration] = &[
             task_id          TEXT NOT NULL,
             phase            TEXT NOT NULL,
             experiences_used TEXT NOT NULL DEFAULT '[]',
-            created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     },
     Migration {
@@ -58,7 +58,7 @@ static Q_VALUE_MIGRATIONS: &[Migration] = &[
             q_value         REAL NOT NULL DEFAULT 0.5,
             retrieval_count INTEGER NOT NULL DEFAULT 0,
             success_count   INTEGER NOT NULL DEFAULT 0,
-            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     },
     Migration {
@@ -72,13 +72,17 @@ static Q_VALUE_MIGRATIONS: &[Migration] = &[
 /// Persistent store for pipeline events and rule Q-values.
 pub struct QValueStore {
     pool: AnyPool,
+    dialect: Dialect,
 }
 
 impl QValueStore {
     /// Open (or create) the Q-value store at `path`, running any pending migrations.
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let pool = open_pool(path).await?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            dialect: Dialect::Sqlite,
+        };
         Migrator::new(&store.pool, Q_VALUE_MIGRATIONS).run().await?;
         Ok(store)
     }
@@ -95,10 +99,11 @@ impl QValueStore {
     ) -> anyhow::Result<()> {
         let experiences_json = serde_json::to_string(experience_ids)?;
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
+        sqlx::query(&rewrite_placeholders(
             "INSERT INTO pipeline_events (task_id, phase, experiences_used, created_at)
-             VALUES (?, ?, ?, datetime('now'))",
-        )
+             VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            self.dialect,
+        ))
         .bind(task_id)
         .bind(phase)
         .bind(&experiences_json)
@@ -106,13 +111,14 @@ impl QValueStore {
         .await?;
 
         for rule_id in experience_ids {
-            sqlx::query(
+            sqlx::query(&rewrite_placeholders(
                 "INSERT INTO rule_experiences (rule_id, retrieval_count, updated_at)
-                 VALUES (?, 1, datetime('now'))
+                 VALUES (?, 1, CURRENT_TIMESTAMP)
                  ON CONFLICT(rule_id) DO UPDATE SET
                    retrieval_count = retrieval_count + 1,
-                   updated_at      = datetime('now')",
-            )
+                   updated_at      = CURRENT_TIMESTAMP",
+                self.dialect,
+            ))
             .bind(rule_id)
             .execute(&mut *tx)
             .await?;
@@ -123,11 +129,13 @@ impl QValueStore {
 
     /// Collect all distinct experience IDs referenced across all pipeline events for a task.
     pub async fn get_experiences_for_task(&self, task_id: &str) -> anyhow::Result<Vec<String>> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT experiences_used FROM pipeline_events WHERE task_id = ?")
-                .bind(task_id)
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<(String,)> = sqlx::query_as(&rewrite_placeholders(
+            "SELECT experiences_used FROM pipeline_events WHERE task_id = ?",
+            self.dialect,
+        ))
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
 
         let mut ids = Vec::new();
         for (json,) in rows {
@@ -158,13 +166,14 @@ impl QValueStore {
 
     /// Ensure a rule_experience row exists and increment its `retrieval_count`.
     pub async fn increment_retrieval(&self, rule_id: &str) -> anyhow::Result<()> {
-        sqlx::query(
+        sqlx::query(&rewrite_placeholders(
             "INSERT INTO rule_experiences (rule_id, retrieval_count, updated_at)
-             VALUES (?, 1, datetime('now'))
+             VALUES (?, 1, CURRENT_TIMESTAMP)
              ON CONFLICT(rule_id) DO UPDATE SET
                retrieval_count = retrieval_count + 1,
-               updated_at      = datetime('now')",
-        )
+               updated_at      = CURRENT_TIMESTAMP",
+            self.dialect,
+        ))
         .bind(rule_id)
         .execute(&self.pool)
         .await?;
@@ -189,14 +198,15 @@ impl QValueStore {
         let mut tx = self.pool.begin().await?;
         for rule_id in experience_ids {
             // Insert or update in one statement: Q_new = Q_old + alpha * (reward - Q_old)
-            sqlx::query(
+            sqlx::query(&rewrite_placeholders(
                 "INSERT INTO rule_experiences (rule_id, q_value, success_count, updated_at)
-                 VALUES (?, 0.5 + ? * (? - 0.5), ?, datetime('now'))
+                 VALUES (?, 0.5 + ? * (? - 0.5), ?, CURRENT_TIMESTAMP)
                  ON CONFLICT(rule_id) DO UPDATE SET
                    q_value       = q_value + ? * (? - q_value),
                    success_count = success_count + ?,
-                   updated_at    = datetime('now')",
-            )
+                   updated_at    = CURRENT_TIMESTAMP",
+                self.dialect,
+            ))
             .bind(rule_id)
             .bind(alpha)
             .bind(reward)
@@ -219,11 +229,13 @@ impl QValueStore {
 
     /// Return the current Q-value for a rule, or `None` if no record exists.
     pub async fn q_value_for(&self, rule_id: &str) -> anyhow::Result<Option<f64>> {
-        let row: Option<(f64,)> =
-            sqlx::query_as("SELECT q_value FROM rule_experiences WHERE rule_id = ?")
-                .bind(rule_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(f64,)> = sqlx::query_as(&rewrite_placeholders(
+            "SELECT q_value FROM rule_experiences WHERE rule_id = ?",
+            self.dialect,
+        ))
+        .bind(rule_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(|(v,)| v))
     }
 }
@@ -323,11 +335,13 @@ mod tests {
         store
             .record_pipeline_event("task-5", "implement", &["rule-Z"])
             .await?;
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT retrieval_count FROM rule_experiences WHERE rule_id = ?")
-                .bind("rule-Z")
-                .fetch_optional(&store.pool)
-                .await?;
+        let row: Option<(i64,)> = sqlx::query_as(&rewrite_placeholders(
+            "SELECT retrieval_count FROM rule_experiences WHERE rule_id = ?",
+            store.dialect,
+        ))
+        .bind("rule-Z")
+        .fetch_optional(&store.pool)
+        .await?;
         assert_eq!(
             row.ok_or_else(|| anyhow::anyhow!("rule-Z row missing"))?.0,
             2
@@ -347,11 +361,13 @@ mod tests {
         store
             .apply_q_update(&experiences, REWARD_CLOSED, DEFAULT_ALPHA)
             .await?;
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT success_count FROM rule_experiences WHERE rule_id = ?")
-                .bind("rule-W")
-                .fetch_optional(&store.pool)
-                .await?;
+        let row: Option<(i64,)> = sqlx::query_as(&rewrite_placeholders(
+            "SELECT success_count FROM rule_experiences WHERE rule_id = ?",
+            store.dialect,
+        ))
+        .bind("rule-W")
+        .fetch_optional(&store.pool)
+        .await?;
         assert_eq!(
             row.ok_or_else(|| anyhow::anyhow!("rule-W row missing after closed"))?
                 .0,
@@ -362,11 +378,13 @@ mod tests {
         store
             .apply_q_update(&experiences, REWARD_MERGED, DEFAULT_ALPHA)
             .await?;
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT success_count FROM rule_experiences WHERE rule_id = ?")
-                .bind("rule-W")
-                .fetch_optional(&store.pool)
-                .await?;
+        let row: Option<(i64,)> = sqlx::query_as(&rewrite_placeholders(
+            "SELECT success_count FROM rule_experiences WHERE rule_id = ?",
+            store.dialect,
+        ))
+        .bind("rule-W")
+        .fetch_optional(&store.pool)
+        .await?;
         assert_eq!(
             row.ok_or_else(|| anyhow::anyhow!("rule-W row missing after merged"))?
                 .0,
