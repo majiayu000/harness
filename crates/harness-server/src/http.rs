@@ -820,7 +820,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                                         .core
                                         .tasks
                                         .get(&task.id)
-                                        .map_or(false, |t| t.status.is_terminal())
+                                        .is_some_and(|t| t.status.is_terminal())
                                     {
                                         tracing::warn!(
                                             task_id = ?task.id,
@@ -1052,7 +1052,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                                         .core
                                         .tasks
                                         .get(&task.id)
-                                        .map_or(false, |t| t.status.is_terminal())
+                                        .is_some_and(|t| t.status.is_terminal())
                                     {
                                         tracing::warn!(
                                             task_id = ?task.id,
