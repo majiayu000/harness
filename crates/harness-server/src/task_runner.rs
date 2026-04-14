@@ -379,6 +379,14 @@ pub struct PersistedRequestSettings {
     pub retry_max_backoff_ms: u64,
     pub stall_timeout_secs: u64,
     pub turn_timeout_secs: u64,
+    /// Additional caller-supplied prompt context for issue tasks.
+    ///
+    /// Callers may submit `{ issue: N, prompt: "extra context" }` to augment
+    /// issue resolution.  The prompt is not stored in `description` (privacy),
+    /// so we persist it here for issue tasks only to survive a server restart.
+    /// Pure prompt tasks and PR tasks leave this `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_prompt: Option<String>,
 }
 
 impl PersistedRequestSettings {
@@ -393,6 +401,15 @@ impl PersistedRequestSettings {
             retry_max_backoff_ms: req.retry_max_backoff_ms,
             stall_timeout_secs: req.stall_timeout_secs,
             turn_timeout_secs: req.turn_timeout_secs,
+            // Only persist the caller's prompt for issue tasks — it serves as
+            // additional context that is safe to store (unlike pure prompt
+            // tasks which may contain credentials).  PR and prompt-only tasks
+            // leave this None.
+            additional_prompt: if req.issue.is_some() {
+                req.prompt.clone()
+            } else {
+                None
+            },
         }
     }
 
@@ -406,6 +423,10 @@ impl PersistedRequestSettings {
         req.retry_max_backoff_ms = self.retry_max_backoff_ms;
         req.stall_timeout_secs = self.stall_timeout_secs;
         req.turn_timeout_secs = self.turn_timeout_secs;
+        // Restore the additional prompt context for recovered issue tasks.
+        if self.additional_prompt.is_some() {
+            req.prompt = self.additional_prompt.clone();
+        }
     }
 }
 

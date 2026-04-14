@@ -815,13 +815,20 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     if let Some(ref settings) = task.request_settings {
                         settings.apply_to_req(&mut req);
                     }
-                    let classification = crate::complexity_router::classify("", None, Some(pr_num));
-                    let agent = match state.core.server.agent_registry.dispatch(&classification) {
+                    // Use the three-tier select_agent() so that an explicit agent
+                    // pin stored in request_settings (Tier 1) and project-level
+                    // defaults (Tier 2a) are honoured, not bypassed by a raw
+                    // complexity dispatch.
+                    let agent = match task_routes::select_agent(
+                        &req,
+                        &state.core.server.agent_registry,
+                        None,
+                    ) {
                         Ok(a) => a,
                         Err(e) => {
                             tracing::error!(
                                 task_id = ?task.id,
-                                "startup recovery: failed to dispatch agent: {e}"
+                                "startup recovery: failed to select agent: {e}"
                             );
                             return;
                         }
@@ -940,10 +947,29 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     {
                         Ok(c) => c,
                         Err(e) => {
-                            tracing::error!(
-                                task_id = ?task.id,
-                                "startup recovery: failed to resolve project path: {e}"
-                            );
+                            let reason =
+                                format!("startup recovery: failed to resolve project path: {e}");
+                            tracing::error!(task_id = ?task.id, "{reason}");
+                            if let Err(pe) = task_runner::mutate_and_persist(
+                                &state.core.tasks,
+                                &task.id,
+                                move |s| {
+                                    s.status = task_runner::TaskStatus::Failed;
+                                    s.error = Some(reason);
+                                },
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    "startup recovery: failed to persist failed status: {pe}"
+                                );
+                            }
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
                             return;
                         }
                     };
@@ -957,10 +983,30 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     {
                         Ok(p) => p,
                         Err(e) => {
-                            tracing::error!(
-                                task_id = ?task.id,
-                                "startup recovery: failed to acquire permit: {e}"
+                            let reason = format!(
+                                "startup recovery: failed to acquire concurrency permit: {e}"
                             );
+                            tracing::error!(task_id = ?task.id, "{reason}");
+                            if let Err(pe) = task_runner::mutate_and_persist(
+                                &state.core.tasks,
+                                &task.id,
+                                move |s| {
+                                    s.status = task_runner::TaskStatus::Failed;
+                                    s.error = Some(reason);
+                                },
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    "startup recovery: failed to persist failed status: {pe}"
+                                );
+                            }
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
                             return;
                         }
                     };
@@ -976,24 +1022,46 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         priority: task.priority,
                         ..Default::default()
                     };
-                    // Restore persisted execution limits so the recovered task resumes
-                    // with the same budget / timeout guardrails as originally requested.
+                    // Restore persisted execution limits and any additional prompt
+                    // context so the recovered task resumes with the same settings
+                    // and caller-supplied context as originally requested.
                     if let Some(ref settings) = task.request_settings {
                         settings.apply_to_req(&mut req);
                     }
 
-                    let classification = crate::complexity_router::classify(
-                        req.prompt.as_deref().unwrap_or(""),
-                        req.issue,
-                        req.pr,
-                    );
-                    let agent = match state.core.server.agent_registry.dispatch(&classification) {
+                    // Use the three-tier select_agent() so that an explicit agent
+                    // pin stored in request_settings (Tier 1) and project-level
+                    // defaults (Tier 2a) are honoured, not bypassed by a raw
+                    // complexity dispatch.
+                    let agent = match task_routes::select_agent(
+                        &req,
+                        &state.core.server.agent_registry,
+                        None,
+                    ) {
                         Ok(a) => a,
                         Err(e) => {
-                            tracing::error!(
-                                task_id = ?task.id,
-                                "startup recovery: failed to dispatch agent: {e}"
-                            );
+                            let reason = format!("startup recovery: failed to select agent: {e}");
+                            tracing::error!(task_id = ?task.id, "{reason}");
+                            if let Err(pe) = task_runner::mutate_and_persist(
+                                &state.core.tasks,
+                                &task.id,
+                                move |s| {
+                                    s.status = task_runner::TaskStatus::Failed;
+                                    s.error = Some(reason);
+                                },
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    "startup recovery: failed to persist failed status: {pe}"
+                                );
+                            }
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
                             return;
                         }
                     };
