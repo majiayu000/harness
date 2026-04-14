@@ -211,16 +211,19 @@ pub(crate) async fn run_turn_lifecycle(
 
     // Register adapter for this turn if one is configured for this agent name.
     // Enables turn/steer and turn/respond_approval to reach the live process.
-    // Gracefully no-ops when no adapter is registered (adapter_registry is empty by default).
-    let _adapter_guard = server.adapter_registry.get(&agent_name).map(|adapter_arc| {
-        server
-            .thread_manager
-            .register_active_adapter(&turn_id, adapter_arc.clone());
-        AdapterGuard {
-            server: server.clone(),
-            turn_id: turn_id.clone(),
-        }
-    });
+    // Gracefully no-ops when no adapter is registered for this agent.
+    let _adapter_guard = server
+        .agent_registry
+        .get_adapter(&agent_name)
+        .map(|adapter_arc| {
+            server
+                .thread_manager
+                .register_active_adapter(&turn_id, adapter_arc.clone());
+            AdapterGuard {
+                server: server.clone(),
+                turn_id: turn_id.clone(),
+            }
+        });
 
     let req = AgentRequest {
         prompt,
