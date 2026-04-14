@@ -1099,28 +1099,18 @@ impl TaskStore {
         // Latencies — phase 2: include terminal tasks from DB not already in cache.
         // After restart with idle queue, cache is empty so without this the p50
         // would be None even though latencies are persisted in the DB.
-        // Uses (id, rounds_json) rows — no RoundResult deserialization — to keep
-        // the per-call footprint proportional to the number of terminal tasks.
-        match self.db.list_terminal_rounds_json().await {
+        // `list_terminal_first_token_latencies_ms` extracts the scalar in SQL via
+        // json_extract (no full rounds blob in Rust memory) and is bounded to the
+        // 500 most-recent terminal tasks so each dashboard poll stays O(1).
+        match self.db.list_terminal_first_token_latencies_ms().await {
             Ok(rows) => {
-                for (id, rounds_json) in rows {
+                for (id, latency_opt) in rows {
                     if cache_ids.contains(&id) {
                         // Already counted via cache iteration above.
                         continue;
                     }
-                    if let Ok(serde_json::Value::Array(rounds)) =
-                        serde_json::from_str::<serde_json::Value>(&rounds_json)
-                    {
-                        if let Some(latency) = rounds
-                            .iter()
-                            .filter(|r| {
-                                r.get("result").and_then(|v| v.as_str())
-                                    != Some("resumed_checkpoint")
-                            })
-                            .find_map(|r| r.get("first_token_latency_ms").and_then(|v| v.as_u64()))
-                        {
-                            first_token_latencies.push(latency);
-                        }
+                    if let Some(ms) = latency_opt {
+                        first_token_latencies.push(ms as u64);
                     }
                 }
             }

@@ -485,13 +485,13 @@ async fn run_agent_streaming(
                             StreamItem::ItemCompleted {
                                 item: Item::AgentReasoning { content },
                             } => {
-                                // Adapters that emit ItemCompleted instead of MessageDelta
-                                // (e.g. AnthropicApiAdapter) never trigger the MessageDelta arm
-                                // above, so capture first-token latency here as well.
-                                if first_token_latency_ms.is_none() {
-                                    first_token_latency_ms =
-                                        Some(turn_start.elapsed().as_millis() as u64);
-                                }
+                                // Non-streaming adapters (e.g. AnthropicApiAgent) call
+                                // execute() to completion before emitting this item, so
+                                // elapsed time here is full-request latency, not TTFB.
+                                // Recording it as first_token_latency_ms would silently
+                                // mix whole-request durations with real streaming TTFB
+                                // values and inflate p50.  Only MessageDelta (true
+                                // streaming events) sets first_token_latency_ms.
                                 // Prefer the full content over accumulated deltas.
                                 output = content.clone();
                             }

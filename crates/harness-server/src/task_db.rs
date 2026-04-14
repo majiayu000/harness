@@ -354,15 +354,32 @@ impl TaskDb {
         Ok(summaries)
     }
 
-    /// Return `(task_id, rounds_json)` pairs for terminal (done/failed) tasks.
+    /// Return `(task_id, first_token_latency_ms)` pairs for the most-recent
+    /// terminal (done/failed) tasks, capped at 500 rows.
     ///
-    /// Used by `collect_llm_metrics_inputs` to include historical latency data
-    /// for tasks that have already left the in-memory cache (e.g. after restart).
-    /// The caller is responsible for skipping IDs that are already in the cache
-    /// to avoid double-counting tasks that completed during the current session.
-    pub async fn list_terminal_rounds_json(&self) -> anyhow::Result<Vec<(String, String)>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, rounds FROM tasks WHERE status IN ('done', 'failed') ORDER BY created_at DESC",
+    /// The latency scalar is extracted directly in SQL via `json_extract` so the
+    /// full `rounds` blob — which may contain large `detail` strings — is never
+    /// allocated on the Rust heap.  The correlated subquery skips synthetic
+    /// `resumed_checkpoint` rounds and returns the first real latency per task.
+    ///
+    /// The `LIMIT 500` keeps each dashboard poll O(1) rather than
+    /// O(total task history).  500 data points are more than sufficient for a
+    /// statistically valid p50; they also represent a natural rolling window that
+    /// gives more weight to recent latency behaviour.
+    pub async fn list_terminal_first_token_latencies_ms(
+        &self,
+    ) -> anyhow::Result<Vec<(String, Option<i64>)>> {
+        let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT id, \
+             (SELECT CAST(json_extract(r.value, '$.first_token_latency_ms') AS INTEGER) \
+              FROM json_each(rounds) r \
+              WHERE json_extract(r.value, '$.result') != 'resumed_checkpoint' \
+                AND json_extract(r.value, '$.first_token_latency_ms') IS NOT NULL \
+              LIMIT 1) AS first_token_latency_ms \
+             FROM tasks \
+             WHERE status IN ('done', 'failed') \
+             ORDER BY created_at DESC \
+             LIMIT 500",
         )
         .fetch_all(&self.pool)
         .await?;
