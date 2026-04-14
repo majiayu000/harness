@@ -146,14 +146,10 @@ async fn restart_with_pr_url_resumes_task() -> anyhow::Result<()> {
         Some("https://github.com/owner/repo/pull/42"),
         "pr_url must be preserved after resume"
     );
-    let err = task.error.as_deref().unwrap_or("");
     assert!(
-        err.contains("resumed after restart"),
-        "error should note resumption, got: {err:?}"
-    );
-    assert!(
-        err.contains("pull/42"),
-        "error should reference the PR URL, got: {err:?}"
+        task.error.is_none(),
+        "resumed task must not have error set, got {:?}",
+        task.error
     );
 
     Ok(())
@@ -185,10 +181,10 @@ async fn restart_with_checkpoint_pr_url_resumes_task() -> anyhow::Result<()> {
         "task with checkpoint PR URL should resume, got {:?}",
         task.status
     );
-    let err = task.error.as_deref().unwrap_or("");
     assert!(
-        err.contains("resumed after restart"),
-        "error should note resumption, got: {err:?}"
+        task.error.is_none(),
+        "resumed task must not have error set, got {:?}",
+        task.error
     );
 
     Ok(())
@@ -220,10 +216,10 @@ async fn restart_with_plan_checkpoint_resumes_task() -> anyhow::Result<()> {
         "task with plan checkpoint should resume, got {:?}",
         task.status
     );
-    let err = task.error.as_deref().unwrap_or("");
     assert!(
-        err.contains("plan checkpoint"),
-        "error should mention plan checkpoint, got: {err:?}"
+        task.error.is_none(),
+        "resumed task must not have error set, got {:?}",
+        task.error
     );
 
     Ok(())
@@ -255,10 +251,10 @@ async fn restart_with_triage_checkpoint_resumes_task() -> anyhow::Result<()> {
         "task with triage checkpoint should resume, got {:?}",
         task.status
     );
-    let err = task.error.as_deref().unwrap_or("");
     assert!(
-        err.contains("triage checkpoint"),
-        "error should mention triage checkpoint, got: {err:?}"
+        task.error.is_none(),
+        "resumed task must not have error set, got {:?}",
+        task.error
     );
 
     Ok(())
