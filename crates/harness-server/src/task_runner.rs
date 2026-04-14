@@ -1732,6 +1732,7 @@ where
         state.external_id = req.external_id.clone();
         state.repo = req.repo.clone();
         state.priority = req.priority;
+        state.request_settings = Some(PersistedRequestSettings::from_req(&req));
         store.insert(&state).await;
         // Register stream channel before spawning so SSE clients can subscribe immediately.
         store.register_task_stream(&task_id);
