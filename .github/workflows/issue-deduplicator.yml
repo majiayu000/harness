@@ -1,0 +1,182 @@
+name: Issue Deduplicator
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  deduplicate:
+    name: Check for duplicate issues
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch open issues
+        id: fetch-issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const newIssueNumber = context.issue.number;
+            const newIssueTitle = context.payload.issue.title;
+            const newIssueBody = (context.payload.issue.body || '').slice(0, 400);
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              sort: 'updated',
+              direction: 'desc',
+              per_page: 50,
+            });
+
+            const existing = issues
+              .filter(i => i.number !== newIssueNumber && !i.pull_request)
+              .map(i => ({
+                number: i.number,
+                title: i.title,
+                body: (i.body || '').slice(0, 400),
+              }));
+
+            core.setOutput('new_number', newIssueNumber);
+            core.setOutput('new_title', newIssueTitle);
+            core.setOutput('new_body', newIssueBody);
+            core.setOutput('existing_count', existing.length);
+            core.setOutput('existing_json', JSON.stringify(existing));
+
+      - name: Skip if no open issues to compare
+        if: steps.fetch-issues.outputs.existing_count == '0'
+        run: |
+          echo "No other open issues found. Skipping deduplication."
+          exit 0
+
+      - name: Call Claude API for semantic comparison
+        id: claude-check
+        if: steps.fetch-issues.outputs.existing_count != '0' && env.ANTHROPIC_API_KEY != ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NEW_TITLE: ${{ steps.fetch-issues.outputs.new_title }}
+          NEW_BODY: ${{ steps.fetch-issues.outputs.new_body }}
+          EXISTING_JSON: ${{ steps.fetch-issues.outputs.existing_json }}
+        run: |
+          EXISTING_LIST=$(echo "$EXISTING_JSON" | jq -r '
+            .[] | "#\(.number): \(.title)\n\(.body | if length > 0 then "  " + . else "" end)\n"
+          ')
+
+          PROMPT="You are reviewing GitHub issues for semantic duplicates. Here are the existing open issues:\n\n${EXISTING_LIST}\n\nNew issue to check:\nTitle: ${NEW_TITLE}\nBody: ${NEW_BODY}\n\nAre any of the existing issues semantic duplicates of the new issue? A duplicate means they address the same underlying problem or request, even if worded differently.\n\nRespond with ONLY valid JSON in this exact format (no markdown, no explanation):\n{\"duplicates\": [{\"number\": <issue_number>, \"reason\": \"<brief reason>\"}]}\n\nIf no duplicates found, respond with:\n{\"duplicates\": []}"
+
+          RESPONSE=$(curl -s -f \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "{
+              \"model\": \"claude-opus-4-6\",
+              \"max_tokens\": 512,
+              \"messages\": [{\"role\": \"user\", \"content\": $(echo "$PROMPT" | jq -Rs .)}]
+            }" \
+            https://api.anthropic.com/v1/messages)
+
+          if [ $? -ne 0 ]; then
+            echo "Claude API call failed. Skipping deduplication."
+            echo "duplicates_json={\"duplicates\":[]}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CONTENT=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+          if [ -z "$CONTENT" ]; then
+            echo "Empty response from Claude. Skipping deduplication."
+            echo "duplicates_json={\"duplicates\":[]}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Validate JSON; fall back to empty on parse error
+          if echo "$CONTENT" | jq -e '.duplicates' > /dev/null 2>&1; then
+            echo "duplicates_json=$CONTENT" >> "$GITHUB_OUTPUT"
+          else
+            echo "Warning: Claude returned malformed JSON. Skipping labeling."
+            echo "duplicates_json={\"duplicates\":[]}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Add duplicate comment and label
+        if: >
+          steps.fetch-issues.outputs.existing_count != '0' &&
+          env.ANTHROPIC_API_KEY != '' &&
+          steps.claude-check.outputs.duplicates_json != '' &&
+          steps.claude-check.outputs.duplicates_json != '{"duplicates":[]}'
+        uses: actions/github-script@v7
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DUPLICATES_JSON: ${{ steps.claude-check.outputs.duplicates_json }}
+        with:
+          script: |
+            const duplicatesJson = process.env.DUPLICATES_JSON;
+            let parsed;
+            try {
+              parsed = JSON.parse(duplicatesJson);
+            } catch (e) {
+              console.log('Failed to parse duplicates JSON. Skipping.');
+              return;
+            }
+
+            const duplicates = parsed.duplicates || [];
+            if (duplicates.length === 0) {
+              console.log('No duplicates found.');
+              return;
+            }
+
+            // Build comment
+            const lines = duplicates.map(d =>
+              `- #${d.number}: ${d.reason}`
+            );
+            const body = [
+              '**Possible duplicate detected** — please review before proceeding.',
+              '',
+              'This issue may overlap with:',
+              ...lines,
+              '',
+              '_This check is automated. A human should make the final call._',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+            // Ensure label exists
+            const labelName = 'possible-duplicate';
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: labelName,
+              });
+            } catch (e) {
+              if (e.status === 404) {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: labelName,
+                  color: 'cfd3d7',
+                  description: 'This issue may be a duplicate of another issue',
+                });
+              }
+            }
+
+            // Check existing labels to stay idempotent
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const alreadyLabeled = issue.labels.some(l => l.name === labelName);
+            if (!alreadyLabeled) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: [labelName],
+              });
+            }
