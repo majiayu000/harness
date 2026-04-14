@@ -601,11 +601,10 @@ impl TaskDb {
 
                 if needs_pr_url_writeback {
                     sqlx::query(
-                        "UPDATE tasks SET status = 'pending', pr_url = ?, error = ?, \
+                        "UPDATE tasks SET status = 'pending', error = NULL, pr_url = ?, \
                          updated_at = datetime('now') WHERE id = ?",
                     )
                     .bind(effective_pr_url)
-                    .bind(&reason)
                     .bind(&row.id)
                     .execute(&self.pool)
                     .await?;
@@ -617,10 +616,9 @@ impl TaskDb {
                     );
                 } else {
                     sqlx::query(
-                        "UPDATE tasks SET status = 'pending', error = ?, updated_at = datetime('now') \
-                         WHERE id = ?",
+                        "UPDATE tasks SET status = 'pending', error = NULL, \
+                         updated_at = datetime('now') WHERE id = ?",
                     )
-                    .bind(&reason)
                     .bind(&row.id)
                     .execute(&self.pool)
                     .await?;
@@ -1534,12 +1532,11 @@ mod tests {
             impl_pr.pr_url.as_deref() == Some("https://github.com/owner/repo/pull/42"),
             "pr_url should be preserved"
         );
-        let err = impl_pr.error.as_deref().unwrap_or("");
         assert!(
-            err.contains("resumed after restart"),
-            "error should note resumption"
+            impl_pr.error.is_none(),
+            "resumed task must not have error set, got {:?}",
+            impl_pr.error
         );
-        assert!(err.contains("pull/42"), "should reference PR URL");
 
         // Verify: agent_review with PR → pending (resumed)
         let review = db
@@ -1588,11 +1585,9 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("t-impl-plan should exist"))?;
         assert!(matches!(task.status, TaskStatus::Pending));
         assert!(
+            task.error.is_none(),
+            "resumed task must not have error set, got {:?}",
             task.error
-                .as_deref()
-                .unwrap_or("")
-                .contains("plan checkpoint"),
-            "error should mention plan checkpoint"
         );
 
         Ok(())
