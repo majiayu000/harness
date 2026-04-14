@@ -1058,12 +1058,23 @@ impl TaskStore {
         // Phase 1: iterate cache refs in-place; never clone full TaskState.
         // Collect both turn counts and latencies in a single pass, and track
         // IDs seen so we can deduplicate against the DB queries in phase 2.
+        //
+        // Only terminal (done/failed) tasks are counted so the cache phase matches
+        // DB phase semantics: both sources use the same status set.  Non-terminal
+        // task IDs are still inserted into `cache_ids` so the DB deduplication
+        // logic remains correct (we never double-count a task that transitions to
+        // terminal while the DB query is in-flight).
         let mut cache_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut turn_counts: Vec<u32> = Vec::new();
         let mut first_token_latencies: Vec<u64> = Vec::new();
         for entry in self.cache.iter() {
             let task = entry.value();
             cache_ids.insert(entry.key().0.clone());
+
+            // Skip non-terminal tasks to match the DB phase (done/failed only).
+            if !matches!(task.status, TaskStatus::Done | TaskStatus::Failed) {
+                continue;
+            }
 
             if task.turn > 0 {
                 turn_counts.push(task.turn);

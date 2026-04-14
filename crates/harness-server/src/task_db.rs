@@ -29,6 +29,7 @@ const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source,
 /// v12 – add priority column for priority-based task scheduling.
 /// v13 – add phase column for consistent phase persistence across cache/DB paths.
 /// v14 – add description column for task observability after restart.
+/// v15 – add (status, updated_at DESC) index for project-agnostic terminal queries.
 static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -118,6 +119,12 @@ static TASK_MIGRATIONS: &[Migration] = &[
         version: 14,
         description: "add description column for task observability",
         sql: "ALTER TABLE tasks ADD COLUMN description TEXT",
+    },
+    Migration {
+        version: 15,
+        description: "add index on tasks(status, updated_at) for project-agnostic terminal queries",
+        sql: "CREATE INDEX IF NOT EXISTS idx_tasks_status_updated \
+              ON tasks(status, updated_at DESC)",
     },
 ];
 

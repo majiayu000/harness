@@ -54,19 +54,27 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         .await
     {
         Ok(events) => {
-            let violation_count = events
-                .iter()
-                .rev()
-                .find(|e| e.hook == "rule_scan")
-                .map(|scan| {
-                    events
-                        .iter()
-                        .filter(|e| e.hook == "rule_check" && e.session_id == scan.session_id)
-                        .count()
-                })
-                .unwrap_or(0);
-            let report = QualityGrader::grade(&events, violation_count);
-            serde_json::to_value(report.grade).ok()
+            // Return None when the rolling window contains no events rather than
+            // computing a false perfect grade from an empty set.  Operators should
+            // see null (unknown) instead of an inflated A when the project has been
+            // quiet for more than DASHBOARD_EVENT_WINDOW_DAYS days.
+            if events.iter().all(|e| e.hook != "rule_scan") {
+                None
+            } else {
+                let violation_count = events
+                    .iter()
+                    .rev()
+                    .find(|e| e.hook == "rule_scan")
+                    .map(|scan| {
+                        events
+                            .iter()
+                            .filter(|e| e.hook == "rule_check" && e.session_id == scan.session_id)
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let report = QualityGrader::grade(&events, violation_count);
+                serde_json::to_value(report.grade).ok()
+            }
         }
         Err(e) => {
             tracing::warn!("dashboard: failed to query events for grade: {e}");

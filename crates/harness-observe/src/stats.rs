@@ -162,14 +162,16 @@ pub fn aggregate_rule_stats(events: &[Event]) -> Vec<RuleStats> {
     stats
 }
 
-/// Count linter/compiler feedback events (Block or Escalate) from `rule_check` events.
+/// Count linter/compiler feedback events (Block) from `rule_check` events.
 ///
 /// High values indicate the agent is in a "hallucination loop" with repeated build failures.
+/// Only `Block` is counted: `rule_check` scanners emit Pass/Warn/Block — `Escalate` is not
+/// produced by this hook and would silently count nothing.
 pub fn linter_feedback_count(events: &[Event]) -> u32 {
     events
         .iter()
         .filter(|e| e.hook == "rule_check")
-        .filter(|e| matches!(e.decision, Decision::Block | Decision::Escalate))
+        .filter(|e| matches!(e.decision, Decision::Block))
         .count() as u32
 }
 
@@ -366,15 +368,17 @@ mod tests {
     }
 
     #[test]
-    fn linter_feedback_count_counts_only_block_and_escalate() {
+    fn linter_feedback_count_counts_only_block() {
+        // rule_check scanners emit Pass/Warn/Block; Escalate is not produced
+        // by this hook so only Block events should be counted.
         let events = vec![
             make_rule_event("SEC-01", Decision::Block),
-            make_rule_event("SEC-01", Decision::Escalate),
+            make_rule_event("SEC-01", Decision::Escalate), // dead for rule_check
             make_rule_event("SEC-02", Decision::Pass),
             make_rule_event("SEC-03", Decision::Warn),
             make_event("other_hook", Decision::Block), // not rule_check
         ];
-        assert_eq!(linter_feedback_count(&events), 2);
+        assert_eq!(linter_feedback_count(&events), 1);
     }
 
     #[test]
