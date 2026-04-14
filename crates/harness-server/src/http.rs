@@ -784,8 +784,8 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     };
                     let project_id = canonical.to_string_lossy().into_owned();
 
-                    // Issue 1: acquire permit here inside the spawned future so serve()
-                    // is never blocked waiting for a concurrency slot.
+                    // Acquire permit inside the spawned future so serve() is never
+                    // blocked waiting for a concurrency slot.
                     let permit = match state
                         .concurrency
                         .task_queue
@@ -794,30 +794,27 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     {
                         Ok(p) => p,
                         Err(e) => {
-                            let reason = format!(
-                                "startup recovery: failed to acquire concurrency permit: {e}"
+                            // acquire() errors are transient (memory pressure, queue
+                            // saturation) — do NOT mark the task Failed.
+                            //
+                            // Marking Failed here would cause two problems:
+                            //   1. Split-brain: mutate_and_persist() mutates the in-memory
+                            //      cache before SQLite; if persist fails the completion
+                            //      callback fires with in-memory=Failed while DB=Pending,
+                            //      triggering duplicate cleanup/notifications on the next
+                            //      restart (the same split-brain validate_recovered_tasks()
+                            //      explicitly avoids).
+                            //   2. False termination: backpressure is transient — marking
+                            //      the task Failed loses work for tasks without a retrying
+                            //      intake source and sends spurious failure notifications.
+                            //
+                            // Leave the task Pending; it will be re-dispatched on the next
+                            // server restart once capacity is available.
+                            tracing::warn!(
+                                task_id = ?task.id,
+                                "startup recovery (Source A): cannot acquire concurrency \
+                                 permit ({e}); leaving task pending for retry on next restart"
                             );
-                            tracing::error!(task_id = ?task.id, "{reason}");
-                            if let Err(pe) = task_runner::mutate_and_persist(
-                                &state.core.tasks,
-                                &task.id,
-                                move |s| {
-                                    s.status = task_runner::TaskStatus::Failed;
-                                    s.error = Some(reason);
-                                },
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    task_id = ?task.id,
-                                    "startup recovery: failed to persist failed status: {pe}"
-                                );
-                            }
-                            if let Some(cb) = &state.intake.completion_callback {
-                                if let Some(final_state) = state.core.tasks.get(&task.id) {
-                                    cb(final_state).await;
-                                }
-                            }
                             return;
                         }
                     };
@@ -1008,30 +1005,26 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     {
                         Ok(p) => p,
                         Err(e) => {
-                            let reason = format!(
-                                "startup recovery: failed to acquire concurrency permit: {e}"
+                            // acquire() errors are transient (memory pressure, queue
+                            // saturation) — do NOT mark the task Failed.
+                            //
+                            // Marking Failed here would cause two problems:
+                            //   1. Split-brain: mutate_and_persist() mutates the in-memory
+                            //      cache before SQLite; if persist fails the completion
+                            //      callback fires with in-memory=Failed while DB=Pending,
+                            //      triggering duplicate cleanup/notifications on the next
+                            //      restart.
+                            //   2. False termination: backpressure is transient — marking
+                            //      the task Failed loses work for tasks without a retrying
+                            //      intake source and sends spurious failure notifications.
+                            //
+                            // Leave the task Pending; it will be re-dispatched on the next
+                            // server restart once capacity is available.
+                            tracing::warn!(
+                                task_id = ?task.id,
+                                "startup recovery (Source B): cannot acquire concurrency \
+                                 permit ({e}); leaving task pending for retry on next restart"
                             );
-                            tracing::error!(task_id = ?task.id, "{reason}");
-                            if let Err(pe) = task_runner::mutate_and_persist(
-                                &state.core.tasks,
-                                &task.id,
-                                move |s| {
-                                    s.status = task_runner::TaskStatus::Failed;
-                                    s.error = Some(reason);
-                                },
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    task_id = ?task.id,
-                                    "startup recovery: failed to persist failed status: {pe}"
-                                );
-                            }
-                            if let Some(cb) = &state.intake.completion_callback {
-                                if let Some(final_state) = state.core.tasks.get(&task.id) {
-                                    cb(final_state).await;
-                                }
-                            }
                             return;
                         }
                     };
