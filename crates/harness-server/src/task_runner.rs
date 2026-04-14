@@ -645,15 +645,13 @@ pub struct DashboardCounts {
 
 /// Lightweight inputs collected for LLM metrics computation.
 ///
-/// Turn counts span all tasks (active + terminal) via DB summaries so the
-/// queue-idle case returns real numbers.  Latencies come from the active
-/// cache only (no full `TaskState` clone) and skip synthetic
-/// `resumed_checkpoint` rounds so resumed tasks are not silently excluded.
+/// Bounded inputs for LLM metrics computation, collected in two O(1) phases:
+/// cache iteration (active tasks) then bounded SQL queries (terminal tasks).
 #[derive(Debug)]
 pub struct LlmMetricsInputs {
-    /// Non-zero turn counts across all tasks, active and terminal.
+    /// Non-zero turn counts from both active (cache) and terminal (DB) tasks.
     pub turn_counts: Vec<u32>,
-    /// First real first-token latency per active task (milliseconds).
+    /// First real first-token latency per task (milliseconds), from cache and DB.
     pub first_token_latencies: Vec<u64>,
 }
 
@@ -1043,43 +1041,34 @@ impl TaskStore {
 
     /// Collect lightweight inputs for LLM metrics computation.
     ///
-    /// **Turn counts** are fetched from `list_all_summaries_with_terminal` so
-    /// they include both active and historical terminal tasks.  When the queue
-    /// is idle this avoids reporting zeros that would misrepresent overall
-    /// throughput.
+    /// Both **turn counts** and **first-token latencies** are collected in two
+    /// bounded phases so the dashboard poll remains O(1) regardless of total
+    /// task history size:
     ///
-    /// **First-token latencies** are collected from two sources:
-    /// 1. The in-memory cache (active tasks + tasks completed this session):
-    ///    iterated via `DashMap` refs — no full `TaskState` clone.
-    /// 2. Terminal (done/failed) tasks in the DB that are no longer in the
-    ///    cache — needed so p50 is non-null after a restart with idle queue.
-    ///    Only `id` and `rounds` columns are fetched; latency is extracted
-    ///    with lightweight `serde_json::Value` parsing (no `RoundResult` alloc).
+    /// 1. **Cache phase** — iterate `DashMap` refs in-place (no full `TaskState`
+    ///    clone).  Records the IDs seen so phase 2 can deduplicate.
+    /// 2. **DB phase** — bounded SQL queries (`LIMIT 500`, `ORDER BY updated_at DESC`)
+    ///    return only scalar columns (`turn`, `first_token_latency_ms`) for the
+    ///    500 most-recently-completed terminal tasks not already counted from cache.
+    ///    This covers the idle-queue restart case without an unbounded table scan.
     ///
     /// Rounds whose `result` is `"resumed_checkpoint"` are skipped in both
     /// sources: they are synthetic markers with no real latency data.
     pub async fn collect_llm_metrics_inputs(&self) -> LlmMetricsInputs {
-        // Turn counts: DB summaries are lightweight (no rounds field) and cover
-        // terminal tasks that have already left the in-memory cache.
-        let turn_counts = match self.list_all_summaries_with_terminal().await {
-            Ok(summaries) => summaries
-                .into_iter()
-                .filter(|s| s.turn > 0)
-                .map(|s| s.turn)
-                .collect(),
-            Err(e) => {
-                tracing::warn!("collect_llm_metrics_inputs: summaries query failed: {e}");
-                vec![]
-            }
-        };
-
-        // Latencies — phase 1: iterate cache refs in-place; never clone full TaskState.
-        // Track IDs seen in cache so we can skip them in the DB query below.
+        // Phase 1: iterate cache refs in-place; never clone full TaskState.
+        // Collect both turn counts and latencies in a single pass, and track
+        // IDs seen so we can deduplicate against the DB queries in phase 2.
         let mut cache_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut turn_counts: Vec<u32> = Vec::new();
         let mut first_token_latencies: Vec<u64> = Vec::new();
         for entry in self.cache.iter() {
             let task = entry.value();
             cache_ids.insert(entry.key().0.clone());
+
+            if task.turn > 0 {
+                turn_counts.push(task.turn);
+            }
+
             // Skip the synthetic resumed_checkpoint round injected at recovery time,
             // then find the first round that actually received a response token.
             // Using find_map (instead of find + and_then) means transient_retry rounds
@@ -1096,12 +1085,28 @@ impl TaskStore {
             }
         }
 
-        // Latencies — phase 2: include terminal tasks from DB not already in cache.
-        // After restart with idle queue, cache is empty so without this the p50
-        // would be None even though latencies are persisted in the DB.
+        // Phase 2a: bounded DB query for terminal turn counts not in cache.
+        // After restart with idle queue the cache is empty; without this, turn
+        // counts would be zero even though history is persisted in the DB.
+        // `list_terminal_turn_counts` fetches only `id` and `turn` (no rounds
+        // blob) and is bounded to 500 rows ordered by updated_at DESC.
+        match self.db.list_terminal_turn_counts().await {
+            Ok(rows) => {
+                for (id, turn) in rows {
+                    if !cache_ids.contains(&id) && turn > 0 {
+                        turn_counts.push(turn as u32);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("collect_llm_metrics_inputs: DB turn counts query failed: {e}");
+            }
+        }
+
+        // Phase 2b: bounded DB query for terminal latencies not in cache.
         // `list_terminal_first_token_latencies_ms` extracts the scalar in SQL via
         // json_extract (no full rounds blob in Rust memory) and is bounded to the
-        // 500 most-recent terminal tasks so each dashboard poll stays O(1).
+        // 500 most-recently-completed terminal tasks so each dashboard poll stays O(1).
         match self.db.list_terminal_first_token_latencies_ms().await {
             Ok(rows) => {
                 for (id, latency_opt) in rows {
