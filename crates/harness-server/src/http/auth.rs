@@ -33,10 +33,12 @@ pub(crate) fn resolve_api_token(
 /// Exempts `/health`, `/webhook`, `/webhook/feishu`, `/signals`, `/favicon.ico`,
 /// `/auth/reset-password`, `/` (dashboard HTML), and `/ws` (WebSocket upgrade).
 /// The dashboard HTML no longer embeds the token, so it is safe to serve without
-/// auth. The WebSocket streams only task-status metadata (no secrets), so it is
-/// also exempt. All other endpoints require an `Authorization: Bearer <token>`
-/// header when `api_token` is configured. When no token is configured the
-/// middleware is a no-op (backward compat).
+/// auth. `/ws` is exempt here because its access control is enforced inside
+/// `ws_handler` itself: browser clients are validated via Origin header (CSWH
+/// prevention), and non-browser clients must present a valid Bearer token.
+/// All other endpoints require an `Authorization: Bearer <token>` header when
+/// `api_token` is configured. When no token is configured the middleware is a
+/// no-op (backward compat).
 pub(crate) async fn api_auth_middleware(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,

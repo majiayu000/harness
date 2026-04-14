@@ -82,8 +82,8 @@ function relativeTime(ts) {
 
 async function fetchTasks() {
   try {
-    const resp = await fetch("/tasks", { headers: authHeaders() });
-    if (!resp.ok) return;
+    const resp = await apiFetch("/tasks", { headers: authHeaders() });
+    if (!resp || !resp.ok) return;
     currentTasks = await resp.json();
     renderBoard(currentTasks);
     updateMetrics(currentTasks);
@@ -97,8 +97,8 @@ async function fetchTasks() {
 
 async function fetchIntake() {
   try {
-    const resp = await fetch("/api/intake", { headers: authHeaders() });
-    if (!resp.ok) return;
+    const resp = await apiFetch("/api/intake", { headers: authHeaders() });
+    if (!resp || !resp.ok) return;
     const data = await resp.json();
     renderIntakeChannels(data.channels || []);
   } catch {}
@@ -106,8 +106,8 @@ async function fetchIntake() {
 
 async function fetchDashboardSummary() {
   try {
-    const resp = await fetch("/api/dashboard", { headers: authHeaders() });
-    if (!resp.ok) return;
+    const resp = await apiFetch("/api/dashboard", { headers: authHeaders() });
+    if (!resp || !resp.ok) return;
     const data = await resp.json();
     renderRuntimeHosts(data.runtime_hosts || []);
   } catch {}
@@ -544,11 +544,12 @@ function initForm() {
     btn.textContent = "Submitting\u2026";
     const prompt = `${title}\n\n${description}`;
     try {
-      const resp = await fetch("/tasks", {
+      const resp = await apiFetch("/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ prompt }),
       });
+      if (!resp) return; // 401 handled by promptToken()
       if (!resp.ok) {
         const text = await resp.text();
         throw new Error(`${resp.status}: ${text}`);
@@ -603,7 +604,8 @@ function fmtTokens(n) { return n.toLocaleString(); }
 
 async function fetchTokenUsage() {
   try {
-    const resp = await fetch("/api/token-usage", { headers: authHeaders() });
+    const resp = await apiFetch("/api/token-usage", { headers: authHeaders() });
+    if (!resp) return; // 401 handled by promptToken()
     if (!resp.ok) {
       let message = `HTTP ${resp.status}`;
       try {

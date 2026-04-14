@@ -9,6 +9,7 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use harness_protocol::{codec, methods::RpcResponse};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::sync::broadcast::error::RecvError;
 
 /// Returns true if the origin is a localhost origin (safe for local dev tools).
@@ -59,8 +60,13 @@ fn validate_origin_header(headers: &HeaderMap) -> Result<(), OriginValidationErr
 
 /// Axum handler that upgrades the HTTP connection to WebSocket.
 ///
-/// Validates the Origin header to prevent Cross-Site WebSocket Hijacking (CSWH).
-/// CLI clients that omit the Origin header are always allowed.
+/// Two-layer access control:
+/// 1. Browser clients (with an Origin header): Origin must be localhost to prevent
+///    Cross-Site WebSocket Hijacking (CSWH).
+/// 2. Non-browser clients (no Origin header, e.g. CLI tools): when an API token is
+///    configured they must present a valid `Authorization: Bearer <token>` header.
+///    Browsers cannot set this header during a WebSocket upgrade, so it is only
+///    checked for non-browser clients.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
@@ -80,6 +86,26 @@ pub async fn ws_handler(
         }
         return StatusCode::FORBIDDEN.into_response();
     }
+
+    // Non-browser clients omit the Origin header.  When a token is configured
+    // they must authenticate via Bearer token in the Authorization header.
+    if !headers.contains_key("Origin") {
+        if let Some(expected) =
+            crate::http::auth::resolve_api_token(&state.core.server.config.server)
+        {
+            let authorized = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .map(|tok| tok.as_bytes().ct_eq(expected.as_bytes()).into())
+                .unwrap_or(false);
+            if !authorized {
+                tracing::warn!("WebSocket connection rejected: missing or invalid Bearer token");
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+        }
+    }
+
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
