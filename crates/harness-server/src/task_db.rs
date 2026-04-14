@@ -880,6 +880,73 @@ impl TaskDb {
         .await?;
         Ok(rows)
     }
+
+    /// Return all `pending` tasks that have a plan or triage checkpoint but no `pr_url`.
+    ///
+    /// Used at startup to re-dispatch tasks that were recovered from plan/triage checkpoints
+    /// but were not picked up by the PR-based redispatch path (which only catches tasks with
+    /// `pr_url` set).
+    ///
+    /// Excludes tasks that already have `tasks.pr_url` set — those are handled by the
+    /// existing PR-based redispatch path in `http.rs`.
+    pub async fn pending_tasks_with_checkpoint(
+        &self,
+    ) -> anyhow::Result<Vec<(TaskState, TaskCheckpoint)>> {
+        let rows = sqlx::query_as::<_, PendingCheckpointRow>(
+            "SELECT t.id, t.status, t.turn, t.pr_url, t.rounds, t.error, t.source, \
+                    t.external_id, t.parent_id, t.created_at, t.repo, t.depends_on, \
+                    t.project, t.priority, t.phase, t.description, \
+                    c.triage_output, c.plan_output, c.pr_url AS ck_pr_url, \
+                    c.last_phase, c.updated_at AS ck_updated_at \
+             FROM tasks t \
+             JOIN task_checkpoints c ON c.task_id = t.id \
+             WHERE t.status = 'pending' \
+               AND t.pr_url IS NULL \
+               AND (c.plan_output IS NOT NULL OR c.triage_output IS NOT NULL)",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut pairs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let task_id = row.id.clone();
+            let task_row = TaskRow {
+                id: row.id,
+                status: row.status,
+                turn: row.turn,
+                pr_url: row.pr_url,
+                rounds: row.rounds,
+                error: row.error,
+                source: row.source,
+                external_id: row.external_id,
+                parent_id: row.parent_id,
+                created_at: row.created_at,
+                repo: row.repo,
+                depends_on: row.depends_on,
+                project: row.project,
+                priority: row.priority,
+                phase: row.phase,
+                description: row.description,
+            };
+            let task_state = match task_row.try_into_task_state() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(task_id = %task_id, "skipping malformed pending checkpoint task: {e}");
+                    continue;
+                }
+            };
+            let checkpoint = TaskCheckpoint {
+                task_id,
+                triage_output: row.triage_output,
+                plan_output: row.plan_output,
+                pr_url: row.ck_pr_url,
+                last_phase: row.last_phase,
+                updated_at: row.ck_updated_at,
+            };
+            pairs.push((task_state, checkpoint));
+        }
+        Ok(pairs)
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -900,6 +967,37 @@ struct TaskRow {
     priority: i64,
     phase: String,
     description: Option<String>,
+}
+
+/// Combined row for the pending-tasks-with-checkpoint JOIN query.
+///
+/// Aliases checkpoint columns to avoid collision with task columns:
+/// `c.pr_url` → `ck_pr_url`, `c.updated_at` → `ck_updated_at`.
+#[derive(sqlx::FromRow)]
+struct PendingCheckpointRow {
+    // Task columns
+    id: String,
+    status: String,
+    turn: i64,
+    pr_url: Option<String>,
+    rounds: String,
+    error: Option<String>,
+    source: Option<String>,
+    external_id: Option<String>,
+    parent_id: Option<String>,
+    created_at: Option<String>,
+    repo: Option<String>,
+    depends_on: String,
+    project: Option<String>,
+    priority: i64,
+    phase: String,
+    description: Option<String>,
+    // Checkpoint columns (aliased)
+    triage_output: Option<String>,
+    plan_output: Option<String>,
+    ck_pr_url: Option<String>,
+    last_phase: String,
+    ck_updated_at: String,
 }
 
 impl TaskRow {
@@ -1986,6 +2084,125 @@ mod tests {
             loaded.description.is_none(),
             "description should be None for legacy rows"
         );
+        Ok(())
+    }
+
+    // --- pending_tasks_with_checkpoint tests ---
+
+    #[tokio::test]
+    async fn pending_with_triage_checkpoint_is_returned() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("t-triage", TaskStatus::Pending);
+        task.description = Some("issue #10".to_string());
+        db.insert(&task).await?;
+        db.write_checkpoint("t-triage", Some("triage output"), None, None, "triage_done")
+            .await?;
+
+        let pairs = db.pending_tasks_with_checkpoint().await?;
+        assert_eq!(pairs.len(), 1);
+        let (t, ck) = &pairs[0];
+        assert_eq!(t.id.0, "t-triage");
+        assert_eq!(ck.triage_output.as_deref(), Some("triage output"));
+        assert!(ck.plan_output.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_with_plan_checkpoint_is_returned() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("t-plan", TaskStatus::Pending);
+        task.description = Some("issue #20".to_string());
+        db.insert(&task).await?;
+        db.write_checkpoint("t-plan", None, Some("plan text"), None, "plan_done")
+            .await?;
+
+        let pairs = db.pending_tasks_with_checkpoint().await?;
+        assert_eq!(pairs.len(), 1);
+        let (t, ck) = &pairs[0];
+        assert_eq!(t.id.0, "t-plan");
+        assert_eq!(ck.plan_output.as_deref(), Some("plan text"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_with_pr_url_excluded_from_checkpoint_query() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        // Task with pr_url set — handled by PR-based redispatch, not checkpoint path.
+        let mut task_pr = make_task("t-pr", TaskStatus::Pending);
+        task_pr.pr_url = Some("https://github.com/o/r/pull/42".to_string());
+        db.insert(&task_pr).await?;
+        db.write_checkpoint("t-pr", None, Some("plan"), None, "plan_done")
+            .await?;
+
+        let pairs = db.pending_tasks_with_checkpoint().await?;
+        assert!(
+            pairs.is_empty(),
+            "task with pr_url should be excluded from checkpoint query"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_without_checkpoint_not_returned() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("t-no-ck", TaskStatus::Pending))
+            .await?;
+
+        let pairs = db.pending_tasks_with_checkpoint().await?;
+        assert!(
+            pairs.is_empty(),
+            "task with no checkpoint should not be returned"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_pending_with_checkpoint_not_returned() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        // Implementing status — should NOT be returned (status filter)
+        db.insert(&make_task("t-impl", TaskStatus::Implementing))
+            .await?;
+        db.write_checkpoint("t-impl", None, Some("plan"), None, "plan_done")
+            .await?;
+
+        let pairs = db.pending_tasks_with_checkpoint().await?;
+        assert!(pairs.is_empty(), "non-pending task should not be returned");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_query_returns_task_state_fields() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("t-fields", TaskStatus::Pending);
+        task.description = Some("issue #99".to_string());
+        task.repo = Some("owner/repo".to_string());
+        task.source = Some("github".to_string());
+        task.external_id = Some("ext-1".to_string());
+        task.priority = 1;
+        db.insert(&task).await?;
+        db.write_checkpoint("t-fields", Some("triage out"), None, None, "triage_done")
+            .await?;
+
+        let pairs = db.pending_tasks_with_checkpoint().await?;
+        assert_eq!(pairs.len(), 1);
+        let (t, _) = &pairs[0];
+        assert_eq!(t.description.as_deref(), Some("issue #99"));
+        assert_eq!(t.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(t.source.as_deref(), Some("github"));
+        assert_eq!(t.external_id.as_deref(), Some("ext-1"));
+        assert_eq!(t.priority, 1);
         Ok(())
     }
 }

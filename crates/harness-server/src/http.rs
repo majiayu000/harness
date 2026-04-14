@@ -848,6 +848,164 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         }
     }
 
+    // Re-dispatch tasks recovered from plan/triage checkpoints but without a PR.
+    // Source A (above) handles tasks with `pr_url` set.  Source B (below) picks up
+    // remaining pending tasks that have a plan or triage checkpoint — these are
+    // issue/prompt tasks interrupted during planning that need to continue execution.
+    // If the DB query fails, log a warning and skip (startup must not abort).
+    {
+        let checkpoint_tasks = match state.core.tasks.pending_tasks_with_checkpoint().await {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                tracing::warn!(
+                    "startup: failed to query checkpoint tasks, \
+                         skipping plan/triage redispatch: {e}"
+                );
+                vec![]
+            }
+        };
+        if !checkpoint_tasks.is_empty() {
+            tracing::info!(
+                count = checkpoint_tasks.len(),
+                "startup: re-dispatching recovered pending task(s) with plan/triage checkpoints"
+            );
+            for (task, _checkpoint) in checkpoint_tasks {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    // Reconstruct request type from the persisted description.
+                    // Description format: "issue #N" → issue task; other → prompt task.
+                    // PR tasks are handled by Source A and never appear here.
+                    let issue_num = task
+                        .description
+                        .as_deref()
+                        .and_then(|d| d.strip_prefix("issue #"))
+                        .and_then(|s| s.split_whitespace().next())
+                        .and_then(|s| s.parse::<u64>().ok());
+
+                    if issue_num.is_none() && task.description.is_none() {
+                        tracing::warn!(
+                            task_id = ?task.id,
+                            "startup recovery: checkpoint task has no issue or description — skipping"
+                        );
+                        return;
+                    }
+
+                    let project_path = match task.repo.as_deref() {
+                        Some(repo) => {
+                            if let Some(registry) = state.core.project_registry.as_deref() {
+                                match registry.resolve_path(repo).await {
+                                    Ok(Some(p)) => Some(p),
+                                    Ok(None) => Some(std::path::PathBuf::from(repo)),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            task_id = ?task.id,
+                                            repo,
+                                            "startup recovery: registry lookup failed: \
+                                             {e}, using repo as path"
+                                        );
+                                        Some(std::path::PathBuf::from(repo))
+                                    }
+                                }
+                            } else {
+                                Some(std::path::PathBuf::from(repo))
+                            }
+                        }
+                        None => None,
+                    };
+
+                    let canonical = match task_runner::resolve_canonical_project(project_path).await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to resolve project path: {e}"
+                            );
+                            return;
+                        }
+                    };
+                    let project_id = canonical.to_string_lossy().into_owned();
+
+                    let permit = match state
+                        .concurrency
+                        .task_queue
+                        .acquire(&project_id, task.priority)
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to acquire permit: {e}"
+                            );
+                            return;
+                        }
+                    };
+
+                    let req = if let Some(issue) = issue_num {
+                        task_runner::CreateTaskRequest {
+                            issue: Some(issue),
+                            project: Some(canonical),
+                            repo: task.repo.clone(),
+                            source: task.source.clone(),
+                            external_id: task.external_id.clone(),
+                            priority: task.priority,
+                            ..Default::default()
+                        }
+                    } else {
+                        task_runner::CreateTaskRequest {
+                            prompt: task.description.clone(),
+                            project: Some(canonical),
+                            repo: task.repo.clone(),
+                            source: task.source.clone(),
+                            external_id: task.external_id.clone(),
+                            priority: task.priority,
+                            ..Default::default()
+                        }
+                    };
+
+                    let classification = crate::complexity_router::classify(
+                        req.prompt.as_deref().unwrap_or(""),
+                        req.issue,
+                        req.pr,
+                    );
+                    let agent = match state.core.server.agent_registry.dispatch(&classification) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to dispatch agent: {e}"
+                            );
+                            return;
+                        }
+                    };
+                    let (reviewer, _) = resolve_reviewer(
+                        &state.core.server.agent_registry,
+                        &state.core.server.config.agents.review,
+                        agent.name(),
+                    );
+                    state.core.tasks.register_task_stream(&task.id);
+                    task_runner::spawn_preregistered_task(
+                        task.id,
+                        state.core.tasks.clone(),
+                        agent,
+                        reviewer,
+                        Arc::new(state.core.server.config.clone()),
+                        state.engines.skills.clone(),
+                        state.observability.events.clone(),
+                        state.interceptors.clone(),
+                        req,
+                        state.concurrency.workspace_mgr.clone(),
+                        permit,
+                        state.intake.completion_callback.clone(),
+                        None,
+                    )
+                    .await;
+                });
+            }
+        }
+    }
+
     let initial_grade = {
         let events = state
             .observability

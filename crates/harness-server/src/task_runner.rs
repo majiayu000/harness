@@ -1339,6 +1339,16 @@ impl TaskStore {
         self.db.load_checkpoint(task_id.as_str()).await
     }
 
+    /// Return pending tasks that have a plan or triage checkpoint but no `pr_url`.
+    ///
+    /// Used at startup to re-dispatch tasks recovered from plan/triage checkpoints
+    /// that were not caught by the PR-based redispatch path.
+    pub(crate) async fn pending_tasks_with_checkpoint(
+        &self,
+    ) -> anyhow::Result<Vec<(TaskState, crate::task_db::TaskCheckpoint)>> {
+        self.db.pending_tasks_with_checkpoint().await
+    }
+
     pub(crate) async fn persist(&self, id: &TaskId) -> anyhow::Result<()> {
         let lock = self
             .persist_locks
