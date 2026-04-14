@@ -1,5 +1,4 @@
 use crate::{router, server::HarnessServer, task_runner};
-use anyhow::Context;
 use axum::{
     body::Bytes,
     extract::DefaultBodyLimit,
@@ -20,9 +19,9 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
-use tokio::time::Duration;
 
 pub(crate) mod auth;
+pub(crate) mod builders;
 pub(crate) mod rate_limit;
 pub(crate) mod task_routes;
 
@@ -209,33 +208,16 @@ fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Build an AppState with all stores. Used by both HTTP and stdio transports.
+///
+/// Initialization is split into five ordered phases — each phase's outputs
+/// become inputs to the next.  Dependency edges:
+///   storage → engines → registry (needs storage.tasks for orphan cleanup)
+///   registry → intake  (needs engines.gc_agent + events, registry.project_registry)
+///   intake   → services (needs interceptors wired to engines.rules + events)
 pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppState> {
     let dir = expand_tilde(&server.config.server.data_dir);
     let project_root = resolve_project_root(&server.config.server.project_root)?;
-    std::fs::create_dir_all(&dir)?;
-    // On Unix, verify that `dir` is a real directory and not a symbolic link.
-    // A low-privileged attacker can pre-create a symlink at the fallback temp
-    // path before a privileged harness process starts, redirecting all
-    // persistent state (tasks.db, threads.db, events, workspaces) to an
-    // attacker-controlled location.  Refusing to operate on a symlink is the
-    // minimal safe response; production deployments must set `data_dir`
-    // explicitly so the fallback path is never reached.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let meta = std::fs::symlink_metadata(&dir)
-            .with_context(|| format!("failed to stat data_dir {:?}", dir))?;
-        if meta.file_type().is_symlink() {
-            anyhow::bail!(
-                "data_dir {:?} is a symbolic link; refusing to start to prevent \
-                 potential symlink hijacking. Set an explicit `data_dir` in your \
-                 harness config file.",
-                dir
-            );
-        }
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to set 0o700 permissions on data_dir {:?}", dir))?;
-    }
+
     tracing::debug!(
         data_dir = %dir.display(),
         project_root = %project_root.display(),
@@ -261,527 +243,45 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         Some(_) => {}
     }
 
-    let db_path = harness_core::config::dirs::default_db_path(&dir, "tasks");
-    tracing::debug!("task db: {}", db_path.display());
-    let tasks = task_runner::TaskStore::open(&db_path).await?;
+    // Phase 1: storage — dir validation (symlink check, chmod), task DB, q_value DB.
+    let storage = builders::storage::build_storage(&dir).await?;
 
-    let q_values_db_path = harness_core::config::dirs::default_db_path(&dir, "q_values");
-    tracing::debug!("q_value db: {}", q_values_db_path.display());
-    let q_values = match crate::q_value_store::QValueStore::open(&q_values_db_path).await {
-        Ok(store) => Some(Arc::new(store)),
-        Err(e) => {
-            tracing::warn!(
-                path = %q_values_db_path.display(),
-                "q_value store init failed, rule utility tracking will be disabled: {e}"
-            );
-            None
-        }
-    };
+    // Phase 2: engines — rule engine, event store (+purge task), GC agent, skill store.
+    // Depends on: storage (none directly, but must precede registry which uses storage.tasks).
+    let engines = builders::engines::build_engines(&server, &dir, &project_root).await?;
 
-    let mut rule_engine = harness_rules::engine::RuleEngine::new();
-    rule_engine.configure_sources(
-        server.config.rules.discovery_paths.clone(),
-        server.config.rules.builtin_path.clone(),
-        server.config.rules.requirements_path.clone(),
-    );
-    if let Err(e) = rule_engine.load_builtin() {
-        tracing::warn!("failed to load builtin rules: {e}");
-    }
-    match rule_engine.auto_register_builtin_guards(&dir) {
-        Ok(registered) => {
-            tracing::debug!(
-                registered_guard_count = registered,
-                total_guard_count = rule_engine.guards().len(),
-                "rules: builtin guard auto-registration completed"
-            );
-        }
-        Err(e) => {
-            tracing::warn!("failed to auto-register builtin guards: {e}");
-        }
-    }
-    match rule_engine.auto_register_project_guards(&project_root.join(".harness/guards")) {
-        Ok(registered) => {
-            tracing::debug!(
-                registered_guard_count = registered,
-                total_guard_count = rule_engine.guards().len(),
-                "rules: project guard auto-registration completed"
-            );
-        }
-        Err(e) => {
-            tracing::warn!("failed to auto-register project guards: {e}");
-        }
-    }
-    // Load guards from each named startup project so non-default projects are
-    // not silently unprotected.
-    for project in &server.startup_projects {
-        match rule_engine.auto_register_project_guards(&project.root.join(".harness/guards")) {
-            Ok(registered) => {
-                tracing::debug!(
-                    project = %project.name,
-                    registered_guard_count = registered,
-                    total_guard_count = rule_engine.guards().len(),
-                    "rules: startup project guard auto-registration completed"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(project = %project.name, "failed to auto-register startup project guards: {e}");
-            }
-        }
-    }
-    rule_engine
-        .load_exec_policy_files(&server.config.rules.exec_policy_paths)
-        .context("failed to load rules.exec_policy_paths")?;
-    rule_engine
-        .load_configured_requirements()
-        .context("failed to load configured rules.requirements_path")?;
+    // Phase 3: registry — thread DB, plan DB + cache, project registry, workspace manager,
+    // runtime state store.
+    // Depends on: storage.tasks (orphan-worktree cleanup reads terminal task IDs).
+    let registry =
+        builders::registry::build_registry(&server, &dir, &project_root, &storage.tasks).await?;
 
-    let events = Arc::new(
-        harness_observe::event_store::EventStore::with_policies_and_otel(
-            &dir,
-            server.config.observe.session_renewal_secs,
-            server.config.observe.log_retention_days,
-            &server.config.otel,
-        )
-        .await?,
-    );
-
-    let retention = server.config.observe.log_retention_days;
-    if retention > 0 {
-        let purge_events = Arc::clone(&events);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
-                if let Err(e) = purge_events.purge_old_events(retention).await {
-                    tracing::warn!("event store: periodic purge failed: {e}");
-                }
-            }
-        });
-    }
-
-    let signal_detector = harness_gc::signal_detector::SignalDetector::new(
-        server.config.gc.signal_thresholds.clone().into(),
-        harness_core::types::ProjectId::from_str(
-            project_root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("default"),
-        ),
-    );
-    let draft_store = harness_gc::draft_store::DraftStore::new(&dir)?;
-    let gc_agent = Arc::new(
-        harness_gc::gc_agent::GcAgent::new(
-            server.config.gc.clone(),
-            signal_detector,
-            draft_store,
-            project_root.clone(),
-        )
-        .with_checkpoint(dir.join("gc-checkpoint.json")),
-    );
-
-    let thread_db_path = harness_core::config::dirs::default_db_path(&dir, "threads");
-    let thread_db = crate::thread_db::ThreadDb::open(&thread_db_path).await?;
-    let plan_db =
-        crate::plan_db::PlanDb::open(&harness_core::config::dirs::default_db_path(&dir, "plans"))
+    // Phase 4: intake — task queue, Feishu/GitHub pollers, quality trigger, completion callback
+    // (including Q-value wrapper).
+    // Depends on: engines.gc_agent + engines.events (quality trigger),
+    //             registry.project_registry (unused directly but ordering is stable).
+    let intake =
+        builders::intake::build_intake(&server, &storage, &engines, &registry, &project_root, &dir)
             .await?;
 
-    let project_registry = crate::project_registry::ProjectRegistry::open(
-        &harness_core::config::dirs::default_db_path(&dir, "projects"),
+    // Phase 5: services — interceptor stack, service layer, runtime host/project-cache
+    // managers, snapshot restore, recovery validator spawn.
+    // Depends on: engines.rules + engines.events (interceptors),
+    //             registry.workspace_mgr + registry.project_registry (execution service),
+    //             intake.task_queue + intake.completion_callback (execution service).
+    let services = builders::services::build_services(
+        &server,
+        &storage,
+        &engines,
+        &registry,
+        &intake,
+        &project_root,
     )
     .await?;
-    // Auto-register the default project from --project-root on startup.
-    let canonical_project_root = project_root.canonicalize().ok();
-    let project_matches_root = |project: &harness_core::config::ProjectEntry| {
-        canonical_project_root
-            .as_ref()
-            .and_then(|canonical_root| {
-                project
-                    .root
-                    .canonicalize()
-                    .ok()
-                    .map(|root| root == *canonical_root)
-            })
-            .unwrap_or_else(|| project.root == project_root)
-    };
-    let default_project_metadata = server
-        .startup_default_project
-        .as_ref()
-        .filter(|project| project_matches_root(project))
-        .or_else(|| {
-            server
-                .startup_projects
-                .iter()
-                .find(|project| project.default && project_matches_root(project))
-                .or_else(|| {
-                    server
-                        .startup_projects
-                        .iter()
-                        .find(|project| project_matches_root(project))
-                })
-        });
-    let default_project = crate::project_registry::Project {
-        id: "default".to_string(),
-        root: project_root.clone(),
-        max_concurrent: default_project_metadata.and_then(|project| project.max_concurrent),
-        default_agent: default_project_metadata.and_then(|project| project.default_agent.clone()),
-        active: true,
-        created_at: chrono::Utc::now().to_rfc3339(),
-    };
-
-    if let Err(e) = project_registry.register(default_project).await {
-        tracing::warn!("failed to auto-register default project: {e}");
-    }
-    // Register any extra named projects supplied via config or --project CLI flags.
-    for project in &server.startup_projects {
-        let proj = crate::project_registry::Project {
-            id: project.name.clone(),
-            root: project.root.clone(),
-            max_concurrent: project.max_concurrent,
-            default_agent: project.default_agent.clone(),
-            active: true,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-        if let Err(e) = project_registry.register(proj).await {
-            tracing::warn!(project = %project.name, "failed to register startup project: {e}");
-        }
-    }
-    let plans_md_dir = dir.join("plans");
-    match plan_db.migrate_from_markdown_dir(&plans_md_dir).await {
-        Ok(0) => {}
-        Ok(n) => tracing::debug!(
-            count = n,
-            "plan migration: imported {} plan(s) from markdown",
-            n
-        ),
-        Err(e) => tracing::warn!("plan migration: failed: {e}"),
-    }
-    let configured_capacity = server.config.server.notification_broadcast_capacity;
-    let notification_broadcast_capacity = configured_capacity.max(1);
-    let notification_lag_log_every = server.config.server.notification_lag_log_every;
-    if configured_capacity == 0 {
-        tracing::warn!(
-            "server.notification_broadcast_capacity=0 is invalid; falling back to capacity=1"
-        );
-    }
-    // Load persisted threads into the in-memory ThreadManager cache
-    for thread in thread_db.list().await? {
-        server
-            .thread_manager
-            .threads_cache()
-            .insert(thread.id.as_str().to_string(), thread);
-    }
-
-    // Load persisted plans into the in-memory plan cache
-    let plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>> = Arc::new(DashMap::new());
-    match plan_db.list().await {
-        Ok(plans) => {
-            let count = plans.len();
-            for plan in plans {
-                plan_cache.insert(plan.id.as_str().to_string(), plan);
-            }
-            if count > 0 {
-                tracing::debug!(count, "plan cache: loaded {} plan(s) from db", count);
-            }
-        }
-        Err(e) => tracing::warn!("plan cache: failed to load plans on startup: {e}"),
-    }
-
-    let mut skill_store = harness_skills::store::SkillStore::new()
-        .with_persist_dir(dir.join("skills"))
-        .with_discovery(&project_root);
-    skill_store.load_builtin();
-    if let Err(e) = skill_store.discover() {
-        tracing::warn!("Failed to reload persisted skills on startup: {}", e);
-    }
-
-    let rules = Arc::new(RwLock::new(rule_engine));
-
-    let validation_config = server.config.validation.clone();
-
-    let workspace_mgr =
-        match crate::workspace::WorkspaceManager::new(server.config.workspace.clone()) {
-            Ok(mgr) => {
-                tracing::debug!(
-                    root = %server.config.workspace.root.display(),
-                    "workspace manager initialized"
-                );
-                Some(Arc::new(mgr))
-            }
-            Err(e) => {
-                tracing::warn!(
-                "failed to initialize workspace manager: {e}; running without workspace isolation"
-            );
-                None
-            }
-        };
-
-    // Cleanup orphan worktrees from any previous crash.
-    // Terminal tasks are no longer held in the in-memory cache, so query DB directly.
-    if let Some(ref wmgr) = workspace_mgr {
-        match tasks.list_terminal_ids_from_db().await {
-            Ok(terminal_ids) => {
-                wmgr.cleanup_orphan_worktrees(&project_root, &terminal_ids)
-                    .await;
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load terminal tasks for orphan worktree cleanup: {e}; skipping cleanup");
-            }
-        }
-    }
-
-    let memory_pressure =
-        server
-            .config
-            .concurrency
-            .memory_pressure_threshold_mb
-            .map(|threshold_mb| {
-                let poll_secs = server.config.concurrency.memory_poll_interval_secs;
-                tracing::info!(threshold_mb, poll_secs, "memory pressure monitor enabled");
-                crate::memory_monitor::start(threshold_mb, poll_secs)
-            });
-    let task_queue = Arc::new(crate::task_queue::TaskQueue::new_with_pressure(
-        &server.config.concurrency,
-        memory_pressure,
-    ));
-    tracing::debug!(
-        max_concurrent = server.config.concurrency.max_concurrent_tasks,
-        max_queue_size = server.config.concurrency.max_queue_size,
-        "task queue initialized"
-    );
-
-    let feishu_intake = server.config.intake.feishu.as_ref().and_then(|cfg| {
-        if !cfg.enabled {
-            return None;
-        }
-        if !crate::intake::feishu::has_verification_token(cfg) {
-            tracing::error!(
-                "intake: Feishu enabled but verification_token is missing; webhook will fail closed"
-            );
-            return None;
-        }
-        tracing::info!(
-            trigger_keyword = %cfg.trigger_keyword,
-            "intake: Feishu bot registered"
-        );
-        Some(Arc::new(crate::intake::feishu::FeishuIntake::new(
-            cfg.clone(),
-        )))
-    });
-
-    // Build ALL GitHub pollers once. The same Arc instances are shared between
-    // the completion callback and the orchestrator, so on_task_complete operates
-    // on the live poller's dispatched map rather than a detached clone.
-    // Keyed as "github:{owner/repo}" for per-repo routing in the callback;
-    // a "github" fallback entry (first poller) supports tasks persisted before
-    // this multi-repo routing was introduced.
-    let github_pollers: Vec<(String, Arc<dyn crate::intake::IntakeSource>)> = server
-        .config
-        .intake
-        .github
-        .as_ref()
-        .filter(|cfg| cfg.enabled)
-        .map(|cfg| {
-            cfg.effective_repos()
-                .into_iter()
-                .map(|repo_cfg| {
-                    tracing::info!(
-                        repo = %repo_cfg.repo,
-                        label = %repo_cfg.label,
-                        "intake: GitHub Issues poller registered"
-                    );
-                    let key = format!("github:{}", repo_cfg.repo);
-                    let poller = Arc::new(crate::intake::github_issues::GitHubIssuesPoller::new(
-                        &repo_cfg,
-                        Some(&dir),
-                    )) as Arc<dyn crate::intake::IntakeSource>;
-                    (key, poller)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let quality_trigger = {
-        let gc_cfg = &server.config.gc;
-        // Select a read-only challenger dynamically: find the first registered agent
-        // that (a) differs from the default primary and (b) does not advertise
-        // Write or Execute capabilities.  Hard-coding "anthropic-api" makes the gate
-        // unreachable when that agent is not registered or when it is also the
-        // configured default (which triggers the identity guard in QualityTrigger).
-        let default_name = server
-            .agent_registry
-            .resolved_default_agent_name()
-            .map(|s| s.to_owned());
-        let all_names: Vec<String> = server
-            .agent_registry
-            .list()
-            .iter()
-            .map(|&s| s.to_owned())
-            .collect();
-        let challenger = all_names.iter().find_map(|name| {
-            if Some(name.as_str()) == default_name.as_deref() {
-                return None;
-            }
-            let agent = server.agent_registry.get(name)?;
-            if agent.capabilities().iter().any(|c| {
-                matches!(
-                    c,
-                    harness_core::types::Capability::Write
-                        | harness_core::types::Capability::Execute
-                )
-            }) {
-                None
-            } else {
-                Some(agent)
-            }
-        });
-        Arc::new(crate::quality_trigger::QualityTrigger::new(
-            events.clone(),
-            gc_agent.clone(),
-            server.agent_registry.clone(),
-            project_root.clone(),
-            gc_cfg.auto_gc_grades.clone(),
-            gc_cfg.auto_gc_cooldown_secs,
-            challenger,
-        ))
-    };
-
-    let completion_callback = build_completion_callback(
-        &feishu_intake,
-        &github_pollers,
-        server.config.agents.review.clone(),
-        Some(quality_trigger),
-        server.config.server.github_token.clone(),
-    );
-
-    // Wrap completion callback to record Q-value pipeline events and apply backprop on
-    // every live task completion (Done/Failed).  This ensures MemRL updates fire during
-    // normal server operation, not only at startup recovery (validate_recovered_tasks).
-    // Guard IDs are captured once at startup; they are stable after registration.
-    let completion_callback = {
-        if let Some(ref qv) = q_values {
-            let qv = qv.clone();
-            let inner = completion_callback;
-            let cb: task_runner::CompletionCallback =
-                std::sync::Arc::new(move |state: task_runner::TaskState| {
-                    let qv = qv.clone();
-                    let inner = inner.clone();
-                    Box::pin(async move {
-                        // Apply Q-value backprop only for terminal task states and only for
-                        // experiences explicitly recorded via record_pipeline_event during
-                        // task execution. Non-terminal states (Pending, Implementing, etc.)
-                        // must not trigger Q-updates — they would incorrectly penalize rules
-                        // that are still in the middle of a task.
-                        //
-                        // For Done tasks, gate the merged reward on pr_url presence: a task
-                        // that exits cleanly without creating a PR (e.g. prompt tasks, analysis
-                        // tasks) should not emit REWARD_MERGED, as that would inflate Q-values
-                        // for rules that contributed nothing to an actual PR merge outcome.
-                        let reward = match state.status {
-                            task_runner::TaskStatus::Done => {
-                                if state.pr_url.is_some() {
-                                    Some(crate::q_value_store::REWARD_MERGED)
-                                } else {
-                                    None
-                                }
-                            }
-                            task_runner::TaskStatus::Failed => {
-                                Some(crate::q_value_store::REWARD_CLOSED)
-                            }
-                            task_runner::TaskStatus::Cancelled => {
-                                Some(crate::q_value_store::REWARD_UNKNOWN_CLOSED)
-                            }
-                            _ => None,
-                        };
-                        if let Some(reward) = reward {
-                            match qv.get_experiences_for_task(&state.id.0).await {
-                                Ok(exp_ids) if !exp_ids.is_empty() => {
-                                    if let Err(e) = qv
-                                        .apply_q_update(
-                                            &exp_ids,
-                                            reward,
-                                            crate::q_value_store::DEFAULT_ALPHA,
-                                        )
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            task_id = %state.id.0,
-                                            "q_value apply_q_update failed: {e}"
-                                        );
-                                    }
-                                }
-                                Ok(_) => {}
-                                Err(e) => tracing::warn!(
-                                    task_id = %state.id.0,
-                                    "q_value get_experiences_for_task failed: {e}"
-                                ),
-                            }
-                        }
-                        if let Some(cb) = inner {
-                            cb(state).await;
-                        }
-                    })
-                });
-            Some(cb)
-        } else {
-            completion_callback
-        }
-    };
-
-    // Validate recovered pending tasks in the background so startup is not blocked
-    // by serial `gh pr view` calls. The completion_callback is passed so that tasks
-    // marked Failed (closed PR) trigger intake cleanup (e.g. removing the issue from
-    // the dispatched map so it can be re-dispatched on the next poll cycle).
-    {
-        let tasks_for_recovery = tasks.clone();
-        let cb_for_recovery = completion_callback.clone();
-        tokio::spawn(async move {
-            tasks_for_recovery
-                .validate_recovered_tasks(cb_for_recovery)
-                .await;
-        });
-    }
-
-    let hook_enforcement = server.config.rules.hook_enforcement;
-    let events_for_hooks = events.clone();
-
-    // ── Service layer construction ────────────────────────────────────────────
-    // Build the interceptor list once so it can be shared with ExecutionService
-    // without reconstructing it inside the AppState literal.
-    let skills_arc = Arc::new(RwLock::new(skill_store));
-    let interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>> = vec![
-        Arc::new(crate::contract_validator::ContractValidator::new()),
-        Arc::new(crate::rule_enforcer::RuleEnforcer::new(rules.clone())),
-        Arc::new(crate::hook_enforcer::HookEnforcer::new(
-            rules.clone(),
-            events_for_hooks,
-            hook_enforcement,
-        )),
-        Arc::new(crate::post_validator::PostExecutionValidator::new(
-            validation_config,
-        )),
-    ];
-
-    let project_svc = crate::services::project::DefaultProjectService::new(
-        project_registry.clone(),
-        project_root.clone(),
-    );
-    let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
-    let execution_svc = crate::services::execution::DefaultExecutionService::new(
-        tasks.clone(),
-        server.agent_registry.clone(),
-        Arc::new(server.config.clone()),
-        skills_arc.clone(),
-        events.clone(),
-        interceptors.clone(),
-        workspace_mgr.clone(),
-        task_queue.clone(),
-        completion_callback.clone(),
-        Some(project_registry.clone()),
-        server.config.server.allowed_project_roots.clone(),
-    );
 
     // Spawn background watcher for AwaitingDeps tasks.
     {
-        let store = tasks.clone();
+        let store = storage.tasks.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -800,62 +300,13 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         });
     }
 
-    let runtime_hosts = Arc::new(crate::runtime_hosts::RuntimeHostManager::new());
-    let runtime_project_cache =
-        Arc::new(crate::runtime_project_cache::RuntimeProjectCacheManager::new());
-    let runtime_state_store = {
-        let runtime_state_db_path =
-            harness_core::config::dirs::default_db_path(&dir, "runtime_state");
-        match crate::runtime_state_store::RuntimeStateStore::open(&runtime_state_db_path).await {
-            Ok(store) => Some(Arc::new(store)),
-            Err(e) => {
-                tracing::warn!(
-                    path = %runtime_state_db_path.display(),
-                    "runtime state store init failed, runtime host state will not persist: {e}"
-                );
-                None
-            }
-        }
-    };
-    if let Some(store) = runtime_state_store.as_ref() {
-        match store.try_load_snapshot().await {
-            Ok((Some(snapshot), crate::runtime_state_store::LoadSnapshotOutcome::Loaded)) => {
-                let restored_hosts = runtime_hosts.restore_state(snapshot.hosts, snapshot.leases);
-                let restored_project_caches =
-                    runtime_project_cache.restore_state(snapshot.project_caches);
-                tracing::info!(
-                    restored_hosts = restored_hosts.0,
-                    restored_leases = restored_hosts.1,
-                    restored_project_caches,
-                    "runtime state restored from persistent snapshot"
-                );
-            }
-            Ok((None, crate::runtime_state_store::LoadSnapshotOutcome::NotFound)) => {
-                tracing::info!("no runtime state snapshot found on startup");
-            }
-            Ok((
-                None,
-                crate::runtime_state_store::LoadSnapshotOutcome::SchemaMismatch { found, expected },
-            )) => {
-                tracing::warn!(
-                    found_schema_version = found,
-                    expected_schema_version = expected,
-                    "runtime state snapshot skipped on startup due to schema mismatch"
-                );
-            }
-            Ok((None, crate::runtime_state_store::LoadSnapshotOutcome::Loaded)) => {
-                tracing::warn!("runtime state snapshot load returned loaded outcome without data");
-            }
-            Ok((Some(_), outcome)) => {
-                tracing::warn!(
-                    ?outcome,
-                    "runtime state snapshot load returned unexpected outcome"
-                );
-            }
-            Err(e) => {
-                tracing::warn!("failed to load runtime state snapshot on startup: {e}");
-            }
-        }
+    let configured_capacity = server.config.server.notification_broadcast_capacity;
+    let notification_broadcast_capacity = configured_capacity.max(1);
+    let notification_lag_log_every = server.config.server.notification_lag_log_every;
+    if configured_capacity == 0 {
+        tracing::warn!(
+            "server.notification_broadcast_capacity=0 is invalid; falling back to capacity=1"
+        );
     }
 
     let signal_rate_limit = server.config.server.signal_rate_limit_per_minute;
@@ -863,26 +314,27 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let home_dir = std::env::var("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| project_root.clone());
+
     Ok(AppState {
         core: CoreServices {
             server,
             project_root,
             home_dir,
-            tasks,
-            thread_db: Some(thread_db),
-            plan_db: Some(plan_db),
-            plan_cache,
-            project_registry: Some(project_registry),
-            runtime_state_store,
-            q_values,
+            tasks: storage.tasks,
+            thread_db: Some(registry.thread_db),
+            plan_db: Some(registry.plan_db),
+            plan_cache: registry.plan_cache,
+            project_registry: Some(registry.project_registry),
+            runtime_state_store: registry.runtime_state_store,
+            q_values: storage.q_values,
         },
         engines: EngineServices {
-            skills: skills_arc,
-            rules,
-            gc_agent,
+            skills: engines.skills,
+            rules: engines.rules,
+            gc_agent: engines.gc_agent,
         },
         observability: ObservabilityServices {
-            events,
+            events: engines.events,
             signal_rate_limiter: Arc::new(rate_limit::SignalRateLimiter::new(signal_rate_limit)),
             password_reset_rate_limiter: Arc::new(rate_limit::PasswordResetRateLimiter::new(
                 password_reset_rate_limit,
@@ -901,11 +353,11 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             },
         },
         concurrency: ConcurrencyServices {
-            task_queue,
-            workspace_mgr,
+            task_queue: intake.task_queue,
+            workspace_mgr: registry.workspace_mgr,
         },
-        runtime_hosts,
-        runtime_project_cache,
+        runtime_hosts: services.runtime_hosts,
+        runtime_project_cache: services.runtime_project_cache,
         runtime_state_persist_lock: Mutex::new(()),
         runtime_state_dirty: AtomicBool::new(false),
         notifications: NotificationServices {
@@ -917,19 +369,19 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             initialized: Arc::new(AtomicBool::new(false)),
             ws_shutdown_tx: broadcast::channel(1).0,
         },
-        interceptors,
+        interceptors: services.interceptors,
         intake: IntakeServices {
-            feishu_intake,
-            github_pollers: github_pollers.into_iter().map(|(_, p)| p).collect(),
-            completion_callback,
+            feishu_intake: intake.feishu_intake,
+            github_pollers: intake.github_pollers.into_iter().map(|(_, p)| p).collect(),
+            completion_callback: intake.completion_callback,
         },
-        project_svc,
-        task_svc,
-        execution_svc,
+        project_svc: services.project_svc,
+        task_svc: services.task_svc,
+        execution_svc: services.execution_svc,
     })
 }
 
-fn build_completion_callback(
+pub(crate) fn build_completion_callback(
     feishu_intake: &Option<Arc<crate::intake::feishu::FeishuIntake>>,
     github_pollers: &[(String, Arc<dyn crate::intake::IntakeSource>)],
     review_config: harness_core::config::agents::AgentReviewConfig,
