@@ -790,8 +790,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                             {
                                 tracing::error!(
                                     task_id = ?task.id,
-                                    "startup recovery: failed to persist failed status: {pe}"
+                                    "startup recovery: failed to persist failed status: {pe}; \
+                                     skipping completion callback to avoid state split"
                                 );
+                                return;
                             }
                             if let Some(cb) = &state.intake.completion_callback {
                                 if let Some(final_state) = state.core.tasks.get(&task.id) {
@@ -829,8 +831,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                             {
                                 tracing::error!(
                                     task_id = ?task.id,
-                                    "startup recovery: failed to persist failed status: {pe}"
+                                    "startup recovery: failed to persist failed status: {pe}; \
+                                     skipping completion callback to avoid state split"
                                 );
+                                return;
                             }
                             if let Some(cb) = &state.intake.completion_callback {
                                 if let Some(final_state) = state.core.tasks.get(&task.id) {
@@ -879,8 +883,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                             {
                                 tracing::error!(
                                     task_id = ?task.id,
-                                    "startup recovery: failed to persist failed status: {pe}"
+                                    "startup recovery: failed to persist failed status: {pe}; \
+                                     skipping completion callback to avoid state split"
                                 );
+                                return;
                             }
                             if let Some(cb) = &state.intake.completion_callback {
                                 if let Some(final_state) = state.core.tasks.get(&task.id) {
@@ -1024,8 +1030,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                             {
                                 tracing::error!(
                                     task_id = ?task.id,
-                                    "startup recovery: failed to persist failed status: {pe}"
+                                    "startup recovery: failed to persist failed status: {pe}; \
+                                     skipping completion callback to avoid state split"
                                 );
+                                return;
                             }
                             if let Some(cb) = &state.intake.completion_callback {
                                 if let Some(final_state) = state.core.tasks.get(&task.id) {
@@ -1061,8 +1069,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                             {
                                 tracing::error!(
                                     task_id = ?task.id,
-                                    "startup recovery: failed to persist failed status: {pe}"
+                                    "startup recovery: failed to persist failed status: {pe}; \
+                                     skipping completion callback to avoid state split"
                                 );
+                                return;
                             }
                             if let Some(cb) = &state.intake.completion_callback {
                                 if let Some(final_state) = state.core.tasks.get(&task.id) {
@@ -1116,8 +1126,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                             {
                                 tracing::error!(
                                     task_id = ?task.id,
-                                    "startup recovery: failed to persist failed status: {pe}"
+                                    "startup recovery: failed to persist failed status: {pe}; \
+                                     skipping completion callback to avoid state split"
                                 );
+                                return;
                             }
                             if let Some(cb) = &state.intake.completion_callback {
                                 if let Some(final_state) = state.core.tasks.get(&task.id) {
