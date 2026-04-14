@@ -175,13 +175,17 @@ pub fn linter_feedback_count(events: &[Event]) -> u32 {
 
 /// Compute the p50 (median) of a slice of turn counts.
 /// Returns `None` for an empty slice.
+///
+/// Uses the lower-median convention for even-length slices so the result never
+/// overstates the true 50th percentile.  For `[1, 2, 3, 4]` this returns `2`
+/// (index `(4-1)/2 = 1`), not `3` (index `4/2 = 2`).
 pub fn p50_turns(turn_counts: &[u32]) -> Option<u32> {
     if turn_counts.is_empty() {
         return None;
     }
     let mut sorted = turn_counts.to_vec();
     sorted.sort_unstable();
-    Some(sorted[sorted.len() / 2])
+    Some(sorted[(sorted.len() - 1) / 2])
 }
 
 pub fn compute_rule_trends(events: &[Event], period_days: u32) -> Vec<RuleTrend> {
@@ -399,7 +403,7 @@ mod tests {
 
     #[test]
     fn p50_turns_even_count_returns_lower_median() {
-        // sorted: [1, 2, 3, 4] — index len/2 = 2 → 3
-        assert_eq!(p50_turns(&[4, 1, 3, 2]), Some(3));
+        // sorted: [1, 2, 3, 4] — index (len-1)/2 = 1 → 2 (lower median)
+        assert_eq!(p50_turns(&[4, 1, 3, 2]), Some(2));
     }
 }

@@ -99,7 +99,8 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         let p50_first_token_latency_ms: Option<u64> = if latencies.is_empty() {
             None
         } else {
-            Some(latencies[latencies.len() / 2])
+            // Lower-median: index (len-1)/2 avoids overstating p50 for even-length slices.
+            Some(latencies[(latencies.len() - 1) / 2])
         };
         // total_linter_feedback from events already queried above.
         // Bounded to the same rolling window as the grade query to avoid a

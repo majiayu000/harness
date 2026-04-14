@@ -1048,12 +1048,16 @@ impl TaskStore {
     /// is idle this avoids reporting zeros that would misrepresent overall
     /// throughput.
     ///
-    /// **First-token latencies** are read directly from the in-memory cache
-    /// entries using `DashMap` references — no full `TaskState` is cloned, so
-    /// large `rounds.detail` strings are never materialised on the heap.
-    /// Rounds whose `result` is `"resumed_checkpoint"` are skipped: they are
-    /// synthetic markers with no real latency data and would silently exclude
-    /// the recovered task from the p50 calculation.
+    /// **First-token latencies** are collected from two sources:
+    /// 1. The in-memory cache (active tasks + tasks completed this session):
+    ///    iterated via `DashMap` refs — no full `TaskState` clone.
+    /// 2. Terminal (done/failed) tasks in the DB that are no longer in the
+    ///    cache — needed so p50 is non-null after a restart with idle queue.
+    ///    Only `id` and `rounds` columns are fetched; latency is extracted
+    ///    with lightweight `serde_json::Value` parsing (no `RoundResult` alloc).
+    ///
+    /// Rounds whose `result` is `"resumed_checkpoint"` are skipped in both
+    /// sources: they are synthetic markers with no real latency data.
     pub async fn collect_llm_metrics_inputs(&self) -> LlmMetricsInputs {
         // Turn counts: DB summaries are lightweight (no rounds field) and cover
         // terminal tasks that have already left the in-memory cache.
@@ -1069,12 +1073,13 @@ impl TaskStore {
             }
         };
 
-        // Latencies: iterate cache refs in-place; never clone full TaskState.
-        // Find the first round that is not the synthetic resume marker and take
-        // its latency — that is the real "cold-start" latency for the task.
+        // Latencies — phase 1: iterate cache refs in-place; never clone full TaskState.
+        // Track IDs seen in cache so we can skip them in the DB query below.
+        let mut cache_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut first_token_latencies: Vec<u64> = Vec::new();
         for entry in self.cache.iter() {
             let task = entry.value();
+            cache_ids.insert(entry.key().0.clone());
             // Skip the synthetic resumed_checkpoint round injected at recovery time,
             // then find the first round that actually received a response token.
             // Using find_map (instead of find + and_then) means transient_retry rounds
@@ -1088,6 +1093,39 @@ impl TaskStore {
                 .find_map(|r| r.first_token_latency_ms)
             {
                 first_token_latencies.push(latency);
+            }
+        }
+
+        // Latencies — phase 2: include terminal tasks from DB not already in cache.
+        // After restart with idle queue, cache is empty so without this the p50
+        // would be None even though latencies are persisted in the DB.
+        // Uses (id, rounds_json) rows — no RoundResult deserialization — to keep
+        // the per-call footprint proportional to the number of terminal tasks.
+        match self.db.list_terminal_rounds_json().await {
+            Ok(rows) => {
+                for (id, rounds_json) in rows {
+                    if cache_ids.contains(&id) {
+                        // Already counted via cache iteration above.
+                        continue;
+                    }
+                    if let Ok(serde_json::Value::Array(rounds)) =
+                        serde_json::from_str::<serde_json::Value>(&rounds_json)
+                    {
+                        if let Some(latency) = rounds
+                            .iter()
+                            .filter(|r| {
+                                r.get("result").and_then(|v| v.as_str())
+                                    != Some("resumed_checkpoint")
+                            })
+                            .find_map(|r| r.get("first_token_latency_ms").and_then(|v| v.as_u64()))
+                        {
+                            first_token_latencies.push(latency);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("collect_llm_metrics_inputs: DB terminal latency query failed: {e}");
             }
         }
 

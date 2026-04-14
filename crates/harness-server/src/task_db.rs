@@ -354,6 +354,21 @@ impl TaskDb {
         Ok(summaries)
     }
 
+    /// Return `(task_id, rounds_json)` pairs for terminal (done/failed) tasks.
+    ///
+    /// Used by `collect_llm_metrics_inputs` to include historical latency data
+    /// for tasks that have already left the in-memory cache (e.g. after restart).
+    /// The caller is responsible for skipping IDs that are already in the cache
+    /// to avoid double-counting tasks that completed during the current session.
+    pub async fn list_terminal_rounds_json(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, rounds FROM tasks WHERE status IN ('done', 'failed') ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Return `(id, status)` pairs for all tasks — skips all heavy columns.
     ///
     /// Used by hot-path callers that only need task status for aggregation
