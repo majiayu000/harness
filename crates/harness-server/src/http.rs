@@ -786,36 +786,34 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
                     // Acquire permit inside the spawned future so serve() is never
                     // blocked waiting for a concurrency slot.
-                    let permit = match state
-                        .concurrency
-                        .task_queue
-                        .acquire(&project_id, task.priority)
-                        .await
-                    {
-                        Ok(p) => p,
-                        Err(e) => {
-                            // acquire() errors are transient (memory pressure, queue
-                            // saturation) — do NOT mark the task Failed.
-                            //
-                            // Marking Failed here would cause two problems:
-                            //   1. Split-brain: mutate_and_persist() mutates the in-memory
-                            //      cache before SQLite; if persist fails the completion
-                            //      callback fires with in-memory=Failed while DB=Pending,
-                            //      triggering duplicate cleanup/notifications on the next
-                            //      restart (the same split-brain validate_recovered_tasks()
-                            //      explicitly avoids).
-                            //   2. False termination: backpressure is transient — marking
-                            //      the task Failed loses work for tasks without a retrying
-                            //      intake source and sends spurious failure notifications.
-                            //
-                            // Leave the task Pending; it will be re-dispatched on the next
-                            // server restart once capacity is available.
-                            tracing::warn!(
-                                task_id = ?task.id,
-                                "startup recovery (Source A): cannot acquire concurrency \
-                                 permit ({e}); leaving task pending for retry on next restart"
-                            );
-                            return;
+                    //
+                    // acquire() errors are transient (memory pressure, queue saturation).
+                    // Retry with bounded exponential backoff rather than returning — once
+                    // this future exits, no other path re-enqueues the task, so a plain
+                    // `return` would strand it in Pending until the next server restart.
+                    let permit = {
+                        const MAX_DELAY_SECS: u64 = 60;
+                        let mut retry_delay = 2u64;
+                        loop {
+                            match state
+                                .concurrency
+                                .task_queue
+                                .acquire(&project_id, task.priority)
+                                .await
+                            {
+                                Ok(p) => break p,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        task_id = ?task.id,
+                                        retry_in_secs = retry_delay,
+                                        "startup recovery (Source A): acquire backpressure \
+                                         ({e}); will retry in {retry_delay}s"
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_secs(retry_delay))
+                                        .await;
+                                    retry_delay = (retry_delay * 2).min(MAX_DELAY_SECS);
+                                }
+                            }
                         }
                     };
 
@@ -997,35 +995,35 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     };
                     let project_id = canonical.to_string_lossy().into_owned();
 
-                    let permit = match state
-                        .concurrency
-                        .task_queue
-                        .acquire(&project_id, task.priority)
-                        .await
-                    {
-                        Ok(p) => p,
-                        Err(e) => {
-                            // acquire() errors are transient (memory pressure, queue
-                            // saturation) — do NOT mark the task Failed.
-                            //
-                            // Marking Failed here would cause two problems:
-                            //   1. Split-brain: mutate_and_persist() mutates the in-memory
-                            //      cache before SQLite; if persist fails the completion
-                            //      callback fires with in-memory=Failed while DB=Pending,
-                            //      triggering duplicate cleanup/notifications on the next
-                            //      restart.
-                            //   2. False termination: backpressure is transient — marking
-                            //      the task Failed loses work for tasks without a retrying
-                            //      intake source and sends spurious failure notifications.
-                            //
-                            // Leave the task Pending; it will be re-dispatched on the next
-                            // server restart once capacity is available.
-                            tracing::warn!(
-                                task_id = ?task.id,
-                                "startup recovery (Source B): cannot acquire concurrency \
-                                 permit ({e}); leaving task pending for retry on next restart"
-                            );
-                            return;
+                    // acquire() errors are transient (memory pressure, queue saturation).
+                    // Retry with bounded exponential backoff rather than returning — once
+                    // this future exits, no other path re-enqueues the task.  For intake-
+                    // backed tasks this is especially important: a plain `return` without
+                    // calling completion_callback leaves the GitHub issue in the poller's
+                    // `dispatched` map permanently (it never calls unmark_dispatched).
+                    let permit = {
+                        const MAX_DELAY_SECS: u64 = 60;
+                        let mut retry_delay = 2u64;
+                        loop {
+                            match state
+                                .concurrency
+                                .task_queue
+                                .acquire(&project_id, task.priority)
+                                .await
+                            {
+                                Ok(p) => break p,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        task_id = ?task.id,
+                                        retry_in_secs = retry_delay,
+                                        "startup recovery (Source B): acquire backpressure \
+                                         ({e}); will retry in {retry_delay}s"
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_secs(retry_delay))
+                                        .await;
+                                    retry_delay = (retry_delay * 2).min(MAX_DELAY_SECS);
+                                }
+                            }
                         }
                     };
 
