@@ -479,14 +479,8 @@ mod tests {
         let req_no_phase = AgentRequest::default();
 
         assert_eq!(agent.resolve_model(&req_planning), "claude-opus-4-6");
-        assert_eq!(
-            agent.resolve_model(&req_execution),
-            "claude-sonnet-4-6"
-        );
-        assert_eq!(
-            agent.resolve_model(&req_validation),
-            "claude-opus-4-6"
-        );
+        assert_eq!(agent.resolve_model(&req_execution), "claude-sonnet-4-6");
+        assert_eq!(agent.resolve_model(&req_validation), "claude-opus-4-6");
         // No phase → falls back to default_model
         assert_eq!(agent.resolve_model(&req_no_phase), "default-model");
     }
@@ -531,21 +525,28 @@ mod tests {
         use std::io::Write;
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("mock-claude.sh");
+        let tmp_path = dir.path().join("mock-claude.sh.tmp");
         let script = format!("#!/bin/sh\nset -eu\n{script_body}\n");
-        // sync_all() (fsync) ensures the kernel flushes dirty pages before we
-        // exec the file; without it, Linux can return ETXTBSY on some kernels.
+        // Write to a temporary path and rename atomically to the final path.
+        // On Linux (including CI kernels) exec'ing a file whose inode was ever
+        // open for writing in the same process can return ETXTBSY even after
+        // the fd is closed. Renaming prevents this: the inode at `path` is
+        // never opened for writing, so the kernel sees no writers on exec.
         {
-            let mut f = fs::File::create(&path).expect("create script");
+            let mut f = fs::File::create(&tmp_path).expect("create script");
             f.write_all(script.as_bytes()).expect("write script");
             f.sync_all().expect("sync script");
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&path).expect("script metadata").permissions();
+            let mut perms = fs::metadata(&tmp_path)
+                .expect("script metadata")
+                .permissions();
             perms.set_mode(0o755);
-            fs::set_permissions(&path, perms).expect("set executable permissions");
+            fs::set_permissions(&tmp_path, perms).expect("set executable permissions");
         }
+        fs::rename(&tmp_path, &path).expect("rename script into place");
         (dir, path)
     }
 
