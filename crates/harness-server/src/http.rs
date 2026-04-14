@@ -791,7 +791,11 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     // Retry with bounded exponential backoff rather than returning — once
                     // this future exits, no other path re-enqueues the task, so a plain
                     // `return` would strand it in Pending until the next server restart.
-                    let permit = {
+                    //
+                    // After each sleep we re-check the task status: if it reached a
+                    // terminal state (Cancelled/Failed/Done) while we were waiting, we
+                    // must NOT redispatch it.
+                    let maybe_permit = {
                         const MAX_DELAY_SECS: u64 = 60;
                         let mut retry_delay = 2u64;
                         loop {
@@ -801,7 +805,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                                 .acquire(&project_id, task.priority)
                                 .await
                             {
-                                Ok(p) => break p,
+                                Ok(p) => break Some(p),
                                 Err(e) => {
                                     tracing::warn!(
                                         task_id = ?task.id,
@@ -812,9 +816,27 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                                     tokio::time::sleep(std::time::Duration::from_secs(retry_delay))
                                         .await;
                                     retry_delay = (retry_delay * 2).min(MAX_DELAY_SECS);
+                                    if state
+                                        .core
+                                        .tasks
+                                        .get(&task.id)
+                                        .map_or(false, |t| t.status.is_terminal())
+                                    {
+                                        tracing::warn!(
+                                            task_id = ?task.id,
+                                            "startup recovery (Source A): task reached \
+                                             terminal state during acquire backoff; \
+                                             skipping redispatch"
+                                        );
+                                        break None;
+                                    }
                                 }
                             }
                         }
+                    };
+                    let permit = match maybe_permit {
+                        Some(p) => p,
+                        None => return,
                     };
 
                     let mut req = task_runner::CreateTaskRequest {
@@ -1001,7 +1023,11 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     // backed tasks this is especially important: a plain `return` without
                     // calling completion_callback leaves the GitHub issue in the poller's
                     // `dispatched` map permanently (it never calls unmark_dispatched).
-                    let permit = {
+                    //
+                    // After each sleep we re-check the task status: if it reached a
+                    // terminal state (Cancelled/Failed/Done) while we were waiting, we
+                    // must NOT redispatch it.
+                    let maybe_permit = {
                         const MAX_DELAY_SECS: u64 = 60;
                         let mut retry_delay = 2u64;
                         loop {
@@ -1011,7 +1037,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                                 .acquire(&project_id, task.priority)
                                 .await
                             {
-                                Ok(p) => break p,
+                                Ok(p) => break Some(p),
                                 Err(e) => {
                                     tracing::warn!(
                                         task_id = ?task.id,
@@ -1022,9 +1048,27 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                                     tokio::time::sleep(std::time::Duration::from_secs(retry_delay))
                                         .await;
                                     retry_delay = (retry_delay * 2).min(MAX_DELAY_SECS);
+                                    if state
+                                        .core
+                                        .tasks
+                                        .get(&task.id)
+                                        .map_or(false, |t| t.status.is_terminal())
+                                    {
+                                        tracing::warn!(
+                                            task_id = ?task.id,
+                                            "startup recovery (Source B): task reached \
+                                             terminal state during acquire backoff; \
+                                             skipping redispatch"
+                                        );
+                                        break None;
+                                    }
                                 }
                             }
                         }
+                    };
+                    let permit = match maybe_permit {
+                        Some(p) => p,
+                        None => return,
                     };
 
                     // issue_num is always Some here — the None branch returned above.
