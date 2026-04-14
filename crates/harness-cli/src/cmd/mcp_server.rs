@@ -1,5 +1,8 @@
 use anyhow::Context;
-use harness_agents::{claude::ClaudeCodeAgent, codex::CodexAgent, registry::AgentRegistry};
+use harness_agents::{
+    claude::ClaudeCodeAgent, claude_adapter::ClaudeAdapter, codex::CodexAgent,
+    codex_adapter::CodexAdapter, registry::AgentRegistry,
+};
 use harness_core::{agent::AgentRequest, config::HarnessConfig, prompts, types::ThreadId};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -497,6 +500,15 @@ pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
             .with_stream_timeout(config.agents.stream_timeout_secs),
         ),
     );
+    agent_registry
+        .register_adapter(
+            "claude",
+            Arc::new(ClaudeAdapter::new(
+                config.agents.claude.cli_path.clone(),
+                config.agents.claude.default_model.clone(),
+            )),
+        )
+        .context("failed to attach claude adapter")?;
     agent_registry.register(
         "codex",
         Arc::new(
@@ -504,6 +516,12 @@ pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
                 .with_stream_timeout(config.agents.stream_timeout_secs),
         ),
     );
+    agent_registry
+        .register_adapter(
+            "codex",
+            Arc::new(CodexAdapter::new(config.agents.codex.cli_path.clone())),
+        )
+        .context("failed to attach codex adapter")?;
 
     let default_agent_name = agent_registry
         .resolved_default_agent_name()

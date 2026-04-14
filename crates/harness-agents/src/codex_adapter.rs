@@ -5,7 +5,8 @@ use harness_core::{
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::ChildStdout;
 use tokio::sync::{mpsc, Mutex};
 use tracing;
 
@@ -19,9 +20,14 @@ pub struct CodexAdapter {
     state: Arc<Mutex<AdapterState>>,
 }
 
+/// Persistent stdout reader kept alive across turns.
+type StdoutLines = Lines<BufReader<ChildStdout>>;
+
 struct AdapterState {
     child: Option<tokio::process::Child>,
     stdin: Option<tokio::process::ChildStdin>,
+    /// Stdout reader persisted between turns so subsequent turns can read events.
+    stdout_lines: Option<StdoutLines>,
     next_id: u64,
 }
 
@@ -30,6 +36,7 @@ impl AdapterState {
         Self {
             child: None,
             stdin: None,
+            stdout_lines: None,
             next_id: 1,
         }
     }
@@ -161,9 +168,8 @@ impl AgentAdapter for CodexAdapter {
             // Initialize handshake
             Self::send_request(&mut state, "initialize", json!({})).await?;
 
-            // Read initialize response (blocking on first line)
-            let reader = tokio::io::BufReader::new(stdout);
-            let mut lines = reader.lines();
+            // Persist the stdout reader across turns so subsequent turns can read events.
+            let mut lines = BufReader::new(stdout).lines();
 
             // Read init response
             if let Ok(Some(line)) = lines.next_line().await {
@@ -173,49 +179,51 @@ impl AgentAdapter for CodexAdapter {
             // Send initialized notification
             Self::send_notification(&mut state, "initialized").await?;
 
-            // Send turn/start
-            Self::send_request(&mut state, "turn/start", json!({ "text": req.prompt })).await?;
+            state.stdout_lines = Some(lines);
+        }
 
-            // Release lock before reading event stream
-            drop(state);
+        // Send turn/start for both first and subsequent turns.
+        Self::send_request(&mut state, "turn/start", json!({ "text": req.prompt })).await?;
 
-            if tx.send(AgentEvent::TurnStarted).await.is_err() {
-                return Ok(());
+        // Take the persistent stdout reader out of state so we can read from it
+        // without holding the lock (which would block concurrent steer/interrupt calls).
+        let mut lines = state.stdout_lines.take().ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution(
+                "codex stdout reader not available".into(),
+            )
+        })?;
+
+        // Release state lock before blocking on stdout.
+        drop(state);
+
+        if tx.send(AgentEvent::TurnStarted).await.is_err() {
+            // Put reader back so future turns can still use it.
+            self.state.lock().await.stdout_lines = Some(lines);
+            return Ok(());
+        }
+
+        // Read event stream until the turn completes or the channel closes.
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
             }
 
-            // Read event stream until turn completes
-            let mut output_buf = String::new();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.trim().is_empty() {
-                    continue;
+            if let Some(event) = parse_codex_message(&line) {
+                let is_turn_completed = matches!(event, AgentEvent::TurnCompleted { .. });
+                let is_error = matches!(event, AgentEvent::Error { .. });
+
+                if tx.send(event).await.is_err() {
+                    break;
                 }
 
-                if let Some(event) = parse_codex_message(&line) {
-                    if let AgentEvent::MessageDelta { ref text } = event {
-                        output_buf.push_str(text);
-                    }
-
-                    let is_turn_completed = matches!(event, AgentEvent::TurnCompleted { .. });
-                    let is_error = matches!(event, AgentEvent::Error { .. });
-
-                    if tx.send(event).await.is_err() {
-                        break;
-                    }
-
-                    if is_turn_completed || is_error {
-                        break;
-                    }
+                if is_turn_completed || is_error {
+                    break;
                 }
-            }
-        } else {
-            // Already running — just send a new turn
-            Self::send_request(&mut state, "turn/start", json!({ "text": req.prompt })).await?;
-            drop(state);
-
-            if let Err(e) = tx.send(AgentEvent::TurnStarted).await {
-                tracing::debug!("stream channel closed: {e}");
             }
         }
+
+        // Return the reader to state for the next turn.
+        self.state.lock().await.stdout_lines = Some(lines);
 
         Ok(())
     }

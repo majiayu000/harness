@@ -5,7 +5,9 @@ use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
 use anyhow::Context;
-use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+use harness_core::agent::{
+    AgentEvent, AgentRequest, AgentResponse, CodeAgent, StreamItem, TurnRequest,
+};
 use harness_core::config::agents::CapabilityProfile;
 use harness_core::error::HarnessError;
 use harness_core::interceptor::ToolUseEvent;
@@ -209,10 +211,14 @@ pub(crate) async fn run_turn_lifecycle(
         }
     }
 
-    // Register adapter for this turn if one is configured for this agent name.
-    // Enables turn/steer and turn/respond_approval to reach the live process.
-    // Gracefully no-ops when no adapter is registered (adapter_registry is empty by default).
-    let _adapter_guard = server.adapter_registry.get(&agent_name).map(|adapter_arc| {
+    // Get the adapter for this agent, if any.
+    let adapter_opt = server.agent_registry.get_adapter(&agent_name);
+
+    // Register as live adapter (RAII guard for cleanup on turn exit).
+    // When an adapter is available, execution goes through adapter.start_turn()
+    // (see below), so the adapter's stdin is initialized before any
+    // steer/respond_approval call arrives.
+    let _adapter_guard = adapter_opt.as_ref().map(|adapter_arc| {
         server
             .thread_manager
             .register_active_adapter(&turn_id, adapter_arc.clone());
@@ -222,15 +228,73 @@ pub(crate) async fn run_turn_lifecycle(
         }
     });
 
-    let req = AgentRequest {
-        prompt,
-        project_root,
-        ..Default::default()
-    };
-
     let stall_timeout = Duration::from_secs(server.config.concurrency.stall_timeout_secs);
     let (stream_tx, mut stream_rx) = mpsc::channel(128);
-    let mut execution = std::pin::pin!(agent.execute_stream(req, stream_tx));
+
+    // Only Codex uses the adapter for turn execution (initializes stdin so that
+    // subsequent steer/respond_approval calls can find a live process).
+    // Other adapters (e.g., ClaudeAdapter) exist for interrupt/steer only and must
+    // not override the configured CodeAgent execution path — ClaudeCodeAgent carries
+    // config-level settings (model, sandbox) that ClaudeAdapter does not replicate.
+    let execution_adapter = adapter_opt
+        .as_ref()
+        .filter(|a| a.name() == "codex")
+        .cloned();
+    let mut execution: std::pin::Pin<
+        Box<dyn std::future::Future<Output = harness_core::error::Result<()>> + Send>,
+    > = if let Some(adapter_arc) = execution_adapter {
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(128);
+        // Move stream_tx into the bridge task so dropping it closes stream_rx.
+        let bridge_tx = stream_tx;
+        tokio::spawn(async move {
+            let mut output_buf = String::new();
+            while let Some(event) = event_rx.recv().await {
+                let maybe_item: Option<StreamItem> = match event {
+                    AgentEvent::MessageDelta { ref text } => {
+                        output_buf.push_str(text);
+                        Some(StreamItem::MessageDelta { text: text.clone() })
+                    }
+                    AgentEvent::ApprovalRequest { id, command } => {
+                        Some(StreamItem::ApprovalRequest { id, command })
+                    }
+                    AgentEvent::Error { message } => Some(StreamItem::Error { message }),
+                    AgentEvent::TurnCompleted { output } => {
+                        let content = if output.is_empty() {
+                            std::mem::take(&mut output_buf)
+                        } else {
+                            output
+                        };
+                        Some(StreamItem::ItemCompleted {
+                            item: harness_core::types::Item::AgentReasoning { content },
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(item) = maybe_item {
+                    if bridge_tx.send(item).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            // event_rx closed → adapter done; dropping bridge_tx closes stream_rx.
+        });
+        let turn_req = TurnRequest {
+            prompt,
+            project_root,
+            model: None,
+            allowed_tools: vec![],
+            context: vec![],
+            timeout_secs: None,
+        };
+        Box::pin(async move { adapter_arc.start_turn(turn_req, event_tx).await })
+    } else {
+        let req = AgentRequest {
+            prompt,
+            project_root,
+            ..Default::default()
+        };
+        Box::pin(agent.execute_stream(req, stream_tx))
+    };
     let mut stream_closed = false;
     let mut execution_result: Option<harness_core::error::Result<()>> = None;
     let mut last_activity = Instant::now();

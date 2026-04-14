@@ -5,8 +5,17 @@ use harness_core::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Bundles an agent executor with an optional interactive adapter.
+///
+/// A descriptor is created with `adapter: None` on plain `register()` calls.
+/// Call `register_adapter()` to attach an adapter after the agent is registered.
+pub struct AgentDescriptor {
+    pub agent: Arc<dyn CodeAgent>,
+    pub adapter: Option<Arc<dyn AgentAdapter>>,
+}
+
 pub struct AgentRegistry {
-    agents: HashMap<String, Arc<dyn CodeAgent>>,
+    entries: HashMap<String, AgentDescriptor>,
     registration_order: Vec<String>,
     default_agent: String,
     complexity_preferred_agents: Vec<String>,
@@ -15,7 +24,7 @@ pub struct AgentRegistry {
 impl AgentRegistry {
     pub fn new(default_agent: impl Into<String>) -> Self {
         Self {
-            agents: HashMap::new(),
+            entries: HashMap::new(),
             registration_order: Vec::new(),
             default_agent: default_agent.into(),
             complexity_preferred_agents: Vec::new(),
@@ -32,27 +41,63 @@ impl AgentRegistry {
 
     pub fn register(&mut self, name: impl Into<String>, agent: Arc<dyn CodeAgent>) {
         let name = name.into();
-        if !self.agents.contains_key(&name) {
+        // Preserve any previously attached adapter so that hot-reload cannot
+        // accidentally clear the adapter by re-registering the agent under the
+        // same name (the old split-registry design had this property naturally).
+        let existing_adapter = self.entries.get(&name).and_then(|d| d.adapter.clone());
+        if !self.entries.contains_key(&name) {
             self.registration_order.push(name.clone());
         }
-        self.agents.insert(name, agent);
+        self.entries.insert(
+            name,
+            AgentDescriptor {
+                agent,
+                adapter: existing_adapter,
+            },
+        );
+    }
+
+    /// Attach an adapter to an already-registered agent.
+    ///
+    /// Returns `Err(HarnessError::AgentNotFound)` if the agent name is unknown,
+    /// so misconfiguration fails loudly instead of silently (U-23).
+    pub fn register_adapter(
+        &mut self,
+        name: &str,
+        adapter: Arc<dyn AgentAdapter>,
+    ) -> harness_core::error::Result<()> {
+        match self.entries.get_mut(name) {
+            Some(descriptor) => {
+                descriptor.adapter = Some(adapter);
+                Ok(())
+            }
+            None => Err(HarnessError::AgentNotFound(format!(
+                "cannot register adapter: agent '{}' not found",
+                name
+            ))),
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn CodeAgent>> {
-        self.agents.get(name).cloned()
+        self.entries.get(name).map(|d| d.agent.clone())
+    }
+
+    /// Return the adapter registered for the given agent name, if any.
+    pub fn get_adapter(&self, name: &str) -> Option<Arc<dyn AgentAdapter>> {
+        self.entries.get(name).and_then(|d| d.adapter.clone())
     }
 
     pub fn resolved_default_agent_name(&self) -> Option<&str> {
         let configured = self.default_agent.trim();
         if !configured.is_empty()
             && !configured.eq_ignore_ascii_case("auto")
-            && self.agents.contains_key(configured)
+            && self.entries.contains_key(configured)
         {
             return Some(configured);
         }
         self.registration_order
             .iter()
-            .find(|name| self.agents.contains_key(name.as_str()))
+            .find(|name| self.entries.contains_key(name.as_str()))
             .map(String::as_str)
     }
 
@@ -80,40 +125,6 @@ impl AgentRegistry {
 
     pub fn list(&self) -> Vec<&str> {
         self.registration_order.iter().map(|k| k.as_str()).collect()
-    }
-}
-
-/// Registry for streaming `AgentAdapter` implementations.
-///
-/// Coexists with `AgentRegistry` — when an adapter is available for a given
-/// agent name, the task executor prefers it over the legacy `CodeAgent` path.
-pub struct AdapterRegistry {
-    adapters: HashMap<String, Arc<dyn AgentAdapter>>,
-    default_adapter: String,
-}
-
-impl AdapterRegistry {
-    pub fn new(default_adapter: impl Into<String>) -> Self {
-        Self {
-            adapters: HashMap::new(),
-            default_adapter: default_adapter.into(),
-        }
-    }
-
-    pub fn register(&mut self, name: impl Into<String>, adapter: Arc<dyn AgentAdapter>) {
-        self.adapters.insert(name.into(), adapter);
-    }
-
-    pub fn get(&self, name: &str) -> Option<Arc<dyn AgentAdapter>> {
-        self.adapters.get(name).cloned()
-    }
-
-    pub fn default_adapter(&self) -> Option<Arc<dyn AgentAdapter>> {
-        self.get(&self.default_adapter)
-    }
-
-    pub fn list(&self) -> Vec<&str> {
-        self.adapters.keys().map(|k| k.as_str()).collect()
     }
 }
 
@@ -328,49 +339,110 @@ mod tests {
     }
 
     #[test]
-    fn adapter_registry_register_and_get_roundtrip() {
-        let mut registry = AdapterRegistry::new("mock");
-        registry.register(
-            "mock",
-            Arc::new(StubAdapter {
-                adapter_name: "mock",
-            }),
-        );
+    fn register_adapter_and_get_roundtrip() {
+        let mut registry = AgentRegistry::new("mock");
+        registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
+        registry
+            .register_adapter(
+                "mock",
+                Arc::new(StubAdapter {
+                    adapter_name: "mock",
+                }),
+            )
+            .unwrap();
 
-        let adapter = registry.get("mock");
+        let adapter = registry.get_adapter("mock");
         assert!(adapter.is_some());
         assert_eq!(adapter.unwrap().name(), "mock");
     }
 
     #[test]
-    fn adapter_registry_default_adapter_uses_configured_name() {
-        let mut registry = AdapterRegistry::new("mock");
+    fn register_adapter_on_unknown_agent_returns_error() {
+        let mut registry = AgentRegistry::new("");
+        let result = registry.register_adapter(
+            "ghost",
+            Arc::new(StubAdapter {
+                adapter_name: "ghost",
+            }),
+        );
+        assert!(matches!(result, Err(HarnessError::AgentNotFound(_))));
+    }
+
+    #[test]
+    fn get_adapter_returns_none_when_not_registered() {
+        let mut registry = AgentRegistry::new("mock");
+        registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
+
+        assert!(registry.get_adapter("mock").is_none());
+    }
+
+    #[test]
+    fn register_creates_descriptor_with_no_adapter() {
+        let mut registry = AgentRegistry::new("mock");
+        registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
+
+        assert!(registry.get_adapter("mock").is_none());
+        assert!(registry.get("mock").is_some());
+    }
+
+    #[test]
+    fn dispatch_regression_returns_descriptor_agent() {
+        let mut registry = AgentRegistry::new("mock");
+        registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
+        registry
+            .register_adapter(
+                "mock",
+                Arc::new(StubAdapter {
+                    adapter_name: "mock",
+                }),
+            )
+            .unwrap();
+
+        // dispatch() must still return the CodeAgent, not the adapter
+        let agent = registry
+            .dispatch(&classification(TaskComplexity::Simple))
+            .unwrap();
+        assert_eq!(agent.name(), "mock");
+    }
+
+    #[test]
+    fn re_register_preserves_existing_adapter() {
+        let mut registry = AgentRegistry::new("mock");
+        registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
+        registry
+            .register_adapter(
+                "mock",
+                Arc::new(StubAdapter {
+                    adapter_name: "mock",
+                }),
+            )
+            .unwrap();
+
+        // Re-registering with a new agent must not clear the adapter.
         registry.register(
             "mock",
-            Arc::new(StubAdapter {
-                adapter_name: "mock",
+            Arc::new(StubAgent {
+                agent_name: "mock-v2",
             }),
         );
 
-        let adapter = registry.default_adapter();
-        assert!(adapter.is_some());
+        let adapter = registry.get_adapter("mock");
+        assert!(
+            adapter.is_some(),
+            "adapter must survive re-registration of the same agent name"
+        );
         assert_eq!(adapter.unwrap().name(), "mock");
+        // The agent itself must be updated.
+        assert_eq!(registry.get("mock").unwrap().name(), "mock-v2");
     }
 
     #[test]
-    fn adapter_registry_default_adapter_missing_returns_none() {
-        let registry = AdapterRegistry::new("missing");
-        assert!(registry.default_adapter().is_none());
-    }
+    fn list_returns_registered_agent_names_in_order() {
+        let mut registry = AgentRegistry::new("a");
+        registry.register("a", Arc::new(StubAgent { agent_name: "a" }));
+        registry.register("b", Arc::new(StubAgent { agent_name: "b" }));
 
-    #[test]
-    fn adapter_registry_list_returns_registered_names() {
-        let mut registry = AdapterRegistry::new("a");
-        registry.register("a", Arc::new(StubAdapter { adapter_name: "a" }));
-        registry.register("b", Arc::new(StubAdapter { adapter_name: "b" }));
-
-        let mut names = registry.list();
-        names.sort_unstable();
+        let names = registry.list();
         assert_eq!(names, vec!["a", "b"]);
     }
 }
