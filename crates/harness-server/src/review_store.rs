@@ -81,18 +81,13 @@ static REVIEW_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         description: "add claimed_at column and backfill stuck pending rows",
-        // ADD COLUMN task_id is a no-op (silently ignored by the migrator) when
-        // the column already exists; it ensures legacy tables that predate the
-        // migration system also have task_id before the backfill UPDATE uses it.
-        // claimed_at is set to a fixed RFC3339 epoch so the string comparison in
-        // recover_stale_pending_claims (claimed_at < cutoff_rfc3339) works correctly
-        // — CURRENT_TIMESTAMP produces "YYYY-MM-DD HH:MM:SS" (space separator) which
-        // sorts before any "YYYY-MM-DDTHH:MM:SSZ" (T separator) cutoff string,
-        // causing freshly backfilled rows to appear stale immediately.
+        // Guard: add task_id first so the subsequent UPDATE reference is safe on
+        // legacy tables that predate the task_id column.  duplicate_add_column_error
+        // silently swallows the "duplicate column name" error if it already exists.
         sql: "ALTER TABLE review_findings ADD COLUMN task_id TEXT;
               ALTER TABLE review_findings ADD COLUMN claimed_at TEXT;
               UPDATE review_findings
-              SET claimed_at = '2000-01-01T00:00:00Z'
+              SET claimed_at = CURRENT_TIMESTAMP
               WHERE task_id = 'pending' AND claimed_at IS NULL",
     },
     Migration {
@@ -130,21 +125,26 @@ static REVIEW_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 5,
-        description: "normalize legacy claimed_at values to RFC3339 format",
-        // Old code wrote claimed_at using SQL CURRENT_TIMESTAMP which produces
-        // 'YYYY-MM-DD HH:MM:SS' (space separator).  recover_stale_pending_claims
-        // compares claimed_at against an RFC3339 cutoff ('YYYY-MM-DDTHH:MM:SSZ',
-        // T separator).  Because SQLite/Postgres use lexicographic string order,
-        // space (' ') sorts before 'T', so any space-format claimed_at is always
-        // less than any RFC3339 cutoff — causing every legacy pending claim to
-        // appear stale on first startup after upgrade and triggering spurious
-        // re-spawns.  Setting them to the RFC3339 epoch marks them as stale
-        // (correct: they predate task-status tracking) without corrupting new rows.
+        description: "normalize legacy claimed_at timestamps to RFC3339",
+        // Migration v2 backfilled claimed_at using SQL CURRENT_TIMESTAMP which
+        // produces "YYYY-MM-DD HH:MM:SS" (space separator, length 19).
+        // recover_stale_pending_claims compares claimed_at against an RFC3339
+        // cutoff string "YYYY-MM-DDTHH:MM:SSZ" (T separator).  Because space
+        // (0x20) < 'T' (0x54) in ASCII, every space-separated value sorts before
+        // every T-separated value on the same date, making all v2-backfilled rows
+        // appear permanently stale immediately after upgrade.
+        //
+        // Fix: detect rows in the old format (length=19, space at position 11)
+        // and rewrite them in-place to RFC3339 by inserting 'T' and appending 'Z',
+        // preserving the original wall-clock time so stale_secs still applies.
+        //
+        // substr() with 1-based indexing and || string concatenation work on both
+        // SQLite and Postgres.
         sql: "UPDATE review_findings
-              SET claimed_at = '2000-01-01T00:00:00Z'
-              WHERE task_id = 'pending'
-                AND claimed_at IS NOT NULL
-                AND claimed_at NOT LIKE '%T%'",
+              SET claimed_at = substr(claimed_at, 1, 10) || 'T' || substr(claimed_at, 12) || 'Z'
+              WHERE claimed_at IS NOT NULL
+                AND length(claimed_at) = 19
+                AND substr(claimed_at, 11, 1) = ' '",
     },
 ];
 
