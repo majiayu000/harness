@@ -29,6 +29,7 @@ const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source,
 /// v12 – add priority column for priority-based task scheduling.
 /// v13 – add phase column for consistent phase persistence across cache/DB paths.
 /// v14 – add description column for task observability after restart.
+/// v15 – add (status, updated_at DESC) index for project-agnostic terminal queries.
 static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -118,6 +119,12 @@ static TASK_MIGRATIONS: &[Migration] = &[
         version: 14,
         description: "add description column for task observability",
         sql: "ALTER TABLE tasks ADD COLUMN description TEXT",
+    },
+    Migration {
+        version: 15,
+        description: "add index on tasks(status, updated_at) for project-agnostic terminal queries",
+        sql: "CREATE INDEX IF NOT EXISTS idx_tasks_status_updated \
+              ON tasks(status, updated_at DESC)",
     },
 ];
 
@@ -352,6 +359,61 @@ impl TaskDb {
             }
         }
         Ok(summaries)
+    }
+
+    /// Return `(task_id, first_token_latency_ms)` pairs for the most-recently
+    /// completed terminal (done/failed) tasks, capped at 500 rows.
+    ///
+    /// The latency scalar is extracted directly in SQL via `json_extract` so the
+    /// full `rounds` blob — which may contain large `detail` strings — is never
+    /// allocated on the Rust heap.  The correlated subquery skips synthetic
+    /// `resumed_checkpoint` rounds and returns the first real latency per task.
+    ///
+    /// Ordered by `updated_at DESC` because `updated_at` is written at task
+    /// completion, so this correctly captures the 500 most-recently-finished
+    /// tasks.  Using `created_at` would silently drop long-running tasks that
+    /// finished recently but were created earlier.
+    ///
+    /// The `LIMIT 500` keeps each dashboard poll O(1) rather than
+    /// O(total task history).  500 data points are more than sufficient for a
+    /// statistically valid p50; they also represent a natural rolling window that
+    /// gives more weight to recent latency behaviour.
+    pub async fn list_terminal_first_token_latencies_ms(
+        &self,
+    ) -> anyhow::Result<Vec<(String, Option<i64>)>> {
+        let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT id, \
+             (SELECT CAST(json_extract(r.value, '$.first_token_latency_ms') AS INTEGER) \
+              FROM json_each(rounds) r \
+              WHERE json_extract(r.value, '$.result') != 'resumed_checkpoint' \
+                AND json_extract(r.value, '$.first_token_latency_ms') IS NOT NULL \
+              LIMIT 1) AS first_token_latency_ms \
+             FROM tasks \
+             WHERE status IN ('done', 'failed') \
+             ORDER BY updated_at DESC \
+             LIMIT 500",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Return `(task_id, turn)` pairs for the 500 most-recently-completed
+    /// terminal (done/failed) tasks, ordered by completion time (`updated_at DESC`).
+    ///
+    /// Only the lightweight `id` and `turn` columns are fetched; the heavy
+    /// `rounds` blob is never touched.  The `LIMIT 500` keeps each dashboard
+    /// poll O(1) rather than O(total task history).
+    pub async fn list_terminal_turn_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT id, turn FROM tasks \
+             WHERE status IN ('done', 'failed') \
+             ORDER BY updated_at DESC \
+             LIMIT 500",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Return `(id, status)` pairs for all tasks — skips all heavy columns.
@@ -1134,6 +1196,7 @@ mod tests {
             action: "implement".to_string(),
             result: "created PR".to_string(),
             detail: None,
+            first_token_latency_ms: None,
         });
         db.update(&task).await?;
 

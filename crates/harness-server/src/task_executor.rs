@@ -455,13 +455,15 @@ async fn run_agent_streaming(
     task_id: &TaskId,
     store: &TaskStore,
     turn: u32,
-) -> harness_core::error::Result<AgentResponse> {
+) -> harness_core::error::Result<(AgentResponse, Option<u64>)> {
+    let turn_start = Instant::now();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamItem>(128);
     let mut exec = std::pin::pin!(agent.execute_stream(req, tx));
     let mut exec_result: Option<harness_core::error::Result<()>> = None;
     let mut channel_closed = false;
     let mut output = String::new();
     let mut token_usage = TokenUsage::default();
+    let mut first_token_latency_ms: Option<u64> = None;
 
     loop {
         tokio::select! {
@@ -474,11 +476,22 @@ async fn run_agent_streaming(
                         store.publish_stream_item(task_id, item.clone());
                         match &item {
                             StreamItem::MessageDelta { text } => {
+                                if first_token_latency_ms.is_none() {
+                                    first_token_latency_ms =
+                                        Some(turn_start.elapsed().as_millis() as u64);
+                                }
                                 output.push_str(text);
                             }
                             StreamItem::ItemCompleted {
                                 item: Item::AgentReasoning { content },
                             } => {
+                                // Non-streaming adapters (e.g. AnthropicApiAgent) call
+                                // execute() to completion before emitting this item, so
+                                // elapsed time here is full-request latency, not TTFB.
+                                // Recording it as first_token_latency_ms would silently
+                                // mix whole-request durations with real streaming TTFB
+                                // values and inflate p50.  Only MessageDelta (true
+                                // streaming events) sets first_token_latency_ms.
                                 // Prefer the full content over accumulated deltas.
                                 output = content.clone();
                             }
@@ -510,14 +523,17 @@ async fn run_agent_streaming(
             "agent execution completed without result".into(),
         ))
     }) {
-        Ok(()) => Ok(AgentResponse {
-            output,
-            stderr: String::new(),
-            items: Vec::new(),
-            token_usage,
-            model: String::new(),
-            exit_code: Some(0),
-        }),
+        Ok(()) => Ok((
+            AgentResponse {
+                output,
+                stderr: String::new(),
+                items: Vec::new(),
+                token_usage,
+                model: String::new(),
+                exit_code: Some(0),
+            },
+            first_token_latency_ms,
+        )),
         Err(e) => Err(e),
     }
 }
@@ -625,7 +641,7 @@ async fn run_triage_plan_pipeline(
     };
 
     let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
-    let triage_resp = tokio::time::timeout(
+    let (triage_resp, _) = tokio::time::timeout(
         turn_timeout,
         run_agent_streaming(agent, triage_req, task_id, store, 0),
     )
@@ -695,7 +711,7 @@ async fn run_triage_plan_pipeline(
         ..Default::default()
     };
 
-    let plan_resp = tokio::time::timeout(
+    let (plan_resp, _) = tokio::time::timeout(
         turn_timeout,
         run_agent_streaming(agent, plan_req, task_id, store, 0),
     )
@@ -1085,6 +1101,7 @@ pub(crate) async fn run_task(
                     action: "implement".into(),
                     result: "resumed_checkpoint".into(),
                     detail: None,
+                    first_token_latency_ms: None,
                 });
             })
             .await?;
@@ -1136,7 +1153,7 @@ pub(crate) async fn run_task(
             turns_used += 1;
             *turns_used_acc = turns_used;
             match raw {
-                Ok(Ok(r)) => {
+                Ok(Ok((r, impl_first_token_ms))) => {
                     // Post-execution tool isolation check (defense-in-depth alongside
                     // --allowedTools CLI enforcement). Violations feed into the retry loop
                     // so the agent gets a chance to self-correct (fail-closed, not fail-open).
@@ -1212,7 +1229,7 @@ pub(crate) async fn run_task(
                             ));
                         }
                     }
-                    break r;
+                    break (r, impl_first_token_ms);
                 }
                 Ok(Err(e)) => {
                     run_on_error(&interceptors, &impl_req, &e.to_string()).await;
@@ -1229,12 +1246,15 @@ pub(crate) async fn run_task(
             }
         };
 
-        let AgentResponse {
-            output,
-            stderr,
-            token_usage: impl_token_usage,
-            ..
-        } = resp;
+        let (
+            AgentResponse {
+                output,
+                stderr,
+                token_usage: impl_token_usage,
+                ..
+            },
+            impl_first_token_ms,
+        ) = resp;
 
         tracing::info!(
             task_id = %task_id,
@@ -1280,6 +1300,7 @@ pub(crate) async fn run_task(
                     } else {
                         Some(output.clone())
                     },
+                    first_token_latency_ms: impl_first_token_ms,
                 });
             })
             .await?;
@@ -1318,6 +1339,7 @@ pub(crate) async fn run_task(
                         } else {
                             Some(output.clone())
                         },
+                        first_token_latency_ms: impl_first_token_ms,
                     });
                 })
                 .await?;
@@ -1349,6 +1371,7 @@ pub(crate) async fn run_task(
                 } else {
                     Some(output.clone())
                 },
+                first_token_latency_ms: impl_first_token_ms,
             });
         })
         .await?;
@@ -1729,6 +1752,7 @@ pub(crate) async fn run_task(
                 action: "review".into(),
                 result: result_label.into(),
                 detail: None,
+                first_token_latency_ms: None,
             });
         })
         .await?;
@@ -2049,6 +2073,7 @@ async fn run_agent_review(
                     format!("{} issues", issues.len())
                 },
                 detail: Some(review_detail),
+                first_token_latency_ms: None,
             });
         })
         .await?;
@@ -2196,6 +2221,7 @@ async fn run_agent_review(
                 action: "agent_review_fix".into(),
                 result: "fixed".into(),
                 detail: None,
+                first_token_latency_ms: None,
             });
         })
         .await?;

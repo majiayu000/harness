@@ -1,9 +1,14 @@
 use crate::{http::AppState, task_runner::DashboardCounts};
 use axum::{extract::State, http::StatusCode, Json};
 use harness_core::types::EventFilters;
-use harness_observe::quality::QualityGrader;
+use harness_observe::{quality::QualityGrader, stats};
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+/// Rolling window for dashboard event queries. Keeps each `/api/dashboard` poll
+/// from doing a full-history scan — the browser polls every 5 s and the event
+/// store materialises all matching rows into memory on every call.
+const DASHBOARD_EVENT_WINDOW_DAYS: i64 = 30;
 
 /// Server start time. Initialized once in `serve()` before accepting connections,
 /// so `uptime_secs` reflects true server uptime rather than time since first dashboard hit.
@@ -38,31 +43,98 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     // Grade from the global quality event store.
     // Derive violation_count from the most recent rule_scan session so we don't
     // permanently depress the grade with historical violations from old scans.
+    let events_since = chrono::Utc::now() - chrono::Duration::days(DASHBOARD_EVENT_WINDOW_DAYS);
     let grade: Option<Value> = match state
         .observability
         .events
-        .query(&EventFilters::default())
+        .query(&EventFilters {
+            since: Some(events_since),
+            ..Default::default()
+        })
         .await
     {
         Ok(events) => {
-            let violation_count = events
-                .iter()
-                .rev()
-                .find(|e| e.hook == "rule_scan")
-                .map(|scan| {
-                    events
-                        .iter()
-                        .filter(|e| e.hook == "rule_check" && e.session_id == scan.session_id)
-                        .count()
-                })
-                .unwrap_or(0);
-            let report = QualityGrader::grade(&events, violation_count);
-            serde_json::to_value(report.grade).ok()
+            // Return None when the rolling window contains no events rather than
+            // computing a false perfect grade from an empty set.  Operators should
+            // see null (unknown) instead of an inflated A when the project has been
+            // quiet for more than DASHBOARD_EVENT_WINDOW_DAYS days.
+            if events.iter().all(|e| e.hook != "rule_scan") {
+                None
+            } else {
+                let violation_count = events
+                    .iter()
+                    .rev()
+                    .find(|e| e.hook == "rule_scan")
+                    .map(|scan| {
+                        events
+                            .iter()
+                            .filter(|e| e.hook == "rule_check" && e.session_id == scan.session_id)
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let report = QualityGrader::grade(&events, violation_count);
+                serde_json::to_value(report.grade).ok()
+            }
         }
         Err(e) => {
             tracing::warn!("dashboard: failed to query events for grade: {e}");
             None
         }
+    };
+
+    // LLM-specific metrics derived from in-memory task state and event store.
+    //
+    // collect_llm_metrics_inputs() avoids two pitfalls:
+    // 1. Performance: does NOT call list_all() which would clone full TaskState
+    //    values (including large rounds.detail strings) on every 5-second poll.
+    //    Turn counts come from lightweight DB summaries; latencies are read
+    //    in-place from cache refs without any full-TaskState allocation.
+    // 2. Correctness: turn counts include terminal tasks from the DB so the
+    //    metrics are not zero when the queue is idle.  Latency computation skips
+    //    the synthetic "resumed_checkpoint" round injected at recovery time so
+    //    resumed tasks are not silently excluded from the p50.
+    let llm_metrics: Value = {
+        let inputs = state.core.tasks.collect_llm_metrics_inputs().await;
+        let turn_counts = inputs.turn_counts;
+        let avg_turns: Option<f64> = if turn_counts.is_empty() {
+            None
+        } else {
+            Some(turn_counts.iter().map(|&t| t as f64).sum::<f64>() / turn_counts.len() as f64)
+        };
+        let p50_turns = stats::p50_turns(&turn_counts);
+        let mut latencies = inputs.first_token_latencies;
+        latencies.sort_unstable();
+        let p50_first_token_latency_ms: Option<u64> = if latencies.is_empty() {
+            None
+        } else {
+            // Lower-median: index (len-1)/2 avoids overstating p50 for even-length slices.
+            Some(latencies[(latencies.len() - 1) / 2])
+        };
+        // total_linter_feedback from events already queried above.
+        // Bounded to the same rolling window as the grade query to avoid a
+        // full-history scan on every 5-second dashboard poll.
+        let total_linter_feedback = match state
+            .observability
+            .events
+            .query(&EventFilters {
+                hook: Some("rule_check".to_string()),
+                since: Some(events_since),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(evts) => stats::linter_feedback_count(&evts),
+            Err(e) => {
+                tracing::warn!("dashboard: failed to query rule_check events: {e}");
+                0
+            }
+        };
+        json!({
+            "avg_turns": avg_turns,
+            "p50_turns": p50_turns,
+            "total_linter_feedback": total_linter_feedback,
+            "p50_first_token_latency_ms": p50_first_token_latency_ms,
+        })
     };
 
     // Fetch latest PR URLs for all projects in one bulk query to avoid N+1.
@@ -136,6 +208,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     let body = json!({
         "projects": projects,
         "runtime_hosts": runtime_hosts,
+        "llm_metrics": llm_metrics,
         "global": {
             "running": tq.running_count(),
             "queued": tq.queued_count(),
