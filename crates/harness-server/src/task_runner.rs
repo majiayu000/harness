@@ -197,6 +197,11 @@ pub struct TaskState {
     /// Output from the Plan phase (Architect plan). Not persisted to DB.
     #[serde(skip)]
     pub plan_output: Option<String>,
+    /// Caller-specified execution limits. Persisted to the DB so that recovered
+    /// tasks resume with the same budget / timeout guardrails as originally
+    /// requested rather than silently falling back to server defaults.
+    #[serde(skip)]
+    pub request_settings: Option<PersistedRequestSettings>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -260,6 +265,7 @@ impl TaskState {
             triage_output: None,
             plan_output: None,
             repo: None,
+            request_settings: None,
         }
     }
 
@@ -351,6 +357,77 @@ pub struct CreateTaskRequest {
     /// Higher values are served first when multiple tasks are waiting for a slot.
     #[serde(default)]
     pub priority: u8,
+}
+
+/// Execution limits that survive a server restart.
+///
+/// Serialised as a JSON blob in `tasks.request_settings`. Restored at startup
+/// redispatch so recovered tasks honour the original budget / timeout
+/// guardrails instead of silently falling back to server-wide defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PersistedRequestSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_budget_usd: Option<f64>,
+    pub wait_secs: u64,
+    pub retry_base_backoff_ms: u64,
+    pub retry_max_backoff_ms: u64,
+    pub stall_timeout_secs: u64,
+    pub turn_timeout_secs: u64,
+    /// Additional caller-supplied prompt context for issue tasks.
+    ///
+    /// Callers may submit `{ issue: N, prompt: "extra context" }` to augment
+    /// issue resolution.  The prompt is not stored in `description` (privacy),
+    /// so we persist it here for issue tasks only to survive a server restart.
+    /// Pure prompt tasks and PR tasks leave this `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_prompt: Option<String>,
+}
+
+impl PersistedRequestSettings {
+    pub(crate) fn from_req(req: &CreateTaskRequest) -> Self {
+        Self {
+            agent: req.agent.clone(),
+            max_rounds: req.max_rounds,
+            max_turns: req.max_turns,
+            max_budget_usd: req.max_budget_usd,
+            wait_secs: req.wait_secs,
+            retry_base_backoff_ms: req.retry_base_backoff_ms,
+            retry_max_backoff_ms: req.retry_max_backoff_ms,
+            stall_timeout_secs: req.stall_timeout_secs,
+            turn_timeout_secs: req.turn_timeout_secs,
+            // Only persist the caller's prompt for issue tasks — it serves as
+            // additional context that is safe to store (unlike pure prompt
+            // tasks which may contain credentials).  PR and prompt-only tasks
+            // leave this None.
+            additional_prompt: if req.issue.is_some() {
+                req.prompt.clone()
+            } else {
+                None
+            },
+        }
+    }
+
+    pub(crate) fn apply_to_req(&self, req: &mut CreateTaskRequest) {
+        req.agent = self.agent.clone();
+        req.max_rounds = self.max_rounds;
+        req.max_turns = self.max_turns;
+        req.max_budget_usd = self.max_budget_usd;
+        req.wait_secs = self.wait_secs;
+        req.retry_base_backoff_ms = self.retry_base_backoff_ms;
+        req.retry_max_backoff_ms = self.retry_max_backoff_ms;
+        req.stall_timeout_secs = self.stall_timeout_secs;
+        req.turn_timeout_secs = self.turn_timeout_secs;
+        // Restore the additional prompt context for recovered issue tasks.
+        if self.additional_prompt.is_some() {
+            req.prompt = self.additional_prompt.clone();
+        }
+    }
 }
 
 impl Default for CreateTaskRequest {
@@ -1339,6 +1416,16 @@ impl TaskStore {
         self.db.load_checkpoint(task_id.as_str()).await
     }
 
+    /// Return pending tasks that have a plan or triage checkpoint but no `pr_url`.
+    ///
+    /// Used at startup to re-dispatch tasks recovered from plan/triage checkpoints
+    /// that were not caught by the PR-based redispatch path.
+    pub(crate) async fn pending_tasks_with_checkpoint(
+        &self,
+    ) -> anyhow::Result<Vec<(TaskState, crate::task_db::TaskCheckpoint)>> {
+        self.db.pending_tasks_with_checkpoint().await
+    }
+
     pub(crate) async fn persist(&self, id: &TaskId) -> anyhow::Result<()> {
         let lock = self
             .persist_locks
@@ -1570,6 +1657,7 @@ pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskReques
     state.priority = req.priority;
     state.issue = req.issue;
     state.description = summarize_request_description(req);
+    state.request_settings = Some(PersistedRequestSettings::from_req(req));
     store.insert(&state).await;
     // Register stream channel now so SSE clients can subscribe before execution begins.
     store.register_task_stream(&task_id);
@@ -1644,6 +1732,7 @@ where
         state.external_id = req.external_id.clone();
         state.repo = req.repo.clone();
         state.priority = req.priority;
+        state.request_settings = Some(PersistedRequestSettings::from_req(&req));
         store.insert(&state).await;
         // Register stream channel before spawning so SSE clients can subscribe immediately.
         store.register_task_stream(&task_id);

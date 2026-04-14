@@ -802,7 +802,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         }
                     };
 
-                    let req = task_runner::CreateTaskRequest {
+                    let mut req = task_runner::CreateTaskRequest {
                         pr: Some(pr_num),
                         project: Some(canonical),
                         repo: task.repo.clone(),
@@ -810,14 +810,263 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         external_id: task.external_id.clone(),
                         ..Default::default()
                     };
-                    let classification = crate::complexity_router::classify("", None, Some(pr_num));
-                    let agent = match state.core.server.agent_registry.dispatch(&classification) {
+                    // Restore persisted execution limits so the recovered task resumes
+                    // with the same budget / timeout guardrails as originally requested.
+                    if let Some(ref settings) = task.request_settings {
+                        settings.apply_to_req(&mut req);
+                    }
+                    // Use the three-tier select_agent() so that an explicit agent
+                    // pin stored in request_settings (Tier 1) and project-level
+                    // defaults (Tier 2a) are honoured, not bypassed by a raw
+                    // complexity dispatch.
+                    let agent = match task_routes::select_agent(
+                        &req,
+                        &state.core.server.agent_registry,
+                        None,
+                    ) {
                         Ok(a) => a,
                         Err(e) => {
                             tracing::error!(
                                 task_id = ?task.id,
-                                "startup recovery: failed to dispatch agent: {e}"
+                                "startup recovery: failed to select agent: {e}"
                             );
+                            return;
+                        }
+                    };
+                    let (reviewer, _) = resolve_reviewer(
+                        &state.core.server.agent_registry,
+                        &state.core.server.config.agents.review,
+                        agent.name(),
+                    );
+                    state.core.tasks.register_task_stream(&task.id);
+                    task_runner::spawn_preregistered_task(
+                        task.id,
+                        state.core.tasks.clone(),
+                        agent,
+                        reviewer,
+                        Arc::new(state.core.server.config.clone()),
+                        state.engines.skills.clone(),
+                        state.observability.events.clone(),
+                        state.interceptors.clone(),
+                        req,
+                        state.concurrency.workspace_mgr.clone(),
+                        permit,
+                        state.intake.completion_callback.clone(),
+                        None,
+                    )
+                    .await;
+                });
+            }
+        }
+    }
+
+    // Re-dispatch tasks recovered from plan/triage checkpoints but without a PR.
+    // Source A (above) handles tasks with `pr_url` set.  Source B (below) picks up
+    // remaining pending tasks that have a plan or triage checkpoint — these are
+    // issue/prompt tasks interrupted during planning that need to continue execution.
+    // If the DB query fails, log a warning and skip (startup must not abort).
+    {
+        let checkpoint_tasks = match state.core.tasks.pending_tasks_with_checkpoint().await {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                tracing::warn!(
+                    "startup: failed to query checkpoint tasks, \
+                         skipping plan/triage redispatch: {e}"
+                );
+                vec![]
+            }
+        };
+        if !checkpoint_tasks.is_empty() {
+            tracing::info!(
+                count = checkpoint_tasks.len(),
+                "startup: re-dispatching recovered pending task(s) with plan/triage checkpoints"
+            );
+            for (task, _checkpoint) in checkpoint_tasks {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    // Reconstruct request type from the persisted description.
+                    // Description format: "issue #N" → issue task; other → prompt task.
+                    // PR tasks are handled by Source A and never appear here.
+                    let issue_num = task
+                        .description
+                        .as_deref()
+                        .and_then(|d| d.strip_prefix("issue #"))
+                        .and_then(|s| s.split_whitespace().next())
+                        .and_then(|s| s.parse::<u64>().ok());
+
+                    if issue_num.is_none() {
+                        // Prompt tasks store the placeholder "prompt task" in description
+                        // by design — the original prompt text is never persisted for
+                        // privacy.  Re-dispatching with that placeholder would execute
+                        // against the wrong prompt, so mark the task failed instead to
+                        // prevent the same broken recovery on every subsequent restart.
+                        let reason = if task.description.as_deref() == Some("prompt task") {
+                            "prompt task cannot be recovered after restart: \
+                             original prompt text is not persisted"
+                        } else {
+                            "checkpoint task has no parseable issue number — skipping"
+                        };
+                        tracing::warn!(task_id = ?task.id, "{reason}");
+                        let mut failed = task.clone();
+                        failed.status = task_runner::TaskStatus::Failed;
+                        failed.error = Some(reason.to_string());
+                        state.core.tasks.cache.insert(failed.id.clone(), failed);
+                        if let Err(e) = state.core.tasks.persist(&task.id).await {
+                            tracing::warn!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to persist failed status: {e}"
+                            );
+                        }
+                        if let Some(cb) = &state.intake.completion_callback {
+                            if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                cb(final_state).await;
+                            }
+                        }
+                        return;
+                    }
+
+                    let project_path = match task.repo.as_deref() {
+                        Some(repo) => {
+                            if let Some(registry) = state.core.project_registry.as_deref() {
+                                match registry.resolve_path(repo).await {
+                                    Ok(Some(p)) => Some(p),
+                                    Ok(None) => Some(std::path::PathBuf::from(repo)),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            task_id = ?task.id,
+                                            repo,
+                                            "startup recovery: registry lookup failed: \
+                                             {e}, using repo as path"
+                                        );
+                                        Some(std::path::PathBuf::from(repo))
+                                    }
+                                }
+                            } else {
+                                Some(std::path::PathBuf::from(repo))
+                            }
+                        }
+                        None => None,
+                    };
+
+                    let canonical = match task_runner::resolve_canonical_project(project_path).await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let reason =
+                                format!("startup recovery: failed to resolve project path: {e}");
+                            tracing::error!(task_id = ?task.id, "{reason}");
+                            if let Err(pe) = task_runner::mutate_and_persist(
+                                &state.core.tasks,
+                                &task.id,
+                                move |s| {
+                                    s.status = task_runner::TaskStatus::Failed;
+                                    s.error = Some(reason);
+                                },
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    "startup recovery: failed to persist failed status: {pe}"
+                                );
+                            }
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
+                            return;
+                        }
+                    };
+                    let project_id = canonical.to_string_lossy().into_owned();
+
+                    let permit = match state
+                        .concurrency
+                        .task_queue
+                        .acquire(&project_id, task.priority)
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let reason = format!(
+                                "startup recovery: failed to acquire concurrency permit: {e}"
+                            );
+                            tracing::error!(task_id = ?task.id, "{reason}");
+                            if let Err(pe) = task_runner::mutate_and_persist(
+                                &state.core.tasks,
+                                &task.id,
+                                move |s| {
+                                    s.status = task_runner::TaskStatus::Failed;
+                                    s.error = Some(reason);
+                                },
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    "startup recovery: failed to persist failed status: {pe}"
+                                );
+                            }
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
+                            return;
+                        }
+                    };
+
+                    // issue_num is always Some here — the None branch returned above.
+                    let issue = issue_num.expect("checked above");
+                    let mut req = task_runner::CreateTaskRequest {
+                        issue: Some(issue),
+                        project: Some(canonical),
+                        repo: task.repo.clone(),
+                        source: task.source.clone(),
+                        external_id: task.external_id.clone(),
+                        priority: task.priority,
+                        ..Default::default()
+                    };
+                    // Restore persisted execution limits and any additional prompt
+                    // context so the recovered task resumes with the same settings
+                    // and caller-supplied context as originally requested.
+                    if let Some(ref settings) = task.request_settings {
+                        settings.apply_to_req(&mut req);
+                    }
+
+                    // Use the three-tier select_agent() so that an explicit agent
+                    // pin stored in request_settings (Tier 1) and project-level
+                    // defaults (Tier 2a) are honoured, not bypassed by a raw
+                    // complexity dispatch.
+                    let agent = match task_routes::select_agent(
+                        &req,
+                        &state.core.server.agent_registry,
+                        None,
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            let reason = format!("startup recovery: failed to select agent: {e}");
+                            tracing::error!(task_id = ?task.id, "{reason}");
+                            if let Err(pe) = task_runner::mutate_and_persist(
+                                &state.core.tasks,
+                                &task.id,
+                                move |s| {
+                                    s.status = task_runner::TaskStatus::Failed;
+                                    s.error = Some(reason);
+                                },
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    "startup recovery: failed to persist failed status: {pe}"
+                                );
+                            }
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
                             return;
                         }
                     };

@@ -114,7 +114,7 @@ async fn check_pr_duplicate(
 ///
 /// Calling this helper from both enqueue paths ensures the three tiers are
 /// enforced identically and cannot drift apart.
-fn select_agent(
+pub(crate) fn select_agent(
     req: &task_runner::CreateTaskRequest,
     registry: &harness_agents::registry::AgentRegistry,
     registry_agent: Option<&str>,
