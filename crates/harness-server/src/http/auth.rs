@@ -33,9 +33,13 @@ pub(crate) fn resolve_api_token(
 /// Exempts `/health`, `/webhook`, `/webhook/feishu`, `/signals`, `/favicon.ico`,
 /// `/auth/reset-password`, `/` (dashboard HTML), and `/ws` (WebSocket upgrade).
 /// The dashboard HTML no longer embeds the token, so it is safe to serve without
-/// auth. `/ws` is exempt here because its access control is enforced inside
-/// `ws_handler` itself: browser clients are validated via Origin header (CSWH
-/// prevention), and non-browser clients must present a valid Bearer token.
+/// auth. `/ws` is exempt from *this middleware* because the WebSocket upgrade
+/// cannot carry a body and must be handled before axum reads headers twice;
+/// however `ws_handler` performs its own two-layer access control: (1) Origin
+/// header validation to prevent CSWH, and (2) Bearer token verification for
+/// **all** clients (including those that present a localhost Origin) when a token
+/// is configured.  Origin alone is not trusted for auth because it can be forged
+/// by non-browser tools.
 /// All other endpoints require an `Authorization: Bearer <token>` header when
 /// `api_token` is configured. When no token is configured the middleware is a
 /// no-op (backward compat).
