@@ -2,36 +2,57 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// Derive a deterministic, Postgres-safe schema name from an arbitrary path.
+/// Normalize path components without filesystem access.
+///
+/// Resolves `.` (current-dir) and `..` (parent-dir) components so that
+/// logically equivalent paths (`/a/./b`, `/a/c/../b`) produce the same
+/// string before hashing.
+fn normalize_path_components(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component<'_>> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.last(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out.iter().collect()
+}
+
+/// FNV-1a 64-bit hash — deterministic, no randomization, no extra dependencies.
+fn fnv1a_64(data: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut hash = OFFSET_BASIS;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Derive a deterministic, collision-resistant, Postgres-safe schema name from a path.
 ///
 /// Each unique path (e.g. per-store data directory or per-test tempdir) gets
 /// its own schema, providing namespace isolation between stores and between
 /// test runs without requiring separate databases.
 ///
-/// The algorithm: sanitize the path to lowercase ASCII alphanumerics/underscores,
-/// keep up to the last 60 characters (the unique suffix), then prepend `"hs_"`.
-/// This is deterministic across process restarts and requires no extra dependencies.
+/// The algorithm: normalize `.`/`..` components (no I/O), hash with FNV-1a
+/// 64-bit, format as `hs_<16-hex-digits>`.  Distinct paths map to distinct
+/// schemas with overwhelming probability (2⁻⁶⁴ per pair); logically
+/// equivalent paths always map to the same schema.
 fn path_to_schema(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    let sanitized: String = s
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    // Take the tail so that the unique part of a long path is preserved.
-    let tail = if sanitized.len() > 60 {
-        &sanitized[sanitized.len() - 60..]
-    } else {
-        sanitized.as_str()
-    };
-    format!("hs_{tail}")
+    let normalized = normalize_path_components(path);
+    let s = normalized.to_string_lossy();
+    let hash = fnv1a_64(s.as_bytes());
+    format!("hs_{hash:016x}")
 }
 
 /// Create a PostgreSQL connection pool scoped to a per-path schema.

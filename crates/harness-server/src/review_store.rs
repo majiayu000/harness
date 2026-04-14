@@ -88,7 +88,7 @@ impl ReviewStore {
         // Uses information_schema (PostgreSQL-compatible).
         let columns: Vec<(String,)> = sqlx::query_as(
             "SELECT column_name FROM information_schema.columns \
-             WHERE table_name = 'review_findings'",
+             WHERE table_schema = current_schema() AND table_name = 'review_findings'",
         )
         .fetch_all(&pool)
         .await?;
