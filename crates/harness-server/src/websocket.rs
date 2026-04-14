@@ -9,16 +9,17 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use harness_protocol::{codec, methods::RpcResponse};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::sync::broadcast::error::RecvError;
 
 /// Returns true if the origin is a localhost origin (safe for local dev tools).
 ///
 /// Parses the host from the origin to prevent bypass via domains like
 /// `http://localhost.evil.com`.
+///
+/// `"null"` is intentionally NOT treated as local: browsers send `Origin: null`
+/// for `file:` URLs and sandboxed iframes, which are untrusted contexts.
 fn is_local_origin(origin: &str) -> bool {
-    if origin == "null" {
-        return true;
-    }
     // Origin format: scheme://host or scheme://host:port
     // Extract the host by stripping scheme and optional port.
     let host = origin
@@ -59,13 +60,23 @@ fn validate_origin_header(headers: &HeaderMap) -> Result<(), OriginValidationErr
 
 /// Axum handler that upgrades the HTTP connection to WebSocket.
 ///
-/// Validates the Origin header to prevent Cross-Site WebSocket Hijacking (CSWH).
-/// CLI clients that omit the Origin header are always allowed.
+/// Two-layer access control:
+/// 1. Origin check (CSWH prevention): when an Origin header is present it must
+///    identify a localhost origin.  This blocks Cross-Site WebSocket Hijacking
+///    from remote websites.
+/// 2. Bearer token auth: when an API token is configured, **every** client must
+///    present a valid `Authorization: Bearer <token>` header, regardless of
+///    whether an Origin header is present.  Checking Origin alone is insufficient
+///    because non-browser clients can forge `Origin: http://localhost` while
+///    omitting the secret token.  Browsers that need to connect to this endpoint
+///    should obtain and forward the token via an alternative mechanism (e.g. a
+///    pre-flight REST call that returns a short-lived credential).
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Response {
+    // Layer 1: CSWH prevention via Origin check.
     if let Err(err) = validate_origin_header(&headers) {
         match err {
             OriginValidationError::InvalidUtf8 => {
@@ -80,6 +91,23 @@ pub async fn ws_handler(
         }
         return StatusCode::FORBIDDEN.into_response();
     }
+
+    // Layer 2: Bearer token auth for all clients when a token is configured.
+    // Origin headers can be forged by non-browser tools, so they do not exempt
+    // a client from token authentication.
+    if let Some(expected) = crate::http::auth::resolve_api_token(&state.core.server.config.server) {
+        let authorized = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(|tok| tok.as_bytes().ct_eq(expected.as_bytes()).into())
+            .unwrap_or(false);
+        if !authorized {
+            tracing::warn!("WebSocket connection rejected: missing or invalid Bearer token");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -382,7 +410,6 @@ mod tests {
         assert!(is_local_origin("https://localhost:9800"));
         assert!(is_local_origin("http://127.0.0.1"));
         assert!(is_local_origin("http://127.0.0.1:8080"));
-        assert!(is_local_origin("null"));
     }
 
     #[test]
@@ -391,6 +418,9 @@ mod tests {
         assert!(!is_local_origin("http://localhost.evil.com"));
         assert!(!is_local_origin("http://192.168.1.1"));
         assert!(!is_local_origin("http://0.0.0.0"));
+        // "null" is sent by browsers for file: URLs and sandboxed iframes —
+        // these are untrusted contexts and must NOT be treated as local.
+        assert!(!is_local_origin("null"));
     }
 
     #[test]

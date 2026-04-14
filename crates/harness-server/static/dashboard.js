@@ -22,8 +22,49 @@ let historyFilter = "all";
 function $(sel) { return document.querySelector(sel); }
 
 function authHeaders() {
-  const tok = window.__HARNESS_TOKEN__;
+  const tok = sessionStorage.getItem("harness_token");
   return tok ? { "Authorization": "Bearer " + tok } : {};
+}
+
+function promptToken() {
+  const existing = document.getElementById("token-overlay");
+  if (existing) return;
+  const overlay = document.createElement("div");
+  overlay.id = "token-overlay";
+  overlay.style.cssText =
+    "position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;" +
+    "align-items:center;justify-content:center;z-index:9999";
+  overlay.innerHTML =
+    '<div style="background:#1e1e2e;padding:2rem;border-radius:.5rem;min-width:320px">' +
+    '<p style="margin:0 0 1rem;font-weight:600">Enter API token</p>' +
+    '<input id="token-input" type="password" placeholder="Bearer token" ' +
+    'style="width:100%;padding:.5rem;border-radius:.25rem;border:1px solid #444;' +
+    'background:#2a2a3d;color:#fff;box-sizing:border-box" />' +
+    '<div style="margin-top:1rem;display:flex;gap:.5rem;justify-content:flex-end">' +
+    '<button id="token-save" style="padding:.4rem .9rem;border-radius:.25rem;' +
+    'background:#7c6af7;color:#fff;border:none;cursor:pointer">Save</button>' +
+    '</div></div>';
+  document.body.appendChild(overlay);
+  const input = document.getElementById("token-input");
+  const saveBtn = document.getElementById("token-save");
+  input.focus();
+  function save() {
+    const val = input.value.trim();
+    if (!val) return;
+    sessionStorage.setItem("harness_token", val);
+    overlay.remove();
+    fetchTasks();
+    fetchIntake();
+    fetchDashboardSummary();
+  }
+  saveBtn.addEventListener("click", save);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
+}
+
+async function apiFetch(url, opts) {
+  const resp = await fetch(url, opts);
+  if (resp.status === 401) { promptToken(); return null; }
+  return resp;
 }
 
 function relativeTime(ts) {
@@ -41,8 +82,8 @@ function relativeTime(ts) {
 
 async function fetchTasks() {
   try {
-    const resp = await fetch("/tasks", { headers: authHeaders() });
-    if (!resp.ok) return;
+    const resp = await apiFetch("/tasks", { headers: authHeaders() });
+    if (!resp || !resp.ok) return;
     currentTasks = await resp.json();
     renderBoard(currentTasks);
     updateMetrics(currentTasks);
@@ -56,8 +97,8 @@ async function fetchTasks() {
 
 async function fetchIntake() {
   try {
-    const resp = await fetch("/api/intake", { headers: authHeaders() });
-    if (!resp.ok) return;
+    const resp = await apiFetch("/api/intake", { headers: authHeaders() });
+    if (!resp || !resp.ok) return;
     const data = await resp.json();
     renderIntakeChannels(data.channels || []);
   } catch {}
@@ -65,8 +106,8 @@ async function fetchIntake() {
 
 async function fetchDashboardSummary() {
   try {
-    const resp = await fetch("/api/dashboard", { headers: authHeaders() });
-    if (!resp.ok) return;
+    const resp = await apiFetch("/api/dashboard", { headers: authHeaders() });
+    if (!resp || !resp.ok) return;
     const data = await resp.json();
     renderRuntimeHosts(data.runtime_hosts || []);
   } catch {}
@@ -459,10 +500,7 @@ function initTabs() {
 
 function connectWebSocket() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const tok = window.__HARNESS_TOKEN__;
-  const url = tok
-    ? `${proto}//${location.host}/ws?token=${encodeURIComponent(tok)}`
-    : `${proto}//${location.host}/ws`;
+  const url = `${proto}//${location.host}/ws`;
   try { ws = new WebSocket(url); } catch { return; }
   ws.onopen = () => { fetchTasks(); fetchIntake(); };
   ws.onmessage = (event) => {
@@ -506,11 +544,12 @@ function initForm() {
     btn.textContent = "Submitting\u2026";
     const prompt = `${title}\n\n${description}`;
     try {
-      const resp = await fetch("/tasks", {
+      const resp = await apiFetch("/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ prompt }),
       });
+      if (!resp) return; // 401 handled by promptToken()
       if (!resp.ok) {
         const text = await resp.text();
         throw new Error(`${resp.status}: ${text}`);
@@ -565,7 +604,8 @@ function fmtTokens(n) { return n.toLocaleString(); }
 
 async function fetchTokenUsage() {
   try {
-    const resp = await fetch("/api/token-usage", { headers: authHeaders() });
+    const resp = await apiFetch("/api/token-usage", { headers: authHeaders() });
+    if (!resp) return; // 401 handled by promptToken()
     if (!resp.ok) {
       let message = `HTTP ${resp.status}`;
       try {
