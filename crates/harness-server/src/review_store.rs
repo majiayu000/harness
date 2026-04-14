@@ -81,9 +81,18 @@ static REVIEW_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         description: "add claimed_at column and backfill stuck pending rows",
-        sql: "ALTER TABLE review_findings ADD COLUMN claimed_at TEXT;
+        // ADD COLUMN task_id is a no-op (silently ignored by the migrator) when
+        // the column already exists; it ensures legacy tables that predate the
+        // migration system also have task_id before the backfill UPDATE uses it.
+        // claimed_at is set to a fixed RFC3339 epoch so the string comparison in
+        // recover_stale_pending_claims (claimed_at < cutoff_rfc3339) works correctly
+        // — CURRENT_TIMESTAMP produces "YYYY-MM-DD HH:MM:SS" (space separator) which
+        // sorts before any "YYYY-MM-DDTHH:MM:SSZ" (T separator) cutoff string,
+        // causing freshly backfilled rows to appear stale immediately.
+        sql: "ALTER TABLE review_findings ADD COLUMN task_id TEXT;
+              ALTER TABLE review_findings ADD COLUMN claimed_at TEXT;
               UPDATE review_findings
-              SET claimed_at = CURRENT_TIMESTAMP
+              SET claimed_at = '2000-01-01T00:00:00Z'
               WHERE task_id = 'pending' AND claimed_at IS NULL",
     },
     Migration {
