@@ -94,9 +94,24 @@ static REVIEW_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 4,
         description: "deduplicate findings and add unique index",
+        // ORDER BY preserves whichever duplicate owns a spawned task:
+        //   0 = real_task_id set (task enqueued — highest priority to keep)
+        //   1 = task_id set but no real_task_id (claim in-flight)
+        //   2 = unclaimed row
+        // Within the same ownership tier, prefer the newest created_at.
+        // Without this ordering a plain "ORDER BY created_at DESC" could delete
+        // the older row that already owns a spawned task and keep a newer
+        // unclaimed duplicate, causing the scheduler to re-spawn the fix task.
         sql: "WITH ranked AS (
             SELECT review_id, id,
-                   ROW_NUMBER() OVER (PARTITION BY rule_id, file, status ORDER BY created_at DESC) AS rn
+                   ROW_NUMBER() OVER (
+                       PARTITION BY rule_id, file, status
+                       ORDER BY
+                           CASE WHEN real_task_id IS NOT NULL THEN 0
+                                WHEN task_id IS NOT NULL THEN 1
+                                ELSE 2 END ASC,
+                           created_at DESC
+                   ) AS rn
             FROM review_findings
         )
         DELETE FROM review_findings
@@ -258,12 +273,19 @@ impl ReviewStore {
     ///
     /// Returns `true` if this caller won the claim, `false` if already claimed.
     pub async fn try_claim_finding(&self, rule_id: &str, file: &str) -> anyhow::Result<bool> {
+        // Use Rust-computed RFC3339 timestamp so claimed_at format matches the
+        // RFC3339 cutoff used in recover_stale_pending_claims.  SQL
+        // CURRENT_TIMESTAMP produces "YYYY-MM-DD HH:MM:SS" (space separator)
+        // which sorts lexicographically before "YYYY-MM-DDTHH:MM:SSZ" (T
+        // separator), causing every same-day claim to appear stale immediately.
+        let now = Utc::now().to_rfc3339();
         let sql = rewrite_placeholders(
-            "UPDATE review_findings SET task_id = 'pending', claimed_at = CURRENT_TIMESTAMP \
+            "UPDATE review_findings SET task_id = 'pending', claimed_at = ? \
              WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id IS NULL",
             self.dialect,
         );
         let result = sqlx::query(&sql)
+            .bind(&now)
             .bind(rule_id)
             .bind(file)
             .execute(&self.pool)

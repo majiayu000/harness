@@ -594,6 +594,24 @@ impl<'a> Migrator<'a> {
         }
     }
 
+    /// Override the SQL dialect used when recording applied versions in
+    /// `schema_migrations`.  Required when the pool was created via
+    /// [`open_pool_url`] with a non-SQLite DSN (e.g. `postgres://…`); the
+    /// default dialect is `Sqlite` for backwards compatibility.
+    ///
+    /// ```no_run
+    /// # async fn example(pool: &sqlx::AnyPool) -> anyhow::Result<()> {
+    /// use harness_core::db::{Dialect, Migration, Migrator};
+    /// Migrator::new(pool, &[])
+    ///     .with_dialect(Dialect::Postgres)
+    ///     .run()
+    ///     .await
+    /// # }
+    /// ```
+    pub fn with_dialect(self, dialect: Dialect) -> Self {
+        Self { dialect, ..self }
+    }
+
     pub async fn run(&self) -> anyhow::Result<()> {
         // Create the migrations tracking table if it doesn't exist yet.
         sqlx::query(
