@@ -2,7 +2,7 @@ name: Close Stale PRs
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # Daily at 6:00 UTC
+    - cron: '0 0 * * *'  # Daily at midnight UTC
   workflow_dispatch:
 
 permissions:
@@ -15,17 +15,17 @@ jobs:
     steps:
       - uses: actions/stale@v9
         with:
-          days-before-stale: 7
-          days-before-close: 7
+          days-before-stale: 10
+          days-before-close: 4
           stale-pr-message: >
-            This PR has been inactive for 7 days and is marked as stale.
-            It will be closed in 7 days if no further activity occurs.
-            Re-open or push new commits to keep it active.
+            This PR has been inactive for 10 days and is marked as stale.
+            It will be closed in 4 days (14 days total inactivity) if no further activity occurs.
+            Push new commits, leave a comment, or add the `keep-open` label to prevent closure.
           close-pr-message: >
             Closed due to 14 days of inactivity.
-            Feel free to re-open if this is still needed.
+            Feel free to re-open if this work is still needed.
           stale-pr-label: 'stale'
-          exempt-pr-labels: 'pinned,wip,do-not-close'
+          exempt-pr-labels: 'keep-open'
           # Don't touch issues
           days-before-issue-stale: -1
           days-before-issue-close: -1
