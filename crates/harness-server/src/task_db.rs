@@ -16,7 +16,7 @@ const ARTIFACT_MAX_BYTES: usize = 65_536;
 /// When adding a field to `TaskRow`, add the column here once and all queries
 /// pick it up automatically.  The `task_row_columns_match_struct` test below
 /// will fail if this list drifts from the struct definition.
-const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description";
+const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description, request_settings";
 
 /// Versioned migrations for the tasks table.
 ///
@@ -126,6 +126,11 @@ static TASK_MIGRATIONS: &[Migration] = &[
         sql: "CREATE INDEX IF NOT EXISTS idx_tasks_status_updated \
               ON tasks(status, updated_at DESC)",
     },
+    Migration {
+        version: 16,
+        description: "add request_settings column for execution limit recovery",
+        sql: "ALTER TABLE tasks ADD COLUMN request_settings TEXT",
+    },
 ];
 
 /// A single persisted artifact captured from agent output during task execution.
@@ -200,9 +205,13 @@ impl TaskDb {
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let status = state.status.as_ref();
         let phase_json = serde_json::to_string(&state.phase)?;
+        let settings_json = state
+            .request_settings
+            .as_ref()
+            .and_then(|s| serde_json::to_string(s).ok());
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description, request_settings)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -220,6 +229,7 @@ impl TaskDb {
         .bind(state.priority as i64)
         .bind(&phase_json)
         .bind(state.description.as_deref())
+        .bind(settings_json.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -230,10 +240,15 @@ impl TaskDb {
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let phase_json = serde_json::to_string(&state.phase)?;
         let status = state.status.as_ref();
+        let settings_json = state
+            .request_settings
+            .as_ref()
+            .and_then(|s| serde_json::to_string(s).ok());
         sqlx::query(
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
                     source = ?, external_id = ?, repo = ?, depends_on = ?, project = ?,
-                    priority = ?, phase = ?, description = ?, updated_at = datetime('now')
+                    priority = ?, phase = ?, description = ?, request_settings = ?,
+                    updated_at = datetime('now')
              WHERE id = ?",
         )
         .bind(status)
@@ -254,6 +269,7 @@ impl TaskDb {
         .bind(state.priority as i64)
         .bind(&phase_json)
         .bind(state.description.as_deref())
+        .bind(settings_json.as_deref())
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -895,7 +911,7 @@ impl TaskDb {
         let rows = sqlx::query_as::<_, PendingCheckpointRow>(
             "SELECT t.id, t.status, t.turn, t.pr_url, t.rounds, t.error, t.source, \
                     t.external_id, t.parent_id, t.created_at, t.repo, t.depends_on, \
-                    t.project, t.priority, t.phase, t.description, \
+                    t.project, t.priority, t.phase, t.description, t.request_settings, \
                     c.triage_output, c.plan_output, c.pr_url AS ck_pr_url, \
                     c.last_phase, c.updated_at AS ck_updated_at \
              FROM tasks t \
@@ -927,6 +943,7 @@ impl TaskDb {
                 priority: row.priority,
                 phase: row.phase,
                 description: row.description,
+                request_settings: row.request_settings,
             };
             let task_state = match task_row.try_into_task_state() {
                 Ok(s) => s,
@@ -967,6 +984,7 @@ struct TaskRow {
     priority: i64,
     phase: String,
     description: Option<String>,
+    request_settings: Option<String>,
 }
 
 /// Combined row for the pending-tasks-with-checkpoint JOIN query.
@@ -992,6 +1010,7 @@ struct PendingCheckpointRow {
     priority: i64,
     phase: String,
     description: Option<String>,
+    request_settings: Option<String>,
     // Checkpoint columns (aliased)
     triage_output: Option<String>,
     plan_output: Option<String>,
@@ -1019,7 +1038,13 @@ impl TaskRow {
             priority,
             phase,
             description,
+            request_settings,
         } = self;
+
+        let decoded_request_settings: Option<crate::task_runner::PersistedRequestSettings> =
+            request_settings
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
             TaskDbDecodeError::RoundsDeserialize {
@@ -1062,6 +1087,7 @@ impl TaskRow {
             triage_output: None,
             plan_output: None,
             repo,
+            request_settings: decoded_request_settings,
         })
     }
 }
@@ -1145,6 +1171,7 @@ mod tests {
             priority: 0,
             phase: r#""implement""#.to_string(),
             description: None,
+            request_settings: None,
         }
     }
 
@@ -1253,6 +1280,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             repo: None,
+            request_settings: None,
         }
     }
 
@@ -1896,13 +1924,14 @@ mod tests {
             priority: 0,
             phase: String::new(),
             description: None,
+            request_settings: None,
         };
 
         // Count must match — catches column added to constant but not struct (or vice versa).
         assert_eq!(
             columns.len(),
-            16, // bump this when adding a field
-            "TASK_ROW_COLUMNS has {} entries but expected 16 — update both the constant and this test",
+            17, // bump this when adding a field
+            "TASK_ROW_COLUMNS has {} entries but expected 17 — update both the constant and this test",
             columns.len()
         );
     }

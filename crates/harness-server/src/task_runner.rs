@@ -197,6 +197,11 @@ pub struct TaskState {
     /// Output from the Plan phase (Architect plan). Not persisted to DB.
     #[serde(skip)]
     pub plan_output: Option<String>,
+    /// Caller-specified execution limits. Persisted to the DB so that recovered
+    /// tasks resume with the same budget / timeout guardrails as originally
+    /// requested rather than silently falling back to server defaults.
+    #[serde(skip)]
+    pub request_settings: Option<PersistedRequestSettings>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -260,6 +265,7 @@ impl TaskState {
             triage_output: None,
             plan_output: None,
             repo: None,
+            request_settings: None,
         }
     }
 
@@ -351,6 +357,56 @@ pub struct CreateTaskRequest {
     /// Higher values are served first when multiple tasks are waiting for a slot.
     #[serde(default)]
     pub priority: u8,
+}
+
+/// Execution limits that survive a server restart.
+///
+/// Serialised as a JSON blob in `tasks.request_settings`. Restored at startup
+/// redispatch so recovered tasks honour the original budget / timeout
+/// guardrails instead of silently falling back to server-wide defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PersistedRequestSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_budget_usd: Option<f64>,
+    pub wait_secs: u64,
+    pub retry_base_backoff_ms: u64,
+    pub retry_max_backoff_ms: u64,
+    pub stall_timeout_secs: u64,
+    pub turn_timeout_secs: u64,
+}
+
+impl PersistedRequestSettings {
+    pub(crate) fn from_req(req: &CreateTaskRequest) -> Self {
+        Self {
+            agent: req.agent.clone(),
+            max_rounds: req.max_rounds,
+            max_turns: req.max_turns,
+            max_budget_usd: req.max_budget_usd,
+            wait_secs: req.wait_secs,
+            retry_base_backoff_ms: req.retry_base_backoff_ms,
+            retry_max_backoff_ms: req.retry_max_backoff_ms,
+            stall_timeout_secs: req.stall_timeout_secs,
+            turn_timeout_secs: req.turn_timeout_secs,
+        }
+    }
+
+    pub(crate) fn apply_to_req(&self, req: &mut CreateTaskRequest) {
+        req.agent = self.agent.clone();
+        req.max_rounds = self.max_rounds;
+        req.max_turns = self.max_turns;
+        req.max_budget_usd = self.max_budget_usd;
+        req.wait_secs = self.wait_secs;
+        req.retry_base_backoff_ms = self.retry_base_backoff_ms;
+        req.retry_max_backoff_ms = self.retry_max_backoff_ms;
+        req.stall_timeout_secs = self.stall_timeout_secs;
+        req.turn_timeout_secs = self.turn_timeout_secs;
+    }
 }
 
 impl Default for CreateTaskRequest {
@@ -1580,6 +1636,7 @@ pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskReques
     state.priority = req.priority;
     state.issue = req.issue;
     state.description = summarize_request_description(req);
+    state.request_settings = Some(PersistedRequestSettings::from_req(req));
     store.insert(&state).await;
     // Register stream channel now so SSE clients can subscribe before execution begins.
     store.register_task_stream(&task_id);

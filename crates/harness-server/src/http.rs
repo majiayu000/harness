@@ -802,7 +802,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         }
                     };
 
-                    let req = task_runner::CreateTaskRequest {
+                    let mut req = task_runner::CreateTaskRequest {
                         pr: Some(pr_num),
                         project: Some(canonical),
                         repo: task.repo.clone(),
@@ -810,6 +810,11 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         external_id: task.external_id.clone(),
                         ..Default::default()
                     };
+                    // Restore persisted execution limits so the recovered task resumes
+                    // with the same budget / timeout guardrails as originally requested.
+                    if let Some(ref settings) = task.request_settings {
+                        settings.apply_to_req(&mut req);
+                    }
                     let classification = crate::complexity_router::classify("", None, Some(pr_num));
                     let agent = match state.core.server.agent_registry.dispatch(&classification) {
                         Ok(a) => a,
@@ -882,11 +887,29 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         .and_then(|s| s.split_whitespace().next())
                         .and_then(|s| s.parse::<u64>().ok());
 
-                    if issue_num.is_none() && task.description.is_none() {
-                        tracing::warn!(
-                            task_id = ?task.id,
-                            "startup recovery: checkpoint task has no issue or description — skipping"
-                        );
+                    if issue_num.is_none() {
+                        // Prompt tasks store the placeholder "prompt task" in description
+                        // by design — the original prompt text is never persisted for
+                        // privacy.  Re-dispatching with that placeholder would execute
+                        // against the wrong prompt, so mark the task failed instead to
+                        // prevent the same broken recovery on every subsequent restart.
+                        let reason = if task.description.as_deref() == Some("prompt task") {
+                            "prompt task cannot be recovered after restart: \
+                             original prompt text is not persisted"
+                        } else {
+                            "checkpoint task has no parseable issue number — skipping"
+                        };
+                        tracing::warn!(task_id = ?task.id, "{reason}");
+                        let mut failed = task.clone();
+                        failed.status = task_runner::TaskStatus::Failed;
+                        failed.error = Some(reason.to_string());
+                        state.core.tasks.cache.insert(failed.id.clone(), failed);
+                        if let Err(e) = state.core.tasks.persist(&task.id).await {
+                            tracing::warn!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to persist failed status: {e}"
+                            );
+                        }
                         return;
                     }
 
@@ -942,27 +965,22 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         }
                     };
 
-                    let req = if let Some(issue) = issue_num {
-                        task_runner::CreateTaskRequest {
-                            issue: Some(issue),
-                            project: Some(canonical),
-                            repo: task.repo.clone(),
-                            source: task.source.clone(),
-                            external_id: task.external_id.clone(),
-                            priority: task.priority,
-                            ..Default::default()
-                        }
-                    } else {
-                        task_runner::CreateTaskRequest {
-                            prompt: task.description.clone(),
-                            project: Some(canonical),
-                            repo: task.repo.clone(),
-                            source: task.source.clone(),
-                            external_id: task.external_id.clone(),
-                            priority: task.priority,
-                            ..Default::default()
-                        }
+                    // issue_num is always Some here — the None branch returned above.
+                    let issue = issue_num.expect("checked above");
+                    let mut req = task_runner::CreateTaskRequest {
+                        issue: Some(issue),
+                        project: Some(canonical),
+                        repo: task.repo.clone(),
+                        source: task.source.clone(),
+                        external_id: task.external_id.clone(),
+                        priority: task.priority,
+                        ..Default::default()
                     };
+                    // Restore persisted execution limits so the recovered task resumes
+                    // with the same budget / timeout guardrails as originally requested.
+                    if let Some(ref settings) = task.request_settings {
+                        settings.apply_to_req(&mut req);
+                    }
 
                     let classification = crate::complexity_router::classify(
                         req.prompt.as_deref().unwrap_or(""),
