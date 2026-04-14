@@ -52,7 +52,7 @@ jobs:
               state: 'open',
               sort: 'updated',
               direction: 'desc',
-              per_page: 50,
+              per_page: 100,
             });
 
             const existing = issues
@@ -150,7 +150,7 @@ jobs:
             VALID_NUMBERS=$(echo "$EXISTING_JSON" | jq -c '[.[].number]')
             FILTERED=$(echo "$CONTENT" | jq -c \
               --argjson valid "$VALID_NUMBERS" \
-              '.duplicates |= map(select(.number as $n | ($valid | index($n)) != null))')
+              '.duplicates |= map(select(type == "object" and (.number as $n | ($valid | index($n)) != null)))')
             {
               echo "duplicates_json<<GHEOF"
               echo "$FILTERED"
