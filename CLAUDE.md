@@ -38,6 +38,7 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 - If Gemini leaves review comments, address valid feedback before merge
 - If no comments or only false positives, proceed with merge
 - **Squash-merge only** — enforced via GitHub ruleset (squash is the only allowed merge method; no bypass for anyone)
+- **Required CI** — the `CI Result` status check must pass before merging (enforced via ruleset)
 - **Do NOT modify `Cargo.toml` version in feature/fix PRs** — version bumps happen only at release time (prevents merge conflicts across parallel PRs)
 - CI uses path-based change detection — only affected crate tests run on PRs
 
