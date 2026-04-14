@@ -23,7 +23,7 @@
 //! - `unknown_closed`→ 0.2 (terminal state but outcome unclear)
 
 use harness_core::db::{open_pool, Migration, Migrator};
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 use std::path::Path;
 
 /// Default learning rate for Q-value updates.
@@ -71,7 +71,7 @@ static Q_VALUE_MIGRATIONS: &[Migration] = &[
 
 /// Persistent store for pipeline events and rule Q-values.
 pub struct QValueStore {
-    pool: SqlitePool,
+    pool: AnyPool,
 }
 
 impl QValueStore {

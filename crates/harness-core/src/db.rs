@@ -1,10 +1,13 @@
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use sqlx::{pool::PoolConnection, Sqlite};
+use sqlx::any::AnyPoolOptions;
+use sqlx::pool::PoolConnection;
+use sqlx::{Any, AnyPool};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::OnceLock;
+
+static DRIVERS_INSTALLED: OnceLock<()> = OnceLock::new();
 
 static SQLITE_TRANSACTIONAL_PREFIXES: OnceLock<Vec<&'static str>> = OnceLock::new();
 
@@ -41,23 +44,92 @@ fn normalized_sqlite_statement_prefix(statement: &str) -> String {
         .to_ascii_uppercase()
 }
 
-/// Create a SQLite connection pool for the given path.
+/// Supported database dialects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
+impl Dialect {
+    /// Detect dialect from a connection URL prefix.
+    pub fn from_url(url: &str) -> Self {
+        if url.starts_with("postgres") {
+            Self::Postgres
+        } else {
+            Self::Sqlite
+        }
+    }
+}
+
+/// Rewrite `?` positional placeholders to `$1`, `$2`, … for Postgres.
+///
+/// SQLite SQL is returned unchanged. Single-quoted string literals are skipped
+/// so that a literal `?` inside a string value is not replaced.
+pub fn rewrite_placeholders(sql: &str, dialect: Dialect) -> String {
+    if dialect == Dialect::Sqlite {
+        return sql.to_string();
+    }
+    let mut result = String::with_capacity(sql.len() + 16);
+    let mut counter = 0usize;
+    let mut chars = sql.chars().peekable();
+    let mut in_single_quote = false;
+    while let Some(ch) = chars.next() {
+        if in_single_quote {
+            result.push(ch);
+            if ch == '\'' {
+                match chars.peek() {
+                    Some('\'') => {
+                        // Escaped single quote inside string literal.
+                        result.push(chars.next().unwrap_or_default());
+                    }
+                    _ => in_single_quote = false,
+                }
+            }
+        } else if ch == '\'' {
+            result.push(ch);
+            in_single_quote = true;
+        } else if ch == '?' {
+            counter += 1;
+            result.push('$');
+            result.push_str(&counter.to_string());
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// Create a connection pool for the given SQLite file path.
 ///
 /// All stores share this configuration: 8 max connections, 10 s acquire
 /// timeout, WAL journal mode, and 5 s busy timeout.
-pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {
+///
+/// To connect to Postgres or use an explicit URL, call [`open_pool_url`].
+pub async fn open_pool(path: &Path) -> anyhow::Result<AnyPool> {
     let url = format!("sqlite:{}?mode=rwc", path.display());
-    let pool = SqlitePoolOptions::new()
+    open_pool_url(&url).await
+}
+
+/// Create a connection pool from an explicit DSN (`sqlite:…` or `postgres://…`).
+///
+/// SQLite connections receive WAL mode and busy_timeout PRAGMAs automatically.
+pub async fn open_pool_url(url: &str) -> anyhow::Result<AnyPool> {
+    DRIVERS_INSTALLED.get_or_init(sqlx::any::install_default_drivers);
+    let dialect = Dialect::from_url(url);
+    let pool = AnyPoolOptions::new()
         .max_connections(8)
         .acquire_timeout(std::time::Duration::from_secs(10))
-        .connect(&url)
+        .connect(url)
         .await?;
-    sqlx::query("PRAGMA journal_mode=WAL")
-        .execute(&pool)
-        .await?;
-    sqlx::query("PRAGMA busy_timeout=5000")
-        .execute(&pool)
-        .await?;
+    if dialect == Dialect::Sqlite {
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA busy_timeout=5000")
+            .execute(&pool)
+            .await?;
+    }
     Ok(pool)
 }
 
@@ -71,7 +143,7 @@ pub trait DbEntity: Serialize + for<'de> Deserialize<'de> + Send + Unpin + 'stat
     fn create_table_sql() -> &'static str;
 }
 
-/// Generic SQLite store that persists entities as JSON blobs.
+/// Generic store that persists entities as JSON blobs.
 ///
 /// Schema:
 /// ```sql
@@ -87,7 +159,7 @@ pub trait DbEntity: Serialize + for<'de> Deserialize<'de> + Send + Unpin + 'stat
 /// For entities requiring SQL-level filtering (e.g. `WHERE status = ?`),
 /// keep a specialised store and call [`open_pool`] for pool creation.
 pub struct Db<T: DbEntity> {
-    pub(crate) pool: SqlitePool,
+    pub(crate) pool: AnyPool,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -157,12 +229,12 @@ impl<T: DbEntity> Db<T> {
 
     /// Expose the underlying pool for stores that need custom queries
     /// beyond the generic CRUD operations (e.g. `json_extract` filters).
-    pub fn pool(&self) -> &SqlitePool {
+    pub fn pool(&self) -> &AnyPool {
         &self.pool
     }
 }
 
-/// Trait for types that can be serialized to/from a SQLite status column.
+/// Trait for types that can be serialized to/from a database status column.
 ///
 /// Implementing this trait once per status type is sufficient — the blanket
 /// `AsRef<str>` and `FromStr` impls are provided by callers that delegate to
@@ -192,9 +264,10 @@ pub struct Migration {
 ///
 /// For `ALTER TABLE ADD COLUMN` statements on pre-existing databases,
 /// "duplicate column name" errors are silently ignored so that migrating
-/// databases that predate the migration system is idempotent.
+/// databases that predate the migration system is idempotent. For Postgres,
+/// the equivalent "already exists" error is also silently ignored.
 pub struct Migrator<'a> {
-    pool: &'a SqlitePool,
+    pool: &'a AnyPool,
     migrations: &'a [Migration],
 }
 
@@ -365,7 +438,7 @@ fn migration_statements(sql: &str) -> Vec<MigrationStatement<'_>> {
 }
 
 async fn apply_statements_on_connection(
-    conn: &mut PoolConnection<Sqlite>,
+    conn: &mut PoolConnection<Any>,
     migration: &Migration,
     statements: &[MigrationStatement<'_>],
 ) -> anyhow::Result<()> {
@@ -390,7 +463,7 @@ async fn apply_statements_on_connection(
 }
 
 async fn apply_outside_transaction(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     migration: &Migration,
     statements: &[MigrationStatement<'_>],
 ) -> anyhow::Result<()> {
@@ -406,11 +479,13 @@ async fn apply_outside_transaction(
 }
 
 fn duplicate_add_column_error(statement: &str, error: &sqlx::Error) -> bool {
-    statement.to_ascii_uppercase().contains("ADD COLUMN")
-        && error
-            .to_string()
-            .to_ascii_lowercase()
-            .contains("duplicate column name")
+    if !statement.to_ascii_uppercase().contains("ADD COLUMN") {
+        return false;
+    }
+    let msg = error.to_string().to_ascii_lowercase();
+    // SQLite: "duplicate column name"
+    // Postgres: "column ... of relation ... already exists"
+    msg.contains("duplicate column name") || msg.contains("already exists")
 }
 
 fn sqlite_statement_is_transaction_safe(statement: &str) -> bool {
@@ -454,7 +529,7 @@ fn pending_migrations<'a>(
     pending
 }
 
-async fn apply_migration(pool: &SqlitePool, migration: &Migration) -> anyhow::Result<()> {
+async fn apply_migration(pool: &AnyPool, migration: &Migration) -> anyhow::Result<()> {
     let statements = migration_statements(migration.sql);
     let use_transaction = statements
         .iter()
@@ -487,7 +562,7 @@ fn applied_versions_set(rows: Vec<(i64,)>) -> HashSet<u32> {
 }
 
 impl<'a> Migrator<'a> {
-    pub fn new(pool: &'a SqlitePool, migrations: &'a [Migration]) -> Self {
+    pub fn new(pool: &'a AnyPool, migrations: &'a [Migration]) -> Self {
         Self { pool, migrations }
     }
 
@@ -668,7 +743,7 @@ mod tests {
         },
     ];
 
-    async fn applied_versions(pool: &SqlitePool) -> anyhow::Result<Vec<i64>> {
+    async fn applied_versions(pool: &AnyPool) -> anyhow::Result<Vec<i64>> {
         Ok(
             sqlx::query_as::<_, (i64,)>("SELECT version FROM schema_migrations ORDER BY version")
                 .fetch_all(pool)
@@ -679,7 +754,7 @@ mod tests {
         )
     }
 
-    async fn table_columns(pool: &SqlitePool, table: &str) -> anyhow::Result<Vec<String>> {
+    async fn table_columns(pool: &AnyPool, table: &str) -> anyhow::Result<Vec<String>> {
         let pragma = format!("PRAGMA table_info({table})");
         Ok(
             sqlx::query_as::<_, (i64, String, String, i64, Option<String>, i64)>(&pragma)
@@ -798,7 +873,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_error_reports_failed_statement_index() -> anyhow::Result<()> {
+    async fn failing_migration_with_syntax_error_reports_version() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let pool = open_pool(&dir.path().join("mig.db")).await?;
         let migrations = [
@@ -985,7 +1060,8 @@ mod tests {
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let url = format!("sqlite:{}?mode=rwc", dir.path().join("mig.db").display());
-        let pool = SqlitePoolOptions::new()
+        sqlx::any::install_default_drivers();
+        let pool = AnyPoolOptions::new()
             .min_connections(2)
             .max_connections(2)
             .acquire_timeout(std::time::Duration::from_secs(10))
@@ -1002,5 +1078,51 @@ mod tests {
         Migrator::new(&pool, &migrations).run().await?;
         assert_eq!(applied_versions(&pool).await?, vec![1]);
         Ok(())
+    }
+
+    // --- rewrite_placeholders tests ---
+
+    #[test]
+    fn rewrite_placeholders_noop_for_sqlite() {
+        let sql = "SELECT * FROM t WHERE id = ? AND name = ?";
+        assert_eq!(rewrite_placeholders(sql, Dialect::Sqlite), sql);
+    }
+
+    #[test]
+    fn rewrite_placeholders_rewrites_for_postgres() {
+        let sql = "SELECT * FROM t WHERE id = ? AND name = ?";
+        assert_eq!(
+            rewrite_placeholders(sql, Dialect::Postgres),
+            "SELECT * FROM t WHERE id = $1 AND name = $2"
+        );
+    }
+
+    #[test]
+    fn rewrite_placeholders_skips_string_literals() {
+        let sql = "INSERT INTO t (a, b) VALUES (?, 'literal?value')";
+        assert_eq!(
+            rewrite_placeholders(sql, Dialect::Postgres),
+            "INSERT INTO t (a, b) VALUES ($1, 'literal?value')"
+        );
+    }
+
+    #[test]
+    fn rewrite_placeholders_handles_escaped_quotes() {
+        let sql = "INSERT INTO t (a) VALUES ('it''s a ?') WHERE x = ?";
+        assert_eq!(
+            rewrite_placeholders(sql, Dialect::Postgres),
+            "INSERT INTO t (a) VALUES ('it''s a ?') WHERE x = $1"
+        );
+    }
+
+    #[test]
+    fn rewrite_placeholders_empty_sql() {
+        assert_eq!(rewrite_placeholders("", Dialect::Postgres), "");
+    }
+
+    #[test]
+    fn rewrite_placeholders_no_params() {
+        let sql = "SELECT 1";
+        assert_eq!(rewrite_placeholders(sql, Dialect::Postgres), "SELECT 1");
     }
 }

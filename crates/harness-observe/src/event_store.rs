@@ -5,7 +5,7 @@ use harness_core::types::{
     AutoFixReport, Decision, Event, EventFilters, EventId, ExternalSignal, ExternalSignalId, Grade,
     SessionId, Severity, Violation,
 };
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -43,7 +43,7 @@ static EVENT_MIGRATIONS: &[Migration] = &[
 /// `events.jsonl` file found in the data directory, then leaves it in place as
 /// an archive.
 pub struct EventStore {
-    pool: SqlitePool,
+    pool: AnyPool,
     data_dir: PathBuf,
     otel_pipeline: Mutex<Option<crate::otel_export::OtelPipeline>>,
     /// Number of seconds of inactivity before a new session is considered started.
@@ -360,7 +360,7 @@ impl EventStore {
         Ok(events)
     }
 
-    fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Event> {
+    fn row_to_event(row: &sqlx::any::AnyRow) -> anyhow::Result<Event> {
         use sqlx::Row;
         let id: String = row.try_get("id")?;
         let ts_str: String = row.try_get("ts")?;

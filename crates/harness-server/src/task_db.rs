@@ -3,7 +3,7 @@ use crate::task_runner::{TaskState, TaskStatus};
 use harness_core::db::{open_pool, Migration, Migrator};
 use harness_core::error::TaskDbDecodeError;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -180,7 +180,7 @@ struct RecoveryRow {
 }
 
 pub struct TaskDb {
-    pool: SqlitePool,
+    pool: AnyPool,
 }
 
 impl TaskDb {

@@ -1,7 +1,7 @@
 use anyhow::Context;
 use harness_core::db::{open_pool, Migration, Migrator};
 use harness_core::{types::Thread, types::ThreadId, types::ThreadStatus};
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 use std::path::Path;
 
 /// Versioned migrations for the threads table.
@@ -21,7 +21,7 @@ static THREAD_MIGRATIONS: &[Migration] = &[Migration {
 
 #[derive(Clone)]
 pub struct ThreadDb {
-    pool: SqlitePool,
+    pool: AnyPool,
 }
 
 impl ThreadDb {

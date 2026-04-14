@@ -1,5 +1,6 @@
+use harness_core::db::open_pool;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 use std::path::Path;
 
 type FindingRow = (
@@ -55,13 +56,12 @@ pub struct ReviewOutput {
 
 /// Persists review findings to SQLite.
 pub struct ReviewStore {
-    pool: SqlitePool,
+    pool: AnyPool,
 }
 
 impl ReviewStore {
     pub async fn open(db_path: &Path) -> anyhow::Result<Self> {
-        let url = format!("sqlite:{}?mode=rwc", db_path.display());
-        let pool = SqlitePool::connect(&url).await?;
+        let pool = open_pool(db_path).await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS review_findings (
                 id          TEXT NOT NULL,
