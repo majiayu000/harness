@@ -197,6 +197,15 @@ pub async fn run(
     }
     claude_agent = claude_agent.with_stream_timeout(serve_config.agents.stream_timeout_secs);
     agent_registry.register("claude", Arc::new(claude_agent));
+    agent_registry
+        .register_adapter(
+            "claude",
+            Arc::new(harness_agents::claude_adapter::ClaudeAdapter::new(
+                serve_config.agents.claude.cli_path.clone(),
+                serve_config.agents.claude.default_model.clone(),
+            )),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     agent_registry.register(
         "codex",
         Arc::new(
@@ -207,6 +216,14 @@ pub async fn run(
             .with_stream_timeout(serve_config.agents.stream_timeout_secs),
         ),
     );
+    agent_registry
+        .register_adapter(
+            "codex",
+            Arc::new(harness_agents::codex_adapter::CodexAdapter::new(
+                serve_config.agents.codex.cli_path.clone(),
+            )),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
         agent_registry.register(
             "anthropic-api",

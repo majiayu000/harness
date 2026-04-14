@@ -41,6 +41,10 @@ impl AgentRegistry {
 
     pub fn register(&mut self, name: impl Into<String>, agent: Arc<dyn CodeAgent>) {
         let name = name.into();
+        // Preserve any previously attached adapter so that hot-reload cannot
+        // accidentally clear the adapter by re-registering the agent under the
+        // same name (the old split-registry design had this property naturally).
+        let existing_adapter = self.entries.get(&name).and_then(|d| d.adapter.clone());
         if !self.entries.contains_key(&name) {
             self.registration_order.push(name.clone());
         }
@@ -48,7 +52,7 @@ impl AgentRegistry {
             name,
             AgentDescriptor {
                 agent,
-                adapter: None,
+                adapter: existing_adapter,
             },
         );
     }
@@ -399,6 +403,37 @@ mod tests {
             .dispatch(&classification(TaskComplexity::Simple))
             .unwrap();
         assert_eq!(agent.name(), "mock");
+    }
+
+    #[test]
+    fn re_register_preserves_existing_adapter() {
+        let mut registry = AgentRegistry::new("mock");
+        registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
+        registry
+            .register_adapter(
+                "mock",
+                Arc::new(StubAdapter {
+                    adapter_name: "mock",
+                }),
+            )
+            .unwrap();
+
+        // Re-registering with a new agent must not clear the adapter.
+        registry.register(
+            "mock",
+            Arc::new(StubAgent {
+                agent_name: "mock-v2",
+            }),
+        );
+
+        let adapter = registry.get_adapter("mock");
+        assert!(
+            adapter.is_some(),
+            "adapter must survive re-registration of the same agent name"
+        );
+        assert_eq!(adapter.unwrap().name(), "mock");
+        // The agent itself must be updated.
+        assert_eq!(registry.get("mock").unwrap().name(), "mock-v2");
     }
 
     #[test]
