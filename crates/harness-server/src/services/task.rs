@@ -1,8 +1,9 @@
 //! TaskService — task lifecycle, stream subscriptions, and task-project association.
 
-use crate::task_runner::{TaskId, TaskState, TaskStore};
+use crate::task_runner::{DashboardCounts, TaskId, TaskState, TaskStore};
 use async_trait::async_trait;
 use harness_core::agent::StreamItem;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -30,6 +31,13 @@ pub trait TaskService: Send + Sync {
     /// Subscribe to the real-time stream of a running task.
     /// Returns `None` when no stream channel is registered for the task.
     fn subscribe_stream(&self, id: &TaskId) -> Option<broadcast::Receiver<StreamItem>>;
+
+    /// Global and per-project done/failed counts for the dashboard.
+    async fn count_for_dashboard(&self) -> DashboardCounts;
+
+    /// Most recent completed-task PR URL keyed by canonical project root string,
+    /// for all projects. Used by the dashboard to show per-project latest PR.
+    async fn latest_done_pr_urls_all_projects(&self) -> HashMap<String, String>;
 }
 
 /// Production implementation backed by [`TaskStore`].
@@ -73,6 +81,14 @@ impl TaskService for DefaultTaskService {
 
     fn subscribe_stream(&self, id: &TaskId) -> Option<broadcast::Receiver<StreamItem>> {
         self.store.subscribe_task_stream(id)
+    }
+
+    async fn count_for_dashboard(&self) -> DashboardCounts {
+        self.store.count_for_dashboard().await
+    }
+
+    async fn latest_done_pr_urls_all_projects(&self) -> HashMap<String, String> {
+        self.store.latest_done_pr_urls_all_projects().await
     }
 }
 
