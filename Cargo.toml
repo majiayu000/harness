@@ -52,7 +52,7 @@ serde_yaml = "0.9"
 toml = "0.8"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

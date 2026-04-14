@@ -3,7 +3,7 @@ use crate::task_runner::{TaskState, TaskStatus};
 use harness_core::db::{open_pool, Migration, Migrator};
 use harness_core::error::TaskDbDecodeError;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqlitePool;
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -41,8 +41,8 @@ static TASK_MIGRATIONS: &[Migration] = &[
             pr_url      TEXT,
             rounds      TEXT NOT NULL DEFAULT '[]',
             error       TEXT,
-            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     },
     Migration {
@@ -64,12 +64,12 @@ static TASK_MIGRATIONS: &[Migration] = &[
         version: 5,
         description: "create task_artifacts table",
         sql: "CREATE TABLE IF NOT EXISTS task_artifacts (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             task_id       TEXT NOT NULL,
             turn          INTEGER NOT NULL DEFAULT 0,
             artifact_type TEXT NOT NULL,
             content       TEXT NOT NULL,
-            created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     },
     Migration {
@@ -185,18 +185,24 @@ struct RecoveryRow {
 }
 
 pub struct TaskDb {
-    pool: SqlitePool,
+    pool: PgPool,
 }
 
 impl TaskDb {
-    fn status_placeholders(len: usize) -> String {
-        std::iter::repeat_n("?", len).collect::<Vec<_>>().join(", ")
+    fn status_placeholders(len: usize, offset: usize) -> String {
+        (offset + 1..=offset + len)
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let pool = open_pool(path).await?;
         let db = Self { pool };
-        Migrator::new(&db.pool, TASK_MIGRATIONS).run().await?;
+        Migrator::new(&db.pool, TASK_MIGRATIONS)
+            .with_tracking_table("task_schema_migrations")
+            .run()
+            .await?;
         Ok(db)
     }
 
@@ -211,7 +217,7 @@ impl TaskDb {
             .and_then(|s| serde_json::to_string(s).ok());
         sqlx::query(
             "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description, request_settings)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, CURRENT_TIMESTAMP::TEXT), $11, $12, $13, $14, $15, $16, $17)",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -245,11 +251,11 @@ impl TaskDb {
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok());
         sqlx::query(
-            "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
-                    source = ?, external_id = ?, repo = ?, depends_on = ?, project = ?,
-                    priority = ?, phase = ?, description = ?, request_settings = ?,
-                    updated_at = datetime('now')
-             WHERE id = ?",
+            "UPDATE tasks SET status = $1, turn = $2, pr_url = $3, rounds = $4, error = $5,
+                    source = $6, external_id = $7, repo = $8, depends_on = $9, project = $10,
+                    priority = $11, phase = $12, description = $13, request_settings = $14,
+                    updated_at = CURRENT_TIMESTAMP
+             WHERE id = $15",
         )
         .bind(status)
         .bind(state.turn as i64)
@@ -277,7 +283,7 @@ impl TaskDb {
     }
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
-        let sql = format!("SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE id = ?");
+        let sql = format!("SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE id = $1");
         let row = sqlx::query_as::<_, TaskRow>(&sql)
             .bind(id)
             .fetch_optional(&self.pool)
@@ -301,7 +307,7 @@ impl TaskDb {
         if statuses.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = Self::status_placeholders(statuses.len());
+        let placeholders = Self::status_placeholders(statuses.len(), 0);
         let sql = format!(
             "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at DESC"
         );
@@ -320,7 +326,7 @@ impl TaskDb {
         external_id: &str,
     ) -> anyhow::Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as(
-            "SELECT id FROM tasks WHERE project = ? AND external_id = ? \
+            "SELECT id FROM tasks WHERE project = $1 AND external_id = $2 \
              AND status IN ('pending', 'awaiting_deps', 'implementing', 'agent_review', 'waiting', 'reviewing') \
              LIMIT 1",
         )
@@ -342,7 +348,7 @@ impl TaskDb {
     ) -> anyhow::Result<Option<(String, String)>> {
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT id, pr_url FROM tasks \
-             WHERE project = ? AND external_id = ? AND status = 'done' AND pr_url IS NOT NULL \
+             WHERE project = $1 AND external_id = $2 AND status = 'done' AND pr_url IS NOT NULL \
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(project)
@@ -399,10 +405,10 @@ impl TaskDb {
     ) -> anyhow::Result<Vec<(String, Option<i64>)>> {
         let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
             "SELECT id, \
-             (SELECT CAST(json_extract(r.value, '$.first_token_latency_ms') AS INTEGER) \
-              FROM json_each(rounds) r \
-              WHERE json_extract(r.value, '$.result') != 'resumed_checkpoint' \
-                AND json_extract(r.value, '$.first_token_latency_ms') IS NOT NULL \
+             (SELECT (elem->>'first_token_latency_ms')::BIGINT \
+              FROM jsonb_array_elements(rounds::jsonb) AS elem \
+              WHERE elem->>'result' != 'resumed_checkpoint' \
+                AND elem->>'first_token_latency_ms' IS NOT NULL \
               LIMIT 1) AS first_token_latency_ms \
              FROM tasks \
              WHERE status IN ('done', 'failed') \
@@ -452,7 +458,7 @@ impl TaskDb {
         if statuses.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = Self::status_placeholders(statuses.len());
+        let placeholders = Self::status_placeholders(statuses.len(), 0);
         let sql = format!("SELECT id FROM tasks WHERE status IN ({placeholders})");
         let mut q = sqlx::query_as::<_, (String,)>(&sql);
         for status in statuses {
@@ -468,7 +474,7 @@ impl TaskDb {
     /// Used by `check_awaiting_deps` to resolve dependency status with a single
     /// DB round-trip instead of a full row fetch.
     pub async fn get_status_only(&self, id: &str) -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM tasks WHERE id = ?")
+        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM tasks WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -477,7 +483,7 @@ impl TaskDb {
 
     /// Return `true` if a task row with the given ID exists in the database.
     pub async fn exists_by_id(&self, id: &str) -> anyhow::Result<bool> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT id FROM tasks WHERE id = ?")
+        let row: Option<(String,)> = sqlx::query_as("SELECT id FROM tasks WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -503,11 +509,11 @@ impl TaskDb {
             // Overwrite to terminal status; only touches tasks still in interrupted states
             // so we never downgrade a task that already reached Done/Failed in the DB.
             let sql = format!(
-                "UPDATE tasks SET status = ?, pr_url = COALESCE(?, pr_url), \
-                 updated_at = datetime('now') \
-                 WHERE id = ? \
+                "UPDATE tasks SET status = $1, pr_url = COALESCE($2, pr_url), \
+                 updated_at = CURRENT_TIMESTAMP \
+                 WHERE id = $3 \
                  AND status IN ({})",
-                Self::status_placeholders(TaskStatus::resumable_statuses().len())
+                Self::status_placeholders(TaskStatus::resumable_statuses().len(), 3)
             );
             let query = sqlx::query(&sql).bind(status).bind(pr_url).bind(task_id);
             let query = TaskStatus::resumable_statuses()
@@ -517,8 +523,8 @@ impl TaskDb {
         } else if let Some(url) = pr_url {
             // Write pr_url back only when the DB row currently has no pr_url.
             sqlx::query(
-                "UPDATE tasks SET pr_url = ? \
-                 WHERE id = ? AND pr_url IS NULL",
+                "UPDATE tasks SET pr_url = $1 \
+                 WHERE id = $2 AND pr_url IS NULL",
             )
             .bind(url)
             .bind(task_id)
@@ -556,7 +562,7 @@ impl TaskDb {
                  FROM tasks t
                  LEFT JOIN task_checkpoints c ON t.id = c.task_id
                  WHERE t.status IN ({})",
-                Self::status_placeholders(TaskStatus::resumable_statuses().len())
+                Self::status_placeholders(TaskStatus::resumable_statuses().len(), 0)
             );
             let query = TaskStatus::resumable_statuses()
                 .iter()
@@ -617,8 +623,8 @@ impl TaskDb {
 
                 if needs_pr_url_writeback {
                     sqlx::query(
-                        "UPDATE tasks SET status = 'pending', error = NULL, pr_url = ?, \
-                         updated_at = datetime('now') WHERE id = ?",
+                        "UPDATE tasks SET status = 'pending', error = NULL, pr_url = $1, \
+                         updated_at = CURRENT_TIMESTAMP WHERE id = $2",
                     )
                     .bind(effective_pr_url)
                     .bind(&row.id)
@@ -633,7 +639,7 @@ impl TaskDb {
                 } else {
                     sqlx::query(
                         "UPDATE tasks SET status = 'pending', error = NULL, \
-                         updated_at = datetime('now') WHERE id = ?",
+                         updated_at = CURRENT_TIMESTAMP WHERE id = $1",
                     )
                     .bind(&row.id)
                     .execute(&self.pool)
@@ -655,8 +661,8 @@ impl TaskDb {
                     row.task_pr_url.as_deref().unwrap_or("none")
                 );
                 sqlx::query(
-                    "UPDATE tasks SET status = 'failed', error = ?, updated_at = datetime('now') \
-                     WHERE id = ?",
+                    "UPDATE tasks SET status = 'failed', error = $1, updated_at = CURRENT_TIMESTAMP \
+                     WHERE id = $2",
                 )
                 .bind(&err)
                 .bind(&row.id)
@@ -675,7 +681,7 @@ impl TaskDb {
              SET status = 'failed', \
                  error = 'recovered after restart (was: pending in transient retry): ' \
                       || COALESCE(error, ''), \
-                 updated_at = datetime('now') \
+                 updated_at = CURRENT_TIMESTAMP \
              WHERE status = 'pending' \
                AND error LIKE 'retrying after transient failure%'",
         )
@@ -710,7 +716,7 @@ impl TaskDb {
         sqlx::query(
             "INSERT INTO task_checkpoints \
                  (task_id, triage_output, plan_output, pr_url, last_phase, updated_at) \
-             VALUES (?, ?, ?, ?, ?, datetime('now')) \
+             VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP) \
              ON CONFLICT(task_id) DO UPDATE SET \
                  triage_output = COALESCE(excluded.triage_output, task_checkpoints.triage_output), \
                  plan_output   = COALESCE(excluded.plan_output,   task_checkpoints.plan_output), \
@@ -732,7 +738,7 @@ impl TaskDb {
     pub async fn load_checkpoint(&self, task_id: &str) -> anyhow::Result<Option<TaskCheckpoint>> {
         let row = sqlx::query_as::<_, TaskCheckpoint>(
             "SELECT task_id, triage_output, plan_output, pr_url, last_phase, updated_at \
-             FROM task_checkpoints WHERE task_id = ?",
+             FROM task_checkpoints WHERE task_id = $1",
         )
         .bind(task_id)
         .fetch_optional(&self.pool)
@@ -760,7 +766,7 @@ impl TaskDb {
     ) -> anyhow::Result<Option<String>> {
         let row: Option<(Option<String>,)> = sqlx::query_as(
             "SELECT pr_url FROM tasks \
-             WHERE status = 'done' AND pr_url IS NOT NULL AND project = ?1 \
+             WHERE status = 'done' AND pr_url IS NOT NULL AND project = $1 \
              ORDER BY updated_at DESC LIMIT 1",
         )
         .bind(project)
@@ -780,7 +786,7 @@ impl TaskDb {
                       ROW_NUMBER() OVER (PARTITION BY project ORDER BY updated_at DESC) AS rn \
                FROM tasks \
                WHERE status = 'done' AND pr_url IS NOT NULL AND project IS NOT NULL\
-             ) WHERE rn = 1",
+             ) t WHERE rn = 1",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -800,7 +806,7 @@ impl TaskDb {
             "SELECT COUNT(CASE WHEN status = 'done' THEN 1 END), \
                     COUNT(CASE WHEN status = 'failed' THEN 1 END) \
              FROM tasks WHERE status IN ({})",
-            Self::status_placeholders(outcome_statuses.len())
+            Self::status_placeholders(outcome_statuses.len(), 0)
         );
         let global: (i64, i64) = outcome_statuses
             .iter()
@@ -817,7 +823,7 @@ impl TaskDb {
              FROM tasks \
              WHERE status IN ({}) AND project IS NOT NULL \
              GROUP BY project",
-            Self::status_placeholders(outcome_statuses.len())
+            Self::status_placeholders(outcome_statuses.len(), 0)
         );
         let rows: Vec<(String, i64, i64)> = outcome_statuses
             .iter()
@@ -837,7 +843,7 @@ impl TaskDb {
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let sql = format!(
-            "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE parent_id = ? ORDER BY created_at DESC"
+            "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE parent_id = $1 ORDER BY created_at DESC"
         );
         let rows = sqlx::query_as::<_, TaskRow>(&sql)
             .bind(parent_id)
@@ -874,7 +880,7 @@ impl TaskDb {
 
         sqlx::query(
             "INSERT INTO task_artifacts (task_id, turn, artifact_type, content)
-             VALUES (?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4)",
         )
         .bind(task_id)
         .bind(turn as i64)
@@ -889,7 +895,7 @@ impl TaskDb {
     pub async fn list_artifacts(&self, task_id: &str) -> anyhow::Result<Vec<TaskArtifact>> {
         let rows = sqlx::query_as::<_, TaskArtifact>(
             "SELECT task_id, turn, artifact_type, content, created_at
-             FROM task_artifacts WHERE task_id = ? ORDER BY id ASC",
+             FROM task_artifacts WHERE task_id = $1 ORDER BY id ASC",
         )
         .bind(task_id)
         .fetch_all(&self.pool)
@@ -1212,7 +1218,7 @@ mod tests {
 
         assert!(db.get("missing-task").await?.is_none());
 
-        sqlx::query("INSERT INTO tasks (id, status, turn, rounds) VALUES (?, ?, ?, ?)")
+        sqlx::query("INSERT INTO tasks (id, status, turn, rounds) VALUES ($1, $2, $3, $4)")
             .bind("task-corrupted")
             .bind("pending")
             .bind(1_i64)
@@ -1234,7 +1240,7 @@ mod tests {
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
 
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, rounds, depends_on) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, status, turn, rounds, depends_on) VALUES ($1, $2, $3, $4, $5)",
         )
         .bind("task-corrupted-deps")
         .bind("pending")

@@ -57,7 +57,7 @@ impl PlanDb {
             .unwrap_or_default()
             .to_string();
         let sql =
-            "SELECT data FROM exec_plans WHERE json_extract(data, '$.status') = ? ORDER BY created_at DESC";
+            "SELECT data FROM exec_plans WHERE data::jsonb->>'status' = $1 ORDER BY created_at DESC";
         let rows: Vec<(String,)> = sqlx::query_as(sql)
             .bind(&status_str)
             .fetch_all(self.inner.pool())
@@ -71,7 +71,7 @@ impl PlanDb {
     pub async fn search_by_name(&self, query: &str) -> anyhow::Result<Vec<ExecPlan>> {
         let pattern = format!("%{}%", query);
         let sql =
-            "SELECT data FROM exec_plans WHERE json_extract(data, '$.purpose') LIKE ? ORDER BY created_at DESC";
+            "SELECT data FROM exec_plans WHERE data::jsonb->>'purpose' LIKE $1 ORDER BY created_at DESC";
         let rows: Vec<(String,)> = sqlx::query_as(sql)
             .bind(&pattern)
             .fetch_all(self.inner.pool())

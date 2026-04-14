@@ -151,8 +151,8 @@ impl ExecPlan {
 const EXEC_PLAN_CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS exec_plans (
     id         TEXT PRIMARY KEY,
     data       TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 )";
 
 impl DbEntity for ExecPlan {

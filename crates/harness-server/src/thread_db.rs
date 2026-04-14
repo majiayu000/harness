@@ -1,7 +1,7 @@
 use anyhow::Context;
 use harness_core::db::{open_pool, Migration, Migrator};
 use harness_core::{types::Thread, types::ThreadId, types::ThreadStatus};
-use sqlx::sqlite::SqlitePool;
+use sqlx::PgPool;
 use std::path::Path;
 
 /// Versioned migrations for the threads table.
@@ -21,14 +21,17 @@ static THREAD_MIGRATIONS: &[Migration] = &[Migration {
 
 #[derive(Clone)]
 pub struct ThreadDb {
-    pool: SqlitePool,
+    pool: PgPool,
 }
 
 impl ThreadDb {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let pool = open_pool(path).await?;
         let db = Self { pool };
-        Migrator::new(&db.pool, THREAD_MIGRATIONS).run().await?;
+        Migrator::new(&db.pool, THREAD_MIGRATIONS)
+            .with_tracking_table("thread_schema_migrations")
+            .run()
+            .await?;
         Ok(db)
     }
 
@@ -37,7 +40,7 @@ impl ThreadDb {
         let metadata_json = serde_json::to_string(&thread.metadata)?;
         sqlx::query(
             "INSERT INTO threads (id, cwd, status, turns, metadata, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(thread.id.as_str())
         .bind(thread.project_root.to_string_lossy().as_ref())
@@ -55,8 +58,8 @@ impl ThreadDb {
         let turns_json = serde_json::to_string(&thread.turns)?;
         let metadata_json = serde_json::to_string(&thread.metadata)?;
         sqlx::query(
-            "UPDATE threads SET cwd = ?, status = ?, turns = ?, metadata = ?, updated_at = ?
-             WHERE id = ?",
+            "UPDATE threads SET cwd = $1, status = $2, turns = $3, metadata = $4, updated_at = $5
+             WHERE id = $6",
         )
         .bind(thread.project_root.to_string_lossy().as_ref())
         .bind(thread.status.as_ref())
@@ -70,7 +73,7 @@ impl ThreadDb {
     }
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<Thread>> {
-        let row = sqlx::query_as::<_, ThreadRow>("SELECT * FROM threads WHERE id = ?")
+        let row = sqlx::query_as::<_, ThreadRow>("SELECT * FROM threads WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -85,7 +88,7 @@ impl ThreadDb {
     }
 
     pub async fn delete(&self, id: &str) -> anyhow::Result<bool> {
-        let result = sqlx::query("DELETE FROM threads WHERE id = ?")
+        let result = sqlx::query("DELETE FROM threads WHERE id = $1")
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -198,7 +201,7 @@ mod tests {
         let thread = Thread::new(PathBuf::from("/srv/app"));
         db.insert(&thread).await?;
 
-        sqlx::query("UPDATE threads SET status = ? WHERE id = ?")
+        sqlx::query("UPDATE threads SET status = $1 WHERE id = $2")
             .bind("paused")
             .bind(thread.id.as_str())
             .execute(&db.pool)

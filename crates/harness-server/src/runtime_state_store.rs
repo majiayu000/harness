@@ -48,8 +48,8 @@ impl DbEntity for RuntimeStateSnapshot {
         "CREATE TABLE IF NOT EXISTS runtime_state (
             id         TEXT PRIMARY KEY,
             data       TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )"
     }
 }
@@ -192,7 +192,7 @@ mod tests {
 
     async fn overwrite_schema_version(path: &Path, schema_version: u32) -> anyhow::Result<()> {
         let pool = open_pool(path).await?;
-        let row = sqlx::query("SELECT data FROM runtime_state WHERE id = ?")
+        let row = sqlx::query("SELECT data FROM runtime_state WHERE id = $1")
             .bind(SNAPSHOT_ID)
             .fetch_one(&pool)
             .await?;
@@ -200,7 +200,7 @@ mod tests {
         let mut snapshot: RuntimeStateSnapshot = serde_json::from_str(&data)?;
         snapshot.schema_version = schema_version;
         let updated_data = serde_json::to_string(&snapshot)?;
-        sqlx::query("UPDATE runtime_state SET data = ? WHERE id = ?")
+        sqlx::query("UPDATE runtime_state SET data = $1 WHERE id = $2")
             .bind(updated_data)
             .bind(SNAPSHOT_ID)
             .execute(&pool)

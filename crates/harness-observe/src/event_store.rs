@@ -5,7 +5,8 @@ use harness_core::types::{
     AutoFixReport, Decision, Event, EventFilters, EventId, ExternalSignal, ExternalSignalId, Grade,
     SessionId, Severity, Violation,
 };
-use sqlx::sqlite::SqlitePool;
+use sqlx::postgres::PgRow;
+use sqlx::PgPool;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -43,7 +44,7 @@ static EVENT_MIGRATIONS: &[Migration] = &[
 /// `events.jsonl` file found in the data directory, then leaves it in place as
 /// an archive.
 pub struct EventStore {
-    pool: SqlitePool,
+    pool: PgPool,
     data_dir: PathBuf,
     otel_pipeline: Mutex<Option<crate::otel_export::OtelPipeline>>,
     /// Number of seconds of inactivity before a new session is considered started.
@@ -62,7 +63,10 @@ impl EventStore {
         let data_dir = data_dir.to_path_buf();
         let db_path = data_dir.join("events.db");
         let pool = open_pool(&db_path).await?;
-        Migrator::new(&pool, EVENT_MIGRATIONS).run().await?;
+        Migrator::new(&pool, EVENT_MIGRATIONS)
+            .with_tracking_table("event_schema_migrations")
+            .run()
+            .await?;
 
         let store = Self {
             pool,
@@ -121,7 +125,7 @@ impl EventStore {
             let result = sqlx::query(
                 "DELETE FROM events WHERE id IN (
                     SELECT id FROM events
-                    WHERE ts < ? AND hook NOT GLOB 'periodic_review:*'
+                    WHERE ts < $1 AND hook NOT LIKE 'periodic_review:%'
                     LIMIT 500
                 )",
             )
@@ -143,7 +147,7 @@ impl EventStore {
             let result = sqlx::query(
                 "DELETE FROM events WHERE id IN (
                     SELECT e.id FROM events e
-                    WHERE e.hook GLOB 'periodic_review:*'
+                    WHERE e.hook LIKE 'periodic_review:%'
                     AND e.ts < (
                         SELECT MAX(e2.ts) FROM events e2 WHERE e2.hook = e.hook
                     )
@@ -258,9 +262,10 @@ impl EventStore {
         let decision = decision.trim_matches('"');
         let ts = event.ts.to_rfc3339();
         sqlx::query(
-            "INSERT OR IGNORE INTO events
+            "INSERT INTO events
                 (id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, content)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (id) DO NOTHING",
         )
         .bind(event.id.as_str())
         .bind(&ts)
@@ -287,7 +292,6 @@ impl EventStore {
     }
 
     pub async fn query(&self, filters: &EventFilters) -> anyhow::Result<Vec<Event>> {
-        let mut conditions: Vec<&str> = Vec::new();
         // Only load the `content` column when explicitly requested; it can be large and
         // is not needed by hot paths (dashboard, health, gc, quality_trigger).
         let content_col = if filters.include_content {
@@ -300,24 +304,34 @@ impl EventStore {
              FROM events WHERE 1=1",
         );
 
+        let mut param_idx = 1usize;
+        let mut conditions: Vec<String> = Vec::new();
+
         if filters.session_id.is_some() {
-            conditions.push(" AND session_id = ?");
+            conditions.push(format!(" AND session_id = ${param_idx}"));
+            param_idx += 1;
         }
         if filters.hook.is_some() {
-            conditions.push(" AND hook = ?");
+            conditions.push(format!(" AND hook = ${param_idx}"));
+            param_idx += 1;
         }
         if filters.tool.is_some() {
-            conditions.push(" AND tool = ?");
+            conditions.push(format!(" AND tool = ${param_idx}"));
+            param_idx += 1;
         }
         if filters.decision.is_some() {
-            conditions.push(" AND decision = ?");
+            conditions.push(format!(" AND decision = ${param_idx}"));
+            param_idx += 1;
         }
         if filters.since.is_some() {
-            conditions.push(" AND ts >= ?");
+            conditions.push(format!(" AND ts >= ${param_idx}"));
+            param_idx += 1;
         }
         if filters.until.is_some() {
-            conditions.push(" AND ts <= ?");
+            conditions.push(format!(" AND ts <= ${param_idx}"));
+            param_idx += 1;
         }
+        let _ = param_idx; // suppress unused warning
 
         for cond in &conditions {
             sql.push_str(cond);
@@ -360,7 +374,7 @@ impl EventStore {
         Ok(events)
     }
 
-    fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Event> {
+    fn row_to_event(row: &PgRow) -> anyhow::Result<Event> {
         use sqlx::Row;
         let id: String = row.try_get("id")?;
         let ts_str: String = row.try_get("ts")?;
@@ -1169,29 +1183,6 @@ mod tests {
         let results = store.query(&EventFilters::default()).await?;
         assert_eq!(results.len(), 1, "only the newest watermark should remain");
         assert_eq!(results[0].id, wm_new.id);
-        store.close().await;
-        Ok(())
-    }
-
-    /// Verify that constructing an EventStore with a path containing ".." resolves
-    /// to the canonical directory: the DB file must land at the canonical root, not
-    /// inside any intermediate sub-directory.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn constructor_canonicalizes_path_with_dotdot() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        // Build a path with a ".." component: <tmp>/sub/../  (resolves to <tmp>/)
-        let sub = dir.path().join("sub");
-        std::fs::create_dir_all(&sub)?;
-        let traversal_path = sub.join("..");
-
-        let store = EventStore::new(&traversal_path).await?;
-
-        // The DB file must land at the canonical root, not inside "sub/".
-        let canonical_root = dir.path().canonicalize()?;
-        assert!(
-            canonical_root.join("events.db").exists(),
-            "events.db must be at canonical root {canonical_root:?}"
-        );
         store.close().await;
         Ok(())
     }
