@@ -836,7 +836,18 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     };
                     let permit = match maybe_permit {
                         Some(p) => p,
-                        None => return,
+                        None => {
+                            // Task reached a terminal state (Cancelled/Failed/Done) during
+                            // the acquire backoff window. Fire the completion callback so
+                            // intake sources remove it from their `dispatched` map — without
+                            // this the entry stays permanently and blocks re-polling.
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
+                            return;
+                        }
                     };
 
                     let mut req = task_runner::CreateTaskRequest {
@@ -1068,7 +1079,18 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     };
                     let permit = match maybe_permit {
                         Some(p) => p,
-                        None => return,
+                        None => {
+                            // Task reached a terminal state (Cancelled/Failed/Done) during
+                            // the acquire backoff window. Fire the completion callback so
+                            // intake sources remove it from their `dispatched` map — without
+                            // this the entry stays permanently and blocks re-polling.
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
+                            return;
+                        }
                     };
 
                     // issue_num is always Some here — the None branch returned above.
