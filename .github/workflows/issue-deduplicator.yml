@@ -7,13 +7,38 @@ on:
 permissions:
   issues: write
 
+# Concurrency: queue (not cancel) to prevent burst consumption of runner capacity
+# when many issues are opened simultaneously. Only one LLM call runs per repo at a time.
+concurrency:
+  group: issue-deduplicator-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   deduplicate:
     name: Check for duplicate issues
     runs-on: ubuntu-latest
+    # Hard cap: if Anthropic or the network stalls, do not hold a runner indefinitely.
+    timeout-minutes: 5
     steps:
+      - name: Gate — skip LLM for untrusted external openers
+        id: trust-gate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Only MEMBER, OWNER, and COLLABORATOR are trusted repository insiders.
+            // External openers (NONE, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, CONTRIBUTOR)
+            // could spam issue creation to amplify Anthropic API costs, so skip the LLM
+            // call for them. The workflow still exits cleanly — no comment is posted.
+            const trusted = ['MEMBER', 'OWNER', 'COLLABORATOR'];
+            const association = context.payload.issue.author_association;
+            const ok = trusted.includes(association);
+            core.setOutput('trusted', ok ? 'true' : 'false');
+            if (!ok) {
+              console.log(`Skipping LLM dedup: author_association=${association} is not trusted.`);
+            }
       - name: Fetch open issues
         id: fetch-issues
+        if: steps.trust-gate.outputs.trusted == 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -45,14 +70,14 @@ jobs:
             core.setOutput('existing_json', JSON.stringify(existing));
 
       - name: Skip if no open issues to compare
-        if: steps.fetch-issues.outputs.existing_count == '0'
+        if: steps.trust-gate.outputs.trusted == 'true' && steps.fetch-issues.outputs.existing_count == '0'
         run: |
           echo "No other open issues found. Skipping deduplication."
           exit 0
 
       - name: Call Claude API for semantic comparison
         id: claude-check
-        if: steps.fetch-issues.outputs.existing_count != '0' && env.ANTHROPIC_API_KEY != ''
+        if: steps.trust-gate.outputs.trusted == 'true' && steps.fetch-issues.outputs.existing_count != '0' && env.ANTHROPIC_API_KEY != ''
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           NEW_TITLE: ${{ steps.fetch-issues.outputs.new_title }}
@@ -86,6 +111,8 @@ jobs:
           # Temporarily disable errexit so we can capture the exit code manually.
           set +e
           RESPONSE=$(curl -s -f \
+            --connect-timeout 10 \
+            --max-time 30 \
             -H "x-api-key: ${ANTHROPIC_API_KEY}" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
@@ -161,9 +188,19 @@ jobs:
               return;
             }
 
-            // Build comment
+            // Build comment — sanitize model-authored reason text before posting:
+            // strip @mentions (prompt injection could steer Claude to @mention users),
+            // collapse whitespace, and truncate to prevent abuse of the comment body.
+            function sanitizeReason(raw) {
+              return String(raw)
+                .replace(/@[\w-]+/g, '[user]')   // neutralise @mentions
+                .replace(/[^\x20-\x7E]/g, '')    // ASCII printable only
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 200);
+            }
             const lines = duplicates.map(d =>
-              `- #${d.number}: ${d.reason}`
+              `- #${d.number}: ${sanitizeReason(d.reason)}`
             );
             const body = [
               '**Possible duplicate detected** — please review before proceeding.',
