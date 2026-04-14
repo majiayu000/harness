@@ -273,8 +273,28 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Load config
     let mut config: harness_core::config::HarnessConfig = if let Some(config_path) = &cli.config {
         let content = std::fs::read_to_string(config_path)?;
-        toml::from_str(&content)?
+        tracing::info!(
+            "config loaded from --config flag: {}",
+            config_path.display()
+        );
+        let mut cfg: harness_core::config::HarnessConfig = toml::from_str(&content)?;
+        if let Some(dir) = config_path.parent() {
+            cfg.rebase_relative_paths(dir);
+        }
+        cfg
+    } else if let Some(discovered) = harness_core::config::dirs::find_config_file() {
+        let content = std::fs::read_to_string(&discovered)?;
+        tracing::info!("config loaded from {}", discovered.display());
+        let mut cfg: harness_core::config::HarnessConfig = toml::from_str(&content)?;
+        // Rebase relative paths against the config file's directory so that a
+        // global config like `project_root = "."` resolves relative to the
+        // config file rather than the operator's working directory.
+        if let Some(dir) = discovered.parent() {
+            cfg.rebase_relative_paths(dir);
+        }
+        cfg
     } else {
+        tracing::warn!("no config file found, using built-in defaults");
         harness_core::config::HarnessConfig::default()
     };
     // Apply env var overrides for all subcommands so that HARNESS_DATA_DIR,
