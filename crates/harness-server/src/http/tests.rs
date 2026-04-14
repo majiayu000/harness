@@ -950,8 +950,9 @@ fn authed_app(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// / is now exempt from auth — dashboard HTML embeds no secrets.
 #[tokio::test]
-async fn dashboard_requires_auth_when_token_configured() -> anyhow::Result<()> {
+async fn dashboard_exempt_from_auth_when_token_configured() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut config = harness_core::config::HarnessConfig::default();
     config.server.api_token = Some("secret123".to_string());
@@ -967,12 +968,14 @@ async fn dashboard_requires_auth_when_token_configured() -> anyhow::Result<()> {
         .oneshot(Request::builder().uri("/").body(Body::empty())?)
         .await?;
 
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Dashboard is now exempt from auth — HTML contains no secrets.
+    assert_eq!(response.status(), StatusCode::OK);
     Ok(())
 }
 
+/// Verify that query-param token no longer grants access to protected endpoints.
 #[tokio::test]
-async fn dashboard_accessible_via_query_param_token() -> anyhow::Result<()> {
+async fn query_param_token_rejected_on_protected_endpoint() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut config = harness_core::config::HarnessConfig::default();
     config.server.api_token = Some("secret123".to_string());
@@ -987,39 +990,12 @@ async fn dashboard_accessible_via_query_param_token() -> anyhow::Result<()> {
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/?token=secret123")
+                .uri("/tasks?token=secret123")
                 .body(Body::empty())?,
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    Ok(())
-}
-
-#[tokio::test]
-async fn dashboard_query_param_token_percent_decoded() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let mut config = harness_core::config::HarnessConfig::default();
-    // Token contains characters that encodeURIComponent would encode.
-    config.server.api_token = Some("tok/en=val+end".to_string());
-    let state = make_test_state_with(
-        dir.path(),
-        config,
-        harness_agents::registry::AgentRegistry::new("test"),
-    )
-    .await?;
-    let app = authed_app(state);
-
-    // Simulate the encodeURIComponent output: / → %2F, = → %3D, + → %2B
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/?token=tok%2Fen%3Dval%2Bend")
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     Ok(())
 }
 
