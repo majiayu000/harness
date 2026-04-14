@@ -558,7 +558,31 @@ async fn apply_migration(
     if use_transaction {
         let mut tx = pool.begin().await?;
         for statement in &statements {
-            if let Err(error) = sqlx::query(statement.sql.as_ref()).execute(&mut *tx).await {
+            // In Postgres any failed statement marks the entire transaction aborted,
+            // so we cannot simply `continue` after a duplicate-column error — the
+            // next statement (or the schema_migrations insert) would fail with
+            // "current transaction is aborted".  Use a savepoint to isolate the
+            // error and roll back only that statement, leaving the transaction valid.
+            let exec_result = if dialect == Dialect::Postgres {
+                sqlx::query("SAVEPOINT _mig").execute(&mut *tx).await?;
+                let res = sqlx::query(statement.sql.as_ref()).execute(&mut *tx).await;
+                if res.is_ok() {
+                    sqlx::query("RELEASE SAVEPOINT _mig")
+                        .execute(&mut *tx)
+                        .await?;
+                } else {
+                    sqlx::query("ROLLBACK TO SAVEPOINT _mig")
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("RELEASE SAVEPOINT _mig")
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                res
+            } else {
+                sqlx::query(statement.sql.as_ref()).execute(&mut *tx).await
+            };
+            if let Err(error) = exec_result {
                 if duplicate_add_column_error(statement.sql.as_ref(), &error) {
                     continue;
                 }
