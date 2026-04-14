@@ -231,14 +231,18 @@ pub(crate) async fn run_turn_lifecycle(
     let stall_timeout = Duration::from_secs(server.config.concurrency.stall_timeout_secs);
     let (stream_tx, mut stream_rx) = mpsc::channel(128);
 
-    // When an adapter is registered, execute via adapter.start_turn() so that
-    // the adapter's stdin is initialized before any steer/respond_approval call
-    // arrives. CodexAgent::execute_stream uses stdin(Stdio::null()), which means
-    // the adapter state would always have stdin=None and steer/approval would
-    // fail with "codex stdin not available".
+    // Only Codex uses the adapter for turn execution (initializes stdin so that
+    // subsequent steer/respond_approval calls can find a live process).
+    // Other adapters (e.g., ClaudeAdapter) exist for interrupt/steer only and must
+    // not override the configured CodeAgent execution path — ClaudeCodeAgent carries
+    // config-level settings (model, sandbox) that ClaudeAdapter does not replicate.
+    let execution_adapter = adapter_opt
+        .as_ref()
+        .filter(|a| a.name() == "codex")
+        .cloned();
     let mut execution: std::pin::Pin<
         Box<dyn std::future::Future<Output = harness_core::error::Result<()>> + Send>,
-    > = if let Some(adapter_arc) = adapter_opt {
+    > = if let Some(adapter_arc) = execution_adapter {
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(128);
         // Move stream_tx into the bridge task so dropping it closes stream_rx.
         let bridge_tx = stream_tx;
