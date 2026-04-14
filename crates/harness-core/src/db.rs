@@ -44,12 +44,29 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 /// its own schema, providing namespace isolation between stores and between
 /// test runs without requiring separate databases.
 ///
-/// The algorithm: normalize `.`/`..` components (no I/O), hash with FNV-1a
-/// 64-bit, format as `hs_<16-hex-digits>`.  Distinct paths map to distinct
-/// schemas with overwhelming probability (2⁻⁶⁴ per pair); logically
-/// equivalent paths always map to the same schema.
+/// The algorithm:
+/// 1. Absolutize the path (prepend `current_dir()` if relative) — without I/O.
+///    This prevents distinct relative paths such as `../data/x.db` and
+///    `data/x.db` from colliding after `..` components are resolved.
+/// 2. Normalize `.`/`..` components.
+/// 3. Hash with FNV-1a 64-bit, format as `hs_<16-hex-digits>`.
+///
+/// Distinct paths map to distinct schemas with overwhelming probability
+/// (2⁻⁶⁴ per pair); logically equivalent paths always map to the same schema.
 fn path_to_schema(path: &Path) -> String {
-    let normalized = normalize_path_components(path);
+    // Absolutize without filesystem access so that a relative path like
+    // `../data/tasks.db` and `data/tasks.db` starting from different CWDs
+    // produce different absolute strings before hashing.  If current_dir()
+    // fails (e.g. CWD was deleted) we fall back to "/" to keep the output
+    // deterministic rather than panicking.
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+            .join(path)
+    };
+    let normalized = normalize_path_components(&absolute);
     let s = normalized.to_string_lossy();
     let hash = fnv1a_64(s.as_bytes());
     format!("hs_{hash:016x}")
@@ -67,9 +84,40 @@ fn path_to_schema(path: &Path) -> String {
 /// when all stores share a single Postgres database.
 ///
 /// All stores share this configuration: 8 max connections, 10 s acquire timeout.
+///
+/// # Upgrade note
+///
+/// This function does **not** migrate data from a pre-existing SQLite file at
+/// `path`.  If such a file is found, a warning is logged — existing tasks,
+/// threads, plans, and events must be migrated manually to PostgreSQL.
 pub async fn open_pool(path: &Path) -> anyhow::Result<PgPool> {
-    let url = std::env::var("DATABASE_URL")
-        .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable must be set"))?;
+    // Issue 1: provide a clear, actionable error when DATABASE_URL is absent so
+    // that operators who upgrade without provisioning Postgres get an explicit
+    // message rather than a confusing "file not found" style error.
+    let url = std::env::var("DATABASE_URL").map_err(|_| {
+        anyhow::anyhow!(
+            "DATABASE_URL is not set. This version of harness requires PostgreSQL.\n\
+             Set DATABASE_URL to a valid Postgres connection string, for example:\n\
+             \n  DATABASE_URL=postgres://user:password@localhost/harness\n\
+             \nIf you are upgrading from a SQLite-backed deployment, existing data\n\
+             must be migrated to PostgreSQL manually before the server can serve\n\
+             previously persisted tasks, threads, plans, and events."
+        )
+    })?;
+
+    // Issue 2: warn loudly when an old SQLite file exists at the store path.
+    // The contents of that file will NOT be read or migrated automatically.
+    // Without manual migration, all previously persisted records will be absent.
+    if path.exists() {
+        eprintln!(
+            "harness WARNING: SQLite database found at '{}' but will NOT be read. \
+             harness now stores data in PostgreSQL. All records in this file \
+             (tasks, threads, plans, events, etc.) must be migrated to PostgreSQL \
+             manually to remain accessible. Until migration is complete, restart \
+             recovery and observability will start from an empty state.",
+            path.display()
+        );
+    }
     let schema = path_to_schema(path);
     PgPoolOptions::new()
         .max_connections(8)
