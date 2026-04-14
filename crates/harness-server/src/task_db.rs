@@ -539,7 +539,7 @@ impl TaskDb {
 
                 if needs_pr_url_writeback {
                     sqlx::query(
-                        "UPDATE tasks SET status = 'pending', pr_url = ?, \
+                        "UPDATE tasks SET status = 'pending', error = NULL, pr_url = ?, \
                          updated_at = datetime('now') WHERE id = ?",
                     )
                     .bind(effective_pr_url)
@@ -554,8 +554,8 @@ impl TaskDb {
                     );
                 } else {
                     sqlx::query(
-                        "UPDATE tasks SET status = 'pending', updated_at = datetime('now') \
-                         WHERE id = ?",
+                        "UPDATE tasks SET status = 'pending', error = NULL, \
+                         updated_at = datetime('now') WHERE id = ?",
                     )
                     .bind(&row.id)
                     .execute(&self.pool)
