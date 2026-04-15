@@ -1803,13 +1803,16 @@ pub(crate) async fn run_task(
                 r
             }
             Ok(Err(e)) => {
-                // Quota exhausted is not retryable — break immediately instead of
-                // burning remaining review rounds on repeated 402 errors.
-                if matches!(e, HarnessError::QuotaExhausted(_)) {
-                    tracing::error!(round, error = %e, "quota exhausted during review — aborting review loop");
-                    store
-                        .set_rate_limit(std::time::Duration::from_secs(3600))
-                        .await;
+                // Quota/billing failures are not retryable — break immediately instead of
+                // burning remaining review rounds on repeated errors.
+                // Do NOT activate the global rate-limit circuit breaker: the reviewer
+                // agent is configured independently from the implementation agent and a
+                // depleted reviewer account must not stall unrelated implementation tasks.
+                if matches!(
+                    e,
+                    HarnessError::QuotaExhausted(_) | HarnessError::BillingFailed(_)
+                ) {
+                    tracing::error!(round, error = %e, "quota/billing failure during review — aborting review loop");
                     run_on_error(&interceptors, &check_req, &e.to_string()).await;
                     mutate_and_persist(store, task_id, |s| {
                         s.status = TaskStatus::Failed;
@@ -2220,11 +2223,15 @@ async fn run_agent_review(
                 r
             }
             Ok(Err(e)) => {
-                if matches!(e, HarnessError::QuotaExhausted(_)) {
-                    tracing::error!(agent_round, error = %e, "quota exhausted during agent review — aborting");
-                    store
-                        .set_rate_limit(std::time::Duration::from_secs(3600))
-                        .await;
+                // Quota/billing failures are not retryable — break immediately.
+                // Do NOT activate the global rate-limit circuit breaker: the reviewer
+                // agent is configured independently from the implementation agent and a
+                // depleted reviewer account must not stall unrelated implementation tasks.
+                if matches!(
+                    e,
+                    HarnessError::QuotaExhausted(_) | HarnessError::BillingFailed(_)
+                ) {
+                    tracing::error!(agent_round, error = %e, "quota/billing failure during agent review — aborting");
                     run_on_error(interceptors, &review_req, &e.to_string()).await;
                     mutate_and_persist(store, task_id, |s| {
                         s.status = TaskStatus::Failed;

@@ -40,6 +40,11 @@ pub enum HarnessError {
     #[error("agent quota exhausted: {0}")]
     QuotaExhausted(String),
 
+    /// Permanent billing failure (payment required, insufficient balance).
+    /// Unlike `QuotaExhausted`, this will not recover after a wait period.
+    #[error("agent billing failure: {0}")]
+    BillingFailed(String),
+
     #[error("protocol error: {0}")]
     Protocol(String),
 
