@@ -1012,14 +1012,20 @@ async fn run_review_tick(
                             // DB-only after a server restart.  Using get_with_db_fallback
                             // ensures we correctly classify those tasks instead of
                             // misidentifying them as successful (None in-memory).
-                            let stale_ids = rs
+                            let stale_ids = match rs
                                 .list_stale_real_task_ids(&project_root_for_poll.to_string_lossy())
                                 .await
-                                .unwrap_or_default();
-                            let mut task_outcome_map: std::collections::HashMap<
-                                String,
-                                Option<bool>,
-                            > = std::collections::HashMap::new();
+                            {
+                                Ok(ids) => ids,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "scheduler: failed to list stale real task IDs, \
+                                         recovery may be incomplete: {e}"
+                                    );
+                                    vec![]
+                                }
+                            };
+                            let mut task_outcome_map = HashMap::new();
                             for tid in stale_ids {
                                 let task_id = harness_core::types::TaskId(tid.clone());
                                 let outcome = match tasks_snapshot

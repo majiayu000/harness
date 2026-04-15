@@ -585,12 +585,18 @@ impl ReviewStore {
     ///
     /// Called when the violation is no longer detected in the latest scan,
     /// ensuring that if it reappears it starts with a fresh failure history.
-    pub async fn reset_finding_cooldown(&self, rule_id: &str, file: &str) -> anyhow::Result<()> {
+    pub async fn reset_finding_cooldown(
+        &self,
+        project_root: &str,
+        rule_id: &str,
+        file: &str,
+    ) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE review_findings \
              SET failure_count = 0, cooldown_until = NULL \
-             WHERE rule_id = ? AND file = ? AND status = 'open'",
+             WHERE project_root = ? AND rule_id = ? AND file = ? AND status = 'open'",
         )
+        .bind(project_root)
         .bind(rule_id)
         .bind(file)
         .execute(&self.pool)
@@ -633,13 +639,12 @@ impl ReviewStore {
         Ok(result.rows_affected())
     }
 
-    /// Release a pending claim by resetting task_id to NULL.
-    ///
-    /// Called when task enqueue fails after a successful `try_claim_finding`,
-    /// allowing the next poll cycle to retry spawning for this finding.
     /// Release a pending claim after the underlying task completed successfully,
     /// clearing task_id, claimed_at, and real_task_id without penalising
     /// failure_count or setting a cooldown.
+    ///
+    /// Returns the number of rows updated (1 if found, 0 if the finding was
+    /// already in a different state when recovery ran).
     async fn release_stale_claim_ok(
         &self,
         project_root: &str,
@@ -660,6 +665,10 @@ impl ReviewStore {
         Ok(result.rows_affected())
     }
 
+    /// Release a pending claim by resetting task_id to NULL.
+    ///
+    /// Called when task enqueue fails after a successful `try_claim_finding`,
+    /// allowing the next poll cycle to retry spawning for this finding.
     pub async fn release_claim(
         &self,
         project_root: &str,
@@ -1085,11 +1094,18 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// Helper: read (failure_count, cooldown_until) for an open finding.
-    async fn get_cooldown(store: &ReviewStore, rule_id: &str, file: &str) -> (i64, Option<String>) {
+    async fn get_cooldown(
+        store: &ReviewStore,
+        project_root: &str,
+        rule_id: &str,
+        file: &str,
+    ) -> (i64, Option<String>) {
         sqlx::query_as::<_, (i64, Option<String>)>(
             "SELECT failure_count, cooldown_until \
-             FROM review_findings WHERE rule_id = ? AND file = ? AND status = 'open'",
+             FROM review_findings \
+             WHERE project_root = ? AND rule_id = ? AND file = ? AND status = 'open'",
         )
+        .bind(project_root)
         .bind(rule_id)
         .bind(file)
         .fetch_one(&store.pool)
@@ -1098,11 +1114,12 @@ mod tests {
     }
 
     /// Put a finding into pending state so mark_finding_failed can act on it.
-    async fn set_pending(store: &ReviewStore, rule_id: &str, file: &str) {
+    async fn set_pending(store: &ReviewStore, project_root: &str, rule_id: &str, file: &str) {
         sqlx::query(
             "UPDATE review_findings SET task_id = 'pending', claimed_at = datetime('now') \
-             WHERE rule_id = ? AND file = ? AND status = 'open'",
+             WHERE project_root = ? AND rule_id = ? AND file = ? AND status = 'open'",
         )
+        .bind(project_root)
         .bind(rule_id)
         .bind(file)
         .execute(&store.pool)
@@ -1119,9 +1136,9 @@ mod tests {
             .await?;
 
         for expected in 1u32..=3 {
-            set_pending(&store, "R1", "a.rs").await;
+            set_pending(&store, "", "R1", "a.rs").await;
             store.mark_finding_failed("", "R1", "a.rs").await?;
-            let (count, _) = get_cooldown(&store, "R1", "a.rs").await;
+            let (count, _) = get_cooldown(&store, "", "R1", "a.rs").await;
             assert_eq!(
                 count as u32, expected,
                 "failure_count after {} calls",
@@ -1139,10 +1156,10 @@ mod tests {
             .persist_findings("", "rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
             .await?;
 
-        set_pending(&store, "R1", "a.rs").await;
+        set_pending(&store, "", "R1", "a.rs").await;
         store.mark_finding_failed("", "R1", "a.rs").await?;
 
-        let (_, cooldown_until) = get_cooldown(&store, "R1", "a.rs").await;
+        let (_, cooldown_until) = get_cooldown(&store, "", "R1", "a.rs").await;
         let ts_str = cooldown_until.expect("cooldown_until must be set after failure");
         // Parse the SQLite datetime string (format: "YYYY-MM-DD HH:MM:SS").
         let dt = chrono::NaiveDateTime::parse_from_str(&ts_str, "%Y-%m-%d %H:%M:%S")
@@ -1163,12 +1180,12 @@ mod tests {
         // Expected delays (seconds) for failure_count = 0..=5.
         let expected_secs: &[i64] = &[3600, 7200, 14400, 28800, 57600, 86400];
         for &expected in expected_secs {
-            set_pending(&store, "R1", "a.rs").await;
+            set_pending(&store, "", "R1", "a.rs").await;
             let before = chrono::Utc::now().naive_utc();
             store.mark_finding_failed("", "R1", "a.rs").await?;
             let after = chrono::Utc::now().naive_utc();
 
-            let (_, cooldown_until) = get_cooldown(&store, "R1", "a.rs").await;
+            let (_, cooldown_until) = get_cooldown(&store, "", "R1", "a.rs").await;
             let ts_str = cooldown_until.unwrap();
             let dt = chrono::NaiveDateTime::parse_from_str(&ts_str, "%Y-%m-%d %H:%M:%S").unwrap();
 
@@ -1247,15 +1264,15 @@ mod tests {
             .await?;
 
         // Apply a failure to set counters.
-        set_pending(&store, "R1", "a.rs").await;
+        set_pending(&store, "", "R1", "a.rs").await;
         store.mark_finding_failed("", "R1", "a.rs").await?;
-        let (count_before, cooldown_before) = get_cooldown(&store, "R1", "a.rs").await;
+        let (count_before, cooldown_before) = get_cooldown(&store, "", "R1", "a.rs").await;
         assert_eq!(count_before, 1);
         assert!(cooldown_before.is_some());
 
-        store.reset_finding_cooldown("R1", "a.rs").await?;
+        store.reset_finding_cooldown("", "R1", "a.rs").await?;
 
-        let (count_after, cooldown_after) = get_cooldown(&store, "R1", "a.rs").await;
+        let (count_after, cooldown_after) = get_cooldown(&store, "", "R1", "a.rs").await;
         assert_eq!(count_after, 0, "failure_count must be 0 after reset");
         assert!(
             cooldown_after.is_none(),
@@ -1287,7 +1304,7 @@ mod tests {
             .await?;
         assert_eq!(recovered, 1, "one row must be recovered");
 
-        let (count, cooldown) = get_cooldown(&store, "R1", "a.rs").await;
+        let (count, cooldown) = get_cooldown(&store, "", "R1", "a.rs").await;
         assert_eq!(
             count, 1,
             "failure_count must be 1 after strategy-1 recovery"
@@ -1325,7 +1342,7 @@ mod tests {
             .await?;
         assert_eq!(recovered, 1, "one row must be recovered via timeout");
 
-        let (count, cooldown) = get_cooldown(&store, "R1", "a.rs").await;
+        let (count, cooldown) = get_cooldown(&store, "", "R1", "a.rs").await;
         assert_eq!(
             count, 0,
             "failure_count must remain 0 for strategy-2 recovery"
@@ -1346,12 +1363,12 @@ mod tests {
             .await?;
 
         // Apply some failures so counters are non-zero.
-        set_pending(&store, "R1", "a.rs").await;
+        set_pending(&store, "", "R1", "a.rs").await;
         store.mark_finding_failed("", "R1", "a.rs").await?;
-        set_pending(&store, "R1", "a.rs").await;
+        set_pending(&store, "", "R1", "a.rs").await;
         store.mark_finding_failed("", "R1", "a.rs").await?;
 
-        let (count_before, cooldown_before) = get_cooldown(&store, "R1", "a.rs").await;
+        let (count_before, cooldown_before) = get_cooldown(&store, "", "R1", "a.rs").await;
         assert_eq!(count_before, 2);
         assert!(cooldown_before.is_some());
 
@@ -1360,7 +1377,7 @@ mod tests {
         let cleared = store.reset_cooldowns_for_resolved("", "rev-2").await?;
         assert_eq!(cleared, 1, "one finding must have its cooldown cleared");
 
-        let (count_after, cooldown_after) = get_cooldown(&store, "R1", "a.rs").await;
+        let (count_after, cooldown_after) = get_cooldown(&store, "", "R1", "a.rs").await;
         assert_eq!(count_after, 0, "failure_count must be 0 after resolution");
         assert!(
             cooldown_after.is_none(),
