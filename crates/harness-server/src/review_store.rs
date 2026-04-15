@@ -413,7 +413,9 @@ impl ReviewStore {
                 Some(true) => {
                     // Task failed or was cancelled — apply exponential backoff so the
                     // same violation is not immediately re-attempted on the next tick.
-                    recovered += self.mark_finding_failed(project_root, &rule_id, &file).await?;
+                    recovered += self
+                        .mark_finding_failed(project_root, &rule_id, &file)
+                        .await?;
                 }
                 Some(false) => {
                     // Task completed successfully — release the claim without penalty.
@@ -453,7 +455,10 @@ impl ReviewStore {
     /// via a synchronous closure.  The in-memory `TaskStore` cache only holds active
     /// tasks; terminal tasks (Failed, Cancelled) are DB-only after a server restart,
     /// so the caller must use `get_with_db_fallback` on each returned ID.
-    pub async fn list_stale_real_task_ids(&self, project_root: &str) -> anyhow::Result<Vec<String>> {
+    pub async fn list_stale_real_task_ids(
+        &self,
+        project_root: &str,
+    ) -> anyhow::Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT real_task_id FROM review_findings \
              WHERE project_root = ? AND task_id = 'pending' AND status = 'open' \
@@ -526,7 +531,12 @@ impl ReviewStore {
     /// 86400-second cap, so the `min()` always fires first at failure_count ≥ 5.
     ///
     /// Returns the number of rows updated (1 if found, 0 if not matching).
-    pub async fn mark_finding_failed(&self, project_root: &str, rule_id: &str, file: &str) -> anyhow::Result<u64> {
+    pub async fn mark_finding_failed(
+        &self,
+        project_root: &str,
+        rule_id: &str,
+        file: &str,
+    ) -> anyhow::Result<u64> {
         let result = sqlx::query(
             "UPDATE review_findings \
              SET task_id = NULL, \
@@ -1069,7 +1079,7 @@ mod tests {
 
         for expected in 1u32..=3 {
             set_pending(&store, "R1", "a.rs").await;
-            store.mark_finding_failed("R1", "a.rs").await?;
+            store.mark_finding_failed("", "R1", "a.rs").await?;
             let (count, _) = get_cooldown(&store, "R1", "a.rs").await;
             assert_eq!(
                 count as u32, expected,
@@ -1089,7 +1099,7 @@ mod tests {
             .await?;
 
         set_pending(&store, "R1", "a.rs").await;
-        store.mark_finding_failed("R1", "a.rs").await?;
+        store.mark_finding_failed("", "R1", "a.rs").await?;
 
         let (_, cooldown_until) = get_cooldown(&store, "R1", "a.rs").await;
         let ts_str = cooldown_until.expect("cooldown_until must be set after failure");
@@ -1114,7 +1124,7 @@ mod tests {
         for &expected in expected_secs {
             set_pending(&store, "R1", "a.rs").await;
             let before = chrono::Utc::now().naive_utc();
-            store.mark_finding_failed("R1", "a.rs").await?;
+            store.mark_finding_failed("", "R1", "a.rs").await?;
             let after = chrono::Utc::now().naive_utc();
 
             let (_, cooldown_until) = get_cooldown(&store, "R1", "a.rs").await;
@@ -1197,7 +1207,7 @@ mod tests {
 
         // Apply a failure to set counters.
         set_pending(&store, "R1", "a.rs").await;
-        store.mark_finding_failed("R1", "a.rs").await?;
+        store.mark_finding_failed("", "R1", "a.rs").await?;
         let (count_before, cooldown_before) = get_cooldown(&store, "R1", "a.rs").await;
         assert_eq!(count_before, 1);
         assert!(cooldown_before.is_some());
@@ -1232,7 +1242,7 @@ mod tests {
 
         // Strategy-1 recovery: task failed → should trigger backoff.
         let recovered = store
-            .recover_stale_pending_claims(3900, |_tid| Some(true))
+            .recover_stale_pending_claims("", 3900, |_tid| Some(true))
             .await?;
         assert_eq!(recovered, 1, "one row must be recovered");
 
@@ -1270,7 +1280,7 @@ mod tests {
         // Strategy-2 recovery via time threshold — must NOT apply backoff.
         // real_task_id is NULL so the closure is never called; type must match.
         let recovered = store
-            .recover_stale_pending_claims(3900, |_tid| Some(false))
+            .recover_stale_pending_claims("", 3900, |_tid| Some(false))
             .await?;
         assert_eq!(recovered, 1, "one row must be recovered via timeout");
 
@@ -1296,9 +1306,9 @@ mod tests {
 
         // Apply some failures so counters are non-zero.
         set_pending(&store, "R1", "a.rs").await;
-        store.mark_finding_failed("R1", "a.rs").await?;
+        store.mark_finding_failed("", "R1", "a.rs").await?;
         set_pending(&store, "R1", "a.rs").await;
-        store.mark_finding_failed("R1", "a.rs").await?;
+        store.mark_finding_failed("", "R1", "a.rs").await?;
 
         let (count_before, cooldown_before) = get_cooldown(&store, "R1", "a.rs").await;
         assert_eq!(count_before, 2);

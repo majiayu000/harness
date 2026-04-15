@@ -1012,7 +1012,10 @@ async fn run_review_tick(
                             // DB-only after a server restart.  Using get_with_db_fallback
                             // ensures we correctly classify those tasks instead of
                             // misidentifying them as successful (None in-memory).
-                            let stale_ids = rs.list_stale_real_task_ids(&project_root_for_poll.to_string_lossy()).await.unwrap_or_default();
+                            let stale_ids = rs
+                                .list_stale_real_task_ids(&project_root_for_poll.to_string_lossy())
+                                .await
+                                .unwrap_or_default();
                             let mut task_outcome_map: std::collections::HashMap<
                                 String,
                                 Option<bool>,
