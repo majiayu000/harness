@@ -132,6 +132,35 @@ impl ReviewStore {
                 .execute(&pool)
                 .await?;
         }
+        // Migrate: add cooldown columns for exponential backoff on repeated failures
+        // (issue #770).  failure_count tracks how many times the auto-fix task failed;
+        // cooldown_until is an ISO-8601 datetime before which spawning is suppressed.
+        let has_failure_count = columns
+            .iter()
+            .any(|(_, name, _, _, _, _)| name == "failure_count");
+        if !has_failure_count {
+            sqlx::query(
+                "ALTER TABLE review_findings ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(&pool)
+            .await?;
+        }
+        let has_cooldown_until = columns
+            .iter()
+            .any(|(_, name, _, _, _, _)| name == "cooldown_until");
+        if !has_cooldown_until {
+            sqlx::query("ALTER TABLE review_findings ADD COLUMN cooldown_until TEXT")
+                .execute(&pool)
+                .await?;
+        }
+        // Partial index speeds up list_spawnable_findings which filters open rows
+        // by task_id IS NULL and cooldown_until on every scheduler tick.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_rf_spawnable \
+             ON review_findings(task_id, cooldown_until) WHERE status = 'open'",
+        )
+        .execute(&pool)
+        .await?;
         // Remove duplicate (rule_id, file, status) rows that may exist from
         // before this unique index was introduced; keep the most recent row per group.
         sqlx::query(
@@ -260,7 +289,8 @@ impl ReviewStore {
                     file, line, title, description, action, task_id \
              FROM review_findings \
              WHERE review_id = ? AND priority IN ({placeholders}) \
-               AND status = 'open' AND task_id IS NULL"
+               AND status = 'open' AND task_id IS NULL \
+               AND (cooldown_until IS NULL OR cooldown_until <= datetime('now'))"
         );
         let mut query = sqlx::query_as::<_, FindingRow>(&sql).bind(review_id.to_owned());
         for p in priorities {
@@ -331,18 +361,10 @@ impl ReviewStore {
         let mut recovered = 0u64;
         for (rule_id, file, real_tid) in with_real_id {
             if is_task_done(&real_tid) {
-                let res = sqlx::query(
-                    "UPDATE review_findings \
-                     SET task_id = NULL, claimed_at = NULL, real_task_id = NULL \
-                     WHERE rule_id = ? AND file = ? AND status = 'open' \
-                       AND task_id = 'pending' AND real_task_id = ?",
-                )
-                .bind(&rule_id)
-                .bind(&file)
-                .bind(&real_tid)
-                .execute(&self.pool)
-                .await?;
-                recovered += res.rows_affected();
+                // The underlying task reached a terminal (failed/cancelled) state.
+                // Record the failure and apply exponential backoff so the same
+                // violation is not immediately re-attempted on the next tick.
+                recovered += self.mark_finding_failed(&rule_id, &file).await?;
             }
         }
 
@@ -401,6 +423,82 @@ impl ReviewStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Record a failed auto-fix attempt and apply exponential backoff cooldown.
+    ///
+    /// Atomically:
+    /// - Releases the pending claim (task_id = NULL)
+    /// - Increments failure_count
+    /// - Sets cooldown_until = now + min(3600 * 2^failure_count, 86400) seconds
+    ///   (1 h → 2 h → 4 h → 8 h → 16 h → 24 h cap)
+    ///
+    /// Uses the pre-increment failure_count to compute the delay so that the
+    /// first failure produces a 1-hour cooldown, the second 2 hours, etc.
+    /// The delay expression uses SQLite's `<<` (left shift) for 2^N arithmetic.
+    ///
+    /// Returns the number of rows updated (1 if found, 0 if not matching).
+    pub async fn mark_finding_failed(&self, rule_id: &str, file: &str) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE review_findings \
+             SET task_id = NULL, \
+                 claimed_at = NULL, \
+                 real_task_id = NULL, \
+                 failure_count = failure_count + 1, \
+                 cooldown_until = datetime('now', '+' || \
+                     cast(min(3600 * (1 << failure_count), 86400) as text) || ' seconds') \
+             WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id = 'pending'",
+        )
+        .bind(rule_id)
+        .bind(file)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Clear the backoff counters for a finding so it can be retried immediately.
+    ///
+    /// Called when the violation is no longer detected in the latest scan,
+    /// ensuring that if it reappears it starts with a fresh failure history.
+    pub async fn reset_finding_cooldown(&self, rule_id: &str, file: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE review_findings \
+             SET failure_count = 0, cooldown_until = NULL \
+             WHERE rule_id = ? AND file = ? AND status = 'open'",
+        )
+        .bind(rule_id)
+        .bind(file)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Reset cooldown counters for open findings that did NOT appear in the
+    /// latest scan (identified by `current_review_id`).
+    ///
+    /// When `persist_findings` runs for a new scan, it updates `review_id` to
+    /// `current_review_id` for every finding that still exists.  Any open
+    /// finding whose `review_id` still points to an older scan was not seen in
+    /// this cycle, which means the violation was resolved (manually or via a
+    /// previously spawned fix task).  Clearing the counters ensures that if
+    /// the violation reappears it starts with a fresh failure history instead
+    /// of inheriting stale backoff state.
+    ///
+    /// Returns the number of rows whose cooldown was cleared.
+    pub async fn reset_cooldowns_for_resolved(
+        &self,
+        current_review_id: &str,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE review_findings \
+             SET failure_count = 0, cooldown_until = NULL \
+             WHERE status = 'open' AND review_id != ? \
+               AND (failure_count > 0 OR cooldown_until IS NOT NULL)",
+        )
+        .bind(current_review_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Release a pending claim by resetting task_id to NULL.
@@ -815,6 +913,294 @@ mod tests {
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].rule_id, "RS-03");
 
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Cooldown / backoff tests (issue #770)
+    // -------------------------------------------------------------------------
+
+    /// Helper: read (failure_count, cooldown_until) for an open finding.
+    async fn get_cooldown(store: &ReviewStore, rule_id: &str, file: &str) -> (i64, Option<String>) {
+        sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT failure_count, cooldown_until \
+             FROM review_findings WHERE rule_id = ? AND file = ? AND status = 'open'",
+        )
+        .bind(rule_id)
+        .bind(file)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+    }
+
+    /// Put a finding into pending state so mark_finding_failed can act on it.
+    async fn set_pending(store: &ReviewStore, rule_id: &str, file: &str) {
+        sqlx::query(
+            "UPDATE review_findings SET task_id = 'pending', claimed_at = datetime('now') \
+             WHERE rule_id = ? AND file = ? AND status = 'open'",
+        )
+        .bind(rule_id)
+        .bind(file)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mark_finding_failed_increments_count() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        store
+            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .await?;
+
+        for expected in 1u32..=3 {
+            set_pending(&store, "R1", "a.rs").await;
+            store.mark_finding_failed("R1", "a.rs").await?;
+            let (count, _) = get_cooldown(&store, "R1", "a.rs").await;
+            assert_eq!(
+                count as u32, expected,
+                "failure_count after {} calls",
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cooldown_until_is_future() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        store
+            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .await?;
+
+        set_pending(&store, "R1", "a.rs").await;
+        store.mark_finding_failed("R1", "a.rs").await?;
+
+        let (_, cooldown_until) = get_cooldown(&store, "R1", "a.rs").await;
+        let ts_str = cooldown_until.expect("cooldown_until must be set after failure");
+        // Parse the SQLite datetime string (format: "YYYY-MM-DD HH:MM:SS").
+        let dt = chrono::NaiveDateTime::parse_from_str(&ts_str, "%Y-%m-%d %H:%M:%S")
+            .expect("cooldown_until must be a valid datetime");
+        let now = chrono::Utc::now().naive_utc();
+        assert!(dt > now, "cooldown_until must be in the future, got {dt}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exponential_backoff_schedule() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        store
+            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .await?;
+
+        // Expected delays (seconds) for failure_count = 0..=5.
+        let expected_secs: &[i64] = &[3600, 7200, 14400, 28800, 57600, 86400];
+        for &expected in expected_secs {
+            set_pending(&store, "R1", "a.rs").await;
+            let before = chrono::Utc::now().naive_utc();
+            store.mark_finding_failed("R1", "a.rs").await?;
+            let after = chrono::Utc::now().naive_utc();
+
+            let (_, cooldown_until) = get_cooldown(&store, "R1", "a.rs").await;
+            let ts_str = cooldown_until.unwrap();
+            let dt = chrono::NaiveDateTime::parse_from_str(&ts_str, "%Y-%m-%d %H:%M:%S").unwrap();
+
+            let lower = before + chrono::Duration::seconds(expected) - chrono::Duration::seconds(2);
+            let upper = after + chrono::Duration::seconds(expected) + chrono::Duration::seconds(2);
+            assert!(
+                dt >= lower && dt <= upper,
+                "cooldown_until {dt} not in expected window [{lower}, {upper}] \
+                 for delay {expected}s"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_spawnable_excludes_cooldown() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        store
+            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .await?;
+
+        // Set an active cooldown (far future).
+        sqlx::query(
+            "UPDATE review_findings \
+             SET cooldown_until = datetime('now', '+3600 seconds') \
+             WHERE rule_id = 'R1' AND file = 'a.rs' AND status = 'open'",
+        )
+        .execute(&store.pool)
+        .await?;
+
+        let spawnable = store
+            .list_spawnable_findings("rev-1", &["P1", "P2"])
+            .await?;
+        assert!(
+            spawnable.is_empty(),
+            "finding with active cooldown must not appear in spawnable list"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_spawnable_includes_expired_cooldown() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        store
+            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .await?;
+
+        // Set an expired cooldown (past timestamp).
+        sqlx::query(
+            "UPDATE review_findings \
+             SET cooldown_until = datetime('now', '-1 seconds') \
+             WHERE rule_id = 'R1' AND file = 'a.rs' AND status = 'open'",
+        )
+        .execute(&store.pool)
+        .await?;
+
+        let spawnable = store
+            .list_spawnable_findings("rev-1", &["P1", "P2"])
+            .await?;
+        assert_eq!(
+            spawnable.len(),
+            1,
+            "finding with expired cooldown must appear in spawnable list"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reset_clears_cooldown() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        store
+            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .await?;
+
+        // Apply a failure to set counters.
+        set_pending(&store, "R1", "a.rs").await;
+        store.mark_finding_failed("R1", "a.rs").await?;
+        let (count_before, cooldown_before) = get_cooldown(&store, "R1", "a.rs").await;
+        assert_eq!(count_before, 1);
+        assert!(cooldown_before.is_some());
+
+        store.reset_finding_cooldown("R1", "a.rs").await?;
+
+        let (count_after, cooldown_after) = get_cooldown(&store, "R1", "a.rs").await;
+        assert_eq!(count_after, 0, "failure_count must be 0 after reset");
+        assert!(
+            cooldown_after.is_none(),
+            "cooldown_until must be NULL after reset"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_strategy1_recovery_triggers_backoff() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        store
+            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .await?;
+
+        // Simulate a confirmed-task pending row (real_task_id set).
+        sqlx::query(
+            "UPDATE review_findings \
+             SET task_id = 'pending', claimed_at = datetime('now'), real_task_id = 'task-xyz' \
+             WHERE rule_id = 'R1' AND file = 'a.rs' AND status = 'open'",
+        )
+        .execute(&store.pool)
+        .await?;
+
+        // Strategy-1 recovery: task is done → should trigger backoff.
+        let recovered = store
+            .recover_stale_pending_claims(3900, |_tid| true)
+            .await?;
+        assert_eq!(recovered, 1, "one row must be recovered");
+
+        let (count, cooldown) = get_cooldown(&store, "R1", "a.rs").await;
+        assert_eq!(
+            count, 1,
+            "failure_count must be 1 after strategy-1 recovery"
+        );
+        assert!(
+            cooldown.is_some(),
+            "cooldown_until must be set after strategy-1 recovery"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_strategy2_timeout_no_backoff() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        store
+            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .await?;
+
+        // Simulate a stale mid-claim row (no real_task_id, old claimed_at).
+        sqlx::query(
+            "UPDATE review_findings \
+             SET task_id = 'pending', \
+                 claimed_at = datetime('now', '-4000 seconds'), \
+                 real_task_id = NULL \
+             WHERE rule_id = 'R1' AND file = 'a.rs' AND status = 'open'",
+        )
+        .execute(&store.pool)
+        .await?;
+
+        // Strategy-2 recovery via time threshold — must NOT apply backoff.
+        let recovered = store
+            .recover_stale_pending_claims(3900, |_tid| false)
+            .await?;
+        assert_eq!(recovered, 1, "one row must be recovered via timeout");
+
+        let (count, cooldown) = get_cooldown(&store, "R1", "a.rs").await;
+        assert_eq!(
+            count, 0,
+            "failure_count must remain 0 for strategy-2 recovery"
+        );
+        assert!(
+            cooldown.is_none(),
+            "cooldown_until must stay NULL for strategy-2 recovery"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resolution_clears_cooldown_state() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ReviewStore::open(&dir.path().join("review.db")).await?;
+        store
+            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .await?;
+
+        // Apply some failures so counters are non-zero.
+        set_pending(&store, "R1", "a.rs").await;
+        store.mark_finding_failed("R1", "a.rs").await?;
+        set_pending(&store, "R1", "a.rs").await;
+        store.mark_finding_failed("R1", "a.rs").await?;
+
+        let (count_before, cooldown_before) = get_cooldown(&store, "R1", "a.rs").await;
+        assert_eq!(count_before, 2);
+        assert!(cooldown_before.is_some());
+
+        // A new scan (rev-2) does not include this finding.  reset_cooldowns_for_resolved
+        // should clear the counters since the finding's review_id is still "rev-1".
+        let cleared = store.reset_cooldowns_for_resolved("rev-2").await?;
+        assert_eq!(cleared, 1, "one finding must have its cooldown cleared");
+
+        let (count_after, cooldown_after) = get_cooldown(&store, "R1", "a.rs").await;
+        assert_eq!(count_after, 0, "failure_count must be 0 after resolution");
+        assert!(
+            cooldown_after.is_none(),
+            "cooldown_until must be NULL after resolution"
+        );
         Ok(())
     }
 }

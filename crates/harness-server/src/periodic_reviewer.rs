@@ -1208,6 +1208,21 @@ async fn run_review_tick(
                                     );
                                 }
                             }
+                            // Reset cooldown counters for findings that were not
+                            // seen in this scan cycle (violation resolved).
+                            // This runs after the spawn loop so that resolution
+                            // and re-spawn cannot race within the same tick.
+                            match rs.reset_cooldowns_for_resolved(&final_task_id.0).await {
+                                Ok(0) => {}
+                                Ok(n) => tracing::debug!(
+                                    cleared = n,
+                                    "scheduler: reset cooldowns for resolved findings"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "scheduler: reset_cooldowns_for_resolved failed \
+                                     (continuing): {e}"
+                                ),
+                            }
                         }
                         Err(e) => tracing::warn!("scheduler: failed to persist findings: {e}"),
                     }
