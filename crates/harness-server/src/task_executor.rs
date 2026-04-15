@@ -534,6 +534,12 @@ async fn run_agent_streaming(
     let mut output = String::new();
     let mut token_usage = TokenUsage::default();
     let mut first_token_latency_ms: Option<u64> = None;
+    // Tracks the byte position up to which we have already scanned for
+    // CREATED_ISSUE= so we do not re-scan the whole buffer on every delta.
+    let mut scanned_len: usize = 0;
+    // Set to true once the early backfill has been attempted so we do not
+    // issue redundant DB writes.
+    let mut early_backfill_attempted = false;
 
     loop {
         tokio::select! {
@@ -551,6 +557,43 @@ async fn run_agent_streaming(
                                         Some(turn_start.elapsed().as_millis() as u64);
                                 }
                                 output.push_str(text);
+
+                                // Early backfill: detect CREATED_ISSUE= as it streams
+                                // and persist external_id immediately.  This closes the
+                                // race where the GitHub webhook for the newly created
+                                // issue arrives before the agent finishes and the
+                                // post-execution backfill runs.
+                                if !early_backfill_attempted
+                                    && output[scanned_len..].contains("CREATED_ISSUE=")
+                                {
+                                    if let Some(issue_num) =
+                                        prompts::parse_created_issue_number(&output)
+                                    {
+                                        let needs_backfill =
+                                            store.get(task_id).is_some_and(|s| {
+                                                s.external_id.is_none()
+                                                    && s.source.as_deref() == Some("auto-fix")
+                                            });
+                                        if needs_backfill {
+                                            let eid = format!("issue:{issue_num}");
+                                            match store.update_external_id(task_id, &eid).await {
+                                                Ok(()) => tracing::info!(
+                                                    task_id = %task_id,
+                                                    external_id = %eid,
+                                                    "streaming: early-backfilled external_id for auto-fix task"
+                                                ),
+                                                Err(e) => tracing::warn!(
+                                                    task_id = %task_id,
+                                                    "streaming: failed to early-backfill external_id: {e}"
+                                                ),
+                                            }
+                                        }
+                                        // Whether or not this task needed a backfill,
+                                        // we have consumed the sentinel — do not retry.
+                                        early_backfill_attempted = true;
+                                    }
+                                }
+                                scanned_len = output.len();
                             }
                             StreamItem::ItemCompleted {
                                 item: Item::AgentReasoning { content },

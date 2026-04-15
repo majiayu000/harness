@@ -739,47 +739,27 @@ fn is_valid_github_pr_url(url: &str) -> bool {
     parts[4..].iter().all(|s| is_valid_slug(s))
 }
 
-/// Parse the most-recently created GitHub issue number from agent output.
+/// Parse the created GitHub issue number from agent output.
 ///
-/// Accepts two forms:
-/// 1. A GitHub issue URL: `https://github.com/{owner}/{repo}/issues/{number}`
-/// 2. An explicit sentinel line: `CREATED_ISSUE={number}`
+/// Only recognises the explicit authoritative sentinel line:
+///   `CREATED_ISSUE=<number>`
 ///
-/// Returns the **last** match found in the output (the most likely final result).
-/// Deliberately rejects bare `#N` patterns — too many false positives from PR
-/// references, line numbers, and issue mentions in comments.
+/// URL scanning was deliberately removed: any unrelated issue link the agent
+/// mentions (in summaries, tool output, or PR descriptions) would be a false
+/// positive, poisoning `external_id` and causing the dedup layer to suppress
+/// the wrong webhook.  The auto-fix prompt explicitly instructs the agent to
+/// emit this sentinel, so heuristic URL extraction is unnecessary.
+///
+/// Returns the **last** sentinel value found (the most likely final answer
+/// when the agent self-corrects mid-output).
 pub fn parse_created_issue_number(output: &str) -> Option<u64> {
     let mut last: Option<u64> = None;
 
     for line in output.lines() {
         let line = line.trim();
-
-        // Explicit sentinel: CREATED_ISSUE=<number>
         if let Some(rest) = line.strip_prefix("CREATED_ISSUE=") {
             if let Ok(n) = rest.trim().parse::<u64>() {
                 last = Some(n);
-                continue;
-            }
-        }
-
-        // GitHub issue URL pattern: https://github.com/<owner>/<repo>/issues/<number>
-        // Scan each whitespace-separated token on the line for a matching URL.
-        for token in line.split_whitespace() {
-            // Strip leading punctuation (e.g. parens, angle brackets)
-            let token = token.trim_start_matches(|c: char| !c.is_alphanumeric() && c != 'h');
-            // Strip trailing punctuation
-            let token = token.trim_end_matches(|c: char| !c.is_alphanumeric());
-
-            let path = match token.strip_prefix("https://github.com/") {
-                Some(p) => p,
-                None => continue,
-            };
-            // path must be: <owner>/<repo>/issues/<number>[/<extra>]
-            let parts: Vec<&str> = path.splitn(5, '/').collect();
-            if parts.len() >= 4 && parts[2] == "issues" {
-                if let Ok(n) = parts[3].parse::<u64>() {
-                    last = Some(n);
-                }
             }
         }
     }
@@ -1612,27 +1592,28 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_created_issue_number_github_url() {
-        let output = "Created issue https://github.com/owner/repo/issues/42";
-        assert_eq!(parse_created_issue_number(output), Some(42));
-    }
-
-    #[test]
     fn test_parse_created_issue_number_sentinel() {
         let output = "some output\nCREATED_ISSUE=99\nmore output";
         assert_eq!(parse_created_issue_number(output), Some(99));
     }
 
     #[test]
-    fn test_parse_created_issue_number_returns_last() {
-        let output =
-            "https://github.com/owner/repo/issues/10\nhttps://github.com/owner/repo/issues/20";
+    fn test_parse_created_issue_number_returns_last_sentinel() {
+        // When the agent emits two sentinel lines (self-correction), take the last.
+        let output = "CREATED_ISSUE=10\nCREATED_ISSUE=20";
         assert_eq!(parse_created_issue_number(output), Some(20));
     }
 
     #[test]
-    fn test_parse_created_issue_number_pr_url_only() {
-        // PR URLs (/pull/) must not match — only /issues/ URLs count.
+    fn test_parse_created_issue_number_github_url_ignored() {
+        // URL scanning was removed to prevent false positives — bare URLs must not match.
+        let output = "Created issue https://github.com/owner/repo/issues/42";
+        assert_eq!(parse_created_issue_number(output), None);
+    }
+
+    #[test]
+    fn test_parse_created_issue_number_pr_url_ignored() {
+        // PR URLs must not match either.
         let output = "PR_URL=https://github.com/owner/repo/pull/42";
         assert_eq!(parse_created_issue_number(output), None);
     }
