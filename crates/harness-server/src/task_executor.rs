@@ -1,3 +1,4 @@
+pub(crate) mod conflict_resolver;
 pub(crate) mod helpers;
 pub(crate) mod pr_detection;
 
@@ -892,6 +893,78 @@ async fn run_triage_plan_pipeline(
     Ok((Some(plan_text), complexity, 2))
 }
 
+/// Fire a single agent turn to rebase a conflicting PR onto `origin/main`.
+///
+/// Logs the outcome (`REBASE_OK` / `REBASE_FAILED`) but does not propagate
+/// errors — a rebase failure is not fatal; the review loop will handle the PR.
+async fn run_rebase_turn(
+    agent: &dyn CodeAgent,
+    pr_num: u64,
+    project: &std::path::Path,
+    repo: &str,
+    turn_timeout: Duration,
+    cargo_env: &HashMap<String, String>,
+) {
+    // Fetch the branch name from GitHub so the prompt has an exact ref.
+    let branch = {
+        let out = tokio::process::Command::new("gh")
+            .current_dir(project)
+            .args([
+                "pr",
+                "view",
+                &pr_num.to_string(),
+                "--json",
+                "headRefName",
+                "--jq",
+                ".headRefName",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .trim_matches('"')
+                .to_string(),
+            _ => {
+                tracing::warn!(
+                    pr = pr_num,
+                    "run_rebase_turn: could not fetch branch name; skipping"
+                );
+                return;
+            }
+        }
+    };
+
+    let prompt = harness_core::prompts::rebase_conflicting_pr(pr_num, &branch, repo);
+    let req = AgentRequest {
+        prompt,
+        project_root: project.to_path_buf(),
+        env_vars: cargo_env.clone(),
+        execution_phase: Some(harness_core::types::ExecutionPhase::Planning),
+        ..Default::default()
+    };
+
+    match tokio::time::timeout(turn_timeout, agent.execute(req)).await {
+        Ok(Ok(resp)) => {
+            let last = resp.output.lines().next_back().unwrap_or("").trim();
+            if last.contains("REBASE_OK") {
+                tracing::info!(pr = pr_num, "rebase turn: REBASE_OK");
+            } else {
+                tracing::warn!(
+                    pr = pr_num,
+                    last_line = last,
+                    "rebase turn: REBASE_FAILED or unexpected output"
+                );
+            }
+        }
+        Ok(Err(e)) => tracing::warn!(pr = pr_num, error = %e, "rebase turn: agent error"),
+        Err(_) => tracing::warn!(pr = pr_num, "rebase turn: timed out"),
+    }
+}
+
 pub(crate) async fn run_task(
     store: &TaskStore,
     task_id: &TaskId,
@@ -978,6 +1051,8 @@ pub(crate) async fn run_task(
     };
     let resumed_pr_url: Option<String> =
         task_pr_url.or_else(|| checkpoint.as_ref().and_then(|c| c.pr_url.clone()));
+    // Capture before `resumed_pr_url` is moved into the `'implement` block.
+    let was_resumed_pr = resumed_pr_url.is_some();
     let resumed_plan: Option<String> = checkpoint.and_then(|c| c.plan_output);
 
     // --- Pipeline: Triage → Plan → Implement ---
@@ -1619,6 +1694,47 @@ pub(crate) async fn run_task(
 
         (pr_url, pr_num)
     }; // end 'implement
+
+    // Conflict resolution gate: intercept CONFLICTING PRs before the review loop.
+    // Only runs on the resume/recovery path — fresh PRs cannot be conflicting yet.
+    if was_resumed_pr {
+        use conflict_resolver::{assess_pr_conflict, PrConflictSize};
+        let conflict_size = assess_pr_conflict(pr_num, &project).await;
+        match conflict_size {
+            PrConflictSize::Small {
+                file_count,
+                region_count,
+            } => {
+                tracing::info!(
+                    pr = pr_num,
+                    file_count,
+                    region_count,
+                    "conflict: small — attempting auto-rebase"
+                );
+                run_rebase_turn(
+                    agent,
+                    pr_num,
+                    &project,
+                    &repo_slug,
+                    turn_timeout,
+                    &cargo_env,
+                )
+                .await;
+            }
+            PrConflictSize::Large {
+                file_count,
+                region_count,
+            } => {
+                tracing::warn!(
+                    pr = pr_num,
+                    file_count,
+                    region_count,
+                    "conflict: too large for auto-rebase — deferring to review agent"
+                );
+            }
+            PrConflictSize::Clean | PrConflictSize::Unknown(_) => {}
+        }
+    }
 
     // Agent review loop (if enabled and reviewer available, and not skipped by triage complexity)
     let mut agent_pushed_commit = false;

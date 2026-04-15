@@ -73,6 +73,47 @@ pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str, repo: &str
     )
 }
 
+/// Build prompt: rebase a conflicting PR onto the current main branch.
+///
+/// Used when [`conflict_resolver::assess_pr_conflict`] classifies the PR as
+/// `Small` (≤3 files, <5 conflict regions). The agent performs the rebase
+/// inside an isolated worktree and force-pushes the result.
+pub fn rebase_conflicting_pr(pr_num: u64, branch: &str, repo: &str) -> String {
+    format!(
+        "PR #{pr_num} on branch `{branch}` in `{repo}` has a merge conflict that is small \
+         enough for automatic rebase.\n\n\
+         IMPORTANT: Never run `git checkout` or `git stash` in the main repository working tree.\n\
+         All work must be done in an isolated worktree.\n\n\
+         Steps:\n\
+         1. Fetch and create an isolated worktree:\n\
+            ```\n\
+            git fetch origin\n\
+            git worktree remove /tmp/harness-rebase-{pr_num} 2>/dev/null || rm -rf /tmp/harness-rebase-{pr_num} 2>/dev/null || true\n\
+            git worktree prune\n\
+            git worktree add /tmp/harness-rebase-{pr_num} {branch}\n\
+            ```\n\
+         2. Rebase onto origin/main inside the worktree:\n\
+            ```\n\
+            cd /tmp/harness-rebase-{pr_num}\n\
+            git rebase origin/main\n\
+            ```\n\
+         3. If rebase conflicts appear, resolve each file, then:\n\
+            ```\n\
+            git add <resolved-files>\n\
+            git rebase --continue\n\
+            ```\n\
+            Repeat until the rebase completes successfully.\n\
+         4. Force-push the rebased branch:\n\
+            ```\n\
+            git push --force-with-lease origin {branch}\n\
+            ```\n\
+         5. Clean up: `git worktree remove /tmp/harness-rebase-{pr_num}`\n\n\
+         On the last line of your output, print exactly one of:\n\
+         - `REBASE_OK` if the rebase and push succeeded.\n\
+         - `REBASE_FAILED` if you could not complete the rebase for any reason."
+    )
+}
+
 /// Build triage prompt: Tech Lead evaluates whether an issue is worth implementing.
 ///
 /// Outputs a triage decision on the last line:
@@ -1084,6 +1125,22 @@ fn last_non_empty_line(output: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebase_prompt_contains_force_push() {
+        let p = rebase_conflicting_pr(42, "feat/my-branch", "owner/repo");
+        assert!(
+            p.contains("--force-with-lease"),
+            "prompt must instruct force-with-lease push"
+        );
+    }
+
+    #[test]
+    fn rebase_prompt_contains_pr_branch() {
+        let branch = "fix/issue-123";
+        let p = rebase_conflicting_pr(123, branch, "owner/repo");
+        assert!(p.contains(branch), "prompt must reference the PR branch");
+    }
 
     #[test]
     fn test_gc_adopt_prompt() {
