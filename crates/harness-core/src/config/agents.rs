@@ -113,7 +113,7 @@ pub struct AgentsConfig {
     pub allowed_tools: Option<Vec<String>>,
     /// Maximum seconds of silence on a stream before declaring a zombie and
     /// killing the subprocess. Set to `0` to disable the per-line idle timeout.
-    /// Default: 1800 (30 minutes).
+    /// Default: 3600 (60 minutes).
     #[serde(
         default = "default_stream_timeout_secs",
         deserialize_with = "deserialize_stream_timeout_secs"
@@ -122,7 +122,7 @@ pub struct AgentsConfig {
 }
 
 fn default_stream_timeout_secs() -> Option<u64> {
-    Some(1800)
+    Some(3600)
 }
 
 /// Deserializer for `stream_timeout_secs`: TOML integer `0` maps to `None`

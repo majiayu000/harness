@@ -32,7 +32,7 @@ impl ClaudeCodeAgent {
             default_model,
             sandbox_mode,
             reasoning_budget: None,
-            stream_timeout_secs: Some(1800),
+            stream_timeout_secs: Some(3600),
         }
     }
 

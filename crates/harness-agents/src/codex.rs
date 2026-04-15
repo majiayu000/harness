@@ -40,7 +40,7 @@ impl CodexAgent {
             reasoning_effort: "high".to_string(),
             cloud,
             sandbox_mode,
-            stream_timeout_secs: Some(1800),
+            stream_timeout_secs: Some(3600),
         }
     }
 
