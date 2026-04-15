@@ -84,30 +84,23 @@ pub fn triage_prompt(issue: u64) -> PromptParts {
     PromptParts {
         static_instructions: format!(
             "You are a Tech Lead evaluating GitHub issue #{issue} before any code is written.\n\n\
-             **CRITICAL FIRST STEP — duplicate PR check:**\n\
-             Before anything else, run: `gh pr list --repo $(gh repo view --json nameWithOwner -q .nameWithOwner) --search \"{issue}\" --state open --json number,title,url`\n\
-             If ANY open PR already references this issue (in title or body), output:\n\
-             COMPLEXITY=low\n\
-             TRIAGE=SKIP\n\
-             with the reason: \"open PR #<number> already targets this issue\".\n\
-             Do NOT proceed with assessment if an open PR exists.\n\n\
-             Your job is to THINK before committing engineering effort. Read the issue carefully, then assess:\n\n\
-             1. **Complexity**: Is this trivial (typo, config, 1-file change), moderate (2-3 files, \
-             clear scope), or complex (4+ files, new API surface, architectural change)?\n\
-             2. **Clarity**: Are the requirements specific enough to implement without guessing? \
-             What assumptions would an engineer have to make?\n\
-             3. **Risk**: What could go wrong in production? Are there edge cases, \
-             backward compatibility concerns, or security implications?\n\
-             4. **Scope**: Does this issue try to do too much? Should it be split?\n\n\
-             Based on your assessment, choose ONE recommendation:\n\
-             - PROCEED — trivial/clear change, no planning needed, go straight to implementation\n\
-             - PROCEED_WITH_PLAN — non-trivial change that needs an implementation plan first\n\
-             - NEEDS_CLARIFICATION — issue is ambiguous; list the specific questions that must be answered\n\
-             - SKIP — not worth doing (explain why: duplicate, out of scope, or fundamentally flawed)\n\n\
-             Output format: Write your assessment (2-5 sentences), then on the second-to-last line print:\n\
-             COMPLEXITY=<low|medium|high> (low=typo/doc fix, medium=single-module change, high=cross-file refactor)\n\
-             Then on the LAST line print:\n\
-             TRIAGE=<recommendation>"
+             **Step 1 — duplicate PR check:**\n\
+             Run: `gh pr list --search \"{issue}\" --state open --json number,title`\n\
+             If an open PR targets this issue, output TRIAGE=SKIP with the PR number.\n\n\
+             **Step 2 — assess the issue (if no duplicate PR):**\n\
+             Read the issue. Assess complexity and clarity briefly (2-3 sentences).\n\n\
+             **Step 3 — choose ONE recommendation:**\n\
+             - PROCEED — clear change, go straight to implementation\n\
+             - PROCEED_WITH_PLAN — complex change, needs a plan first\n\
+             - SKIP — ONLY if the issue is a literal duplicate of another issue, or fundamentally impossible\n\n\
+             **IMPORTANT RULES:**\n\
+             - Default to PROCEED or PROCEED_WITH_PLAN. Most issues should be attempted.\n\
+             - Do NOT skip issues just because they are large, complex, or ambitious.\n\
+             - Do NOT use NEEDS_CLARIFICATION — if the issue is unclear, PROCEED_WITH_PLAN and let the planner figure it out.\n\
+             - Large refactors (4+ files) → PROCEED_WITH_PLAN, never SKIP.\n\n\
+             **OUTPUT FORMAT (mandatory, must be the last 2 lines):**\n\
+             COMPLEXITY=<low|medium|high>\n\
+             TRIAGE=<PROCEED|PROCEED_WITH_PLAN|SKIP>"
         ),
         context: String::new(),
         dynamic_payload: String::new(),
@@ -1895,7 +1888,6 @@ PR_URL=https://github.com/owner/repo/pull/269";
         assert!(s.contains("Tech Lead"));
         assert!(s.contains("PROCEED"));
         assert!(s.contains("PROCEED_WITH_PLAN"));
-        assert!(s.contains("NEEDS_CLARIFICATION"));
         assert!(s.contains("SKIP"));
         assert!(s.contains("TRIAGE="));
     }

@@ -838,13 +838,9 @@ async fn run_triage_plan_pipeline(
             anyhow::bail!("triage decided to skip issue #{issue}");
         }
         prompts::TriageDecision::NeedsClarification => {
-            mutate_and_persist(store, task_id, |state| {
-                state.status = crate::task_runner::TaskStatus::Failed;
-                state.phase = TaskPhase::Terminal;
-                state.error = Some("Triage: needs clarification before implementation".to_string());
-            })
-            .await?;
-            anyhow::bail!("triage requires clarification on issue #{issue}");
+            // Treat as ProceedWithPlan — let the planner figure out ambiguities
+            // instead of failing the task outright.
+            tracing::info!(task_id = %task_id, "triage: NEEDS_CLARIFICATION → treating as PROCEED_WITH_PLAN");
         }
         prompts::TriageDecision::Proceed => {
             tracing::info!(task_id = %task_id, "triage: PROCEED — skipping plan phase");
