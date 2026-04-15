@@ -185,21 +185,26 @@ impl ReviewStore {
         )
         .execute(&pool)
         .await?;
-        // Remove duplicate (rule_id, file, status) rows that may exist from
-        // before this unique index was introduced; keep the most recent row per group.
+        // Remove duplicate (project_root, rule_id, file, status) rows that may exist
+        // from before this unique index was introduced; keep the most recent row per group.
         sqlx::query(
             "DELETE FROM review_findings \
              WHERE rowid NOT IN ( \
-                 SELECT MAX(rowid) FROM review_findings GROUP BY rule_id, file, status \
+                 SELECT MAX(rowid) FROM review_findings GROUP BY project_root, rule_id, file, status \
              )",
         )
         .execute(&pool)
         .await?;
+        // Migrate: rebuild the unique dedup index to include project_root so that
+        // findings from different projects with the same rule_id+file do not collide.
+        sqlx::query("DROP INDEX IF EXISTS idx_finding_dedup")
+            .execute(&pool)
+            .await?;
         // Unique index enables specific-conflict INSERT deduplication without a
         // TOCTOU race between a SELECT check and an INSERT.
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_dedup \
-             ON review_findings(rule_id, file, status)",
+             ON review_findings(project_root, rule_id, file, status)",
         )
         .execute(&pool)
         .await?;
@@ -263,11 +268,16 @@ impl ReviewStore {
             } else {
                 // Existing open finding for the same rule_id+file — mark as recurring
                 // and update project_root in case the row was created before migration.
+                // The `(project_root = ? OR project_root = '')` condition ensures that
+                // pre-migration rows (project_root='') are correctly backfilled while
+                // new rows are matched precisely by project scope.
                 sqlx::query(
                     "UPDATE review_findings SET review_id = ?, project_root = ? \
-                     WHERE rule_id = ? AND file = ? AND status = 'open'",
+                     WHERE (project_root = ? OR project_root = '') \
+                       AND rule_id = ? AND file = ? AND status = 'open'",
                 )
                 .bind(review_id)
+                .bind(project_root)
                 .bind(project_root)
                 .bind(&f.rule_id)
                 .bind(&f.file)
@@ -382,6 +392,7 @@ impl ReviewStore {
     /// Returns the number of findings recovered.
     pub async fn recover_stale_pending_claims(
         &self,
+        project_root: &str,
         stale_secs: i64,
         get_task_outcome: impl Fn(&str) -> Option<bool>,
     ) -> anyhow::Result<u64> {
@@ -389,9 +400,10 @@ impl ReviewStore {
         let with_real_id: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT rule_id, file, real_task_id \
              FROM review_findings \
-             WHERE task_id = 'pending' AND status = 'open' \
+             WHERE project_root = ? AND task_id = 'pending' AND status = 'open' \
                AND claimed_at IS NOT NULL AND real_task_id IS NOT NULL",
         )
+        .bind(project_root)
         .fetch_all(&self.pool)
         .await?;
 
@@ -401,7 +413,7 @@ impl ReviewStore {
                 Some(true) => {
                     // Task failed or was cancelled — apply exponential backoff so the
                     // same violation is not immediately re-attempted on the next tick.
-                    recovered += self.mark_finding_failed(&rule_id, &file).await?;
+                    recovered += self.mark_finding_failed(project_root, &rule_id, &file).await?;
                 }
                 Some(false) => {
                     // Task completed successfully — release the claim without penalty.
@@ -420,10 +432,11 @@ impl ReviewStore {
         // Strategy 2: recover mid-claim rows (no real task id yet) via time threshold.
         let result = sqlx::query(
             "UPDATE review_findings SET task_id = NULL, claimed_at = NULL \
-             WHERE task_id = 'pending' AND status = 'open' \
+             WHERE project_root = ? AND task_id = 'pending' AND status = 'open' \
                AND claimed_at IS NOT NULL AND real_task_id IS NULL \
                AND claimed_at < datetime('now', '-' || cast(? as text) || ' seconds')",
         )
+        .bind(project_root)
         .bind(stale_secs)
         .execute(&self.pool)
         .await?;
@@ -440,12 +453,13 @@ impl ReviewStore {
     /// via a synchronous closure.  The in-memory `TaskStore` cache only holds active
     /// tasks; terminal tasks (Failed, Cancelled) are DB-only after a server restart,
     /// so the caller must use `get_with_db_fallback` on each returned ID.
-    pub async fn list_stale_real_task_ids(&self) -> anyhow::Result<Vec<String>> {
+    pub async fn list_stale_real_task_ids(&self, project_root: &str) -> anyhow::Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT real_task_id FROM review_findings \
-             WHERE task_id = 'pending' AND status = 'open' \
+             WHERE project_root = ? AND task_id = 'pending' AND status = 'open' \
                AND claimed_at IS NOT NULL AND real_task_id IS NOT NULL",
         )
+        .bind(project_root)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
@@ -512,7 +526,7 @@ impl ReviewStore {
     /// 86400-second cap, so the `min()` always fires first at failure_count ≥ 5.
     ///
     /// Returns the number of rows updated (1 if found, 0 if not matching).
-    pub async fn mark_finding_failed(&self, rule_id: &str, file: &str) -> anyhow::Result<u64> {
+    pub async fn mark_finding_failed(&self, project_root: &str, rule_id: &str, file: &str) -> anyhow::Result<u64> {
         let result = sqlx::query(
             "UPDATE review_findings \
              SET task_id = NULL, \
@@ -521,8 +535,10 @@ impl ReviewStore {
                  failure_count = failure_count + 1, \
                  cooldown_until = datetime('now', '+' || \
                      cast(min(3600 * (1 << min(failure_count, 24)), 86400) as text) || ' seconds') \
-             WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id = 'pending'",
+             WHERE project_root = ? AND rule_id = ? AND file = ? AND status = 'open' \
+               AND task_id IS NOT NULL",
         )
+        .bind(project_root)
         .bind(rule_id)
         .bind(file)
         .execute(&self.pool)

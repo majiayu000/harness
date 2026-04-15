@@ -1012,7 +1012,7 @@ async fn run_review_tick(
                             // DB-only after a server restart.  Using get_with_db_fallback
                             // ensures we correctly classify those tasks instead of
                             // misidentifying them as successful (None in-memory).
-                            let stale_ids = rs.list_stale_real_task_ids().await.unwrap_or_default();
+                            let stale_ids = rs.list_stale_real_task_ids(&project_root_for_poll.to_string_lossy()).await.unwrap_or_default();
                             let mut task_outcome_map: std::collections::HashMap<
                                 String,
                                 Option<bool>,
@@ -1038,7 +1038,7 @@ async fn run_review_tick(
                                 task_outcome_map.insert(tid, outcome);
                             }
                             match rs
-                                .recover_stale_pending_claims(3900, |tid| {
+                                .recover_stale_pending_claims(&project_root_for_poll.to_string_lossy(), 3900, |tid| {
                                     // Flatten Option<&Option<bool>> → Option<bool>.
                                     task_outcome_map.get(tid).copied().flatten()
                                 })
