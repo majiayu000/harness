@@ -496,17 +496,23 @@ impl ReviewStore {
     /// both `confirm_task_spawned` attempts failed.  This enables task-status-based
     /// stale recovery via [`recover_stale_pending_claims`] without relying on a
     /// fixed time threshold that may not bound actual task lifetime.
+    ///
+    /// Scoped by `project_root` to prevent cross-project contamination when two
+    /// projects share the same `rule_id` + `file` combination.
     pub async fn record_real_task_id(
         &self,
+        project_root: &str,
         rule_id: &str,
         file: &str,
         real_task_id: &str,
     ) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE review_findings SET real_task_id = ? \
-             WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id = 'pending'",
+             WHERE project_root = ? AND rule_id = ? AND file = ? \
+               AND status = 'open' AND task_id = 'pending'",
         )
         .bind(real_task_id)
+        .bind(project_root)
         .bind(rule_id)
         .bind(file)
         .execute(&self.pool)

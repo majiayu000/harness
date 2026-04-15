@@ -1190,6 +1190,8 @@ async fn run_review_tick(
                                                                     .await;
                                                                 match rs
                                                                     .record_real_task_id(
+                                                                        &project_root_for_poll
+                                                                            .to_string_lossy(),
                                                                         &finding.rule_id,
                                                                         &finding.file,
                                                                         &fix_task_id.0,
