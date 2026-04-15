@@ -387,6 +387,13 @@ pub struct PersistedRequestSettings {
     /// Pure prompt tasks and PR tasks leave this `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_prompt: Option<String>,
+    /// Primary prompt for prompt-only tasks (no issue or pr).
+    ///
+    /// Stored so that `AwaitingDeps` tasks can reconstruct the original request
+    /// when their dependencies resolve.  Issue and PR tasks leave this `None`
+    /// because the work is identifiable from the issue/PR number alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
 }
 
 impl PersistedRequestSettings {
@@ -410,6 +417,13 @@ impl PersistedRequestSettings {
             } else {
                 None
             },
+            // For prompt-only tasks (no issue/pr), store the prompt so that
+            // AwaitingDeps tasks can reconstruct the original request when deps resolve.
+            prompt: if req.issue.is_none() && req.pr.is_none() {
+                req.prompt.clone()
+            } else {
+                None
+            },
         }
     }
 
@@ -426,6 +440,10 @@ impl PersistedRequestSettings {
         // Restore the additional prompt context for recovered issue tasks.
         if self.additional_prompt.is_some() {
             req.prompt = self.additional_prompt.clone();
+        }
+        // Restore the primary prompt for recovered prompt-only tasks.
+        if self.prompt.is_some() {
+            req.prompt = self.prompt.clone();
         }
     }
 }
@@ -1332,15 +1350,6 @@ impl TaskStore {
         }
     }
 
-    /// Check if the rate-limit circuit breaker is currently active.
-    pub async fn is_rate_limited(&self) -> bool {
-        let deadline = *self.rate_limit_until.read().await;
-        match deadline {
-            Some(until) => tokio::time::Instant::now() < until,
-            None => false,
-        }
-    }
-
     /// Persist an artifact captured from agent output during task execution.
     pub(crate) async fn insert_artifact(
         &self,
@@ -2221,6 +2230,9 @@ pub async fn spawn_task_awaiting_deps(
     state.external_id = req.external_id.clone();
     state.repo = req.repo.clone();
     state.priority = req.priority;
+    state.issue = req.issue;
+    state.description = summarize_request_description(&req);
+    state.request_settings = Some(PersistedRequestSettings::from_req(&req));
     if let Some(parent) = req.parent_task_id.clone() {
         state.parent_id = Some(parent);
     }

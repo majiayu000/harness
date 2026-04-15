@@ -156,21 +156,6 @@ impl QValueStore {
         Ok(ids)
     }
 
-    /// Ensure a rule_experience row exists and increment its `retrieval_count`.
-    pub async fn increment_retrieval(&self, rule_id: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO rule_experiences (rule_id, retrieval_count, updated_at)
-             VALUES (?, 1, datetime('now'))
-             ON CONFLICT(rule_id) DO UPDATE SET
-               retrieval_count = retrieval_count + 1,
-               updated_at      = datetime('now')",
-        )
-        .bind(rule_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     /// Apply Q-value updates using the MemRL formula:
     /// `Q_new = Q_old + alpha * (reward - Q_old)`
     ///

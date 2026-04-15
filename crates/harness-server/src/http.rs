@@ -279,27 +279,6 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     )
     .await?;
 
-    // Spawn background watcher for AwaitingDeps tasks.
-    {
-        let store = storage.tasks.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let (ready_ids, failed_ids) = crate::task_runner::check_awaiting_deps(&store).await;
-                for task_id in ready_ids.iter().chain(failed_ids.iter()) {
-                    if let Err(e) = store.persist(task_id).await {
-                        tracing::warn!(
-                            "dep-watcher: failed to persist {} after transition: {e}",
-                            task_id.0
-                        );
-                    }
-                }
-            }
-        });
-    }
-
     let configured_capacity = server.config.server.notification_broadcast_capacity;
     let notification_broadcast_capacity = configured_capacity.max(1);
     let notification_lag_log_every = server.config.server.notification_lag_log_every;
@@ -676,6 +655,194 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             pending_tasks = task_count,
             "harness: ready"
         );
+    }
+
+    // Spawn background watcher for AwaitingDeps tasks.
+    // Uses Weak<AppState> to avoid a reference cycle; the loop exits when AppState is dropped.
+    {
+        let weak_state = Arc::downgrade(&state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let state = match weak_state.upgrade() {
+                    Some(s) => s,
+                    None => break,
+                };
+                let (ready_ids, failed_ids) =
+                    crate::task_runner::check_awaiting_deps(&state.core.tasks).await;
+                // Persist status changes for both ready and failed tasks.
+                for task_id in ready_ids.iter().chain(failed_ids.iter()) {
+                    if let Err(e) = state.core.tasks.persist(task_id).await {
+                        tracing::warn!(
+                            "dep-watcher: failed to persist {} after transition: {e}",
+                            task_id.0
+                        );
+                    }
+                }
+                // Spawn an agent for each task whose deps are now satisfied.
+                for task_id in ready_ids {
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        let task = match state.core.tasks.get(&task_id) {
+                            Some(t) => t,
+                            None => {
+                                tracing::warn!(
+                                    "dep-watcher: task {} not found after Pending transition",
+                                    task_id.0
+                                );
+                                return;
+                            }
+                        };
+                        // Reconstruct the project path: prefer stored project_root,
+                        // fall back to repo slug so the agent runs in the right worktree.
+                        let project_path = task
+                            .project_root
+                            .clone()
+                            .or_else(|| task.repo.as_deref().map(std::path::PathBuf::from));
+                        let canonical =
+                            match task_runner::resolve_canonical_project(project_path).await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    let reason =
+                                        format!("dep-watcher: failed to resolve project path: {e}");
+                                    tracing::error!(task_id = ?task.id, "{reason}");
+                                    if let Err(pe) = task_runner::mutate_and_persist(
+                                        &state.core.tasks,
+                                        &task.id,
+                                        move |s| {
+                                            s.status = task_runner::TaskStatus::Failed;
+                                            s.error = Some(reason);
+                                        },
+                                    )
+                                    .await
+                                    {
+                                        tracing::error!(
+                                            task_id = ?task.id,
+                                            "dep-watcher: failed to persist failed status: {pe}"
+                                        );
+                                    }
+                                    return;
+                                }
+                            };
+                        let project_id = canonical.to_string_lossy().into_owned();
+
+                        // Reconstruct the CreateTaskRequest from persisted task fields.
+                        // Parse issue/pr numbers from the canonical external_id (e.g. "issue:42").
+                        let (issue, pr) = task
+                            .external_id
+                            .as_deref()
+                            .map(|eid| {
+                                if let Some(n) = eid.strip_prefix("issue:") {
+                                    (n.parse::<u64>().ok(), None)
+                                } else if let Some(n) = eid.strip_prefix("pr:") {
+                                    (None, n.parse::<u64>().ok())
+                                } else {
+                                    (None, None)
+                                }
+                            })
+                            .unwrap_or((None, None));
+                        let mut req = task_runner::CreateTaskRequest {
+                            issue,
+                            pr,
+                            project: Some(canonical),
+                            repo: task.repo.clone(),
+                            source: task.source.clone(),
+                            external_id: task.external_id.clone(),
+                            parent_task_id: task.parent_id.clone(),
+                            priority: task.priority,
+                            ..Default::default()
+                        };
+                        // Restore execution limits and prompt from persisted settings.
+                        if let Some(ref settings) = task.request_settings {
+                            settings.apply_to_req(&mut req);
+                        }
+
+                        let permit = match state
+                            .concurrency
+                            .task_queue
+                            .acquire(&project_id, task.priority)
+                            .await
+                        {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let reason = format!(
+                                    "dep-watcher: failed to acquire concurrency permit: {e}"
+                                );
+                                tracing::error!(task_id = ?task.id, "{reason}");
+                                if let Err(pe) = task_runner::mutate_and_persist(
+                                    &state.core.tasks,
+                                    &task.id,
+                                    move |s| {
+                                        s.status = task_runner::TaskStatus::Failed;
+                                        s.error = Some(reason);
+                                    },
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        task_id = ?task.id,
+                                        "dep-watcher: failed to persist failed status: {pe}"
+                                    );
+                                }
+                                return;
+                            }
+                        };
+
+                        let agent = match task_routes::select_agent(
+                            &req,
+                            &state.core.server.agent_registry,
+                            None,
+                        ) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                let reason = format!("dep-watcher: failed to select agent: {e}");
+                                tracing::error!(task_id = ?task.id, "{reason}");
+                                if let Err(pe) = task_runner::mutate_and_persist(
+                                    &state.core.tasks,
+                                    &task.id,
+                                    move |s| {
+                                        s.status = task_runner::TaskStatus::Failed;
+                                        s.error = Some(reason);
+                                    },
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        task_id = ?task.id,
+                                        "dep-watcher: failed to persist failed status: {pe}"
+                                    );
+                                }
+                                return;
+                            }
+                        };
+                        let (reviewer, _) = resolve_reviewer(
+                            &state.core.server.agent_registry,
+                            &state.core.server.config.agents.review,
+                            agent.name(),
+                        );
+                        state.core.tasks.register_task_stream(&task.id);
+                        task_runner::spawn_preregistered_task(
+                            task.id,
+                            state.core.tasks.clone(),
+                            agent,
+                            reviewer,
+                            Arc::new(state.core.server.config.clone()),
+                            state.engines.skills.clone(),
+                            state.observability.events.clone(),
+                            state.interceptors.clone(),
+                            req,
+                            state.concurrency.workspace_mgr.clone(),
+                            permit,
+                            state.intake.completion_callback.clone(),
+                            None,
+                        )
+                        .await;
+                    });
+                }
+            }
+        });
     }
 
     // Re-dispatch tasks that were recovered to pending after server restart.
