@@ -172,10 +172,16 @@ impl ReviewStore {
             .await?;
         }
         // Partial index speeds up list_spawnable_findings which filters open rows
-        // by task_id IS NULL and cooldown_until on every scheduler tick.
+        // by review_id, task_id IS NULL and cooldown_until on every scheduler tick.
+        // Drop-and-recreate ensures the index is updated if the definition changed
+        // (CREATE INDEX IF NOT EXISTS is a no-op on an existing index, even with a
+        // different column list).
+        sqlx::query("DROP INDEX IF EXISTS idx_rf_spawnable")
+            .execute(&pool)
+            .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_rf_spawnable \
-             ON review_findings(task_id, cooldown_until) WHERE status = 'open'",
+             ON review_findings(review_id, task_id, cooldown_until) WHERE status = 'open'",
         )
         .execute(&pool)
         .await?;
@@ -371,7 +377,7 @@ impl ReviewStore {
     /// - `None`        — task is still in-flight; leave the claim intact.
     /// - `Some(true)`  — task failed or was cancelled; apply exponential backoff.
     /// - `Some(false)` — task completed successfully; release claim without penalty
-    ///                   so the next review cycle can re-evaluate the finding.
+    ///   so the next review cycle can re-evaluate the finding.
     ///
     /// Returns the number of findings recovered.
     pub async fn recover_stale_pending_claims(
