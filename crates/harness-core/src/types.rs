@@ -576,6 +576,10 @@ pub enum ExecutionPhase {
     Execution,
     /// Validation and review (uses high-reasoning model).
     Validation,
+    /// Git rebase / conflict resolution (uses lightweight model).
+    Rebase,
+    /// Simple review pass that does not require deep reasoning (uses lightweight model).
+    SimpleReview,
 }
 
 impl ExecutionPhase {
@@ -585,6 +589,8 @@ impl ExecutionPhase {
             ExecutionPhase::Planning => "max",
             ExecutionPhase::Execution => "high",
             ExecutionPhase::Validation => "max",
+            ExecutionPhase::Rebase => "low",
+            ExecutionPhase::SimpleReview => "low",
         }
     }
 }
@@ -656,6 +662,7 @@ impl ReasoningBudget {
             ExecutionPhase::Planning => self.planning_tier,
             ExecutionPhase::Execution => self.execution_tier,
             ExecutionPhase::Validation => self.validation_tier,
+            ExecutionPhase::Rebase | ExecutionPhase::SimpleReview => BudgetTier::Medium,
         };
         match tier {
             BudgetTier::XHigh => &self.xhigh_model,
@@ -849,6 +856,35 @@ mod tests {
         );
         let back: ExecutionPhase = serde_json::from_str("\"validation\"")?;
         assert_eq!(back, ExecutionPhase::Validation);
+        Ok(())
+    }
+
+    #[test]
+    fn rebase_and_simple_review_use_medium_tier() {
+        let budget = ReasoningBudget::default();
+        // Rebase and SimpleReview both map to Medium tier → haiku
+        assert_eq!(
+            budget.model_for_phase(ExecutionPhase::Rebase),
+            "claude-haiku-4-5-20251001"
+        );
+        assert_eq!(
+            budget.model_for_phase(ExecutionPhase::SimpleReview),
+            "claude-haiku-4-5-20251001"
+        );
+    }
+
+    #[test]
+    fn rebase_and_simple_review_serde_snake_case() -> anyhow::Result<()> {
+        assert_eq!(
+            serde_json::to_string(&ExecutionPhase::Rebase)?,
+            "\"rebase\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionPhase::SimpleReview)?,
+            "\"simple_review\""
+        );
+        let back: ExecutionPhase = serde_json::from_str("\"rebase\"")?;
+        assert_eq!(back, ExecutionPhase::Rebase);
         Ok(())
     }
 }

@@ -1807,6 +1807,9 @@ pub(crate) async fn run_task(
                 // burning remaining review rounds on repeated 402 errors.
                 if matches!(e, HarnessError::QuotaExhausted(_)) {
                     tracing::error!(round, error = %e, "quota exhausted during review — aborting review loop");
+                    store
+                        .set_rate_limit(std::time::Duration::from_secs(3600))
+                        .await;
                     run_on_error(&interceptors, &check_req, &e.to_string()).await;
                     mutate_and_persist(store, task_id, |s| {
                         s.status = TaskStatus::Failed;
@@ -2166,7 +2169,7 @@ async fn run_agent_review(
             },
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
-            execution_phase: Some(ExecutionPhase::Validation),
+            execution_phase: Some(ExecutionPhase::SimpleReview),
             allowed_tools: Some(vec![
                 "Read".to_string(),
                 "Grep".to_string(),
@@ -2219,6 +2222,9 @@ async fn run_agent_review(
             Ok(Err(e)) => {
                 if matches!(e, HarnessError::QuotaExhausted(_)) {
                     tracing::error!(agent_round, error = %e, "quota exhausted during agent review — aborting");
+                    store
+                        .set_rate_limit(std::time::Duration::from_secs(3600))
+                        .await;
                     run_on_error(interceptors, &review_req, &e.to_string()).await;
                     mutate_and_persist(store, task_id, |s| {
                         s.status = TaskStatus::Failed;
