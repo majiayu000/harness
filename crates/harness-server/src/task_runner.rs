@@ -389,10 +389,13 @@ pub struct PersistedRequestSettings {
     pub additional_prompt: Option<String>,
     /// Primary prompt for prompt-only tasks (no issue or pr).
     ///
-    /// Stored so that `AwaitingDeps` tasks can reconstruct the original request
-    /// when their dependencies resolve.  Issue and PR tasks leave this `None`
-    /// because the work is identifiable from the issue/PR number alone.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Kept in memory so that `AwaitingDeps` tasks can reconstruct the original
+    /// request when their dependencies resolve within the same server session.
+    /// Intentionally NOT serialised to the database: prompts may contain
+    /// credentials or sensitive data and must not be written at rest.
+    /// After a server restart the prompt will be absent; the task will still
+    /// be dispatched but without the caller's original prompt text.
+    #[serde(skip)]
     pub prompt: Option<String>,
 }
 
@@ -860,7 +863,7 @@ impl TaskStore {
     /// `SELECT status` query (no `rounds` JSON decode) for terminal tasks
     /// evicted from the startup cache.  Returns `None` when the task is
     /// unknown in both cache and DB, or when the DB call fails.
-    async fn dep_status(&self, id: &TaskId) -> Option<TaskStatus> {
+    pub(crate) async fn dep_status(&self, id: &TaskId) -> Option<TaskStatus> {
         if let Some(task) = self.cache.get(id) {
             return Some(task.status.clone());
         }
@@ -2233,6 +2236,10 @@ pub async fn spawn_task_awaiting_deps(
     state.issue = req.issue;
     state.description = summarize_request_description(&req);
     state.request_settings = Some(PersistedRequestSettings::from_req(&req));
+    // Persist the caller's resolved project root so that duplicate detection
+    // (which keys on project_root + external_id) and the dep-watcher's project
+    // path resolution both work correctly for waiting tasks.
+    state.project_root = req.project.clone();
     if let Some(parent) = req.parent_task_id.clone() {
         state.parent_id = Some(parent);
     }
@@ -2312,16 +2319,21 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
             }
         }
     }
+    // Only return IDs where the transition actually happened.  If a task was
+    // cancelled or otherwise moved out of AwaitingDeps between the snapshot
+    // and this guard, it must NOT be included — the dep-watcher would otherwise
+    // launch an already-terminal or concurrently-cancelled task.
+    let mut actually_ready: Vec<TaskId> = Vec::with_capacity(ready.len());
     for task_id in &ready {
         if let Some(mut entry) = store.cache.get_mut(task_id) {
-            // Same guard: skip if status changed since we snapshotted.
             if matches!(entry.status, TaskStatus::AwaitingDeps) {
                 entry.status = TaskStatus::Pending;
+                actually_ready.push(task_id.clone());
             }
         }
     }
 
-    (ready, newly_failed)
+    (actually_ready, newly_failed)
 }
 
 #[cfg(test)]
