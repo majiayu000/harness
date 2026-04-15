@@ -2151,6 +2151,68 @@ pub fn evaluator_prompt(contract_yaml: &str, impl_output: &str, round: u32) -> P
     }
 }
 
+// ─── Pipeline prompt templates (Part 2 of issue #772) ───────────────────────
+// These functions extract inline prompt strings from the pipeline modules into
+// testable, named templates. Callers in pipeline modules replace inline
+// `format!()` literals with calls to these functions.
+
+/// Prompt used in `run_plan_for_prompt` to ask the agent for an implementation
+/// plan before writing code (prompt-only tasks that hit the complexity gate).
+pub fn plan_for_task_prompt(task_description: &str) -> String {
+    format!(
+        "Before implementing, produce a concise implementation plan for the following task.\n\
+         List the files to change, the approach, and any non-obvious design decisions.\n\
+         Do NOT write code yet — planning only.\n\n\
+         Task:\n{task_description}"
+    )
+}
+
+/// Formats the validation-retry context injected into the implementation prompt
+/// when a post-execution interceptor returns an error.
+///
+/// `base_prompt` is the original (first) implementation prompt.
+/// `error` is the truncated validation error string.
+/// `attempt` and `max_attempts` are the current retry counter values.
+pub fn validation_retry_error_context(
+    base_prompt: &str,
+    error: &str,
+    attempt: u32,
+    max_attempts: u32,
+) -> String {
+    format!(
+        "{base_prompt}\n\nPost-execution validation failed (attempt {attempt}/{max_attempts}).\n\
+         Errors are prefixed with [COMPILE ERROR], [TEST FAILURE], [LINT ERROR], or \
+         [VALIDATION ERROR] for classified failures, or with an interceptor name \
+         (e.g. [hook_name]) for hook/policy violations — focus your fix on the indicated \
+         error type:\n{error}"
+    )
+}
+
+/// Prepends test-gate failure context to the base review prompt when the
+/// previous LGTM was rejected because the project's tests failed.
+///
+/// `gate_output` is the captured stdout/stderr from the failing test command.
+/// `base_prompt` is the normal review prompt for this round.
+pub fn test_gate_failure_context(gate_output: &str, base_prompt: &str) -> String {
+    format!(
+        "IMPORTANT: The previous LGTM was rejected because the project's tests failed. \
+         Fix the test failures before declaring LGTM again.\n\n\
+         Test output:\n```\n{gate_output}\n```\n\n{base_prompt}"
+    )
+}
+
+/// Capability restriction note injected into the reviewer prompt so the agent
+/// knows which tools are permitted in review mode.
+///
+/// This is the primary enforcement mechanism now that `--allowedTools` is no
+/// longer passed to the CLI (issue #483).
+pub fn reviewer_capability_note() -> &'static str {
+    "Tool restriction: you are operating in review mode. \
+     Only Read, Grep, Glob, and Bash are permitted. \
+     Use Bash ONLY for read-only commands like `gh pr diff`. \
+     Do NOT call Write, Edit, or any other tool."
+}
+
 #[cfg(test)]
 mod contract_prompt_tests {
     use super::*;

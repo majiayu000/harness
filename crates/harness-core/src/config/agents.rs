@@ -186,6 +186,11 @@ pub struct AgentReviewConfig {
     /// GitHub login of the review bot (used for freshness checks in review loop).
     #[serde(default = "default_reviewer_name")]
     pub reviewer_name: String,
+    /// When true, the agent review loop runs `cargo check --workspace` and
+    /// `cargo test --package <pkg>` between rounds and includes the output
+    /// in the reviewer prompt. Default false for safe incremental rollout.
+    #[serde(default)]
+    pub enable_compilation_gate: bool,
 }
 
 impl Default for AgentReviewConfig {
@@ -197,6 +202,7 @@ impl Default for AgentReviewConfig {
             review_bot_command: default_review_bot_command(),
             review_bot_auto_trigger: default_review_bot_auto_trigger(),
             reviewer_name: default_reviewer_name(),
+            enable_compilation_gate: false,
         }
     }
 }
