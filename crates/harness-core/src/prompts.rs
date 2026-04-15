@@ -739,6 +739,34 @@ fn is_valid_github_pr_url(url: &str) -> bool {
     parts[4..].iter().all(|s| is_valid_slug(s))
 }
 
+/// Parse the created GitHub issue number from agent output.
+///
+/// Only recognises the explicit authoritative sentinel line:
+///   `CREATED_ISSUE=<number>`
+///
+/// URL scanning was deliberately removed: any unrelated issue link the agent
+/// mentions (in summaries, tool output, or PR descriptions) would be a false
+/// positive, poisoning `external_id` and causing the dedup layer to suppress
+/// the wrong webhook.  The auto-fix prompt explicitly instructs the agent to
+/// emit this sentinel, so heuristic URL extraction is unnecessary.
+///
+/// Returns the **last** sentinel value found (the most likely final answer
+/// when the agent self-corrects mid-output).
+pub fn parse_created_issue_number(output: &str) -> Option<u64> {
+    let mut last: Option<u64> = None;
+
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("CREATED_ISSUE=") {
+            if let Ok(n) = rest.trim().parse::<u64>() {
+                last = Some(n);
+            }
+        }
+    }
+
+    last
+}
+
 /// Extract PR number from a GitHub PR URL.
 /// Handles URL fragments (`#discussion_r123`) and path suffixes (`/files`, `/commits`).
 pub fn extract_pr_number(url: &str) -> Option<u64> {
@@ -1561,6 +1589,45 @@ mod tests {
             extract_pr_number("https://github.com/owner/repo/pull/42#discussion_r123"),
             Some(42)
         );
+    }
+
+    #[test]
+    fn test_parse_created_issue_number_sentinel() {
+        let output = "some output\nCREATED_ISSUE=99\nmore output";
+        assert_eq!(parse_created_issue_number(output), Some(99));
+    }
+
+    #[test]
+    fn test_parse_created_issue_number_returns_last_sentinel() {
+        // When the agent emits two sentinel lines (self-correction), take the last.
+        let output = "CREATED_ISSUE=10\nCREATED_ISSUE=20";
+        assert_eq!(parse_created_issue_number(output), Some(20));
+    }
+
+    #[test]
+    fn test_parse_created_issue_number_github_url_ignored() {
+        // URL scanning was removed to prevent false positives — bare URLs must not match.
+        let output = "Created issue https://github.com/owner/repo/issues/42";
+        assert_eq!(parse_created_issue_number(output), None);
+    }
+
+    #[test]
+    fn test_parse_created_issue_number_pr_url_ignored() {
+        // PR URLs must not match either.
+        let output = "PR_URL=https://github.com/owner/repo/pull/42";
+        assert_eq!(parse_created_issue_number(output), None);
+    }
+
+    #[test]
+    fn test_parse_created_issue_number_bare_hash_ignored() {
+        // Bare #N references must not match.
+        let output = "fixes #55 as requested";
+        assert_eq!(parse_created_issue_number(output), None);
+    }
+
+    #[test]
+    fn test_parse_created_issue_number_no_match() {
+        assert_eq!(parse_created_issue_number("no url here"), None);
     }
 
     /// Regression: extract_pr_number must NOT be called on raw multi-line agent

@@ -438,6 +438,7 @@ enum ImplementationOutcome {
     ParsedPr {
         pr_url: Option<String>,
         pr_num: Option<u64>,
+        created_issue_num: Option<u64>,
     },
 }
 
@@ -447,7 +448,12 @@ fn parse_implementation_outcome(output: &str) -> ImplementationOutcome {
     }
     let pr_url = prompts::parse_pr_url(output);
     let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
-    ImplementationOutcome::ParsedPr { pr_url, pr_num }
+    let created_issue_num = prompts::parse_created_issue_number(output);
+    ImplementationOutcome::ParsedPr {
+        pr_url,
+        pr_num,
+        created_issue_num,
+    }
 }
 
 /// Persist a completed stream item as a task artifact when it carries content
@@ -528,6 +534,18 @@ async fn run_agent_streaming(
     let mut output = String::new();
     let mut token_usage = TokenUsage::default();
     let mut first_token_latency_ms: Option<u64> = None;
+    // Tracks the last CREATED_ISSUE= number we successfully wrote to the DB so
+    // we can (a) skip redundant writes and (b) detect agent self-corrections
+    // that replace an earlier sentinel with a later one ("last sentinel wins").
+    // Using Option<u64> rather than a boolean means each distinct value causes
+    // exactly one DB write, and a second CREATED_ISSUE=20 after CREATED_ISSUE=10
+    // correctly overwrites the stored external_id.
+    let mut last_backfilled_issue: Option<u64> = None;
+    // Pre-check whether this task is auto-fix to avoid a cache lookup on every
+    // MessageDelta.  The source field is immutable after creation.
+    let is_auto_fix_task = store
+        .get(task_id)
+        .is_some_and(|s| s.source.as_deref() == Some("auto-fix"));
 
     loop {
         tokio::select! {
@@ -545,6 +563,56 @@ async fn run_agent_streaming(
                                         Some(turn_start.elapsed().as_millis() as u64);
                                 }
                                 output.push_str(text);
+
+                                // Early backfill: scan the full accumulated output on
+                                // every delta.  Scanning the full buffer (rather than
+                                // only the newly appended window) is required for two
+                                // correctness properties:
+                                //
+                                // 1. Chunked streaming: if the sentinel was split across
+                                //    chunk boundaries (e.g. "CREATED_ISSUE=" in one
+                                //    delta, "42\n" in the next), a window-only scan
+                                //    would miss the number.  The full-buffer scan sees
+                                //    the complete sentinel once both chunks have arrived.
+                                //
+                                // 2. "Last sentinel wins": parse_created_issue_number
+                                //    returns the LAST CREATED_ISSUE= in the output, so
+                                //    a later self-correction (CREATED_ISSUE=20 after
+                                //    CREATED_ISSUE=10) is written to the DB.
+                                //    last_backfilled_issue prevents redundant writes
+                                //    when the parsed number has not changed.
+                                if is_auto_fix_task {
+                                    // Only scan up to the last newline so that a
+                                    // sentinel split across chunk boundaries (e.g.
+                                    // "CREATED_ISSUE=4" then "2\n" in the next delta)
+                                    // does not produce a spurious partial value.
+                                    let complete_len =
+                                        output.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                                    if let Some(issue_num) =
+                                        prompts::parse_created_issue_number(
+                                            &output[..complete_len],
+                                        )
+                                    {
+                                        if Some(issue_num) != last_backfilled_issue {
+                                            let eid = format!("issue:{issue_num}");
+                                            match store
+                                                .overwrite_external_id_auto_fix(task_id, &eid)
+                                                .await
+                                            {
+                                                Ok(()) => tracing::info!(
+                                                    task_id = %task_id,
+                                                    external_id = %eid,
+                                                    "streaming: backfilled external_id for auto-fix task"
+                                                ),
+                                                Err(e) => tracing::warn!(
+                                                    task_id = %task_id,
+                                                    "streaming: failed to backfill external_id: {e}"
+                                                ),
+                                            }
+                                            last_backfilled_issue = Some(issue_num);
+                                        }
+                                    }
+                                }
                             }
                             StreamItem::ItemCompleted {
                                 item: Item::AgentReasoning { content },
@@ -558,6 +626,34 @@ async fn run_agent_streaming(
                                 // streaming events) sets first_token_latency_ms.
                                 // Prefer the full content over accumulated deltas.
                                 output = content.clone();
+                                // For non-streaming adapters the full output arrives
+                                // here; apply the same sentinel scan so backfill
+                                // happens before the post-execution path runs (closes
+                                // the webhook race for these adapters too).
+                                if is_auto_fix_task {
+                                    if let Some(issue_num) =
+                                        prompts::parse_created_issue_number(&output)
+                                    {
+                                        if Some(issue_num) != last_backfilled_issue {
+                                            let eid = format!("issue:{issue_num}");
+                                            match store
+                                                .overwrite_external_id_auto_fix(task_id, &eid)
+                                                .await
+                                            {
+                                                Ok(()) => tracing::info!(
+                                                    task_id = %task_id,
+                                                    external_id = %eid,
+                                                    "streaming: backfilled external_id for auto-fix task"
+                                                ),
+                                                Err(e) => tracing::warn!(
+                                                    task_id = %task_id,
+                                                    "streaming: failed to backfill external_id: {e}"
+                                                ),
+                                            }
+                                            last_backfilled_issue = Some(issue_num);
+                                        }
+                                    }
+                                }
                             }
                             StreamItem::ItemCompleted { item: completed_item } => {
                                 persist_artifact(store, task_id, turn, completed_item).await;
@@ -1383,7 +1479,7 @@ pub(crate) async fn run_task(
             return Ok(());
         }
 
-        let (pr_url, pr_num) = match parse_implementation_outcome(&output) {
+        let (pr_url, pr_num, created_issue_num) = match parse_implementation_outcome(&output) {
             ImplementationOutcome::PlanIssue(plan_issue) => {
                 tracing::error!(
                     task_id = %task_id,
@@ -1417,7 +1513,11 @@ pub(crate) async fn run_task(
                 );
                 return Ok(());
             }
-            ImplementationOutcome::ParsedPr { pr_url, pr_num } => (pr_url, pr_num),
+            ImplementationOutcome::ParsedPr {
+                pr_url,
+                pr_num,
+                created_issue_num,
+            } => (pr_url, pr_num, created_issue_num),
         };
 
         mutate_and_persist(store, task_id, |s| {
@@ -1439,6 +1539,33 @@ pub(crate) async fn run_task(
             });
         })
         .await?;
+
+        // Back-fill (or correct) external_id for auto-fix tasks that created a
+        // GitHub issue.  Dedup layers 1-3 match on external_id; without this,
+        // intake re-creates a duplicate task when it receives the webhook for the
+        // newly created issue.
+        //
+        // We compare against the current in-memory value rather than checking
+        // IS NULL so that a post-run self-correction (agent emitted CREATED_ISSUE=20
+        // after an earlier CREATED_ISSUE=10) is always written even when the
+        // streaming path already stored the stale value.
+        if let Some(issue_num) = created_issue_num {
+            let final_eid = format!("issue:{issue_num}");
+            let needs_backfill = store.get(task_id).is_some_and(|s| {
+                s.source.as_deref() == Some("auto-fix")
+                    && s.external_id.as_deref() != Some(&final_eid)
+            });
+            if needs_backfill {
+                if let Err(e) = store
+                    .overwrite_external_id_auto_fix(task_id, &final_eid)
+                    .await
+                {
+                    tracing::warn!(task_id = %task_id, "failed to back-fill external_id: {e}");
+                } else {
+                    tracing::info!(task_id = %task_id, external_id = %final_eid, "back-filled external_id for auto-fix task");
+                }
+            }
+        }
 
         // Emit PrDetected event so crash recovery can reconstruct pr_url.
         if let Some(pr_url_str) = pr_url.as_deref() {
@@ -2508,6 +2635,7 @@ mod tests {
             ImplementationOutcome::ParsedPr {
                 pr_url: Some("https://github.com/majiayu000/harness/pull/42".to_string()),
                 pr_num: Some(42),
+                created_issue_num: None,
             }
         );
     }

@@ -1426,6 +1426,27 @@ impl TaskStore {
         self.db.pending_tasks_with_checkpoint().await
     }
 
+    /// Overwrite `external_id` on an auto-fix task, even if one is already set.
+    ///
+    /// Used during streaming to implement "last sentinel wins" — the agent may
+    /// emit multiple `CREATED_ISSUE=` lines as it self-corrects.  Updates both
+    /// the DB and the in-memory cache so dedup reads are immediately consistent.
+    pub(crate) async fn overwrite_external_id_auto_fix(
+        &self,
+        id: &TaskId,
+        external_id: &str,
+    ) -> anyhow::Result<()> {
+        self.db
+            .overwrite_external_id_auto_fix(id.as_str(), external_id)
+            .await?;
+        if let Some(mut entry) = self.cache.get_mut(id) {
+            if entry.source.as_deref() == Some("auto-fix") {
+                entry.external_id = Some(external_id.to_string());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn persist(&self, id: &TaskId) -> anyhow::Result<()> {
         let lock = self
             .persist_locks
