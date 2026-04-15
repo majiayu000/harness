@@ -422,8 +422,7 @@ impl ReviewStore {
                     // The next review cycle will re-evaluate whether the finding is
                     // still present; treating a success as a failure would incorrectly
                     // increment failure_count and suppress respawn for an open finding.
-                    self.release_stale_claim_ok(&rule_id, &file).await?;
-                    recovered += 1;
+                    recovered += self.release_stale_claim_ok(&rule_id, &file).await?;
                 }
                 None => {
                     // Task still in-flight — leave the pending claim intact.
@@ -615,8 +614,8 @@ impl ReviewStore {
     /// Release a pending claim after the underlying task completed successfully,
     /// clearing task_id, claimed_at, and real_task_id without penalising
     /// failure_count or setting a cooldown.
-    async fn release_stale_claim_ok(&self, rule_id: &str, file: &str) -> anyhow::Result<()> {
-        sqlx::query(
+    async fn release_stale_claim_ok(&self, rule_id: &str, file: &str) -> anyhow::Result<u64> {
+        let result = sqlx::query(
             "UPDATE review_findings \
              SET task_id = NULL, claimed_at = NULL, real_task_id = NULL \
              WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id = 'pending'",
@@ -625,7 +624,7 @@ impl ReviewStore {
         .bind(file)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected())
     }
 
     pub async fn release_claim(&self, rule_id: &str, file: &str) -> anyhow::Result<()> {
