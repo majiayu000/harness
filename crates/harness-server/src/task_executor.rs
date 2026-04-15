@@ -763,6 +763,14 @@ async fn run_plan_for_prompt(
         state.phase = TaskPhase::Implement;
     })
     .await?;
+    // Persist plan text to the checkpoint table so that recover_in_progress()
+    // can resume this task after a crash (mirrors run_triage_plan_pipeline).
+    if let Err(e) = store
+        .write_checkpoint(task_id, None, Some(&plan_text), None, "plan_done")
+        .await
+    {
+        tracing::warn!(task_id = %task_id, "failed to write plan checkpoint: {e}");
+    }
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete (prompt-only)");
     Ok((Some(plan_text), prompts::TriageComplexity::Medium, 1))
