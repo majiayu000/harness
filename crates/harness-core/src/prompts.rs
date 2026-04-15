@@ -739,6 +739,54 @@ fn is_valid_github_pr_url(url: &str) -> bool {
     parts[4..].iter().all(|s| is_valid_slug(s))
 }
 
+/// Parse the most-recently created GitHub issue number from agent output.
+///
+/// Accepts two forms:
+/// 1. A GitHub issue URL: `https://github.com/{owner}/{repo}/issues/{number}`
+/// 2. An explicit sentinel line: `CREATED_ISSUE={number}`
+///
+/// Returns the **last** match found in the output (the most likely final result).
+/// Deliberately rejects bare `#N` patterns — too many false positives from PR
+/// references, line numbers, and issue mentions in comments.
+pub fn parse_created_issue_number(output: &str) -> Option<u64> {
+    let mut last: Option<u64> = None;
+
+    for line in output.lines() {
+        let line = line.trim();
+
+        // Explicit sentinel: CREATED_ISSUE=<number>
+        if let Some(rest) = line.strip_prefix("CREATED_ISSUE=") {
+            if let Ok(n) = rest.trim().parse::<u64>() {
+                last = Some(n);
+                continue;
+            }
+        }
+
+        // GitHub issue URL pattern: https://github.com/<owner>/<repo>/issues/<number>
+        // Scan each whitespace-separated token on the line for a matching URL.
+        for token in line.split_whitespace() {
+            // Strip leading punctuation (e.g. parens, angle brackets)
+            let token = token.trim_start_matches(|c: char| !c.is_alphanumeric() && c != 'h');
+            // Strip trailing punctuation
+            let token = token.trim_end_matches(|c: char| !c.is_alphanumeric());
+
+            let path = match token.strip_prefix("https://github.com/") {
+                Some(p) => p,
+                None => continue,
+            };
+            // path must be: <owner>/<repo>/issues/<number>[/<extra>]
+            let parts: Vec<&str> = path.splitn(5, '/').collect();
+            if parts.len() >= 4 && parts[2] == "issues" {
+                if let Ok(n) = parts[3].parse::<u64>() {
+                    last = Some(n);
+                }
+            }
+        }
+    }
+
+    last
+}
+
 /// Extract PR number from a GitHub PR URL.
 /// Handles URL fragments (`#discussion_r123`) and path suffixes (`/files`, `/commits`).
 pub fn extract_pr_number(url: &str) -> Option<u64> {
@@ -1561,6 +1609,44 @@ mod tests {
             extract_pr_number("https://github.com/owner/repo/pull/42#discussion_r123"),
             Some(42)
         );
+    }
+
+    #[test]
+    fn test_parse_created_issue_number_github_url() {
+        let output = "Created issue https://github.com/owner/repo/issues/42";
+        assert_eq!(parse_created_issue_number(output), Some(42));
+    }
+
+    #[test]
+    fn test_parse_created_issue_number_sentinel() {
+        let output = "some output\nCREATED_ISSUE=99\nmore output";
+        assert_eq!(parse_created_issue_number(output), Some(99));
+    }
+
+    #[test]
+    fn test_parse_created_issue_number_returns_last() {
+        let output =
+            "https://github.com/owner/repo/issues/10\nhttps://github.com/owner/repo/issues/20";
+        assert_eq!(parse_created_issue_number(output), Some(20));
+    }
+
+    #[test]
+    fn test_parse_created_issue_number_pr_url_only() {
+        // PR URLs (/pull/) must not match — only /issues/ URLs count.
+        let output = "PR_URL=https://github.com/owner/repo/pull/42";
+        assert_eq!(parse_created_issue_number(output), None);
+    }
+
+    #[test]
+    fn test_parse_created_issue_number_bare_hash_ignored() {
+        // Bare #N references must not match.
+        let output = "fixes #55 as requested";
+        assert_eq!(parse_created_issue_number(output), None);
+    }
+
+    #[test]
+    fn test_parse_created_issue_number_no_match() {
+        assert_eq!(parse_created_issue_number("no url here"), None);
     }
 
     /// Regression: extract_pr_number must NOT be called on raw multi-line agent

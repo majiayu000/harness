@@ -352,6 +352,21 @@ impl TaskDb {
         Ok(row)
     }
 
+    /// Back-fill `external_id` on a task that was created without one.
+    ///
+    /// The `AND external_id IS NULL` guard prevents overwriting a legitimately-set
+    /// external_id on a re-queued task or any task that already has one.
+    pub async fn update_external_id(&self, id: &str, external_id: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE tasks SET external_id = ?, updated_at = datetime('now') WHERE id = ? AND external_id IS NULL",
+        )
+        .bind(external_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Return all tasks as lightweight summaries, skipping the heavy `rounds` column.
     ///
     /// Used by the `/tasks` list endpoint to avoid deserializing large round histories
@@ -1405,6 +1420,42 @@ mod tests {
             .await?
             .expect("task with error should exist");
         assert_eq!(loaded.error.as_deref(), Some("agent panicked"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_external_id_back_fills_null() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let task = make_task("task-backfill", TaskStatus::Pending);
+        db.insert(&task).await?;
+
+        // Confirm initial state has no external_id
+        let before = db.get("task-backfill").await?.expect("should exist");
+        assert!(before.external_id.is_none());
+
+        db.update_external_id("task-backfill", "issue:55").await?;
+
+        let after = db.get("task-backfill").await?.expect("should exist");
+        assert_eq!(after.external_id.as_deref(), Some("issue:55"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_external_id_guard_does_not_overwrite() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-guard", TaskStatus::Pending);
+        task.external_id = Some("issue:10".to_string());
+        db.insert(&task).await?;
+
+        // Attempt to overwrite — the IS NULL guard must prevent it
+        db.update_external_id("task-guard", "issue:99").await?;
+
+        let after = db.get("task-guard").await?.expect("should exist");
+        assert_eq!(after.external_id.as_deref(), Some("issue:10"));
         Ok(())
     }
 

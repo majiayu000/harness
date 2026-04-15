@@ -438,6 +438,7 @@ enum ImplementationOutcome {
     ParsedPr {
         pr_url: Option<String>,
         pr_num: Option<u64>,
+        created_issue_num: Option<u64>,
     },
 }
 
@@ -447,7 +448,12 @@ fn parse_implementation_outcome(output: &str) -> ImplementationOutcome {
     }
     let pr_url = prompts::parse_pr_url(output);
     let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
-    ImplementationOutcome::ParsedPr { pr_url, pr_num }
+    let created_issue_num = prompts::parse_created_issue_number(output);
+    ImplementationOutcome::ParsedPr {
+        pr_url,
+        pr_num,
+        created_issue_num,
+    }
 }
 
 /// Persist a completed stream item as a task artifact when it carries content
@@ -1383,7 +1389,7 @@ pub(crate) async fn run_task(
             return Ok(());
         }
 
-        let (pr_url, pr_num) = match parse_implementation_outcome(&output) {
+        let (pr_url, pr_num, created_issue_num) = match parse_implementation_outcome(&output) {
             ImplementationOutcome::PlanIssue(plan_issue) => {
                 tracing::error!(
                     task_id = %task_id,
@@ -1417,7 +1423,11 @@ pub(crate) async fn run_task(
                 );
                 return Ok(());
             }
-            ImplementationOutcome::ParsedPr { pr_url, pr_num } => (pr_url, pr_num),
+            ImplementationOutcome::ParsedPr {
+                pr_url,
+                pr_num,
+                created_issue_num,
+            } => (pr_url, pr_num, created_issue_num),
         };
 
         mutate_and_persist(store, task_id, |s| {
@@ -1439,6 +1449,23 @@ pub(crate) async fn run_task(
             });
         })
         .await?;
+
+        // Back-fill external_id for auto-fix tasks that created a GitHub issue.
+        // Dedup layers 1-3 match on external_id; without this, intake re-creates a
+        // duplicate task when it receives the webhook for the newly created issue.
+        if let Some(issue_num) = created_issue_num {
+            let needs_backfill = store.get(task_id).is_some_and(|s| {
+                s.external_id.is_none() && s.source.as_deref() == Some("auto-fix")
+            });
+            if needs_backfill {
+                let eid = format!("issue:{issue_num}");
+                if let Err(e) = store.update_external_id(task_id, &eid).await {
+                    tracing::warn!(task_id = %task_id, "failed to back-fill external_id: {e}");
+                } else {
+                    tracing::info!(task_id = %task_id, external_id = %eid, "back-filled external_id for auto-fix task");
+                }
+            }
+        }
 
         // Emit PrDetected event so crash recovery can reconstruct pr_url.
         if let Some(pr_url_str) = pr_url.as_deref() {
@@ -2508,6 +2535,7 @@ mod tests {
             ImplementationOutcome::ParsedPr {
                 pr_url: Some("https://github.com/majiayu000/harness/pull/42".to_string()),
                 pr_num: Some(42),
+                created_issue_num: None,
             }
         );
     }

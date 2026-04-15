@@ -1426,6 +1426,27 @@ impl TaskStore {
         self.db.pending_tasks_with_checkpoint().await
     }
 
+    /// Back-fill `external_id` on a task that was created without one.
+    ///
+    /// Updates both the DB (with an `IS NULL` guard to prevent overwriting a
+    /// legitimately-set value) and the in-memory cache so dedup reads are
+    /// immediately consistent.
+    pub(crate) async fn update_external_id(
+        &self,
+        id: &TaskId,
+        external_id: &str,
+    ) -> anyhow::Result<()> {
+        self.db.update_external_id(id.as_str(), external_id).await?;
+        if let Some(mut entry) = self.cache.get_mut(id) {
+            // Only mirror into cache if DB guard passed (external_id was NULL).
+            // Re-read to check: if DB now shows the value, cache should too.
+            if entry.external_id.is_none() {
+                entry.external_id = Some(external_id.to_string());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn persist(&self, id: &TaskId) -> anyhow::Result<()> {
         let lock = self
             .persist_locks
