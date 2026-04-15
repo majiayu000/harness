@@ -332,8 +332,8 @@ impl ReviewStore {
     ///
     /// 1. **Known-task rows** (`real_task_id IS NOT NULL`): both `confirm_task_spawned`
     ///    attempts failed but `enqueue_task` succeeded.  We stored the real task id in
-    ///    `real_task_id` so recovery can call `is_task_done(real_task_id)` to verify
-    ///    the underlying task has reached a terminal state before resetting the claim.
+    ///    `real_task_id` so recovery can call `get_task_outcome(real_task_id)` to
+    ///    determine the terminal state before acting on the claim.
     ///    This is correct regardless of how many rounds the task ran or how long it
     ///    spent queued — no fixed time threshold is needed.
     ///
@@ -342,11 +342,17 @@ impl ReviewStore {
     ///    calls.  A time-based `stale_secs` threshold is appropriate here; this window
     ///    should never exceed a few seconds under normal operation.
     ///
+    /// The `get_task_outcome` closure returns:
+    /// - `None`        — task is still in-flight; leave the claim intact.
+    /// - `Some(true)`  — task failed or was cancelled; apply exponential backoff.
+    /// - `Some(false)` — task completed successfully; release claim without penalty
+    ///                   so the next review cycle can re-evaluate the finding.
+    ///
     /// Returns the number of findings recovered.
     pub async fn recover_stale_pending_claims(
         &self,
         stale_secs: i64,
-        is_task_done: impl Fn(&str) -> bool,
+        get_task_outcome: impl Fn(&str) -> Option<bool>,
     ) -> anyhow::Result<u64> {
         // Strategy 1: recover rows whose real underlying task has terminated.
         let with_real_id: Vec<(String, String, String)> = sqlx::query_as(
@@ -360,11 +366,23 @@ impl ReviewStore {
 
         let mut recovered = 0u64;
         for (rule_id, file, real_tid) in with_real_id {
-            if is_task_done(&real_tid) {
-                // The underlying task reached a terminal (failed/cancelled) state.
-                // Record the failure and apply exponential backoff so the same
-                // violation is not immediately re-attempted on the next tick.
-                recovered += self.mark_finding_failed(&rule_id, &file).await?;
+            match get_task_outcome(&real_tid) {
+                Some(true) => {
+                    // Task failed or was cancelled — apply exponential backoff so the
+                    // same violation is not immediately re-attempted on the next tick.
+                    recovered += self.mark_finding_failed(&rule_id, &file).await?;
+                }
+                Some(false) => {
+                    // Task completed successfully — release the claim without penalty.
+                    // The next review cycle will re-evaluate whether the finding is
+                    // still present; treating a success as a failure would incorrectly
+                    // increment failure_count and suppress respawn for an open finding.
+                    self.release_stale_claim_ok(&rule_id, &file).await?;
+                    recovered += 1;
+                }
+                None => {
+                    // Task still in-flight — leave the pending claim intact.
+                }
             }
         }
 
@@ -435,7 +453,13 @@ impl ReviewStore {
     ///
     /// Uses the pre-increment failure_count to compute the delay so that the
     /// first failure produces a 1-hour cooldown, the second 2 hours, etc.
-    /// The delay expression uses SQLite's `<<` (left shift) for 2^N arithmetic.
+    ///
+    /// The shift amount is capped at 24 before applying `<<` to avoid SQLite
+    /// integer overflow: `1 << 64` wraps to 0 (or goes negative) in SQLite's
+    /// 64-bit signed integers, which would collapse the cooldown to `now` after
+    /// enough failures and restart the every-tick respawn loop.  Capping at 24
+    /// gives `1 << 24 = 16_777_216`; multiplied by 3600 this far exceeds the
+    /// 86400-second cap, so the `min()` always fires first at failure_count ≥ 5.
     ///
     /// Returns the number of rows updated (1 if found, 0 if not matching).
     pub async fn mark_finding_failed(&self, rule_id: &str, file: &str) -> anyhow::Result<u64> {
@@ -446,7 +470,7 @@ impl ReviewStore {
                  real_task_id = NULL, \
                  failure_count = failure_count + 1, \
                  cooldown_until = datetime('now', '+' || \
-                     cast(min(3600 * (1 << failure_count), 86400) as text) || ' seconds') \
+                     cast(min(3600 * (1 << min(failure_count, 24)), 86400) as text) || ' seconds') \
              WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id = 'pending'",
         )
         .bind(rule_id)
@@ -505,6 +529,22 @@ impl ReviewStore {
     ///
     /// Called when task enqueue fails after a successful `try_claim_finding`,
     /// allowing the next poll cycle to retry spawning for this finding.
+    /// Release a pending claim after the underlying task completed successfully,
+    /// clearing task_id, claimed_at, and real_task_id without penalising
+    /// failure_count or setting a cooldown.
+    async fn release_stale_claim_ok(&self, rule_id: &str, file: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE review_findings \
+             SET task_id = NULL, claimed_at = NULL, real_task_id = NULL \
+             WHERE rule_id = ? AND file = ? AND status = 'open' AND task_id = 'pending'",
+        )
+        .bind(rule_id)
+        .bind(file)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn release_claim(&self, rule_id: &str, file: &str) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE review_findings SET task_id = NULL \
@@ -1117,9 +1157,9 @@ mod tests {
         .execute(&store.pool)
         .await?;
 
-        // Strategy-1 recovery: task is done → should trigger backoff.
+        // Strategy-1 recovery: task failed → should trigger backoff.
         let recovered = store
-            .recover_stale_pending_claims(3900, |_tid| true)
+            .recover_stale_pending_claims(3900, |_tid| Some(true))
             .await?;
         assert_eq!(recovered, 1, "one row must be recovered");
 
@@ -1155,8 +1195,9 @@ mod tests {
         .await?;
 
         // Strategy-2 recovery via time threshold — must NOT apply backoff.
+        // real_task_id is NULL so the closure is never called; type must match.
         let recovered = store
-            .recover_stale_pending_claims(3900, |_tid| false)
+            .recover_stale_pending_claims(3900, |_tid| Some(false))
             .await?;
         assert_eq!(recovered, 1, "one row must be recovered via timeout");
 

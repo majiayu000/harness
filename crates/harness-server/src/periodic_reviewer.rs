@@ -1005,10 +1005,23 @@ async fn run_review_tick(
                             match rs
                                 .recover_stale_pending_claims(3900, |tid| {
                                     let id = harness_core::types::TaskId(tid.to_string());
-                                    // task not in store → treat as done
-                                    tasks_snapshot
-                                        .get(&id)
-                                        .is_none_or(|t| t.status.is_terminal())
+                                    match tasks_snapshot.get(&id) {
+                                        // Task not in store: unknown outcome — release
+                                        // claim without penalty and let the next review
+                                        // cycle re-evaluate the finding.
+                                        None => Some(false),
+                                        Some(t) if matches!(
+                                            t.status,
+                                            crate::task_runner::TaskStatus::Done
+                                        ) => Some(false),
+                                        Some(t) if matches!(
+                                            t.status,
+                                            crate::task_runner::TaskStatus::Failed
+                                                | crate::task_runner::TaskStatus::Cancelled
+                                        ) => Some(true),
+                                        // Still in-flight — leave pending claim intact.
+                                        Some(_) => None,
+                                    }
                                 })
                                 .await
                             {
