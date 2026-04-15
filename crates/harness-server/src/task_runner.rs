@@ -202,6 +202,14 @@ pub struct TaskState {
     /// requested rather than silently falling back to server defaults.
     #[serde(skip)]
     pub request_settings: Option<PersistedRequestSettings>,
+    /// Original request stored for AwaitingDeps tasks so the dep-watcher can
+    /// dispatch the task once all dependencies complete.  Cleared from cache
+    /// after the first dispatch attempt.
+    ///
+    /// Not persisted via serde — `task_db` serializes it as `pending_request_json`
+    /// so it survives a server restart (crash-safe dispatch).
+    #[serde(skip)]
+    pub pending_request: Option<CreateTaskRequest>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -266,6 +274,7 @@ impl TaskState {
             plan_output: None,
             repo: None,
             request_settings: None,
+            pending_request: None,
         }
     }
 
@@ -298,7 +307,7 @@ impl TaskState {
 /// `0` = normal (default), `1` = high, `2` = critical.
 pub const MAX_TASK_PRIORITY: u8 = 2;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTaskRequest {
     /// Free-text task description (prompt, issue URL, etc.).
     pub prompt: Option<String>,
@@ -2227,6 +2236,9 @@ pub async fn spawn_task_awaiting_deps(
 
     if !all_done && !state.depends_on.is_empty() {
         state.status = TaskStatus::AwaitingDeps;
+        // Store the full request so the dep-watcher can dispatch this task
+        // once all dependencies complete (crash-safe via pending_request_json in DB).
+        state.pending_request = Some(req.clone());
     }
 
     store.insert(&state).await;
@@ -3321,6 +3333,75 @@ mod tests {
         let key = root.to_string_lossy().into_owned();
         assert_eq!(counts.by_project[&key].done, 1);
         assert_eq!(counts.by_project[&key].failed, 1);
+        Ok(())
+    }
+
+    // --- dependency scheduling ---
+
+    #[tokio::test]
+    async fn spawn_task_awaiting_deps_stores_pending_request() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let mut upstream = TaskState::new(TaskId::new());
+        upstream.status = TaskStatus::Implementing;
+        store.insert(&upstream).await;
+
+        let req = CreateTaskRequest {
+            prompt: Some("downstream".into()),
+            depends_on: vec![upstream.id.clone()],
+            ..Default::default()
+        };
+        let task_id = spawn_task_awaiting_deps(store.clone(), req.clone()).await?;
+        let state = store.get(&task_id).expect("task must exist");
+
+        assert!(
+            matches!(state.status, TaskStatus::AwaitingDeps),
+            "expected AwaitingDeps, got {:?}",
+            state.status
+        );
+        let stored = state.pending_request.expect("pending_request must be Some");
+        assert_eq!(stored.prompt, req.prompt);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_awaiting_deps_preserves_pending_request() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let mut t1 = TaskState::new(TaskId::new());
+        t1.status = TaskStatus::Implementing;
+        store.insert(&t1).await;
+
+        let t2_id = spawn_task_awaiting_deps(
+            store.clone(),
+            CreateTaskRequest {
+                prompt: Some("downstream".into()),
+                depends_on: vec![t1.id.clone()],
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // Mark t1 Done.
+        if let Some(mut e) = store.cache.get_mut(&t1.id) {
+            e.status = TaskStatus::Done;
+        }
+
+        let (ready, _failed) = check_awaiting_deps(&store).await;
+        assert_eq!(ready, vec![t2_id.clone()]);
+
+        let state = store.get(&t2_id).expect("T2 must exist");
+        assert!(
+            matches!(state.status, TaskStatus::Pending),
+            "expected Pending, got {:?}",
+            state.status
+        );
+        assert!(
+            state.pending_request.is_some(),
+            "pending_request must survive check_awaiting_deps"
+        );
         Ok(())
     }
 }

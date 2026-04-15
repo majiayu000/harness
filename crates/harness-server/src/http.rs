@@ -280,21 +280,103 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     .await?;
 
     // Spawn background watcher for AwaitingDeps tasks.
+    // When all dependencies of a task complete, the dep-watcher transitions it
+    // from AwaitingDeps → Pending, persists that state, then dispatches it.
     {
         let store = storage.tasks.clone();
+        let dw_agent_registry = server.agent_registry.clone();
+        let dw_server_config = Arc::new(server.config.clone());
+        let dw_skills = engines.skills.clone();
+        let dw_events = engines.events.clone();
+        let dw_interceptors = services.interceptors.clone();
+        let dw_workspace_mgr = registry.workspace_mgr.clone();
+        let dw_task_queue = intake.task_queue.clone();
+        let dw_completion_callback = intake.completion_callback.clone();
+        let dw_project_registry = registry.project_registry.clone();
+        let dw_allowed_roots = server.config.server.allowed_project_roots.clone();
+        let dw_review_config = server.config.agents.review.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 let (ready_ids, failed_ids) = crate::task_runner::check_awaiting_deps(&store).await;
-                for task_id in ready_ids.iter().chain(failed_ids.iter()) {
+                // Persist failed tasks (status already set to Failed by check_awaiting_deps).
+                for task_id in &failed_ids {
                     if let Err(e) = store.persist(task_id).await {
                         tracing::warn!(
-                            "dep-watcher: failed to persist {} after transition: {e}",
+                            "dep-watcher: failed to persist {} after dep-failure: {e}",
                             task_id.0
                         );
                     }
+                    store.close_task_stream(task_id);
+                }
+                // Dispatch each ready task.
+                for task_id in ready_ids {
+                    // Atomically take pending_request to prevent double-dispatch.
+                    let pending_req = store
+                        .cache
+                        .get_mut(&task_id)
+                        .and_then(|mut e| e.pending_request.take());
+                    let req = match pending_req {
+                        Some(r) => r,
+                        None => {
+                            tracing::warn!(
+                                task_id = %task_id.0,
+                                "dep-watcher: task ready but pending_request is None — skipping"
+                            );
+                            continue;
+                        }
+                    };
+                    // Persist Pending status (with pending_request_json cleared) so that
+                    // startup recovery can distinguish "mid-dispatch crash" from a normal
+                    // pending task. The pending_request_json column is now NULL because
+                    // pending_request was taken above.
+                    if let Err(e) = store.persist(&task_id).await {
+                        tracing::error!(
+                            task_id = %task_id.0,
+                            "dep-watcher: persist failed before dispatch: {e} — reverting to AwaitingDeps"
+                        );
+                        if let Some(mut entry) = store.cache.get_mut(&task_id) {
+                            if matches!(entry.status, crate::task_runner::TaskStatus::Pending) {
+                                entry.status = crate::task_runner::TaskStatus::AwaitingDeps;
+                                entry.pending_request = Some(req);
+                            }
+                        }
+                        continue;
+                    }
+                    // Dispatch in a separate task so the watcher loop is never blocked.
+                    let store2 = store.clone();
+                    let agent_registry2 = dw_agent_registry.clone();
+                    let server_config2 = dw_server_config.clone();
+                    let skills2 = dw_skills.clone();
+                    let events2 = dw_events.clone();
+                    let interceptors2 = dw_interceptors.clone();
+                    let workspace_mgr2 = dw_workspace_mgr.clone();
+                    let task_queue2 = dw_task_queue.clone();
+                    let completion_callback2 = dw_completion_callback.clone();
+                    let project_registry2 = dw_project_registry.clone();
+                    let allowed_roots2 = dw_allowed_roots.clone();
+                    let review_config2 = dw_review_config.clone();
+                    tokio::spawn(async move {
+                        dispatch_awaiting_task(
+                            task_id,
+                            req,
+                            store2,
+                            agent_registry2,
+                            server_config2,
+                            skills2,
+                            events2,
+                            interceptors2,
+                            workspace_mgr2,
+                            task_queue2,
+                            completion_callback2,
+                            Some(project_registry2),
+                            allowed_roots2,
+                            review_config2,
+                        )
+                        .await;
+                    });
                 }
             }
         });
@@ -379,6 +461,155 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         task_svc: services.task_svc,
         execution_svc: services.execution_svc,
     })
+}
+
+/// Dispatch a task that was waiting for dependencies and is now ready.
+///
+/// Handles project resolution, agent selection, allowed-roots enforcement,
+/// concurrency-permit acquisition, and spawning `spawn_preregistered_task`.
+/// On any error, the task is failed and its stream is closed.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_awaiting_task(
+    task_id: crate::task_runner::TaskId,
+    mut req: crate::task_runner::CreateTaskRequest,
+    store: std::sync::Arc<crate::task_runner::TaskStore>,
+    agent_registry: std::sync::Arc<harness_agents::registry::AgentRegistry>,
+    server_config: std::sync::Arc<harness_core::config::HarnessConfig>,
+    skills: std::sync::Arc<tokio::sync::RwLock<harness_skills::store::SkillStore>>,
+    events: std::sync::Arc<harness_observe::event_store::EventStore>,
+    interceptors: Vec<std::sync::Arc<dyn harness_core::interceptor::TurnInterceptor>>,
+    workspace_mgr: Option<std::sync::Arc<crate::workspace::WorkspaceManager>>,
+    task_queue: std::sync::Arc<crate::task_queue::TaskQueue>,
+    completion_callback: Option<crate::task_runner::CompletionCallback>,
+    project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
+    allowed_roots: Vec<std::path::PathBuf>,
+    review_config: harness_core::config::agents::AgentReviewConfig,
+) {
+    // Resolve project path through registry if needed.
+    if let (Some(registry), Some(ref project_path)) = (&project_registry, &req.project) {
+        if !project_path.is_dir() {
+            let id = project_path.to_string_lossy();
+            match registry.resolve_path(&id).await {
+                Ok(Some(resolved)) => req.project = Some(resolved),
+                Ok(None) => {
+                    fail_task(
+                        &store,
+                        &task_id,
+                        &format!("dep-watcher: project '{id}' not found in registry"),
+                        &completion_callback,
+                    )
+                    .await;
+                    return;
+                }
+                Err(e) => {
+                    fail_task(
+                        &store,
+                        &task_id,
+                        &format!("dep-watcher: registry lookup failed: {e}"),
+                        &completion_callback,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    let canonical = match crate::task_runner::resolve_canonical_project(req.project.clone()).await {
+        Ok(c) => c,
+        Err(e) => {
+            fail_task(
+                &store,
+                &task_id,
+                &format!("dep-watcher: failed to resolve project path: {e}"),
+                &completion_callback,
+            )
+            .await;
+            return;
+        }
+    };
+
+    if let Err(e) = crate::project_registry::check_allowed_roots(&canonical, &allowed_roots) {
+        fail_task(
+            &store,
+            &task_id,
+            &format!("dep-watcher: project not in allowed_project_roots: {e}"),
+            &completion_callback,
+        )
+        .await;
+        return;
+    }
+
+    let project_id = canonical.to_string_lossy().into_owned();
+    req.project = Some(canonical);
+
+    let agent = match crate::http::task_routes::select_agent(&req, &agent_registry, None) {
+        Ok(a) => a,
+        Err(e) => {
+            fail_task(
+                &store,
+                &task_id,
+                &format!("dep-watcher: failed to select agent: {e}"),
+                &completion_callback,
+            )
+            .await;
+            return;
+        }
+    };
+    let (reviewer, _) =
+        crate::http::resolve_reviewer(&agent_registry, &review_config, agent.name());
+
+    let permit = match task_queue.acquire(&project_id, req.priority).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(
+                task_id = %task_id.0,
+                "dep-watcher: failed to acquire concurrency permit: {e} — task stays Pending for retry"
+            );
+            return;
+        }
+    };
+
+    crate::task_runner::spawn_preregistered_task(
+        task_id,
+        store,
+        agent,
+        reviewer,
+        server_config,
+        skills,
+        events,
+        interceptors,
+        req,
+        workspace_mgr,
+        permit,
+        completion_callback,
+        None,
+    )
+    .await;
+}
+
+/// Mark a task as Failed, persist, close its stream, and fire the completion callback.
+async fn fail_task(
+    store: &std::sync::Arc<crate::task_runner::TaskStore>,
+    task_id: &crate::task_runner::TaskId,
+    reason: &str,
+    completion_callback: &Option<crate::task_runner::CompletionCallback>,
+) {
+    tracing::error!(task_id = %task_id.0, "{reason}");
+    let persist_ok = crate::task_runner::mutate_and_persist(store, task_id, |s| {
+        s.status = crate::task_runner::TaskStatus::Failed;
+        s.error = Some(reason.to_string());
+    })
+    .await
+    .is_ok();
+    store.close_task_stream(task_id);
+    if persist_ok {
+        if let Some(cb) = completion_callback {
+            if let Some(final_state) = store.get(task_id) {
+                cb(final_state).await;
+            }
+        }
+    }
 }
 
 pub(crate) fn build_completion_callback(
@@ -916,6 +1147,59 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         permit,
                         state.intake.completion_callback.clone(),
                         None,
+                    )
+                    .await;
+                });
+            }
+        }
+    }
+
+    // Re-dispatch dep-watcher tasks that were in mid-dispatch (Pending with pending_request set).
+    {
+        let recovered_dep: Vec<_> = state
+            .core
+            .tasks
+            .list_all()
+            .into_iter()
+            .filter(|t| {
+                matches!(t.status, task_runner::TaskStatus::Pending)
+                    && t.pending_request.is_some()
+                    && t.pr_url.is_none()
+            })
+            .collect();
+        if !recovered_dep.is_empty() {
+            tracing::info!(
+                count = recovered_dep.len(),
+                "startup: re-dispatching dep-watcher pending task(s) with stored requests"
+            );
+            for task in recovered_dep {
+                let req = match task.pending_request {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let state2 = state.clone();
+                tokio::spawn(async move {
+                    dispatch_awaiting_task(
+                        task.id,
+                        req,
+                        state2.core.tasks.clone(),
+                        state2.core.server.agent_registry.clone(),
+                        Arc::new(state2.core.server.config.clone()),
+                        state2.engines.skills.clone(),
+                        state2.observability.events.clone(),
+                        state2.interceptors.clone(),
+                        state2.concurrency.workspace_mgr.clone(),
+                        state2.concurrency.task_queue.clone(),
+                        state2.intake.completion_callback.clone(),
+                        state2.core.project_registry.clone(),
+                        state2
+                            .core
+                            .server
+                            .config
+                            .server
+                            .allowed_project_roots
+                            .clone(),
+                        state2.core.server.config.agents.review.clone(),
                     )
                     .await;
                 });
