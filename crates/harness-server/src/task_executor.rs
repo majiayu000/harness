@@ -582,8 +582,16 @@ async fn run_agent_streaming(
                                 //    last_backfilled_issue prevents redundant writes
                                 //    when the parsed number has not changed.
                                 if is_auto_fix_task {
+                                    // Only scan up to the last newline so that a
+                                    // sentinel split across chunk boundaries (e.g.
+                                    // "CREATED_ISSUE=4" then "2\n" in the next delta)
+                                    // does not produce a spurious partial value.
+                                    let complete_len =
+                                        output.rfind('\n').map(|i| i + 1).unwrap_or(0);
                                     if let Some(issue_num) =
-                                        prompts::parse_created_issue_number(&output)
+                                        prompts::parse_created_issue_number(
+                                            &output[..complete_len],
+                                        )
                                     {
                                         if Some(issue_num) != last_backfilled_issue {
                                             let eid = format!("issue:{issue_num}");
