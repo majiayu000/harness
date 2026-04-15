@@ -90,7 +90,7 @@ pub fn rebase_conflicting_pr(pr_num: u64, branch: &str, repo: &str) -> String {
             git fetch origin\n\
             git worktree remove /tmp/harness-rebase-{pr_num} 2>/dev/null || rm -rf /tmp/harness-rebase-{pr_num} 2>/dev/null || true\n\
             git worktree prune\n\
-            git worktree add /tmp/harness-rebase-{pr_num} {branch}\n\
+            git worktree add /tmp/harness-rebase-{pr_num} '{branch}'\n\
             ```\n\
          2. Rebase onto origin/main inside the worktree:\n\
             ```\n\
@@ -105,7 +105,7 @@ pub fn rebase_conflicting_pr(pr_num: u64, branch: &str, repo: &str) -> String {
             Repeat until the rebase completes successfully.\n\
          4. Force-push the rebased branch:\n\
             ```\n\
-            git push --force-with-lease origin {branch}\n\
+            git push --force-with-lease origin '{branch}'\n\
             ```\n\
          5. Clean up: `git worktree remove /tmp/harness-rebase-{pr_num}`\n\n\
          On the last line of your output, print exactly one of:\n\

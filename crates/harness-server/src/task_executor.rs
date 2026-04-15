@@ -895,8 +895,9 @@ async fn run_triage_plan_pipeline(
 
 /// Fire a single agent turn to rebase a conflicting PR onto `origin/main`.
 ///
-/// Logs the outcome (`REBASE_OK` / `REBASE_FAILED`) but does not propagate
-/// errors — a rebase failure is not fatal; the review loop will handle the PR.
+/// Returns `true` if the agent reported `REBASE_OK` (i.e. a new commit was
+/// force-pushed), `false` in every other case.  Errors are not propagated —
+/// a rebase failure is not fatal; the review loop will handle the PR.
 async fn run_rebase_turn(
     agent: &dyn CodeAgent,
     pr_num: u64,
@@ -904,7 +905,7 @@ async fn run_rebase_turn(
     repo: &str,
     turn_timeout: Duration,
     cargo_env: &HashMap<String, String>,
-) {
+) -> bool {
     // Fetch the branch name from GitHub so the prompt has an exact ref.
     let branch = {
         let out = tokio::process::Command::new("gh")
@@ -933,10 +934,25 @@ async fn run_rebase_turn(
                     pr = pr_num,
                     "run_rebase_turn: could not fetch branch name; skipping"
                 );
-                return;
+                return false;
             }
         }
     };
+
+    // Reject branch names that contain shell metacharacters.  The branch
+    // name is embedded inside single-quoted shell commands in the agent
+    // prompt; a single-quote in the name would break out of the quoting.
+    if !branch
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | '@' | '~' | '+' | ':'))
+    {
+        tracing::warn!(
+            pr = pr_num,
+            branch = %branch,
+            "run_rebase_turn: branch name contains unsafe characters; skipping"
+        );
+        return false;
+    }
 
     let prompt = harness_core::prompts::rebase_conflicting_pr(pr_num, &branch, repo);
     let req = AgentRequest {
@@ -952,16 +968,24 @@ async fn run_rebase_turn(
             let last = resp.output.lines().next_back().unwrap_or("").trim();
             if last.contains("REBASE_OK") {
                 tracing::info!(pr = pr_num, "rebase turn: REBASE_OK");
+                true
             } else {
                 tracing::warn!(
                     pr = pr_num,
                     last_line = last,
                     "rebase turn: REBASE_FAILED or unexpected output"
                 );
+                false
             }
         }
-        Ok(Err(e)) => tracing::warn!(pr = pr_num, error = %e, "rebase turn: agent error"),
-        Err(_) => tracing::warn!(pr = pr_num, "rebase turn: timed out"),
+        Ok(Err(e)) => {
+            tracing::warn!(pr = pr_num, error = %e, "rebase turn: agent error");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(pr = pr_num, "rebase turn: timed out");
+            false
+        }
     }
 }
 
@@ -1697,6 +1721,7 @@ pub(crate) async fn run_task(
 
     // Conflict resolution gate: intercept CONFLICTING PRs before the review loop.
     // Only runs on the resume/recovery path — fresh PRs cannot be conflicting yet.
+    let mut rebase_pushed = false;
     if was_resumed_pr {
         use conflict_resolver::{assess_pr_conflict, PrConflictSize};
         let conflict_size = assess_pr_conflict(pr_num, &project).await;
@@ -1711,7 +1736,7 @@ pub(crate) async fn run_task(
                     region_count,
                     "conflict: small — attempting auto-rebase"
                 );
-                run_rebase_turn(
+                rebase_pushed = run_rebase_turn(
                     agent,
                     pr_num,
                     &project,
@@ -1813,7 +1838,7 @@ pub(crate) async fn run_task(
     // Starts true if the implementation phase pushed a commit, and is set to true again
     // whenever a review round produces FIXED (agent commits + pushes). This drives the
     // freshness check in every round after a fix commit, not just round 1.
-    let mut prev_fixed = agent_pushed_commit;
+    let mut prev_fixed = agent_pushed_commit || rebase_pushed;
     let repo_slug = prompts::repo_slug_from_pr_url(pr_url.as_deref());
 
     // Convergence tracking: detect when issue count stops decreasing.
