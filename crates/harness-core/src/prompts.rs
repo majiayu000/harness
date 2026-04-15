@@ -86,7 +86,7 @@ pub fn triage_prompt(issue: u64) -> PromptParts {
             "You are a Tech Lead evaluating GitHub issue #{issue} before any code is written.\n\n\
              **Step 1 — duplicate PR check:**\n\
              Run: `gh pr list --search \"{issue}\" --state open --json number,title`\n\
-             If an open PR targets this issue, output TRIAGE=SKIP with the PR number.\n\n\
+             If an open PR targets this issue, mention the PR number in your response, then follow the mandatory output format below with TRIAGE=SKIP.\n\n\
              **Step 2 — assess the issue (if no duplicate PR):**\n\
              Read the issue. Assess complexity and clarity briefly (2-3 sentences).\n\n\
              **Step 3 — choose ONE recommendation:**\n\
