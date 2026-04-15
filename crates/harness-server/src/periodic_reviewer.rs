@@ -1084,7 +1084,11 @@ async fn run_review_tick(
                                         // if the claim succeeds do we enqueue a task,
                                         // preventing orphaned tasks on race loss.
                                         match rs
-                                            .try_claim_finding(&finding.rule_id, &finding.file)
+                                            .try_claim_finding(
+                                                &project_root_for_poll.to_string_lossy(),
+                                                &finding.rule_id,
+                                                &finding.file,
+                                            )
                                             .await
                                         {
                                             Ok(false) => {
@@ -1115,6 +1119,7 @@ async fn run_review_tick(
                                             Ok(fix_task_id) => {
                                                 match rs
                                                     .confirm_task_spawned(
+                                                        &project_root_for_poll.to_string_lossy(),
                                                         &finding.rule_id,
                                                         &finding.file,
                                                         &fix_task_id.0,
@@ -1142,6 +1147,8 @@ async fn run_review_tick(
                                                         // second attempt is safe.
                                                         if let Err(e2) = rs
                                                             .confirm_task_spawned(
+                                                                &project_root_for_poll
+                                                                    .to_string_lossy(),
                                                                 &finding.rule_id,
                                                                 &finding.file,
                                                                 &fix_task_id.0,
@@ -1221,7 +1228,11 @@ async fn run_review_tick(
                                             Err(e) => {
                                                 // Release the claim so the next cycle can retry.
                                                 if let Err(re) = rs
-                                                    .release_claim(&finding.rule_id, &finding.file)
+                                                    .release_claim(
+                                                        &project_root_for_poll.to_string_lossy(),
+                                                        &finding.rule_id,
+                                                        &finding.file,
+                                                    )
                                                     .await
                                                 {
                                                     tracing::warn!(
