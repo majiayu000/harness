@@ -1426,21 +1426,21 @@ impl TaskStore {
         self.db.pending_tasks_with_checkpoint().await
     }
 
-    /// Back-fill `external_id` on a task that was created without one.
+    /// Overwrite `external_id` on an auto-fix task, even if one is already set.
     ///
-    /// Updates both the DB (with an `IS NULL` guard to prevent overwriting a
-    /// legitimately-set value) and the in-memory cache so dedup reads are
-    /// immediately consistent.
-    pub(crate) async fn update_external_id(
+    /// Used during streaming to implement "last sentinel wins" — the agent may
+    /// emit multiple `CREATED_ISSUE=` lines as it self-corrects.  Updates both
+    /// the DB and the in-memory cache so dedup reads are immediately consistent.
+    pub(crate) async fn overwrite_external_id_auto_fix(
         &self,
         id: &TaskId,
         external_id: &str,
     ) -> anyhow::Result<()> {
-        self.db.update_external_id(id.as_str(), external_id).await?;
+        self.db
+            .overwrite_external_id_auto_fix(id.as_str(), external_id)
+            .await?;
         if let Some(mut entry) = self.cache.get_mut(id) {
-            // Only mirror into cache if DB guard passed (external_id was NULL).
-            // Re-read to check: if DB now shows the value, cache should too.
-            if entry.external_id.is_none() {
+            if entry.source.as_deref() == Some("auto-fix") {
                 entry.external_id = Some(external_id.to_string());
             }
         }
