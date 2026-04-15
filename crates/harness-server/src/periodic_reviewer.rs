@@ -977,7 +977,11 @@ async fn run_review_tick(
                 );
                 if let Some(ref rs) = review_store {
                     match rs
-                        .persist_findings(&final_task_id.0, &review.findings)
+                        .persist_findings(
+                            &project_root_for_poll.to_string_lossy(),
+                            &final_task_id.0,
+                            &review.findings,
+                        )
                         .await
                     {
                         Ok(n) => {
@@ -1002,26 +1006,41 @@ async fn run_review_tick(
                             //       premature recovery while any task spawned before the
                             //       upgrade may still be running.
                             let tasks_snapshot = state_for_synthesis.core.tasks.clone();
+                            // Pre-resolve task statuses for all stale real_task_ids.
+                            // The in-memory cache only contains active tasks; terminal
+                            // tasks (Failed, Cancelled) are evicted at startup and are
+                            // DB-only after a server restart.  Using get_with_db_fallback
+                            // ensures we correctly classify those tasks instead of
+                            // misidentifying them as successful (None in-memory).
+                            let stale_ids = rs.list_stale_real_task_ids().await.unwrap_or_default();
+                            let mut task_outcome_map: std::collections::HashMap<
+                                String,
+                                Option<bool>,
+                            > = std::collections::HashMap::new();
+                            for tid in stale_ids {
+                                let task_id = harness_core::types::TaskId(tid.clone());
+                                let outcome = match tasks_snapshot
+                                    .get_with_db_fallback(&task_id)
+                                    .await
+                                {
+                                    Ok(Some(t)) => match t.status {
+                                        crate::task_runner::TaskStatus::Done => Some(false),
+                                        crate::task_runner::TaskStatus::Failed
+                                        | crate::task_runner::TaskStatus::Cancelled => Some(true),
+                                        // Still in-flight — leave pending claim intact.
+                                        _ => None,
+                                    },
+                                    // Task unknown in both cache and DB, or DB error:
+                                    // leave the pending claim intact so Strategy 2
+                                    // (time-based fallback) can recover it later.
+                                    Ok(None) | Err(_) => None,
+                                };
+                                task_outcome_map.insert(tid, outcome);
+                            }
                             match rs
                                 .recover_stale_pending_claims(3900, |tid| {
-                                    let id = harness_core::types::TaskId(tid.to_string());
-                                    match tasks_snapshot.get(&id) {
-                                        // Task not in store: unknown outcome — release
-                                        // claim without penalty and let the next review
-                                        // cycle re-evaluate the finding.
-                                        None => Some(false),
-                                        Some(t) if matches!(
-                                            t.status,
-                                            crate::task_runner::TaskStatus::Done
-                                        ) => Some(false),
-                                        Some(t) if matches!(
-                                            t.status,
-                                            crate::task_runner::TaskStatus::Failed
-                                                | crate::task_runner::TaskStatus::Cancelled
-                                        ) => Some(true),
-                                        // Still in-flight — leave pending claim intact.
-                                        Some(_) => None,
-                                    }
+                                    // Flatten Option<&Option<bool>> → Option<bool>.
+                                    task_outcome_map.get(tid).copied().flatten()
                                 })
                                 .await
                             {
@@ -1225,7 +1244,13 @@ async fn run_review_tick(
                             // seen in this scan cycle (violation resolved).
                             // This runs after the spawn loop so that resolution
                             // and re-spawn cannot race within the same tick.
-                            match rs.reset_cooldowns_for_resolved(&final_task_id.0).await {
+                            match rs
+                                .reset_cooldowns_for_resolved(
+                                    &project_root_for_poll.to_string_lossy(),
+                                    &final_task_id.0,
+                                )
+                                .await
+                            {
                                 Ok(0) => {}
                                 Ok(n) => tracing::debug!(
                                     cleared = n,

@@ -153,6 +153,24 @@ impl ReviewStore {
                 .execute(&pool)
                 .await?;
         }
+        // Migrate: add project_root column to enable per-project scoping of
+        // reset_cooldowns_for_resolved (issue #771).  Without this column the
+        // reset query clears cooldown state for all projects in a multi-project
+        // server when any single project finishes a scan.
+        // DEFAULT '' keeps existing rows selectable but they won't match any
+        // real project root query, effectively orphaning pre-migration cooldown
+        // state (acceptable; the next scan repopulates the correct value).
+        let has_project_root = columns
+            .iter()
+            .any(|(_, name, _, _, _, _)| name == "project_root");
+        if !has_project_root {
+            sqlx::query(
+                "ALTER TABLE review_findings \
+                 ADD COLUMN project_root TEXT NOT NULL DEFAULT ''",
+            )
+            .execute(&pool)
+            .await?;
+        }
         // Partial index speeds up list_spawnable_findings which filters open rows
         // by task_id IS NULL and cooldown_until on every scheduler tick.
         sqlx::query(
@@ -188,8 +206,12 @@ impl ReviewStore {
     /// returned as an error rather than silently dropped by INSERT OR IGNORE.
     /// Cross-review dedup (same rule_id+file already open) is handled atomically by
     /// INSERT OR IGNORE + conditional UPDATE, eliminating the TOCTOU race.
+    ///
+    /// `project_root` is stored on each row to enable per-project scoping of
+    /// `reset_cooldowns_for_resolved` in multi-project server deployments.
     pub async fn persist_findings(
         &self,
+        project_root: &str,
         review_id: &str,
         findings: &[ReviewFinding],
     ) -> anyhow::Result<usize> {
@@ -210,12 +232,13 @@ impl ReviewStore {
         for f in findings {
             let result = sqlx::query(
                 "INSERT OR IGNORE INTO review_findings \
-                 (id, review_id, rule_id, priority, impact, confidence, effort, \
+                 (id, review_id, project_root, rule_id, priority, impact, confidence, effort, \
                   file, line, title, description, action) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&f.id)
             .bind(review_id)
+            .bind(project_root)
             .bind(&f.rule_id)
             .bind(&f.priority)
             .bind(f.impact)
@@ -232,12 +255,14 @@ impl ReviewStore {
             if result.rows_affected() == 1 {
                 inserted += 1;
             } else {
-                // Existing open finding for the same rule_id+file — mark as recurring.
+                // Existing open finding for the same rule_id+file — mark as recurring
+                // and update project_root in case the row was created before migration.
                 sqlx::query(
-                    "UPDATE review_findings SET review_id = ? \
+                    "UPDATE review_findings SET review_id = ?, project_root = ? \
                      WHERE rule_id = ? AND file = ? AND status = 'open'",
                 )
                 .bind(review_id)
+                .bind(project_root)
                 .bind(&f.rule_id)
                 .bind(&f.file)
                 .execute(&mut *tx)
@@ -401,6 +426,25 @@ impl ReviewStore {
         Ok(recovered)
     }
 
+    /// Return the `real_task_id` values for all findings currently stuck in
+    /// `task_id='pending'` that have a confirmed real task ID.
+    ///
+    /// Used by callers to pre-resolve task statuses asynchronously (including
+    /// DB-fallback lookups) before passing results to `recover_stale_pending_claims`
+    /// via a synchronous closure.  The in-memory `TaskStore` cache only holds active
+    /// tasks; terminal tasks (Failed, Cancelled) are DB-only after a server restart,
+    /// so the caller must use `get_with_db_fallback` on each returned ID.
+    pub async fn list_stale_real_task_ids(&self) -> anyhow::Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT real_task_id FROM review_findings \
+             WHERE task_id = 'pending' AND status = 'open' \
+               AND claimed_at IS NOT NULL AND real_task_id IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     /// Record the real task id for a finding stuck in `task_id='pending'` after
     /// both `confirm_task_spawned` attempts failed.  This enables task-status-based
     /// stale recovery via [`recover_stale_pending_claims`] without relying on a
@@ -508,17 +552,24 @@ impl ReviewStore {
     /// the violation reappears it starts with a fresh failure history instead
     /// of inheriting stale backoff state.
     ///
+    /// `project_root` scopes the reset to findings belonging to the same project.
+    /// In a multi-project server all projects share one DB; without this filter
+    /// a scan completion for project A would incorrectly clear cooldown state for
+    /// open findings from project B whose `review_id != current_review_id`.
+    ///
     /// Returns the number of rows whose cooldown was cleared.
     pub async fn reset_cooldowns_for_resolved(
         &self,
+        project_root: &str,
         current_review_id: &str,
     ) -> anyhow::Result<u64> {
         let result = sqlx::query(
             "UPDATE review_findings \
              SET failure_count = 0, cooldown_until = NULL \
-             WHERE status = 'open' AND review_id != ? \
+             WHERE status = 'open' AND project_root = ? AND review_id != ? \
                AND (failure_count > 0 OR cooldown_until IS NOT NULL)",
         )
+        .bind(project_root)
         .bind(current_review_id)
         .execute(&self.pool)
         .await?;
@@ -707,8 +758,8 @@ mod tests {
         let f2 = findings.clone();
 
         let (r1, r2) = tokio::join!(
-            store1.persist_findings("rev-1", &f1),
-            store2.persist_findings("rev-2", &f2),
+            store1.persist_findings("", "rev-1", &f1),
+            store2.persist_findings("", "rev-2", &f2),
         );
 
         // Both calls must succeed without constraint violation errors.
@@ -744,7 +795,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         let findings = vec![make_finding("F001", "RS-03", "src/lib.rs", "P1")];
-        store.persist_findings("rev-1", &findings).await?;
+        store.persist_findings("", "rev-1", &findings).await?;
 
         // First claim wins.
         assert!(
@@ -776,7 +827,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         let findings = vec![make_finding("F001", "RS-03", "src/lib.rs", "P1")];
-        store.persist_findings("rev-1", &findings).await?;
+        store.persist_findings("", "rev-1", &findings).await?;
 
         // Claim, then release (simulates enqueue failure).
         assert!(store.try_claim_finding("RS-03", "src/lib.rs").await?);
@@ -800,7 +851,7 @@ mod tests {
             make_finding("F2", "R2", "c.rs", "P2"),
             make_finding("F3", "R3", "d.rs", "P3"),
         ];
-        store.persist_findings("rev-1", &findings).await?;
+        store.persist_findings("", "rev-1", &findings).await?;
 
         let spawnable = store
             .list_spawnable_findings("rev-1", &["P1", "P2"])
@@ -821,7 +872,7 @@ mod tests {
             make_finding("F1", "R1", "a.rs", "P1"),
             make_finding("F2", "R2", "b.rs", "P2"),
         ];
-        store.persist_findings("rev-1", &findings).await?;
+        store.persist_findings("", "rev-1", &findings).await?;
         store.try_claim_finding("R1", "a.rs").await?;
         store.confirm_task_spawned("R1", "a.rs", "task-111").await?;
 
@@ -838,7 +889,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         let findings = vec![make_finding("F1", "R1", "a.rs", "P1")];
-        store.persist_findings("rev-1", &findings).await?;
+        store.persist_findings("", "rev-1", &findings).await?;
         sqlx::query("UPDATE review_findings SET status = 'resolved' WHERE id = 'F1'")
             .execute(&store.pool)
             .await?;
@@ -861,7 +912,7 @@ mod tests {
 
         // First review: persist, claim and confirm task.
         store
-            .persist_findings("rev-1", std::slice::from_ref(&finding))
+            .persist_findings("", "rev-1", std::slice::from_ref(&finding))
             .await?;
         store.try_claim_finding("RS-03", "src/lib.rs").await?;
         store
@@ -871,7 +922,7 @@ mod tests {
         // Second review: same rule_id+file triggers UPDATE (recurring finding),
         // review_id changes to rev-2 but task_id must be preserved.
         let finding2 = make_finding("F1", "RS-03", "src/lib.rs", "P1");
-        store.persist_findings("rev-2", &[finding2]).await?;
+        store.persist_findings("", "rev-2", &[finding2]).await?;
 
         // task_id IS NOT NULL so it must not appear in spawnable list.
         let spawnable = store
@@ -897,12 +948,12 @@ mod tests {
 
         // Simulate: list_spawnable_findings returned F1 under rev-1.
         store
-            .persist_findings("rev-1", std::slice::from_ref(&finding))
+            .persist_findings("", "rev-1", std::slice::from_ref(&finding))
             .await?;
 
         // Simulate race: persist_findings runs with rev-2 BEFORE try_claim_finding.
         let finding2 = make_finding("F1", "RS-03", "src/lib.rs", "P1");
-        store.persist_findings("rev-2", &[finding2]).await?;
+        store.persist_findings("", "rev-2", &[finding2]).await?;
 
         // try_claim_finding must succeed even though the row now has review_id="rev-2".
         let claimed = store.try_claim_finding("RS-03", "src/lib.rs").await?;
@@ -942,11 +993,11 @@ mod tests {
             task_id: None,
         }];
 
-        let inserted = store.persist_findings("rev-1", &findings).await?;
+        let inserted = store.persist_findings("", "rev-1", &findings).await?;
         assert_eq!(inserted, 1);
 
         // Same rule_id + file = dedup (recurring).
-        let inserted = store.persist_findings("rev-2", &findings).await?;
+        let inserted = store.persist_findings("", "rev-2", &findings).await?;
         assert_eq!(inserted, 0);
 
         let open = store.list_open().await?;
@@ -991,7 +1042,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         store
-            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .persist_findings("", "rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
             .await?;
 
         for expected in 1u32..=3 {
@@ -1012,7 +1063,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         store
-            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .persist_findings("", "rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
             .await?;
 
         set_pending(&store, "R1", "a.rs").await;
@@ -1033,7 +1084,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         store
-            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .persist_findings("", "rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
             .await?;
 
         // Expected delays (seconds) for failure_count = 0..=5.
@@ -1064,7 +1115,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         store
-            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .persist_findings("", "rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
             .await?;
 
         // Set an active cooldown (far future).
@@ -1091,7 +1142,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         store
-            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .persist_findings("", "rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
             .await?;
 
         // Set an expired cooldown (past timestamp).
@@ -1119,7 +1170,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         store
-            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .persist_findings("", "rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
             .await?;
 
         // Apply a failure to set counters.
@@ -1145,7 +1196,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         store
-            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .persist_findings("", "rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
             .await?;
 
         // Simulate a confirmed-task pending row (real_task_id set).
@@ -1180,7 +1231,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         store
-            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .persist_findings("", "rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
             .await?;
 
         // Simulate a stale mid-claim row (no real_task_id, old claimed_at).
@@ -1218,7 +1269,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = ReviewStore::open(&dir.path().join("review.db")).await?;
         store
-            .persist_findings("rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
+            .persist_findings("", "rev-1", &[make_finding("F1", "R1", "a.rs", "P1")])
             .await?;
 
         // Apply some failures so counters are non-zero.
@@ -1233,7 +1284,7 @@ mod tests {
 
         // A new scan (rev-2) does not include this finding.  reset_cooldowns_for_resolved
         // should clear the counters since the finding's review_id is still "rev-1".
-        let cleared = store.reset_cooldowns_for_resolved("rev-2").await?;
+        let cleared = store.reset_cooldowns_for_resolved("", "rev-2").await?;
         assert_eq!(cleared, 1, "one finding must have its cooldown cleared");
 
         let (count_after, cooldown_after) = get_cooldown(&store, "R1", "a.rs").await;
