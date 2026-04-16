@@ -143,11 +143,17 @@ impl CodeAgent for CodexAgent {
 
         if !output.status.success() {
             let stderr_lower = stderr.to_lowercase();
-            if stderr_lower.contains("402")
-                || stderr_lower.contains("quota")
-                || stderr_lower.contains("payment required")
+            // Permanent billing failures (will not recover after a wait).
+            if stderr_lower.contains("payment required")
                 || stderr_lower.contains("insufficient available balance")
             {
+                return Err(harness_core::error::HarnessError::BillingFailed(format!(
+                    "codex billing failure (exit {}): {stderr}",
+                    output.status
+                )));
+            }
+            // Transient quota exhaustion (rate-limited; may recover after backoff).
+            if stderr_lower.contains("402") || stderr_lower.contains("quota") {
                 return Err(harness_core::error::HarnessError::QuotaExhausted(format!(
                     "codex quota exhausted (exit {}): {stderr}",
                     output.status
