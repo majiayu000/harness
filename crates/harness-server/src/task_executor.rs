@@ -763,6 +763,13 @@ async fn run_plan_for_prompt(
         state.phase = TaskPhase::Implement;
     })
     .await?;
+    // NOTE: intentionally no write_checkpoint() here.  Prompt-only tasks cannot
+    // be recovered after a crash (http.rs startup recovery hard-fails them because
+    // the original prompt is not persisted — by design, to avoid writing
+    // credentials/customer data to disk).  Writing the plan blob to the checkpoint
+    // table would therefore provide no resumability benefit while writing
+    // prompt-derived content (which often echoes or summarises the raw prompt) to
+    // the on-disk SQLite store, violating the same privacy invariant.
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete (prompt-only)");
     Ok((Some(plan_text), prompts::TriageComplexity::Medium, 1))
