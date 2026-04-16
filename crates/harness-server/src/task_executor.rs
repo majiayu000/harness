@@ -600,17 +600,19 @@ async fn run_agent_streaming(
                                                 .overwrite_external_id_auto_fix(task_id, &eid)
                                                 .await
                                             {
-                                                Ok(()) => tracing::info!(
-                                                    task_id = %task_id,
-                                                    external_id = %eid,
-                                                    "streaming: backfilled external_id for auto-fix task"
-                                                ),
+                                                Ok(()) => {
+                                                    tracing::info!(
+                                                        task_id = %task_id,
+                                                        external_id = %eid,
+                                                        "streaming: backfilled external_id for auto-fix task"
+                                                    );
+                                                    last_backfilled_issue = Some(issue_num);
+                                                }
                                                 Err(e) => tracing::warn!(
                                                     task_id = %task_id,
                                                     "streaming: failed to backfill external_id: {e}"
                                                 ),
                                             }
-                                            last_backfilled_issue = Some(issue_num);
                                         }
                                     }
                                 }
@@ -641,17 +643,19 @@ async fn run_agent_streaming(
                                                 .overwrite_external_id_auto_fix(task_id, &eid)
                                                 .await
                                             {
-                                                Ok(()) => tracing::info!(
-                                                    task_id = %task_id,
-                                                    external_id = %eid,
-                                                    "streaming: backfilled external_id for auto-fix task"
-                                                ),
+                                                Ok(()) => {
+                                                    tracing::info!(
+                                                        task_id = %task_id,
+                                                        external_id = %eid,
+                                                        "streaming: backfilled external_id for auto-fix task"
+                                                    );
+                                                    last_backfilled_issue = Some(issue_num);
+                                                }
                                                 Err(e) => tracing::warn!(
                                                     task_id = %task_id,
                                                     "streaming: failed to backfill external_id: {e}"
                                                 ),
                                             }
-                                            last_backfilled_issue = Some(issue_num);
                                         }
                                     }
                                 }
