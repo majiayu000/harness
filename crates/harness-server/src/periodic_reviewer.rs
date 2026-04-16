@@ -977,7 +977,11 @@ async fn run_review_tick(
                 );
                 if let Some(ref rs) = review_store {
                     match rs
-                        .persist_findings(&final_task_id.0, &review.findings)
+                        .persist_findings(
+                            &project_root_for_poll.to_string_lossy(),
+                            &final_task_id.0,
+                            &review.findings,
+                        )
                         .await
                     {
                         Ok(n) => {
@@ -1002,13 +1006,50 @@ async fn run_review_tick(
                             //       premature recovery while any task spawned before the
                             //       upgrade may still be running.
                             let tasks_snapshot = state_for_synthesis.core.tasks.clone();
+                            // Pre-resolve task statuses for all stale real_task_ids.
+                            // The in-memory cache only contains active tasks; terminal
+                            // tasks (Failed, Cancelled) are evicted at startup and are
+                            // DB-only after a server restart.  Using get_with_db_fallback
+                            // ensures we correctly classify those tasks instead of
+                            // misidentifying them as successful (None in-memory).
+                            let stale_ids = match rs
+                                .list_stale_real_task_ids(&project_root_for_poll.to_string_lossy())
+                                .await
+                            {
+                                Ok(ids) => ids,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "scheduler: failed to list stale real task IDs, \
+                                         recovery may be incomplete: {e}"
+                                    );
+                                    vec![]
+                                }
+                            };
+                            let mut task_outcome_map = HashMap::new();
+                            for tid in stale_ids {
+                                let task_id = harness_core::types::TaskId(tid.clone());
+                                let outcome = match tasks_snapshot
+                                    .get_with_db_fallback(&task_id)
+                                    .await
+                                {
+                                    Ok(Some(t)) => match t.status {
+                                        crate::task_runner::TaskStatus::Done => Some(false),
+                                        crate::task_runner::TaskStatus::Failed
+                                        | crate::task_runner::TaskStatus::Cancelled => Some(true),
+                                        // Still in-flight — leave pending claim intact.
+                                        _ => None,
+                                    },
+                                    // Task unknown in both cache and DB, or DB error:
+                                    // leave the pending claim intact so Strategy 2
+                                    // (time-based fallback) can recover it later.
+                                    Ok(None) | Err(_) => None,
+                                };
+                                task_outcome_map.insert(tid, outcome);
+                            }
                             match rs
-                                .recover_stale_pending_claims(3900, |tid| {
-                                    let id = harness_core::types::TaskId(tid.to_string());
-                                    // task not in store → treat as done
-                                    tasks_snapshot
-                                        .get(&id)
-                                        .is_none_or(|t| t.status.is_terminal())
+                                .recover_stale_pending_claims(&project_root_for_poll.to_string_lossy(), 3900, |tid| {
+                                    // Flatten Option<&Option<bool>> → Option<bool>.
+                                    task_outcome_map.get(tid).copied().flatten()
                                 })
                                 .await
                             {
@@ -1049,7 +1090,11 @@ async fn run_review_tick(
                                         // if the claim succeeds do we enqueue a task,
                                         // preventing orphaned tasks on race loss.
                                         match rs
-                                            .try_claim_finding(&finding.rule_id, &finding.file)
+                                            .try_claim_finding(
+                                                &project_root_for_poll.to_string_lossy(),
+                                                &finding.rule_id,
+                                                &finding.file,
+                                            )
                                             .await
                                         {
                                             Ok(false) => {
@@ -1080,6 +1125,7 @@ async fn run_review_tick(
                                             Ok(fix_task_id) => {
                                                 match rs
                                                     .confirm_task_spawned(
+                                                        &project_root_for_poll.to_string_lossy(),
                                                         &finding.rule_id,
                                                         &finding.file,
                                                         &fix_task_id.0,
@@ -1107,6 +1153,8 @@ async fn run_review_tick(
                                                         // second attempt is safe.
                                                         if let Err(e2) = rs
                                                             .confirm_task_spawned(
+                                                                &project_root_for_poll
+                                                                    .to_string_lossy(),
                                                                 &finding.rule_id,
                                                                 &finding.file,
                                                                 &fix_task_id.0,
@@ -1142,6 +1190,8 @@ async fn run_review_tick(
                                                                     .await;
                                                                 match rs
                                                                     .record_real_task_id(
+                                                                        &project_root_for_poll
+                                                                            .to_string_lossy(),
                                                                         &finding.rule_id,
                                                                         &finding.file,
                                                                         &fix_task_id.0,
@@ -1186,7 +1236,11 @@ async fn run_review_tick(
                                             Err(e) => {
                                                 // Release the claim so the next cycle can retry.
                                                 if let Err(re) = rs
-                                                    .release_claim(&finding.rule_id, &finding.file)
+                                                    .release_claim(
+                                                        &project_root_for_poll.to_string_lossy(),
+                                                        &finding.rule_id,
+                                                        &finding.file,
+                                                    )
                                                     .await
                                                 {
                                                     tracing::warn!(
@@ -1207,6 +1261,27 @@ async fn run_review_tick(
                                         "scheduler: failed to list spawnable findings: {e}"
                                     );
                                 }
+                            }
+                            // Reset cooldown counters for findings that were not
+                            // seen in this scan cycle (violation resolved).
+                            // This runs after the spawn loop so that resolution
+                            // and re-spawn cannot race within the same tick.
+                            match rs
+                                .reset_cooldowns_for_resolved(
+                                    &project_root_for_poll.to_string_lossy(),
+                                    &final_task_id.0,
+                                )
+                                .await
+                            {
+                                Ok(0) => {}
+                                Ok(n) => tracing::debug!(
+                                    cleared = n,
+                                    "scheduler: reset cooldowns for resolved findings"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "scheduler: reset_cooldowns_for_resolved failed \
+                                     (continuing): {e}"
+                                ),
                             }
                         }
                         Err(e) => tracing::warn!("scheduler: failed to persist findings: {e}"),
