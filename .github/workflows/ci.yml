@@ -109,11 +109,18 @@ jobs:
     name: CI Result
     runs-on: ubuntu-latest
     if: always()
-    needs: [fmt, check, clippy, test, audit]
+    needs: [changed, fmt, check, clippy, test, audit]
     steps:
       - name: Check all jobs
         run: |
-          results=("${{ needs.fmt.result }}" "${{ needs.check.result }}" "${{ needs.clippy.result }}" "${{ needs.test.result }}" "${{ needs.audit.result }}")
+          results=(
+            "${{ needs.changed.result }}"
+            "${{ needs.fmt.result }}"
+            "${{ needs.check.result }}"
+            "${{ needs.clippy.result }}"
+            "${{ needs.test.result }}"
+            "${{ needs.audit.result }}"
+          )
           for r in "${results[@]}"; do
             if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then
               echo "Job failed or cancelled: $r"
