@@ -223,6 +223,32 @@ pub(crate) async fn enqueue_task(
         return Ok(existing_id);
     }
 
+    // Tasks with unresolved dependencies are registered as AwaitingDeps without
+    // acquiring a concurrency permit. The dep watcher will dispatch them later.
+    // If all declared deps are already Done we skip the AwaitingDeps path and
+    // fall through to the normal concurrency-permit dispatch below.
+    if !req.depends_on.is_empty() {
+        let mut all_deps_done = true;
+        for dep_id in &req.depends_on {
+            if !matches!(
+                state.core.tasks.dep_status(dep_id).await,
+                Some(task_runner::TaskStatus::Done)
+            ) {
+                all_deps_done = false;
+                break;
+            }
+        }
+        if !all_deps_done {
+            let task_id = task_runner::spawn_task_awaiting_deps(state.core.tasks.clone(), req)
+                .await
+                .map_err(|e| EnqueueTaskError::BadRequest(e.to_string()))?;
+            return Ok(task_id);
+        }
+        // All deps satisfied — clear the list so the normal spawn path
+        // does not re-enter the AwaitingDeps branch.
+        req.depends_on.clear();
+    }
+
     // Acquire concurrency permit before spawning. Blocks if all slots are
     // occupied; rejects immediately if the waiting queue is full.
     let permit = state
