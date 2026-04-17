@@ -1446,8 +1446,31 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                                 tracing::error!(
                                     task_id = ?task.id,
                                     description = ?task.description,
-                                    "startup recovery: no issue number or prompt recoverable; skipping task to avoid empty-prompt execution"
+                                    "startup recovery: no issue number or prompt recoverable; marking failed"
                                 );
+                                if let Err(e) = task_runner::mutate_and_persist(
+                                    &state.core.tasks,
+                                    &task.id,
+                                    |s| {
+                                        s.status = task_runner::TaskStatus::Failed;
+                                        s.error = Some(
+                                            "startup recovery: no issue number or prompt recoverable"
+                                                .to_string(),
+                                        );
+                                    },
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        task_id = ?task.id,
+                                        "startup recovery: failed to persist failed status: {e}"
+                                    );
+                                }
+                                if let Some(cb) = &state.intake.completion_callback {
+                                    if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                        cb(final_state).await;
+                                    }
+                                }
                                 return;
                             }
                             tracing::warn!(
