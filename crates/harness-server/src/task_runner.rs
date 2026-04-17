@@ -1717,7 +1717,15 @@ impl TaskStore {
                     "validate_done_tasks_pr_state: set_pr_state failed: {e}"
                 );
             } else {
-                tracing::info!(task_id, pr_url, state, "startup: backfilled pr_state");
+                // Mirror the DB write into the in-memory cache so that
+                // `find_terminal_pr_duplicate` sees the updated state
+                // immediately — without this, a task that completes during
+                // the current server session retains pr_state=None in the
+                // cache and continues blocking resubmission until restart.
+                if let Some(mut entry) = self.cache.get_mut(&CoreTaskId(task_id.clone())) {
+                    entry.pr_state = Some(state.clone());
+                }
+                tracing::info!(task_id, pr_url, state, "backfilled pr_state");
             }
 
             // Pace calls to avoid GitHub API rate limits.

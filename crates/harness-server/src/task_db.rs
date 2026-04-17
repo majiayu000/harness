@@ -344,10 +344,10 @@ impl TaskDb {
     /// tasks are excluded so that retries after failure are always permitted.
     ///
     /// Rows where `pr_state = 'CLOSED'` are excluded: a closed-without-merge PR must
-    /// not block resubmission. NULL `pr_state` is eligible only within the 90-day
-    /// backfill window (matching `list_done_tasks_needing_pr_state`). Rows older than
-    /// 90 days with NULL `pr_state` will never be backfilled and must not permanently
-    /// block resubmission.
+    /// not block resubmission. Rows with NULL `pr_state` are included regardless of age
+    /// — we cannot know whether their PR is OPEN or MERGED, so we conservatively block
+    /// resubmission. The backfill sweep (`list_done_tasks_needing_pr_state`) has its own
+    /// 90-day limit for API efficiency; that limit must not carry over to dedup.
     pub async fn find_terminal_with_pr(
         &self,
         project: &str,
@@ -357,7 +357,6 @@ impl TaskDb {
             "SELECT id, pr_url FROM tasks \
              WHERE project = ? AND external_id = ? AND status = 'done' AND pr_url IS NOT NULL \
              AND (pr_state IS NULL OR pr_state != 'CLOSED') \
-             AND (pr_state IS NOT NULL OR updated_at >= datetime('now', '-90 days')) \
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(project)
