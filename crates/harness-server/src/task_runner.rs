@@ -393,8 +393,10 @@ pub struct PersistedRequestSettings {
     /// request when their dependencies resolve within the same server session.
     /// Intentionally NOT serialised to the database: prompts may contain
     /// credentials or sensitive data and must not be written at rest.
-    /// After a server restart the prompt will be absent; the task will still
-    /// be dispatched but without the caller's original prompt text.
+    /// LIMITATION: after a server restart the prompt will be absent; prompt-only
+    /// `AwaitingDeps` tasks will transition to `Pending` once their dependencies
+    /// resolve, then fail immediately in the dep-watcher dispatch path because
+    /// no prompt is available to replay.
     #[serde(skip)]
     pub prompt: Option<String>,
 }
@@ -2263,7 +2265,8 @@ pub async fn spawn_task_awaiting_deps(
 /// the caller so that status transitions survive a process restart.
 pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>) {
     let mut ready = Vec::new();
-    let mut failed_deps: Vec<(TaskId, TaskId)> = Vec::new();
+    // (task_id, dep_id, dep_terminal_status_label) — label is "failed" or "cancelled".
+    let mut failed_deps: Vec<(TaskId, TaskId, &'static str)> = Vec::new();
 
     // Snapshot AwaitingDeps tasks from cache before async work.
     let awaiting: Vec<(TaskId, Vec<TaskId>)> = store
@@ -2282,12 +2285,22 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
     for (task_id, depends_on) in awaiting {
         // Single pass: one DB lookup per dep (cache-first, then lightweight
         // `SELECT status` — no `rounds` JSON decode).
-        let mut failed_dep_id = None;
+        let mut failed_dep_id: Option<(TaskId, &'static str)> = None;
         let mut all_done = true;
         for dep_id in &depends_on {
             match store.dep_status(dep_id).await {
                 Some(TaskStatus::Failed) => {
-                    failed_dep_id = Some(dep_id.clone());
+                    failed_dep_id = Some((dep_id.clone(), "failed"));
+                    break; // fail-fast — no need to inspect remaining deps
+                }
+                Some(TaskStatus::Cancelled) => {
+                    // A cancelled dependency hard-fails its dependents. When a
+                    // task is re-queued it always receives a new TaskId, so the
+                    // original (now-cancelled) TaskId in `depends_on` can never
+                    // transition to Done. Leaving the dependent in AwaitingDeps
+                    // would block it indefinitely; failing it immediately lets
+                    // the caller re-submit with correct dependency IDs.
+                    failed_dep_id = Some((dep_id.clone(), "cancelled"));
                     break; // fail-fast — no need to inspect remaining deps
                 }
                 Some(TaskStatus::Done) => {} // this dep is satisfied
@@ -2298,8 +2311,8 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
                 }
             }
         }
-        if let Some(fd) = failed_dep_id {
-            failed_deps.push((task_id, fd));
+        if let Some((fd, label)) = failed_dep_id {
+            failed_deps.push((task_id, fd, label));
             continue;
         }
         if all_done {
@@ -2308,13 +2321,13 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
     }
 
     let mut newly_failed: Vec<TaskId> = Vec::new();
-    for (task_id, failed_dep_id) in &failed_deps {
+    for (task_id, failed_dep_id, label) in &failed_deps {
         if let Some(mut entry) = store.cache.get_mut(task_id) {
             // Only overwrite if the task is still AwaitingDeps — a concurrent
             // cancel or status transition must not be clobbered.
             if matches!(entry.status, TaskStatus::AwaitingDeps) {
                 entry.status = TaskStatus::Failed;
-                entry.error = Some(format!("dependency {} failed", failed_dep_id.0));
+                entry.error = Some(format!("dependency {} {}", failed_dep_id.0, label));
                 newly_failed.push(task_id.clone());
             }
         }
@@ -3345,6 +3358,278 @@ mod tests {
         let key = root.to_string_lossy().into_owned();
         assert_eq!(counts.by_project[&key].done, 1);
         assert_eq!(counts.by_project[&key].failed, 1);
+        Ok(())
+    }
+
+    // --- dependency scheduling tests ---
+
+    fn tid(s: &str) -> harness_core::types::TaskId {
+        harness_core::types::TaskId(s.to_string())
+    }
+
+    #[tokio::test]
+    async fn spawn_awaiting_all_deps_done_creates_pending() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let dep_id = tid("dep-done");
+        let mut dep = TaskState::new(dep_id.clone());
+        dep.status = TaskStatus::Done;
+        store.insert(&dep).await;
+
+        let req = CreateTaskRequest {
+            prompt: Some("task with done dep".into()),
+            depends_on: vec![dep_id],
+            ..Default::default()
+        };
+
+        let task_id = spawn_task_awaiting_deps(store.clone(), req).await?;
+        let state = store.get(&task_id).expect("task should be in store");
+        assert!(
+            matches!(state.status, TaskStatus::Pending),
+            "expected Pending when all deps Done, got {:?}",
+            state.status
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_awaiting_unresolved_dep_creates_awaiting() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let dep_id = tid("dep-pending");
+        let dep = TaskState::new(dep_id.clone()); // Pending by default
+        store.insert(&dep).await;
+
+        let req = CreateTaskRequest {
+            prompt: Some("task with pending dep".into()),
+            depends_on: vec![dep_id],
+            ..Default::default()
+        };
+
+        let task_id = spawn_task_awaiting_deps(store.clone(), req).await?;
+        let state = store.get(&task_id).expect("task should be in store");
+        assert!(
+            matches!(state.status, TaskStatus::AwaitingDeps),
+            "expected AwaitingDeps when dep not Done, got {:?}",
+            state.status
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_awaiting_detects_direct_cycle() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        // Chain: new → A → new  (A's depends_on contains new_id)
+        let new_id = tid("new-task");
+        let a_id = tid("task-a");
+
+        let mut task_a = TaskState::new(a_id.clone());
+        task_a.depends_on = vec![new_id.clone()];
+        store.insert(&task_a).await;
+
+        assert!(
+            detect_cycle(&store, &new_id, &[a_id]),
+            "expected direct cycle to be detected"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_awaiting_detects_transitive_cycle() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        // Chain: new → A → B → new
+        let new_id = tid("new-task");
+        let a_id = tid("task-a");
+        let b_id = tid("task-b");
+
+        let mut task_b = TaskState::new(b_id.clone());
+        task_b.depends_on = vec![new_id.clone()];
+        store.insert(&task_b).await;
+
+        let mut task_a = TaskState::new(a_id.clone());
+        task_a.depends_on = vec![b_id];
+        store.insert(&task_a).await;
+
+        assert!(
+            detect_cycle(&store, &new_id, &[a_id]),
+            "expected transitive cycle to be detected"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_awaiting_no_tasks_returns_empty() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let (ready, failed) = check_awaiting_deps(&store).await;
+        assert!(ready.is_empty(), "expected no ready tasks");
+        assert!(failed.is_empty(), "expected no failed tasks");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_awaiting_ready_transitions_to_pending() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let dep_id = tid("dep-done");
+        let mut dep = TaskState::new(dep_id.clone());
+        dep.status = TaskStatus::Done;
+        store.insert(&dep).await;
+
+        let task_id = tid("awaiting-task");
+        let mut task = TaskState::new(task_id.clone());
+        task.status = TaskStatus::AwaitingDeps;
+        task.depends_on = vec![dep_id];
+        store.insert(&task).await;
+
+        let (ready, failed) = check_awaiting_deps(&store).await;
+        assert!(ready.contains(&task_id), "expected task in ready_ids");
+        assert!(failed.is_empty(), "expected no failed tasks");
+
+        let state = store.get(&task_id).expect("task should still be in store");
+        assert!(
+            matches!(state.status, TaskStatus::Pending),
+            "expected Pending after transition, got {:?}",
+            state.status
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_awaiting_failed_dep_transitions_to_failed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let dep_id = tid("dep-failed");
+        let mut dep = TaskState::new(dep_id.clone());
+        dep.status = TaskStatus::Failed;
+        store.insert(&dep).await;
+
+        let task_id = tid("awaiting-task");
+        let mut task = TaskState::new(task_id.clone());
+        task.status = TaskStatus::AwaitingDeps;
+        task.depends_on = vec![dep_id];
+        store.insert(&task).await;
+
+        let (ready, failed) = check_awaiting_deps(&store).await;
+        assert!(ready.is_empty(), "expected no ready tasks");
+        assert!(failed.contains(&task_id), "expected task in failed_ids");
+
+        let state = store.get(&task_id).expect("task should still be in store");
+        assert!(
+            matches!(state.status, TaskStatus::Failed),
+            "expected Failed after dep failure, got {:?}",
+            state.status
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_awaiting_partial_deps_stays_awaiting() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let dep_done_id = tid("dep-done");
+        let mut dep_done = TaskState::new(dep_done_id.clone());
+        dep_done.status = TaskStatus::Done;
+        store.insert(&dep_done).await;
+
+        let dep_pending_id = tid("dep-pending");
+        let dep_pending = TaskState::new(dep_pending_id.clone()); // Pending by default
+        store.insert(&dep_pending).await;
+
+        let task_id = tid("awaiting-task");
+        let mut task = TaskState::new(task_id.clone());
+        task.status = TaskStatus::AwaitingDeps;
+        task.depends_on = vec![dep_done_id, dep_pending_id];
+        store.insert(&task).await;
+
+        let (ready, failed) = check_awaiting_deps(&store).await;
+        assert!(!ready.contains(&task_id), "task must not be in ready_ids");
+        assert!(!failed.contains(&task_id), "task must not be in failed_ids");
+
+        let state = store.get(&task_id).expect("task should still be in store");
+        assert!(
+            matches!(state.status, TaskStatus::AwaitingDeps),
+            "expected AwaitingDeps with partial deps, got {:?}",
+            state.status
+        );
+        Ok(())
+    }
+
+    /// A cancelled dependency hard-fails its dependents. Re-queued tasks always
+    /// get new TaskIds, so the old cancelled ID would never resolve — leaving the
+    /// dependent in AwaitingDeps would block it indefinitely.
+    #[tokio::test]
+    async fn check_awaiting_cancelled_dep_hard_fails_dependent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let dep_id = tid("dep-cancelled");
+        let mut dep = TaskState::new(dep_id.clone());
+        dep.status = TaskStatus::Cancelled;
+        store.insert(&dep).await;
+
+        let task_id = tid("awaiting-task");
+        let mut task = TaskState::new(task_id.clone());
+        task.status = TaskStatus::AwaitingDeps;
+        task.depends_on = vec![dep_id.clone()];
+        store.insert(&task).await;
+
+        let (ready, failed) = check_awaiting_deps(&store).await;
+        assert!(ready.is_empty(), "cancelled dep must not unblock dependent");
+        assert!(
+            failed.contains(&task_id),
+            "cancelled dep must hard-fail its dependent"
+        );
+
+        let state = store.get(&task_id).expect("task should still be in store");
+        assert!(
+            matches!(state.status, TaskStatus::Failed),
+            "dependent must be Failed when dep is Cancelled, got {:?}",
+            state.status
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_awaiting_concurrent_cancel_excluded() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let dep_id = tid("dep-done");
+        let mut dep = TaskState::new(dep_id.clone());
+        dep.status = TaskStatus::Done;
+        store.insert(&dep).await;
+
+        let task_id = tid("awaiting-task");
+        let mut task = TaskState::new(task_id.clone());
+        task.status = TaskStatus::AwaitingDeps;
+        task.depends_on = vec![dep_id];
+        store.insert(&task).await;
+
+        // Simulate concurrent cancel: flip status before check_awaiting_deps runs.
+        if let Some(mut entry) = store.cache.get_mut(&task_id) {
+            entry.status = TaskStatus::Cancelled;
+        }
+
+        let (ready, failed) = check_awaiting_deps(&store).await;
+        assert!(
+            !ready.contains(&task_id),
+            "cancelled task must not be in ready_ids"
+        );
+        assert!(
+            !failed.contains(&task_id),
+            "cancelled task must not be in failed_ids"
+        );
         Ok(())
     }
 }

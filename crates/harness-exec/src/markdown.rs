@@ -115,20 +115,18 @@ pub fn from_markdown(content: &str) -> anyhow::Result<ExecPlan> {
             plan.project_root = PathBuf::from(p);
         } else {
             match section {
-                "progress" => {
-                    if line.starts_with("- [") {
-                        let completed = line.contains("[x]");
-                        let desc = line
-                            .trim_start_matches("- [x] ")
-                            .trim_start_matches("- [ ] ")
-                            .to_string();
-                        if !desc.is_empty() {
-                            plan.progress.push(Milestone {
-                                description: desc,
-                                completed,
-                                completed_at: None,
-                            });
-                        }
+                "progress" if line.starts_with("- [") => {
+                    let completed = line.contains("[x]");
+                    let desc = line
+                        .trim_start_matches("- [x] ")
+                        .trim_start_matches("- [ ] ")
+                        .to_string();
+                    if !desc.is_empty() {
+                        plan.progress.push(Milestone {
+                            description: desc,
+                            completed,
+                            completed_at: None,
+                        });
                     }
                 }
                 "steps" => {

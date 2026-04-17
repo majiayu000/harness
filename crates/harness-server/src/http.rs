@@ -681,6 +681,26 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         );
                     }
                 }
+                // Invoke completion_callback for dep-failed tasks so intake
+                // sources (e.g. github_issues) can unmark them from the
+                // dispatched map and allow retries on the next poll cycle.
+                // Without this the issue stays permanently "dispatched" and
+                // the intake poller never re-queues it.
+                if let Some(ref cb) = state.intake.completion_callback {
+                    for task_id in &failed_ids {
+                        if let Some(task) = state.core.tasks.get(task_id) {
+                            let cb = cb.clone();
+                            tokio::spawn(async move {
+                                cb(task).await;
+                            });
+                        } else {
+                            tracing::warn!(
+                                "dep-watcher: task {} not found after dep-failed transition",
+                                task_id.0
+                            );
+                        }
+                    }
+                }
                 // Spawn an agent for each task whose deps are now satisfied.
                 for task_id in ready_ids {
                     let state = state.clone();
@@ -757,6 +777,43 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         // Restore execution limits and prompt from persisted settings.
                         if let Some(ref settings) = task.request_settings {
                             settings.apply_to_req(&mut req);
+                        }
+
+                        // Guard: prompt-only tasks store their prompt in memory only
+                        // (#[serde(skip)]). After a server restart the prompt field is
+                        // absent. If no issue/pr is present either, dispatching would
+                        // call implement_from_prompt("") — a silent mis-execution.
+                        // Fail the task explicitly so the caller can re-submit.
+                        if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
+                            let reason = "dep-watcher: prompt-only task has no persisted \
+                                prompt after server restart; please re-submit the task"
+                                .to_string();
+                            tracing::error!(task_id = ?task.id, "{reason}");
+                            if let Err(pe) = task_runner::mutate_and_persist(
+                                &state.core.tasks,
+                                &task.id,
+                                move |s| {
+                                    s.status = task_runner::TaskStatus::Failed;
+                                    s.error = Some(reason);
+                                },
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    "dep-watcher: failed to persist failed status: {pe}"
+                                );
+                            }
+                            // Fire completion callback so intake sources (e.g. GitHub Issues
+                            // poller) remove this task from their `dispatched` map. Without
+                            // this the issue stays marked as dispatched forever and will never
+                            // be re-queued, causing a silent production deadlock.
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
+                            return;
                         }
 
                         let permit = match state
