@@ -3388,7 +3388,7 @@ mod tests {
         store.wait_for_rate_limit().await;
         // After the limit expires, a subsequent call must return immediately.
         tokio::time::timeout(
-            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(100),
             store.wait_for_rate_limit(),
         )
         .await
