@@ -251,7 +251,7 @@ pub(crate) async fn run_rebase_turn(
         return false;
     }
 
-    let prompt = harness_core::prompts::rebase_conflicting_pr(pr_num, &branch, repo);
+    let prompt = harness_core::prompts::rebase_conflicting_pr(pr_num, &branch, repo, project);
     let req = AgentRequest {
         prompt,
         project_root: project.to_path_buf(),
