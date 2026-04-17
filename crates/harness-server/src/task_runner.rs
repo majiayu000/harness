@@ -2096,9 +2096,12 @@ where
             }
         };
 
-        // Cleanup workspace when task ends (Done or Failed) if auto_cleanup is set.
+        // Cleanup workspace when task ends.
+        // On failure: always remove to prevent stale worktrees from polluting subsequent
+        // tasks (the root cause of cross-task PR pollution, issue #799).
+        // On success: respect auto_cleanup so users can inspect the worktree post-run.
         if let Some(wmgr) = workspace_mgr {
-            if wmgr.config.auto_cleanup {
+            if task_result.is_err() || wmgr.config.auto_cleanup {
                 if let Err(e) = wmgr.remove_workspace(&id).await {
                     tracing::warn!("workspace cleanup failed for {id:?}: {e}");
                 }

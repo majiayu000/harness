@@ -49,6 +49,12 @@ pub(crate) fn parse_implementation_outcome(output: &str) -> ImplementationOutcom
     }
 }
 
+/// Returns true if the agent output contains the sentinel string that indicates
+/// the agent is operating inside a stale worktree owned by another harness session.
+pub(crate) fn contains_worktree_collision_sentinel(output: &str) -> bool {
+    output.contains("managed by another harness session")
+}
+
 pub(crate) fn prepend_constitution(prompt: String, enabled: bool) -> String {
     const CONSTITUTION: &str = include_str!("../../../../config/constitution.md");
     if enabled {
@@ -498,6 +504,45 @@ pub(crate) async fn run_implement_phase(
             tracing::warn!(stderr = %stderr, "agent stderr during implementation");
         }
 
+        // Fast-fail: if the agent observed a stale worktree managed by another harness
+        // session, abort immediately. This prevents the task from pushing commits to the
+        // wrong PR (issue #799).
+        if contains_worktree_collision_sentinel(&output) {
+            tracing::error!(
+                task_id = %task_id,
+                "WorktreeCollision: agent observed stale worktree; aborting task"
+            );
+            mutate_and_persist(store, task_id, |s| {
+                s.status = TaskStatus::Failed;
+                s.turn = 1;
+                s.error = Some(
+                    "WorktreeCollision: agent observed worktree managed by another harness session"
+                        .into(),
+                );
+                s.rounds.push(RoundResult {
+                    turn: 1,
+                    action: "implement".into(),
+                    result: "worktree_collision".into(),
+                    detail: if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.clone())
+                    },
+                    first_token_latency_ms: impl_first_token_ms,
+                });
+            })
+            .await?;
+            tracing::info!(
+                task_id = %task_id,
+                status = "failed",
+                turns = 1,
+                pr_url = tracing::field::Empty,
+                total_elapsed_secs = task_start.elapsed().as_secs(),
+                "task_completed"
+            );
+            return Ok(ImplementOutcome::Done);
+        }
+
         // Review-only tasks produce a report, not a PR.
         // Persist the output and return immediately — no PR parsing or review loop.
         let is_review_task = store.get(task_id).is_some_and(|s| {
@@ -740,6 +785,25 @@ mod tests {
                 pr_num: Some(42),
                 created_issue_num: None,
             }
+        );
+    }
+
+    #[test]
+    fn worktree_collision_sentinel_detected() {
+        let collision_output =
+            "Pushed. Now clean up the worktree (it's managed by another harness session so I'll skip removing it):\nPR_URL=https://github.com/owner/repo/pull/796";
+        assert!(
+            contains_worktree_collision_sentinel(collision_output),
+            "sentinel should be detected in collision output"
+        );
+    }
+
+    #[test]
+    fn worktree_collision_sentinel_absent_in_normal_output() {
+        let normal_output = "Done.\nPR_URL=https://github.com/owner/repo/pull/42";
+        assert!(
+            !contains_worktree_collision_sentinel(normal_output),
+            "sentinel should not be detected in normal output"
         );
     }
 

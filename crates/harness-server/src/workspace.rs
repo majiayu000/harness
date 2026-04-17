@@ -95,6 +95,20 @@ impl WorkspaceManager {
             }
         }
 
+        // Stale-state guard: if the workspace directory already exists on disk but was
+        // not tracked as active (Occupied path above), a previous failed task left it
+        // behind without cleanup. Reject immediately so this task cannot silently inherit
+        // a stale branch or push commits to the wrong PR.
+        if workspace_path.exists() {
+            self.active.remove(task_id);
+            anyhow::bail!(
+                "WorktreeCollision: workspace path {:?} already exists on disk for task {}; \
+                 a previous run did not clean up — remove the directory to retry",
+                workspace_path,
+                task_id.0
+            );
+        }
+
         // Fetch latest base_branch from remote so the worktree starts from upstream HEAD.
         let fetch_output = git_command()
             .args([
@@ -673,6 +687,40 @@ mod tests {
         );
         // Should not be tracked in active map.
         assert!(mgr.get_workspace(&task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn create_workspace_rejects_stale_directory() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let task_id = harness_core::types::TaskId("stale-task-check-001".to_string());
+
+        // Pre-create the directory to simulate a stale worktree from a previous failed run.
+        let stale_path = workspaces.path().join("stale-task-check-001");
+        std::fs::create_dir_all(&stale_path).expect("create stale dir");
+
+        let result = mgr
+            .create_workspace(&task_id, source.path(), "origin", &branch)
+            .await;
+        assert!(result.is_err(), "should fail when stale directory exists");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("WorktreeCollision"),
+            "error should mention WorktreeCollision, got: {err_msg}"
+        );
+        // Task must not be left in the active map after a collision error.
+        assert!(
+            mgr.get_workspace(&task_id).is_none(),
+            "task should not be in active map after collision"
+        );
     }
 
     #[tokio::test]
