@@ -1503,6 +1503,24 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Update status in cache and DB without resetting `updated_at`.
+    ///
+    /// Used to roll back a cancelled status after a failed retry enqueue so that
+    /// `list_stalled_tasks` still considers the task stale on the next tick instead
+    /// of deferring by a full `stale_threshold_mins` window.
+    pub(crate) async fn restore_status_preserve_staleness(
+        &self,
+        id: &TaskId,
+        status: TaskStatus,
+    ) -> anyhow::Result<()> {
+        if let Some(mut entry) = self.cache.get_mut(id) {
+            entry.value_mut().status = status.clone();
+        }
+        self.db
+            .update_status_only(id.0.as_str(), status.as_ref())
+            .await
+    }
+
     /// Validate recovered pending tasks by checking their GitHub PR state via `gh`.
     ///
     /// Spawned as a background task from `http.rs` after the completion callback is

@@ -352,6 +352,20 @@ impl TaskDb {
         Ok(row)
     }
 
+    /// Update only the `status` column without touching `updated_at`.
+    ///
+    /// Used when rolling back a status change after a failed operation so that
+    /// stale-detection (`list_stalled_tasks`) continues to see the task as stale
+    /// on the next scheduler tick rather than deferring by a full threshold window.
+    pub(crate) async fn update_status_only(&self, id: &str, status: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE tasks SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Back-fill `external_id` on a task that was created without one.
     ///
     /// The `AND external_id IS NULL` guard prevents overwriting a legitimately-set

@@ -219,13 +219,15 @@ async fn run_retry_tick(
                         task_id = %task.id.0,
                         "periodic_retry: failed to enqueue retry: {e}; restoring task status"
                     );
-                    // Restore the stalled task to its pre-cancel status so the
-                    // next tick can detect and retry it.  Without this, a
-                    // transient enqueue failure permanently drops the work item.
-                    if let Err(e2) = mutate_and_persist(&state.core.tasks, &task.id, |s| {
-                        s.status = original_status.clone();
-                    })
-                    .await
+                    // Restore the stalled task to its pre-cancel status WITHOUT
+                    // updating updated_at so the next scheduler tick still sees it
+                    // as stale and retries it promptly instead of waiting another
+                    // full stale_threshold_mins window.
+                    if let Err(e2) = state
+                        .core
+                        .tasks
+                        .restore_status_preserve_staleness(&task.id, original_status)
+                        .await
                     {
                         tracing::error!(
                             task_id = %task.id.0,
@@ -254,8 +256,23 @@ async fn run_retry_tick(
             if !prior_stuck.is_empty() {
                 tracing::debug!(
                     task_id = %task.id.0,
-                    "periodic_retry: already escalated as stuck, skipping duplicate"
+                    "periodic_retry: already escalated as stuck, re-attempting cancellation"
                 );
+                // Previous escalation may not have successfully cancelled the task.
+                // Re-attempt cancellation so the task does not permanently occupy a
+                // stalled-scan slot (LIMIT 100) and block progress for other tasks.
+                if let Err(e) = mutate_and_persist(&state.core.tasks, &task.id, |s| {
+                    s.status = TaskStatus::Cancelled;
+                })
+                .await
+                {
+                    tracing::warn!(
+                        task_id = %task.id.0,
+                        "periodic_retry: failed to cancel already-escalated stuck task: {e}"
+                    );
+                } else {
+                    state.core.tasks.abort_task(&task.id);
+                }
                 stuck += 1;
                 continue;
             }
