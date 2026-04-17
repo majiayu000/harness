@@ -128,7 +128,12 @@ pub(crate) async fn build_services(
             tasks_for_recovery
                 .validate_recovered_tasks(cb_for_recovery)
                 .await;
-            tasks_for_recovery.validate_done_tasks_pr_state().await;
+            // Sweep at startup then every 5 minutes so tasks that complete during
+            // this server session get pr_state populated without waiting for a restart.
+            loop {
+                tasks_for_recovery.validate_done_tasks_pr_state().await;
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            }
         });
     }
 
