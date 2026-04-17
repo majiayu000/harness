@@ -127,13 +127,14 @@ pub fn rebase_conflicting_pr(pr_num: u64, branch: &str, repo: &str, project_root
 /// project types so the agent can decide what to run rather than invoking the
 /// wrong toolchain (e.g. `cargo` in a TypeScript project).
 fn rebase_validation_step(pr_num: u64, project_root: &Path) -> String {
-    use crate::lang_detect::{
-        default_pre_commit_commands, default_pre_push_commands, detect_language,
-    };
+    use crate::lang_detect::{default_pre_push_commands, detect_language};
 
     let lang = detect_language(project_root);
-    let mut cmds = default_pre_commit_commands(lang, project_root);
-    cmds.extend(default_pre_push_commands(lang, project_root));
+    // Use only pre-push (non-mutating build+test) commands. Pre-commit commands
+    // include mutating formatters (cargo fmt --all, gofmt -w) that modify the
+    // working tree without committing — pushing after those would leave CI
+    // formatting gates unsatisfied on the actual committed code.
+    let cmds = default_pre_push_commands(lang, project_root);
 
     if cmds.is_empty() {
         // Unknown project type — give a prose instruction so the agent runs
