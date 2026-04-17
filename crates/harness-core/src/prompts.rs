@@ -1,6 +1,7 @@
 //! Prompt templates and output parsers shared across CLI and HTTP entries.
 
 use crate::config::project::GitConfig;
+use std::path::Path;
 
 /// A prompt decomposed into its static, semi-static, and dynamic layers.
 ///
@@ -78,7 +79,11 @@ pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str, repo: &str
 /// Used when [`conflict_resolver::assess_pr_conflict`] classifies the PR as
 /// `Small` (≤3 files, <5 conflict regions). The agent performs the rebase
 /// inside an isolated worktree and force-pushes the result.
-pub fn rebase_conflicting_pr(pr_num: u64, branch: &str, repo: &str) -> String {
+///
+/// `project_root` is used to detect the project language so the validation
+/// step uses the correct build/test toolchain instead of hardcoding `cargo`.
+pub fn rebase_conflicting_pr(pr_num: u64, branch: &str, repo: &str, project_root: &Path) -> String {
+    let validation_step = rebase_validation_step(pr_num, project_root);
     format!(
         "PR #{pr_num} on branch `{branch}` in `{repo}` has a merge conflict that is small \
          enough for automatic rebase.\n\n\
@@ -103,15 +108,53 @@ pub fn rebase_conflicting_pr(pr_num: u64, branch: &str, repo: &str) -> String {
             git rebase --continue\n\
             ```\n\
             Repeat until the rebase completes successfully.\n\
-         4. Force-push the rebased branch:\n\
+         {validation_step}\
+         5. Force-push the rebased branch:\n\
             ```\n\
             git push --force-with-lease origin '{branch}'\n\
             ```\n\
-         5. Clean up: `git worktree remove /tmp/harness-rebase-{pr_num}`\n\n\
+         6. Clean up: `git worktree remove /tmp/harness-rebase-{pr_num}`\n\n\
          On the last line of your output, print exactly one of:\n\
          - `REBASE_OK` if the rebase and push succeeded.\n\
          - `REBASE_FAILED` if you could not complete the rebase for any reason."
     )
+}
+
+/// Build step 4 of the rebase prompt: language-appropriate validation commands.
+///
+/// Detects the project toolchain from `project_root` and emits the correct
+/// build/test commands. Falls back to a prose instruction for unrecognised
+/// project types so the agent can decide what to run rather than invoking the
+/// wrong toolchain (e.g. `cargo` in a TypeScript project).
+fn rebase_validation_step(pr_num: u64, project_root: &Path) -> String {
+    use crate::lang_detect::{default_pre_push_commands, detect_language};
+
+    let lang = detect_language(project_root);
+    // Use only pre-push (non-mutating build+test) commands. Pre-commit commands
+    // include mutating formatters (cargo fmt --all, gofmt -w) that modify the
+    // working tree without committing — pushing after those would leave CI
+    // formatting gates unsatisfied on the actual committed code.
+    let cmds = default_pre_push_commands(lang, project_root);
+
+    if cmds.is_empty() {
+        // Unknown project type — give a prose instruction so the agent runs
+        // whatever the project provides instead of a wrong hardcoded command.
+        "4. Verify the result is correct before pushing using the project's available \
+build and test tools. If verification fails or you cannot determine how to validate, \
+print `REBASE_FAILED` and stop — do NOT force-push.\n         "
+            .to_string()
+    } else {
+        let cmd_str = cmds.join(" && ");
+        format!(
+            "4. Verify the result compiles and tests pass before pushing:\n\
+            ```\n\
+            cd /tmp/harness-rebase-{pr_num}\n\
+            {cmd_str}\n\
+            ```\n\
+            If this step fails, print `REBASE_FAILED` and stop — do NOT force-push.\n\
+         "
+        )
+    }
 }
 
 /// Build triage prompt: Tech Lead evaluates whether an issue is worth implementing.
@@ -1128,7 +1171,12 @@ mod tests {
 
     #[test]
     fn rebase_prompt_contains_force_push() {
-        let p = rebase_conflicting_pr(42, "feat/my-branch", "owner/repo");
+        let p = rebase_conflicting_pr(
+            42,
+            "feat/my-branch",
+            "owner/repo",
+            std::path::Path::new("."),
+        );
         assert!(
             p.contains("--force-with-lease"),
             "prompt must instruct force-with-lease push"
@@ -1138,8 +1186,41 @@ mod tests {
     #[test]
     fn rebase_prompt_contains_pr_branch() {
         let branch = "fix/issue-123";
-        let p = rebase_conflicting_pr(123, branch, "owner/repo");
+        let p = rebase_conflicting_pr(123, branch, "owner/repo", std::path::Path::new("."));
         assert!(p.contains(branch), "prompt must reference the PR branch");
+    }
+
+    #[test]
+    fn rebase_prompt_validation_step_is_language_aware() {
+        use std::fs;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Rust project
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"t\"").unwrap();
+        let p = rebase_conflicting_pr(1, "b", "o/r", dir.path());
+        assert!(
+            p.contains("cargo"),
+            "Rust project must use cargo for validation"
+        );
+        assert!(!p.contains("npm"), "Rust project must not reference npm");
+
+        // TypeScript project
+        let dir2 = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir2.path().join("package.json"),
+            r#"{"scripts":{"test":"echo ok"}}"#,
+        )
+        .unwrap();
+        let p2 = rebase_conflicting_pr(2, "b", "o/r", dir2.path());
+        assert!(!p2.contains("cargo"), "TS project must not use cargo");
+
+        // Unknown project — should not contain any specific toolchain command
+        let dir3 = tempfile::tempdir().expect("tempdir");
+        let p3 = rebase_conflicting_pr(3, "b", "o/r", dir3.path());
+        assert!(!p3.contains("cargo"), "unknown project must not use cargo");
+        assert!(
+            !p3.contains("npm"),
+            "unknown project must not reference npm"
+        );
     }
 
     #[test]
