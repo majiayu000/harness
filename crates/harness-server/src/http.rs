@@ -681,6 +681,22 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         );
                     }
                 }
+                // Invoke completion_callback for dep-failed tasks so intake
+                // sources (e.g. github_issues) can unmark them from the
+                // dispatched map and allow retries on the next poll cycle.
+                // Without this the issue stays permanently "dispatched" and
+                // the intake poller never re-queues it.
+                if let Some(ref cb) = state.intake.completion_callback {
+                    for task_id in &failed_ids {
+                        match state.core.tasks.get(task_id) {
+                            Some(task) => cb(task).await,
+                            None => tracing::warn!(
+                                "dep-watcher: task {} not found after dep-failed transition",
+                                task_id.0
+                            ),
+                        }
+                    }
+                }
                 // Spawn an agent for each task whose deps are now satisfied.
                 for task_id in ready_ids {
                     let state = state.clone();

@@ -2293,13 +2293,20 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
                     break; // fail-fast — no need to inspect remaining deps
                 }
                 Some(TaskStatus::Cancelled) => {
-                    failed_dep_id = Some((dep_id.clone(), "cancelled"));
-                    break; // cancelled dep is also terminal — dependents cannot proceed
+                    // A cancelled dependency does NOT unblock or hard-fail its
+                    // dependents — this matches the intake DAG contract in
+                    // intake/mod.rs where `status_unblocks_dependents` only
+                    // returns true for Done | Failed, and cancelled tasks are
+                    // tracked in a separate `cancelled_sprint` set.  Keeping
+                    // the dependent in AwaitingDeps allows the cancelled parent
+                    // to be re-queued later; if it eventually reaches Done the
+                    // dependent will be released normally.
+                    all_done = false;
                 }
                 Some(TaskStatus::Done) => {} // this dep is satisfied
                 _ => {
                     // Pending, Implementing, or unknown — not ready yet.
-                    // Keep scanning in case a later dep is Failed or Cancelled.
+                    // Keep scanning in case a later dep is Failed.
                     all_done = false;
                 }
             }
@@ -3558,8 +3565,12 @@ mod tests {
         Ok(())
     }
 
+    /// A cancelled dependency must NOT hard-fail its dependents — they stay
+    /// in AwaitingDeps so that the parent can be re-queued later.  This
+    /// matches the intake DAG contract in intake/mod.rs where
+    /// `status_unblocks_dependents` only returns true for Done | Failed.
     #[tokio::test]
-    async fn check_awaiting_cancelled_dep_transitions_to_failed() -> anyhow::Result<()> {
+    async fn check_awaiting_cancelled_dep_stays_blocked() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
 
@@ -3575,22 +3586,17 @@ mod tests {
         store.insert(&task).await;
 
         let (ready, failed) = check_awaiting_deps(&store).await;
-        assert!(ready.is_empty(), "expected no ready tasks");
+        assert!(ready.is_empty(), "cancelled dep must not unblock dependent");
         assert!(
-            failed.contains(&task_id),
-            "expected task in failed_ids when dep is Cancelled"
+            failed.is_empty(),
+            "cancelled dep must not hard-fail dependent (DAG contract)"
         );
 
         let state = store.get(&task_id).expect("task should still be in store");
         assert!(
-            matches!(state.status, TaskStatus::Failed),
-            "expected Failed after dep cancelled, got {:?}",
+            matches!(state.status, TaskStatus::AwaitingDeps),
+            "dependent must remain AwaitingDeps when dep is Cancelled, got {:?}",
             state.status
-        );
-        assert!(
-            state.error.as_deref().unwrap_or("").contains("cancelled"),
-            "error message should mention 'cancelled', got: {:?}",
-            state.error
         );
         Ok(())
     }
