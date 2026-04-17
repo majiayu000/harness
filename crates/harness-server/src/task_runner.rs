@@ -3361,6 +3361,41 @@ mod tests {
         Ok(())
     }
 
+    // --- rate-limit circuit-breaker tests ---
+
+    #[tokio::test]
+    async fn wait_for_rate_limit_no_op_when_none() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            store.wait_for_rate_limit(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("wait_for_rate_limit must return immediately when no limit is active")
+        })?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rate_limit_cleared_after_deadline() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        store
+            .set_rate_limit(std::time::Duration::from_millis(50))
+            .await;
+        store.wait_for_rate_limit().await;
+        // After the limit expires, a subsequent call must return immediately.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            store.wait_for_rate_limit(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("rate limit must be cleared after its deadline passes"))?;
+        Ok(())
+    }
+
     // --- dependency scheduling tests ---
 
     fn tid(s: &str) -> harness_core::types::TaskId {
