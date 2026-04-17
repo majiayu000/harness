@@ -202,6 +202,11 @@ pub struct TaskState {
     /// requested rather than silently falling back to server defaults.
     #[serde(skip)]
     pub request_settings: Option<PersistedRequestSettings>,
+    /// GitHub PR state: `"OPEN"`, `"MERGED"`, or `"CLOSED"`. Persisted to the DB
+    /// so that dedup correctly skips done tasks whose PR was closed without merging.
+    /// `None` for tasks created before migration v17 until the startup sweep runs.
+    #[serde(skip)]
+    pub pr_state: Option<String>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -266,6 +271,7 @@ impl TaskState {
             plan_output: None,
             repo: None,
             request_settings: None,
+            pr_state: None,
         }
     }
 
@@ -939,6 +945,9 @@ impl TaskStore {
 
     /// Check whether a `done` task with a PR URL already exists for the same
     /// project + external_id. Cache-first, DB fallback. Fail-open on DB errors.
+    ///
+    /// Skips cache entries whose `pr_state` is `"CLOSED"` — a closed-without-merge
+    /// PR must not block resubmission (mirrors the SQL fix in `find_terminal_with_pr`).
     pub async fn find_terminal_pr_duplicate(
         &self,
         project_id: &str,
@@ -953,6 +962,9 @@ impl TaskStore {
                     .map(|p| p.to_string_lossy() == project_id)
                     .unwrap_or(false);
             if same_key && matches!(task.status, TaskStatus::Done) {
+                if task.pr_state.as_deref() == Some("CLOSED") {
+                    continue;
+                }
                 if let Some(ref url) = task.pr_url {
                     return Some((task.id.clone(), url.clone()));
                 }
@@ -1592,6 +1604,7 @@ impl TaskStore {
             if let Some(status) = new_status {
                 if let Some(mut entry) = self.cache.get_mut(&task_id) {
                     entry.status = status;
+                    entry.pr_state = Some(state.clone());
                 }
                 // Persist before invoking the callback. If persist fails the task
                 // remains `pending` in SQLite; firing the callback anyway would push
@@ -1624,6 +1637,91 @@ impl TaskStore {
                     "startup recovery: PR state {state} → leaving pending"
                 );
             }
+        }
+    }
+
+    /// Sweep done tasks that have a `pr_url` but no `pr_state` and backfill the column.
+    ///
+    /// Targets tasks created before migration v17 (or any task where `pr_state` was not
+    /// set at completion). Calls `gh pr view` for each candidate and writes
+    /// `OPEN` / `MERGED` / `CLOSED` to the DB. Limits to tasks updated within the last
+    /// 90 days to avoid hammering the GitHub API on large installs.
+    ///
+    /// This is the mechanism that lets `find_terminal_with_pr` correctly unblock
+    /// resubmission after a PR is closed: once `pr_state = 'CLOSED'` is written here,
+    /// the next dedup check will not match the old task.
+    pub async fn validate_done_tasks_pr_state(&self) {
+        let candidates: Vec<(String, String)> =
+            match self.db.list_done_tasks_needing_pr_state().await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!("validate_done_tasks_pr_state: DB query failed: {e}");
+                    return;
+                }
+            };
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            "startup: backfilling pr_state for {} done task(s) with unset pr_state",
+            candidates.len()
+        );
+
+        for (task_id, pr_url) in candidates {
+            let Some((owner, repo, number)) = parse_pr_url(&pr_url) else {
+                tracing::warn!(
+                    task_id,
+                    pr_url,
+                    "validate_done_tasks_pr_state: could not parse PR URL; skipping"
+                );
+                continue;
+            };
+
+            let pr_ref = format!("{owner}/{repo}#{number}");
+            let mut cmd = tokio::process::Command::new("gh");
+            cmd.args(["pr", "view", &pr_ref, "--json", "state", "--jq", ".state"])
+                .kill_on_drop(true);
+            let gh_result =
+                tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await;
+
+            let output = match gh_result {
+                Err(_) => {
+                    tracing::warn!(task_id, pr_url, "gh pr view timed out; skipping");
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(task_id, pr_url, "gh CLI error: {e}; skipping");
+                    continue;
+                }
+                Ok(Ok(out)) => out,
+            };
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(task_id, pr_url, "gh pr view failed: {stderr}; skipping");
+                continue;
+            }
+
+            let state = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_uppercase();
+            if state.is_empty() {
+                continue;
+            }
+
+            if let Err(e) = self.db.set_pr_state(&task_id, &state).await {
+                tracing::warn!(
+                    task_id,
+                    "validate_done_tasks_pr_state: set_pr_state failed: {e}"
+                );
+            } else {
+                tracing::info!(task_id, pr_url, state, "startup: backfilled pr_state");
+            }
+
+            // Pace calls to avoid GitHub API rate limits.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
 }
@@ -3629,6 +3727,30 @@ mod tests {
         assert!(
             !failed.contains(&task_id),
             "cancelled task must not be in failed_ids"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_terminal_pr_duplicate_skips_closed_in_cache() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let task_id = harness_core::types::TaskId("t-closed-cache".to_string());
+        let mut state = TaskState::new(task_id.clone());
+        state.status = TaskStatus::Done;
+        state.external_id = Some("issue:999".to_string());
+        state.project_root = Some(std::path::PathBuf::from("/repo/y"));
+        state.pr_url = Some("https://github.com/org/repo/pull/99".to_string());
+        state.pr_state = Some("CLOSED".to_string());
+        store.cache.insert(task_id, state);
+
+        let result = store
+            .find_terminal_pr_duplicate("/repo/y", "issue:999")
+            .await;
+        assert!(
+            result.is_none(),
+            "cache entry with pr_state=CLOSED must not block resubmission"
         );
         Ok(())
     }

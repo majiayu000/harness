@@ -33,6 +33,7 @@ fn make_task(id: &str, status: TaskStatus) -> TaskState {
         plan_output: None,
         repo: None,
         request_settings: None,
+        pr_state: None,
     }
 }
 

@@ -16,7 +16,7 @@ const ARTIFACT_MAX_BYTES: usize = 65_536;
 /// When adding a field to `TaskRow`, add the column here once and all queries
 /// pick it up automatically.  The `task_row_columns_match_struct` test below
 /// will fail if this list drifts from the struct definition.
-const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description, request_settings";
+const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description, request_settings, pr_state";
 
 /// Versioned migrations for the tasks table.
 ///
@@ -130,6 +130,11 @@ static TASK_MIGRATIONS: &[Migration] = &[
         version: 16,
         description: "add request_settings column for execution limit recovery",
         sql: "ALTER TABLE tasks ADD COLUMN request_settings TEXT",
+    },
+    Migration {
+        version: 17,
+        description: "add pr_state column for dedup correctness on closed PRs",
+        sql: "ALTER TABLE tasks ADD COLUMN pr_state TEXT",
     },
 ];
 
@@ -248,6 +253,7 @@ impl TaskDb {
             "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
                     source = ?, external_id = ?, repo = ?, depends_on = ?, project = ?,
                     priority = ?, phase = ?, description = ?, request_settings = ?,
+                    pr_state = COALESCE(?, pr_state),
                     updated_at = datetime('now')
              WHERE id = ?",
         )
@@ -270,6 +276,7 @@ impl TaskDb {
         .bind(&phase_json)
         .bind(state.description.as_deref())
         .bind(settings_json.as_deref())
+        .bind(state.pr_state.as_deref())
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -335,6 +342,10 @@ impl TaskDb {
     ///
     /// Returns `(task_id, pr_url)` when found. Only matches `done` — failed/cancelled
     /// tasks are excluded so that retries after failure are always permitted.
+    ///
+    /// Rows where `pr_state = 'CLOSED'` are excluded: a closed-without-merge PR must
+    /// not block resubmission. NULL `pr_state` (legacy rows) still matches to preserve
+    /// backward compatibility until the startup sweep populates `pr_state`.
     pub async fn find_terminal_with_pr(
         &self,
         project: &str,
@@ -343,6 +354,7 @@ impl TaskDb {
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT id, pr_url FROM tasks \
              WHERE project = ? AND external_id = ? AND status = 'done' AND pr_url IS NOT NULL \
+             AND (pr_state IS NULL OR pr_state != 'CLOSED') \
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(project)
@@ -350,6 +362,34 @@ impl TaskDb {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    /// Return `(task_id, pr_url)` for done tasks that have a PR URL but no `pr_state` set.
+    ///
+    /// Limited to tasks updated within the last 90 days to bound GitHub API call volume
+    /// during the startup sweep. Returns rows ordered by most-recently-updated first.
+    pub async fn list_done_tasks_needing_pr_state(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, pr_url FROM tasks \
+             WHERE status = 'done' AND pr_url IS NOT NULL AND pr_state IS NULL \
+             AND updated_at >= datetime('now', '-90 days') \
+             ORDER BY updated_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Update the `pr_state` column for a single task row.
+    ///
+    /// Expected values: `"OPEN"`, `"MERGED"`, `"CLOSED"` (GitHub PR state strings).
+    pub async fn set_pr_state(&self, task_id: &str, state: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE tasks SET pr_state = ?, updated_at = datetime('now') WHERE id = ?")
+            .bind(state)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Back-fill `external_id` on a task that was created without one.
@@ -949,6 +989,7 @@ impl TaskDb {
             "SELECT t.id, t.status, t.turn, t.pr_url, t.rounds, t.error, t.source, \
                     t.external_id, t.parent_id, t.created_at, t.repo, t.depends_on, \
                     t.project, t.priority, t.phase, t.description, t.request_settings, \
+                    t.pr_state, \
                     c.triage_output, c.plan_output, c.pr_url AS ck_pr_url, \
                     c.last_phase, c.updated_at AS ck_updated_at \
              FROM tasks t \
@@ -981,6 +1022,7 @@ impl TaskDb {
                 phase: row.phase,
                 description: row.description,
                 request_settings: row.request_settings,
+                pr_state: row.pr_state,
             };
             let task_state = match task_row.try_into_task_state() {
                 Ok(s) => s,
@@ -1022,6 +1064,7 @@ struct TaskRow {
     phase: String,
     description: Option<String>,
     request_settings: Option<String>,
+    pr_state: Option<String>,
 }
 
 /// Combined row for the pending-tasks-with-checkpoint JOIN query.
@@ -1048,6 +1091,7 @@ struct PendingCheckpointRow {
     phase: String,
     description: Option<String>,
     request_settings: Option<String>,
+    pr_state: Option<String>,
     // Checkpoint columns (aliased)
     triage_output: Option<String>,
     plan_output: Option<String>,
@@ -1076,6 +1120,7 @@ impl TaskRow {
             phase,
             description,
             request_settings,
+            pr_state,
         } = self;
 
         let decoded_request_settings: Option<crate::task_runner::PersistedRequestSettings> =
@@ -1125,6 +1170,7 @@ impl TaskRow {
             plan_output: None,
             repo,
             request_settings: decoded_request_settings,
+            pr_state,
         })
     }
 }
@@ -1209,6 +1255,7 @@ mod tests {
             phase: r#""implement""#.to_string(),
             description: None,
             request_settings: None,
+            pr_state: None,
         }
     }
 
@@ -1318,6 +1365,7 @@ mod tests {
             plan_output: None,
             repo: None,
             request_settings: None,
+            pr_state: None,
         }
     }
 
@@ -2039,15 +2087,107 @@ mod tests {
             phase: String::new(),
             description: None,
             request_settings: None,
+            pr_state: None,
         };
 
         // Count must match — catches column added to constant but not struct (or vice versa).
         assert_eq!(
             columns.len(),
-            17, // bump this when adding a field
-            "TASK_ROW_COLUMNS has {} entries but expected 17 — update both the constant and this test",
+            18, // bump this when adding a field
+            "TASK_ROW_COLUMNS has {} entries but expected 18 — update both the constant and this test",
             columns.len()
         );
+    }
+
+    // --- find_terminal_with_pr pr_state tests ---
+
+    #[tokio::test]
+    async fn find_terminal_with_pr_returns_none_when_pr_closed() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-closed", TaskStatus::Done);
+        task.external_id = Some("issue:100".to_string());
+        task.pr_url = Some("https://github.com/org/repo/pull/10".to_string());
+        task.project_root = Some(std::path::PathBuf::from("/repo/x"));
+        db.insert(&task).await?;
+        db.set_pr_state("task-closed", "CLOSED").await?;
+
+        let result = db.find_terminal_with_pr("/repo/x", "issue:100").await?;
+        assert!(
+            result.is_none(),
+            "CLOSED pr_state must not block resubmission"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_terminal_with_pr_returns_row_when_pr_open() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-open", TaskStatus::Done);
+        task.external_id = Some("issue:101".to_string());
+        task.pr_url = Some("https://github.com/org/repo/pull/11".to_string());
+        task.project_root = Some(std::path::PathBuf::from("/repo/x"));
+        db.insert(&task).await?;
+        db.set_pr_state("task-open", "OPEN").await?;
+
+        let result = db.find_terminal_with_pr("/repo/x", "issue:101").await?;
+        assert!(result.is_some(), "OPEN pr_state must still dedup");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_terminal_with_pr_returns_row_when_pr_merged() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-merged", TaskStatus::Done);
+        task.external_id = Some("issue:102".to_string());
+        task.pr_url = Some("https://github.com/org/repo/pull/12".to_string());
+        task.project_root = Some(std::path::PathBuf::from("/repo/x"));
+        db.insert(&task).await?;
+        db.set_pr_state("task-merged", "MERGED").await?;
+
+        let result = db.find_terminal_with_pr("/repo/x", "issue:102").await?;
+        assert!(result.is_some(), "MERGED pr_state must still dedup");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_terminal_with_pr_returns_row_when_pr_state_null() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let mut task = make_task("task-null-state", TaskStatus::Done);
+        task.external_id = Some("issue:103".to_string());
+        task.pr_url = Some("https://github.com/org/repo/pull/13".to_string());
+        task.project_root = Some(std::path::PathBuf::from("/repo/x"));
+        db.insert(&task).await?;
+        // pr_state left NULL (legacy row — no set_pr_state call)
+
+        let result = db.find_terminal_with_pr("/repo/x", "issue:103").await?;
+        assert!(
+            result.is_some(),
+            "NULL pr_state must still dedup for backward compat"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_pr_state_updates_correctly() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        let task = make_task("task-set-state", TaskStatus::Done);
+        db.insert(&task).await?;
+
+        db.set_pr_state("task-set-state", "MERGED").await?;
+
+        let loaded = db.get("task-set-state").await?.expect("should exist");
+        assert_eq!(loaded.pr_state.as_deref(), Some("MERGED"));
+        Ok(())
     }
 
     /// Regression: list_by_status must map to TaskRow correctly (including priority).

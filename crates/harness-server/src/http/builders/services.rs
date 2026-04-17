@@ -128,6 +128,7 @@ pub(crate) async fn build_services(
             tasks_for_recovery
                 .validate_recovered_tasks(cb_for_recovery)
                 .await;
+            tasks_for_recovery.validate_done_tasks_pr_state().await;
         });
     }
 

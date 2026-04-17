@@ -92,6 +92,7 @@ async fn claim_endpoint_blocks_double_claim() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        pr_state: None,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -182,6 +183,7 @@ async fn claim_endpoint_honors_project_filter() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        pr_state: None,
     };
     let task_b = crate::task_runner::TaskState {
         id: crate::task_runner::TaskId::new(),
@@ -205,6 +207,7 @@ async fn claim_endpoint_honors_project_filter() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        pr_state: None,
     };
     let task_b_id = task_b.id.clone();
 
@@ -279,6 +282,7 @@ async fn claim_endpoint_rejects_out_of_range_lease_secs() -> anyhow::Result<()> 
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        pr_state: None,
     };
     state.core.tasks.insert(&task).await;
     let app = runtime_hosts_app(state);
@@ -344,6 +348,7 @@ async fn claim_endpoint_rejects_overflowing_lease_ttl() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        pr_state: None,
     };
     state.core.tasks.insert(&task).await;
     let app = runtime_hosts_app(state);
