@@ -1,0 +1,448 @@
+use super::agent_review::jaccard_word_similarity;
+use super::helpers::{run_on_error, run_post_execute, run_pre_execute, update_status};
+use crate::task_runner::{
+    mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
+};
+use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
+use harness_core::error::HarnessError;
+use harness_core::prompts;
+use harness_core::tool_isolation::validate_tool_usage;
+use harness_core::types::{Event, ExecutionPhase, SessionId};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use tokio::time::{sleep, Duration, Instant};
+
+/// Execute the external review bot wait loop.
+///
+/// Polls the PR for review bot feedback, handles LGTM/FIXED/WAITING responses,
+/// runs the test gate on LGTM acceptance, and manages convergence tracking.
+/// Returns `Ok(())` when the task is complete (status already persisted).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_review_loop(
+    store: &TaskStore,
+    task_id: &TaskId,
+    agent: &dyn CodeAgent,
+    review_config: &harness_core::config::agents::AgentReviewConfig,
+    project_config: &harness_core::config::project::ProjectConfig,
+    req: &CreateTaskRequest,
+    events: &Arc<harness_observe::event_store::EventStore>,
+    interceptors: &Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
+    context_items: &[harness_core::types::ContextItem],
+    project: &Path,
+    cargo_env: &HashMap<String, String>,
+    pr_url: Option<String>,
+    pr_num: u64,
+    effective_max_turns: Option<u32>,
+    _effective_max_rounds: u32,
+    wait_secs: u64,
+    max_rounds: u32,
+    agent_pushed_commit: bool,
+    rebase_pushed: bool,
+    turn_timeout: Duration,
+    turns_used: &mut u32,
+    turns_used_acc: &mut u32,
+    task_start: Instant,
+    repo_slug: String,
+    jaccard_threshold: f64,
+) -> anyhow::Result<()> {
+    let review_phase_start = Instant::now();
+
+    // `prev_fixed` tracks whether a commit was pushed that hasn't been re-reviewed yet.
+    // Starts true if the implementation phase pushed a commit, and is set to true again
+    // whenever a review round produces FIXED (agent commits + pushes). This drives the
+    // freshness check in every round after a fix commit, not just round 1.
+    let mut prev_fixed = agent_pushed_commit || rebase_pushed;
+
+    // Convergence tracking: detect when issue count stops decreasing.
+    let mut issue_counts: Vec<Option<u32>> = Vec::new();
+    let mut impasse = false;
+
+    // Carries test gate failure output from a rejected LGTM into the next review round.
+    let mut pending_test_failure: Option<String> = None;
+    // Issue 2 fix: track whether any LGTM was ever rejected by the test gate
+    // without a subsequent clean LGTM+pass. `pending_test_failure.take()` clears
+    // the Option at the start of each round (to avoid re-showing the same output),
+    // but the graduation check must still know a test gate rejection occurred.
+    let mut lgtm_test_gate_rejected = false;
+
+    // Tracks the most recent non-waiting review output for Jaccard loop detection.
+    let mut prev_review_output: Option<String> = None;
+
+    // Review loop.
+    // Use an explicit counter so WAITING responses don't consume a round — `continue`
+    // inside a `for` loop would silently advance the iterator even without a real review.
+    let mut round: u32 = 1;
+    let mut waiting_count: u32 = 1;
+    while round <= max_rounds {
+        update_status(store, task_id, TaskStatus::Reviewing, round).await?;
+
+        let base_prompt = prompts::review_prompt(
+            req.issue,
+            pr_num,
+            round,
+            prev_fixed,
+            &review_config.review_bot_command,
+            &review_config.reviewer_name,
+            &repo_slug,
+            impasse,
+        );
+        // If the previous LGTM was rejected by the test gate, prepend the failure
+        // output so the agent has context for why re-work is needed.
+        let round_prompt = if let Some(failure) = pending_test_failure.take() {
+            prompts::test_gate_failure_prompt(&failure, &base_prompt)
+        } else {
+            base_prompt
+        };
+
+        let check_req = AgentRequest {
+            prompt: round_prompt,
+            project_root: project.to_path_buf(),
+            context: context_items.to_vec(),
+            execution_phase: Some(ExecutionPhase::Execution),
+            env_vars: cargo_env.clone(),
+            ..Default::default()
+        };
+        let check_req = run_pre_execute(interceptors, check_req).await?;
+
+        if let Some(max) = effective_max_turns {
+            if *turns_used >= max {
+                let msg = format!(
+                    "Turn budget exhausted: used {} of {} allowed turns",
+                    turns_used, max
+                );
+                tracing::warn!(task_id = %task_id, turns_used, max, "turn budget exhausted in review loop");
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Failed;
+                    s.error = Some(msg.clone());
+                })
+                .await?;
+                return Ok(());
+            }
+        }
+        let resp = tokio::time::timeout(turn_timeout, agent.execute(check_req.clone())).await;
+        *turns_used += 1;
+        *turns_used_acc = *turns_used;
+        let resp = match resp {
+            Ok(Ok(r)) => {
+                let tool_violations = validate_tool_usage(
+                    &r.output,
+                    check_req.allowed_tools.as_deref().unwrap_or(&[]),
+                );
+                if !tool_violations.is_empty() {
+                    let msg = format!(
+                        "Tool isolation violation in review check round {round}: agent used disallowed tools: [{}]",
+                        tool_violations.join(", ")
+                    );
+                    tracing::warn!(
+                        round,
+                        ?tool_violations,
+                        "review check: agent used tools outside allowed list"
+                    );
+                    run_on_error(interceptors, &check_req, &msg).await;
+                    return Err(anyhow::anyhow!("{msg}"));
+                }
+                if let Some(val_err) = run_post_execute(interceptors, &check_req, &r).await {
+                    tracing::error!(
+                        round,
+                        error = %val_err,
+                        "post-execute validation failed in review check; will re-enter review"
+                    );
+                    pending_test_failure =
+                        Some(format!("Post-execution validation failed:\n{val_err}"));
+                }
+                r
+            }
+            Ok(Err(e)) => {
+                // Quota/billing failures are not retryable — break immediately instead of
+                // burning remaining review rounds on repeated errors.
+                // Do NOT activate the global rate-limit circuit breaker: the reviewer
+                // agent is configured independently from the implementation agent and a
+                // depleted reviewer account must not stall unrelated implementation tasks.
+                if matches!(
+                    e,
+                    HarnessError::QuotaExhausted(_) | HarnessError::BillingFailed(_)
+                ) {
+                    tracing::error!(round, error = %e, "quota/billing failure during review — aborting review loop");
+                    run_on_error(interceptors, &check_req, &e.to_string()).await;
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.error = Some(e.to_string());
+                    })
+                    .await?;
+                    return Ok(());
+                }
+                run_on_error(interceptors, &check_req, &e.to_string()).await;
+                return Err(e.into());
+            }
+            Err(_) => {
+                let msg = format!(
+                    "Review check round {round} timed out after {}s",
+                    turn_timeout.as_secs()
+                );
+                run_on_error(interceptors, &check_req, &msg).await;
+                return Err(anyhow::anyhow!("{msg}"));
+            }
+        };
+
+        let AgentResponse { output, stderr, .. } = resp;
+
+        if !stderr.is_empty() {
+            tracing::warn!(round, stderr = %stderr, "agent stderr during review check");
+        }
+
+        let raw_lgtm = prompts::is_lgtm(&output);
+        let waiting = prompts::is_waiting(&output);
+        // If post-execute validation failed this round, block LGTM acceptance even
+        // if the reviewer approved — the local validator caught an issue that must be
+        // fixed before the PR can be marked done.
+        let lgtm = raw_lgtm && pending_test_failure.is_none();
+        let fixed = !lgtm && !waiting;
+
+        // Parse issue count before the Jaccard check so loop detection can distinguish
+        // genuine forward progress (decreasing issue count) from true stuck loops.
+        let current_issues = prompts::parse_issue_count(&output);
+
+        // Jaccard loop detection: two consecutive non-waiting, non-LGTM outputs that are
+        // too similar indicate the reviewer is stuck repeating itself without making progress.
+        // Skip when the raw output is an approval: repeated LGTM is legitimate convergence
+        // (e.g., reviewer approves again after a test-gate previously blocked acceptance).
+        if !waiting && !raw_lgtm {
+            if let Some(ref prev) = prev_review_output {
+                let score = jaccard_word_similarity(prev, &output);
+                if score >= jaccard_threshold {
+                    // If the issue count decreased since the previous round, the agent is making
+                    // genuine progress despite similar output structure (e.g., one fix per round
+                    // with a consistent report format). Only abort on true stagnation.
+                    let last_count = issue_counts.last().and_then(|x| *x);
+                    let progressing = matches!(
+                        (last_count, current_issues),
+                        (Some(prev_n), Some(curr_n)) if curr_n < prev_n
+                    );
+                    if !progressing {
+                        let msg = format!(
+                            "review loop detected: output similarity {score:.2} >= threshold {jaccard_threshold:.2}"
+                        );
+                        tracing::warn!(task_id = %task_id, round, score, jaccard_threshold, "jaccard loop detected in review");
+                        mutate_and_persist(store, task_id, |s| {
+                            s.status = TaskStatus::Failed;
+                            s.error = Some(msg.clone());
+                        })
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            prev_review_output = Some(output.clone());
+        } else if raw_lgtm {
+            // A test-gate-rejected LGTM still resets the comparison baseline so the
+            // next genuine non-LGTM review is not incorrectly compared against a
+            // pre-LGTM review and falsely flagged as a loop.
+            prev_review_output = None;
+        }
+
+        if !waiting {
+            issue_counts.push(current_issues);
+        }
+
+        // Convergence check: if the last 3 rounds all reported issues and the
+        // count is not decreasing, enter impasse mode (critical-only fixes).
+        if issue_counts.len() >= 3 && !impasse {
+            let tail = &issue_counts[issue_counts.len() - 3..];
+            if let [Some(a), Some(b), Some(c)] = tail {
+                if c >= a && c >= b {
+                    impasse = true;
+                    tracing::warn!(
+                        task_id = %task_id,
+                        round,
+                        issues = %format_args!("[{a}, {b}, {c}]"),
+                        "review loop impasse detected: issue count not decreasing"
+                    );
+                }
+            }
+        }
+
+        // WAITING means review bot hasn't posted yet (e.g., quota exhausted).
+        // Don't consume a round — just sleep and retry without incrementing.
+        // Cap consecutive waits to prevent infinite loops when the bot never responds.
+        const MAX_CONSECUTIVE_WAITS: u32 = 10;
+        if waiting {
+            if waiting_count >= MAX_CONSECUTIVE_WAITS {
+                tracing::warn!(
+                    round,
+                    waiting_count,
+                    "PR #{pr_num} review bot has not responded after {MAX_CONSECUTIVE_WAITS} waits; \
+                     consuming a round to prevent infinite loop"
+                );
+                round += 1;
+                waiting_count = 0;
+            } else {
+                tracing::info!(
+                    round,
+                    waiting_count,
+                    "PR #{pr_num} review bot has not responded yet; sleeping without consuming round"
+                );
+                waiting_count += 1;
+                update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
+                sleep(Duration::from_secs(wait_secs)).await;
+                continue;
+            }
+        }
+
+        let result_label = if lgtm { "lgtm" } else { "fixed" };
+        mutate_and_persist(store, task_id, |s| {
+            s.rounds.push(RoundResult {
+                turn: round,
+                action: "review".into(),
+                result: result_label.into(),
+                detail: None,
+                first_token_latency_ms: None,
+            });
+        })
+        .await?;
+
+        // Emit RoundCompleted for crash recovery.
+        store.log_event(crate::event_replay::TaskEvent::RoundCompleted {
+            task_id: task_id.0.clone(),
+            ts: crate::event_replay::now_ts(),
+            round,
+            result: result_label.to_string(),
+        });
+
+        // Log pr_review event for observability and GC signal detection.
+        let mut ev = Event::new(
+            SessionId::new(),
+            "pr_review",
+            "task_runner",
+            if lgtm {
+                harness_core::types::Decision::Complete
+            } else {
+                harness_core::types::Decision::Warn
+            },
+        );
+        ev.detail = Some(format!("pr={pr_num}"));
+        let result_label = if lgtm { "lgtm" } else { "fixed" };
+        ev.reason = Some(format!("round {round}: {result_label}"));
+        if let Err(e) = events.log(&ev).await {
+            tracing::warn!("failed to log pr_review event: {e}");
+        }
+
+        if lgtm {
+            // Hard gate: run the project's tests before accepting LGTM.
+            // This prevents agents from gaming the review by manipulating tests
+            // rather than fixing code (OpenAI "Monitoring Reasoning Models", 2026).
+            match super::run_test_gate(
+                project,
+                &project_config.validation.pre_push,
+                project_config.validation.test_gate_timeout_secs,
+                cargo_env,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!("PR #{pr_num} approved at round {round}");
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Done;
+                        s.turn = round.saturating_add(1);
+                    })
+                    .await?;
+                    store.log_event(crate::event_replay::TaskEvent::Completed {
+                        task_id: task_id.0.clone(),
+                        ts: crate::event_replay::now_ts(),
+                    });
+                    tracing::info!(
+                        task_id = %task_id,
+                        phase = "reviewing",
+                        elapsed_secs = review_phase_start.elapsed().as_secs(),
+                        "phase_completed"
+                    );
+                    tracing::info!(
+                        task_id = %task_id,
+                        status = "done",
+                        turns = round.saturating_add(1),
+                        pr_url = pr_url.as_deref().unwrap_or(""),
+                        total_elapsed_secs = task_start.elapsed().as_secs(),
+                        "task_completed"
+                    );
+                    return Ok(());
+                }
+                Err(output) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        round,
+                        "LGTM rejected: tests failed in test gate, re-entering review round {}",
+                        round.saturating_add(1)
+                    );
+                    lgtm_test_gate_rejected = true;
+                    pending_test_failure = Some(output);
+                }
+            }
+        }
+
+        // Track whether this round produced a fix so the next round enforces
+        // freshness checks against new reviewer feedback.
+        // Also treat a test gate rejection as a "fixed" round — the agent needs
+        // to push a fix and get a fresh review before LGTM can be accepted.
+        prev_fixed = fixed || pending_test_failure.is_some();
+        tracing::info!("PR #{pr_num} fixed at round {round}; waiting for bot re-review");
+        if round < max_rounds {
+            waiting_count += 1;
+            update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
+            sleep(Duration::from_secs(wait_secs)).await;
+        }
+        round += 1;
+    }
+
+    // Graduated exit: if the last round had few issues remaining, mark as done
+    // with a warning instead of outright failure — the PR is likely mergeable.
+    // But never graduate when the test gate was still failing on the last round:
+    // a PR whose tests consistently fail must not be approved.
+    let last_issue_count = issue_counts.iter().rev().find_map(|c| *c);
+    // Never graduate when a LGTM was rejected by the test gate — the pending_test_failure
+    // Option was already cleared by take() at round start, so we track rejection separately.
+    let graduated = last_issue_count.is_some_and(|n| n <= 2) && !lgtm_test_gate_rejected;
+
+    if graduated {
+        tracing::info!(
+            task_id = %task_id,
+            remaining_issues = last_issue_count.unwrap_or(0),
+            "review loop exhausted but few issues remain — marking done with warning"
+        );
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Done;
+            s.turn = max_rounds.saturating_add(1);
+            s.error = Some(format!(
+                "Graduated: LGTM not received after {} rounds but only {} issues remain.",
+                max_rounds,
+                last_issue_count.unwrap_or(0),
+            ));
+        })
+        .await?;
+    } else {
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Failed;
+            s.turn = max_rounds.saturating_add(1);
+            s.error = Some(format!(
+                "Task did not receive LGTM after {} review rounds (last issues: {}).",
+                max_rounds,
+                last_issue_count.map_or("unknown".to_string(), |n| n.to_string()),
+            ));
+        })
+        .await?;
+    }
+    tracing::info!(
+        task_id = %task_id,
+        phase = "reviewing",
+        elapsed_secs = review_phase_start.elapsed().as_secs(),
+        "phase_completed"
+    );
+    tracing::info!(
+        task_id = %task_id,
+        status = if graduated { "done" } else { "failed" },
+        turns = max_rounds.saturating_add(1),
+        pr_url = pr_url.as_deref().unwrap_or(""),
+        total_elapsed_secs = task_start.elapsed().as_secs(),
+        "task_completed"
+    );
+    Ok(())
+}

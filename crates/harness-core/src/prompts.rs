@@ -2208,6 +2208,57 @@ pub fn evaluator_prompt(contract_yaml: &str, impl_output: &str, round: u32) -> P
     }
 }
 
+/// Build the planning prompt for a prompt-only task.
+///
+/// Used when the planning gate forces `TaskPhase::Plan` for a complex prompt-only task.
+/// The agent produces a plan first, which is then threaded into the implementation prompt.
+pub fn plan_for_prompt_task(prompt_text: &str) -> String {
+    format!(
+        "Before implementing, produce a concise implementation plan for the following task.\n\
+         List the files to change, the approach, and any non-obvious design decisions.\n\
+         Do NOT write code yet — planning only.\n\n\
+         Task:\n{prompt_text}"
+    )
+}
+
+/// Build the retry prompt when post-execution validation fails.
+///
+/// Prepends the original prompt with error context so the agent can self-correct.
+/// Error messages are prefixed with their type ([COMPILE ERROR], [TEST FAILURE], etc.)
+/// to help the agent focus on the specific failure.
+pub fn validation_retry_prompt(base_prompt: &str, attempt: u32, max: u32, error: &str) -> String {
+    format!(
+        "{base_prompt}\n\nPost-execution validation failed (attempt {attempt}/{max}).\n\
+         Errors are prefixed with [COMPILE ERROR], [TEST FAILURE], [LINT ERROR], or \
+         [VALIDATION ERROR] for classified failures, or with an interceptor name \
+         (e.g. [hook_name]) for hook/policy violations — focus your fix on the indicated \
+         error type:\n{error}"
+    )
+}
+
+/// Prepend a test-gate failure notice to the review round prompt.
+///
+/// Used when the previous LGTM was rejected because the project's tests failed.
+/// The failure output is included so the agent has context for why re-work is needed.
+pub fn test_gate_failure_prompt(failure_output: &str, base_prompt: &str) -> String {
+    format!(
+        "IMPORTANT: The previous LGTM was rejected because the project's tests failed. \
+         Fix the test failures before declaring LGTM again.\n\n\
+         Test output:\n```\n{failure_output}\n```\n\n{base_prompt}"
+    )
+}
+
+/// Returns the capability restriction note injected into agent review prompts.
+///
+/// This note informs the reviewer which tools are permitted, serving as the
+/// primary enforcement path alongside --allowedTools CLI enforcement (issue #483).
+pub fn agent_review_capability_note() -> &'static str {
+    "Tool restriction: you are operating in review mode. \
+     Only Read, Grep, Glob, and Bash are permitted. \
+     Use Bash ONLY for read-only commands like `gh pr diff`. \
+     Do NOT call Write, Edit, or any other tool."
+}
+
 #[cfg(test)]
 mod contract_prompt_tests {
     use super::*;
