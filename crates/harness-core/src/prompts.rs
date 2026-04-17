@@ -103,11 +103,17 @@ pub fn rebase_conflicting_pr(pr_num: u64, branch: &str, repo: &str) -> String {
             git rebase --continue\n\
             ```\n\
             Repeat until the rebase completes successfully.\n\
-         4. Force-push the rebased branch:\n\
+         4. Verify the result compiles and tests pass before pushing:\n\
+            ```\n\
+            cd /tmp/harness-rebase-{pr_num}\n\
+            cargo check && cargo test\n\
+            ```\n\
+            If this step fails, print `REBASE_FAILED` and stop — do NOT force-push.\n\
+         5. Force-push the rebased branch:\n\
             ```\n\
             git push --force-with-lease origin '{branch}'\n\
             ```\n\
-         5. Clean up: `git worktree remove /tmp/harness-rebase-{pr_num}`\n\n\
+         6. Clean up: `git worktree remove /tmp/harness-rebase-{pr_num}`\n\n\
          On the last line of your output, print exactly one of:\n\
          - `REBASE_OK` if the rebase and push succeeded.\n\
          - `REBASE_FAILED` if you could not complete the rebase for any reason."
