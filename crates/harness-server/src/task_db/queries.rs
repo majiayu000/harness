@@ -13,9 +13,13 @@ pub(super) async fn insert(pool: &SqlitePool, state: &TaskState) -> anyhow::Resu
     let depends_on_json = serde_json::to_string(&state.depends_on)?;
     let status = state.status.as_ref();
     let phase_json = serde_json::to_string(&state.phase)?;
+    let request_settings_json = state
+        .request_settings
+        .as_ref()
+        .and_then(|s| serde_json::to_string(s).ok());
     sqlx::query(
-        "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description, request_settings)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&state.id.0)
     .bind(status)
@@ -33,6 +37,7 @@ pub(super) async fn insert(pool: &SqlitePool, state: &TaskState) -> anyhow::Resu
     .bind(state.priority as i64)
     .bind(&phase_json)
     .bind(state.description.as_deref())
+    .bind(request_settings_json.as_deref())
     .execute(pool)
     .await?;
     Ok(())
@@ -43,10 +48,16 @@ pub(super) async fn update(pool: &SqlitePool, state: &TaskState) -> anyhow::Resu
     let depends_on_json = serde_json::to_string(&state.depends_on)?;
     let phase_json = serde_json::to_string(&state.phase)?;
     let status = state.status.as_ref();
+    let request_settings_json = state
+        .request_settings
+        .as_ref()
+        .and_then(|s| serde_json::to_string(s).ok());
     sqlx::query(
         "UPDATE tasks SET status = ?, turn = ?, pr_url = ?, rounds = ?, error = ?,
                 source = ?, external_id = ?, repo = ?, depends_on = ?, project = ?,
-                priority = ?, phase = ?, description = ?, updated_at = datetime('now')
+                priority = ?, phase = ?, description = ?,
+                request_settings = COALESCE(?, request_settings),
+                updated_at = datetime('now')
          WHERE id = ?",
     )
     .bind(status)
@@ -67,6 +78,7 @@ pub(super) async fn update(pool: &SqlitePool, state: &TaskState) -> anyhow::Resu
     .bind(state.priority as i64)
     .bind(&phase_json)
     .bind(state.description.as_deref())
+    .bind(request_settings_json.as_deref())
     .bind(&state.id.0)
     .execute(pool)
     .await?;

@@ -20,6 +20,7 @@ pub(super) struct TaskRow {
     pub(super) priority: i64,
     pub(super) phase: String,
     pub(super) description: Option<String>,
+    pub(super) request_settings: Option<String>,
 }
 
 impl TaskRow {
@@ -41,6 +42,7 @@ impl TaskRow {
             priority,
             phase,
             description,
+            request_settings,
         } = self;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
@@ -62,6 +64,15 @@ impl TaskRow {
             }
         })?;
 
+        let decoded_request_settings = request_settings.as_deref().and_then(|json| {
+            serde_json::from_str::<crate::task_runner::PersistedRequestSettings>(json)
+                .map_err(|e| {
+                    tracing::warn!(task_id = %id, "failed to decode request_settings: {e}");
+                    e
+                })
+                .ok()
+        });
+
         Ok(TaskState {
             id: harness_core::types::TaskId(id),
             status: status.parse::<TaskStatus>()?,
@@ -82,6 +93,7 @@ impl TaskRow {
             phase: decoded_phase,
             triage_output: None,
             plan_output: None,
+            request_settings: decoded_request_settings,
             repo,
         })
     }

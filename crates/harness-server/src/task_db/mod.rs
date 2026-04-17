@@ -192,6 +192,7 @@ mod tests {
             priority: 0,
             phase: r#""implement""#.to_string(),
             description: None,
+            request_settings: None,
         }
     }
 
@@ -299,6 +300,7 @@ mod tests {
             phase: crate::task_runner::TaskPhase::default(),
             triage_output: None,
             plan_output: None,
+            request_settings: None,
             repo: None,
         }
     }
@@ -945,13 +947,14 @@ mod tests {
             priority: 0,
             phase: String::new(),
             description: None,
+            request_settings: None,
         };
 
         // Count must match — catches column added to constant but not struct (or vice versa).
         assert_eq!(
             columns.len(),
-            16, // bump this when adding a field
-            "TASK_ROW_COLUMNS has {} entries but expected 16 — update both the constant and this test",
+            17, // bump this when adding a field
+            "TASK_ROW_COLUMNS has {} entries but expected 17 — update both the constant and this test",
             columns.len()
         );
     }

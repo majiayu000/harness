@@ -119,6 +119,7 @@ mod tests {
             phase: crate::task_runner::TaskPhase::default(),
             triage_output: None,
             plan_output: None,
+            request_settings: None,
             repo: None,
         };
         state.source = Some("github".to_string());
@@ -159,6 +160,7 @@ mod tests {
             phase: crate::task_runner::TaskPhase::default(),
             triage_output: None,
             plan_output: None,
+            request_settings: None,
             repo: None,
         };
         store.insert(&parent_state).await;
@@ -183,6 +185,7 @@ mod tests {
             phase: crate::task_runner::TaskPhase::default(),
             triage_output: None,
             plan_output: None,
+            request_settings: None,
             repo: None,
         };
         store.insert(&child_state).await;

@@ -9,7 +9,7 @@ pub(super) const ARTIFACT_MAX_BYTES: usize = 65_536;
 /// When adding a field to `TaskRow`, add the column here once and all queries
 /// pick it up automatically.  The `task_row_columns_match_struct` test below
 /// will fail if this list drifts from the struct definition.
-pub(super) const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description";
+pub(super) const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description, request_settings";
 
 /// Versioned migrations for the tasks table.
 ///
@@ -111,5 +111,10 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
         version: 14,
         description: "add description column for task observability",
         sql: "ALTER TABLE tasks ADD COLUMN description TEXT",
+    },
+    Migration {
+        version: 15,
+        description: "add request_settings column for per-task guardrail recovery",
+        sql: "ALTER TABLE tasks ADD COLUMN request_settings TEXT",
     },
 ];

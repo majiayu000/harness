@@ -1227,8 +1227,12 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     }
 
     // Re-dispatch tasks that were recovered to pending after server restart.
-    // These had PRs when the server crashed and need their review loop re-started.
-    // Without this, recovered tasks silently hang in pending forever.
+    // Two recovery kinds are handled:
+    //   (a) PR tasks — had a pr_url when the server crashed; resume at agent review.
+    //   (b) Checkpoint-only tasks — crashed during triage or plan (before any PR was
+    //       created); the executor will load the saved checkpoint and resume from
+    //       the appropriate phase.
+    // Without this, both kinds silently hang in pending forever after boot.
     //
     // Each task is re-dispatched in a background tokio task so that permit
     // acquisition never blocks serve() — if more tasks exist than available
@@ -1239,64 +1243,75 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             .tasks
             .list_all()
             .into_iter()
-            .filter(|t| matches!(t.status, task_runner::TaskStatus::Pending) && t.pr_url.is_some())
+            .filter(|t| {
+                if !matches!(t.status, task_runner::TaskStatus::Pending) {
+                    return false;
+                }
+                // (a) PR-backed recovery — always re-dispatch.
+                if t.pr_url.is_some() {
+                    return true;
+                }
+                // (b) Checkpoint-only recovery — error field was set by recover_in_progress().
+                t.error
+                    .as_deref()
+                    .map(|e| e.contains("plan checkpoint") || e.contains("triage checkpoint"))
+                    .unwrap_or(false)
+            })
             .collect();
         if !recovered.is_empty() {
             tracing::info!(
                 count = recovered.len(),
-                "startup: re-dispatching recovered pending task(s) with PRs"
+                "startup: re-dispatching recovered pending task(s)"
             );
             for task in recovered {
                 let state = state.clone();
                 tokio::spawn(async move {
-                    let pr_url = task.pr_url.as_deref().unwrap_or("");
-                    // Issue 4: robust parsing handles /pull/42/files and #fragment suffixes
-                    let pr_num = match parse_pr_num_from_url(pr_url) {
-                        Some(n) => n,
-                        None => {
-                            // pr_url is present but unparseable (empty, corrupted, or
-                            // non-standard).  Simply returning would leave the task stuck in
-                            // 'pending' forever — fail-close it instead so operators can see
-                            // it and the re-dispatch filter never picks it up again.
-                            tracing::error!(
-                                task_id = ?task.id,
-                                pr_url,
-                                "startup recovery: cannot parse PR number from URL — marking task failed"
-                            );
-                            let bad_url = pr_url.to_owned();
-                            if let Err(e) = task_runner::mutate_and_persist(
-                                &state.core.tasks,
-                                &task.id,
-                                move |s| {
-                                    s.status = task_runner::TaskStatus::Failed;
-                                    s.error = Some(format!(
-                                        "startup recovery: unparseable pr_url: {bad_url}"
-                                    ));
-                                },
-                            )
-                            .await
-                            {
+                    // ---- Step 1: determine recovery kind ----
+                    // PR tasks: parse the PR number; checkpoint-only tasks: no PR number.
+                    let pr_num_opt: Option<u64> = if let Some(pr_url) = task.pr_url.as_deref() {
+                        match parse_pr_num_from_url(pr_url) {
+                            Some(n) => Some(n),
+                            None => {
+                                // pr_url is present but unparseable — fail-close to prevent
+                                // the task from hanging in 'pending' forever.
                                 tracing::error!(
                                     task_id = ?task.id,
-                                    "startup recovery: failed to persist failed status: {e}"
+                                    pr_url,
+                                    "startup recovery: cannot parse PR number from URL — marking task failed"
                                 );
-                            }
-                            // Fire completion callback so intake sources (e.g. GitHub Issues
-                            // poller) remove this task from their `dispatched` map. Without
-                            // this the issue stays marked as dispatched forever and will never
-                            // be re-queued, causing a silent production deadlock.
-                            if let Some(cb) = &state.intake.completion_callback {
-                                if let Some(final_state) = state.core.tasks.get(&task.id) {
-                                    cb(final_state).await;
+                                let bad_url = pr_url.to_owned();
+                                if let Err(e) = task_runner::mutate_and_persist(
+                                    &state.core.tasks,
+                                    &task.id,
+                                    move |s| {
+                                        s.status = task_runner::TaskStatus::Failed;
+                                        s.error = Some(format!(
+                                            "startup recovery: unparseable pr_url: {bad_url}"
+                                        ));
+                                    },
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        task_id = ?task.id,
+                                        "startup recovery: failed to persist failed status: {e}"
+                                    );
                                 }
+                                // Fire completion callback so intake sources remove this task
+                                // from their dispatched map and can re-queue it.
+                                if let Some(cb) = &state.intake.completion_callback {
+                                    if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                        cb(final_state).await;
+                                    }
+                                }
+                                return;
                             }
-                            return;
                         }
+                    } else {
+                        None
                     };
 
-                    // Issues 2 & 3: resolve canonical project path from repo name so that
-                    // (a) the correct per-project concurrency bucket is used, and
-                    // (b) req.project is populated so the agent runs in the right worktree.
+                    // ---- Step 2: resolve canonical project path ----
                     let project_path = match task.repo.as_deref() {
                         Some(repo) => {
                             if let Some(registry) = state.core.project_registry.as_deref() {
@@ -1332,8 +1347,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     };
                     let project_id = canonical.to_string_lossy().into_owned();
 
-                    // Issue 1: acquire permit here inside the spawned future so serve()
-                    // is never blocked waiting for a concurrency slot.
+                    // ---- Step 3: acquire concurrency permit ----
                     let permit = match state
                         .concurrency
                         .task_queue
@@ -1350,25 +1364,71 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         }
                     };
 
-                    let req = task_runner::CreateTaskRequest {
-                        pr: Some(pr_num),
+                    // ---- Step 4: reconstruct request, restoring persisted guardrails ----
+                    // For tasks created before migration v15 (no request_settings), fall back
+                    // to defaults so recovered tasks behave identically to before.
+                    let settings = task.request_settings.clone().unwrap_or_default();
+                    let mut req = task_runner::CreateTaskRequest {
                         project: Some(canonical),
                         repo: task.repo.clone(),
                         source: task.source.clone(),
                         external_id: task.external_id.clone(),
+                        agent: settings.agent.clone(),
+                        max_rounds: settings.max_rounds,
+                        max_turns: settings.max_turns,
+                        max_budget_usd: settings.max_budget_usd,
+                        turn_timeout_secs: settings.turn_timeout_secs,
+                        stall_timeout_secs: settings.stall_timeout_secs,
+                        retry_base_backoff_ms: settings.retry_base_backoff_ms,
+                        retry_max_backoff_ms: settings.retry_max_backoff_ms,
                         ..Default::default()
                     };
-                    let classification = crate::complexity_router::classify("", None, Some(pr_num));
-                    let agent = match state.core.server.agent_registry.dispatch(&classification) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            tracing::error!(
+                    if let Some(pr_num) = pr_num_opt {
+                        req.pr = Some(pr_num);
+                    } else {
+                        // Checkpoint-only: restore issue number from the persisted
+                        // description ("issue #N" format set at task creation time).
+                        req.issue = task
+                            .description
+                            .as_deref()
+                            .and_then(|d| d.strip_prefix("issue #"))
+                            .and_then(|n| n.parse::<u64>().ok());
+                        if req.issue.is_none() {
+                            tracing::warn!(
                                 task_id = ?task.id,
-                                "startup recovery: failed to dispatch agent: {e}"
+                                description = ?task.description,
+                                "startup recovery: checkpoint task has no parseable issue number; resuming without issue context"
                             );
-                            return;
+                        }
+                    }
+
+                    // ---- Step 5: select agent ----
+                    // Use the pinned agent from the original request when still registered;
+                    // fall back to complexity-based dispatch for pre-migration tasks or when
+                    // the pinned agent has since been removed.
+                    let agent = {
+                        let pinned = settings
+                            .agent
+                            .as_deref()
+                            .and_then(|name| state.core.server.agent_registry.get(name));
+                        if let Some(a) = pinned {
+                            a
+                        } else {
+                            let classification =
+                                crate::complexity_router::classify("", None, pr_num_opt);
+                            match state.core.server.agent_registry.dispatch(&classification) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    tracing::error!(
+                                        task_id = ?task.id,
+                                        "startup recovery: failed to dispatch agent: {e}"
+                                    );
+                                    return;
+                                }
+                            }
                         }
                     };
+
                     let (reviewer, _) = resolve_reviewer(
                         &state.core.server.agent_registry,
                         &state.core.server.config.agents.review,

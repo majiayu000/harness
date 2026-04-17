@@ -12,8 +12,8 @@ pub(crate) use types::{
     is_non_decomposable_prompt_source, is_transient_error, prompt_requires_plan,
 };
 pub use types::{
-    CompletionCallback, CreateTaskRequest, DashboardCounts, ProjectCounts, RoundResult, TaskPhase,
-    TaskState, TaskStatus, TaskSummary,
+    CompletionCallback, CreateTaskRequest, DashboardCounts, PersistedRequestSettings,
+    ProjectCounts, RoundResult, TaskPhase, TaskState, TaskStatus, TaskSummary,
 };
 pub use types::{TaskId, MAX_TASK_PRIORITY};
 

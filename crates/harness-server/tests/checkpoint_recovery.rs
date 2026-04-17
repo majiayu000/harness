@@ -31,6 +31,7 @@ fn make_task(id: &str, status: TaskStatus) -> TaskState {
         phase: TaskPhase::default(),
         triage_output: None,
         plan_output: None,
+        request_settings: None,
         repo: None,
     }
 }

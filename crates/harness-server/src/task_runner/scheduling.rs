@@ -2,8 +2,9 @@ use super::store::TaskStore;
 use super::types::{
     detect_main_worktree, effective_turn_timeout, is_non_decomposable_prompt_source,
     is_transient_error, prompt_requires_plan, resolve_project_root_with,
-    summarize_request_description, CompletionCallback, CreateTaskRequest, RoundResult, TaskId,
-    TaskPhase as Phase, TaskState, TaskStatus, ACCOUNT_LIMIT_PATTERN, MAX_TRANSIENT_RETRIES,
+    summarize_request_description, CompletionCallback, CreateTaskRequest, PersistedRequestSettings,
+    RoundResult, TaskId, TaskPhase as Phase, TaskState, TaskStatus, ACCOUNT_LIMIT_PATTERN,
+    MAX_TRANSIENT_RETRIES,
 };
 use harness_core::agent::CodeAgent;
 use harness_core::types::{Decision, Event, SessionId};
@@ -81,6 +82,7 @@ pub async fn spawn_task_awaiting_deps(
     state.external_id = req.external_id.clone();
     state.repo = req.repo.clone();
     state.priority = req.priority;
+    state.request_settings = Some(PersistedRequestSettings::from_req(&req));
     if let Some(parent) = req.parent_task_id.clone() {
         state.parent_id = Some(parent);
     }
@@ -258,6 +260,7 @@ pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskReques
     state.priority = req.priority;
     state.issue = req.issue;
     state.description = summarize_request_description(req);
+    state.request_settings = Some(PersistedRequestSettings::from_req(req));
     store.insert(&state).await;
     // Register stream channel now so SSE clients can subscribe before execution begins.
     store.register_task_stream(&task_id);
@@ -332,6 +335,7 @@ where
         state.external_id = req.external_id.clone();
         state.repo = req.repo.clone();
         state.priority = req.priority;
+        state.request_settings = Some(PersistedRequestSettings::from_req(&req));
         store.insert(&state).await;
         // Register stream channel before spawning so SSE clients can subscribe immediately.
         store.register_task_stream(&task_id);

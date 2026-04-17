@@ -190,6 +190,10 @@ pub struct TaskState {
     /// Output from the Plan phase (Architect plan). Not persisted to DB.
     #[serde(skip)]
     pub plan_output: Option<String>,
+    /// Per-task request settings persisted for restart recovery. Stored as a JSON
+    /// blob in the `request_settings` column; not included in the API wire format.
+    #[serde(skip)]
+    pub request_settings: Option<PersistedRequestSettings>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -252,6 +256,7 @@ impl TaskState {
             phase: TaskPhase::default(),
             triage_output: None,
             plan_output: None,
+            request_settings: None,
             repo: None,
         }
     }
@@ -368,6 +373,65 @@ impl Default for CreateTaskRequest {
             parent_task_id: None,
             depends_on: Vec::new(),
             priority: 0,
+        }
+    }
+}
+
+/// Per-task request settings persisted to the database so that recovered tasks
+/// (after a server restart) resume with the same agent and guardrails as the
+/// original invocation.
+///
+/// Stored as a JSON blob in the `request_settings` column of the tasks table.
+/// Fields use `#[serde(default)]` so that blobs written by older versions
+/// (missing new fields) still deserialize correctly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedRequestSettings {
+    /// Pinned agent name; `None` means use complexity-based dispatch.
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub max_rounds: Option<u32>,
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
+    #[serde(default = "default_turn_timeout")]
+    pub turn_timeout_secs: u64,
+    #[serde(default = "default_stall_timeout")]
+    pub stall_timeout_secs: u64,
+    #[serde(default = "default_retry_base_backoff_ms")]
+    pub retry_base_backoff_ms: u64,
+    #[serde(default = "default_retry_max_backoff_ms")]
+    pub retry_max_backoff_ms: u64,
+}
+
+impl Default for PersistedRequestSettings {
+    fn default() -> Self {
+        Self {
+            agent: None,
+            max_rounds: None,
+            max_turns: None,
+            max_budget_usd: None,
+            turn_timeout_secs: default_turn_timeout(),
+            stall_timeout_secs: default_stall_timeout(),
+            retry_base_backoff_ms: default_retry_base_backoff_ms(),
+            retry_max_backoff_ms: default_retry_max_backoff_ms(),
+        }
+    }
+}
+
+impl PersistedRequestSettings {
+    /// Snapshot the per-task guardrails from a `CreateTaskRequest` at creation time.
+    pub fn from_req(req: &CreateTaskRequest) -> Self {
+        Self {
+            agent: req.agent.clone(),
+            max_rounds: req.max_rounds,
+            max_turns: req.max_turns,
+            max_budget_usd: req.max_budget_usd,
+            turn_timeout_secs: req.turn_timeout_secs,
+            stall_timeout_secs: req.stall_timeout_secs,
+            retry_base_backoff_ms: req.retry_base_backoff_ms,
+            retry_max_backoff_ms: req.retry_max_backoff_ms,
         }
     }
 }
