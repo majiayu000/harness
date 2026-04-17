@@ -90,7 +90,7 @@ async fn run_retry_tick(
             format!("{project_prefix}:{raw_ext}")
         };
         let attempt_hook = format!("periodic_retry:attempt:{ext_key}");
-        let attempts = state
+        let attempts = match state
             .observability
             .events
             .query(&EventFilters {
@@ -98,7 +98,17 @@ async fn run_retry_tick(
                 ..EventFilters::default()
             })
             .await
-            .unwrap_or_default();
+        {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task.id.0,
+                    "periodic_retry: failed to query attempt history, skipping: {e}"
+                );
+                skipped += 1;
+                continue;
+            }
+        };
 
         let attempt_count = attempts.len() as u32;
         let last_attempt_ts = attempts.iter().map(|e| e.ts).max();
@@ -180,6 +190,7 @@ async fn run_retry_tick(
                     .clone()
                     .or_else(|| Some("periodic-retry".to_string())),
                 project: task.project_root.clone(),
+                priority: task.priority,
                 ..CreateTaskRequest::default()
             };
             if let Some(settings) = &task.request_settings {
