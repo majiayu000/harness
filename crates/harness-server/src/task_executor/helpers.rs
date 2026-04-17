@@ -574,7 +574,7 @@ pub(crate) async fn run_agent_streaming(
                                 //    CREATED_ISSUE=10) is written to the DB.
                                 //    last_backfilled_issue prevents redundant writes
                                 //    when the parsed number has not changed.
-                                if is_auto_fix_task {
+                                if is_auto_fix_task && text.contains('\n') {
                                     // Only scan up to the last newline so that a
                                     // sentinel split across chunk boundaries (e.g.
                                     // "CREATED_ISSUE=4" then "2\n" in the next delta)
