@@ -1374,6 +1374,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         source: task.source.clone(),
                         external_id: task.external_id.clone(),
                         agent: settings.agent.clone(),
+                        // Restore the original prompt so issue tasks retain their
+                        // caller-supplied context hint and prompt-only tasks can resume
+                        // with the correct instruction instead of an empty string.
+                        prompt: settings.prompt.clone(),
                         max_rounds: settings.max_rounds,
                         max_turns: settings.max_turns,
                         max_budget_usd: settings.max_budget_usd,
@@ -1394,10 +1398,22 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                             .and_then(|d| d.strip_prefix("issue #"))
                             .and_then(|n| n.parse::<u64>().ok());
                         if req.issue.is_none() {
+                            // No PR and no parseable issue number. If a prompt was
+                            // stored (new rows always have one), resume as a prompt
+                            // task. If not (pre-migration rows), fail closed to avoid
+                            // executing with an empty prompt and producing garbage work.
+                            if req.prompt.is_none() {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    description = ?task.description,
+                                    "startup recovery: no issue number or prompt recoverable; skipping task to avoid empty-prompt execution"
+                                );
+                                return;
+                            }
                             tracing::warn!(
                                 task_id = ?task.id,
                                 description = ?task.description,
-                                "startup recovery: checkpoint task has no parseable issue number; resuming without issue context"
+                                "startup recovery: checkpoint task has no parseable issue number; resuming as prompt task"
                             );
                         }
                     }

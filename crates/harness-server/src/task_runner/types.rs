@@ -389,6 +389,12 @@ pub struct PersistedRequestSettings {
     /// Pinned agent name; `None` means use complexity-based dispatch.
     #[serde(default)]
     pub agent: Option<String>,
+    /// Caller-supplied prompt text, including additional context hints supplied
+    /// alongside an issue number. Stored so that recovery after a server restart
+    /// can reconstruct the original request faithfully instead of resuming with
+    /// an empty prompt.
+    #[serde(default)]
+    pub prompt: Option<String>,
     #[serde(default)]
     pub max_rounds: Option<u32>,
     #[serde(default)]
@@ -409,6 +415,7 @@ impl Default for PersistedRequestSettings {
     fn default() -> Self {
         Self {
             agent: None,
+            prompt: None,
             max_rounds: None,
             max_turns: None,
             max_budget_usd: None,
@@ -425,6 +432,7 @@ impl PersistedRequestSettings {
     pub fn from_req(req: &CreateTaskRequest) -> Self {
         Self {
             agent: req.agent.clone(),
+            prompt: req.prompt.clone(),
             max_rounds: req.max_rounds,
             max_turns: req.max_turns,
             max_budget_usd: req.max_budget_usd,

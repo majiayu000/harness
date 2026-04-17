@@ -237,6 +237,10 @@ pub(crate) async fn enqueue_task(
         &state.core.server.agent_registry,
         registry_default_agent.as_deref(),
     )?;
+    // Normalize req.agent to the resolved name so PersistedRequestSettings always
+    // captures the actual agent used, regardless of which selection tier picked it
+    // (explicit override, project config, registry default, or complexity dispatch).
+    req.agent = Some(agent.name().to_string());
 
     let (reviewer, _review_config) = resolve_reviewer(
         &state.core.server.agent_registry,
@@ -397,6 +401,9 @@ async fn enqueue_task_background(
         &state.core.server.agent_registry,
         registry_default_agent.as_deref(),
     )?;
+    // Normalize req.agent to the resolved name so PersistedRequestSettings always
+    // captures the actual agent used, regardless of which selection tier picked it.
+    req.agent = Some(agent.name().to_string());
 
     let (reviewer, _review_config) = resolve_reviewer(
         &state.core.server.agent_registry,

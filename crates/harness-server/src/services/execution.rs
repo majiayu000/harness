@@ -198,6 +198,9 @@ impl ExecutionService for DefaultExecutionService {
             .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
 
         let agent = self.select_agent(&req)?;
+        // Normalize req.agent to the resolved name so PersistedRequestSettings always
+        // captures the actual agent used, regardless of which selection tier picked it.
+        req.agent = Some(agent.name().to_string());
         let (reviewer, _) = resolve_reviewer(
             &self.agent_registry,
             &self.server_config.agents.review,
@@ -232,6 +235,9 @@ impl ExecutionService for DefaultExecutionService {
 
         // Resolve agent up-front so validation errors surface immediately.
         let agent = self.select_agent(&req)?;
+        // Normalize req.agent to the resolved name so PersistedRequestSettings always
+        // captures the actual agent used, regardless of which selection tier picked it.
+        req.agent = Some(agent.name().to_string());
         let (reviewer, _) = resolve_reviewer(
             &self.agent_registry,
             &self.server_config.agents.review,
