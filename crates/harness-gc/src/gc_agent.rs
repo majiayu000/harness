@@ -5,7 +5,10 @@ use crate::signal_detector::SignalDetector;
 use anyhow::Context;
 use chrono::Utc;
 use harness_core::agent::{AgentRequest, CodeAgent};
-use harness_core::config::{agents::CapabilityProfile, misc::GcConfig};
+use harness_core::config::{
+    agents::CapabilityProfile,
+    misc::{AutoAdoptPolicy, GcConfig},
+};
 use harness_core::types::{
     Artifact, ArtifactType, Draft, DraftId, DraftStatus, ExternalSignal, Project, RemediationType,
     Signal, SignalType,
@@ -20,6 +23,10 @@ const DEFAULT_GC_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
 pub struct GcReport {
     pub signals: Vec<Signal>,
     pub drafts_generated: usize,
+    /// IDs of drafts created during this run. Used by auto-adoption paths that
+    /// need to identify freshly-created drafts without re-querying the store.
+    #[serde(default)]
+    pub draft_ids: Vec<DraftId>,
     pub errors: Vec<String>,
 }
 
@@ -172,6 +179,7 @@ impl GcAgent {
 
         // 3. Generate fix drafts (up to max_drafts_per_run).
         let mut drafts_generated = 0;
+        let mut draft_ids: Vec<DraftId> = Vec::new();
         let mut errors = Vec::new();
         let allowed_tools: Vec<String> = self
             .config
@@ -218,6 +226,7 @@ impl GcAgent {
                         errors.push(format!("failed to save draft: {e}"));
                     } else {
                         drafts_generated += 1;
+                        draft_ids.push(draft.id.clone());
                     }
                 }
                 Err(e) => {
@@ -232,6 +241,7 @@ impl GcAgent {
         let report = GcReport {
             signals,
             drafts_generated,
+            draft_ids,
             errors,
         };
 
@@ -284,6 +294,64 @@ impl GcAgent {
         draft.status = DraftStatus::Adopted;
         self.draft_store.save(&draft)?;
         Ok(())
+    }
+
+    /// Auto-adopt drafts from `draft_ids` that are eligible under `policy`.
+    ///
+    /// For `AutoAdoptPolicy::RulesOnly`, a draft is eligible when:
+    ///   1. its signal remediation is `RemediationType::Rule`, AND
+    ///   2. every artifact `target_path` (after lexical normalization) is a
+    ///      relative path whose first component(s) match `path_prefix`.
+    ///
+    /// Returns the list of draft IDs that were successfully adopted. Failures
+    /// to adopt individual drafts are logged and do not abort the loop.
+    ///
+    /// This method is a no-op when `policy` is `Off` or `draft_ids` is empty.
+    pub fn auto_adopt_matching(
+        &self,
+        draft_ids: &[DraftId],
+        policy: AutoAdoptPolicy,
+        path_prefix: &str,
+    ) -> Vec<DraftId> {
+        if matches!(policy, AutoAdoptPolicy::Off) || draft_ids.is_empty() {
+            return Vec::new();
+        }
+        let mut adopted = Vec::new();
+        for id in draft_ids {
+            let draft = match self.draft_store.get(id) {
+                Ok(Some(d)) => d,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(draft_id = %id.0, error = %e, "auto_adopt: failed to load draft");
+                    continue;
+                }
+            };
+            if !matches!(policy, AutoAdoptPolicy::RulesOnly) {
+                continue;
+            }
+            if draft.signal.remediation != RemediationType::Rule {
+                continue;
+            }
+            if draft.artifacts.is_empty() {
+                continue;
+            }
+            let all_under_prefix = draft
+                .artifacts
+                .iter()
+                .all(|a| artifact_path_under_prefix(&a.target_path, path_prefix));
+            if !all_under_prefix {
+                continue;
+            }
+            match self.adopt(id) {
+                Ok(()) => adopted.push(id.clone()),
+                Err(e) => tracing::warn!(
+                    draft_id = %id.0,
+                    error = %e,
+                    "auto_adopt: adopt failed"
+                ),
+            }
+        }
+        adopted
     }
 
     /// Reject a draft.
@@ -365,6 +433,29 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// Returns true when `target_path` is a relative path that, after lexical
+/// normalization, lies under `path_prefix`. Used by auto-adoption to limit
+/// writes to a configured sandbox directory (e.g. `.harness/generated/`).
+///
+/// Absolute paths and paths that escape the prefix (`..`) return false.
+fn artifact_path_under_prefix(target_path: &Path, path_prefix: &str) -> bool {
+    if target_path.is_absolute() {
+        return false;
+    }
+    let normalized = normalize_path(target_path);
+    // Reject paths that still contain ParentDir segments after normalization
+    // (e.g. `..` at the front, which normalize_path leaves intact when the
+    // output is empty).
+    if normalized
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return false;
+    }
+    let prefix_normalized = normalize_path(Path::new(path_prefix));
+    normalized.starts_with(&prefix_normalized)
 }
 
 /// Walk up from `path` to find the nearest existing ancestor, canonicalize it,
@@ -602,6 +693,128 @@ mod tests {
             generated_at: Utc::now(),
             agent_model: "test".into(),
         }
+    }
+
+    #[test]
+    fn artifact_path_under_prefix_accepts_paths_inside_prefix() {
+        assert!(artifact_path_under_prefix(
+            Path::new(".harness/generated/rules/new.md"),
+            ".harness/generated/"
+        ));
+        assert!(artifact_path_under_prefix(
+            Path::new(".harness/generated/rules/./new.md"),
+            ".harness/generated/"
+        ));
+    }
+
+    #[test]
+    fn artifact_path_under_prefix_rejects_paths_outside_prefix() {
+        assert!(!artifact_path_under_prefix(
+            Path::new("src/main.rs"),
+            ".harness/generated/"
+        ));
+        assert!(!artifact_path_under_prefix(
+            Path::new("/etc/passwd"),
+            ".harness/generated/"
+        ));
+        assert!(!artifact_path_under_prefix(
+            Path::new(".harness/generated/../../etc/passwd"),
+            ".harness/generated/"
+        ));
+    }
+
+    #[test]
+    fn auto_adopt_matching_off_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let gc = make_test_gc_agent(dir.path());
+        let draft = test_draft(vec![]);
+        gc.draft_store.save(&draft).unwrap();
+        let adopted = gc.auto_adopt_matching(
+            std::slice::from_ref(&draft.id),
+            AutoAdoptPolicy::Off,
+            ".harness/generated/",
+        );
+        assert!(adopted.is_empty());
+    }
+
+    #[test]
+    fn auto_adopt_matching_rules_only_adopts_rule_drafts_under_prefix() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let project_root = sandbox.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let signal_detector = SignalDetector::new(
+            crate::signal_detector::SignalThresholds::default(),
+            ProjectId::new(),
+        );
+        let draft_store = DraftStore::new(sandbox.path()).unwrap();
+        let gc = GcAgent::new(
+            GcConfig::default(),
+            signal_detector,
+            draft_store,
+            project_root.clone(),
+        );
+
+        // Eligible: Rule remediation + artifact under prefix.
+        let eligible = Draft {
+            signal: Signal::new(
+                SignalType::RepeatedWarn,
+                ProjectId::new(),
+                serde_json::json!({}),
+                RemediationType::Rule,
+            ),
+            ..test_draft(vec![Artifact {
+                artifact_type: ArtifactType::Rule,
+                target_path: PathBuf::from(".harness/generated/rules/new.md"),
+                content: "rule".into(),
+            }])
+        };
+        gc.draft_store.save(&eligible).unwrap();
+
+        // Ineligible — remediation is Guard.
+        let guard_draft = test_draft(vec![Artifact {
+            artifact_type: ArtifactType::Guard,
+            target_path: PathBuf::from(".harness/generated/guards/g.sh"),
+            content: "guard".into(),
+        }]);
+        gc.draft_store.save(&guard_draft).unwrap();
+
+        // Ineligible — artifact outside prefix.
+        let outside = Draft {
+            signal: Signal::new(
+                SignalType::RepeatedWarn,
+                ProjectId::new(),
+                serde_json::json!({}),
+                RemediationType::Rule,
+            ),
+            ..test_draft(vec![Artifact {
+                artifact_type: ArtifactType::Rule,
+                target_path: PathBuf::from("src/main.rs"),
+                content: "rule".into(),
+            }])
+        };
+        gc.draft_store.save(&outside).unwrap();
+
+        let adopted = gc.auto_adopt_matching(
+            &[
+                eligible.id.clone(),
+                guard_draft.id.clone(),
+                outside.id.clone(),
+            ],
+            AutoAdoptPolicy::RulesOnly,
+            ".harness/generated/",
+        );
+        assert_eq!(adopted, vec![eligible.id.clone()]);
+
+        let reloaded = gc.draft_store.get(&eligible.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, DraftStatus::Adopted);
+        let written =
+            std::fs::read_to_string(project_root.join(".harness/generated/rules/new.md")).unwrap();
+        assert_eq!(written, "rule");
+
+        let guard_reloaded = gc.draft_store.get(&guard_draft.id).unwrap().unwrap();
+        assert_eq!(guard_reloaded.status, DraftStatus::Pending);
+        let outside_reloaded = gc.draft_store.get(&outside.id).unwrap().unwrap();
+        assert_eq!(outside_reloaded.status, DraftStatus::Pending);
     }
 
     #[test]

@@ -204,6 +204,29 @@ pub struct GcConfig {
     /// Tools allowed during GC agent execution. Default: ["Read", "Grep", "Glob"].
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
+    /// Auto-adoption policy for drafts produced by `gc_agent.run`.
+    /// Default: `Off` — all drafts remain `Pending` and require explicit
+    /// `gc adopt` from the CLI or UI. See `AutoAdoptPolicy` for other modes.
+    #[serde(default)]
+    pub auto_adopt: AutoAdoptPolicy,
+    /// Target-path prefix (relative to project root) required for auto-adopt
+    /// to apply. Drafts whose artifacts target paths outside this prefix are
+    /// left `Pending` even when `auto_adopt` is enabled. Default: `.harness/generated/`.
+    #[serde(default = "default_auto_adopt_path_prefix")]
+    pub auto_adopt_path_prefix: String,
+}
+
+/// Controls whether drafts produced by a GC run are automatically moved to
+/// `Adopted` status (which writes their artifacts into the project tree).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoAdoptPolicy {
+    /// No auto-adoption. Drafts stay `Pending` until a human adopts them.
+    #[default]
+    Off,
+    /// Auto-adopt drafts whose signal remediation is `Rule`, provided all
+    /// artifact target paths fall under `auto_adopt_path_prefix`.
+    RulesOnly,
 }
 
 impl Default for GcConfig {
@@ -221,8 +244,14 @@ impl Default for GcConfig {
             auto_gc_cooldown_secs: default_auto_gc_cooldown_secs(),
             auto_pr: default_gc_auto_pr(),
             allowed_tools: None,
+            auto_adopt: AutoAdoptPolicy::default(),
+            auto_adopt_path_prefix: default_auto_adopt_path_prefix(),
         }
     }
+}
+
+fn default_auto_adopt_path_prefix() -> String {
+    ".harness/generated/".to_string()
 }
 
 fn default_gc_adopt_wait_secs() -> u64 {
@@ -242,7 +271,11 @@ fn default_gc_draft_ttl_hours() -> u64 {
 }
 
 fn default_auto_gc_grades() -> Vec<Grade> {
-    vec![Grade::D]
+    // Any grade below A triggers GC. Previously this was `[Grade::D]` alone,
+    // which meant an otherwise-uncalibrated grader that rarely (or never)
+    // emitted D silently disabled the entire GC feedback loop. Widening the
+    // trigger set to B/C/D ensures any degradation produces a draft.
+    vec![Grade::B, Grade::C, Grade::D]
 }
 
 fn default_auto_gc_cooldown_secs() -> u64 {

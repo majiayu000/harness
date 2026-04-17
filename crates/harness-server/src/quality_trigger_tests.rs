@@ -52,6 +52,8 @@ async fn make_trigger_with_challenger(
         auto_gc_grades,
         cooldown_secs,
         challenger,
+        harness_core::config::misc::AutoAdoptPolicy::Off,
+        ".harness/generated/".to_string(),
     )
 }
 
