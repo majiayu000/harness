@@ -523,7 +523,7 @@ async fn run_agent_streaming(
 }
 
 fn prepend_constitution(prompt: String, enabled: bool) -> String {
-    const CONSTITUTION: &str = include_str!("../../../config/constitution.md");
+    const CONSTITUTION: &str = include_str!("../../../../config/constitution.md");
     if enabled {
         format!("{CONSTITUTION}\n\n{prompt}")
     } else {
