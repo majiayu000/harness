@@ -688,12 +688,16 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                 // the intake poller never re-queues it.
                 if let Some(ref cb) = state.intake.completion_callback {
                     for task_id in &failed_ids {
-                        match state.core.tasks.get(task_id) {
-                            Some(task) => cb(task).await,
-                            None => tracing::warn!(
+                        if let Some(task) = state.core.tasks.get(task_id) {
+                            let cb = cb.clone();
+                            tokio::spawn(async move {
+                                cb(task).await;
+                            });
+                        } else {
+                            tracing::warn!(
                                 "dep-watcher: task {} not found after dep-failed transition",
                                 task_id.0
-                            ),
+                            );
                         }
                     }
                 }

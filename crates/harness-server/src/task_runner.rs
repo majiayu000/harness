@@ -2294,15 +2294,14 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
                     break; // fail-fast — no need to inspect remaining deps
                 }
                 Some(TaskStatus::Cancelled) => {
-                    // A cancelled dependency does NOT unblock or hard-fail its
-                    // dependents — this matches the intake DAG contract in
-                    // intake/mod.rs where `status_unblocks_dependents` only
-                    // returns true for Done | Failed, and cancelled tasks are
-                    // tracked in a separate `cancelled_sprint` set.  Keeping
-                    // the dependent in AwaitingDeps allows the cancelled parent
-                    // to be re-queued later; if it eventually reaches Done the
-                    // dependent will be released normally.
-                    all_done = false;
+                    // A cancelled dependency hard-fails its dependents. When a
+                    // task is re-queued it always receives a new TaskId, so the
+                    // original (now-cancelled) TaskId in `depends_on` can never
+                    // transition to Done. Leaving the dependent in AwaitingDeps
+                    // would block it indefinitely; failing it immediately lets
+                    // the caller re-submit with correct dependency IDs.
+                    failed_dep_id = Some((dep_id.clone(), "cancelled"));
+                    break; // fail-fast — no need to inspect remaining deps
                 }
                 Some(TaskStatus::Done) => {} // this dep is satisfied
                 _ => {
@@ -3566,12 +3565,11 @@ mod tests {
         Ok(())
     }
 
-    /// A cancelled dependency must NOT hard-fail its dependents — they stay
-    /// in AwaitingDeps so that the parent can be re-queued later.  This
-    /// matches the intake DAG contract in intake/mod.rs where
-    /// `status_unblocks_dependents` only returns true for Done | Failed.
+    /// A cancelled dependency hard-fails its dependents. Re-queued tasks always
+    /// get new TaskIds, so the old cancelled ID would never resolve — leaving the
+    /// dependent in AwaitingDeps would block it indefinitely.
     #[tokio::test]
-    async fn check_awaiting_cancelled_dep_stays_blocked() -> anyhow::Result<()> {
+    async fn check_awaiting_cancelled_dep_hard_fails_dependent() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
 
@@ -3589,14 +3587,14 @@ mod tests {
         let (ready, failed) = check_awaiting_deps(&store).await;
         assert!(ready.is_empty(), "cancelled dep must not unblock dependent");
         assert!(
-            failed.is_empty(),
-            "cancelled dep must not hard-fail dependent (DAG contract)"
+            failed.contains(&task_id),
+            "cancelled dep must hard-fail its dependent"
         );
 
         let state = store.get(&task_id).expect("task should still be in store");
         assert!(
-            matches!(state.status, TaskStatus::AwaitingDeps),
-            "dependent must remain AwaitingDeps when dep is Cancelled, got {:?}",
+            matches!(state.status, TaskStatus::Failed),
+            "dependent must be Failed when dep is Cancelled, got {:?}",
             state.status
         );
         Ok(())
