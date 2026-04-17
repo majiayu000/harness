@@ -75,9 +75,20 @@ async fn run_retry_tick(
     for task in &stalled {
         checked += 1;
 
-        // Key attempt history by external_id so counts persist across task
-        // generations (each retry creates a new task_id but the same issue/PR).
-        let ext_key = task.external_id.as_deref().unwrap_or(task.id.0.as_str());
+        // Key attempt history by project+external_id so counts persist across
+        // task generations (each retry creates a new task_id) while remaining
+        // isolated per repo on multi-repo servers.
+        let project_prefix = task
+            .project_root
+            .as_ref()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        let raw_ext = task.external_id.as_deref().unwrap_or(task.id.0.as_str());
+        let ext_key = if project_prefix.is_empty() {
+            raw_ext.to_string()
+        } else {
+            format!("{project_prefix}:{raw_ext}")
+        };
         let attempt_hook = format!("periodic_retry:attempt:{ext_key}");
         let attempts = state
             .observability
@@ -152,7 +163,13 @@ async fn run_retry_tick(
                 issue: issue_num,
                 pr: pr_num,
                 repo: task.repo.clone(),
-                source: Some("periodic-retry".to_string()),
+                // Preserve the original intake source so the completion
+                // callback can route back to the correct intake (e.g. GitHub)
+                // and unmark the issue from the dispatched set on failure/cancel.
+                source: task
+                    .source
+                    .clone()
+                    .or_else(|| Some("periodic-retry".to_string())),
                 project: task.project_root.clone(),
                 ..CreateTaskRequest::default()
             };
@@ -262,6 +279,22 @@ async fn run_retry_tick(
                         "periodic_retry: failed to enqueue stuck-label task: {e}"
                     );
                 }
+            }
+
+            // Transition the exhausted task out of active status so it no
+            // longer occupies a slot in list_stalled_tasks (which has a
+            // LIMIT 100), preventing it from starving newer stalled tasks.
+            if let Err(e) = mutate_and_persist(&state.core.tasks, &task.id, |s| {
+                s.status = TaskStatus::Cancelled;
+            })
+            .await
+            {
+                tracing::warn!(
+                    task_id = %task.id.0,
+                    "periodic_retry: failed to cancel stuck task: {e}"
+                );
+            } else {
+                state.core.tasks.abort_task(&task.id);
             }
 
             stuck += 1;
