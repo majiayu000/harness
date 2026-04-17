@@ -1493,8 +1493,11 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                         if let Some(a) = pinned {
                             a
                         } else {
-                            let classification =
-                                crate::complexity_router::classify("", None, pr_num_opt);
+                            let classification = crate::complexity_router::classify(
+                                req.prompt.as_deref().unwrap_or(""),
+                                req.issue,
+                                pr_num_opt,
+                            );
                             match state.core.server.agent_registry.dispatch(&classification) {
                                 Ok(a) => a,
                                 Err(e) => {

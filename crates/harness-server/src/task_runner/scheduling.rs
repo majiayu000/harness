@@ -129,7 +129,7 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
         let mut all_done = true;
         for dep_id in &depends_on {
             match store.dep_status(dep_id).await {
-                Some(TaskStatus::Failed) => {
+                Some(TaskStatus::Failed) | Some(TaskStatus::Cancelled) => {
                     failed_dep_id = Some(dep_id.clone());
                     break; // fail-fast — no need to inspect remaining deps
                 }
@@ -157,7 +157,10 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
             // cancel or status transition must not be clobbered.
             if matches!(entry.status, TaskStatus::AwaitingDeps) {
                 entry.status = TaskStatus::Failed;
-                entry.error = Some(format!("dependency {} failed", failed_dep_id.0));
+                entry.error = Some(format!(
+                    "dependency {} failed or was cancelled",
+                    failed_dep_id.0
+                ));
                 newly_failed.push(task_id.clone());
             }
         }
