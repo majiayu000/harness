@@ -256,7 +256,7 @@ pub(crate) async fn run_rebase_turn(
         prompt,
         project_root: project.to_path_buf(),
         env_vars: cargo_env.clone(),
-        execution_phase: Some(harness_core::types::ExecutionPhase::Planning),
+        execution_phase: Some(harness_core::types::ExecutionPhase::Rebase),
         ..Default::default()
     };
 
