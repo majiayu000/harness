@@ -1392,16 +1392,56 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     } else {
                         // Checkpoint-only: restore issue number from the persisted
                         // description ("issue #N" format set at task creation time).
+                        let description_is_issue = task
+                            .description
+                            .as_deref()
+                            .map(|d| d.starts_with("issue #"))
+                            .unwrap_or(false);
                         req.issue = task
                             .description
                             .as_deref()
                             .and_then(|d| d.strip_prefix("issue #"))
                             .and_then(|n| n.parse::<u64>().ok());
                         if req.issue.is_none() {
-                            // No PR and no parseable issue number. If a prompt was
-                            // stored (new rows always have one), resume as a prompt
-                            // task. If not (pre-migration rows), fail closed to avoid
-                            // executing with an empty prompt and producing garbage work.
+                            if description_is_issue {
+                                // Description says "issue #..." but the number is
+                                // unparseable — this was an issue task with corrupted
+                                // data. Fail closed to avoid silently running a generic
+                                // prompt instead of the intended issue-resume flow.
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    description = ?task.description,
+                                    "startup recovery: checkpoint task has malformed issue number; marking failed"
+                                );
+                                if let Err(e) = task_runner::mutate_and_persist(
+                                    &state.core.tasks,
+                                    &task.id,
+                                    |s| {
+                                        s.status = task_runner::TaskStatus::Failed;
+                                        s.error = Some(
+                                            "startup recovery: malformed issue number in description"
+                                                .to_string(),
+                                        );
+                                    },
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        task_id = ?task.id,
+                                        "startup recovery: failed to persist failed status: {e}"
+                                    );
+                                }
+                                if let Some(cb) = &state.intake.completion_callback {
+                                    if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                        cb(final_state).await;
+                                    }
+                                }
+                                return;
+                            }
+                            // No issue-style description. If a prompt was stored (new
+                            // rows always have one), resume as a prompt task. If not
+                            // (pre-migration rows), fail closed to avoid executing with
+                            // an empty prompt and producing garbage work.
                             if req.prompt.is_none() {
                                 tracing::error!(
                                     task_id = ?task.id,
