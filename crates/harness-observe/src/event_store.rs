@@ -142,12 +142,16 @@ impl EventStore {
         }
 
         // Phase 2: trim watermark history — keep only the newest row per hook.
-        // Covers both periodic_review:* and periodic_retry:* watermarks.
+        // Only trims true watermark hooks (periodic_review:* and
+        // periodic_retry:summary).  Per-identity history hooks such as
+        // periodic_retry:attempt:* and periodic_retry:stuck:* must NOT be
+        // trimmed because attempt counts are derived from the number of events
+        // stored under those hooks.
         loop {
             let result = sqlx::query(
                 "DELETE FROM events WHERE id IN (
                     SELECT e.id FROM events e
-                    WHERE (e.hook GLOB 'periodic_review:*' OR e.hook GLOB 'periodic_retry:*')
+                    WHERE (e.hook GLOB 'periodic_review:*' OR e.hook = 'periodic_retry:summary')
                     AND e.ts < (
                         SELECT MAX(e2.ts) FROM events e2 WHERE e2.hook = e.hook
                     )

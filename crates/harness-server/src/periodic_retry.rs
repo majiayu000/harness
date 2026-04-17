@@ -75,8 +75,10 @@ async fn run_retry_tick(
     for task in &stalled {
         checked += 1;
 
-        // Query attempt history for this specific task.
-        let attempt_hook = format!("periodic_retry:attempt:{}", task.id.0);
+        // Key attempt history by external_id so counts persist across task
+        // generations (each retry creates a new task_id but the same issue/PR).
+        let ext_key = task.external_id.as_deref().unwrap_or(task.id.0.as_str());
+        let attempt_hook = format!("periodic_retry:attempt:{ext_key}");
         let attempts = state
             .observability
             .events
@@ -125,6 +127,9 @@ async fn run_retry_tick(
                 );
             }
 
+            // Capture original status so we can restore it if enqueue fails.
+            let original_status = task.status.clone();
+
             // Cancel the stalled task before re-enqueuing so the active-task
             // dedup in enqueue_task does not find it and return the same ID
             // instead of creating a new successor.
@@ -166,13 +171,26 @@ async fn run_retry_tick(
                 Err(e) => {
                     tracing::warn!(
                         task_id = %task.id.0,
-                        "periodic_retry: failed to enqueue retry: {e}"
+                        "periodic_retry: failed to enqueue retry: {e}; restoring task status"
                     );
+                    // Restore the stalled task to its pre-cancel status so the
+                    // next tick can detect and retry it.  Without this, a
+                    // transient enqueue failure permanently drops the work item.
+                    if let Err(e2) = mutate_and_persist(&state.core.tasks, &task.id, |s| {
+                        s.status = original_status.clone();
+                    })
+                    .await
+                    {
+                        tracing::error!(
+                            task_id = %task.id.0,
+                            "periodic_retry: failed to restore task status after enqueue failure: {e2}"
+                        );
+                    }
                 }
             }
         } else {
             // Retry cap reached.
-            let stuck_hook = format!("periodic_retry:stuck:{}", task.id.0);
+            let stuck_hook = format!("periodic_retry:stuck:{ext_key}");
 
             // Once-only guard: if we already emitted a stuck event for this
             // task, skip re-escalation — prompt-only tasks have no external_id
