@@ -394,8 +394,9 @@ pub struct PersistedRequestSettings {
     /// Intentionally NOT serialised to the database: prompts may contain
     /// credentials or sensitive data and must not be written at rest.
     /// LIMITATION: after a server restart the prompt will be absent; prompt-only
-    /// `AwaitingDeps` tasks will be dispatched without the caller's original
-    /// prompt text and will remain stuck in `AwaitingDeps` with no prompt to replay.
+    /// `AwaitingDeps` tasks will transition to `Pending` once their dependencies
+    /// resolve, then fail immediately in the dep-watcher dispatch path because
+    /// no prompt is available to replay.
     #[serde(skip)]
     pub prompt: Option<String>,
 }

@@ -800,6 +800,15 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                                     "dep-watcher: failed to persist failed status: {pe}"
                                 );
                             }
+                            // Fire completion callback so intake sources (e.g. GitHub Issues
+                            // poller) remove this task from their `dispatched` map. Without
+                            // this the issue stays marked as dispatched forever and will never
+                            // be re-queued, causing a silent production deadlock.
+                            if let Some(cb) = &state.intake.completion_callback {
+                                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                    cb(final_state).await;
+                                }
+                            }
                             return;
                         }
 

@@ -67,7 +67,7 @@ fn aggregate_violations(violations: &[Violation]) -> Vec<ViolationSummary> {
             severity,
         })
         .collect();
-    summaries.sort_by(|a, b| b.count.cmp(&a.count));
+    summaries.sort_by_key(|b| std::cmp::Reverse(b.count));
     summaries
 }
 
@@ -92,7 +92,7 @@ fn derive_signals(events: &[Event]) -> Vec<SignalSummary> {
             last_detected,
         })
         .collect();
-    summaries.sort_by(|a, b| b.count.cmp(&a.count));
+    summaries.sort_by_key(|b| std::cmp::Reverse(b.count));
     summaries
 }
 
