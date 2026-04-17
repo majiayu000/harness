@@ -43,8 +43,10 @@ impl Scheduler {
         });
 
         let review_config = state.core.server.config.review.clone();
+        let retry_config = state.core.server.config.retry_scheduler.clone();
         crate::self_evolution::start(state.clone(), self.self_evolution_interval);
-        crate::periodic_reviewer::start(state, review_config);
+        crate::periodic_reviewer::start(state.clone(), review_config);
+        crate::periodic_retry::start(state, retry_config);
     }
 
     async fn run_health_tick(state: &AppState) -> anyhow::Result<()> {

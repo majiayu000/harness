@@ -116,12 +116,15 @@ impl EventStore {
         let mut total_deleted: u64 = 0;
 
         // Phase 1: delete regular (non-watermark) events older than the
-        // retention window.
+        // retention window.  Both periodic_review:* and periodic_retry:* hooks
+        // are spared so their watermark/attempt history survives purges.
         loop {
             let result = sqlx::query(
                 "DELETE FROM events WHERE id IN (
                     SELECT id FROM events
-                    WHERE ts < ? AND hook NOT GLOB 'periodic_review:*'
+                    WHERE ts < ?
+                      AND hook NOT GLOB 'periodic_review:*'
+                      AND hook NOT GLOB 'periodic_retry:*'
                     LIMIT 500
                 )",
             )
@@ -139,11 +142,12 @@ impl EventStore {
         }
 
         // Phase 2: trim watermark history — keep only the newest row per hook.
+        // Covers both periodic_review:* and periodic_retry:* watermarks.
         loop {
             let result = sqlx::query(
                 "DELETE FROM events WHERE id IN (
                     SELECT e.id FROM events e
-                    WHERE e.hook GLOB 'periodic_review:*'
+                    WHERE (e.hook GLOB 'periodic_review:*' OR e.hook GLOB 'periodic_retry:*')
                     AND e.ts < (
                         SELECT MAX(e2.ts) FROM events e2 WHERE e2.hook = e.hook
                     )
@@ -531,6 +535,38 @@ impl EventStore {
             if let Err(e) = self.log(&evt).await {
                 tracing::warn!("failed to log auto_fix_attempt event: {e}");
             }
+        }
+    }
+
+    /// Emit a `periodic_retry:summary` event recording one scheduler tick's outcome.
+    ///
+    /// `checked`  — total stalled tasks evaluated this tick.
+    /// `retried`  — tasks successfully re-enqueued.
+    /// `stuck`    — tasks that hit the retry cap and were labelled `harness:stuck`.
+    /// `skipped`  — tasks skipped due to cooldown or other reasons.
+    pub async fn persist_retry_summary(
+        &self,
+        checked: u32,
+        retried: u32,
+        stuck: u32,
+        skipped: u32,
+    ) {
+        let decision = if stuck > 0 {
+            Decision::Warn
+        } else {
+            Decision::Pass
+        };
+        let mut event = Event::new(
+            SessionId::new(),
+            "periodic_retry:summary",
+            "RetryScheduler",
+            decision,
+        );
+        event.detail = Some(format!(
+            r#"{{"checked":{checked},"retried":{retried},"stuck":{stuck},"skipped":{skipped}}}"#
+        ));
+        if let Err(e) = self.log(&event).await {
+            tracing::warn!("periodic_retry: failed to log summary event: {e}");
         }
     }
 

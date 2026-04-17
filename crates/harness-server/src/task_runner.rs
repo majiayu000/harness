@@ -879,6 +879,16 @@ impl TaskStore {
         }
     }
 
+    /// Return tasks that are in an active status and have not been updated for
+    /// at least `stale_threshold`.  Delegates to [`TaskDb::list_stalled_tasks`].
+    pub async fn list_stalled_tasks(
+        &self,
+        stale_threshold: std::time::Duration,
+        project: Option<&str>,
+    ) -> anyhow::Result<Vec<TaskState>> {
+        self.db.list_stalled_tasks(stale_threshold, project).await
+    }
+
     /// Return IDs of terminal tasks (Done, Failed, Cancelled) directly from the database.
     ///
     /// Used during startup for worktree cleanup. Only fetches task IDs to avoid
