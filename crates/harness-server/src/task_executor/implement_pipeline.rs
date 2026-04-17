@@ -508,6 +508,12 @@ pub(crate) async fn run_implement_phase(
         // session, abort immediately. This prevents the task from pushing commits to the
         // wrong PR (issue #799).
         if contains_worktree_collision_sentinel(&output) {
+            // If the agent already pushed to a PR before we detected the collision,
+            // capture the URL so there is a tracked handle for cleanup.
+            let collision_pr_url = match parse_implementation_outcome(&output) {
+                ImplementationOutcome::ParsedPr { pr_url, .. } => pr_url,
+                _ => None,
+            };
             tracing::error!(
                 task_id = %task_id,
                 "WorktreeCollision: agent observed stale worktree; aborting task"
@@ -515,6 +521,7 @@ pub(crate) async fn run_implement_phase(
             mutate_and_persist(store, task_id, |s| {
                 s.status = TaskStatus::Failed;
                 s.turn = 1;
+                s.pr_url = collision_pr_url.clone();
                 s.error = Some(
                     "WorktreeCollision: agent observed worktree managed by another harness session"
                         .into(),
@@ -536,7 +543,7 @@ pub(crate) async fn run_implement_phase(
                 task_id = %task_id,
                 status = "failed",
                 turns = 1,
-                pr_url = tracing::field::Empty,
+                pr_url = ?collision_pr_url,
                 total_elapsed_secs = task_start.elapsed().as_secs(),
                 "task_completed"
             );

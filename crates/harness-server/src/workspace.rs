@@ -96,10 +96,20 @@ impl WorkspaceManager {
         }
 
         // Stale-state guard: if the workspace directory already exists on disk but was
-        // not tracked as active (Occupied path above), a previous failed task left it
-        // behind without cleanup. Reject immediately so this task cannot silently inherit
-        // a stale branch or push commits to the wrong PR.
+        // not tracked as active (Occupied path above), check whether it is this task's
+        // own worktree left behind by a server crash (recovery path) or a truly foreign
+        // worktree (collision path).
         if workspace_path.exists() {
+            let expected_branch = format!("harness/{}", task_id.0);
+            if is_worktree_on_branch(&workspace_path, &expected_branch).await {
+                // Recovery: same task's worktree survived a crash — re-register and reuse.
+                tracing::info!(
+                    task_id = %task_id.0,
+                    path = ?workspace_path,
+                    "workspace recovery: re-using existing worktree from previous run"
+                );
+                return Ok(workspace_path);
+            }
             self.active.remove(task_id);
             anyhow::bail!(
                 "WorktreeCollision: workspace path {:?} already exists on disk for task {}; \
@@ -346,6 +356,26 @@ fn sanitize_task_id(id: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Returns true when the git worktree at `path` is currently on `branch`.
+/// Used to distinguish crash-recovery (same task's worktree) from a true collision.
+async fn is_worktree_on_branch(path: &Path, branch: &str) -> bool {
+    git_command()
+        .args([
+            "-C",
+            &path.to_string_lossy(),
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+        ])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|b| b.trim() == branch)
+        .unwrap_or(false)
 }
 
 async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {

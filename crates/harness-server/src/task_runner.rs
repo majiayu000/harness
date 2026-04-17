@@ -42,7 +42,7 @@ pub enum TaskPhase {
     Terminal,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
@@ -2101,7 +2101,13 @@ where
         // tasks (the root cause of cross-task PR pollution, issue #799).
         // On success: respect auto_cleanup so users can inspect the worktree post-run.
         if let Some(wmgr) = workspace_mgr {
-            if task_result.is_err() || wmgr.config.auto_cleanup {
+            // Also force cleanup when the task ended with Failed status even though the
+            // executor returned Ok(()) — the worktree-collision path sets TaskStatus::Failed
+            // then returns Ok(ImplementOutcome::Done) so task_result.is_err() is false.
+            let task_is_failed = store
+                .get(&id)
+                .is_some_and(|s| s.status == TaskStatus::Failed);
+            if task_result.is_err() || task_is_failed || wmgr.config.auto_cleanup {
                 if let Err(e) = wmgr.remove_workspace(&id).await {
                     tracing::warn!("workspace cleanup failed for {id:?}: {e}");
                 }
