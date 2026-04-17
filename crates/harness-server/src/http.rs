@@ -759,6 +759,34 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                             settings.apply_to_req(&mut req);
                         }
 
+                        // Guard: prompt-only tasks store their prompt in memory only
+                        // (#[serde(skip)]). After a server restart the prompt field is
+                        // absent. If no issue/pr is present either, dispatching would
+                        // call implement_from_prompt("") — a silent mis-execution.
+                        // Fail the task explicitly so the caller can re-submit.
+                        if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
+                            let reason = "dep-watcher: prompt-only task has no persisted \
+                                prompt after server restart; please re-submit the task"
+                                .to_string();
+                            tracing::error!(task_id = ?task.id, "{reason}");
+                            if let Err(pe) = task_runner::mutate_and_persist(
+                                &state.core.tasks,
+                                &task.id,
+                                move |s| {
+                                    s.status = task_runner::TaskStatus::Failed;
+                                    s.error = Some(reason);
+                                },
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    task_id = ?task.id,
+                                    "dep-watcher: failed to persist failed status: {pe}"
+                                );
+                            }
+                            return;
+                        }
+
                         let permit = match state
                             .concurrency
                             .task_queue

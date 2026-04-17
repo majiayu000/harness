@@ -2264,7 +2264,8 @@ pub async fn spawn_task_awaiting_deps(
 /// the caller so that status transitions survive a process restart.
 pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>) {
     let mut ready = Vec::new();
-    let mut failed_deps: Vec<(TaskId, TaskId)> = Vec::new();
+    // (task_id, dep_id, dep_terminal_status_label) — label is "failed" or "cancelled".
+    let mut failed_deps: Vec<(TaskId, TaskId, &'static str)> = Vec::new();
 
     // Snapshot AwaitingDeps tasks from cache before async work.
     let awaiting: Vec<(TaskId, Vec<TaskId>)> = store
@@ -2283,24 +2284,28 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
     for (task_id, depends_on) in awaiting {
         // Single pass: one DB lookup per dep (cache-first, then lightweight
         // `SELECT status` — no `rounds` JSON decode).
-        let mut failed_dep_id = None;
+        let mut failed_dep_id: Option<(TaskId, &'static str)> = None;
         let mut all_done = true;
         for dep_id in &depends_on {
             match store.dep_status(dep_id).await {
                 Some(TaskStatus::Failed) => {
-                    failed_dep_id = Some(dep_id.clone());
+                    failed_dep_id = Some((dep_id.clone(), "failed"));
                     break; // fail-fast — no need to inspect remaining deps
+                }
+                Some(TaskStatus::Cancelled) => {
+                    failed_dep_id = Some((dep_id.clone(), "cancelled"));
+                    break; // cancelled dep is also terminal — dependents cannot proceed
                 }
                 Some(TaskStatus::Done) => {} // this dep is satisfied
                 _ => {
                     // Pending, Implementing, or unknown — not ready yet.
-                    // Keep scanning in case a later dep is Failed.
+                    // Keep scanning in case a later dep is Failed or Cancelled.
                     all_done = false;
                 }
             }
         }
-        if let Some(fd) = failed_dep_id {
-            failed_deps.push((task_id, fd));
+        if let Some((fd, label)) = failed_dep_id {
+            failed_deps.push((task_id, fd, label));
             continue;
         }
         if all_done {
@@ -2309,13 +2314,13 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
     }
 
     let mut newly_failed: Vec<TaskId> = Vec::new();
-    for (task_id, failed_dep_id) in &failed_deps {
+    for (task_id, failed_dep_id, label) in &failed_deps {
         if let Some(mut entry) = store.cache.get_mut(task_id) {
             // Only overwrite if the task is still AwaitingDeps — a concurrent
             // cancel or status transition must not be clobbered.
             if matches!(entry.status, TaskStatus::AwaitingDeps) {
                 entry.status = TaskStatus::Failed;
-                entry.error = Some(format!("dependency {} failed", failed_dep_id.0));
+                entry.error = Some(format!("dependency {} {}", failed_dep_id.0, label));
                 newly_failed.push(task_id.clone());
             }
         }
@@ -3549,6 +3554,43 @@ mod tests {
             matches!(state.status, TaskStatus::AwaitingDeps),
             "expected AwaitingDeps with partial deps, got {:?}",
             state.status
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_awaiting_cancelled_dep_transitions_to_failed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let dep_id = tid("dep-cancelled");
+        let mut dep = TaskState::new(dep_id.clone());
+        dep.status = TaskStatus::Cancelled;
+        store.insert(&dep).await;
+
+        let task_id = tid("awaiting-task");
+        let mut task = TaskState::new(task_id.clone());
+        task.status = TaskStatus::AwaitingDeps;
+        task.depends_on = vec![dep_id.clone()];
+        store.insert(&task).await;
+
+        let (ready, failed) = check_awaiting_deps(&store).await;
+        assert!(ready.is_empty(), "expected no ready tasks");
+        assert!(
+            failed.contains(&task_id),
+            "expected task in failed_ids when dep is Cancelled"
+        );
+
+        let state = store.get(&task_id).expect("task should still be in store");
+        assert!(
+            matches!(state.status, TaskStatus::Failed),
+            "expected Failed after dep cancelled, got {:?}",
+            state.status
+        );
+        assert!(
+            state.error.as_deref().unwrap_or("").contains("cancelled"),
+            "error message should mention 'cancelled', got: {:?}",
+            state.error
         );
         Ok(())
     }
