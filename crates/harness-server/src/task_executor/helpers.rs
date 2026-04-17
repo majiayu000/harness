@@ -506,6 +506,39 @@ pub(crate) async fn persist_artifact(
         .await;
 }
 
+/// Scan `output_slice` for a `CREATED_ISSUE=` sentinel and, when a new issue
+/// number is found, write it to the database via [`TaskStore::overwrite_external_id_auto_fix`].
+///
+/// Deduplicates writes using `last_backfilled_issue` so each distinct issue
+/// number causes exactly one DB write ("last sentinel wins" semantics are
+/// preserved by the caller choosing which slice to pass).
+async fn backfill_issue_if_found(
+    output_slice: &str,
+    last_backfilled_issue: &mut Option<u64>,
+    store: &TaskStore,
+    task_id: &TaskId,
+) {
+    if let Some(issue_num) = prompts::parse_created_issue_number(output_slice) {
+        if Some(issue_num) != *last_backfilled_issue {
+            let eid = format!("issue:{issue_num}");
+            match store.overwrite_external_id_auto_fix(task_id, &eid).await {
+                Ok(()) => {
+                    tracing::info!(
+                        task_id = %task_id,
+                        external_id = %eid,
+                        "streaming: backfilled external_id for auto-fix task"
+                    );
+                    *last_backfilled_issue = Some(issue_num);
+                }
+                Err(e) => tracing::warn!(
+                    task_id = %task_id,
+                    "streaming: failed to backfill external_id: {e}"
+                ),
+            }
+        }
+    }
+}
+
 /// Execute an agent request via [`CodeAgent::execute_stream`], broadcasting
 /// each [`StreamItem`] to the per-task channel in real time, and reconstruct
 /// an [`AgentResponse`] from the collected stream events.
@@ -581,32 +614,13 @@ pub(crate) async fn run_agent_streaming(
                                     // does not produce a spurious partial value.
                                     let complete_len =
                                         output.rfind('\n').map(|i| i + 1).unwrap_or(0);
-                                    if let Some(issue_num) =
-                                        prompts::parse_created_issue_number(
-                                            &output[..complete_len],
-                                        )
-                                    {
-                                        if Some(issue_num) != last_backfilled_issue {
-                                            let eid = format!("issue:{issue_num}");
-                                            match store
-                                                .overwrite_external_id_auto_fix(task_id, &eid)
-                                                .await
-                                            {
-                                                Ok(()) => {
-                                                    tracing::info!(
-                                                        task_id = %task_id,
-                                                        external_id = %eid,
-                                                        "streaming: backfilled external_id for auto-fix task"
-                                                    );
-                                                    last_backfilled_issue = Some(issue_num);
-                                                }
-                                                Err(e) => tracing::warn!(
-                                                    task_id = %task_id,
-                                                    "streaming: failed to backfill external_id: {e}"
-                                                ),
-                                            }
-                                        }
-                                    }
+                                    backfill_issue_if_found(
+                                        &output[..complete_len],
+                                        &mut last_backfilled_issue,
+                                        store,
+                                        task_id,
+                                    )
+                                    .await;
                                 }
                             }
                             StreamItem::ItemCompleted {
@@ -626,30 +640,13 @@ pub(crate) async fn run_agent_streaming(
                                 // happens before the post-execution path runs (closes
                                 // the webhook race for these adapters too).
                                 if is_auto_fix_task {
-                                    if let Some(issue_num) =
-                                        prompts::parse_created_issue_number(&output)
-                                    {
-                                        if Some(issue_num) != last_backfilled_issue {
-                                            let eid = format!("issue:{issue_num}");
-                                            match store
-                                                .overwrite_external_id_auto_fix(task_id, &eid)
-                                                .await
-                                            {
-                                                Ok(()) => {
-                                                    tracing::info!(
-                                                        task_id = %task_id,
-                                                        external_id = %eid,
-                                                        "streaming: backfilled external_id for auto-fix task"
-                                                    );
-                                                    last_backfilled_issue = Some(issue_num);
-                                                }
-                                                Err(e) => tracing::warn!(
-                                                    task_id = %task_id,
-                                                    "streaming: failed to backfill external_id: {e}"
-                                                ),
-                                            }
-                                        }
-                                    }
+                                    backfill_issue_if_found(
+                                        &output,
+                                        &mut last_backfilled_issue,
+                                        store,
+                                        task_id,
+                                    )
+                                    .await;
                                 }
                             }
                             StreamItem::ItemCompleted { item: completed_item } => {

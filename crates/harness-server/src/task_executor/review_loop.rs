@@ -13,6 +13,19 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration, Instant};
 
+/// Returns `true` when the trailing three entries of `counts` are all `Some`
+/// and the issue count is not decreasing (`c >= a && c >= b`).
+///
+/// Used to detect convergence failure in the review loop so the caller can
+/// switch to impasse (critical-only) mode.
+fn issue_count_not_decreasing(counts: &[Option<u32>]) -> bool {
+    if counts.len() < 3 {
+        return false;
+    }
+    let tail = &counts[counts.len() - 3..];
+    matches!(tail, [Some(a), Some(b), Some(c)] if c >= a && c >= b)
+}
+
 /// Execute the external review bot wait loop.
 ///
 /// Polls the PR for review bot feedback, handles LGTM/FIXED/WAITING responses,
@@ -247,18 +260,16 @@ pub(crate) async fn run_review_loop(
 
         // Convergence check: if the last 3 rounds all reported issues and the
         // count is not decreasing, enter impasse mode (critical-only fixes).
-        if issue_counts.len() >= 3 && !impasse {
+        if !impasse && issue_count_not_decreasing(&issue_counts) {
+            impasse = true;
             let tail = &issue_counts[issue_counts.len() - 3..];
             if let [Some(a), Some(b), Some(c)] = tail {
-                if c >= a && c >= b {
-                    impasse = true;
-                    tracing::warn!(
-                        task_id = %task_id,
-                        round,
-                        issues = %format_args!("[{a}, {b}, {c}]"),
-                        "review loop impasse detected: issue count not decreasing"
-                    );
-                }
+                tracing::warn!(
+                    task_id = %task_id,
+                    round,
+                    issues = %format_args!("[{a}, {b}, {c}]"),
+                    "review loop impasse detected: issue count not decreasing"
+                );
             }
         }
 

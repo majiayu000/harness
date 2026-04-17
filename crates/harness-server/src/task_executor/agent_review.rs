@@ -238,12 +238,16 @@ pub(crate) async fn run_agent_review(
         };
         impasse_tracker = Some((normalized, consecutive_count));
 
-        // 5 consecutive rounds with identical issues → mark task as Failed immediately.
-        if consecutive_count >= 5 {
+        // Hard-fail after this many consecutive identical-issue rounds.
+        const IMPASSE_HARD_FAIL_ROUNDS: u32 = 5;
+        // Switch to intervention prompt after this many consecutive identical-issue rounds.
+        const IMPASSE_INTERVENTION_ROUNDS: u32 = 3;
+
+        if consecutive_count >= IMPASSE_HARD_FAIL_ROUNDS {
             tracing::warn!(
                 agent_round,
                 consecutive_count,
-                "agent review impasse: same issues repeated 5 times — marking task as failed"
+                "agent review impasse: same issues repeated {IMPASSE_HARD_FAIL_ROUNDS} times — marking task as failed"
             );
             mutate_and_persist(store, task_id, |s| {
                 s.status = TaskStatus::Failed;
@@ -256,7 +260,7 @@ pub(crate) async fn run_agent_review(
         }
 
         // 3+ consecutive rounds with identical issues → use the intervention prompt.
-        let is_impasse = consecutive_count >= 3;
+        let is_impasse = consecutive_count >= IMPASSE_INTERVENTION_ROUNDS;
         if is_impasse {
             tracing::warn!(
                 agent_round,
