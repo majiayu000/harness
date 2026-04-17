@@ -119,23 +119,31 @@ async fn run_retry_tick(
         }
 
         if attempt_count < config.max_retries {
-            // Emit attempt watermark event before enqueuing so that a
-            // scheduler crash between the two does not cause a silent retry
-            // without an event record.
-            let session_id = SessionId::new();
-            let mut attempt_event =
-                Event::new(session_id, &attempt_hook, "RetryScheduler", Decision::Pass);
-            attempt_event.reason = Some(format!(
-                "attempt {}/{}",
-                attempt_count + 1,
-                config.max_retries
-            ));
-            attempt_event.detail = Some(task.id.0.clone());
-            if let Err(e) = state.observability.events.log(&attempt_event).await {
+            // Validate that the external_id is parseable before any destructive
+            // operation so a legacy or malformed ID cannot burn all retry attempts
+            // without ever producing a successor task.
+            let (issue_num, pr_num) = parse_external_id(task.external_id.as_deref());
+            if issue_num.is_none() && pr_num.is_none() {
                 tracing::warn!(
                     task_id = %task.id.0,
-                    "periodic_retry: failed to log attempt event: {e}"
+                    external_id = ?task.external_id,
+                    "periodic_retry: external_id is not parseable as issue/pr; \
+                     cancelling task without consuming a retry counter"
                 );
+                if let Err(e) = mutate_and_persist(&state.core.tasks, &task.id, |s| {
+                    s.status = TaskStatus::Cancelled;
+                })
+                .await
+                {
+                    tracing::warn!(
+                        task_id = %task.id.0,
+                        "periodic_retry: failed to cancel unparseable task: {e}"
+                    );
+                } else {
+                    state.core.tasks.abort_task(&task.id);
+                }
+                stuck += 1;
+                continue;
             }
 
             // Capture original status so we can restore it if enqueue fails.
@@ -157,9 +165,10 @@ async fn run_retry_tick(
             }
             state.core.tasks.abort_task(&task.id);
 
-            let (issue_num, pr_num) = parse_external_id(task.external_id.as_deref());
-
-            let req = CreateTaskRequest {
+            // Restore original execution limits so the retry honours the same
+            // agent, budgets, timeouts, and prompt context as the original
+            // request rather than silently falling back to server defaults.
+            let mut req = CreateTaskRequest {
                 issue: issue_num,
                 pr: pr_num,
                 repo: task.repo.clone(),
@@ -173,9 +182,29 @@ async fn run_retry_tick(
                 project: task.project_root.clone(),
                 ..CreateTaskRequest::default()
             };
+            if let Some(settings) = &task.request_settings {
+                settings.apply_to_req(&mut req);
+            }
 
             match task_routes::enqueue_task(state, req).await {
                 Ok(new_id) => {
+                    // Emit attempt watermark only after confirmed enqueue so that
+                    // a transient enqueue failure does not consume a retry counter.
+                    let session_id = SessionId::new();
+                    let mut attempt_event =
+                        Event::new(session_id, &attempt_hook, "RetryScheduler", Decision::Pass);
+                    attempt_event.reason = Some(format!(
+                        "attempt {}/{}",
+                        attempt_count + 1,
+                        config.max_retries
+                    ));
+                    attempt_event.detail = Some(new_id.to_string());
+                    if let Err(e) = state.observability.events.log(&attempt_event).await {
+                        tracing::warn!(
+                            task_id = %task.id.0,
+                            "periodic_retry: failed to log attempt event: {e}"
+                        );
+                    }
                     tracing::info!(
                         new_task_id = %new_id,
                         stalled_task_id = %task.id.0,
