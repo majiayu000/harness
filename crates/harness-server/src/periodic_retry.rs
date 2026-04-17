@@ -1,6 +1,6 @@
 use crate::http::task_routes;
 use crate::http::AppState;
-use crate::task_runner::CreateTaskRequest;
+use crate::task_runner::{mutate_and_persist, CreateTaskRequest, TaskStatus};
 use chrono::Utc;
 use harness_core::{
     config::misc::RetrySchedulerConfig,
@@ -9,6 +9,20 @@ use harness_core::{
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
+
+/// Parse a canonical `external_id` into `(issue_num, pr_num)`.
+fn parse_external_id(external_id: Option<&str>) -> (Option<u64>, Option<u64>) {
+    match external_id {
+        Some(eid) if eid.starts_with("issue:") => (
+            eid.strip_prefix("issue:").and_then(|s| s.parse().ok()),
+            None,
+        ),
+        Some(eid) if eid.starts_with("pr:") => {
+            (None, eid.strip_prefix("pr:").and_then(|s| s.parse().ok()))
+        }
+        _ => (None, None),
+    }
+}
 
 /// Spawn the periodic retry loop as a background task.
 ///
@@ -111,14 +125,27 @@ async fn run_retry_tick(
                 );
             }
 
-            let issue_num = task
-                .external_id
-                .as_deref()
-                .and_then(|eid| eid.strip_prefix("issue:"))
-                .and_then(|s| s.parse::<u64>().ok());
+            // Cancel the stalled task before re-enqueuing so the active-task
+            // dedup in enqueue_task does not find it and return the same ID
+            // instead of creating a new successor.
+            if let Err(e) = mutate_and_persist(&state.core.tasks, &task.id, |s| {
+                s.status = TaskStatus::Cancelled;
+            })
+            .await
+            {
+                tracing::warn!(
+                    task_id = %task.id.0,
+                    "periodic_retry: failed to cancel stalled task before retry: {e}; skipping"
+                );
+                continue;
+            }
+            state.core.tasks.abort_task(&task.id);
+
+            let (issue_num, pr_num) = parse_external_id(task.external_id.as_deref());
 
             let req = CreateTaskRequest {
                 issue: issue_num,
+                pr: pr_num,
                 repo: task.repo.clone(),
                 source: Some("periodic-retry".to_string()),
                 project: task.project_root.clone(),
@@ -144,9 +171,33 @@ async fn run_retry_tick(
                 }
             }
         } else {
-            // Retry cap reached — emit stuck event and ask an agent to apply label.
-            let session_id = SessionId::new();
+            // Retry cap reached.
             let stuck_hook = format!("periodic_retry:stuck:{}", task.id.0);
+
+            // Once-only guard: if we already emitted a stuck event for this
+            // task, skip re-escalation — prompt-only tasks have no external_id
+            // so the normal dedup path would not stop duplicates.
+            let prior_stuck = state
+                .observability
+                .events
+                .query(&EventFilters {
+                    hook: Some(stuck_hook.clone()),
+                    ..EventFilters::default()
+                })
+                .await
+                .unwrap_or_default();
+
+            if !prior_stuck.is_empty() {
+                tracing::debug!(
+                    task_id = %task.id.0,
+                    "periodic_retry: already escalated as stuck, skipping duplicate"
+                );
+                stuck += 1;
+                continue;
+            }
+
+            // Emit stuck event and ask an agent to apply label.
+            let session_id = SessionId::new();
             let mut stuck_event =
                 Event::new(session_id, &stuck_hook, "RetryScheduler", Decision::Warn);
             stuck_event.reason = Some(format!(
@@ -163,18 +214,23 @@ async fn run_retry_tick(
 
             // Enqueue an agent task to apply the harness:stuck label.
             // Direct gh calls are forbidden inside harness crates (CLAUDE.md).
-            if let Some(issue_num) = task
-                .external_id
-                .as_deref()
-                .and_then(|eid| eid.strip_prefix("issue:"))
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                let prompt = format!(
-                    "Add the label `harness:stuck` to issue #{issue_num}. \
+            let (issue_num, pr_num) = parse_external_id(task.external_id.as_deref());
+            let stuck_prompt = match (issue_num, pr_num) {
+                (Some(n), _) => Some(format!(
+                    "Add the label `harness:stuck` to issue #{n}. \
                      This issue has reached the maximum automatic retry limit \
                      ({}/{}) and requires human attention.",
                     attempt_count, config.max_retries
-                );
+                )),
+                (_, Some(n)) => Some(format!(
+                    "Add the label `harness:stuck` to PR #{n}. \
+                     This pull request has reached the maximum automatic retry limit \
+                     ({}/{}) and requires human attention.",
+                    attempt_count, config.max_retries
+                )),
+                _ => None,
+            };
+            if let Some(prompt) = stuck_prompt {
                 let req = CreateTaskRequest {
                     prompt: Some(prompt),
                     repo: task.repo.clone(),
@@ -185,7 +241,6 @@ async fn run_retry_tick(
                 if let Err(e) = task_routes::enqueue_task(state, req).await {
                     tracing::warn!(
                         task_id = %task.id.0,
-                        issue = issue_num,
                         "periodic_retry: failed to enqueue stuck-label task: {e}"
                     );
                 }
