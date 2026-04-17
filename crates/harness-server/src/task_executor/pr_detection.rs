@@ -260,8 +260,15 @@ fn pr_claims_to_close_issue(item: &GhPrListItem, issue: u64) -> bool {
         item.body.to_ascii_lowercase()
     );
     let needle = format!("#{issue}");
-    // Scan each occurrence of `#N` and check the preceding token is a close keyword.
+    // Scan each occurrence of `#N` and check:
+    //   1. the preceding token is a close keyword, AND
+    //   2. the matched `#N` is not itself a prefix of a longer issue number
+    //      (e.g. scanning for `#79` must not match `#791`).
     for (idx, _) in haystack.match_indices(&needle) {
+        let after = &haystack[idx + needle.len()..];
+        if after.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            continue;
+        }
         let prefix = &haystack[..idx];
         // Skip trailing whitespace/punctuation between keyword and `#N`.
         let trimmed = prefix.trim_end_matches(|c: char| c.is_whitespace() || c == ':');
@@ -427,6 +434,22 @@ mod tests {
     fn title_suffix_for_other_issue_does_not_match() {
         let it = item("fix: something (#100)", "passing reference to #791");
         assert!(!pr_claims_to_close_issue(&it, 791));
+    }
+
+    #[test]
+    fn prefix_number_does_not_match_longer_issue() {
+        // Codex-flagged regression: scanning for `#79` must NOT match `#791`.
+        // A PR body "closes #791" claims to close issue 791, not issue 79.
+        let it = item("", "closes #791");
+        assert!(!pr_claims_to_close_issue(&it, 79));
+    }
+
+    #[test]
+    fn exact_issue_still_matches_even_when_prefix_of_another() {
+        // When asked about #79, a PR body that actually says "closes #79"
+        // (e.g. followed by space/punctuation, not another digit) must match.
+        let it = item("", "closes #79 and also mentions #791");
+        assert!(pr_claims_to_close_issue(&it, 79));
     }
 
     // --- word_boundary_before ---
