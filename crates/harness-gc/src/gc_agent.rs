@@ -306,6 +306,14 @@ impl GcAgent {
             .get(draft_id)?
             .ok_or_else(|| anyhow::anyhow!("draft not found"))?;
 
+        if draft.status != DraftStatus::Pending {
+            anyhow::bail!(
+                "cannot adopt draft {}: status is {:?}, expected Pending",
+                draft_id.0,
+                draft.status
+            );
+        }
+
         let canonical_root = self.project_root.canonicalize().with_context(|| {
             format!(
                 "failed to canonicalize project root '{}'",
@@ -368,6 +376,10 @@ impl GcAgent {
                     continue;
                 }
             };
+            if draft.status != DraftStatus::Pending {
+                tracing::debug!(draft_id = %id.0, status = ?draft.status, "auto_adopt: skipping non-Pending draft");
+                continue;
+            }
             if draft.signal.remediation != RemediationType::Rule {
                 continue;
             }
@@ -1046,5 +1058,68 @@ mod tests {
         assert!(artifacts[0].content.contains("fn full_content()"));
         // Content should be from the code block, not the diff header
         assert!(!artifacts[0].content.contains("+++ b/src/lib.rs"));
+    }
+
+    #[test]
+    fn adopt_rejected_draft_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let gc = make_test_gc_agent(dir.path());
+
+        let mut draft = test_draft(vec![]);
+        draft.status = DraftStatus::Rejected;
+        gc.draft_store.save(&draft).unwrap();
+
+        let err = gc.adopt(&draft.id).unwrap_err();
+        assert!(
+            err.to_string().contains("Rejected"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_adopt_skips_rejected() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let project_root = sandbox.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let signal_detector = SignalDetector::new(
+            crate::signal_detector::SignalThresholds::default(),
+            ProjectId::new(),
+        );
+        let draft_store = DraftStore::new(sandbox.path()).unwrap();
+        let gc = GcAgent::new(
+            GcConfig::default(),
+            signal_detector,
+            draft_store,
+            project_root.clone(),
+        );
+
+        let mut rejected = Draft {
+            signal: Signal::new(
+                SignalType::RepeatedWarn,
+                ProjectId::new(),
+                serde_json::json!({}),
+                RemediationType::Rule,
+            ),
+            ..test_draft(vec![Artifact {
+                artifact_type: ArtifactType::Rule,
+                target_path: PathBuf::from(".harness/generated/rules/rejected.md"),
+                content: "should not be written".into(),
+            }])
+        };
+        rejected.status = DraftStatus::Rejected;
+        gc.draft_store.save(&rejected).unwrap();
+
+        let adopted = gc.auto_adopt_matching(
+            std::slice::from_ref(&rejected.id),
+            AutoAdoptPolicy::RulesOnly,
+            ".harness/generated/",
+        );
+        assert!(adopted.is_empty(), "rejected draft should not be adopted");
+
+        let reloaded = gc.draft_store.get(&rejected.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, DraftStatus::Rejected);
+        assert!(!project_root
+            .join(".harness/generated/rules/rejected.md")
+            .exists());
     }
 }
