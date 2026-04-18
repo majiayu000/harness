@@ -192,7 +192,67 @@ pub enum AutoAdoptPolicy {
     RulesOnly,
 }
 
+/// Intermediate deserialization target for [`GcConfig`].
+///
+/// Handles backward compatibility for the legacy `auto_pr: bool` field that was
+/// superseded by `auto_adopt_policy: AutoAdoptPolicy`.  When `auto_pr = false`
+/// is present and `auto_adopt_policy` is absent, the effective policy becomes
+/// `Off`, preserving the operator's intent instead of silently defaulting to
+/// `RulesOnly`.
+#[derive(Deserialize)]
+struct GcConfigRaw {
+    pub max_drafts_per_run: usize,
+    pub budget_per_signal_usd: f64,
+    pub total_budget_usd: f64,
+    #[serde(default = "default_gc_adopt_wait_secs")]
+    pub adopt_wait_secs: u64,
+    #[serde(default = "default_gc_adopt_max_rounds")]
+    pub adopt_max_rounds: u32,
+    #[serde(default = "default_gc_adopt_turn_timeout_secs")]
+    pub adopt_turn_timeout_secs: u64,
+    #[serde(default = "default_gc_draft_ttl_hours")]
+    pub draft_ttl_hours: u64,
+    pub signal_thresholds: SignalThresholdsConfig,
+    #[serde(default = "default_auto_gc_grades")]
+    pub auto_gc_grades: Vec<Grade>,
+    #[serde(default = "default_auto_gc_cooldown_secs")]
+    pub auto_gc_cooldown_secs: u64,
+    /// New field — takes precedence over `auto_pr` when present.
+    #[serde(default)]
+    pub auto_adopt_policy: Option<AutoAdoptPolicy>,
+    /// Legacy field — superseded by `auto_adopt_policy`.
+    /// `false` maps to `Off`; `true` (or absent) maps to `RulesOnly`.
+    #[serde(default)]
+    pub auto_pr: Option<bool>,
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+impl From<GcConfigRaw> for GcConfig {
+    fn from(raw: GcConfigRaw) -> Self {
+        let auto_adopt_policy = raw.auto_adopt_policy.unwrap_or_else(|| match raw.auto_pr {
+            Some(false) => AutoAdoptPolicy::Off,
+            _ => AutoAdoptPolicy::default(),
+        });
+        Self {
+            max_drafts_per_run: raw.max_drafts_per_run,
+            budget_per_signal_usd: raw.budget_per_signal_usd,
+            total_budget_usd: raw.total_budget_usd,
+            adopt_wait_secs: raw.adopt_wait_secs,
+            adopt_max_rounds: raw.adopt_max_rounds,
+            adopt_turn_timeout_secs: raw.adopt_turn_timeout_secs,
+            draft_ttl_hours: raw.draft_ttl_hours,
+            signal_thresholds: raw.signal_thresholds,
+            auto_gc_grades: raw.auto_gc_grades,
+            auto_gc_cooldown_secs: raw.auto_gc_cooldown_secs,
+            auto_adopt_policy,
+            allowed_tools: raw.allowed_tools,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "GcConfigRaw")]
 pub struct GcConfig {
     pub max_drafts_per_run: usize,
     pub budget_per_signal_usd: f64,
