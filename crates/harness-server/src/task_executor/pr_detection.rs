@@ -258,6 +258,13 @@ pub(crate) async fn find_existing_pr_for_issue(
 fn pr_claims_to_close_issue(item: &GhPrListItem, issue: u64, repo_slug: Option<&str>) -> bool {
     let title = item.title.to_ascii_lowercase();
     let body = item.body.to_ascii_lowercase();
+    // Honor the `(#N)` trailing title suffix that older harness runs append to
+    // every PR they create. PRs opened before the `Closes #N` requirement was
+    // added to prompts carry only this suffix; without it they would escape
+    // detection and trigger a duplicate PR branch.
+    if title.trim_end().ends_with(&format!("(#{issue})")) {
+        return true;
+    }
     // Scan title and body independently so that a keyword at the end of the
     // title cannot be paired with `#N` at the start of the body.
     field_claims_to_close_issue(&title, issue, repo_slug)
@@ -381,13 +388,17 @@ pub(crate) fn parse_repo_slug_from_remote_url(url: &str) -> Option<String> {
     None
 }
 
-/// Detect the `"owner/repo"` slug by parsing the git remote URL.
+/// Detect the `"owner/repo"` slug by scanning all configured git remotes.
 ///
-/// Uses `git remote get-url <remote>` (pure git, no GitHub auth required).
+/// Uses `git remote -v` (pure git, no GitHub auth required). Prefers `origin`
+/// for stability but falls back to any other remote that has a recognisable
+/// GitHub URL. Trying every remote prevents silently disabling the cross-repo
+/// guard in repos or worktrees where the primary remote is named something
+/// other than `origin` (e.g. `upstream`, `fork`, or a CI-injected name).
 pub(crate) async fn detect_repo_slug(project: &Path) -> Option<String> {
     let output = Command::new("git")
         .current_dir(project)
-        .args(["remote", "get-url", "origin"])
+        .args(["remote", "-v"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -397,8 +408,34 @@ pub(crate) async fn detect_repo_slug(project: &Path) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    parse_repo_slug_from_remote_url(&url)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // `git remote -v` output: "<name>\t<url> (fetch)\n<name>\t<url> (push)\n…"
+    // Only inspect fetch lines to avoid processing each remote twice.
+    let mut fallback: Option<String> = None;
+    for line in stdout.lines() {
+        if !line.ends_with("(fetch)") {
+            continue;
+        }
+        let mut parts = line.splitn(2, '\t');
+        let name = match parts.next() {
+            Some(n) => n.trim(),
+            None => continue,
+        };
+        let rest = match parts.next() {
+            Some(r) => r,
+            None => continue,
+        };
+        let url = rest.trim_end_matches("(fetch)").trim();
+        if let Some(slug) = parse_repo_slug_from_remote_url(url) {
+            if name == "origin" {
+                return Some(slug);
+            }
+            if fallback.is_none() {
+                fallback = Some(slug);
+            }
+        }
+    }
+    fallback
 }
 
 #[cfg(test)]
@@ -418,13 +455,13 @@ mod tests {
     // --- pr_claims_to_close_issue: positive cases ---
 
     #[test]
-    fn title_suffix_alone_does_not_match() {
-        // The `(#N)` trailing suffix is no longer a trusted close signal:
-        // PR creation prompts do not contractually enforce this convention,
-        // so a manual PR titled "chore: cleanup (#791)" without any closing
-        // keyword must NOT be matched for issue 791.
+    fn title_suffix_alone_matches_for_backward_compat() {
+        // The `(#N)` trailing title suffix IS a trusted close signal for
+        // backward compat: older harness runs append it to every PR they open
+        // but do not add a `Closes #N` keyword to the body. Those still-open
+        // PRs must be detected so that a retry does not open a duplicate branch.
         let it = item("fix(dedup): guard against closed PRs (#791)", "");
-        assert!(!pr_claims_to_close_issue(&it, 791, None));
+        assert!(pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
