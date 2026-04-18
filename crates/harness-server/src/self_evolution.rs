@@ -20,13 +20,22 @@ pub(crate) struct SelfEvolutionReport {
 ///
 /// Each tick invokes the existing `learn_rules` + `learn_skills` pipeline and
 /// logs an aggregate `self_evolution_tick` event for observability.
+///
+/// The first tick runs immediately after startup (after a brief delay to let
+/// the rest of the server finish wiring up). Subsequent ticks wait `interval`
+/// between runs. This ensures the learning loop is observable on every restart
+/// instead of requiring the server to stay up for a full `interval` (24h by
+/// default) before producing any output.
 pub fn start(state: Arc<AppState>, interval: Duration) {
     tokio::spawn(async move {
+        // Small warm-up delay so AppState finishes initialization (event store
+        // migrations, skill discovery) before the first tick queries them.
+        sleep(Duration::from_secs(30)).await;
         loop {
-            sleep(interval).await;
             if let Err(err) = run_tick(&state).await {
                 tracing::error!("scheduler: periodic self-evolution tick failed: {err}");
             }
+            sleep(interval).await;
         }
     });
 }

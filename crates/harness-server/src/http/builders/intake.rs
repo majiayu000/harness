@@ -140,6 +140,8 @@ pub(crate) async fn build_intake(
             gc_cfg.auto_gc_grades.clone(),
             gc_cfg.auto_gc_cooldown_secs,
             challenger,
+            gc_cfg.auto_adopt,
+            gc_cfg.auto_adopt_path_prefix.clone(),
         ))
     };
 

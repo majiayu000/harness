@@ -1,5 +1,7 @@
 use crate::handlers::cross_review::run_cross_review;
+use chrono::{Duration as ChronoDuration, Utc};
 use harness_core::agent::CodeAgent;
+use harness_core::config::misc::AutoAdoptPolicy;
 use harness_core::types::{Capability, EventFilters, Grade, Project};
 use harness_gc::gc_agent::GcAgent;
 use harness_observe::event_store::EventStore;
@@ -7,6 +9,13 @@ use harness_observe::quality::QualityGrader;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Time window used to grade post-task quality. The grader denominator is the
+/// count of events in this window, so a smaller window gives recent failures
+/// proportionally more weight. Grading against the lifetime event log (the
+/// previous behavior) drowned out single-task failures in thousands of older
+/// pass events and pinned every task at Grade::A regardless of outcome.
+const QUALITY_WINDOW_HOURS: i64 = 1;
 
 pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -32,9 +41,12 @@ pub struct QualityTrigger {
     cooldown_secs: u64,
     pub(crate) last_triggered: Arc<AtomicU64>,
     challenger_agent: Option<Arc<dyn CodeAgent>>,
+    auto_adopt: AutoAdoptPolicy,
+    auto_adopt_path_prefix: String,
 }
 
 impl QualityTrigger {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         events: Arc<EventStore>,
         gc_agent: Arc<GcAgent>,
@@ -43,6 +55,8 @@ impl QualityTrigger {
         auto_gc_grades: Vec<Grade>,
         cooldown_secs: u64,
         challenger_agent: Option<Arc<dyn CodeAgent>>,
+        auto_adopt: AutoAdoptPolicy,
+        auto_adopt_path_prefix: String,
     ) -> Self {
         Self {
             events,
@@ -53,6 +67,8 @@ impl QualityTrigger {
             cooldown_secs,
             last_triggered: Arc::new(AtomicU64::new(0)),
             challenger_agent,
+            auto_adopt,
+            auto_adopt_path_prefix,
         }
     }
 
@@ -80,7 +96,15 @@ impl QualityTrigger {
     /// Grade recent events, run optional cross-review, log the result, and
     /// auto-trigger GC if warranted.
     pub async fn check_and_maybe_trigger(&self, task_ctx: Option<&TaskReviewContext>) {
-        let events = match self.events.query(&EventFilters::default()).await {
+        // Grade only events from the recent window so that a single task's
+        // failures affect the grade rather than being averaged over lifetime
+        // history. See `QUALITY_WINDOW_HOURS` docstring.
+        let since = Utc::now() - ChronoDuration::hours(QUALITY_WINDOW_HOURS);
+        let filters = EventFilters {
+            since: Some(since),
+            ..EventFilters::default()
+        };
+        let events = match self.events.query(&filters).await {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!("quality_trigger: failed to query events: {e}");
@@ -88,7 +112,22 @@ impl QualityTrigger {
             }
         };
 
-        let mut report = QualityGrader::grade(&events, 0);
+        // Pull the most recent rule_scan violation count from the same window
+        // so the grader's coverage dimension reflects reality. Previously this
+        // was hard-coded to 0, which locked coverage at 100%.
+        let violation_count = events
+            .iter()
+            .filter(|e| e.hook == "rule_scan")
+            .filter_map(|e| {
+                e.reason
+                    .as_deref()
+                    .and_then(|r| r.strip_prefix("violations="))
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
+            .next_back()
+            .unwrap_or(0);
+
+        let mut report = QualityGrader::grade(&events, violation_count);
 
         // Cross-review gate: skip if no challenger, no task context, or grade=A.
         if let (Some(challenger), Some(ctx)) = (&self.challenger_agent, task_ctx) {
@@ -244,12 +283,31 @@ impl QualityTrigger {
             return;
         };
         let project = Project::from_path(self.project_root.clone());
-        if let Err(e) = self
+        match self
             .gc_agent
             .run(&project, &events, &[], agent.as_ref())
             .await
         {
-            tracing::warn!("quality_trigger: gc_agent.run failed: {e}");
+            Ok(report) => {
+                if !matches!(self.auto_adopt, AutoAdoptPolicy::Off) && !report.draft_ids.is_empty()
+                {
+                    let adopted = self.gc_agent.auto_adopt_matching(
+                        &report.draft_ids,
+                        self.auto_adopt,
+                        &self.auto_adopt_path_prefix,
+                    );
+                    if !adopted.is_empty() {
+                        tracing::info!(
+                            adopted_count = adopted.len(),
+                            path_prefix = %self.auto_adopt_path_prefix,
+                            "quality_trigger: auto-adopted GC drafts"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("quality_trigger: gc_agent.run failed: {e}");
+            }
         }
     }
 }
