@@ -11,7 +11,7 @@ use crate::http::AppState;
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Duration, Timelike, Utc};
 use harness_core::types::{Decision, Event, EventFilters};
-use harness_observe::{quality::QualityGrader, stats};
+use harness_observe::quality::QualityGrader;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,7 +30,14 @@ const FEED_LIMIT: usize = 40;
 /// GET /api/overview — JSON payload driving the system overview page.
 pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
     let now = Utc::now();
-    let since_dt = now - Duration::hours(OVERVIEW_WINDOW_HOURS);
+    // Snap the query window to the start of the oldest bucket on the hour
+    // axis so that SQL rows and JS buckets agree. Without this, tasks
+    // completed in the partial "now - 24h .. oldest-bucket-start" slice are
+    // counted in the global `merged_24h` KPI but dropped when their
+    // `strftime('%H:00:00Z')` hour key falls outside the axis, which makes
+    // per-project sums understate the KPI for every request that is not
+    // exactly on the hour.
+    let since_dt = window_start(now);
     let since = since_dt.to_rfc3339();
 
     // ---- global task queue counts (reuse existing services) ----
@@ -238,21 +245,30 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
     (StatusCode::OK, Json(body))
 }
 
+/// Start of the oldest bucket on the hour axis. Shared by the SQL `since`
+/// filter and [`build_hour_axis`] so the two views align.
+fn window_start(now: DateTime<Utc>) -> DateTime<Utc> {
+    hour_top(now) - Duration::hours((THROUGHPUT_BUCKETS as i64) - 1)
+}
+
+/// Top of the current hour (i.e. `HH:00:00Z`). Falls back to `now` on the
+/// near-impossible DST-style failure of `with_minute(0)`.
+fn hour_top(now: DateTime<Utc>) -> DateTime<Utc> {
+    now.with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(now)
+}
+
 /// Build an ISO-8601 hour axis covering the last [`THROUGHPUT_BUCKETS`] hours
 /// ending at `now`, oldest first. Each element matches the format produced by
 /// `TaskDb::done_per_project_hour_since` so the two can be joined by string
 /// equality.
 fn build_hour_axis(now: DateTime<Utc>) -> Vec<String> {
-    let Some(hour_top) = now
-        .with_minute(0)
-        .and_then(|t| t.with_second(0))
-        .and_then(|t| t.with_nanosecond(0))
-    else {
-        return Vec::new();
-    };
+    let top = hour_top(now);
     let mut out = Vec::with_capacity(THROUGHPUT_BUCKETS);
     for i in (0..THROUGHPUT_BUCKETS).rev() {
-        let ts = hour_top - Duration::hours(i as i64);
+        let ts = top - Duration::hours(i as i64);
         out.push(ts.format("%Y-%m-%dT%H:00:00Z").to_string());
     }
     out
@@ -283,16 +299,23 @@ fn compute_grade(events: &[Event]) -> (Option<f64>, Option<Value>) {
 
 /// Percentage of `rule_check` events in the window that blocked. Returns `0.0`
 /// when no rule_check events fired.
+///
+/// The denominator is every rule_check (Pass/Warn/Block), NOT just blocks —
+/// `harness_observe::stats::linter_feedback_count` already filters to blocks,
+/// so using it as the total would collapse the metric to 0% / 100%.
 fn compute_rule_fail_rate_pct(events: &[Event]) -> f64 {
-    let total = stats::linter_feedback_count(events) as f64;
-    if total == 0.0 {
+    let (total, failed) =
+        events
+            .iter()
+            .filter(|e| e.hook == "rule_check")
+            .fold((0u64, 0u64), |(t, f), e| {
+                let blocked = u64::from(matches!(e.decision, Decision::Block));
+                (t + 1, f + blocked)
+            });
+    if total == 0 {
         return 0.0;
     }
-    let failed = events
-        .iter()
-        .filter(|e| e.hook == "rule_check" && matches!(e.decision, Decision::Block))
-        .count() as f64;
-    (failed / total) * 100.0
+    (failed as f64 / total as f64) * 100.0
 }
 
 /// Build the cross-project live activity feed from the latest events.

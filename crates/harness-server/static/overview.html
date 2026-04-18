@@ -654,11 +654,58 @@ function basename(path){
   return parts.length ? parts[parts.length-1] : String(path);
 }
 
+/* ---------- auth ----------
+   /overview is an exempt public HTML page, but /api/overview sits behind
+   `api_auth_middleware`. Mirror the dashboard's sessionStorage-based token
+   flow (see crates/harness-server/static/dashboard.js) so a bearer token
+   saved from the dashboard carries over here and a 401 prompts for one. */
+function authHeaders(){
+  const tok = sessionStorage.getItem('harness_token');
+  return tok ? { 'Authorization': 'Bearer ' + tok } : {};
+}
+function promptToken(onSaved){
+  if (document.getElementById('token-overlay')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'token-overlay';
+  overlay.style.cssText =
+    'position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;' +
+    'align-items:center;justify-content:center;z-index:9999';
+  overlay.innerHTML =
+    '<div style="background:var(--bg-1);padding:1.5rem;border:1px solid var(--line-2);min-width:320px;font-family:var(--sans)">' +
+    '<p style="margin:0 0 1rem;font-weight:600;color:var(--ink)">Enter API token</p>' +
+    '<input id="token-input" type="password" placeholder="Bearer token" ' +
+    'style="width:100%;padding:.5rem;border:1px solid var(--line-2);' +
+    'background:var(--bg);color:var(--ink);box-sizing:border-box;font-family:var(--mono)" />' +
+    '<div style="margin-top:1rem;display:flex;gap:.5rem;justify-content:flex-end">' +
+    '<button id="token-save" style="padding:.4rem .9rem;' +
+    'background:var(--rust);color:#fff;border:0;cursor:pointer;font-family:var(--mono)">Save</button>' +
+    '</div></div>';
+  document.body.appendChild(overlay);
+  const input = document.getElementById('token-input');
+  const save = () => {
+    const val = input.value.trim();
+    if (!val) return;
+    sessionStorage.setItem('harness_token', val);
+    overlay.remove();
+    if (onSaved) onSaved();
+  };
+  document.getElementById('token-save').addEventListener('click', save);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') save(); });
+  input.focus();
+}
+
 /* ---------- top-level fetch loop ---------- */
 let lastPayload = null;
 async function fetchOverview(){
   try {
-    const resp = await fetch('/api/overview', { headers: { accept: 'application/json' } });
+    const resp = await fetch('/api/overview', {
+      headers: { accept: 'application/json', ...authHeaders() },
+    });
+    if (resp.status === 401) {
+      setStatus(false);
+      promptToken(fetchOverview);
+      return;
+    }
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const payload = await resp.json();
     lastPayload = payload;
