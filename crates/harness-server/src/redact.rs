@@ -14,8 +14,8 @@ fn secret_patterns() -> &'static Vec<Regex> {
             r"ghu_[A-Za-z0-9]{36,}",
             r"gho_[A-Za-z0-9]{36,}",
             r"ghr_[A-Za-z0-9]{36,}",
-            // Authorization header bearer values
-            r"Bearer\s+\S+",
+            // Authorization header bearer values (case-insensitive per RFC 7235)
+            r"(?i)Bearer\s+\S+",
             // OpenAI / Anthropic style keys: sk-xxx, sk-proj-xxx, sk-ant-xxx, sk-svcacct-xxx, etc.
             r"sk-[A-Za-z0-9_\-]{20,}",
             // JWTs: three base64url segments joined by dots

@@ -1071,7 +1071,7 @@ impl TaskDb {
     pub async fn get_task_prompts(&self, task_id: &str) -> anyhow::Result<Vec<TaskPrompt>> {
         let rows = sqlx::query_as::<_, TaskPrompt>(
             "SELECT task_id, turn, phase, prompt, created_at
-             FROM task_prompts WHERE task_id = ? ORDER BY turn ASC",
+             FROM task_prompts WHERE task_id = ? ORDER BY turn ASC, id ASC",
         )
         .bind(task_id)
         .fetch_all(&self.pool)

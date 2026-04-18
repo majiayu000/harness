@@ -19,6 +19,7 @@ let historyPage = 0;
 let historyQuery = "";
 let historyFilter = "all";
 let _activeDetailTaskId = null;
+let _detailGeneration = 0;
 
 function $(sel) { return document.querySelector(sel); }
 
@@ -443,9 +444,12 @@ function showDetail(task) {
   document.getElementById("detail-body").innerHTML = body;
 
   // Track which task is active so the async fetch can bail if the user
-  // switches to a different task before the response arrives.
+  // switches to a different task before the response arrives. The generation
+  // counter additionally prevents duplicate panels when showDetail is called
+  // multiple times for the same task while a fetch is still in flight.
   _activeDetailTaskId = task.id;
-  fetchAndRenderPrompts(task.id);
+  const generation = ++_detailGeneration;
+  fetchAndRenderPrompts(task.id, generation);
 
   const cancelBtn = document.querySelector(".cancel-btn[data-task-id]");
   if (cancelBtn) {
@@ -510,7 +514,7 @@ function lineDiff(a, b) {
   return html || "<em>No line-level differences</em>";
 }
 
-async function fetchAndRenderPrompts(taskId) {
+async function fetchAndRenderPrompts(taskId, generation) {
   const body = document.getElementById("detail-body");
   if (!body) return;
 
@@ -521,8 +525,8 @@ async function fetchAndRenderPrompts(taskId) {
     prompts = await resp.json();
   } catch { return; }
 
-  // Guard: user may have opened a different task while this fetch was in flight.
-  if (_activeDetailTaskId !== taskId) return;
+  // Guard: bail if the user switched tasks or re-opened the same task (new generation).
+  if (_activeDetailTaskId !== taskId || _detailGeneration !== generation) return;
 
   if (!Array.isArray(prompts) || prompts.length === 0) {
     const el = document.createElement("div");

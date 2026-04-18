@@ -1771,6 +1771,24 @@ async fn get_task_artifacts(
 /// GET /tasks/{id}/prompts — all persisted redacted prompts for a task.
 async fn get_task_prompts(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let task_id = harness_core::types::TaskId(id);
+    match state.core.tasks.get_with_db_fallback(&task_id).await {
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "task not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!("get_task_prompts: database error: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response();
+        }
+        Ok(Some(_)) => {}
+    }
     match state.core.tasks.get_prompts(&task_id).await {
         Ok(prompts) => Json(prompts).into_response(),
         Err(e) => {
