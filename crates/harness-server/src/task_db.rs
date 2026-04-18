@@ -873,15 +873,25 @@ impl TaskDb {
 
     /// Count tasks that reached `done` status with `updated_at >= since`.
     ///
-    /// `since` must be an ISO-8601 UTC timestamp (e.g. `2026-04-17T23:00:00Z`).
-    /// Uses the `idx_tasks_status_updated` index. Used by the system overview
-    /// endpoint to compute "merged in last 24h" without loading full task rows.
+    /// `since` may be any datetime string SQLite's `datetime()` understands
+    /// (RFC3339 with `T`/offset is fine — it is normalised before comparison).
+    /// Both sides of the predicate are wrapped in `datetime(...)` because
+    /// `tasks.updated_at` is written via `datetime('now')`, which produces the
+    /// `YYYY-MM-DD HH:MM:SS` form; comparing that TEXT to an RFC3339 string
+    /// lexicographically would silently drop same-day rows (space `0x20` sorts
+    /// before `T` `0x54`). Uses the `idx_tasks_status_updated` index — the
+    /// index lookup is still viable because `datetime(updated_at)` is a
+    /// monotonic transform, so SQLite will range-scan on the index and filter.
+    /// Used by the system overview endpoint to compute "merged in last 24h"
+    /// without loading full task rows.
     pub async fn count_done_since(&self, since: &str) -> anyhow::Result<u64> {
-        let row: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM tasks WHERE status = 'done' AND updated_at >= ?")
-                .bind(since)
-                .fetch_one(&self.pool)
-                .await?;
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM tasks \
+             WHERE status = 'done' AND datetime(updated_at) >= datetime(?)",
+        )
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(row.0 as u64)
     }
 
@@ -891,7 +901,8 @@ impl TaskDb {
     /// `updated_at` timestamp truncated to the hour in UTC (format
     /// `YYYY-MM-DDTHH:00:00Z`). Rows with `project IS NULL` are reported with
     /// an empty project key. Used to build the fleet-throughput stacked-area
-    /// chart (per project, per hour over the window).
+    /// chart (per project, per hour over the window). Uses `datetime(...)` on
+    /// both sides for the same reason [`Self::count_done_since`] does.
     pub async fn done_per_project_hour_since(
         &self,
         since: &str,
@@ -901,7 +912,7 @@ impl TaskDb {
                     strftime('%Y-%m-%dT%H:00:00Z', updated_at) AS hour, \
                     COUNT(*) \
              FROM tasks \
-             WHERE status = 'done' AND updated_at >= ? \
+             WHERE status = 'done' AND datetime(updated_at) >= datetime(?) \
              GROUP BY project, hour",
         )
         .bind(since)
@@ -1771,6 +1782,34 @@ mod tests {
         assert_eq!(global_done, 1);
         assert_eq!(global_failed, 1);
         assert_eq!(by_project, vec![(root.to_string(), 1, 1)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_done_since_counts_same_day_rows() -> anyhow::Result<()> {
+        // Regression for PR #816: tasks.updated_at is stored via
+        // datetime('now') in `YYYY-MM-DD HH:MM:SS` form, so raw TEXT
+        // comparison against an RFC3339 `since` (with `T` separator)
+        // would silently drop all same-day rows because space `0x20`
+        // sorts before `T` `0x54`. datetime(updated_at) >= datetime(?)
+        // must normalise both sides.
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("fresh", TaskStatus::Done)).await?;
+
+        // RFC3339 string representing an hour ago.
+        let since = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        assert_eq!(db.count_done_since(&since).await?, 1);
+
+        let rows = db.done_per_project_hour_since(&since).await?;
+        let total: u64 = rows.iter().map(|(_, _, c)| *c).sum();
+        assert_eq!(total, 1);
+
+        // A future `since` still returns zero — sanity check that the
+        // predicate is not inverted.
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        assert_eq!(db.count_done_since(&future).await?, 0);
         Ok(())
     }
 
