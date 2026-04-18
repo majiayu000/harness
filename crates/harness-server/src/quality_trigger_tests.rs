@@ -51,6 +51,7 @@ async fn make_trigger_with_challenger(
         dir.to_path_buf(),
         auto_gc_grades,
         cooldown_secs,
+        120,
         challenger,
     )
 }

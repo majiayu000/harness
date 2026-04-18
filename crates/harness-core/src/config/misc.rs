@@ -204,6 +204,9 @@ pub struct GcConfig {
     /// Tools allowed during GC agent execution. Default: ["Read", "Grep", "Glob"].
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
+    /// Seconds before an auto-triggered gc_agent.run() call is cancelled. Default: 120.
+    #[serde(default = "default_gc_run_timeout_secs")]
+    pub gc_run_timeout_secs: u64,
 }
 
 impl Default for GcConfig {
@@ -221,6 +224,7 @@ impl Default for GcConfig {
             auto_gc_cooldown_secs: default_auto_gc_cooldown_secs(),
             auto_pr: default_gc_auto_pr(),
             allowed_tools: None,
+            gc_run_timeout_secs: default_gc_run_timeout_secs(),
         }
     }
 }
@@ -251,6 +255,10 @@ fn default_auto_gc_cooldown_secs() -> u64 {
 
 fn default_gc_auto_pr() -> bool {
     true
+}
+
+fn default_gc_run_timeout_secs() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

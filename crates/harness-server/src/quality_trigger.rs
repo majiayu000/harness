@@ -30,6 +30,7 @@ pub struct QualityTrigger {
     project_root: PathBuf,
     auto_gc_grades: Vec<Grade>,
     cooldown_secs: u64,
+    gc_run_timeout_secs: u64,
     pub(crate) last_triggered: Arc<AtomicU64>,
     challenger_agent: Option<Arc<dyn CodeAgent>>,
 }
@@ -42,6 +43,7 @@ impl QualityTrigger {
         project_root: PathBuf,
         auto_gc_grades: Vec<Grade>,
         cooldown_secs: u64,
+        gc_run_timeout_secs: u64,
         challenger_agent: Option<Arc<dyn CodeAgent>>,
     ) -> Self {
         Self {
@@ -51,6 +53,7 @@ impl QualityTrigger {
             project_root,
             auto_gc_grades,
             cooldown_secs,
+            gc_run_timeout_secs,
             last_triggered: Arc::new(AtomicU64::new(0)),
             challenger_agent,
         }
@@ -244,12 +247,23 @@ impl QualityTrigger {
             return;
         };
         let project = Project::from_path(self.project_root.clone());
-        if let Err(e) = self
-            .gc_agent
-            .run(&project, &events, &[], agent.as_ref())
-            .await
+        let timeout_secs = self.gc_run_timeout_secs;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.gc_agent.run(&project, &events, &[], agent.as_ref()),
+        )
+        .await
         {
-            tracing::warn!("quality_trigger: gc_agent.run failed: {e}");
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("quality_trigger: gc_agent.run failed: {e}");
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    "quality_trigger: gc_agent.run timed out after {timeout_secs}s; \
+                     skipping GC this cycle"
+                );
+            }
         }
     }
 }
