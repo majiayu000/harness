@@ -7,11 +7,23 @@ static SECRET_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
 fn secret_patterns() -> &'static Vec<Regex> {
     SECRET_PATTERNS.get_or_init(|| {
         let raw = [
+            // GitHub tokens: classic PAT, server-to-server, fine-grained PAT, OAuth, user-to-server, refresh
             r"ghp_[A-Za-z0-9]{36,}",
             r"ghs_[A-Za-z0-9]{36,}",
+            r"github_pat_[A-Za-z0-9_]{36,}",
+            r"ghu_[A-Za-z0-9]{36,}",
+            r"gho_[A-Za-z0-9]{36,}",
+            r"ghr_[A-Za-z0-9]{36,}",
+            // 40-char hex — SHA1-length tokens (catches legacy API tokens that look like git hashes)
             r"[0-9a-f]{40}",
+            // Authorization header bearer values
             r"Bearer\s+\S+",
-            r"sk-[A-Za-z0-9]{32,}",
+            // OpenAI / Anthropic style keys: sk-xxx, sk-proj-xxx, sk-ant-xxx, sk-svcacct-xxx, etc.
+            r"sk-[A-Za-z0-9_\-]{20,}",
+            // JWTs: three base64url segments joined by dots
+            r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+",
+            // PEM private keys: SSH, TLS, PKCS#8 (dotall — key body spans multiple lines)
+            r"(?s)-----BEGIN [A-Z ]+PRIVATE KEY-----.*?-----END [A-Z ]+PRIVATE KEY-----",
         ];
         raw.iter().filter_map(|p| Regex::new(p).ok()).collect()
     })
@@ -97,5 +109,52 @@ mod tests {
         let vars = env(&[("FLAG", "true")]);
         let result = redact_secrets("flag is true", &vars);
         assert_eq!(result, "flag is true");
+    }
+
+    #[test]
+    fn fine_grained_github_pat_is_redacted() {
+        let result = redact_secrets(
+            "token=github_pat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA end",
+            &env(&[]),
+        );
+        assert!(result.contains("[REDACTED]"), "got: {result}");
+        assert!(!result.contains("github_pat_"));
+    }
+
+    #[test]
+    fn ghu_token_is_redacted() {
+        let result = redact_secrets(
+            "oauth=ghu_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA end",
+            &env(&[]),
+        );
+        assert!(result.contains("[REDACTED]"), "got: {result}");
+        assert!(!result.contains("ghu_"));
+    }
+
+    #[test]
+    fn openai_project_key_is_redacted() {
+        let result = redact_secrets(
+            "key=sk-proj-abcdefghijklmnopqrstuvwxyz1234567890 end",
+            &env(&[]),
+        );
+        assert!(result.contains("[REDACTED]"), "got: {result}");
+        assert!(!result.contains("sk-proj-"));
+    }
+
+    #[test]
+    fn jwt_is_redacted() {
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let result = redact_secrets(&format!("auth: {jwt}"), &env(&[]));
+        assert!(result.contains("[REDACTED]"), "got: {result}");
+        assert!(!result.contains("eyJ"));
+    }
+
+    #[test]
+    fn pem_private_key_is_redacted() {
+        let key =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----";
+        let result = redact_secrets(&format!("key: {key} end"), &env(&[]));
+        assert!(result.contains("[REDACTED]"), "got: {result}");
+        assert!(!result.contains("PRIVATE KEY"));
     }
 }

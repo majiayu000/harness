@@ -18,6 +18,7 @@ let currentTasks = [];
 let historyPage = 0;
 let historyQuery = "";
 let historyFilter = "all";
+let _activeDetailTaskId = null;
 
 function $(sel) { return document.querySelector(sel); }
 
@@ -441,7 +442,9 @@ function showDetail(task) {
 
   document.getElementById("detail-body").innerHTML = body;
 
-  // Async: fetch and render the prompts panel after initial HTML is set.
+  // Track which task is active so the async fetch can bail if the user
+  // switches to a different task before the response arrives.
+  _activeDetailTaskId = task.id;
   fetchAndRenderPrompts(task.id);
 
   const cancelBtn = document.querySelector(".cancel-btn[data-task-id]");
@@ -499,6 +502,9 @@ async function fetchAndRenderPrompts(taskId) {
     if (!resp || !resp.ok) return;
     prompts = await resp.json();
   } catch { return; }
+
+  // Guard: user may have opened a different task while this fetch was in flight.
+  if (_activeDetailTaskId !== taskId) return;
 
   if (!Array.isArray(prompts) || prompts.length === 0) {
     const el = document.createElement("div");
