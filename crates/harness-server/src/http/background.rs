@@ -309,29 +309,33 @@ pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
                     }
                 };
 
-                // Issues 2 & 3: resolve canonical project path from repo name so that
-                // (a) the correct per-project concurrency bucket is used, and
-                // (b) req.project is populated so the agent runs in the right worktree.
-                let project_path = match task.repo.as_deref() {
-                    Some(repo) => {
-                        if let Some(registry) = state.core.project_registry.as_deref() {
-                            match registry.resolve_path(repo).await {
-                                Ok(Some(p)) => Some(p),
-                                Ok(None) => Some(std::path::PathBuf::from(repo)),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        task_id = ?task.id,
-                                        repo,
-                                        "startup recovery: registry lookup failed: {e}, using repo as path"
-                                    );
-                                    Some(std::path::PathBuf::from(repo))
+                // Issues 2 & 3: resolve canonical project path. Prefer the
+                // persisted absolute project_root (set at dispatch time); fall
+                // back to registry/repo lookup only when it is absent.
+                let project_path = if let Some(root) = task.project_root.clone() {
+                    Some(root)
+                } else {
+                    match task.repo.as_deref() {
+                        Some(repo) => {
+                            if let Some(registry) = state.core.project_registry.as_deref() {
+                                match registry.resolve_path(repo).await {
+                                    Ok(Some(p)) => Some(p),
+                                    Ok(None) => Some(std::path::PathBuf::from(repo)),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            task_id = ?task.id,
+                                            repo,
+                                            "startup recovery: registry lookup failed: {e}, using repo as path"
+                                        );
+                                        Some(std::path::PathBuf::from(repo))
+                                    }
                                 }
+                            } else {
+                                Some(std::path::PathBuf::from(repo))
                             }
-                        } else {
-                            Some(std::path::PathBuf::from(repo))
                         }
+                        None => None,
                     }
-                    None => None,
                 };
 
                 let canonical = match task_runner::resolve_canonical_project(project_path).await {
@@ -500,15 +504,22 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
         for (task, _checkpoint) in checkpoint_tasks {
             let state = state.clone();
             tokio::spawn(async move {
-                // Reconstruct request type from the persisted description.
-                // Description format: "issue #N" → issue task; other → prompt task.
+                // Reconstruct request type: parse issue number from the
+                // authoritative external_id ("issue:<n>") first, then fall
+                // back to the human-readable description for older rows.
                 // PR tasks are handled by Source A and never appear here.
                 let issue_num = task
-                    .description
+                    .external_id
                     .as_deref()
-                    .and_then(|d| d.strip_prefix("issue #"))
-                    .and_then(|s| s.split_whitespace().next())
-                    .and_then(|s| s.parse::<u64>().ok());
+                    .and_then(|eid| eid.strip_prefix("issue:"))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .or_else(|| {
+                        task.description
+                            .as_deref()
+                            .and_then(|d| d.strip_prefix("issue #"))
+                            .and_then(|s| s.split_whitespace().next())
+                            .and_then(|s| s.parse::<u64>().ok())
+                    });
 
                 if issue_num.is_none() {
                     // Prompt tasks store the placeholder "prompt task" in description
@@ -541,27 +552,31 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                     return;
                 }
 
-                let project_path = match task.repo.as_deref() {
-                    Some(repo) => {
-                        if let Some(registry) = state.core.project_registry.as_deref() {
-                            match registry.resolve_path(repo).await {
-                                Ok(Some(p)) => Some(p),
-                                Ok(None) => Some(std::path::PathBuf::from(repo)),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        task_id = ?task.id,
-                                        repo,
-                                        "startup recovery: registry lookup failed: \
-                                         {e}, using repo as path"
-                                    );
-                                    Some(std::path::PathBuf::from(repo))
+                let project_path = if let Some(root) = task.project_root.clone() {
+                    Some(root)
+                } else {
+                    match task.repo.as_deref() {
+                        Some(repo) => {
+                            if let Some(registry) = state.core.project_registry.as_deref() {
+                                match registry.resolve_path(repo).await {
+                                    Ok(Some(p)) => Some(p),
+                                    Ok(None) => Some(std::path::PathBuf::from(repo)),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            task_id = ?task.id,
+                                            repo,
+                                            "startup recovery: registry lookup failed: \
+                                             {e}, using repo as path"
+                                        );
+                                        Some(std::path::PathBuf::from(repo))
+                                    }
                                 }
+                            } else {
+                                Some(std::path::PathBuf::from(repo))
                             }
-                        } else {
-                            Some(std::path::PathBuf::from(repo))
                         }
+                        None => None,
                     }
-                    None => None,
                 };
 
                 let canonical = match task_runner::resolve_canonical_project(project_path).await {
