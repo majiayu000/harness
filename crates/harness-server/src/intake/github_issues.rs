@@ -229,9 +229,18 @@ impl IntakeSource for GitHubIssuesPoller {
         external_id: &str,
         result: &TaskCompletionResult,
     ) -> anyhow::Result<()> {
-        // Remove failed or cancelled issues from dispatched so the poller can retry
-        // them later if they remain open. Done tasks stay dispatched to avoid re-processing.
-        if result.status.is_failure() || result.status.is_cancelled() {
+        // Failures that require manual intervention must stay in dispatched so the poller
+        // does not immediately re-discover the open issue and hot-loop. The operator must
+        // resolve the conflict before the issue can be re-dispatched.
+        let needs_manual = result
+            .error
+            .as_deref()
+            .map(|e| e.contains("manual resolution required"))
+            .unwrap_or(false);
+        // Remove transient failed or cancelled issues from dispatched so the poller can
+        // retry them later if they remain open. Done tasks and permanent failures stay
+        // dispatched to avoid re-processing.
+        if (result.status.is_failure() || result.status.is_cancelled()) && !needs_manual {
             self.dispatched.remove(external_id);
             self.persist_dispatched();
         }
@@ -380,6 +389,70 @@ mod tests {
         futures::executor::block_on(poller.on_task_complete(external_id, &result)).unwrap();
 
         assert!(!poller.dispatched.contains_key(external_id));
+    }
+
+    #[test]
+    fn on_task_complete_manual_conflict_keeps_dispatched() {
+        // Gate B: failures requiring manual resolution must NOT unmark the issue so
+        // the poller cannot immediately re-discover the same conflict and hot-loop.
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: None,
+        };
+        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
+        let external_id = "77";
+        poller.dispatched.insert(
+            external_id.to_string(),
+            harness_core::types::TaskId("task-77".to_string()),
+        );
+
+        let result = TaskCompletionResult {
+            status: TaskStatus::Failed,
+            pr_url: None,
+            error: Some(
+                "pr:77 is conflicting and rebase was not pushed; manual resolution required"
+                    .to_string(),
+            ),
+            summary: "conflict gate fired".to_string(),
+        };
+
+        futures::executor::block_on(poller.on_task_complete(external_id, &result)).unwrap();
+
+        assert!(
+            poller.dispatched.contains_key(external_id),
+            "issue must remain in dispatched after manual-resolution failure to prevent hot-loop"
+        );
+    }
+
+    #[test]
+    fn on_task_complete_transient_failure_removes_from_dispatched() {
+        // Transient failures (e.g. rate limit, empty output) should unmark for retry.
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: None,
+        };
+        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
+        let external_id = "88";
+        poller.dispatched.insert(
+            external_id.to_string(),
+            harness_core::types::TaskId("task-88".to_string()),
+        );
+
+        let result = TaskCompletionResult {
+            status: TaskStatus::Failed,
+            pr_url: None,
+            error: Some("no PR number found in agent output; task requires PR_URL".to_string()),
+            summary: "transient failure".to_string(),
+        };
+
+        futures::executor::block_on(poller.on_task_complete(external_id, &result)).unwrap();
+
+        assert!(
+            !poller.dispatched.contains_key(external_id),
+            "issue must be removed from dispatched after transient failure so poller can retry"
+        );
     }
 
     #[test]

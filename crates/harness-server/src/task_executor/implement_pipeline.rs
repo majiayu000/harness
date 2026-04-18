@@ -58,6 +58,13 @@ pub(crate) fn prepend_constitution(prompt: String, enabled: bool) -> String {
     }
 }
 
+/// Returns true when the task type requires the agent to emit a `PR_URL=…` line.
+/// Issue-backed tasks and `pr:N` review tasks must produce a PR URL; prompt-only
+/// tasks (periodic_review, etc.) may produce output without creating a PR.
+pub(crate) fn task_needs_pr_url(req: &CreateTaskRequest) -> bool {
+    req.issue.is_some() || req.pr.is_some()
+}
+
 /// Outcome of the implement phase.
 #[derive(Debug)]
 pub(crate) enum ImplementOutcome {
@@ -685,20 +692,22 @@ pub(crate) async fn run_implement_phase(
                 );
                 return Ok(ImplementOutcome::Done);
             }
-            // Issue tasks must produce a PR; mark Failed so the issue is removed from the
-            // dispatched set by on_task_complete and can be re-queued by the poller.
-            // Non-issue tasks (prompt-only, periodic_review, etc.) may legitimately produce
-            // output without a PR — Done is correct there.
-            if req.issue.is_some() {
+            // Issue tasks and pr:N tasks must produce a PR URL. Mark Failed so the issue
+            // is removed from the dispatched set by on_task_complete and can be re-queued.
+            // Prompt-only tasks (periodic_review, etc.) may legitimately produce output
+            // without a PR — Done is correct there.
+            if task_needs_pr_url(req) {
                 tracing::warn!(
                     task_id = %task_id,
-                    "no PR number found in agent output for issue task; marking failed to allow requeue"
+                    issue = req.issue,
+                    pr = req.pr,
+                    "no PR number found in agent output for issue/pr task; marking failed to allow requeue"
                 );
                 mutate_and_persist(store, task_id, |s| {
                     s.status = TaskStatus::Failed;
                     s.turn = 2;
                     s.error = Some(
-                        "no PR number found in agent output; issue task requires PR".to_string(),
+                        "no PR number found in agent output; task requires PR_URL".to_string(),
                     );
                 })
                 .await?;
