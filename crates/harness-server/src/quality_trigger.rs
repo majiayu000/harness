@@ -319,12 +319,23 @@ impl QualityTrigger {
         .await
         {
             Ok(Ok(report)) => {
-                if let Err(e) = self
-                    .events
-                    .set_scan_watermark(&project_key, "gc", scan_ts)
-                    .await
-                {
-                    tracing::warn!("quality_trigger: failed to update scan watermark: {e}");
+                // Only advance the watermark when the run completed without
+                // errors.  Partial failures (e.g. a transient agent error or a
+                // draft-store write) are recorded in report.errors; keeping the
+                // watermark behind lets the next scan retry those events.
+                if report.errors.is_empty() {
+                    if let Err(e) = self
+                        .events
+                        .set_scan_watermark(&project_key, "gc", scan_ts)
+                        .await
+                    {
+                        tracing::warn!("quality_trigger: failed to update scan watermark: {e}");
+                    }
+                } else {
+                    tracing::warn!(
+                        error_count = report.errors.len(),
+                        "quality_trigger: gc run had errors; watermark not advanced for retry"
+                    );
                 }
                 if !matches!(self.auto_adopt, AutoAdoptPolicy::Off) && !report.draft_ids.is_empty()
                 {
