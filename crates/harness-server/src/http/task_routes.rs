@@ -170,17 +170,20 @@ pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
     mut req: task_runner::CreateTaskRequest,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
+    let now = chrono::Utc::now();
     if state
         .core
-        .maintenance_active
-        .load(std::sync::atomic::Ordering::Relaxed)
+        .server
+        .config
+        .maintenance_window
+        .in_quiet_window(now)
     {
         let retry_after_secs = state
             .core
             .server
             .config
             .maintenance_window
-            .secs_until_window_end(chrono::Utc::now());
+            .secs_until_window_end(now);
         return Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs });
     }
 
@@ -390,6 +393,23 @@ async fn enqueue_task_background(
     mut req: task_runner::CreateTaskRequest,
     group_sem: Option<Arc<tokio::sync::Semaphore>>,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
+    let now = chrono::Utc::now();
+    if state
+        .core
+        .server
+        .config
+        .maintenance_window
+        .in_quiet_window(now)
+    {
+        let retry_after_secs = state
+            .core
+            .server
+            .config
+            .maintenance_window
+            .secs_until_window_end(now);
+        return Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs });
+    }
+
     if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
         return Err(EnqueueTaskError::BadRequest(
             "at least one of prompt, issue, or pr must be provided".to_string(),

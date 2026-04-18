@@ -581,6 +581,7 @@ impl MaintenanceWindowConfig {
     /// Always returns `false` when `enabled = false`.
     /// Handles cross-midnight windows: if `quiet_window_end < quiet_window_start`,
     /// the window spans midnight and is active when `time >= start || time < end`.
+    /// Equal start and end produce a zero-length window (always returns `false`).
     /// Falls back to UTC if the timezone string cannot be parsed.
     pub fn in_quiet_window(&self, now: DateTime<Utc>) -> bool {
         if !self.enabled {
@@ -594,7 +595,7 @@ impl MaintenanceWindowConfig {
         let t = local.time();
         let start = self.quiet_window_start;
         let end = self.quiet_window_end;
-        if end <= start {
+        if end < start {
             // Cross-midnight: active from start to midnight, and midnight to end.
             t >= start || t < end
         } else {
