@@ -1143,7 +1143,7 @@ impl TaskStore {
     ///
     /// Forwards to [`TaskDb::count_done_since`]; used by the system overview
     /// to compute merged-in-last-24h without materialising full task rows.
-    pub async fn count_done_since(&self, since: &str) -> u64 {
+    pub async fn count_done_since(&self, since: chrono::DateTime<chrono::Utc>) -> u64 {
         match self.db.count_done_since(since).await {
             Ok(v) => v,
             Err(e) => {
@@ -1156,7 +1156,10 @@ impl TaskStore {
     /// Per-(project, hour) done counts since `since`. Forwards to
     /// [`TaskDb::done_per_project_hour_since`] and returns an empty vec on
     /// error so callers can degrade gracefully.
-    pub async fn done_per_project_hour_since(&self, since: &str) -> Vec<(String, String, u64)> {
+    pub async fn done_per_project_hour_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<(String, String, u64)> {
         match self.db.done_per_project_hour_since(since).await {
             Ok(rows) => rows,
             Err(e) => {

@@ -1,5 +1,6 @@
 use crate::http::parse_pr_num_from_url;
 use crate::task_runner::{TaskState, TaskStatus};
+use chrono::{DateTime, Utc};
 use harness_core::db::{open_pool, Migration, Migrator};
 use harness_core::error::TaskDbDecodeError;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,15 @@ use std::path::{Path, PathBuf};
 
 /// Maximum artifact content size in bytes before truncation.
 const ARTIFACT_MAX_BYTES: usize = 65_536;
+
+/// Format a `DateTime<Utc>` exactly the way SQLite's `datetime('now')` writes
+/// `tasks.updated_at` (`YYYY-MM-DD HH:MM:SS`, space separator, no offset),
+/// so raw `updated_at >= ?` comparisons stay monotonic and the planner can
+/// still use the `idx_tasks_status_updated` / `idx_tasks_project_status_updated`
+/// range indexes.
+fn sqlite_datetime(ts: DateTime<Utc>) -> String {
+    ts.format("%Y-%m-%d %H:%M:%S").to_string()
+}
 
 /// Column list for `query_as::<_, TaskRow>` — single source of truth.
 ///
@@ -873,25 +883,21 @@ impl TaskDb {
 
     /// Count tasks that reached `done` status with `updated_at >= since`.
     ///
-    /// `since` may be any datetime string SQLite's `datetime()` understands
-    /// (RFC3339 with `T`/offset is fine — it is normalised before comparison).
-    /// Both sides of the predicate are wrapped in `datetime(...)` because
-    /// `tasks.updated_at` is written via `datetime('now')`, which produces the
-    /// `YYYY-MM-DD HH:MM:SS` form; comparing that TEXT to an RFC3339 string
-    /// lexicographically would silently drop same-day rows (space `0x20` sorts
-    /// before `T` `0x54`). Uses the `idx_tasks_status_updated` index — the
-    /// index lookup is still viable because `datetime(updated_at)` is a
-    /// monotonic transform, so SQLite will range-scan on the index and filter.
+    /// `since` is formatted to the exact storage form (`YYYY-MM-DD HH:MM:SS`
+    /// UTC, matching what `datetime('now')` writes) so the raw TEXT comparison
+    /// is monotonic and the planner can range-scan on the
+    /// `idx_tasks_status_updated` index. Wrapping `updated_at` in `datetime()`
+    /// would defeat that index and force a full scan of `status='done'` rows,
+    /// which is painful when the overview page polls every 5 seconds.
     /// Used by the system overview endpoint to compute "merged in last 24h"
     /// without loading full task rows.
-    pub async fn count_done_since(&self, since: &str) -> anyhow::Result<u64> {
-        let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM tasks \
-             WHERE status = 'done' AND datetime(updated_at) >= datetime(?)",
-        )
-        .bind(since)
-        .fetch_one(&self.pool)
-        .await?;
+    pub async fn count_done_since(&self, since: DateTime<Utc>) -> anyhow::Result<u64> {
+        let since_str = sqlite_datetime(since);
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM tasks WHERE status = 'done' AND updated_at >= ?")
+                .bind(&since_str)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(row.0 as u64)
     }
 
@@ -901,21 +907,23 @@ impl TaskDb {
     /// `updated_at` timestamp truncated to the hour in UTC (format
     /// `YYYY-MM-DDTHH:00:00Z`). Rows with `project IS NULL` are reported with
     /// an empty project key. Used to build the fleet-throughput stacked-area
-    /// chart (per project, per hour over the window). Uses `datetime(...)` on
-    /// both sides for the same reason [`Self::count_done_since`] does.
+    /// chart (per project, per hour over the window). Formats `since` like
+    /// [`Self::count_done_since`] so the `idx_tasks_project_status_updated`
+    /// index range scan stays viable.
     pub async fn done_per_project_hour_since(
         &self,
-        since: &str,
+        since: DateTime<Utc>,
     ) -> anyhow::Result<Vec<(String, String, u64)>> {
+        let since_str = sqlite_datetime(since);
         let rows: Vec<(Option<String>, String, i64)> = sqlx::query_as(
             "SELECT project, \
                     strftime('%Y-%m-%dT%H:00:00Z', updated_at) AS hour, \
                     COUNT(*) \
              FROM tasks \
-             WHERE status = 'done' AND datetime(updated_at) >= datetime(?) \
+             WHERE status = 'done' AND updated_at >= ? \
              GROUP BY project, hour",
         )
-        .bind(since)
+        .bind(&since_str)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -1788,28 +1796,28 @@ mod tests {
     #[tokio::test]
     async fn count_done_since_counts_same_day_rows() -> anyhow::Result<()> {
         // Regression for PR #816: tasks.updated_at is stored via
-        // datetime('now') in `YYYY-MM-DD HH:MM:SS` form, so raw TEXT
-        // comparison against an RFC3339 `since` (with `T` separator)
-        // would silently drop all same-day rows because space `0x20`
-        // sorts before `T` `0x54`. datetime(updated_at) >= datetime(?)
-        // must normalise both sides.
+        // datetime('now') in `YYYY-MM-DD HH:MM:SS` form. Comparing an
+        // RFC3339 `since` (with `T` separator) as raw TEXT would silently
+        // drop all same-day rows because space `0x20` sorts before
+        // `T` `0x54`. sqlite_datetime() now formats `since` in the stored
+        // form so `updated_at >= ?` is monotonic and the index range scan
+        // stays intact.
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
 
         db.insert(&make_task("fresh", TaskStatus::Done)).await?;
 
-        // RFC3339 string representing an hour ago.
-        let since = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-        assert_eq!(db.count_done_since(&since).await?, 1);
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert_eq!(db.count_done_since(since).await?, 1);
 
-        let rows = db.done_per_project_hour_since(&since).await?;
+        let rows = db.done_per_project_hour_since(since).await?;
         let total: u64 = rows.iter().map(|(_, _, c)| *c).sum();
         assert_eq!(total, 1);
 
         // A future `since` still returns zero — sanity check that the
         // predicate is not inverted.
-        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
-        assert_eq!(db.count_done_since(&future).await?, 0);
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        assert_eq!(db.count_done_since(future).await?, 0);
         Ok(())
     }
 

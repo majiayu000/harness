@@ -39,15 +39,17 @@ pub trait TaskService: Send + Sync {
     /// for all projects. Used by the dashboard to show per-project latest PR.
     async fn latest_done_pr_urls_all_projects(&self) -> HashMap<String, String>;
 
-    /// Count tasks that reached `done` with `updated_at >= since`.
-    /// `since` is an ISO-8601 UTC timestamp. Used by the system overview to
-    /// display "merged in last 24h".
-    async fn count_done_since(&self, since: &str) -> u64;
+    /// Count tasks that reached `done` with `updated_at >= since`. Used by
+    /// the system overview to display "merged in last 24h".
+    async fn count_done_since(&self, since: chrono::DateTime<chrono::Utc>) -> u64;
 
     /// Per-(project, hour) done counts since `since`. Returns rows of
     /// `(project_key, hour_iso, count)`. Rows with no project carry an empty
     /// project key. Used to build the fleet-throughput chart.
-    async fn done_per_project_hour_since(&self, since: &str) -> Vec<(String, String, u64)>;
+    async fn done_per_project_hour_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<(String, String, u64)>;
 }
 
 /// Production implementation backed by [`TaskStore`].
@@ -101,11 +103,14 @@ impl TaskService for DefaultTaskService {
         self.store.latest_done_pr_urls_all_projects().await
     }
 
-    async fn count_done_since(&self, since: &str) -> u64 {
+    async fn count_done_since(&self, since: chrono::DateTime<chrono::Utc>) -> u64 {
         self.store.count_done_since(since).await
     }
 
-    async fn done_per_project_hour_since(&self, since: &str) -> Vec<(String, String, u64)> {
+    async fn done_per_project_hour_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<(String, String, u64)> {
         self.store.done_per_project_hour_since(since).await
     }
 }

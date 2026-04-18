@@ -38,7 +38,6 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
     // per-project sums understate the KPI for every request that is not
     // exactly on the hour.
     let since_dt = window_start(now);
-    let since = since_dt.to_rfc3339();
 
     // ---- global task queue counts (reuse existing services) ----
     let tq = &state.concurrency.task_queue;
@@ -50,11 +49,11 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
     let global_done = dashboard_counts.global_done;
     let global_failed = dashboard_counts.global_failed;
 
-    let merged_24h = state.task_svc.count_done_since(&since).await;
+    let merged_24h = state.task_svc.count_done_since(since_dt).await;
 
     // Per-project hourly done counts — drives both the fleet throughput chart
     // and each project's 24h trend sparkline.
-    let hour_rows = state.task_svc.done_per_project_hour_since(&since).await;
+    let hour_rows = state.task_svc.done_per_project_hour_since(since_dt).await;
     let hours = build_hour_axis(now);
     let hour_index: HashMap<String, usize> = hours
         .iter()
@@ -110,16 +109,26 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
         }));
     }
 
-    // Tasks with no registered project still contribute to the global
-    // throughput; surface them as an "unassigned" series so the KPI stays
-    // consistent with `merged_24h`.
-    if let Some(unassigned) = per_project_buckets.remove("") {
-        if unassigned.iter().any(|&v| v > 0) {
-            throughput_series.push(json!({
-                "project": "unassigned",
-                "values": unassigned,
-            }));
+    // Any buckets left over after draining the registry belong to tasks
+    // whose project is no longer registered (or was never registered).
+    // Emit them as fallback series so the stacked-area sum still matches
+    // the global `merged_24h` KPI — otherwise deleting a project while it
+    // had recent done tasks would silently desync the chart from the KPI.
+    let mut leftover: Vec<(String, Vec<u64>)> = per_project_buckets.drain().collect();
+    leftover.sort_by(|a, b| a.0.cmp(&b.0));
+    for (key, values) in leftover {
+        if !values.iter().any(|&v| v > 0) {
+            continue;
         }
+        let label = if key.is_empty() {
+            "unassigned".to_string()
+        } else {
+            format!("unregistered · {key}")
+        };
+        throughput_series.push(json!({
+            "project": label,
+            "values": values,
+        }));
     }
 
     // ---- runtime fleet ----
@@ -198,7 +207,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
     let body = json!({
         "window": {
             "hours": OVERVIEW_WINDOW_HOURS,
-            "since": since,
+            "since": since_dt.to_rfc3339(),
             "now": now.to_rfc3339(),
         },
         "kpi": {
