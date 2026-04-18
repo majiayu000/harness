@@ -292,6 +292,10 @@ impl QualityTrigger {
             .get_scan_watermark(&project_key, "gc")
             .await
             .unwrap_or(None);
+        // Capture the scan boundary before querying so that events written
+        // while gc_agent.run() executes are included in the NEXT run, not
+        // silently skipped (same pattern as periodic_reviewer).
+        let scan_ts = Utc::now();
         let all_events = match self
             .events
             .query(&EventFilters {
@@ -317,7 +321,7 @@ impl QualityTrigger {
             Ok(Ok(report)) => {
                 if let Err(e) = self
                     .events
-                    .set_scan_watermark(&project_key, "gc", Utc::now())
+                    .set_scan_watermark(&project_key, "gc", scan_ts)
                     .await
                 {
                     tracing::warn!("quality_trigger: failed to update scan watermark: {e}");
