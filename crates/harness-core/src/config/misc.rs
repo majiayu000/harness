@@ -214,6 +214,10 @@ pub struct GcConfig {
     /// left `Pending` even when `auto_adopt` is enabled. Default: `.harness/generated/`.
     #[serde(default = "default_auto_adopt_path_prefix")]
     pub auto_adopt_path_prefix: String,
+    /// Maximum seconds to wait for `gc_agent.run` in the task-completion
+    /// handler before giving up and logging a warning. Default: 120.
+    #[serde(default = "default_gc_run_timeout_secs")]
+    pub gc_run_timeout_secs: u64,
 }
 
 /// Controls whether drafts produced by a GC run are automatically moved to
@@ -246,6 +250,7 @@ impl Default for GcConfig {
             allowed_tools: None,
             auto_adopt: AutoAdoptPolicy::default(),
             auto_adopt_path_prefix: default_auto_adopt_path_prefix(),
+            gc_run_timeout_secs: default_gc_run_timeout_secs(),
         }
     }
 }
@@ -280,6 +285,10 @@ fn default_auto_gc_grades() -> Vec<Grade> {
 
 fn default_auto_gc_cooldown_secs() -> u64 {
     300
+}
+
+fn default_gc_run_timeout_secs() -> u64 {
+    120
 }
 
 fn default_gc_auto_pr() -> bool {

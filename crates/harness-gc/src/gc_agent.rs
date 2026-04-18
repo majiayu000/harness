@@ -178,8 +178,19 @@ impl GcAgent {
         signals.sort_by_key(|s| signal_priority(s.signal_type));
 
         // 3. Generate fix drafts (up to max_drafts_per_run).
-        let mut drafts_generated = 0;
-        let mut draft_ids: Vec<DraftId> = Vec::new();
+        //
+        // Two-phase design for cancellation safety:
+        //   Phase A – invoke agents and persist each draft immediately after generation.
+        //             Contains .await points (agent execution + pre-fetched HEAD).
+        //   Phase B – update checkpoint atomically (sync, zero .await points).
+        //
+        // Each draft is written to the store as soon as it is produced, so a
+        // tokio::time::timeout cancellation mid-loop cannot discard work that
+        // completed for earlier signals.
+        //
+        // HEAD is fetched before the loop so that Phase B (checkpoint write) has no
+        // .await, eliminating the window where drafts are on disk but the checkpoint
+        // is stale.
         let mut errors = Vec::new();
         let allowed_tools: Vec<String> = self
             .config
@@ -187,6 +198,16 @@ impl GcAgent {
             .clone()
             .unwrap_or_else(|| DEFAULT_GC_TOOLS.iter().map(|s| s.to_string()).collect());
 
+        // Pre-fetch HEAD before any writes so Phase B (checkpoint) needs no .await.
+        let head_commit = if self.checkpoint_path.is_some() {
+            get_current_head(&self.project_root).await
+        } else {
+            None
+        };
+
+        // Phase A: run agent for each signal; persist each draft immediately.
+        let mut draft_ids: Vec<DraftId> = Vec::new();
+        let mut drafts_generated = 0;
         for signal in signals.iter().take(self.config.max_drafts_per_run) {
             let base_prompt = build_prompt(signal, project);
             // Inject capability restriction note as secondary context alongside
@@ -222,11 +243,13 @@ impl GcAgent {
                         generated_at: Utc::now(),
                         agent_model: resp.model,
                     };
+                    // Persist immediately so a future cancellation (timeout) cannot
+                    // discard work already completed for this signal.
                     if let Err(e) = self.draft_store.save(&draft) {
                         errors.push(format!("failed to save draft: {e}"));
                     } else {
                         drafts_generated += 1;
-                        draft_ids.push(draft.id.clone());
+                        draft_ids.push(draft.id);
                     }
                 }
                 Err(e) => {
@@ -245,11 +268,11 @@ impl GcAgent {
             errors,
         };
 
-        // Update checkpoint with current timestamp and HEAD commit hash.
+        // Phase B: update checkpoint (sync — no .await points).
+        // HEAD was pre-fetched before the loop, so this block is cancellation-safe.
         if let Some(path) = &self.checkpoint_path {
-            let head = get_current_head(&self.project_root).await;
             let mut cp = GcCheckpoint::new(Utc::now());
-            if let Some(h) = head {
+            if let Some(h) = head_commit {
                 cp = cp.with_head_commit(h);
             }
             if let Err(e) = cp.save(path) {

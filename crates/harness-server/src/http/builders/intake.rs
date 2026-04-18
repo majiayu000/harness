@@ -142,6 +142,7 @@ pub(crate) async fn build_intake(
             challenger,
             gc_cfg.auto_adopt,
             gc_cfg.auto_adopt_path_prefix.clone(),
+            gc_cfg.gc_run_timeout_secs,
         ))
     };
 
