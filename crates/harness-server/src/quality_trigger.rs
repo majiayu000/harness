@@ -286,10 +286,20 @@ impl QualityTrigger {
             tracing::warn!("quality_trigger: no agent registered, skipping auto-GC");
             return;
         };
-        // Full history for GC — gc_agent does its own checkpoint-based slicing and
-        // must not receive the 1h-windowed list, which would silently drop events in
-        // the gap (last_scan_at, now-1h) and permanently lose those signals.
-        let all_events = match self.events.query(&EventFilters::default()).await {
+        // Query events since the GC checkpoint so the DB restriction is applied at
+        // query time rather than loading the entire event history into memory.
+        // Falls back to a full scan when no checkpoint exists (first run).
+        // gc_agent.run() applies filter_events_since() again internally, which is a
+        // no-op on the already-restricted slice — this is intentional.
+        let gc_since = self.gc_agent.checkpoint_since();
+        let all_events = match self
+            .events
+            .query(&EventFilters {
+                since: gc_since,
+                ..Default::default()
+            })
+            .await
+        {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!("quality_trigger: failed to query all events for gc: {e}");
@@ -299,7 +309,8 @@ impl QualityTrigger {
         let project = Project::from_path(self.project_root.clone());
         match tokio::time::timeout(
             Duration::from_secs(self.gc_run_timeout_secs),
-            self.gc_agent.run(&project, &all_events, &[], agent.as_ref()),
+            self.gc_agent
+                .run(&project, &all_events, &[], agent.as_ref()),
         )
         .await
         {

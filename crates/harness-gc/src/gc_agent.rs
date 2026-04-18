@@ -3,7 +3,7 @@ use crate::draft_store::DraftStore;
 use crate::remediation::signal_priority;
 use crate::signal_detector::SignalDetector;
 use anyhow::Context;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use harness_core::agent::{AgentRequest, CodeAgent};
 use harness_core::config::{
     agents::CapabilityProfile,
@@ -60,6 +60,19 @@ impl GcAgent {
     pub fn with_checkpoint(mut self, path: PathBuf) -> Self {
         self.checkpoint_path = Some(path);
         self
+    }
+
+    /// Return the `last_scan_at` timestamp from the persisted checkpoint, if any.
+    ///
+    /// Callers can use this to restrict a DB event query to the incremental
+    /// window (`EventFilters { since: gc_agent.checkpoint_since(), .. }`) so
+    /// that the DB applies the row restriction before materializing results,
+    /// rather than loading the entire event history into memory first.
+    pub fn checkpoint_since(&self) -> Option<DateTime<Utc>> {
+        self.checkpoint_path
+            .as_deref()
+            .and_then(GcCheckpoint::load)
+            .map(|cp| cp.last_scan_at)
     }
 
     /// Return the list of files changed since the last checkpoint commit.
