@@ -1388,3 +1388,222 @@ async fn dispatch_simple_prompt_selects_default_agent() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// --- Real router (build_router) coverage ---
+// The tests above use hand-built minimal routers. The three tests below use
+// the real `http_router::build_router` so that dropped routes, missing
+// DefaultBodyLimit wiring, or removed auth middleware fail CI rather than
+// failing only after deploy.
+
+#[tokio::test]
+async fn build_router_health_route_returns_ok() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = super::http_router::build_router(state);
+
+    let response = app
+        .oneshot(Request::builder().uri("/health").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn build_router_auth_middleware_blocks_unauthenticated_requests() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.api_token = Some("test-token-abc".to_string());
+    let state = make_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = super::http_router::build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/tasks")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn build_router_webhook_body_limit_enforced() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let secret = "secret";
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let body_limit = state.core.server.config.server.max_webhook_body_bytes;
+    let app = super::http_router::build_router(state);
+
+    let oversized = vec![b'a'; body_limit + 1024];
+    let signature = webhook_signature(secret, &oversized);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("x-github-event", "issue_comment")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(oversized))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    Ok(())
+}
+
+// --- Startup recovery coverage ---
+// spawn_pr_recovery and spawn_checkpoint_recovery only run at server restart,
+// so CI never exercised them before these tests. A regression in the callback,
+// permit, or project-resolution wiring would leave tasks stuck in pending
+// forever in production while CI stayed green.
+
+#[tokio::test]
+async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        status: task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: Some("not-a-valid-pr-url".to_string()),
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: None,
+        issue: None,
+        repo: None,
+        description: None,
+        created_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+    };
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+
+    super::background::spawn_pr_recovery(&state);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(t) = state.core.tasks.get(&task_id) {
+            if matches!(t.status, task_runner::TaskStatus::Failed) {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("task was not marked Failed within 5 seconds after pr_recovery");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let final_state = state
+        .core
+        .tasks
+        .get(&task_id)
+        .expect("task must still exist");
+    assert!(matches!(
+        final_state.status,
+        task_runner::TaskStatus::Failed
+    ));
+    assert!(
+        final_state
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("unparseable pr_url"),
+        "error should mention unparseable pr_url, got: {:?}",
+        final_state.error
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        status: task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: None,
+        issue: None,
+        repo: None,
+        description: Some("prompt task".to_string()),
+        created_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+    };
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+    // Write a checkpoint so the task appears in pending_tasks_with_checkpoint().
+    state
+        .core
+        .tasks
+        .write_checkpoint(&task_id, None, Some("plan output"), None, "plan")
+        .await?;
+
+    super::background::spawn_checkpoint_recovery(&state).await;
+
+    // The spawned tokio task updates the cache; give it a moment to complete.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(t) = state.core.tasks.get(&task_id) {
+            if matches!(t.status, task_runner::TaskStatus::Failed) {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("prompt task was not marked Failed within 5 seconds after checkpoint_recovery");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let final_state = state
+        .core
+        .tasks
+        .get(&task_id)
+        .expect("task must still exist");
+    assert!(matches!(
+        final_state.status,
+        task_runner::TaskStatus::Failed
+    ));
+    assert!(
+        final_state
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("prompt task"),
+        "error should mention prompt task recovery failure, got: {:?}",
+        final_state.error
+    );
+    Ok(())
+}
