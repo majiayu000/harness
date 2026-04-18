@@ -13,3 +13,5 @@ docs/artifacts/
 
 # Git worktrees (superpowers skill convention)
 .worktrees/
+web/node_modules/
+web/dist/
