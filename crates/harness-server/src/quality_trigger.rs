@@ -1,5 +1,6 @@
 use crate::handlers::cross_review::run_cross_review;
 use harness_core::agent::CodeAgent;
+use harness_core::config::misc::GcConfig;
 use harness_core::types::{Capability, EventFilters, Grade, Project};
 use harness_gc::gc_agent::GcAgent;
 use harness_observe::event_store::EventStore;
@@ -41,9 +42,7 @@ impl QualityTrigger {
         gc_agent: Arc<GcAgent>,
         agent_registry: Arc<harness_agents::registry::AgentRegistry>,
         project_root: PathBuf,
-        auto_gc_grades: Vec<Grade>,
-        cooldown_secs: u64,
-        gc_run_timeout_secs: u64,
+        gc_config: &GcConfig,
         challenger_agent: Option<Arc<dyn CodeAgent>>,
     ) -> Self {
         Self {
@@ -51,9 +50,9 @@ impl QualityTrigger {
             gc_agent,
             agent_registry,
             project_root,
-            auto_gc_grades,
-            cooldown_secs,
-            gc_run_timeout_secs,
+            auto_gc_grades: gc_config.auto_gc_grades.clone(),
+            cooldown_secs: gc_config.auto_gc_cooldown_secs,
+            gc_run_timeout_secs: gc_config.gc_run_timeout_secs,
             last_triggered: Arc::new(AtomicU64::new(0)),
             challenger_agent,
         }
@@ -248,18 +247,16 @@ impl QualityTrigger {
         };
         let project = Project::from_path(self.project_root.clone());
         let min_timeout = self.gc_agent.min_run_timeout_secs();
-        let timeout_secs = if self.gc_run_timeout_secs < min_timeout {
+        if self.gc_run_timeout_secs < min_timeout {
             tracing::warn!(
                 configured = self.gc_run_timeout_secs,
                 minimum = min_timeout,
                 "quality_trigger: gc_run_timeout_secs is below minimum for \
-                 max_drafts_per_run; using minimum of {min_timeout}s to prevent \
+                 max_drafts_per_run; operator-configured timeout may cause a \
                  deterministic timeout loop"
             );
-            min_timeout
-        } else {
-            self.gc_run_timeout_secs
-        };
+        }
+        let timeout_secs = self.gc_run_timeout_secs;
         match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             self.gc_agent.run(&project, &events, &[], agent.as_ref()),

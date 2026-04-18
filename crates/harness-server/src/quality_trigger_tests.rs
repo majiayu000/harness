@@ -27,14 +27,18 @@ async fn make_trigger_with_challenger(
     challenger: Option<Arc<dyn CodeAgent>>,
 ) -> QualityTrigger {
     let events = Arc::new(EventStore::new(dir).await.expect("event store"));
-    let gc_config = harness_core::config::misc::GcConfig::default();
+    let gc_config = harness_core::config::misc::GcConfig {
+        auto_gc_grades,
+        auto_gc_cooldown_secs: cooldown_secs,
+        ..harness_core::config::misc::GcConfig::default()
+    };
     let signal_detector = SignalDetector::new(
         gc_config.signal_thresholds.clone().into(),
         harness_core::types::ProjectId::new(),
     );
     let draft_store = DraftStore::new(dir).expect("draft store");
     let gc_agent = Arc::new(GcAgent::new(
-        gc_config,
+        gc_config.clone(),
         signal_detector,
         draft_store,
         dir.to_path_buf(),
@@ -49,9 +53,7 @@ async fn make_trigger_with_challenger(
         gc_agent,
         agent_registry,
         dir.to_path_buf(),
-        auto_gc_grades,
-        cooldown_secs,
-        120,
+        &gc_config,
         challenger,
     )
 }
@@ -95,14 +97,19 @@ async fn make_trigger_with_gc_timeout(
     primary: Option<Arc<dyn CodeAgent>>,
 ) -> QualityTrigger {
     let events = Arc::new(EventStore::new(dir).await.expect("event store"));
-    let gc_config = harness_core::config::misc::GcConfig::default();
+    let gc_config = harness_core::config::misc::GcConfig {
+        auto_gc_grades,
+        auto_gc_cooldown_secs: cooldown_secs,
+        gc_run_timeout_secs,
+        ..harness_core::config::misc::GcConfig::default()
+    };
     let signal_detector = SignalDetector::new(
         gc_config.signal_thresholds.clone().into(),
         harness_core::types::ProjectId::new(),
     );
     let draft_store = DraftStore::new(dir).expect("draft store");
     let gc_agent = Arc::new(GcAgent::new(
-        gc_config,
+        gc_config.clone(),
         signal_detector,
         draft_store,
         dir.to_path_buf(),
@@ -117,9 +124,7 @@ async fn make_trigger_with_gc_timeout(
         gc_agent,
         agent_registry,
         dir.to_path_buf(),
-        auto_gc_grades,
-        cooldown_secs,
-        gc_run_timeout_secs,
+        &gc_config,
         None,
     )
 }

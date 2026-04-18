@@ -137,9 +137,7 @@ pub(crate) async fn build_intake(
             engines.gc_agent.clone(),
             server.agent_registry.clone(),
             project_root.to_path_buf(),
-            gc_cfg.auto_gc_grades.clone(),
-            gc_cfg.auto_gc_cooldown_secs,
-            gc_cfg.gc_run_timeout_secs,
+            gc_cfg,
             challenger,
         ))
     };
