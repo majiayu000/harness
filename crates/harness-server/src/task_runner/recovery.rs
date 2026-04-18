@@ -158,6 +158,220 @@ impl TaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_runner::{TaskState, TaskStatus};
+    use harness_core::types::TaskId as ConcreteTaskId;
+    use std::sync::Arc;
+
+    // Serialize tests that temporarily prepend a fake `gh` binary to PATH so
+    // that concurrent tests don't see each other's PATH mutations.
+    // tokio::sync::Mutex::const_new works as a process-global static.
+    static GH_PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Write a shell script named `gh` to `dir` that prints `stdout` and exits
+    /// with `exit_code`.  Marks the file executable on Unix.
+    fn write_fake_gh(dir: &std::path::Path, stdout: &str, exit_code: i32) {
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\nexit {}\n",
+            stdout, exit_code
+        );
+        let path = dir.join("gh");
+        std::fs::write(&path, &script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    async fn open_store(dir: &std::path::Path) -> Arc<super::super::store::TaskStore> {
+        super::super::store::TaskStore::open(&dir.join("tasks.db"))
+            .await
+            .unwrap()
+    }
+
+    // ── validate_recovered_tasks behaviour tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn validate_recovered_empty_cache_returns_early_no_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path()).await;
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        let cb: CompletionCallback = Arc::new(move |_| {
+            fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {})
+        });
+        store.validate_recovered_tasks(Some(cb)).await;
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::SeqCst),
+            "callback must not fire when there are no pending PR tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_recovered_unparseable_url_skips_task_leaves_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path()).await;
+        let mut task = TaskState::new(ConcreteTaskId("t-bad-url".to_string()));
+        task.pr_url = Some("not-a-github-pr-url".to_string());
+        let task_id = task.id.clone();
+        store.cache.insert(task_id.clone(), task);
+
+        store.validate_recovered_tasks(None).await;
+
+        assert!(
+            matches!(store.get(&task_id).unwrap().status, TaskStatus::Pending),
+            "task with unparseable PR URL must remain Pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_recovered_merged_pr_marks_task_done_invokes_callback() {
+        let _path_lock = GH_PATH_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_gh(dir.path(), "MERGED", 0);
+
+        let store = open_store(dir.path()).await;
+        let mut task = TaskState::new(ConcreteTaskId("t-merged".to_string()));
+        task.pr_url = Some("https://github.com/owner/repo/pull/10".to_string());
+        let task_id = task.id.clone();
+        store.cache.insert(task_id.clone(), task);
+
+        let cb_states: Arc<tokio::sync::Mutex<Vec<TaskState>>> = Default::default();
+        let cb_clone = cb_states.clone();
+        let cb: CompletionCallback = Arc::new(move |s| {
+            let states = cb_clone.clone();
+            Box::pin(async move {
+                states.lock().await.push(s);
+            })
+        });
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: protected by GH_PATH_LOCK; no concurrent test modifies PATH.
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.path().display(), old_path)) };
+        store.validate_recovered_tasks(Some(cb)).await;
+        unsafe { std::env::set_var("PATH", &old_path) };
+
+        assert!(
+            matches!(store.get(&task_id).unwrap().status, TaskStatus::Done),
+            "MERGED PR must transition task to Done"
+        );
+        assert_eq!(
+            cb_states.lock().await.len(),
+            1,
+            "completion callback must be invoked exactly once for MERGED"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_recovered_closed_pr_marks_task_failed_invokes_callback() {
+        let _path_lock = GH_PATH_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_gh(dir.path(), "CLOSED", 0);
+
+        let store = open_store(dir.path()).await;
+        let mut task = TaskState::new(ConcreteTaskId("t-closed".to_string()));
+        task.pr_url = Some("https://github.com/owner/repo/pull/11".to_string());
+        let task_id = task.id.clone();
+        store.cache.insert(task_id.clone(), task);
+
+        let cb_states: Arc<tokio::sync::Mutex<Vec<TaskState>>> = Default::default();
+        let cb_clone = cb_states.clone();
+        let cb: CompletionCallback = Arc::new(move |s| {
+            let states = cb_clone.clone();
+            Box::pin(async move {
+                states.lock().await.push(s);
+            })
+        });
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: protected by GH_PATH_LOCK; no concurrent test modifies PATH.
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.path().display(), old_path)) };
+        store.validate_recovered_tasks(Some(cb)).await;
+        unsafe { std::env::set_var("PATH", &old_path) };
+
+        assert!(
+            matches!(store.get(&task_id).unwrap().status, TaskStatus::Failed),
+            "CLOSED PR must transition task to Failed"
+        );
+        assert_eq!(
+            cb_states.lock().await.len(),
+            1,
+            "completion callback must be invoked exactly once for CLOSED"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_recovered_open_pr_leaves_task_pending_no_callback() {
+        let _path_lock = GH_PATH_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_gh(dir.path(), "OPEN", 0);
+
+        let store = open_store(dir.path()).await;
+        let mut task = TaskState::new(ConcreteTaskId("t-open".to_string()));
+        task.pr_url = Some("https://github.com/owner/repo/pull/12".to_string());
+        let task_id = task.id.clone();
+        store.cache.insert(task_id.clone(), task);
+
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        let cb: CompletionCallback = Arc::new(move |_| {
+            fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {})
+        });
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: protected by GH_PATH_LOCK; no concurrent test modifies PATH.
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.path().display(), old_path)) };
+        store.validate_recovered_tasks(Some(cb)).await;
+        unsafe { std::env::set_var("PATH", &old_path) };
+
+        assert!(
+            matches!(store.get(&task_id).unwrap().status, TaskStatus::Pending),
+            "OPEN PR must leave task Pending"
+        );
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::SeqCst),
+            "callback must not fire for an OPEN PR"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_recovered_gh_nonzero_exit_leaves_task_pending() {
+        let _path_lock = GH_PATH_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_gh(dir.path(), "error: repository not found", 1);
+
+        let store = open_store(dir.path()).await;
+        let mut task = TaskState::new(ConcreteTaskId("t-gh-fail".to_string()));
+        task.pr_url = Some("https://github.com/owner/repo/pull/13".to_string());
+        let task_id = task.id.clone();
+        store.cache.insert(task_id.clone(), task);
+
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        let cb: CompletionCallback = Arc::new(move |_| {
+            fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {})
+        });
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: protected by GH_PATH_LOCK; no concurrent test modifies PATH.
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.path().display(), old_path)) };
+        store.validate_recovered_tasks(Some(cb)).await;
+        unsafe { std::env::set_var("PATH", &old_path) };
+
+        assert!(
+            matches!(store.get(&task_id).unwrap().status, TaskStatus::Pending),
+            "gh non-zero exit must leave task Pending"
+        );
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::SeqCst),
+            "callback must not fire when gh exits non-zero"
+        );
+    }
+
+    // ── parse_pr_url unit tests (pre-existing) ───────────────────────────────
 
     #[test]
     fn parse_pr_url_standard() {

@@ -752,5 +752,19 @@ impl TaskStore {
 }
 
 #[cfg(test)]
+impl TaskStore {
+    /// Insert a task directly into both the in-memory cache and the backing
+    /// SQLite DB.  Test setup only — normal code uses `register_pending_task`.
+    pub(crate) async fn insert_task_for_test(&self, task: &TaskState) -> anyhow::Result<()> {
+        self.db.insert(task).await?;
+        self.persist_locks
+            .entry(task.id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())));
+        self.cache.insert(task.id.clone(), task.clone());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 #[path = "store_tests.rs"]
 mod tests;

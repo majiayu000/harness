@@ -701,3 +701,135 @@ pub(crate) async fn redispatch_checkpoint_tasks(state: &Arc<AppState>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        task_runner::{self, TaskState, TaskStatus},
+        test_helpers::{HomeGuard, HOME_LOCK},
+    };
+    use harness_core::types::TaskId;
+    use std::sync::Arc;
+
+    // ── redispatch_recovered_pr_tasks: unparseable pr_url → fail-close ───────
+
+    #[tokio::test]
+    async fn redispatch_recovered_pr_tasks_bad_url_marks_failed_fires_callback() {
+        let _lock = HOME_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fake_home = dir.path().join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        // SAFETY: HOME_LOCK is held; HomeGuard::drop restores HOME unconditionally.
+        let _env = unsafe { HomeGuard::set(&fake_home) };
+
+        // Oneshot channel used to detect callback invocation without polling.
+        let (tx, rx) = tokio::sync::oneshot::channel::<TaskState>();
+        let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
+        let cb: task_runner::CompletionCallback = Arc::new(move |s| {
+            let sender = tx.clone();
+            Box::pin(async move {
+                if let Some(ch) = sender.lock().await.take() {
+                    let _ = ch.send(s);
+                }
+            })
+        });
+
+        let mut state = crate::test_helpers::make_test_state(dir.path())
+            .await
+            .unwrap();
+        state.intake.completion_callback = Some(cb);
+        let state = Arc::new(state);
+
+        // Insert a Pending task with an unparseable pr_url into the cache only
+        // (list_all() reads the cache, so no DB row is needed for this path).
+        let mut task = TaskState::new(TaskId("t-bad-pr".to_string()));
+        task.pr_url = Some("not-a-github-url".to_string());
+        let task_id = task.id.clone();
+        state.core.tasks.cache.insert(task_id.clone(), task);
+
+        redispatch_recovered_pr_tasks(&state);
+
+        // The fail-close branch fires the callback; await it with a 5-second guard.
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("completion callback must fire within 5 s for a bad-URL task")
+            .expect("oneshot sender must not be dropped before firing");
+
+        assert!(
+            matches!(completed.status, TaskStatus::Failed),
+            "task with unparseable pr_url must be marked Failed; got {:?}",
+            completed.status
+        );
+        assert!(
+            completed
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unparseable"),
+            "error must mention 'unparseable'; got: {:?}",
+            completed.error
+        );
+    }
+
+    // ── redispatch_checkpoint_tasks: prompt-only task → fail-close ───────────
+
+    #[tokio::test]
+    async fn redispatch_checkpoint_tasks_prompt_task_marks_failed_fires_callback() {
+        let _lock = HOME_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fake_home = dir.path().join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        // SAFETY: HOME_LOCK is held; HomeGuard::drop restores HOME unconditionally.
+        let _env = unsafe { HomeGuard::set(&fake_home) };
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<TaskState>();
+        let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
+        let cb: task_runner::CompletionCallback = Arc::new(move |s| {
+            let sender = tx.clone();
+            Box::pin(async move {
+                if let Some(ch) = sender.lock().await.take() {
+                    let _ = ch.send(s);
+                }
+            })
+        });
+
+        let mut state = crate::test_helpers::make_test_state(dir.path())
+            .await
+            .unwrap();
+        state.intake.completion_callback = Some(cb);
+        let state = Arc::new(state);
+
+        // Build a Pending task whose description marks it as a prompt-only task.
+        // pending_tasks_with_checkpoint() JOINs tasks + task_checkpoints in the DB,
+        // so both rows must be present before calling redispatch_checkpoint_tasks.
+        let mut task = TaskState::new(TaskId("t-prompt".to_string()));
+        task.description = Some("prompt task".to_string());
+        state.core.tasks.insert_task_for_test(&task).await.unwrap();
+        // A non-null triage_output is required for the JOIN filter to match.
+        state
+            .core
+            .tasks
+            .write_checkpoint(&task.id, Some("triage"), None, None, "triage")
+            .await
+            .unwrap();
+
+        redispatch_checkpoint_tasks(&state).await;
+
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("completion callback must fire within 5 s for a prompt task")
+            .expect("oneshot sender must not be dropped before firing");
+
+        assert!(
+            matches!(completed.status, TaskStatus::Failed),
+            "prompt-only checkpoint task must be marked Failed; got {:?}",
+            completed.status
+        );
+        assert!(
+            completed.error.as_deref().unwrap_or("").contains("prompt"),
+            "error must mention prompt recovery failure; got: {:?}",
+            completed.error
+        );
+    }
+}
