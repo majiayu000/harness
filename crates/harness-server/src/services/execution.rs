@@ -23,6 +23,11 @@ use tokio::sync::RwLock;
 pub enum EnqueueTaskError {
     BadRequest(String),
     Internal(String),
+    /// The server is inside a maintenance window; the caller should retry after
+    /// `retry_after_secs` seconds.
+    MaintenanceWindow {
+        retry_after_secs: u64,
+    },
 }
 
 impl std::fmt::Display for EnqueueTaskError {
@@ -30,6 +35,12 @@ impl std::fmt::Display for EnqueueTaskError {
         match self {
             Self::BadRequest(msg) => write!(f, "bad request: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
+            Self::MaintenanceWindow { retry_after_secs } => {
+                write!(
+                    f,
+                    "maintenance window active; retry after {retry_after_secs}s"
+                )
+            }
         }
     }
 }

@@ -51,6 +51,8 @@ pub struct HarnessConfig {
     pub review: ReviewConfig,
     #[serde(default)]
     pub retry_scheduler: RetrySchedulerConfig,
+    #[serde(default)]
+    pub maintenance_window: MaintenanceWindowConfig,
     /// Projects declared in the config file. Registered on server startup.
     #[serde(default)]
     pub projects: Vec<ProjectEntry>,

@@ -104,8 +104,26 @@ impl IntakeOrchestrator {
             "intake orchestrator started"
         );
         tokio::spawn(async move {
+            let mw = &state.core.server.config.maintenance_window;
+            let mut was_in_window = state
+                .core
+                .maintenance_active
+                .load(std::sync::atomic::Ordering::Relaxed);
             loop {
                 tokio::time::sleep(self.poll_interval).await;
+                let in_window = mw.in_quiet_window(chrono::Utc::now());
+                if in_window != was_in_window {
+                    state
+                        .core
+                        .maintenance_active
+                        .store(in_window, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(in_window, "maintenance window state changed");
+                    was_in_window = in_window;
+                }
+                if in_window {
+                    tracing::debug!("intake: quiet window active, skipping tick");
+                    continue;
+                }
                 self.poll_tick(&state).await;
             }
         });
@@ -347,7 +365,7 @@ async fn run_repo_sprint(
     let max_slots = 4usize; // matches max_concurrent in config
     let start = tokio::time::Instant::now();
 
-    loop {
+    'sprint: loop {
         // All done?
         if completed.len() + cancelled_sprint.len() >= all_task_issues.len() && running.is_empty() {
             break;
@@ -417,6 +435,15 @@ async fn run_repo_sprint(
                         tracing::warn!(external_id = %ext_id, "intake: mark_dispatched update failed: {e}");
                     }
                     running.insert(issue_num, task_id);
+                }
+                Err(crate::services::execution::EnqueueTaskError::MaintenanceWindow { .. }) => {
+                    tracing::info!(
+                        repo,
+                        external_id = %ext_id,
+                        "intake: quiet window active, deferring sprint"
+                    );
+                    source.unmark_dispatched(&ext_id).await;
+                    break 'sprint;
                 }
                 Err(e) => {
                     tracing::error!(repo, external_id = %ext_id, "intake: failed to spawn: {e:?}");
