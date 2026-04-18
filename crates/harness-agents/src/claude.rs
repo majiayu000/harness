@@ -253,11 +253,25 @@ impl CodeAgent for ClaudeCodeAgent {
         crate::strip_claude_env(&mut cmd);
         cmd.envs(&req.env_vars);
 
-        let mut child = cmd.spawn().map_err(|error| {
-            harness_core::error::HarnessError::AgentExecution(format!(
-                "failed to run claude: {error}"
-            ))
-        })?;
+        // ETXTBSY (error 26) occurs on Linux when a security scanner or indexer
+        // briefly opens the executable for writing after it is written. Retry once.
+        let spawn_result = cmd.spawn();
+        let mut child = match spawn_result {
+            Ok(child) => child,
+            Err(ref e) if e.raw_os_error() == Some(26) => {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                cmd.spawn().map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "failed to run claude: {error}"
+                    ))
+                })?
+            }
+            Err(error) => {
+                return Err(harness_core::error::HarnessError::AgentExecution(format!(
+                    "failed to run claude: {error}"
+                )));
+            }
+        };
 
         if let Some(stderr) = child.stderr.take() {
             let agent = self.name().to_string();
