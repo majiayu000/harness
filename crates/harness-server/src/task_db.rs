@@ -871,6 +871,48 @@ impl TaskDb {
         Ok((global.0 as u64, global.1 as u64, by_project))
     }
 
+    /// Count tasks that reached `done` status with `updated_at >= since`.
+    ///
+    /// `since` must be an ISO-8601 UTC timestamp (e.g. `2026-04-17T23:00:00Z`).
+    /// Uses the `idx_tasks_status_updated` index. Used by the system overview
+    /// endpoint to compute "merged in last 24h" without loading full task rows.
+    pub async fn count_done_since(&self, since: &str) -> anyhow::Result<u64> {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM tasks WHERE status = 'done' AND updated_at >= ?")
+                .bind(since)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.0 as u64)
+    }
+
+    /// Per-(project, hour-bucket) count of tasks that reached `done` after `since`.
+    ///
+    /// Returns rows of `(project_key, hour_iso, count)` where `hour_iso` is the
+    /// `updated_at` timestamp truncated to the hour in UTC (format
+    /// `YYYY-MM-DDTHH:00:00Z`). Rows with `project IS NULL` are reported with
+    /// an empty project key. Used to build the fleet-throughput stacked-area
+    /// chart (per project, per hour over the window).
+    pub async fn done_per_project_hour_since(
+        &self,
+        since: &str,
+    ) -> anyhow::Result<Vec<(String, String, u64)>> {
+        let rows: Vec<(Option<String>, String, i64)> = sqlx::query_as(
+            "SELECT project, \
+                    strftime('%Y-%m-%dT%H:00:00Z', updated_at) AS hour, \
+                    COUNT(*) \
+             FROM tasks \
+             WHERE status = 'done' AND updated_at >= ? \
+             GROUP BY project, hour",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(p, h, c)| (p.unwrap_or_default(), h, c as u64))
+            .collect())
+    }
+
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let sql = format!(
