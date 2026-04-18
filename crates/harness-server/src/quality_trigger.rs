@@ -247,16 +247,15 @@ impl QualityTrigger {
         };
         let project = Project::from_path(self.project_root.clone());
         let min_timeout = self.gc_agent.min_run_timeout_secs();
-        if self.gc_run_timeout_secs < min_timeout {
+        let timeout_secs = self.gc_run_timeout_secs.max(min_timeout);
+        if timeout_secs != self.gc_run_timeout_secs {
             tracing::warn!(
                 configured = self.gc_run_timeout_secs,
-                minimum = min_timeout,
-                "quality_trigger: gc_run_timeout_secs is below minimum for \
-                 max_drafts_per_run; operator-configured timeout may cause a \
-                 deterministic timeout loop"
+                effective = timeout_secs,
+                "quality_trigger: gc_run_timeout_secs raised to minimum for \
+                 max_drafts_per_run to prevent deterministic timeout loop"
             );
         }
-        let timeout_secs = self.gc_run_timeout_secs;
         match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             self.gc_agent.run(&project, &events, &[], agent.as_ref()),

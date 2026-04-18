@@ -101,6 +101,9 @@ async fn make_trigger_with_gc_timeout(
         auto_gc_grades,
         auto_gc_cooldown_secs: cooldown_secs,
         gc_run_timeout_secs,
+        // max_drafts_per_run = 0 → min_run_timeout_secs() = 0, so the
+        // configured gc_run_timeout_secs is used as-is without clamping.
+        max_drafts_per_run: 0,
         ..harness_core::config::misc::GcConfig::default()
     };
     let signal_detector = SignalDetector::new(
@@ -572,14 +575,14 @@ async fn challenger_no_ctx_skips_cross_review() {
 
 // --- gc_run timeout tests ---
 
-// Timeout must NOT reset last_triggered to 0: drafts may have been saved
-// incrementally before the cancellation point; an immediate retry would create
-// duplicate pending drafts for the same signals.
+// last_triggered must be set before gc_agent.run and never reset by the timeout
+// handler. max_drafts_per_run = 0 (via helper) ensures min_run_timeout_secs() = 0
+// so gc_run_timeout_secs = 1 is used as-is; the run completes before the timeout,
+// but last_triggered is preserved in all cases.
 #[tokio::test]
 async fn gc_run_timeout_preserves_cooldown() {
     let dir = tempfile::tempdir().unwrap();
     // 5 security-hook blocks → grade D, zero cooldown so GC fires immediately.
-    // gc_run_timeout_secs = 1 so SlowAgent (3 s sleep) triggers the timeout path.
     let trigger =
         make_trigger_with_gc_timeout(dir.path(), vec![Grade::D], 0, 1, Some(Arc::new(SlowAgent)))
             .await;
