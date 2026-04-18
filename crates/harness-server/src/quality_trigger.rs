@@ -259,9 +259,14 @@ impl QualityTrigger {
                 tracing::warn!("quality_trigger: gc_agent.run failed: {e}");
             }
             Err(_elapsed) => {
+                // Reset last_triggered so the cooldown window is not wasted: the
+                // run was cancelled before the checkpoint could be written, so the
+                // next eligible check must be allowed to retry rather than being
+                // suppressed for a full cooldown period.
+                self.last_triggered.store(0, Ordering::Relaxed);
                 tracing::warn!(
                     "quality_trigger: gc_agent.run timed out after {timeout_secs}s; \
-                     skipping GC this cycle"
+                     cooldown reset to allow immediate retry"
                 );
             }
         }

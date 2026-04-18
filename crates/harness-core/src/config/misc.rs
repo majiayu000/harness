@@ -204,7 +204,10 @@ pub struct GcConfig {
     /// Tools allowed during GC agent execution. Default: ["Read", "Grep", "Glob"].
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
-    /// Seconds before an auto-triggered gc_agent.run() call is cancelled. Default: 120.
+    /// Seconds before an auto-triggered gc_agent.run() call is cancelled.
+    /// Must be large enough to cover up to `max_drafts_per_run` sequential agent
+    /// calls; the default (600 s) equals the default max_drafts_per_run (5) ×
+    /// 120 s per call.
     #[serde(default = "default_gc_run_timeout_secs")]
     pub gc_run_timeout_secs: u64,
 }
@@ -258,7 +261,8 @@ fn default_gc_auto_pr() -> bool {
 }
 
 fn default_gc_run_timeout_secs() -> u64 {
-    120
+    // default max_drafts_per_run (5) × 120 s per agent call
+    600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
