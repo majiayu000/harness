@@ -476,18 +476,36 @@ function showDetail(task) {
 function lineDiff(a, b) {
   const aLines = a.split("\n");
   const bLines = b.split("\n");
-  const aSet = new Set(aLines);
-  const bSet = new Set(bLines);
-  let html = "";
-  for (const line of aLines) {
-    if (!bSet.has(line)) {
-      html += `<div class="diff-removed">- ${escapeHtml(line)}</div>`;
+  const MAX = 500;
+  if (aLines.length > MAX || bLines.length > MAX) {
+    return "<em>Prompts too large for line diff</em>";
+  }
+  const m = aLines.length, n = bLines.length;
+  const dp = Array.from({length: m + 1}, () => new Uint16Array(n + 1));
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = aLines[i - 1] === bLines[j - 1]
+        ? dp[i - 1][j - 1] + 1
+        : Math.max(dp[i - 1][j], dp[i][j - 1]);
     }
   }
-  for (const line of bLines) {
-    if (!aSet.has(line)) {
-      html += `<div class="diff-added">+ ${escapeHtml(line)}</div>`;
+  const ops = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && aLines[i - 1] === bLines[j - 1]) {
+      i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      ops.push({type: "add", line: bLines[--j]});
+    } else {
+      ops.push({type: "rem", line: aLines[--i]});
     }
+  }
+  let html = "";
+  for (let k = ops.length - 1; k >= 0; k--) {
+    const op = ops[k];
+    html += op.type === "add"
+      ? `<div class="diff-added">+ ${escapeHtml(op.line)}</div>`
+      : `<div class="diff-removed">- ${escapeHtml(op.line)}</div>`;
   }
   return html || "<em>No line-level differences</em>";
 }
@@ -543,7 +561,7 @@ async function fetchAndRenderPrompts(taskId) {
     const preview = p.prompt.length > 2048 ? p.prompt.slice(0, 2048) + "\u2026" : p.prompt;
     panel.innerHTML = `<pre class="detail-pre prompt-pre">${escapeHtml(preview)}</pre>` +
       (p.prompt.length > 2048
-        ? `<button class="prompt-expand-btn" data-full="${encodeURIComponent(p.prompt)}" data-panel="${panelId}">Show full prompt</button>`
+        ? `<button class="prompt-expand-btn" data-idx="${idx}" data-panel="${panelId}">Show full prompt</button>`
         : "");
 
     const diffPanel = document.createElement("div");
@@ -581,7 +599,8 @@ async function fetchAndRenderPrompts(taskId) {
   // Wire expand buttons
   section.querySelectorAll(".prompt-expand-btn").forEach(btn => {
     btn.addEventListener("click", () => {
-      const full = decodeURIComponent(btn.dataset.full);
+      const idx = parseInt(btn.dataset.idx, 10);
+      const full = prompts[idx].prompt;
       const panel = document.getElementById(btn.dataset.panel);
       if (panel) panel.querySelector("pre").textContent = full;
       btn.remove();

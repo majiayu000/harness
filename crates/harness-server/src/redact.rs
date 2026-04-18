@@ -14,8 +14,6 @@ fn secret_patterns() -> &'static Vec<Regex> {
             r"ghu_[A-Za-z0-9]{36,}",
             r"gho_[A-Za-z0-9]{36,}",
             r"ghr_[A-Za-z0-9]{36,}",
-            // 40-char hex — SHA1-length tokens (catches legacy API tokens that look like git hashes)
-            r"[0-9a-f]{40}",
             // Authorization header bearer values
             r"Bearer\s+\S+",
             // OpenAI / Anthropic style keys: sk-xxx, sk-proj-xxx, sk-ant-xxx, sk-svcacct-xxx, etc.
