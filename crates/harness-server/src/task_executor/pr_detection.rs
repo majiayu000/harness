@@ -230,9 +230,11 @@ pub(crate) async fn find_existing_pr_for_issue(
     let items: Vec<GhPrListItem> = serde_json::from_slice(&output.stdout)
         .map_err(|e| anyhow::anyhow!("invalid JSON from `gh pr list`: {e}"))?;
 
+    let repo_slug = detect_repo_slug(project).await;
+
     Ok(items
         .into_iter()
-        .find(|item| pr_claims_to_close_issue(item, issue))
+        .find(|item| pr_claims_to_close_issue(item, issue, repo_slug.as_deref()))
         .map(|item| (item.number, item.head_ref_name, item.url)))
 }
 
@@ -248,29 +250,38 @@ pub(crate) async fn find_existing_pr_for_issue(
 /// so any manually-created or unrelated PR whose title happens to end with
 /// `(#N)` (e.g. `chore: cleanup scheduler (#799)`) would be falsely matched.
 /// Only GitHub's closing-keyword syntax is reliable.
-fn pr_claims_to_close_issue(item: &GhPrListItem, issue: u64) -> bool {
+///
+/// `repo_slug` is the `owner/repo` identifier for the current repository.
+/// When provided, repo-qualified references (e.g. `Fixes owner/repo#N`) are
+/// only accepted if the qualifier matches `repo_slug`, preventing cross-repo
+/// false positives. When `None` the qualifier is accepted as-is.
+fn pr_claims_to_close_issue(item: &GhPrListItem, issue: u64, repo_slug: Option<&str>) -> bool {
+    let title = item.title.to_ascii_lowercase();
+    let body = item.body.to_ascii_lowercase();
+    // Scan title and body independently so that a keyword at the end of the
+    // title cannot be paired with `#N` at the start of the body.
+    field_claims_to_close_issue(&title, issue, repo_slug)
+        || field_claims_to_close_issue(&body, issue, repo_slug)
+}
+
+fn field_claims_to_close_issue(field: &str, issue: u64, repo_slug: Option<&str>) -> bool {
     // GitHub's auto-close keywords (case-insensitive per GitHub docs).
     // See: https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/using-keywords-in-issues-and-pull-requests
     // Word boundary on the left prevents e.g. "prefixes #5" from matching "fixes #5".
     const CLOSE_KEYWORDS: &[&str] = &[
         "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
     ];
-    let haystack = format!(
-        "{}\n{}",
-        item.title.to_ascii_lowercase(),
-        item.body.to_ascii_lowercase()
-    );
     let needle = format!("#{issue}");
     // Scan each occurrence of `#N` and check:
     //   1. the preceding token is a close keyword, AND
-    //   2. the matched `#N` is not itself a prefix of a longer issue number
-    //      (e.g. scanning for `#79` must not match `#791`).
-    for (idx, _) in haystack.match_indices(&needle) {
-        let after = &haystack[idx + needle.len()..];
-        if after.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+    //   2. the matched `#N` is not itself a prefix of a longer issue reference
+    //      (e.g. scanning for `#79` must not match `#791` or `#791abc`).
+    for (idx, _) in field.match_indices(needle.as_str()) {
+        let after = &field[idx + needle.len()..];
+        if after.chars().next().is_some_and(|c| c.is_alphanumeric()) {
             continue;
         }
-        let prefix = &haystack[..idx];
+        let prefix = &field[..idx];
         // Skip trailing whitespace/punctuation between keyword and `#N`.
         let trimmed = prefix.trim_end_matches(|c: char| c.is_whitespace() || c == ':');
         if CLOSE_KEYWORDS
@@ -282,6 +293,13 @@ fn pr_claims_to_close_issue(item: &GhPrListItem, issue: u64) -> bool {
         // Also handle GitHub's repo-qualified syntax: "Fixes owner/repo#N".
         // Strip the trailing "owner/repo" slug and check the remainder for a keyword.
         if let Some(remainder) = strip_trailing_repo_qualifier(trimmed) {
+            // Reject references to a different repository.
+            if let Some(slug) = repo_slug {
+                let qualifier = trimmed[remainder.len()..].trim();
+                if !qualifier.eq_ignore_ascii_case(slug) {
+                    continue;
+                }
+            }
             let inner = remainder.trim_end_matches(|c: char| c.is_whitespace() || c == ':');
             if CLOSE_KEYWORDS
                 .iter()
@@ -406,39 +424,39 @@ mod tests {
         // so a manual PR titled "chore: cleanup (#791)" without any closing
         // keyword must NOT be matched for issue 791.
         let it = item("fix(dedup): guard against closed PRs (#791)", "");
-        assert!(!pr_claims_to_close_issue(&it, 791));
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
     fn title_suffix_with_close_keyword_matches() {
         // A PR that has both the suffix AND a closing keyword in the body is fine.
         let it = item("fix(dedup): guard against closed PRs (#791)", "Fixes #791");
-        assert!(pr_claims_to_close_issue(&it, 791));
+        assert!(pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
     fn closes_keyword_in_body_matches() {
         let it = item("some PR", "This PR closes #791 as agreed.");
-        assert!(pr_claims_to_close_issue(&it, 791));
+        assert!(pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
     fn fixes_keyword_in_body_matches() {
         let it = item("some PR", "Fixes #791");
-        assert!(pr_claims_to_close_issue(&it, 791));
+        assert!(pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
     fn resolves_keyword_case_insensitive() {
         let it = item("RESOLVES #791 finally", "");
-        assert!(pr_claims_to_close_issue(&it, 791));
+        assert!(pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
     fn closes_with_colon_between_keyword_and_number() {
         // "closes: #791" — trim trailing colon before keyword check.
         let it = item("", "closes: #791");
-        assert!(pr_claims_to_close_issue(&it, 791));
+        assert!(pr_claims_to_close_issue(&it, 791, None));
     }
 
     // --- pr_claims_to_close_issue: negative cases (the #799 bug) ---
@@ -451,39 +469,39 @@ mod tests {
             "feat(scheduler): add periodic retry (#794)",
             "depends on #791 being fixed first",
         );
-        assert!(!pr_claims_to_close_issue(&it, 791));
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
     fn relates_to_does_not_match() {
         let it = item("some PR", "relates to #791");
-        assert!(!pr_claims_to_close_issue(&it, 791));
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
     fn see_also_does_not_match() {
         let it = item("some PR", "See also #791 for context.");
-        assert!(!pr_claims_to_close_issue(&it, 791));
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
     fn word_boundary_prefixes_does_not_match_fix() {
         // "prefixes #791" must NOT match the keyword "fixes".
         let it = item("some PR", "prefixes #791 with a label");
-        assert!(!pr_claims_to_close_issue(&it, 791));
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
     fn different_issue_number_in_close_keyword_does_not_match() {
         // PR closes #100 but we're asking about #791 — must not match.
         let it = item("", "closes #100, mentions #791");
-        assert!(!pr_claims_to_close_issue(&it, 791));
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
     fn title_suffix_for_other_issue_does_not_match() {
         let it = item("fix: something (#100)", "passing reference to #791");
-        assert!(!pr_claims_to_close_issue(&it, 791));
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
@@ -491,7 +509,7 @@ mod tests {
         // "(#791)" appears in the middle of the title but "#812" is the real
         // trailing harness suffix — must NOT match issue 791.
         let it = item("follow-up to prior fix (#791) (#812)", "");
-        assert!(!pr_claims_to_close_issue(&it, 791));
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
@@ -499,7 +517,7 @@ mod tests {
         // "docs: mention prior fix (#791)" — no closing keyword, just a
         // mid-title mention that happens to end a sub-phrase.
         let it = item("docs: mention prior fix (#791) and move on (#812)", "");
-        assert!(!pr_claims_to_close_issue(&it, 791));
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
@@ -507,7 +525,7 @@ mod tests {
         // Codex-flagged regression: scanning for `#79` must NOT match `#791`.
         // A PR body "closes #791" claims to close issue 791, not issue 79.
         let it = item("", "closes #791");
-        assert!(!pr_claims_to_close_issue(&it, 79));
+        assert!(!pr_claims_to_close_issue(&it, 79, None));
     }
 
     #[test]
@@ -515,7 +533,7 @@ mod tests {
         // When asked about #79, a PR body that actually says "closes #79"
         // (e.g. followed by space/punctuation, not another digit) must match.
         let it = item("", "closes #79 and also mentions #791");
-        assert!(pr_claims_to_close_issue(&it, 79));
+        assert!(pr_claims_to_close_issue(&it, 79, None));
     }
 
     // --- repo-qualified close references (Codex P2) ---
@@ -524,27 +542,63 @@ mod tests {
     fn repo_qualified_fixes_matches() {
         // GitHub allows "Fixes owner/repo#N" as a valid closing reference.
         let it = item("", "Fixes majiayu000/harness#791");
-        assert!(pr_claims_to_close_issue(&it, 791));
+        assert!(pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
     fn repo_qualified_closes_matches() {
         let it = item("", "closes owner/repo#791 in this body");
-        assert!(pr_claims_to_close_issue(&it, 791));
+        assert!(pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
     fn repo_qualified_plain_mention_does_not_match() {
         // "related to owner/repo#N" must NOT match — no close keyword.
         let it = item("", "related to majiayu000/harness#791");
-        assert!(!pr_claims_to_close_issue(&it, 791));
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
     fn repo_qualified_boundary_guards_longer_number() {
         // "fixes owner/repo#791" must not match when querying issue 79.
         let it = item("", "fixes owner/repo#791");
-        assert!(!pr_claims_to_close_issue(&it, 79));
+        assert!(!pr_claims_to_close_issue(&it, 79, None));
+    }
+
+    #[test]
+    fn repo_qualified_cross_repo_does_not_match() {
+        // A PR that closes rust-lang/rust#791 must not match issue #791 in our repo.
+        let it = item("", "Fixes rust-lang/rust#791");
+        assert!(!pr_claims_to_close_issue(
+            &it,
+            791,
+            Some("majiayu000/harness")
+        ));
+    }
+
+    #[test]
+    fn repo_qualified_same_repo_matches_with_slug() {
+        let it = item("", "Fixes majiayu000/harness#791");
+        assert!(pr_claims_to_close_issue(
+            &it,
+            791,
+            Some("majiayu000/harness")
+        ));
+    }
+
+    #[test]
+    fn cross_field_keyword_does_not_match() {
+        // "fixes" at the end of the title must NOT pair with "#791" at the start
+        // of the body. Scanning each field independently prevents this.
+        let it = item("CI fixes", "#791 is the main bug");
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
+    }
+
+    #[test]
+    fn trailing_alpha_after_issue_number_does_not_match() {
+        // "fixes #791abc" — alphanumeric character after the number must not match.
+        let it = item("", "fixes #791abc");
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     // --- word_boundary_before ---
@@ -577,7 +631,7 @@ mod tests {
     fn unicode_prefix_does_not_match_keyword() {
         // "éfixes #791" — no word boundary before "fixes", must not match.
         let it = item("", "éfixes #791");
-        assert!(!pr_claims_to_close_issue(&it, 791));
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
@@ -585,7 +639,7 @@ mod tests {
         // "前fixes #791" — CJK character before "fixes". CJK chars are
         // alphanumeric under Unicode (letter category), so no boundary.
         let it = item("", "前fixes #791");
-        assert!(!pr_claims_to_close_issue(&it, 791));
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     // --- parse_harness_mention_command (pre-existing, light coverage) ---
