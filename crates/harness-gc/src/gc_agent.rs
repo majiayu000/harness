@@ -336,7 +336,8 @@ impl GcAgent {
         }
 
         draft.status = DraftStatus::Adopted;
-        self.draft_store.save(&draft)?;
+        self.draft_store
+            .save_if_status(&draft, DraftStatus::Pending)?;
         Ok(())
     }
 

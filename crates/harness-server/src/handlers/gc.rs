@@ -1,9 +1,11 @@
 use crate::http::{resolve_reviewer, AppState};
 use harness_core::{
     config::resolve::resolve_config,
-    types::{Decision, DraftId, Event, ProjectId, SessionId},
+    types::{Decision, DraftId, DraftStatus, Event, ProjectId, SessionId},
 };
-use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR, methods::NOT_FOUND};
+use harness_protocol::{
+    methods::RpcResponse, methods::CONFLICT, methods::INTERNAL_ERROR, methods::NOT_FOUND,
+};
 use std::path::Path;
 
 fn gc_adopt_task_request(
@@ -237,6 +239,16 @@ pub async fn gc_adopt(
         }
         Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
     };
+    if draft.status != DraftStatus::Pending {
+        return RpcResponse::error(
+            id,
+            CONFLICT,
+            format!(
+                "cannot adopt draft {}: status is {:?}, expected Pending",
+                draft_id, draft.status
+            ),
+        );
+    }
     let artifact_paths: Vec<String> = draft
         .artifacts
         .iter()
@@ -368,6 +380,22 @@ pub async fn gc_adopt(
             )
         }
         Err(e) => {
+            // Re-read to distinguish a concurrent state-conflict from a true internal error.
+            let error_code = state
+                .engines
+                .gc_agent
+                .draft_store()
+                .get(&draft_id)
+                .ok()
+                .flatten()
+                .map(|d| {
+                    if d.status != DraftStatus::Pending {
+                        CONFLICT
+                    } else {
+                        INTERNAL_ERROR
+                    }
+                })
+                .unwrap_or(INTERNAL_ERROR);
             log_gc_event(
                 state,
                 "gc_adopt",
@@ -376,7 +404,7 @@ pub async fn gc_adopt(
                 None,
             )
             .await;
-            RpcResponse::error(id, INTERNAL_ERROR, e.to_string())
+            RpcResponse::error(id, error_code, e.to_string())
         }
     }
 }
