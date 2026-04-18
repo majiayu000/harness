@@ -335,7 +335,7 @@ impl CodeAgent for CapturingAgent {
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         *self.captured_root.lock().unwrap() = Some(req.project_root.clone());
         Ok(AgentResponse {
-            output: String::new(),
+            output: "Agent: project root captured, nothing to implement".to_string(),
             stderr: String::new(),
             items: vec![],
             token_usage: TokenUsage::default(),
@@ -351,7 +351,7 @@ impl CodeAgent for CapturingAgent {
     ) -> harness_core::error::Result<()> {
         *self.captured_root.lock().unwrap() = Some(req.project_root.clone());
         tx.send(StreamItem::MessageDelta {
-            text: String::new(),
+            text: "Agent: project root captured, nothing to implement".to_string(),
         })
         .await
         .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;

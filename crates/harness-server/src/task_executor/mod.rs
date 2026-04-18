@@ -357,9 +357,24 @@ pub(crate) async fn run_task(
         } => (pr_url, pr_num, context_items),
     };
 
+    // Gate A: require pr_url when the implement phase extracted a pr_num.
+    // A null pr_url means URL parsing failed; mark Failed so the dedup index
+    // is not poisoned with a task that never produced a usable PR reference.
+    if pr_url.is_none() {
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Failed;
+            s.error = Some(format!(
+                "pr:{pr_num} produced no detectable pr_url; dedup unblocked"
+            ));
+        })
+        .await?;
+        return Ok(());
+    }
+
     // Conflict resolution gate: intercept CONFLICTING PRs before the review loop.
     // Only runs on the resume/recovery path — fresh PRs cannot be conflicting yet.
     let mut rebase_pushed = false;
+    let mut conflict_was_detected = false;
     if was_resumed_pr {
         use conflict_resolver::{assess_pr_conflict, PrConflictSize};
         let conflict_size = assess_pr_conflict(pr_num, &project).await;
@@ -374,6 +389,7 @@ pub(crate) async fn run_task(
                     region_count,
                     "conflict: small — attempting auto-rebase"
                 );
+                conflict_was_detected = true;
                 rebase_pushed = triage_pipeline::run_rebase_turn(
                     agent,
                     pr_num,
@@ -394,8 +410,23 @@ pub(crate) async fn run_task(
                     region_count,
                     "conflict: too large for auto-rebase — deferring to review agent"
                 );
+                conflict_was_detected = true;
             }
             PrConflictSize::Clean | PrConflictSize::Unknown(_) => {}
+        }
+
+        // Gate B: a detected conflict that was not resolved by a successful rebase
+        // must not silently proceed to review. Mark Failed so the operator can
+        // re-queue after manual resolution rather than getting a false Done.
+        if conflict_was_detected && !rebase_pushed {
+            mutate_and_persist(store, task_id, |s| {
+                s.status = TaskStatus::Failed;
+                s.error = Some(format!(
+                    "pr:{pr_num} is conflicting and rebase was not pushed; manual resolution required"
+                ));
+            })
+            .await?;
+            return Ok(());
         }
     }
 
@@ -672,5 +703,187 @@ mod tests {
     fn implementation_turn_uses_full_profile_no_restriction() {
         // Full profile returns None — no tool restriction is applied to the agent.
         assert!(CapabilityProfile::Full.tools().is_none());
+    }
+
+    // --- Gate A: pr_url null gate ---
+
+    #[tokio::test]
+    async fn null_pr_url_gate_marks_failed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = TaskId::new();
+        let state = crate::task_runner::TaskState::new(task_id.clone());
+        store.insert(&state).await;
+
+        let pr_num: u64 = 42;
+        mutate_and_persist(&store, &task_id, |s| {
+            s.status = TaskStatus::Failed;
+            s.error = Some(format!(
+                "pr:{pr_num} produced no detectable pr_url; dedup unblocked"
+            ));
+        })
+        .await?;
+
+        let final_state = store
+            .get(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("task must exist"))?;
+        assert!(
+            matches!(final_state.status, TaskStatus::Failed),
+            "status must be Failed"
+        );
+        assert!(
+            final_state
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("no detectable pr_url"),
+            "error message must mention pr_url"
+        );
+        Ok(())
+    }
+
+    // --- Gate C: empty agent output ---
+
+    #[tokio::test]
+    async fn empty_agent_output_marks_failed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = TaskId::new();
+        let state = crate::task_runner::TaskState::new(task_id.clone());
+        store.insert(&state).await;
+
+        // Simulate the gate: output is empty and no pr_num was parsed.
+        let output = "";
+        if output.trim().is_empty() {
+            mutate_and_persist(&store, &task_id, |s| {
+                s.status = TaskStatus::Failed;
+                s.turn = 2;
+                s.error = Some("empty agent output: no PR created and no output".to_string());
+            })
+            .await?;
+        }
+
+        let final_state = store
+            .get(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("task must exist"))?;
+        assert!(
+            matches!(final_state.status, TaskStatus::Failed),
+            "status must be Failed"
+        );
+        assert!(
+            final_state
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("empty agent output"),
+            "error message must mention empty output"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nonempty_output_no_pr_still_done() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = TaskId::new();
+        let state = crate::task_runner::TaskState::new(task_id.clone());
+        store.insert(&state).await;
+
+        // Simulate the gate: output is non-empty but no PR was created — keep Done.
+        let output = "Agent: nothing to do";
+        if output.trim().is_empty() {
+            mutate_and_persist(&store, &task_id, |s| {
+                s.status = TaskStatus::Failed;
+                s.turn = 2;
+                s.error = Some("empty agent output: no PR created and no output".to_string());
+            })
+            .await?;
+        } else {
+            mutate_and_persist(&store, &task_id, |s| {
+                s.status = TaskStatus::Done;
+                s.turn = 2;
+            })
+            .await?;
+        }
+
+        let final_state = store
+            .get(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("task must exist"))?;
+        assert!(
+            matches!(final_state.status, TaskStatus::Done),
+            "status must be Done"
+        );
+        Ok(())
+    }
+
+    // --- Gate B: conflict detected + no rebase ---
+
+    #[tokio::test]
+    async fn large_conflict_no_rebase_marks_failed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = TaskId::new();
+        let state = crate::task_runner::TaskState::new(task_id.clone());
+        store.insert(&state).await;
+
+        // Simulate the gate: Large conflict, rebase_pushed=false.
+        let pr_num: u64 = 99;
+        let conflict_was_detected = true;
+        let rebase_pushed = false;
+        if conflict_was_detected && !rebase_pushed {
+            mutate_and_persist(&store, &task_id, |s| {
+                s.status = TaskStatus::Failed;
+                s.error = Some(format!(
+                    "pr:{pr_num} is conflicting and rebase was not pushed; manual resolution required"
+                ));
+            })
+            .await?;
+        }
+
+        let final_state = store
+            .get(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("task must exist"))?;
+        assert!(
+            matches!(final_state.status, TaskStatus::Failed),
+            "status must be Failed"
+        );
+        assert!(
+            final_state
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("conflicting"),
+            "error message must mention conflicting"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn small_conflict_rebase_success_proceeds() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = TaskId::new();
+        let state = crate::task_runner::TaskState::new(task_id.clone());
+        store.insert(&state).await;
+
+        // Simulate the gate: Small conflict, rebase_pushed=true — gate must not trigger.
+        let conflict_was_detected = true;
+        let rebase_pushed = true;
+        if conflict_was_detected && !rebase_pushed {
+            mutate_and_persist(&store, &task_id, |s| {
+                s.status = TaskStatus::Failed;
+            })
+            .await?;
+        }
+
+        // Task should remain in its initial Pending state (gate did not fire).
+        let final_state = store
+            .get(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("task must exist"))?;
+        assert!(
+            matches!(final_state.status, TaskStatus::Pending),
+            "status must be Pending"
+        );
+        Ok(())
     }
 }

@@ -660,6 +660,31 @@ pub(crate) async fn run_implement_phase(
         }
 
         let Some(pr_num) = pr_num else {
+            if output.trim().is_empty() {
+                tracing::warn!(
+                    task_id = %task_id,
+                    "empty agent output: no PR created; marking failed"
+                );
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Failed;
+                    s.turn = 2;
+                    s.error = Some("empty agent output: no PR created and no output".to_string());
+                })
+                .await?;
+                store.log_event(crate::event_replay::TaskEvent::Completed {
+                    task_id: task_id.0.clone(),
+                    ts: crate::event_replay::now_ts(),
+                });
+                tracing::info!(
+                    task_id = %task_id,
+                    status = "failed",
+                    turns = 2,
+                    pr_url = tracing::field::Empty,
+                    total_elapsed_secs = task_start.elapsed().as_secs(),
+                    "task_completed"
+                );
+                return Ok(ImplementOutcome::Done);
+            }
             tracing::warn!("no PR number found in agent output; skipping review");
             mutate_and_persist(store, task_id, |s| {
                 s.status = TaskStatus::Done;
