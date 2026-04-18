@@ -155,7 +155,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     if storage.q_values.is_none() {
         degraded_subsystems.push("q_value_store");
     }
-    if registry.runtime_state_store.is_none() {
+    if registry.runtime_state_store.is_none() || services.snapshot_load_failed {
         degraded_subsystems.push("runtime_state_store");
     }
     if registry.workspace_mgr.is_none() {

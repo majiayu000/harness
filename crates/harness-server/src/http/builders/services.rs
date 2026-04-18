@@ -15,6 +15,10 @@ pub(crate) struct ServicesBundle {
     pub execution_svc: Arc<dyn crate::services::execution::ExecutionService>,
     pub runtime_hosts: Arc<crate::runtime_hosts::RuntimeHostManager>,
     pub runtime_project_cache: Arc<crate::runtime_project_cache::RuntimeProjectCacheManager>,
+    /// True when the runtime state snapshot load was attempted but failed
+    /// (schema mismatch, I/O error, or unexpected outcome). The store itself
+    /// may still be usable for future writes; only the recovery was incomplete.
+    pub snapshot_load_failed: bool,
 }
 
 /// Initialize interceptors, service impls, runtime host/project-cache managers,
@@ -77,6 +81,7 @@ pub(crate) async fn build_services(
         Arc::new(crate::runtime_project_cache::RuntimeProjectCacheManager::new());
 
     // Restore persisted runtime state snapshot when available.
+    let mut snapshot_load_failed = false;
     if let Some(store) = registry.runtime_state_store.as_ref() {
         match store.try_load_snapshot().await {
             Ok((Some(snapshot), crate::runtime_state_store::LoadSnapshotOutcome::Loaded)) => {
@@ -102,18 +107,22 @@ pub(crate) async fn build_services(
                     expected_schema_version = expected,
                     "runtime state snapshot skipped on startup due to schema mismatch"
                 );
+                snapshot_load_failed = true;
             }
             Ok((None, crate::runtime_state_store::LoadSnapshotOutcome::Loaded)) => {
                 tracing::warn!("runtime state snapshot load returned loaded outcome without data");
+                snapshot_load_failed = true;
             }
             Ok((Some(_), outcome)) => {
                 tracing::warn!(
                     ?outcome,
                     "runtime state snapshot load returned unexpected outcome"
                 );
+                snapshot_load_failed = true;
             }
             Err(e) => {
                 tracing::warn!("failed to load runtime state snapshot on startup: {e}");
+                snapshot_load_failed = true;
             }
         }
     }
@@ -138,6 +147,7 @@ pub(crate) async fn build_services(
         execution_svc,
         runtime_hosts,
         runtime_project_cache,
+        snapshot_load_failed,
     })
 }
 
