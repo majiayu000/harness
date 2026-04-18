@@ -39,7 +39,7 @@ pub fn redact_secrets(prompt: &str, env_vars: &HashMap<String, String>) -> Strin
         .filter(|(_, v)| v.len() >= 8)
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    sorted_vars.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    sorted_vars.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
 
     let mut result = prompt.to_string();
     for (key, value) in &sorted_vars {
