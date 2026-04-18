@@ -298,7 +298,7 @@ fn compute_rule_fail_rate_pct(events: &[Event]) -> f64 {
 /// Build the cross-project live activity feed from the latest events.
 fn build_feed(events: &[Event], now: DateTime<Utc>) -> Vec<Value> {
     let mut sorted: Vec<&Event> = events.iter().collect();
-    sorted.sort_by(|a, b| b.ts.cmp(&a.ts));
+    sorted.sort_by_key(|e| std::cmp::Reverse(e.ts));
     sorted
         .into_iter()
         .take(FEED_LIMIT)
