@@ -18,6 +18,7 @@ use harness_core::types::{
     Artifact, ArtifactType, Capability, Draft, DraftId, DraftStatus, ProjectId, RemediationType,
     Signal, SignalType, TokenUsage,
 };
+use harness_protocol::methods::CONFLICT;
 use harness_server::{
     handlers::gc::gc_adopt, http::build_app_state, server::HarnessServer,
     thread_manager::ThreadManager,
@@ -457,6 +458,38 @@ async fn gc_adopt_task_uses_appstate_project_root() -> anyhow::Result<()> {
         project_root.canonicalize()?,
         "gc_adopt must pass AppState project_root to the spawned task, not None/CWD"
     );
+
+    Ok(())
+}
+
+/// gc_adopt returns CONFLICT when the draft is not in Pending status.
+///
+/// Covers the repeat-adopt and reject/adopt-race scenarios identified in review round 1.
+#[tokio::test]
+async fn gc_adopt_non_pending_draft_returns_conflict() -> anyhow::Result<()> {
+    let sandbox = common::tempdir_in_home("gc-adopt-non-pending-")?;
+    let state = make_state(sandbox.path()).await?;
+
+    for non_pending in [DraftStatus::Adopted, DraftStatus::Rejected] {
+        let artifact_rel = std::path::PathBuf::from(".harness/drafts/test-guard.sh");
+        let mut draft = make_draft(&artifact_rel, "content");
+        draft.status = non_pending;
+        state.engines.gc_agent.draft_store().save(&draft)?;
+
+        let resp = gc_adopt(&state, Some(serde_json::json!(1)), draft.id.clone()).await;
+
+        assert!(
+            resp.error.is_some(),
+            "expected error for {:?} draft",
+            non_pending
+        );
+        assert_eq!(
+            resp.error.unwrap().code,
+            CONFLICT,
+            "expected CONFLICT for {:?} draft",
+            non_pending
+        );
+    }
 
     Ok(())
 }

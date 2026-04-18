@@ -1,9 +1,12 @@
 use chrono::Utc;
 use harness_core::{types::Draft, types::DraftId, types::DraftStatus};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 pub struct DraftStore {
     data_dir: PathBuf,
+    /// Serializes status-transition writes to prevent concurrent last-write-wins races.
+    transition_lock: Mutex<()>,
 }
 
 impl DraftStore {
@@ -13,10 +16,65 @@ impl DraftStore {
         // Canonicalize after creation to resolve symlinks and ".." components.
         // Defensive-only: the primary path-traversal boundary is at task_routes.rs.
         let dir = dir.canonicalize()?;
-        Ok(Self { data_dir: dir })
+        Ok(Self {
+            data_dir: dir,
+            transition_lock: Mutex::new(()),
+        })
     }
 
     pub fn save(&self, draft: &Draft) -> anyhow::Result<()> {
+        let path = self.draft_path(&draft.id);
+        let content = serde_json::to_string_pretty(draft)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+
+    /// Atomically adopt a draft: run `side_effects` (e.g. artifact file writes) while
+    /// holding `transition_lock`, then commit the status change to `Adopted`.
+    ///
+    /// Returns an error if the draft is not `Pending` when the lock is acquired, or if
+    /// `side_effects` returns an error (in which case the status is NOT updated).
+    pub fn adopt_if_pending(
+        &self,
+        id: &DraftId,
+        side_effects: impl FnOnce(&Draft) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let _guard = self.transition_lock.lock().unwrap();
+        let mut draft = self
+            .get(id)?
+            .ok_or_else(|| anyhow::anyhow!("draft {} not found", id))?;
+        if draft.status != DraftStatus::Pending {
+            anyhow::bail!(
+                "cannot adopt draft {}: status is {:?}, expected Pending",
+                id,
+                draft.status
+            );
+        }
+        side_effects(&draft)?;
+        draft.status = DraftStatus::Adopted;
+        let path = self.draft_path(&draft.id);
+        let content = serde_json::to_string_pretty(&draft)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+
+    /// Atomically save `draft` only if the on-disk status still equals `expected_from`.
+    ///
+    /// Holds `transition_lock` for the read-verify-write sequence so that concurrent
+    /// `adopt()` / `reject()` calls cannot overwrite each other's terminal state.
+    pub fn save_if_status(&self, draft: &Draft, expected_from: DraftStatus) -> anyhow::Result<()> {
+        let _guard = self.transition_lock.lock().unwrap();
+        let current = self
+            .get(&draft.id)?
+            .ok_or_else(|| anyhow::anyhow!("draft {} not found", draft.id))?;
+        if current.status != expected_from {
+            anyhow::bail!(
+                "cannot transition draft {}: status is {:?}, expected {:?}",
+                draft.id,
+                current.status,
+                expected_from
+            );
+        }
         let path = self.draft_path(&draft.id);
         let content = serde_json::to_string_pretty(draft)?;
         std::fs::write(path, content)?;

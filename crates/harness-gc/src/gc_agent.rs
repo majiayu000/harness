@@ -300,12 +300,11 @@ impl GcAgent {
     ///
     /// All artifact target_paths are canonicalized and validated to reside
     /// within the project root before any writes occur.
+    ///
+    /// The status check, file writes, and status commit are all performed under
+    /// `DraftStore::transition_lock` to prevent a concurrent `reject()` from
+    /// winning the race between file writes and status commit.
     pub fn adopt(&self, draft_id: &DraftId) -> anyhow::Result<()> {
-        let mut draft = self
-            .draft_store
-            .get(draft_id)?
-            .ok_or_else(|| anyhow::anyhow!("draft not found"))?;
-
         let canonical_root = self.project_root.canonicalize().with_context(|| {
             format!(
                 "failed to canonicalize project root '{}'",
@@ -313,23 +312,22 @@ impl GcAgent {
             )
         })?;
 
-        // Validate and resolve all paths before writing any files.
-        let resolved: Vec<PathBuf> = draft
-            .artifacts
-            .iter()
-            .map(|a| validate_target_path(&canonical_root, &a.target_path))
-            .collect::<anyhow::Result<_>>()?;
+        self.draft_store.adopt_if_pending(draft_id, |draft| {
+            // Validate and resolve all paths before writing any files.
+            let resolved: Vec<PathBuf> = draft
+                .artifacts
+                .iter()
+                .map(|a| validate_target_path(&canonical_root, &a.target_path))
+                .collect::<anyhow::Result<_>>()?;
 
-        for (artifact, target) in draft.artifacts.iter().zip(resolved.iter()) {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
+            for (artifact, target) in draft.artifacts.iter().zip(resolved.iter()) {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(target, &artifact.content)?;
             }
-            std::fs::write(target, &artifact.content)?;
-        }
-
-        draft.status = DraftStatus::Adopted;
-        self.draft_store.save(&draft)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Auto-adopt drafts from `draft_ids` that are eligible under `policy`.
@@ -368,6 +366,10 @@ impl GcAgent {
                     continue;
                 }
             };
+            if draft.status != DraftStatus::Pending {
+                tracing::debug!(draft_id = %id.0, status = ?draft.status, "auto_adopt: skipping non-Pending draft");
+                continue;
+            }
             if draft.signal.remediation != RemediationType::Rule {
                 continue;
             }
@@ -394,13 +396,17 @@ impl GcAgent {
     }
 
     /// Reject a draft.
+    ///
+    /// Uses `save_if_status` to prevent an unconditional overwrite of an already-Adopted
+    /// draft when `adopt()` and `reject()` race on the same draft.
     pub fn reject(&self, draft_id: &DraftId, _reason: Option<&str>) -> anyhow::Result<()> {
         let mut draft = self
             .draft_store
             .get(draft_id)?
             .ok_or_else(|| anyhow::anyhow!("draft not found"))?;
         draft.status = DraftStatus::Rejected;
-        self.draft_store.save(&draft)?;
+        self.draft_store
+            .save_if_status(&draft, DraftStatus::Pending)?;
         Ok(())
     }
 
@@ -1046,5 +1052,68 @@ mod tests {
         assert!(artifacts[0].content.contains("fn full_content()"));
         // Content should be from the code block, not the diff header
         assert!(!artifacts[0].content.contains("+++ b/src/lib.rs"));
+    }
+
+    #[test]
+    fn adopt_rejected_draft_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let gc = make_test_gc_agent(dir.path());
+
+        let mut draft = test_draft(vec![]);
+        draft.status = DraftStatus::Rejected;
+        gc.draft_store.save(&draft).unwrap();
+
+        let err = gc.adopt(&draft.id).unwrap_err();
+        assert!(
+            err.to_string().contains("Rejected"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_adopt_skips_rejected() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let project_root = sandbox.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let signal_detector = SignalDetector::new(
+            crate::signal_detector::SignalThresholds::default(),
+            ProjectId::new(),
+        );
+        let draft_store = DraftStore::new(sandbox.path()).unwrap();
+        let gc = GcAgent::new(
+            GcConfig::default(),
+            signal_detector,
+            draft_store,
+            project_root.clone(),
+        );
+
+        let mut rejected = Draft {
+            signal: Signal::new(
+                SignalType::RepeatedWarn,
+                ProjectId::new(),
+                serde_json::json!({}),
+                RemediationType::Rule,
+            ),
+            ..test_draft(vec![Artifact {
+                artifact_type: ArtifactType::Rule,
+                target_path: PathBuf::from(".harness/generated/rules/rejected.md"),
+                content: "should not be written".into(),
+            }])
+        };
+        rejected.status = DraftStatus::Rejected;
+        gc.draft_store.save(&rejected).unwrap();
+
+        let adopted = gc.auto_adopt_matching(
+            std::slice::from_ref(&rejected.id),
+            AutoAdoptPolicy::RulesOnly,
+            ".harness/generated/",
+        );
+        assert!(adopted.is_empty(), "rejected draft should not be adopted");
+
+        let reloaded = gc.draft_store.get(&rejected.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, DraftStatus::Rejected);
+        assert!(!project_root
+            .join(".harness/generated/rules/rejected.md")
+            .exists());
     }
 }
