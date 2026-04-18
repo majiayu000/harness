@@ -2,9 +2,13 @@
   "name": "harness-web",
   "private": true,
   "version": "0.0.0",
+  "engines": {
+    "bun": ">=1.0.0"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "cd ../sdk/typescript && bun install && bun run build",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",

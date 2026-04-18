@@ -9,7 +9,7 @@ the client router dispatches on `location.pathname`.
 Run a backend in one terminal:
 
 ```sh
-cargo run -p harness-cli -- serve --transport http --port 9800 --project-root .
+cargo run -p harness-cli -- serve --transport http --port 9800 --project harness=.
 ```
 
 Then in this directory:
