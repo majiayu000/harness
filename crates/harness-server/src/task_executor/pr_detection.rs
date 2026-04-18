@@ -278,6 +278,17 @@ fn pr_claims_to_close_issue(item: &GhPrListItem, issue: u64) -> bool {
         {
             return true;
         }
+        // Also handle GitHub's repo-qualified syntax: "Fixes owner/repo#N".
+        // Strip the trailing "owner/repo" slug and check the remainder for a keyword.
+        if let Some(remainder) = strip_trailing_repo_qualifier(trimmed) {
+            let inner = remainder.trim_end_matches(|c: char| c.is_whitespace() || c == ':');
+            if CLOSE_KEYWORDS
+                .iter()
+                .any(|kw| inner.ends_with(*kw) && word_boundary_before(inner, kw.len()))
+            {
+                return true;
+            }
+        }
     }
     false
 }
@@ -296,6 +307,30 @@ fn word_boundary_before(s: &str, kw_len: usize) -> bool {
         .get(start - 1)
         .map(|b| !b.is_ascii_alphanumeric())
         .unwrap_or(true)
+}
+
+/// If `s` ends with an `owner/repo` slug pattern, return the portion before the slug.
+/// Used to detect repo-qualified close references like `fixes owner/repo#N`.
+fn strip_trailing_repo_qualifier(s: &str) -> Option<&str> {
+    let slash_pos = s.rfind('/')?;
+    let repo_part = &s[slash_pos + 1..];
+    if repo_part.is_empty()
+        || !repo_part
+            .chars()
+            .all(|c: char| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return None;
+    }
+    let before_slash = &s[..slash_pos];
+    // Find the start of the owner segment: last non-slug character before the slash.
+    let owner_start = before_slash
+        .rfind(|c: char| !c.is_alphanumeric() && c != '-' && c != '_' && c != '.')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    if owner_start >= slash_pos {
+        return None;
+    }
+    Some(&s[..owner_start])
 }
 
 /// Parse `"owner/repo"` from a git remote URL.
@@ -450,6 +485,35 @@ mod tests {
         // (e.g. followed by space/punctuation, not another digit) must match.
         let it = item("", "closes #79 and also mentions #791");
         assert!(pr_claims_to_close_issue(&it, 79));
+    }
+
+    // --- repo-qualified close references (Codex P2) ---
+
+    #[test]
+    fn repo_qualified_fixes_matches() {
+        // GitHub allows "Fixes owner/repo#N" as a valid closing reference.
+        let it = item("", "Fixes majiayu000/harness#791");
+        assert!(pr_claims_to_close_issue(&it, 791));
+    }
+
+    #[test]
+    fn repo_qualified_closes_matches() {
+        let it = item("", "closes owner/repo#791 in this body");
+        assert!(pr_claims_to_close_issue(&it, 791));
+    }
+
+    #[test]
+    fn repo_qualified_plain_mention_does_not_match() {
+        // "related to owner/repo#N" must NOT match — no close keyword.
+        let it = item("", "related to majiayu000/harness#791");
+        assert!(!pr_claims_to_close_issue(&it, 791));
+    }
+
+    #[test]
+    fn repo_qualified_boundary_guards_longer_number() {
+        // "fixes owner/repo#791" must not match when querying issue 79.
+        let it = item("", "fixes owner/repo#791");
+        assert!(!pr_claims_to_close_issue(&it, 79));
     }
 
     // --- word_boundary_before ---
