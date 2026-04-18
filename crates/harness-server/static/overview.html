@@ -528,7 +528,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;paddin
       <div class="panel">
         <div class="panel-h">
           <h3>Projects</h3>
-          <span class="sub">click a row to enter the project dashboard</span>
+          <span class="sub">click a row to open the dashboard — per-project scope is tracked as a follow-up</span>
           <div class="r">
             <span>sort: activity ▾</span>
             <a onclick="location.href='/#projects'">manage →</a>
@@ -944,7 +944,10 @@ function renderProjects(p){
       const toks = proj.tokens_24h != null ? escHtml(proj.tokens_24h) : '—';
       const agents = (proj.agents && proj.agents.length) ? proj.agents.join(' · ') : '—';
       const pathDisplay = proj.root || '';
-      return `<tr onclick="location.href='/?project=${encodeURIComponent(proj.id || '')}'">
+      // The dashboard does not yet parse `?project=` / scope its view to
+      // a project, so passing the id in the URL would be a false promise.
+      // Plain navigation until the dashboard grows project scoping.
+      return `<tr onclick="location.href='/'">
         <td><div class="pn"><div class="av">${escHtml(av)}</div><div><div><b>${escHtml(proj.id || basename(pathDisplay))}</b></div><div class="path">${escHtml(pathDisplay)}</div></div></div></td>
         <td>
           <div class="mini-bar">
