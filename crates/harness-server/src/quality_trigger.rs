@@ -286,12 +286,12 @@ impl QualityTrigger {
             tracing::warn!("quality_trigger: no agent registered, skipping auto-GC");
             return;
         };
-        // Query events since the GC checkpoint so the DB restriction is applied at
-        // query time rather than loading the entire event history into memory.
-        // Falls back to a full scan when no checkpoint exists (first run).
-        // gc_agent.run() applies filter_events_since() again internally, which is a
-        // no-op on the already-restricted slice — this is intentional.
-        let gc_since = self.gc_agent.checkpoint_since();
+        let project_key = self.project_root.to_string_lossy().into_owned();
+        let gc_since = self
+            .events
+            .get_scan_watermark(&project_key, "gc")
+            .await
+            .unwrap_or(None);
         let all_events = match self
             .events
             .query(&EventFilters {
@@ -315,6 +315,13 @@ impl QualityTrigger {
         .await
         {
             Ok(Ok(report)) => {
+                if let Err(e) = self
+                    .events
+                    .set_scan_watermark(&project_key, "gc", Utc::now())
+                    .await
+                {
+                    tracing::warn!("quality_trigger: failed to update scan watermark: {e}");
+                }
                 if !matches!(self.auto_adopt, AutoAdoptPolicy::Off) && !report.draft_ids.is_empty()
                 {
                     let adopted = self.gc_agent.auto_adopt_matching(
