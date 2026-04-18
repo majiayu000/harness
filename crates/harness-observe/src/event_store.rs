@@ -35,6 +35,16 @@ static EVENT_MIGRATIONS: &[Migration] = &[
         description: "add content column to events table",
         sql: "ALTER TABLE events ADD COLUMN content TEXT",
     },
+    Migration {
+        version: 3,
+        description: "create scan_watermarks table",
+        sql: "CREATE TABLE IF NOT EXISTS scan_watermarks (
+            project      TEXT NOT NULL,
+            agent_id     TEXT NOT NULL,
+            last_scan_ts TEXT NOT NULL,
+            PRIMARY KEY (project, agent_id)
+        )",
+    },
 ];
 
 /// Event store backed by SQLite (same database as other harness stores).
@@ -572,6 +582,50 @@ impl EventStore {
         if let Err(e) = self.log(&event).await {
             tracing::warn!("periodic_retry: failed to log summary event: {e}");
         }
+    }
+
+    /// Return the last-scan watermark for a `(project, agent_id)` pair, or `None`
+    /// if no watermark has been recorded yet.
+    pub async fn get_scan_watermark(
+        &self,
+        project: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT last_scan_ts FROM scan_watermarks WHERE project = ? AND agent_id = ?",
+        )
+        .bind(project)
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            None => Ok(None),
+            Some((ts_str,)) => {
+                let ts = chrono::DateTime::parse_from_rfc3339(&ts_str)
+                    .map_err(|e| anyhow::anyhow!("invalid watermark ts '{ts_str}': {e}"))?
+                    .with_timezone(&chrono::Utc);
+                Ok(Some(ts))
+            }
+        }
+    }
+
+    /// Persist (or replace) the last-scan watermark for a `(project, agent_id)` pair.
+    pub async fn set_scan_watermark(
+        &self,
+        project: &str,
+        agent_id: &str,
+        ts: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO scan_watermarks (project, agent_id, last_scan_ts)
+             VALUES (?, ?, ?)",
+        )
+        .bind(project)
+        .bind(agent_id)
+        .bind(ts.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn query_recent(&self, duration: std::time::Duration) -> anyhow::Result<Vec<Event>> {
@@ -1209,6 +1263,62 @@ mod tests {
         let results = store.query(&EventFilters::default()).await?;
         assert_eq!(results.len(), 1, "only the newest watermark should remain");
         assert_eq!(results[0].id, wm_new.id);
+        store.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watermark_returns_none_before_first_set() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path()).await?;
+        let result = store.get_scan_watermark("proj", "gc").await?;
+        assert!(result.is_none());
+        store.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_then_get_watermark_roundtrip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path()).await?;
+        let ts = chrono::Utc::now();
+        store.set_scan_watermark("proj", "gc", ts).await?;
+        let retrieved = store
+            .get_scan_watermark("proj", "gc")
+            .await?
+            .expect("watermark must exist after set");
+        assert_eq!(retrieved.timestamp(), ts.timestamp());
+        store.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watermarks_are_per_project_and_agent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path()).await?;
+        let ts = chrono::Utc::now();
+        store.set_scan_watermark("proj1", "gc", ts).await?;
+        let r1 = store.get_scan_watermark("proj1", "other").await?;
+        assert!(r1.is_none(), "different agent_id must not share watermark");
+        let r2 = store.get_scan_watermark("proj2", "gc").await?;
+        assert!(r2.is_none(), "different project must not share watermark");
+        store.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_watermark_overwrites_previous() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = EventStore::new(dir.path()).await?;
+        let ts1 = chrono::Utc::now() - chrono::Duration::hours(1);
+        let ts2 = chrono::Utc::now();
+        store.set_scan_watermark("proj", "gc", ts1).await?;
+        store.set_scan_watermark("proj", "gc", ts2).await?;
+        let retrieved = store
+            .get_scan_watermark("proj", "gc")
+            .await?
+            .expect("watermark must exist");
+        assert_eq!(retrieved.timestamp(), ts2.timestamp());
         store.close().await;
         Ok(())
     }

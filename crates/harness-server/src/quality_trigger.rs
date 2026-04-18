@@ -286,12 +286,16 @@ impl QualityTrigger {
             tracing::warn!("quality_trigger: no agent registered, skipping auto-GC");
             return;
         };
-        // Query events since the GC checkpoint so the DB restriction is applied at
-        // query time rather than loading the entire event history into memory.
-        // Falls back to a full scan when no checkpoint exists (first run).
-        // gc_agent.run() applies filter_events_since() again internally, which is a
-        // no-op on the already-restricted slice — this is intentional.
-        let gc_since = self.gc_agent.checkpoint_since();
+        let project_key = self.project_root.to_string_lossy().into_owned();
+        let gc_since = self
+            .events
+            .get_scan_watermark(&project_key, "gc")
+            .await
+            .unwrap_or(None);
+        // Capture the scan boundary before querying so that events written
+        // while gc_agent.run() executes are included in the NEXT run, not
+        // silently skipped (same pattern as periodic_reviewer).
+        let scan_ts = Utc::now();
         let all_events = match self
             .events
             .query(&EventFilters {
@@ -315,6 +319,24 @@ impl QualityTrigger {
         .await
         {
             Ok(Ok(report)) => {
+                // Only advance the watermark when the run completed without
+                // errors.  Partial failures (e.g. a transient agent error or a
+                // draft-store write) are recorded in report.errors; keeping the
+                // watermark behind lets the next scan retry those events.
+                if report.errors.is_empty() {
+                    if let Err(e) = self
+                        .events
+                        .set_scan_watermark(&project_key, "gc", scan_ts)
+                        .await
+                    {
+                        tracing::warn!("quality_trigger: failed to update scan watermark: {e}");
+                    }
+                } else {
+                    tracing::warn!(
+                        error_count = report.errors.len(),
+                        "quality_trigger: gc run had errors; watermark not advanced for retry"
+                    );
+                }
                 if !matches!(self.auto_adopt, AutoAdoptPolicy::Off) && !report.draft_ids.is_empty()
                 {
                     let adopted = self.gc_agent.auto_adopt_matching(

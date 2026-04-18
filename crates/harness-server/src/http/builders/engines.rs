@@ -109,6 +109,38 @@ pub(crate) async fn build_engines(
         });
     }
 
+    // ── GC watermark migration ────────────────────────────────────────────────
+    // On first boot after upgrading from file-checkpoint to KV-watermark, seed
+    // the KV watermark from gc-checkpoint.json so the first incremental scan
+    // doesn't regress to a full O(total-events) scan.
+    let project_key = project_root.to_string_lossy().into_owned();
+    match events.get_scan_watermark(&project_key, "gc").await {
+        Ok(None) => {
+            // No KV watermark yet — try the legacy file checkpoint.
+            let checkpoint_path = harness_gc::checkpoint::default_checkpoint_path(project_root);
+            if let Some(cp) = harness_gc::checkpoint::GcCheckpoint::load(&checkpoint_path) {
+                match events
+                    .set_scan_watermark(&project_key, "gc", cp.last_scan_at)
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            ts = %cp.last_scan_at,
+                            "gc: migrated legacy checkpoint to KV watermark"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("gc: failed to seed KV watermark from checkpoint: {e}");
+                    }
+                }
+            }
+        }
+        Ok(Some(_)) => {} // already seeded — nothing to do
+        Err(e) => {
+            tracing::warn!("gc: failed to read KV watermark during migration check: {e}");
+        }
+    }
+
     // ── GC agent ─────────────────────────────────────────────────────────────
     let signal_detector = harness_gc::signal_detector::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
@@ -120,15 +152,16 @@ pub(crate) async fn build_engines(
         ),
     );
     let draft_store = harness_gc::draft_store::DraftStore::new(data_dir)?;
-    let gc_agent = Arc::new(
-        harness_gc::gc_agent::GcAgent::new(
-            server.config.gc.clone(),
-            signal_detector,
-            draft_store,
-            project_root.to_path_buf(),
-        )
-        .with_checkpoint(data_dir.join("gc-checkpoint.json")),
-    );
+    // No file checkpoint: QualityTrigger owns the scan watermark via the KV
+    // store (get_scan_watermark / set_scan_watermark).  A second file-based
+    // cursor in GcAgent would create two independent cursors that can diverge
+    // and silently drop events.
+    let gc_agent = Arc::new(harness_gc::gc_agent::GcAgent::new(
+        server.config.gc.clone(),
+        signal_detector,
+        draft_store,
+        project_root.to_path_buf(),
+    ));
 
     // ── Skill store ───────────────────────────────────────────────────────────
     let mut skill_store = harness_skills::store::SkillStore::new()
