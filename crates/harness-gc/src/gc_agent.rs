@@ -336,7 +336,13 @@ impl GcAgent {
         policy: AutoAdoptPolicy,
         path_prefix: &str,
     ) -> Vec<DraftId> {
-        if matches!(policy, AutoAdoptPolicy::Off) || draft_ids.is_empty() {
+        // Exhaustive match: adding a new AutoAdoptPolicy variant must become a
+        // compile error here, not a silent no-op that drops all drafts.
+        match policy {
+            AutoAdoptPolicy::Off => return Vec::new(),
+            AutoAdoptPolicy::RulesOnly => {}
+        }
+        if draft_ids.is_empty() {
             return Vec::new();
         }
         let mut adopted = Vec::new();
@@ -349,9 +355,6 @@ impl GcAgent {
                     continue;
                 }
             };
-            if !matches!(policy, AutoAdoptPolicy::RulesOnly) {
-                continue;
-            }
             if draft.signal.remediation != RemediationType::Rule {
                 continue;
             }
