@@ -865,3 +865,24 @@ body {
   .filter-select { width: 100%; }
   .detail-sheet { width: 100vw; }
 }
+
+/* Prompts panel */
+.prompt-item { border: 1px solid #e0e0e8; border-radius: .4rem; margin-top: .6rem; overflow: hidden; }
+.prompt-header { display: flex; align-items: center; justify-content: space-between;
+  padding: .45rem .7rem; background: #f0f0f8; cursor: default; }
+.prompt-meta { font-size: .8rem; color: #555; }
+.prompt-actions { display: flex; gap: .35rem; align-items: center; }
+.prompt-actions button { font-size: .75rem; padding: .2rem .5rem; border-radius: .25rem;
+  border: 1px solid #bbb; background: #fff; cursor: pointer; }
+.prompt-actions button:hover { background: #e8e8f0; }
+.prompt-body { padding: .5rem .7rem; }
+.prompt-collapsed { display: none; }
+.prompt-pre { max-height: 14rem; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+  font-size: .78rem; margin: 0; }
+.prompt-expand-btn { margin-top: .3rem; font-size: .75rem; padding: .2rem .5rem;
+  border-radius: .25rem; border: 1px solid #bbb; background: #fff; cursor: pointer; }
+.prompt-diff-panel { padding: .5rem .7rem; background: #fafafa; border-top: 1px solid #e0e0e8; }
+.prompt-diff-body { font-family: monospace; font-size: .75rem; line-height: 1.4; }
+.diff-added { background: #e6ffe6; color: #1a6e1a; padding: 0 .2rem; }
+.diff-removed { background: #ffe6e6; color: #8b1a1a; padding: 0 .2rem; }
+.prompts-empty { font-size: .85rem; color: #888; margin: .4rem 0; }

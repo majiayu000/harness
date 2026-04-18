@@ -40,6 +40,7 @@ pub(crate) async fn run_plan_for_prompt(
     };
 
     let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
+
     // Use agent.execute() directly — NOT run_agent_streaming — to avoid the
     // state side-effects that run_agent_streaming performs: PR_URL extraction,
     // turn counter mutations, and status updates.  Those side-effects would
@@ -94,7 +95,7 @@ pub(crate) async fn run_triage_plan_pipeline(
         prompt: triage_prompt,
         project_root: project.to_path_buf(),
         env_vars: cargo_env.clone(),
-        execution_phase: Some(ExecutionPhase::Planning),
+        execution_phase: Some(ExecutionPhase::Triage),
         ..Default::default()
     };
 

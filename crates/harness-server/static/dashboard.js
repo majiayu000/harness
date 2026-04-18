@@ -18,6 +18,8 @@ let currentTasks = [];
 let historyPage = 0;
 let historyQuery = "";
 let historyFilter = "all";
+let _activeDetailTaskId = null;
+let _detailGeneration = 0;
 
 function $(sel) { return document.querySelector(sel); }
 
@@ -441,6 +443,14 @@ function showDetail(task) {
 
   document.getElementById("detail-body").innerHTML = body;
 
+  // Track which task is active so the async fetch can bail if the user
+  // switches to a different task before the response arrives. The generation
+  // counter additionally prevents duplicate panels when showDetail is called
+  // multiple times for the same task while a fetch is still in flight.
+  _activeDetailTaskId = task.id;
+  const generation = ++_detailGeneration;
+  fetchAndRenderPrompts(task.id, generation);
+
   const cancelBtn = document.querySelector(".cancel-btn[data-task-id]");
   if (cancelBtn) {
     cancelBtn.addEventListener("click", async () => {
@@ -463,6 +473,159 @@ function showDetail(task) {
 
   panel.classList.add("detail-panel-open");
   document.body.style.overflow = "hidden";
+}
+
+// --- Prompts panel ---
+
+function lineDiff(a, b) {
+  const aLines = a.split("\n");
+  const bLines = b.split("\n");
+  const MAX = 500;
+  if (aLines.length > MAX || bLines.length > MAX) {
+    return "<em>Prompts too large for line diff</em>";
+  }
+  const m = aLines.length, n = bLines.length;
+  const dp = Array.from({length: m + 1}, () => new Uint16Array(n + 1));
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = aLines[i - 1] === bLines[j - 1]
+        ? dp[i - 1][j - 1] + 1
+        : Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  const ops = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && aLines[i - 1] === bLines[j - 1]) {
+      i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      ops.push({type: "add", line: bLines[--j]});
+    } else {
+      ops.push({type: "rem", line: aLines[--i]});
+    }
+  }
+  let html = "";
+  for (let k = ops.length - 1; k >= 0; k--) {
+    const op = ops[k];
+    html += op.type === "add"
+      ? `<div class="diff-added">+ ${escapeHtml(op.line)}</div>`
+      : `<div class="diff-removed">- ${escapeHtml(op.line)}</div>`;
+  }
+  return html || "<em>No line-level differences</em>";
+}
+
+async function fetchAndRenderPrompts(taskId, generation) {
+  const body = document.getElementById("detail-body");
+  if (!body) return;
+
+  let prompts;
+  try {
+    const resp = await apiFetch(`/tasks/${encodeURIComponent(taskId)}/prompts`, { headers: authHeaders() });
+    if (!resp || !resp.ok) return;
+    prompts = await resp.json();
+  } catch { return; }
+
+  // Guard: bail if the user switched tasks or re-opened the same task (new generation).
+  if (_activeDetailTaskId !== taskId || _detailGeneration !== generation) return;
+
+  if (!Array.isArray(prompts) || prompts.length === 0) {
+    const el = document.createElement("div");
+    el.className = "detail-section";
+    el.innerHTML = `<div class="detail-section-title">Agent Prompts</div><p class="prompts-empty">No prompts yet.</p>`;
+    body.appendChild(el);
+    return;
+  }
+
+  const section = document.createElement("div");
+  section.className = "detail-section";
+  section.innerHTML = `<div class="detail-section-title">Agent Prompts (${prompts.length} turn${prompts.length > 1 ? "s" : ""})</div>`;
+
+  prompts.forEach((p, idx) => {
+    const panelId = `prompt-body-${idx}`;
+    const diffId = `prompt-diff-${idx}`;
+    const hasPrev = idx > 0;
+
+    const item = document.createElement("div");
+    item.className = "prompt-item";
+
+    const header = document.createElement("div");
+    header.className = "prompt-header";
+    header.innerHTML =
+      `<span class="prompt-meta">Turn ${p.turn} &mdash; <em>${escapeHtml(p.phase)}</em></span>` +
+      `<span class="prompt-actions">` +
+      (hasPrev ? `<button class="prompt-diff-btn" data-diff="${diffId}" data-prev="${idx - 1}" data-cur="${idx}">Diff</button> ` : "") +
+      `<button class="prompt-copy-btn" data-idx="${idx}">Copy</button>` +
+      `<button class="prompt-toggle-btn" data-panel="${panelId}">\u25bc</button>` +
+      `</span>`;
+
+    const panel = document.createElement("div");
+    panel.id = panelId;
+    panel.className = "prompt-body prompt-collapsed";
+
+    const preview = p.prompt.length > 2048 ? p.prompt.slice(0, 2048) + "\u2026" : p.prompt;
+    panel.innerHTML = `<pre class="detail-pre prompt-pre">${escapeHtml(preview)}</pre>` +
+      (p.prompt.length > 2048
+        ? `<button class="prompt-expand-btn" data-idx="${idx}" data-panel="${panelId}">Show full prompt</button>`
+        : "");
+
+    const diffPanel = document.createElement("div");
+    diffPanel.id = diffId;
+    diffPanel.className = "prompt-diff-panel prompt-collapsed";
+
+    item.appendChild(header);
+    item.appendChild(panel);
+    item.appendChild(diffPanel);
+    section.appendChild(item);
+  });
+
+  body.appendChild(section);
+
+  // Wire toggle buttons
+  section.querySelectorAll(".prompt-toggle-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const panel = document.getElementById(btn.dataset.panel);
+      if (!panel) return;
+      const collapsed = panel.classList.toggle("prompt-collapsed");
+      btn.textContent = collapsed ? "\u25bc" : "\u25b2";
+    });
+  });
+
+  // Wire copy buttons
+  section.querySelectorAll(".prompt-copy-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = parseInt(btn.dataset.idx, 10);
+      navigator.clipboard.writeText(prompts[idx].prompt).catch(() => {});
+      btn.textContent = "Copied!";
+      setTimeout(() => { btn.textContent = "Copy"; }, 1500);
+    });
+  });
+
+  // Wire expand buttons
+  section.querySelectorAll(".prompt-expand-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = parseInt(btn.dataset.idx, 10);
+      const full = prompts[idx].prompt;
+      const panel = document.getElementById(btn.dataset.panel);
+      if (panel) panel.querySelector("pre").textContent = full;
+      btn.remove();
+    });
+  });
+
+  // Wire diff buttons
+  section.querySelectorAll(".prompt-diff-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const diffPanel = document.getElementById(btn.dataset.diff);
+      if (!diffPanel) return;
+      const collapsed = diffPanel.classList.toggle("prompt-collapsed");
+      if (!collapsed && !diffPanel.dataset.rendered) {
+        const prevIdx = parseInt(btn.dataset.prev, 10);
+        const curIdx = parseInt(btn.dataset.cur, 10);
+        diffPanel.innerHTML = `<div class="prompt-diff-body">${lineDiff(prompts[prevIdx].prompt, prompts[curIdx].prompt)}</div>`;
+        diffPanel.dataset.rendered = "1";
+      }
+      btn.textContent = collapsed ? "Diff" : "Hide Diff";
+    });
+  });
 }
 
 function closeDetail() {

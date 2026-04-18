@@ -580,13 +580,15 @@ pub enum ExecutionPhase {
     Rebase,
     /// Simple review pass that does not require deep reasoning (uses lightweight model).
     SimpleReview,
+    /// Initial triage/assessment pass before planning (uses high-reasoning model).
+    Triage,
 }
 
 impl ExecutionPhase {
     /// Returns the Claude Code CLI `--effort` level for this phase.
     pub fn effort_level(self) -> &'static str {
         match self {
-            ExecutionPhase::Planning => "max",
+            ExecutionPhase::Planning | ExecutionPhase::Triage => "max",
             ExecutionPhase::Execution => "high",
             ExecutionPhase::Validation => "max",
             ExecutionPhase::Rebase => "low",
@@ -659,7 +661,7 @@ impl ReasoningBudget {
     /// Returns the model identifier for the given execution phase.
     pub fn model_for_phase(&self, phase: ExecutionPhase) -> &str {
         let tier = match phase {
-            ExecutionPhase::Planning => self.planning_tier,
+            ExecutionPhase::Planning | ExecutionPhase::Triage => self.planning_tier,
             ExecutionPhase::Execution => self.execution_tier,
             ExecutionPhase::Validation => self.validation_tier,
             ExecutionPhase::Rebase | ExecutionPhase::SimpleReview => BudgetTier::Medium,

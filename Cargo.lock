@@ -1304,6 +1304,7 @@ dependencies = [
  "harness-workflow",
  "hmac",
  "http-body-util",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
