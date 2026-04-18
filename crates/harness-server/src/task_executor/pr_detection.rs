@@ -258,13 +258,6 @@ pub(crate) async fn find_existing_pr_for_issue(
 fn pr_claims_to_close_issue(item: &GhPrListItem, issue: u64, repo_slug: Option<&str>) -> bool {
     let title = item.title.to_ascii_lowercase();
     let body = item.body.to_ascii_lowercase();
-    // Honor the `(#N)` trailing title suffix that older harness runs append to
-    // every PR they create. PRs opened before the `Closes #N` requirement was
-    // added to prompts carry only this suffix; without it they would escape
-    // detection and trigger a duplicate PR branch.
-    if title.trim_end().ends_with(&format!("(#{issue})")) {
-        return true;
-    }
     // Scan title and body independently so that a keyword at the end of the
     // title cannot be paired with `#N` at the start of the body.
     field_claims_to_close_issue(&title, issue, repo_slug)
@@ -365,11 +358,19 @@ fn strip_trailing_repo_qualifier(s: &str) -> Option<&str> {
 
 /// Parse `"owner/repo"` from a git remote URL.
 ///
-/// Handles HTTPS (`https://github.com/owner/repo.git`) and
-/// SSH (`git@github.com:owner/repo.git`) formats.
+/// Handles HTTPS (`https://github.com/owner/repo.git`),
+/// SCP-style SSH (`git@github.com:owner/repo.git`), and
+/// ssh-scheme SSH (`ssh://git@github.com/owner/repo.git`) formats.
 pub(crate) fn parse_repo_slug_from_remote_url(url: &str) -> Option<String> {
-    // SSH: git@github.com:owner/repo.git
+    // SCP-style SSH: git@github.com:owner/repo.git
     if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let slug = rest.trim_end_matches(".git");
+        if slug.contains('/') {
+            return Some(slug.to_string());
+        }
+    }
+    // ssh-scheme SSH: ssh://git@github.com/owner/repo.git
+    if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
         let slug = rest.trim_end_matches(".git");
         if slug.contains('/') {
             return Some(slug.to_string());
@@ -455,13 +456,13 @@ mod tests {
     // --- pr_claims_to_close_issue: positive cases ---
 
     #[test]
-    fn title_suffix_alone_matches_for_backward_compat() {
-        // The `(#N)` trailing title suffix IS a trusted close signal for
-        // backward compat: older harness runs append it to every PR they open
-        // but do not add a `Closes #N` keyword to the body. Those still-open
-        // PRs must be detected so that a retry does not open a duplicate branch.
+    fn title_suffix_alone_does_not_match() {
+        // A PR title ending with `(#N)` but no GitHub closing keyword in title
+        // or body is NOT a close signal. Human-authored PRs like
+        // "docs: mention scheduler cleanup (#799)" would otherwise be falsely
+        // reused as the branch for issue #799.
         let it = item("fix(dedup): guard against closed PRs (#791)", "");
-        assert!(pr_claims_to_close_issue(&it, 791, None));
+        assert!(!pr_claims_to_close_issue(&it, 791, None));
     }
 
     #[test]
@@ -732,6 +733,17 @@ mod tests {
     fn parses_https_remote_without_git_suffix() {
         assert_eq!(
             parse_repo_slug_from_remote_url("https://github.com/owner/repo"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_ssh_scheme_remote() {
+        // ssh://git@github.com/owner/repo.git — distinct from SCP-style
+        // git@github.com:owner/repo.git; without this branch, detect_repo_slug
+        // returns None and the cross-repo guard is silently disabled.
+        assert_eq!(
+            parse_repo_slug_from_remote_url("ssh://git@github.com/owner/repo.git"),
             Some("owner/repo".to_string())
         );
     }
