@@ -205,13 +205,16 @@ pub(crate) async fn find_existing_pr_for_issue(
             "open",
         ])
         // Fetch more fields so we can distinguish "this PR closes #N" from
-        // "this PR merely mentions #N". Limit raised to 10 so we can scan a
-        // handful of candidates — the search itself is already issue-scoped.
+        // "this PR merely mentions #N". The search is free-text (title, body,
+        // and comments), so widely-referenced issues can accumulate many
+        // mention-only results before the real closing PR appears. Use a limit
+        // of 100 to ensure we scan enough candidates without missing the one
+        // PR that actually claims to close the issue.
         .args([
             "--json",
             "number,headRefName,url,title,body",
             "--limit",
-            "10",
+            "100",
         ])
         .output()
         .await
@@ -240,11 +243,13 @@ pub(crate) async fn find_existing_pr_for_issue(
 /// is NOT sufficient and must return false, otherwise one issue's PR can be
 /// silently reused for a different issue.
 fn pr_claims_to_close_issue(item: &GhPrListItem, issue: u64) -> bool {
-    // Harness's own PR titles use `(#N)` as a trailing issue suffix:
+    // Harness's own PR titles use `(#N)` as a *trailing* issue suffix:
     //   "fix(dedup): guard against closed PRs (#791)"
-    // This is a strong, single-owner signal.
+    // Only match when it is the very last token to avoid false positives on
+    // titles like "follow-up to prior fix (#791) (#812)", where #812 is the
+    // real owning issue and #791 is merely context.
     let issue_suffix = format!("(#{issue})");
-    if item.title.contains(&issue_suffix) {
+    if item.title.trim_end().ends_with(&issue_suffix) {
         return true;
     }
 
@@ -468,6 +473,22 @@ mod tests {
     #[test]
     fn title_suffix_for_other_issue_does_not_match() {
         let it = item("fix: something (#100)", "passing reference to #791");
+        assert!(!pr_claims_to_close_issue(&it, 791));
+    }
+
+    #[test]
+    fn title_suffix_not_trailing_does_not_match() {
+        // "(#791)" appears in the middle of the title but "#812" is the real
+        // trailing harness suffix — must NOT match issue 791.
+        let it = item("follow-up to prior fix (#791) (#812)", "");
+        assert!(!pr_claims_to_close_issue(&it, 791));
+    }
+
+    #[test]
+    fn title_suffix_not_trailing_context_mention_does_not_match() {
+        // "docs: mention prior fix (#791)" — no closing keyword, just a
+        // mid-title mention that happens to end a sub-phrase.
+        let it = item("docs: mention prior fix (#791) and move on (#812)", "");
         assert!(!pr_claims_to_close_issue(&it, 791));
     }
 
