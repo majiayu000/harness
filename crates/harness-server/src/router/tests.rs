@@ -240,11 +240,10 @@ async fn gc_adopt_response_includes_task_id() -> anyhow::Result<()> {
     assert_eq!(
         err.code,
         harness_protocol::methods::INTERNAL_ERROR,
-        "gc_adopt should fail fast when auto_pr is enabled but no default agent exists"
+        "gc_adopt should fail fast when auto_adopt_policy is RulesOnly but no default agent exists"
     );
     assert!(
-        err.message
-            .contains("auto_pr requires a registered default agent"),
+        err.message.contains("requires a registered default agent"),
         "unexpected error message: {}",
         err.message
     );

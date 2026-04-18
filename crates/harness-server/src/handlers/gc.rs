@@ -1,6 +1,6 @@
 use crate::http::{resolve_reviewer, AppState};
 use harness_core::{
-    config::resolve::resolve_config,
+    config::{misc::AutoAdoptPolicy, resolve::resolve_config},
     types::{Decision, DraftId, Event, ProjectId, SessionId},
 };
 use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR, methods::NOT_FOUND};
@@ -242,14 +242,18 @@ pub async fn gc_adopt(
         .iter()
         .map(|a| a.target_path.display().to_string())
         .collect();
-    let needs_task_dispatch = !artifact_paths.is_empty() && state.core.server.config.gc.auto_pr;
+    let needs_task_dispatch = !artifact_paths.is_empty()
+        && match state.core.server.config.gc.auto_adopt_policy {
+            AutoAdoptPolicy::Off => false,
+            AutoAdoptPolicy::RulesOnly => true,
+        };
 
     let task_dispatch_plan = if needs_task_dispatch {
         let Some(agent) = state.core.server.agent_registry.default_agent() else {
             return RpcResponse::error(
                 id,
                 INTERNAL_ERROR,
-                "gc_adopt auto_pr requires a registered default agent",
+                "gc_adopt requires a registered default agent",
             );
         };
         let path_refs: Vec<&str> = artifact_paths.iter().map(String::as_str).collect();

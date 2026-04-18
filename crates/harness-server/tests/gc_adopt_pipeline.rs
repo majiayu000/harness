@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use harness_agents::registry::AgentRegistry;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
-use harness_core::config::HarnessConfig;
+use harness_core::config::{misc::AutoAdoptPolicy, HarnessConfig};
 use harness_core::error::HarnessError;
 use harness_core::types::{
     Artifact, ArtifactType, Capability, Draft, DraftId, DraftStatus, ProjectId, RemediationType,
@@ -89,7 +89,11 @@ async fn make_state_with_auto_pr(
     config.server.data_dir = root.join("server-data");
     config.server.project_root = project_root;
     config.agents.default_agent = "mock-pr".to_string();
-    config.gc.auto_pr = auto_pr;
+    config.gc.auto_adopt_policy = if auto_pr {
+        AutoAdoptPolicy::RulesOnly
+    } else {
+        AutoAdoptPolicy::Off
+    };
 
     let mut registry = AgentRegistry::new("mock-pr");
     registry.register("mock-pr", Arc::new(MockPrAgent));
@@ -108,7 +112,7 @@ async fn make_state_without_default_agent(
     config.server.data_dir = root.join("server-data");
     config.server.project_root = project_root;
     config.agents.default_agent = "missing".to_string();
-    config.gc.auto_pr = true;
+    config.gc.auto_adopt_policy = AutoAdoptPolicy::RulesOnly;
 
     let registry = AgentRegistry::new("missing");
     let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
@@ -390,7 +394,7 @@ async fn gc_adopt_task_uses_appstate_project_root() -> anyhow::Result<()> {
     config.server.data_dir = sandbox.path().join("server-data");
     config.server.project_root = project_root.clone();
     config.agents.default_agent = "capturing".to_string();
-    config.gc.auto_pr = true;
+    config.gc.auto_adopt_policy = AutoAdoptPolicy::RulesOnly;
     // Point workspace root at a path under the blocker file so create_dir_all fails.
     config.workspace.root = ws_blocker.join("workspaces");
 

@@ -176,6 +176,22 @@ impl Default for ValidationConfig {
     }
 }
 
+/// Controls whether and how `gc adopt` automatically dispatches an agent task after writing
+/// draft artifacts to disk.
+///
+/// Use an exhaustive `match` on this enum at every call site so that adding a new variant
+/// causes a compile error instead of a silent no-op.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoAdoptPolicy {
+    /// Do not automatically dispatch any agent task after adopting a draft.
+    Off,
+    /// Dispatch an agent task to create a branch, commit the fix, push, and open a PR.
+    /// This is the default.
+    #[default]
+    RulesOnly,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcConfig {
     pub max_drafts_per_run: usize,
@@ -197,10 +213,10 @@ pub struct GcConfig {
     /// Minimum seconds between auto-triggered GC runs (cooldown). Default: 300.
     #[serde(default = "default_auto_gc_cooldown_secs")]
     pub auto_gc_cooldown_secs: u64,
-    /// When true, `gc adopt` automatically creates a branch, commits the fix, pushes,
-    /// and opens a PR via the agent prompt flow. Default: true.
-    #[serde(default = "default_gc_auto_pr")]
-    pub auto_pr: bool,
+    /// Controls whether and how `gc adopt` automatically dispatches an agent task.
+    /// Default: `rules_only` (dispatch a task to create a branch, commit, push, and open a PR).
+    #[serde(default)]
+    pub auto_adopt_policy: AutoAdoptPolicy,
     /// Tools allowed during GC agent execution. Default: ["Read", "Grep", "Glob"].
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
@@ -219,7 +235,7 @@ impl Default for GcConfig {
             signal_thresholds: SignalThresholdsConfig::default(),
             auto_gc_grades: default_auto_gc_grades(),
             auto_gc_cooldown_secs: default_auto_gc_cooldown_secs(),
-            auto_pr: default_gc_auto_pr(),
+            auto_adopt_policy: AutoAdoptPolicy::default(),
             allowed_tools: None,
         }
     }
@@ -247,10 +263,6 @@ fn default_auto_gc_grades() -> Vec<Grade> {
 
 fn default_auto_gc_cooldown_secs() -> u64 {
     300
-}
-
-fn default_gc_auto_pr() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
