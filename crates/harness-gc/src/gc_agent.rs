@@ -178,8 +178,16 @@ impl GcAgent {
         signals.sort_by_key(|s| signal_priority(s.signal_type));
 
         // 3. Generate fix drafts (up to max_drafts_per_run).
-        let mut drafts_generated = 0;
-        let mut draft_ids: Vec<DraftId> = Vec::new();
+        //
+        // Two-phase design for cancellation safety:
+        //   Phase A – invoke agents (async, contains .await points).
+        //   Phase B – persist results to disk (sync, no .await points).
+        //
+        // Because tokio::time::timeout in quality_trigger.rs drops this future
+        // at an .await point, keeping all writes in Phase B guarantees that a
+        // timeout can never leave orphaned drafts in the store with the
+        // checkpoint unupdated.
+        let mut pending_drafts: Vec<Draft> = Vec::new();
         let mut errors = Vec::new();
         let allowed_tools: Vec<String> = self
             .config
@@ -187,6 +195,7 @@ impl GcAgent {
             .clone()
             .unwrap_or_else(|| DEFAULT_GC_TOOLS.iter().map(|s| s.to_string()).collect());
 
+        // Phase A: run agent for each signal; accumulate results in memory.
         for signal in signals.iter().take(self.config.max_drafts_per_run) {
             let base_prompt = build_prompt(signal, project);
             // Inject capability restriction note as secondary context alongside
@@ -209,7 +218,7 @@ impl GcAgent {
 
             match result {
                 Ok(resp) => {
-                    let draft = Draft {
+                    pending_drafts.push(Draft {
                         id: DraftId::new(),
                         status: DraftStatus::Pending,
                         signal: signal.clone(),
@@ -221,13 +230,7 @@ impl GcAgent {
                         validation: "Run guard check after applying".to_string(),
                         generated_at: Utc::now(),
                         agent_model: resp.model,
-                    };
-                    if let Err(e) = self.draft_store.save(&draft) {
-                        errors.push(format!("failed to save draft: {e}"));
-                    } else {
-                        drafts_generated += 1;
-                        draft_ids.push(draft.id.clone());
-                    }
+                    });
                 }
                 Err(e) => {
                     errors.push(format!(
@@ -235,6 +238,18 @@ impl GcAgent {
                         signal.signal_type
                     ));
                 }
+            }
+        }
+
+        // Phase B: persist all collected drafts (no .await — not a cancellation point).
+        let mut draft_ids: Vec<DraftId> = Vec::new();
+        let mut drafts_generated = 0;
+        for draft in &pending_drafts {
+            if let Err(e) = self.draft_store.save(draft) {
+                errors.push(format!("failed to save draft: {e}"));
+            } else {
+                drafts_generated += 1;
+                draft_ids.push(draft.id.clone());
             }
         }
 
