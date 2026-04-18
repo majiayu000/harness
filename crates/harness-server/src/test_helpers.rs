@@ -191,6 +191,7 @@ async fn make_state_inner(
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
         interceptors: vec![],
+        degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
             feishu_intake: None,
             github_pollers: vec![],

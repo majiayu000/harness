@@ -139,6 +139,18 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         Arc::new(AtomicBool::new(in_window))
     };
 
+    // NOTE: add a matching entry here whenever a new optional store is added.
+    let mut degraded_subsystems: Vec<&'static str> = Vec::new();
+    if storage.q_values.is_none() {
+        degraded_subsystems.push("q_value_store");
+    }
+    if registry.runtime_state_store.is_none() {
+        degraded_subsystems.push("runtime_state_store");
+    }
+    if registry.workspace_mgr.is_none() {
+        degraded_subsystems.push("workspace_manager");
+    }
+
     Ok(AppState {
         core: CoreServices {
             server,
@@ -195,6 +207,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             ws_shutdown_tx: broadcast::channel(1).0,
         },
         interceptors: services.interceptors,
+        degraded_subsystems,
         intake: IntakeServices {
             feishu_intake: intake.feishu_intake,
             github_pollers: intake.github_pollers.into_iter().map(|(_, p)| p).collect(),

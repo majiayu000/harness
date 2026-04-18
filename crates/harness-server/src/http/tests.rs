@@ -168,6 +168,7 @@ async fn make_test_state_with(
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
         interceptors: vec![],
+        degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
             feishu_intake,
             github_pollers: vec![],
@@ -342,33 +343,98 @@ fn webhook_signature(secret: &str, payload: &[u8]) -> String {
     format!("sha256={digest_hex}")
 }
 
+#[derive(serde::Deserialize, Debug)]
+struct HealthResponse {
+    status: String,
+    tasks: u64,
+    persistence: PersistenceBlock,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct PersistenceBlock {
+    degraded_subsystems: Vec<String>,
+    runtime_state_dirty: bool,
+}
+
+async fn call_health(state: Arc<AppState>) -> anyhow::Result<HealthResponse> {
+    use http_body_util::BodyExt;
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .with_state(state);
+    let response = app
+        .oneshot(Request::builder().uri("/health").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await?.to_bytes();
+    Ok(serde_json::from_slice(&body)?)
+}
+
 #[tokio::test]
 async fn health_endpoint_returns_ok_and_task_count() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
-
-    let app = Router::new()
-        .route("/health", get(health_check))
-        .with_state(state);
-
-    let response = app
-        .oneshot(Request::builder().uri("/health").body(Body::empty())?)
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    #[derive(serde::Deserialize, Debug)]
-    struct HealthResponse {
-        status: String,
-        tasks: u64,
-    }
-
-    use http_body_util::BodyExt;
-    let body = response.into_body().collect().await?.to_bytes();
-    let health: HealthResponse = serde_json::from_slice(&body)?;
-
+    let health = call_health(state).await?;
     assert_eq!(health.status, "ok");
     assert_eq!(health.tasks, 0);
+    assert!(health.persistence.degraded_subsystems.is_empty());
+    assert!(!health.persistence.runtime_state_dirty);
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_degraded_when_subsystem_missing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut state = make_test_state(dir.path()).await?;
+    Arc::get_mut(&mut state).unwrap().degraded_subsystems = vec!["q_value_store"];
+    let health = call_health(state).await?;
+    assert_eq!(health.status, "degraded");
+    assert_eq!(health.persistence.degraded_subsystems, ["q_value_store"]);
+    assert!(!health.persistence.runtime_state_dirty);
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_degraded_when_runtime_state_dirty() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    state.runtime_state_dirty.store(true, Ordering::Release);
+    let health = call_health(state).await?;
+    assert_eq!(health.status, "degraded");
+    assert!(health.persistence.degraded_subsystems.is_empty());
+    assert!(health.persistence.runtime_state_dirty);
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_degraded_multiple_subsystems() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut state = make_test_state(dir.path()).await?;
+    Arc::get_mut(&mut state).unwrap().degraded_subsystems =
+        vec!["q_value_store", "runtime_state_store"];
+    let health = call_health(state).await?;
+    assert_eq!(health.status, "degraded");
+    assert_eq!(
+        health.persistence.degraded_subsystems,
+        ["q_value_store", "runtime_state_store"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_degraded_both_conditions() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir()?;
+    let mut state = make_test_state(dir.path()).await?;
+    Arc::get_mut(&mut state).unwrap().degraded_subsystems = vec!["workspace_manager"];
+    state.runtime_state_dirty.store(true, Ordering::Release);
+    let health = call_health(state).await?;
+    assert_eq!(health.status, "degraded");
+    assert_eq!(
+        health.persistence.degraded_subsystems,
+        ["workspace_manager"]
+    );
+    assert!(health.persistence.runtime_state_dirty);
     Ok(())
 }
 
