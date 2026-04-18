@@ -247,7 +247,19 @@ impl QualityTrigger {
             return;
         };
         let project = Project::from_path(self.project_root.clone());
-        let timeout_secs = self.gc_run_timeout_secs;
+        let min_timeout = self.gc_agent.min_run_timeout_secs();
+        let timeout_secs = if self.gc_run_timeout_secs < min_timeout {
+            tracing::warn!(
+                configured = self.gc_run_timeout_secs,
+                minimum = min_timeout,
+                "quality_trigger: gc_run_timeout_secs is below minimum for \
+                 max_drafts_per_run; using minimum of {min_timeout}s to prevent \
+                 deterministic timeout loop"
+            );
+            min_timeout
+        } else {
+            self.gc_run_timeout_secs
+        };
         match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             self.gc_agent.run(&project, &events, &[], agent.as_ref()),
@@ -259,14 +271,14 @@ impl QualityTrigger {
                 tracing::warn!("quality_trigger: gc_agent.run failed: {e}");
             }
             Err(_elapsed) => {
-                // Reset last_triggered so the cooldown window is not wasted: the
-                // run was cancelled before the checkpoint could be written, so the
-                // next eligible check must be allowed to retry rather than being
-                // suppressed for a full cooldown period.
-                self.last_triggered.store(0, Ordering::Relaxed);
+                // Do NOT reset last_triggered to 0: drafts may have been saved
+                // incrementally before the cancellation point. Resetting the
+                // cooldown would allow an immediate retry that re-processes the
+                // same signals and creates duplicate pending drafts. The cooldown
+                // that was set before the run started remains active.
                 tracing::warn!(
                     "quality_trigger: gc_agent.run timed out after {timeout_secs}s; \
-                     cooldown reset to allow immediate retry"
+                     cooldown remains active to prevent duplicate draft generation"
                 );
             }
         }

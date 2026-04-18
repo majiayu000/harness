@@ -16,6 +16,10 @@ use std::path::{Component, Path, PathBuf};
 /// Default tools allowed during GC agent execution.
 const DEFAULT_GC_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
 
+/// Minimum wall-clock seconds assumed per sequential agent call when computing
+/// the required run timeout from `max_drafts_per_run`.
+pub const MIN_SECS_PER_AGENT_CALL: u64 = 120;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcReport {
     pub signals: Vec<Signal>,
@@ -53,6 +57,16 @@ impl GcAgent {
     pub fn with_checkpoint(mut self, path: PathBuf) -> Self {
         self.checkpoint_path = Some(path);
         self
+    }
+
+    /// Minimum wall-clock timeout required to cover one full run at the
+    /// current `max_drafts_per_run` setting.
+    ///
+    /// Callers that configure `gc_run_timeout_secs` independently should use
+    /// `max(configured, min_run_timeout_secs())` to prevent deterministic
+    /// timeouts when `max_drafts_per_run` exceeds the default of 5.
+    pub fn min_run_timeout_secs(&self) -> u64 {
+        self.config.max_drafts_per_run as u64 * MIN_SECS_PER_AGENT_CALL
     }
 
     /// Return the list of files changed since the last checkpoint commit.
@@ -794,5 +808,47 @@ mod tests {
         assert!(artifacts[0].content.contains("fn full_content()"));
         // Content should be from the code block, not the diff header
         assert!(!artifacts[0].content.contains("+++ b/src/lib.rs"));
+    }
+
+    #[test]
+    fn min_run_timeout_secs_scales_with_max_drafts_per_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let signal_detector = SignalDetector::new(
+            crate::signal_detector::SignalThresholds::default(),
+            ProjectId::new(),
+        );
+        let draft_store = DraftStore::new(dir.path()).unwrap();
+        let config = GcConfig {
+            max_drafts_per_run: 5,
+            ..GcConfig::default()
+        };
+        let agent = GcAgent::new(
+            config,
+            signal_detector,
+            draft_store,
+            dir.path().to_path_buf(),
+        );
+        assert_eq!(agent.min_run_timeout_secs(), 5 * MIN_SECS_PER_AGENT_CALL);
+    }
+
+    #[test]
+    fn min_run_timeout_secs_scales_with_larger_max_drafts() {
+        let dir = tempfile::tempdir().unwrap();
+        let signal_detector = SignalDetector::new(
+            crate::signal_detector::SignalThresholds::default(),
+            ProjectId::new(),
+        );
+        let draft_store = DraftStore::new(dir.path()).unwrap();
+        let config = GcConfig {
+            max_drafts_per_run: 10,
+            ..GcConfig::default()
+        };
+        let agent = GcAgent::new(
+            config,
+            signal_detector,
+            draft_store,
+            dir.path().to_path_buf(),
+        );
+        assert_eq!(agent.min_run_timeout_secs(), 10 * MIN_SECS_PER_AGENT_CALL);
     }
 }

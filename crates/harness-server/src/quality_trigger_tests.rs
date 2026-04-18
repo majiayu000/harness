@@ -56,6 +56,74 @@ async fn make_trigger_with_challenger(
     )
 }
 
+// Mock agent that sleeps for 3 seconds — used to exercise the timeout path.
+struct SlowAgent;
+
+#[async_trait::async_trait]
+impl CodeAgent for SlowAgent {
+    fn name(&self) -> &str {
+        "slow-agent"
+    }
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![]
+    }
+    async fn execute(&self, _req: AgentRequest) -> HarnessResult<AgentResponse> {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        Ok(AgentResponse {
+            output: String::new(),
+            stderr: String::new(),
+            items: vec![],
+            token_usage: TokenUsage::default(),
+            model: "mock".to_string(),
+            exit_code: Some(0),
+        })
+    }
+    async fn execute_stream(
+        &self,
+        _req: AgentRequest,
+        _tx: Sender<StreamItem>,
+    ) -> HarnessResult<()> {
+        Ok(())
+    }
+}
+
+async fn make_trigger_with_gc_timeout(
+    dir: &Path,
+    auto_gc_grades: Vec<Grade>,
+    cooldown_secs: u64,
+    gc_run_timeout_secs: u64,
+    primary: Option<Arc<dyn CodeAgent>>,
+) -> QualityTrigger {
+    let events = Arc::new(EventStore::new(dir).await.expect("event store"));
+    let gc_config = harness_core::config::misc::GcConfig::default();
+    let signal_detector = SignalDetector::new(
+        gc_config.signal_thresholds.clone().into(),
+        harness_core::types::ProjectId::new(),
+    );
+    let draft_store = DraftStore::new(dir).expect("draft store");
+    let gc_agent = Arc::new(GcAgent::new(
+        gc_config,
+        signal_detector,
+        draft_store,
+        dir.to_path_buf(),
+    ));
+    let mut registry = harness_agents::registry::AgentRegistry::new("test");
+    if let Some(p) = primary {
+        registry.register("test", p);
+    }
+    let agent_registry = Arc::new(registry);
+    QualityTrigger::new(
+        events,
+        gc_agent,
+        agent_registry,
+        dir.to_path_buf(),
+        auto_gc_grades,
+        cooldown_secs,
+        gc_run_timeout_secs,
+        None,
+    )
+}
+
 // Mock that returns "ISSUE: foo\nCONFIRMED: foo" — used as primary in NOT_CONVERGED tests.
 // Has a distinct name from NotConvergedMock so the identity guard does not skip cross-review.
 struct NotConvergedPrimaryMock;
@@ -495,6 +563,37 @@ async fn challenger_no_ctx_skips_cross_review() {
         .await
         .unwrap();
     assert_eq!(events.len(), 1);
+}
+
+// --- gc_run timeout tests ---
+
+// Timeout must NOT reset last_triggered to 0: drafts may have been saved
+// incrementally before the cancellation point; an immediate retry would create
+// duplicate pending drafts for the same signals.
+#[tokio::test]
+async fn gc_run_timeout_preserves_cooldown() {
+    let dir = tempfile::tempdir().unwrap();
+    // 5 security-hook blocks → grade D, zero cooldown so GC fires immediately.
+    // gc_run_timeout_secs = 1 so SlowAgent (3 s sleep) triggers the timeout path.
+    let trigger =
+        make_trigger_with_gc_timeout(dir.path(), vec![Grade::D], 0, 1, Some(Arc::new(SlowAgent)))
+            .await;
+    for _ in 0..5 {
+        trigger
+            .events
+            .log(&block_event("security_check"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(trigger.last_triggered.load(Ordering::Relaxed), 0);
+    trigger.check_and_maybe_trigger(None).await;
+    // last_triggered must be > 0: the trigger set it before gc_agent.run and
+    // the timeout path must NOT reset it to 0 (which would allow immediate
+    // re-triggering and duplicate draft creation).
+    assert!(
+        trigger.last_triggered.load(Ordering::Relaxed) > 0,
+        "timeout reset last_triggered to 0; would allow immediate re-run and duplicate drafts"
+    );
 }
 
 // Scenario 7: primary has Write/Execute capabilities → cross-review skipped,
