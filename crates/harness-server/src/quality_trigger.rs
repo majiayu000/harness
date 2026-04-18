@@ -9,6 +9,7 @@ use harness_observe::quality::QualityGrader;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Time window used to grade post-task quality. The grader denominator is the
 /// count of events in this window, so a smaller window gives recent failures
@@ -43,6 +44,7 @@ pub struct QualityTrigger {
     challenger_agent: Option<Arc<dyn CodeAgent>>,
     auto_adopt: AutoAdoptPolicy,
     auto_adopt_path_prefix: String,
+    gc_run_timeout_secs: u64,
 }
 
 impl QualityTrigger {
@@ -57,6 +59,7 @@ impl QualityTrigger {
         challenger_agent: Option<Arc<dyn CodeAgent>>,
         auto_adopt: AutoAdoptPolicy,
         auto_adopt_path_prefix: String,
+        gc_run_timeout_secs: u64,
     ) -> Self {
         Self {
             events,
@@ -69,6 +72,7 @@ impl QualityTrigger {
             challenger_agent,
             auto_adopt,
             auto_adopt_path_prefix,
+            gc_run_timeout_secs,
         }
     }
 
@@ -283,12 +287,13 @@ impl QualityTrigger {
             return;
         };
         let project = Project::from_path(self.project_root.clone());
-        match self
-            .gc_agent
-            .run(&project, &events, &[], agent.as_ref())
-            .await
+        match tokio::time::timeout(
+            Duration::from_secs(self.gc_run_timeout_secs),
+            self.gc_agent.run(&project, &events, &[], agent.as_ref()),
+        )
+        .await
         {
-            Ok(report) => {
+            Ok(Ok(report)) => {
                 if !matches!(self.auto_adopt, AutoAdoptPolicy::Off) && !report.draft_ids.is_empty()
                 {
                     let adopted = self.gc_agent.auto_adopt_matching(
@@ -305,8 +310,14 @@ impl QualityTrigger {
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!("quality_trigger: gc_agent.run failed: {e}");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = self.gc_run_timeout_secs,
+                    "quality_trigger: gc_agent.run timed out"
+                );
             }
         }
     }
