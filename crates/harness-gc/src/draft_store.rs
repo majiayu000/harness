@@ -29,6 +29,35 @@ impl DraftStore {
         Ok(())
     }
 
+    /// Atomically adopt a draft: run `side_effects` (e.g. artifact file writes) while
+    /// holding `transition_lock`, then commit the status change to `Adopted`.
+    ///
+    /// Returns an error if the draft is not `Pending` when the lock is acquired, or if
+    /// `side_effects` returns an error (in which case the status is NOT updated).
+    pub fn adopt_if_pending(
+        &self,
+        id: &DraftId,
+        side_effects: impl FnOnce(&Draft) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let _guard = self.transition_lock.lock().unwrap();
+        let mut draft = self
+            .get(id)?
+            .ok_or_else(|| anyhow::anyhow!("draft {} not found", id))?;
+        if draft.status != DraftStatus::Pending {
+            anyhow::bail!(
+                "cannot adopt draft {}: status is {:?}, expected Pending",
+                id,
+                draft.status
+            );
+        }
+        side_effects(&draft)?;
+        draft.status = DraftStatus::Adopted;
+        let path = self.draft_path(&draft.id);
+        let content = serde_json::to_string_pretty(&draft)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+
     /// Atomically save `draft` only if the on-disk status still equals `expected_from`.
     ///
     /// Holds `transition_lock` for the read-verify-write sequence so that concurrent

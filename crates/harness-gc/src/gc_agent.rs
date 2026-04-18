@@ -300,20 +300,11 @@ impl GcAgent {
     ///
     /// All artifact target_paths are canonicalized and validated to reside
     /// within the project root before any writes occur.
+    ///
+    /// The status check, file writes, and status commit are all performed under
+    /// `DraftStore::transition_lock` to prevent a concurrent `reject()` from
+    /// winning the race between file writes and status commit.
     pub fn adopt(&self, draft_id: &DraftId) -> anyhow::Result<()> {
-        let mut draft = self
-            .draft_store
-            .get(draft_id)?
-            .ok_or_else(|| anyhow::anyhow!("draft not found"))?;
-
-        if draft.status != DraftStatus::Pending {
-            anyhow::bail!(
-                "cannot adopt draft {}: status is {:?}, expected Pending",
-                draft_id.0,
-                draft.status
-            );
-        }
-
         let canonical_root = self.project_root.canonicalize().with_context(|| {
             format!(
                 "failed to canonicalize project root '{}'",
@@ -321,24 +312,22 @@ impl GcAgent {
             )
         })?;
 
-        // Validate and resolve all paths before writing any files.
-        let resolved: Vec<PathBuf> = draft
-            .artifacts
-            .iter()
-            .map(|a| validate_target_path(&canonical_root, &a.target_path))
-            .collect::<anyhow::Result<_>>()?;
+        self.draft_store.adopt_if_pending(draft_id, |draft| {
+            // Validate and resolve all paths before writing any files.
+            let resolved: Vec<PathBuf> = draft
+                .artifacts
+                .iter()
+                .map(|a| validate_target_path(&canonical_root, &a.target_path))
+                .collect::<anyhow::Result<_>>()?;
 
-        for (artifact, target) in draft.artifacts.iter().zip(resolved.iter()) {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
+            for (artifact, target) in draft.artifacts.iter().zip(resolved.iter()) {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(target, &artifact.content)?;
             }
-            std::fs::write(target, &artifact.content)?;
-        }
-
-        draft.status = DraftStatus::Adopted;
-        self.draft_store
-            .save_if_status(&draft, DraftStatus::Pending)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Auto-adopt drafts from `draft_ids` that are eligible under `policy`.
@@ -407,13 +396,17 @@ impl GcAgent {
     }
 
     /// Reject a draft.
+    ///
+    /// Uses `save_if_status` to prevent an unconditional overwrite of an already-Adopted
+    /// draft when `adopt()` and `reject()` race on the same draft.
     pub fn reject(&self, draft_id: &DraftId, _reason: Option<&str>) -> anyhow::Result<()> {
         let mut draft = self
             .draft_store
             .get(draft_id)?
             .ok_or_else(|| anyhow::anyhow!("draft not found"))?;
         draft.status = DraftStatus::Rejected;
-        self.draft_store.save(&draft)?;
+        self.draft_store
+            .save_if_status(&draft, DraftStatus::Pending)?;
         Ok(())
     }
 
