@@ -24,6 +24,7 @@ pub mod http;
 pub mod intake;
 pub mod memory_monitor;
 pub mod notify;
+pub mod overview;
 pub mod parallel_dispatch;
 pub mod periodic_reviewer;
 pub use harness_workflow::plan_db;
