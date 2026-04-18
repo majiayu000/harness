@@ -1,7 +1,10 @@
 use crate::quality_trigger::{unix_now, QualityTrigger, TaskReviewContext};
+use chrono::{Duration as ChronoDuration, Utc};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::error::Result as HarnessResult;
-use harness_core::types::{Capability, Decision, Event, Grade, SessionId, TokenUsage};
+use harness_core::types::{
+    Capability, Decision, Event, EventFilters, Grade, SessionId, TokenUsage,
+};
 use harness_gc::draft_store::DraftStore;
 use harness_gc::gc_agent::GcAgent;
 use harness_gc::signal_detector::SignalDetector;
@@ -541,4 +544,62 @@ async fn write_primary_skips_cross_review() {
         detail.contains("B") || detail.contains("A"),
         "expected B or A (no downgrade) when primary is skipped: {detail}"
     );
+}
+
+// Regression test for #810: events at now-2h must not be silently dropped.
+//
+// Before the fix, `check_and_maybe_trigger` forwarded the 1h-windowed event list
+// to `gc_agent.run`. Any event in the gap (last_scan_at, now-1h) was permanently
+// lost because GC still advanced its checkpoint past those events.
+//
+// After the fix, gc_agent.run receives the full unfiltered event history, so old
+// events remain visible regardless of when they were logged.
+#[tokio::test]
+async fn gc_receives_full_event_history_not_just_grading_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let trigger = make_trigger(dir.path(), vec![Grade::D], 0).await;
+
+    // Log a block event with ts = now - 2h (outside the QUALITY_WINDOW_HOURS=1h window).
+    let mut old_event = Event::new(SessionId::new(), "pre_tool_use", "Edit", Decision::Block);
+    old_event.ts = Utc::now() - ChronoDuration::hours(2);
+    trigger.events.log(&old_event).await.unwrap();
+
+    // Confirm the 1h window excludes the old event while the full query includes it.
+    let since = Utc::now() - ChronoDuration::hours(1);
+    let window_events = trigger
+        .events
+        .query(&EventFilters {
+            since: Some(since),
+            ..EventFilters::default()
+        })
+        .await
+        .unwrap();
+    let all_events = trigger
+        .events
+        .query(&EventFilters::default())
+        .await
+        .unwrap();
+
+    assert!(
+        !window_events.iter().any(|e| e.id == old_event.id),
+        "1h window must exclude the 2h-old event"
+    );
+    assert!(
+        all_events.iter().any(|e| e.id == old_event.id),
+        "unfiltered query must include the 2h-old event"
+    );
+
+    // Add enough recent block events so grading produces Grade::D and GC fires.
+    for _ in 0..10 {
+        trigger
+            .events
+            .log(&block_event("pre_tool_use"))
+            .await
+            .unwrap();
+    }
+
+    // Must complete without panic. With the fix, gc_agent.run receives all_events
+    // (including old_event); before the fix it received window_events and would
+    // permanently miss old_event once the checkpoint advanced past it.
+    trigger.check_and_maybe_trigger(None).await;
 }

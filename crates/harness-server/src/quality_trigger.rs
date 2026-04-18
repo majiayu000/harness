@@ -108,7 +108,7 @@ impl QualityTrigger {
             since: Some(since),
             ..EventFilters::default()
         };
-        let events = match self.events.query(&filters).await {
+        let window_events = match self.events.query(&filters).await {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!("quality_trigger: failed to query events: {e}");
@@ -119,7 +119,7 @@ impl QualityTrigger {
         // Pull the most recent rule_scan violation count from the same window
         // so the grader's coverage dimension reflects reality. Previously this
         // was hard-coded to 0, which locked coverage at 100%.
-        let violation_count = events
+        let violation_count = window_events
             .iter()
             .filter(|e| e.hook == "rule_scan")
             .filter_map(|e| {
@@ -131,7 +131,7 @@ impl QualityTrigger {
             .next_back()
             .unwrap_or(0);
 
-        let mut report = QualityGrader::grade(&events, violation_count);
+        let mut report = QualityGrader::grade(&window_events, violation_count);
 
         // Cross-review gate: skip if no challenger, no task context, or grade=A.
         if let (Some(challenger), Some(ctx)) = (&self.challenger_agent, task_ctx) {
@@ -286,10 +286,20 @@ impl QualityTrigger {
             tracing::warn!("quality_trigger: no agent registered, skipping auto-GC");
             return;
         };
+        // Full history for GC — gc_agent does its own checkpoint-based slicing and
+        // must not receive the 1h-windowed list, which would silently drop events in
+        // the gap (last_scan_at, now-1h) and permanently lose those signals.
+        let all_events = match self.events.query(&EventFilters::default()).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("quality_trigger: failed to query all events for gc: {e}");
+                return;
+            }
+        };
         let project = Project::from_path(self.project_root.clone());
         match tokio::time::timeout(
             Duration::from_secs(self.gc_run_timeout_secs),
-            self.gc_agent.run(&project, &events, &[], agent.as_ref()),
+            self.gc_agent.run(&project, &all_events, &[], agent.as_ref()),
         )
         .await
         {
