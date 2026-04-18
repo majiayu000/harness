@@ -242,17 +242,13 @@ pub(crate) async fn find_existing_pr_for_issue(
 /// A plain mention of `#N` in the body (e.g. "related to #N", "depends on #N")
 /// is NOT sufficient and must return false, otherwise one issue's PR can be
 /// silently reused for a different issue.
+///
+/// The `(#N)` trailing-title suffix is intentionally NOT treated as a close
+/// signal here: PR creation prompts do not contractually enforce that suffix,
+/// so any manually-created or unrelated PR whose title happens to end with
+/// `(#N)` (e.g. `chore: cleanup scheduler (#799)`) would be falsely matched.
+/// Only GitHub's closing-keyword syntax is reliable.
 fn pr_claims_to_close_issue(item: &GhPrListItem, issue: u64) -> bool {
-    // Harness's own PR titles use `(#N)` as a *trailing* issue suffix:
-    //   "fix(dedup): guard against closed PRs (#791)"
-    // Only match when it is the very last token to avoid false positives on
-    // titles like "follow-up to prior fix (#791) (#812)", where #812 is the
-    // real owning issue and #791 is merely context.
-    let issue_suffix = format!("(#{issue})");
-    if item.title.trim_end().ends_with(&issue_suffix) {
-        return true;
-    }
-
     // GitHub's auto-close keywords (case-insensitive per GitHub docs).
     // See: https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/using-keywords-in-issues-and-pull-requests
     // Word boundary on the left prevents e.g. "prefixes #5" from matching "fixes #5".
@@ -306,11 +302,15 @@ fn word_boundary_before(s: &str, kw_len: usize) -> bool {
     if start == 0 {
         return true;
     }
-    // Look at the byte immediately before the keyword start. Safe because
-    // ASCII close-keywords are 3-8 bytes; preceding char for our use cases is ASCII too.
-    s.as_bytes()
-        .get(start - 1)
-        .map(|b| !b.is_ascii_alphanumeric())
+    // Use char-aware look-back so that multi-byte UTF-8 sequences are handled
+    // correctly. A raw-byte check would treat the trailing byte of a multi-byte
+    // character (e.g. `é` → 0xC3 0xA9) as non-ASCII and therefore non-
+    // alphanumeric, falsely reporting a word boundary for inputs like
+    // `éfixes #791`.
+    s[..start]
+        .chars()
+        .next_back()
+        .map(|c| !c.is_alphanumeric())
         .unwrap_or(true)
 }
 
@@ -400,9 +400,19 @@ mod tests {
     // --- pr_claims_to_close_issue: positive cases ---
 
     #[test]
-    fn title_suffix_matches() {
-        // Harness's own convention: "(#N)" trailing suffix in the PR title.
+    fn title_suffix_alone_does_not_match() {
+        // The `(#N)` trailing suffix is no longer a trusted close signal:
+        // PR creation prompts do not contractually enforce this convention,
+        // so a manual PR titled "chore: cleanup (#791)" without any closing
+        // keyword must NOT be matched for issue 791.
         let it = item("fix(dedup): guard against closed PRs (#791)", "");
+        assert!(!pr_claims_to_close_issue(&it, 791));
+    }
+
+    #[test]
+    fn title_suffix_with_close_keyword_matches() {
+        // A PR that has both the suffix AND a closing keyword in the body is fine.
+        let it = item("fix(dedup): guard against closed PRs (#791)", "Fixes #791");
         assert!(pr_claims_to_close_issue(&it, 791));
     }
 
@@ -553,6 +563,29 @@ mod tests {
     fn word_boundary_before_alnum_is_not_boundary() {
         // "prefix" — char before last 3 ("fix") is 'e', alphanumeric.
         assert!(!word_boundary_before("prefix", 3));
+    }
+
+    #[test]
+    fn word_boundary_before_multibyte_unicode_alnum_is_not_boundary() {
+        // `é` is a multi-byte UTF-8 character (U+00E9, 0xC3 0xA9). A raw-byte
+        // check would see 0xA9, which is not ASCII-alphanumeric, and falsely
+        // report a boundary. The char-aware check must return false here.
+        assert!(!word_boundary_before("éfix", 3));
+    }
+
+    #[test]
+    fn unicode_prefix_does_not_match_keyword() {
+        // "éfixes #791" — no word boundary before "fixes", must not match.
+        let it = item("", "éfixes #791");
+        assert!(!pr_claims_to_close_issue(&it, 791));
+    }
+
+    #[test]
+    fn cjk_prefix_does_not_match_keyword() {
+        // "前fixes #791" — CJK character before "fixes". CJK chars are
+        // alphanumeric under Unicode (letter category), so no boundary.
+        let it = item("", "前fixes #791");
+        assert!(!pr_claims_to_close_issue(&it, 791));
     }
 
     // --- parse_harness_mention_command (pre-existing, light coverage) ---
