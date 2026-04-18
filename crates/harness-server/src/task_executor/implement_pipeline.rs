@@ -685,12 +685,31 @@ pub(crate) async fn run_implement_phase(
                 );
                 return Ok(ImplementOutcome::Done);
             }
-            tracing::warn!("no PR number found in agent output; skipping review");
-            mutate_and_persist(store, task_id, |s| {
-                s.status = TaskStatus::Done;
-                s.turn = 2;
-            })
-            .await?;
+            // Issue tasks must produce a PR; mark Failed so the issue is removed from the
+            // dispatched set by on_task_complete and can be re-queued by the poller.
+            // Non-issue tasks (prompt-only, periodic_review, etc.) may legitimately produce
+            // output without a PR — Done is correct there.
+            if req.issue.is_some() {
+                tracing::warn!(
+                    task_id = %task_id,
+                    "no PR number found in agent output for issue task; marking failed to allow requeue"
+                );
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Failed;
+                    s.turn = 2;
+                    s.error = Some(
+                        "no PR number found in agent output; issue task requires PR".to_string(),
+                    );
+                })
+                .await?;
+            } else {
+                tracing::warn!("no PR number found in agent output; skipping review");
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Done;
+                    s.turn = 2;
+                })
+                .await?;
+            }
             store.log_event(crate::event_replay::TaskEvent::Completed {
                 task_id: task_id.0.clone(),
                 ts: crate::event_replay::now_ts(),

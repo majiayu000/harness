@@ -243,7 +243,8 @@ pub(crate) async fn run_task(
     let resumed_pr_url: Option<String> =
         task_pr_url.or_else(|| checkpoint.as_ref().and_then(|c| c.pr_url.clone()));
     // Capture before `resumed_pr_url` is moved into run_implement_phase.
-    let was_resumed_pr = resumed_pr_url.is_some();
+    // Also covers fresh pr:N tasks from webhook (req.pr is set but no checkpoint pr_url yet).
+    let mut was_resumed_pr = resumed_pr_url.is_some() || req.pr.is_some();
     let resumed_plan: Option<String> = checkpoint.and_then(|c| c.plan_output);
 
     // --- Pipeline: Triage → Plan → Implement ---
@@ -270,6 +271,8 @@ pub(crate) async fn run_task(
             )
             .await?
         } else {
+            // Fresh issue task reusing an existing PR — treat as resumed for conflict gating.
+            was_resumed_pr = true;
             (None, prompts::TriageComplexity::Medium, 0u32)
         }
     } else {
