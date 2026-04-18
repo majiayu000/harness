@@ -362,6 +362,20 @@ impl TaskDb {
         Ok(row)
     }
 
+    /// Update only the `status` column without touching `updated_at`.
+    ///
+    /// Used when rolling back a status change after a failed operation so that
+    /// stale-detection (`list_stalled_tasks`) continues to see the task as stale
+    /// on the next scheduler tick rather than deferring by a full threshold window.
+    pub(crate) async fn update_status_only(&self, id: &str, status: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE tasks SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Back-fill `external_id` on a task that was created without one.
     ///
     /// The `AND external_id IS NULL` guard prevents overwriting a legitimately-set
@@ -1062,6 +1076,50 @@ impl TaskDb {
         }
         Ok(pairs)
     }
+
+    /// Return tasks that are in an active status and have not been updated for
+    /// at least `stale_threshold`.
+    ///
+    /// Only tasks with a non-null `external_id` are returned (i.e. tasks linked
+    /// to a GitHub issue or PR).  Results are ordered by `updated_at ASC` so
+    /// the oldest stalls are retried first.  At most 100 rows are returned per
+    /// call to bound scheduler work per tick.
+    ///
+    /// `project` filters by project root path when provided.
+    pub async fn list_stalled_tasks(
+        &self,
+        stale_threshold: std::time::Duration,
+        project: Option<&str>,
+    ) -> anyhow::Result<Vec<TaskState>> {
+        let mins = stale_threshold.as_secs() / 60;
+        let modifier = format!("-{mins} minutes");
+        let sql = if project.is_some() {
+            format!(
+                "SELECT {TASK_ROW_COLUMNS} FROM tasks \
+                 WHERE status IN ('implementing', 'agent_review', 'waiting', 'reviewing') \
+                 AND external_id IS NOT NULL \
+                 AND updated_at < datetime('now', ?) \
+                 AND project = ? \
+                 ORDER BY updated_at ASC \
+                 LIMIT 100"
+            )
+        } else {
+            format!(
+                "SELECT {TASK_ROW_COLUMNS} FROM tasks \
+                 WHERE status IN ('implementing', 'agent_review', 'waiting', 'reviewing') \
+                 AND external_id IS NOT NULL \
+                 AND updated_at < datetime('now', ?) \
+                 ORDER BY updated_at ASC \
+                 LIMIT 100"
+            )
+        };
+        let mut q = sqlx::query_as::<_, TaskRow>(&sql).bind(&modifier);
+        if let Some(proj) = project {
+            q = q.bind(proj);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.into_iter().map(TaskRow::try_into_task_state).collect()
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -1242,6 +1300,14 @@ impl TaskSummaryRow {
             subtask_ids: Vec::new(),
             project: self.project,
         })
+    }
+}
+
+impl TaskDb {
+    /// Expose the raw pool for test-only SQL setup (e.g. back-dating `updated_at`).
+    #[cfg(test)]
+    pub(crate) fn pool_for_test(&self) -> &sqlx::sqlite::SqlitePool {
+        &self.pool
     }
 }
 

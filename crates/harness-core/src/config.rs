@@ -49,6 +49,8 @@ pub struct HarnessConfig {
     pub intake: IntakeConfig,
     #[serde(default)]
     pub review: ReviewConfig,
+    #[serde(default)]
+    pub retry_scheduler: RetrySchedulerConfig,
     /// Projects declared in the config file. Registered on server startup.
     #[serde(default)]
     pub projects: Vec<ProjectEntry>,
@@ -520,6 +522,40 @@ mod tests {
     fn harness_config_includes_review() {
         let config = HarnessConfig::default();
         assert!(!config.review.enabled);
+    }
+
+    #[test]
+    fn retry_scheduler_config_defaults() {
+        let config = RetrySchedulerConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.interval_secs, 300);
+        assert_eq!(config.stale_threshold_mins, 60);
+        assert_eq!(config.cooldown_mins, 120);
+        assert_eq!(config.max_retries, 3);
+    }
+
+    #[test]
+    fn retry_scheduler_config_deserializes_from_toml() {
+        let toml_str = r#"
+            enabled = true
+            interval_secs = 600
+            stale_threshold_mins = 30
+            cooldown_mins = 60
+            max_retries = 5
+        "#;
+        let config: RetrySchedulerConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.interval_secs, 600);
+        assert_eq!(config.stale_threshold_mins, 30);
+        assert_eq!(config.cooldown_mins, 60);
+        assert_eq!(config.max_retries, 5);
+    }
+
+    #[test]
+    fn harness_config_includes_retry_scheduler() {
+        let config = HarnessConfig::default();
+        assert!(!config.retry_scheduler.enabled);
+        assert_eq!(config.retry_scheduler.interval_secs, 300);
     }
 
     #[test]

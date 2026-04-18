@@ -465,6 +465,60 @@ impl Default for ReviewConfig {
     }
 }
 
+/// Configuration for the periodic retry scheduler.
+///
+/// The scheduler scans for stalled in-flight tasks (tasks in active statuses
+/// whose `updated_at` is older than `stale_threshold_mins`) and re-enqueues
+/// them up to `max_retries` times before labelling the issue `harness:stuck`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrySchedulerConfig {
+    /// Whether the periodic retry scheduler is enabled. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds between scheduler ticks. Default: 300 (5 minutes).
+    #[serde(default = "default_retry_interval_secs")]
+    pub interval_secs: u64,
+    /// A task is considered stalled when `updated_at` is older than this many
+    /// minutes. Default: 60.
+    #[serde(default = "default_retry_stale_threshold_mins")]
+    pub stale_threshold_mins: u64,
+    /// Minimum gap in minutes between two retries of the same task. Default: 120.
+    #[serde(default = "default_retry_cooldown_mins")]
+    pub cooldown_mins: u64,
+    /// Maximum number of automatic retries before the task is labelled
+    /// `harness:stuck`. Default: 3.
+    #[serde(default = "default_retry_max_retries")]
+    pub max_retries: u32,
+}
+
+fn default_retry_interval_secs() -> u64 {
+    300
+}
+
+fn default_retry_stale_threshold_mins() -> u64 {
+    60
+}
+
+fn default_retry_cooldown_mins() -> u64 {
+    120
+}
+
+fn default_retry_max_retries() -> u32 {
+    3
+}
+
+impl Default for RetrySchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_retry_interval_secs(),
+            stale_threshold_mins: default_retry_stale_threshold_mins(),
+            cooldown_mins: default_retry_cooldown_mins(),
+            max_retries: default_retry_max_retries(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
