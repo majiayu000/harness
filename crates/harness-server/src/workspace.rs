@@ -95,6 +95,30 @@ impl WorkspaceManager {
             }
         }
 
+        // Stale-state guard: if the workspace directory already exists on disk but was
+        // not tracked as active (Occupied path above), check whether it is this task's
+        // own worktree left behind by a server crash (recovery path) or a truly foreign
+        // worktree (collision path).
+        if workspace_path.exists() {
+            let expected_branch = format!("harness/{}", task_id.0);
+            if is_worktree_on_branch(&workspace_path, &expected_branch).await {
+                // Recovery: same task's worktree survived a crash — re-register and reuse.
+                tracing::info!(
+                    task_id = %task_id.0,
+                    path = ?workspace_path,
+                    "workspace recovery: re-using existing worktree from previous run"
+                );
+                return Ok(workspace_path);
+            }
+            self.active.remove(task_id);
+            anyhow::bail!(
+                "WorktreeCollision: workspace path {:?} already exists on disk for task {}; \
+                 a previous run did not clean up — remove the directory to retry",
+                workspace_path,
+                task_id.0
+            );
+        }
+
         // Fetch latest base_branch from remote so the worktree starts from upstream HEAD.
         let fetch_output = git_command()
             .args([
@@ -332,6 +356,26 @@ fn sanitize_task_id(id: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Returns true when the git worktree at `path` is currently on `branch`.
+/// Used to distinguish crash-recovery (same task's worktree) from a true collision.
+async fn is_worktree_on_branch(path: &Path, branch: &str) -> bool {
+    git_command()
+        .args([
+            "-C",
+            &path.to_string_lossy(),
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+        ])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|b| b.trim() == branch)
+        .unwrap_or(false)
 }
 
 async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {
@@ -673,6 +717,40 @@ mod tests {
         );
         // Should not be tracked in active map.
         assert!(mgr.get_workspace(&task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn create_workspace_rejects_stale_directory() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let task_id = harness_core::types::TaskId("stale-task-check-001".to_string());
+
+        // Pre-create the directory to simulate a stale worktree from a previous failed run.
+        let stale_path = workspaces.path().join("stale-task-check-001");
+        std::fs::create_dir_all(&stale_path).expect("create stale dir");
+
+        let result = mgr
+            .create_workspace(&task_id, source.path(), "origin", &branch)
+            .await;
+        assert!(result.is_err(), "should fail when stale directory exists");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("WorktreeCollision"),
+            "error should mention WorktreeCollision, got: {err_msg}"
+        );
+        // Task must not be left in the active map after a collision error.
+        assert!(
+            mgr.get_workspace(&task_id).is_none(),
+            "task should not be in active map after collision"
+        );
     }
 
     #[tokio::test]
