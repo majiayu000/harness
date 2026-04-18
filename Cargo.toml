@@ -69,6 +69,7 @@ opentelemetry-otlp = { version = "0.27", features = ["trace", "metrics", "logs",
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.8", features = ["serde"] }
 
 # IDs
 uuid = { version = "1", features = ["v4", "serde"] }

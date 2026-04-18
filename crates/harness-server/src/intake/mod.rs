@@ -104,8 +104,26 @@ impl IntakeOrchestrator {
             "intake orchestrator started"
         );
         tokio::spawn(async move {
+            let mw = &state.core.server.config.maintenance_window;
+            let mut was_in_window = state
+                .core
+                .maintenance_active
+                .load(std::sync::atomic::Ordering::Relaxed);
             loop {
                 tokio::time::sleep(self.poll_interval).await;
+                let in_window = mw.in_quiet_window(chrono::Utc::now());
+                if in_window != was_in_window {
+                    state
+                        .core
+                        .maintenance_active
+                        .store(in_window, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(in_window, "maintenance window state changed");
+                    was_in_window = in_window;
+                }
+                if in_window {
+                    tracing::debug!("intake: quiet window active, skipping tick");
+                    continue;
+                }
                 self.poll_tick(&state).await;
             }
         });

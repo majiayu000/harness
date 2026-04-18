@@ -2,7 +2,7 @@ use super::{resolve_reviewer, AppState};
 use crate::{
     project_registry::check_allowed_roots, services::execution::EnqueueTaskError, task_runner,
 };
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, response::Response, Json};
 use harness_core::agent::CodeAgent;
 use serde::Deserialize;
 use serde_json::json;
@@ -170,6 +170,20 @@ pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
     mut req: task_runner::CreateTaskRequest,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
+    if state
+        .core
+        .maintenance_active
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let retry_after_secs = state
+            .core
+            .server
+            .config
+            .maintenance_window
+            .secs_until_window_end(chrono::Utc::now());
+        return Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs });
+    }
+
     if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
         return Err(EnqueueTaskError::BadRequest(
             "at least one of prompt, issue, or pr must be provided".to_string(),
@@ -634,6 +648,9 @@ pub(super) async fn create_tasks_batch(
             }
             Err(EnqueueTaskError::BadRequest(error)) => json!({ "error": error }),
             Err(EnqueueTaskError::Internal(error)) => json!({ "error": error }),
+            Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs }) => {
+                json!({ "error": "maintenance_window", "retry_after": retry_after_secs })
+            }
         };
         results.push(entry);
     }
@@ -644,7 +661,7 @@ pub(super) async fn create_tasks_batch(
 pub(super) async fn create_task(
     State(state): State<Arc<AppState>>,
     Json(req): Json<task_runner::CreateTaskRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response {
     match enqueue_task(&state, req).await {
         Ok(task_id) => (
             StatusCode::ACCEPTED,
@@ -652,14 +669,25 @@ pub(super) async fn create_task(
                 "task_id": task_id.0,
                 "status": "running"
             })),
-        ),
+        )
+            .into_response(),
         Err(EnqueueTaskError::BadRequest(error)) => {
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
         }
         Err(EnqueueTaskError::Internal(error)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": error })),
-        ),
+        )
+            .into_response(),
+        Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs }) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                axum::http::header::RETRY_AFTER,
+                retry_after_secs.to_string(),
+            )],
+            Json(json!({ "error": "maintenance_window", "retry_after": retry_after_secs })),
+        )
+            .into_response(),
     }
 }
 

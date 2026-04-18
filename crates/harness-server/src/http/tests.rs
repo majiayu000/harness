@@ -129,6 +129,7 @@ async fn make_test_state_with(
             project_registry: None,
             runtime_state_store: None,
             q_values: None,
+            maintenance_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
         engines: crate::http::EngineServices {
             skills: Arc::new(tokio::sync::RwLock::new(

@@ -42,6 +42,10 @@ pub struct CoreServices {
     pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
     /// Q-value store for MemRL rule utility tracking. None when unavailable.
     pub q_values: Option<Arc<crate::q_value_store::QValueStore>>,
+    /// Set to `true` while the daily maintenance window is active.
+    /// Pollers skip dispatch and HTTP POST /tasks returns 503 when this is set.
+    /// Initialized to the correct value at startup (handles server starting mid-window).
+    pub maintenance_active: Arc<AtomicBool>,
 }
 
 /// Engine services: skills, rules, and garbage collection.
@@ -294,6 +298,14 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| project_root.clone());
 
+    let maintenance_active = {
+        let in_window = server
+            .config
+            .maintenance_window
+            .in_quiet_window(chrono::Utc::now());
+        Arc::new(AtomicBool::new(in_window))
+    };
+
     Ok(AppState {
         core: CoreServices {
             server,
@@ -306,6 +318,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             project_registry: Some(registry.project_registry),
             runtime_state_store: registry.runtime_state_store,
             q_values: storage.q_values,
+            maintenance_active,
         },
         engines: EngineServices {
             skills: engines.skills,
@@ -1688,6 +1701,12 @@ async fn github_webhook(
         Err(crate::services::execution::EnqueueTaskError::Internal(error)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": error })),
+        ),
+        Err(crate::services::execution::EnqueueTaskError::MaintenanceWindow {
+            retry_after_secs,
+        }) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "maintenance_window", "retry_after": retry_after_secs })),
         ),
     }
 }
