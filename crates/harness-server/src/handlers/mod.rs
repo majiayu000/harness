@@ -6,6 +6,7 @@ pub mod gc;
 pub mod health;
 pub mod learn;
 pub mod observe;
+pub mod overview;
 pub mod preflight;
 pub mod projects;
 pub mod rules;
