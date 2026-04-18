@@ -40,6 +40,16 @@ pub(crate) async fn run_plan_for_prompt(
     };
 
     let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
+
+    // Persist redacted prompt before plan_req is consumed by agent.execute().
+    let redacted_plan_prompt = crate::redact::redact_secrets(&plan_req.prompt, &plan_req.env_vars);
+    if let Err(e) = store
+        .save_prompt(task_id, 0, "planning", &redacted_plan_prompt)
+        .await
+    {
+        tracing::warn!(task_id = %task_id, "failed to persist plan prompt: {e}");
+    }
+
     // Use agent.execute() directly — NOT run_agent_streaming — to avoid the
     // state side-effects that run_agent_streaming performs: PR_URL extraction,
     // turn counter mutations, and status updates.  Those side-effects would

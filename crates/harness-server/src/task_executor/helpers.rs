@@ -553,6 +553,20 @@ pub(crate) async fn run_agent_streaming(
     turn: u32,
 ) -> harness_core::error::Result<(AgentResponse, Option<u64>)> {
     let turn_start = Instant::now();
+
+    // Persist redacted prompt before req is consumed by execute_stream.
+    let phase_str = req
+        .execution_phase
+        .map(|p| format!("{p:?}").to_lowercase())
+        .unwrap_or_else(|| "unknown".into());
+    let redacted_prompt = crate::redact::redact_secrets(&req.prompt, &req.env_vars);
+    if let Err(e) = store
+        .save_prompt(task_id, turn, &phase_str, &redacted_prompt)
+        .await
+    {
+        tracing::warn!(task_id = %task_id, turn, "failed to persist prompt: {e}");
+    }
+
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamItem>(128);
     let mut exec = std::pin::pin!(agent.execute_stream(req, tx));
     let mut exec_result: Option<harness_core::error::Result<()>> = None;

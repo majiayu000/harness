@@ -1420,6 +1420,27 @@ impl TaskStore {
         self.db.list_artifacts(&task_id.0).await
     }
 
+    /// Persist a redacted agent prompt for a task turn (fire-and-forget wrapper).
+    pub(crate) async fn save_prompt(
+        &self,
+        task_id: &TaskId,
+        turn: u32,
+        phase: &str,
+        prompt: &str,
+    ) -> anyhow::Result<()> {
+        self.db
+            .save_task_prompt(&task_id.0, turn, phase, prompt)
+            .await
+    }
+
+    /// Return all persisted prompts for a task ordered by turn.
+    pub async fn get_prompts(
+        &self,
+        task_id: &TaskId,
+    ) -> anyhow::Result<Vec<crate::task_db::TaskPrompt>> {
+        self.db.get_task_prompts(&task_id.0).await
+    }
+
     /// Append a [`TaskEvent`] to the event log. No-op when the log is not open.
     pub(crate) fn log_event(&self, event: crate::event_replay::TaskEvent) {
         if let Some(ref log) = self.event_log {

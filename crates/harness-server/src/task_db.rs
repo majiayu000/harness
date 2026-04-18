@@ -20,6 +20,9 @@ fn sqlite_datetime(ts: DateTime<Utc>) -> String {
     ts.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// Maximum prompt content size in bytes before truncation (2 MB).
+const PROMPT_MAX_BYTES: usize = 2 * 1024 * 1024;
+
 /// Column list for `query_as::<_, TaskRow>` — single source of truth.
 ///
 /// Every SELECT that maps to `TaskRow` MUST use this constant.
@@ -141,6 +144,20 @@ static TASK_MIGRATIONS: &[Migration] = &[
         description: "add request_settings column for execution limit recovery",
         sql: "ALTER TABLE tasks ADD COLUMN request_settings TEXT",
     },
+    Migration {
+        version: 17,
+        description: "create task_prompts table for per-turn prompt persistence",
+        sql: "CREATE TABLE IF NOT EXISTS task_prompts (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id    TEXT NOT NULL,
+            turn       INTEGER NOT NULL,
+            phase      TEXT NOT NULL,
+            prompt     TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(task_id, turn, phase)
+        ); CREATE INDEX IF NOT EXISTS idx_task_prompts_task_id
+           ON task_prompts(task_id, turn)",
+    },
 ];
 
 /// A single persisted artifact captured from agent output during task execution.
@@ -150,6 +167,16 @@ pub struct TaskArtifact {
     pub turn: i64,
     pub artifact_type: String,
     pub content: String,
+    pub created_at: String,
+}
+
+/// A single persisted agent prompt captured per turn for UI observability.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TaskPrompt {
+    pub task_id: String,
+    pub turn: i64,
+    pub phase: String,
+    pub prompt: String,
     pub created_at: String,
 }
 
@@ -1002,6 +1029,49 @@ impl TaskDb {
         let rows = sqlx::query_as::<_, TaskArtifact>(
             "SELECT task_id, turn, artifact_type, content, created_at
              FROM task_artifacts WHERE task_id = ? ORDER BY id ASC",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Persist a redacted agent prompt for a task turn, overwriting any previous
+    /// entry for the same (task_id, turn, phase) triplet.
+    pub async fn save_task_prompt(
+        &self,
+        task_id: &str,
+        turn: u32,
+        phase: &str,
+        prompt: &str,
+    ) -> anyhow::Result<()> {
+        let stored = if prompt.len() > PROMPT_MAX_BYTES {
+            let mut boundary = PROMPT_MAX_BYTES;
+            while boundary > 0 && !prompt.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            format!("{}\n[TRUNCATED]", &prompt[..boundary])
+        } else {
+            prompt.to_string()
+        };
+        sqlx::query(
+            "INSERT OR REPLACE INTO task_prompts (task_id, turn, phase, prompt)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(task_id)
+        .bind(turn as i64)
+        .bind(phase)
+        .bind(&stored)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return all prompts for a task ordered by turn ascending.
+    pub async fn get_task_prompts(&self, task_id: &str) -> anyhow::Result<Vec<TaskPrompt>> {
+        let rows = sqlx::query_as::<_, TaskPrompt>(
+            "SELECT task_id, turn, phase, prompt, created_at
+             FROM task_prompts WHERE task_id = ? ORDER BY turn ASC",
         )
         .bind(task_id)
         .fetch_all(&self.pool)

@@ -33,6 +33,7 @@ pub mod post_validator;
 pub mod project_registry;
 pub mod q_value_store;
 pub mod quality_trigger;
+pub mod redact;
 pub mod review_store;
 pub mod router;
 pub mod rule_enforcer;

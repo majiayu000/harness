@@ -35,6 +35,7 @@ subtle = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 sysinfo = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 http-body-util = "0.1"
