@@ -365,7 +365,7 @@ async fn run_repo_sprint(
     let max_slots = 4usize; // matches max_concurrent in config
     let start = tokio::time::Instant::now();
 
-    loop {
+    'sprint: loop {
         // All done?
         if completed.len() + cancelled_sprint.len() >= all_task_issues.len() && running.is_empty() {
             break;
@@ -435,6 +435,15 @@ async fn run_repo_sprint(
                         tracing::warn!(external_id = %ext_id, "intake: mark_dispatched update failed: {e}");
                     }
                     running.insert(issue_num, task_id);
+                }
+                Err(crate::services::execution::EnqueueTaskError::MaintenanceWindow { .. }) => {
+                    tracing::info!(
+                        repo,
+                        external_id = %ext_id,
+                        "intake: quiet window active, deferring sprint"
+                    );
+                    source.unmark_dispatched(&ext_id).await;
+                    break 'sprint;
                 }
                 Err(e) => {
                     tracing::error!(repo, external_id = %ext_id, "intake: failed to spawn: {e:?}");

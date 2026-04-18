@@ -1,5 +1,5 @@
 use crate::types::Grade;
-use chrono::{DateTime, NaiveTime, Utc};
+use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -605,8 +605,8 @@ impl MaintenanceWindowConfig {
 
     /// Returns the number of seconds until the quiet window ends.
     ///
-    /// Accounts for cross-midnight windows by adding 86400 when the remaining
-    /// duration would otherwise be negative. Returns 0 when `enabled = false`.
+    /// Uses timezone-aware `DateTime` arithmetic so the result is correct on
+    /// DST transition days. Returns 0 when `enabled = false`.
     pub fn secs_until_window_end(&self, now: DateTime<Utc>) -> u64 {
         if !self.enabled {
             return 0;
@@ -615,17 +615,27 @@ impl MaintenanceWindowConfig {
             .timezone
             .parse::<chrono_tz::Tz>()
             .unwrap_or(chrono_tz::UTC);
-        let local = now.with_timezone(&tz);
-        let t = local.time();
-        let end = self.quiet_window_end;
-        // signed_duration_since gives end - t; negative means end has passed today.
-        let diff_secs = end.signed_duration_since(t).num_seconds();
-        let secs = if diff_secs < 0 {
-            diff_secs + 86400
-        } else {
-            diff_secs
+        let local: chrono::DateTime<chrono_tz::Tz> = now.with_timezone(&tz);
+        let today = local.date_naive();
+        let end_naive = today.and_time(self.quiet_window_end);
+        // earliest() resolves DST ambiguity (fall-back); returns None on spring-forward
+        // gaps, which we treat as "window end has passed".
+        let diff_secs = match tz.from_local_datetime(&end_naive).earliest() {
+            Some(end_dt) => end_dt.signed_duration_since(local).num_seconds(),
+            None => 0,
         };
-        secs as u64
+        if diff_secs > 0 {
+            diff_secs as u64
+        } else {
+            // End time has already passed today; for cross-midnight windows the end
+            // falls tomorrow — compute against tomorrow's wall-clock end time.
+            let tomorrow = today + Duration::days(1);
+            let end_tomorrow_naive = tomorrow.and_time(self.quiet_window_end);
+            tz.from_local_datetime(&end_tomorrow_naive)
+                .earliest()
+                .map(|end_dt| end_dt.signed_duration_since(local).num_seconds().max(0) as u64)
+                .unwrap_or(0)
+        }
     }
 }
 

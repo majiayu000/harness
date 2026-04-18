@@ -546,7 +546,7 @@ async fn enqueue_task_background(
 pub(super) async fn create_tasks_batch(
     State(state): State<Arc<AppState>>,
     Json(req): Json<BatchCreateTaskRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response {
     let has_issues = req.issues.as_ref().is_some_and(|v| !v.is_empty());
     let has_tasks = req.tasks.as_ref().is_some_and(|v| !v.is_empty());
 
@@ -554,7 +554,8 @@ pub(super) async fn create_tasks_batch(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "at least one of issues or tasks must be provided" })),
-        );
+        )
+            .into_response();
     }
 
     // Build the list of per-task CreateTaskRequests.
@@ -649,12 +650,15 @@ pub(super) async fn create_tasks_batch(
     // Each task gets an ID immediately; a background tokio task handles permit
     // waiting and execution. The HTTP handler returns as soon as all tasks are registered.
     let mut results = Vec::with_capacity(n);
+    let mut all_maintenance_window = n > 0;
+    let mut mw_retry_after: Option<u64> = None;
     for (i, task_req) in task_requests.into_iter().enumerate() {
         let sem = task_semaphores[i].take();
         let is_serialized = sem.is_some();
         let conflict_files = std::mem::take(&mut task_conflict_files[i]);
         let entry = match enqueue_task_background(state.clone(), task_req, sem).await {
             Ok(task_id) => {
+                all_maintenance_window = false;
                 if is_serialized {
                     json!({
                         "task_id": task_id.0,
@@ -666,16 +670,33 @@ pub(super) async fn create_tasks_batch(
                     json!({ "task_id": task_id.0, "status": "queued" })
                 }
             }
-            Err(EnqueueTaskError::BadRequest(error)) => json!({ "error": error }),
-            Err(EnqueueTaskError::Internal(error)) => json!({ "error": error }),
+            Err(EnqueueTaskError::BadRequest(error)) => {
+                all_maintenance_window = false;
+                json!({ "error": error })
+            }
+            Err(EnqueueTaskError::Internal(error)) => {
+                all_maintenance_window = false;
+                json!({ "error": error })
+            }
             Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs }) => {
+                mw_retry_after.get_or_insert(retry_after_secs);
                 json!({ "error": "maintenance_window", "retry_after": retry_after_secs })
             }
         };
         results.push(entry);
     }
 
-    (StatusCode::ACCEPTED, Json(json!(results)))
+    if all_maintenance_window {
+        let retry_after = mw_retry_after.unwrap_or(0);
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, retry_after.to_string())],
+            Json(json!(results)),
+        )
+            .into_response();
+    }
+
+    (StatusCode::ACCEPTED, Json(json!(results))).into_response()
 }
 
 pub(super) async fn create_task(
