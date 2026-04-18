@@ -1139,6 +1139,36 @@ impl TaskStore {
         }
     }
 
+    /// Count tasks that completed (`done`) with `updated_at >= since`.
+    ///
+    /// Forwards to [`TaskDb::count_done_since`]; used by the system overview
+    /// to compute merged-in-last-24h without materialising full task rows.
+    pub async fn count_done_since(&self, since: chrono::DateTime<chrono::Utc>) -> u64 {
+        match self.db.count_done_since(since).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("count_done_since: SQL aggregation failed: {e}");
+                0
+            }
+        }
+    }
+
+    /// Per-(project, hour) done counts since `since`. Forwards to
+    /// [`TaskDb::done_per_project_hour_since`] and returns an empty vec on
+    /// error so callers can degrade gracefully.
+    pub async fn done_per_project_hour_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<(String, String, u64)> {
+        match self.db.done_per_project_hour_since(since).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("done_per_project_hour_since: SQL aggregation failed: {e}");
+                Vec::new()
+            }
+        }
+    }
+
     /// Collect lightweight inputs for LLM metrics computation.
     ///
     /// Both **turn counts** and **first-token latencies** are collected in two

@@ -1427,6 +1427,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
     let app = Router::new()
         .route("/", get(crate::dashboard::index))
+        .route("/overview", get(crate::overview::index))
         .route("/favicon.ico", get(crate::dashboard::favicon))
         .route("/health", get(health_check))
         .route("/rpc", post(handle_rpc))
@@ -1450,6 +1451,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         )
         .route("/projects/queue-stats", get(project_queue_stats))
         .route("/api/dashboard", get(crate::handlers::dashboard::dashboard))
+        .route("/api/overview", get(crate::handlers::overview::overview))
         .route("/api/intake", get(intake_status))
         .route(
             "/api/runtime-hosts",

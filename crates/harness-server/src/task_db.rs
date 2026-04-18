@@ -1,5 +1,6 @@
 use crate::http::parse_pr_num_from_url;
 use crate::task_runner::{TaskState, TaskStatus};
+use chrono::{DateTime, Utc};
 use harness_core::db::{open_pool, Migration, Migrator};
 use harness_core::error::TaskDbDecodeError;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,15 @@ use std::path::{Path, PathBuf};
 
 /// Maximum artifact content size in bytes before truncation.
 const ARTIFACT_MAX_BYTES: usize = 65_536;
+
+/// Format a `DateTime<Utc>` exactly the way SQLite's `datetime('now')` writes
+/// `tasks.updated_at` (`YYYY-MM-DD HH:MM:SS`, space separator, no offset),
+/// so raw `updated_at >= ?` comparisons stay monotonic and the planner can
+/// still use the `idx_tasks_status_updated` / `idx_tasks_project_status_updated`
+/// range indexes.
+fn sqlite_datetime(ts: DateTime<Utc>) -> String {
+    ts.format("%Y-%m-%d %H:%M:%S").to_string()
+}
 
 /// Column list for `query_as::<_, TaskRow>` — single source of truth.
 ///
@@ -871,6 +881,57 @@ impl TaskDb {
         Ok((global.0 as u64, global.1 as u64, by_project))
     }
 
+    /// Count tasks that reached `done` status with `updated_at >= since`.
+    ///
+    /// `since` is formatted to the exact storage form (`YYYY-MM-DD HH:MM:SS`
+    /// UTC, matching what `datetime('now')` writes) so the raw TEXT comparison
+    /// is monotonic and the planner can range-scan on the
+    /// `idx_tasks_status_updated` index. Wrapping `updated_at` in `datetime()`
+    /// would defeat that index and force a full scan of `status='done'` rows,
+    /// which is painful when the overview page polls every 5 seconds.
+    /// Used by the system overview endpoint to compute "merged in last 24h"
+    /// without loading full task rows.
+    pub async fn count_done_since(&self, since: DateTime<Utc>) -> anyhow::Result<u64> {
+        let since_str = sqlite_datetime(since);
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM tasks WHERE status = 'done' AND updated_at >= ?")
+                .bind(&since_str)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.0 as u64)
+    }
+
+    /// Per-(project, hour-bucket) count of tasks that reached `done` after `since`.
+    ///
+    /// Returns rows of `(project_key, hour_iso, count)` where `hour_iso` is the
+    /// `updated_at` timestamp truncated to the hour in UTC (format
+    /// `YYYY-MM-DDTHH:00:00Z`). Rows with `project IS NULL` are reported with
+    /// an empty project key. Used to build the fleet-throughput stacked-area
+    /// chart (per project, per hour over the window). Formats `since` like
+    /// [`Self::count_done_since`] so the `idx_tasks_project_status_updated`
+    /// index range scan stays viable.
+    pub async fn done_per_project_hour_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<(String, String, u64)>> {
+        let since_str = sqlite_datetime(since);
+        let rows: Vec<(Option<String>, String, i64)> = sqlx::query_as(
+            "SELECT project, \
+                    strftime('%Y-%m-%dT%H:00:00Z', updated_at) AS hour, \
+                    COUNT(*) \
+             FROM tasks \
+             WHERE status = 'done' AND updated_at >= ? \
+             GROUP BY project, hour",
+        )
+        .bind(&since_str)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(p, h, c)| (p.unwrap_or_default(), h, c as u64))
+            .collect())
+    }
+
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
         let sql = format!(
@@ -1729,6 +1790,34 @@ mod tests {
         assert_eq!(global_done, 1);
         assert_eq!(global_failed, 1);
         assert_eq!(by_project, vec![(root.to_string(), 1, 1)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_done_since_counts_same_day_rows() -> anyhow::Result<()> {
+        // Regression for PR #816: tasks.updated_at is stored via
+        // datetime('now') in `YYYY-MM-DD HH:MM:SS` form. Comparing an
+        // RFC3339 `since` (with `T` separator) as raw TEXT would silently
+        // drop all same-day rows because space `0x20` sorts before
+        // `T` `0x54`. sqlite_datetime() now formats `since` in the stored
+        // form so `updated_at >= ?` is monotonic and the index range scan
+        // stays intact.
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+
+        db.insert(&make_task("fresh", TaskStatus::Done)).await?;
+
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert_eq!(db.count_done_since(since).await?, 1);
+
+        let rows = db.done_per_project_hour_since(since).await?;
+        let total: u64 = rows.iter().map(|(_, _, c)| *c).sum();
+        assert_eq!(total, 1);
+
+        // A future `since` still returns zero — sanity check that the
+        // predicate is not inverted.
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        assert_eq!(db.count_done_since(future).await?, 0);
         Ok(())
     }
 
