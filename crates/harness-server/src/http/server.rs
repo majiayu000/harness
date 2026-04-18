@@ -170,8 +170,13 @@ fn build_router(state: Arc<AppState>) -> Router {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::error!("failed to install Ctrl+C handler: {e}");
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::error!("failed to install Ctrl+C handler: {e}");
+                // Stay pending so a handler-install failure never looks like a shutdown request.
+                std::future::pending::<()>().await;
+            }
         }
     };
 
@@ -181,7 +186,10 @@ async fn shutdown_signal() {
             Ok(mut sig) => {
                 sig.recv().await;
             }
-            Err(e) => tracing::error!("failed to install SIGTERM handler: {e}"),
+            Err(e) => {
+                tracing::error!("failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
         }
     };
 
