@@ -254,7 +254,8 @@ pub fn implement_from_issue(
              3. Implement the change with the minimum necessary modifications\n\
              4. Run `cargo check` and `cargo test` — fix any failures before proceeding\n\
              5. Create a feature branch, commit with a descriptive message, push\n\
-             6. Create a PR with `gh pr create`"
+             6. Create a PR with `gh pr create`. Include \"Closes #{issue}\" in the PR body \
+so that GitHub and harness can identify this PR as closing the issue."
         ),
         context: git_line,
         dynamic_payload: "On the last line of your output, print PR_URL=<full PR URL>".to_string(),
