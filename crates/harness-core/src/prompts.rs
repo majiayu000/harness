@@ -254,7 +254,8 @@ pub fn implement_from_issue(
              3. Implement the change with the minimum necessary modifications\n\
              4. Run `cargo check` and `cargo test` — fix any failures before proceeding\n\
              5. Create a feature branch, commit with a descriptive message, push\n\
-             6. Create a PR with `gh pr create`"
+             6. Create a PR with `gh pr create`. Include \"Closes #{issue}\" in the PR body \
+so that GitHub and harness can identify this PR as closing the issue."
         ),
         context: git_line,
         dynamic_payload: "On the last line of your output, print PR_URL=<full PR URL>".to_string(),
@@ -489,31 +490,46 @@ fn review_focus_for_type(project_type: &str) -> &'static str {
     }
 }
 
-/// Build prompt: reviewer agent evaluates a PR diff.
+/// Build prompt: reviewer agent evaluates a PR holistically.
 ///
-/// The reviewer reads the diff and outputs either `APPROVED` on the last line
-/// or lists issues prefixed with `ISSUE:`.
+/// The reviewer reads the PR description, linked issue, full diff, and the
+/// *entire* body of each changed file, then outputs either `APPROVED` on the
+/// last line or lists issues prefixed with `ISSUE:`.
+///
+/// This is a *whole-PR review*, not a diff-only review: reading hunks in
+/// isolation hides bugs that live in the surrounding code (contract drift,
+/// dead branches, missing call-site updates). The prompt requires the reviewer
+/// to read each changed file in full, not just the diff hunks.
 pub fn agent_review_prompt(pr_url: &str, round: u32, project_type: &str) -> String {
     let focus = review_focus_for_type(project_type);
     format!(
-        "You are a Staff Engineer conducting an independent code review of PR {pr_url} \
+        "You are a Staff Engineer conducting an independent whole-PR review of {pr_url} \
          (review round {round}).\n\n\
          Your job is to find bugs that pass CI but blow up in production. Think about:\n\
          - Error paths: what happens when this fails? Is the failure handled or silently swallowed?\n\
          - Edge cases: empty inputs, large inputs, unicode, off-by-one\n\
          - Security: injection, path traversal, unvalidated input at system boundaries\n\
          {focus}\n\n\
-         Steps:\n\
-         1. Run `gh pr diff '{pr_url}'` to read the full diff\n\
-         2. For each changed file, understand the CONTEXT — read surrounding code if needed\n\
-         3. Evaluate correctness and safety in priority order: security > logic > quality > style\n\
-         4. If everything looks good, print APPROVED on the last line\n\
-         5. Otherwise, list each issue on its own line prefixed with \"ISSUE: \"\n\n\
+         Steps (MANDATORY — do not skip):\n\
+         1. Run `gh pr view '{pr_url}'` to read the PR description and any linked issue. \
+            Understand the INTENT before judging the implementation.\n\
+         2. Run `gh pr diff '{pr_url}'` to get the full diff.\n\
+         3. For EACH changed file, read the ENTIRE file — not just the diff hunks. \
+            Bugs hide in the surrounding code: dead branches, callers that were not updated, \
+            contracts that drift from the new behaviour. Use the Read tool on each changed path.\n\
+         4. For any non-test file with non-trivial changes, open the corresponding test file(s) \
+            and verify that the new behaviour is actually exercised. Missing or weak test coverage \
+            is itself an ISSUE worth flagging.\n\
+         5. Evaluate correctness and safety in priority order: security > logic > quality > style.\n\
+         6. If everything looks good, print APPROVED on the last line.\n\
+         7. Otherwise, list each issue on its own line prefixed with \"ISSUE: \".\n\n\
          Constraints:\n\
          - Focus on correctness and safety, not cosmetic preferences\n\
          - NEVER downgrade dependency versions\n\
          - Be specific: reference file names and line numbers\n\
-         - Do NOT flag style preferences as issues (naming, formatting, comment density)"
+         - Do NOT flag style preferences as issues (naming, formatting, comment density)\n\
+         - Do NOT approve a PR whose diff you have read but whose changed files you have not \
+           opened in full — that is a diff review, not a whole-PR review."
     )
 }
 
@@ -2089,6 +2105,31 @@ PR_URL=https://github.com/owner/repo/pull/269";
         let p = agent_review_prompt("https://github.com/owner/repo/pull/42", 1, "mixed");
         assert!(p.contains("Staff Engineer"));
         assert!(p.contains("security > logic > quality > style"));
+    }
+
+    #[test]
+    fn test_agent_review_prompt_is_whole_pr_not_diff_only() {
+        let p = agent_review_prompt("https://github.com/owner/repo/pull/42", 1, "mixed");
+        // Must read PR description and linked issue, not just the diff.
+        assert!(
+            p.contains("gh pr view"),
+            "reviewer must be told to read the PR description (gh pr view), not only the diff"
+        );
+        // Must read the entire body of each changed file, not only diff hunks.
+        assert!(
+            p.contains("read the ENTIRE file"),
+            "reviewer must be told to read each changed file in full"
+        );
+        // Must check tests for non-trivial changes.
+        assert!(
+            p.contains("test file"),
+            "reviewer must be told to verify test coverage"
+        );
+        // Must explicitly disallow approving without reading full files.
+        assert!(
+            p.contains("diff review"),
+            "reviewer must be told not to approve a diff-only review"
+        );
     }
 
     #[test]

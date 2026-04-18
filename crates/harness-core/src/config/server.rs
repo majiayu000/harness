@@ -378,13 +378,16 @@ mod tests {
                 ("GITHUB_TOKEN", None::<&str>),
             ],
             || {
-                let default = ServerConfig::default();
                 let mut cfg = ServerConfig::default();
+                // Snapshot before calling apply_env_overrides to avoid a race
+                // with parallel tests that temporarily mutate HOME.
+                let http_addr_before = cfg.http_addr;
+                let data_dir_before = cfg.data_dir.clone();
                 cfg.apply_env_overrides().unwrap();
-                assert_eq!(cfg.http_addr, default.http_addr);
-                assert_eq!(cfg.data_dir, default.data_dir);
-                assert_eq!(cfg.api_token, default.api_token);
-                assert_eq!(cfg.github_token, default.github_token);
+                assert_eq!(cfg.http_addr, http_addr_before);
+                assert_eq!(cfg.data_dir, data_dir_before);
+                assert_eq!(cfg.api_token, None);
+                assert_eq!(cfg.github_token, None);
             },
         );
     }
