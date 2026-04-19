@@ -20,6 +20,16 @@ static PLAN_MIGRATIONS: &[Migration] = &[
         description: "add index on exec_plans(created_at)",
         sql: "CREATE INDEX IF NOT EXISTS idx_exec_plans_created_at ON exec_plans(created_at)",
     },
+    Migration {
+        version: 3,
+        description: "convert exec_plans.data from TEXT to JSONB",
+        sql: "ALTER TABLE exec_plans ALTER COLUMN data TYPE JSONB USING data::jsonb",
+    },
+    Migration {
+        version: 4,
+        description: "add GIN index on exec_plans.data for JSONB path queries",
+        sql: "CREATE INDEX IF NOT EXISTS idx_exec_plans_data_gin ON exec_plans USING GIN (data jsonb_path_ops)",
+    },
 ];
 
 pub struct PlanDb {
@@ -54,7 +64,7 @@ impl PlanDb {
     pub async fn upsert(&self, plan: &ExecPlan) -> anyhow::Result<()> {
         let data = serde_json::to_string(plan)?;
         sqlx::query(
-            "INSERT INTO exec_plans (id, data) VALUES ($1, $2)
+            "INSERT INTO exec_plans (id, data) VALUES ($1, $2::jsonb)
              ON CONFLICT(id) DO UPDATE SET data = EXCLUDED.data,
                  updated_at = CURRENT_TIMESTAMP",
         )
@@ -83,10 +93,11 @@ impl PlanDb {
     }
 
     pub async fn get(&self, id: &ExecPlanId) -> anyhow::Result<Option<ExecPlan>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT data FROM exec_plans WHERE id = $1")
-            .bind(id.as_str())
-            .fetch_optional(&self.pool)
-            .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data::text FROM exec_plans WHERE id = $1")
+                .bind(id.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
         match row {
             Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
             None => Ok(None),
@@ -95,7 +106,7 @@ impl PlanDb {
 
     pub async fn list(&self) -> anyhow::Result<Vec<ExecPlan>> {
         let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT data FROM exec_plans ORDER BY created_at DESC")
+            sqlx::query_as("SELECT data::text FROM exec_plans ORDER BY created_at DESC")
                 .fetch_all(&self.pool)
                 .await?;
         rows.into_iter()
@@ -118,7 +129,7 @@ impl PlanDb {
             .unwrap_or_default()
             .to_string();
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT data FROM exec_plans WHERE data::jsonb->>'status' = $1 ORDER BY created_at DESC",
+            "SELECT data::text FROM exec_plans WHERE data->>'status' = $1 ORDER BY created_at DESC",
         )
         .bind(&status_str)
         .fetch_all(&self.pool)
@@ -132,7 +143,7 @@ impl PlanDb {
     pub async fn search_by_name(&self, query: &str) -> anyhow::Result<Vec<ExecPlan>> {
         let pattern = format!("%{}%", query);
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT data FROM exec_plans WHERE data::jsonb->>'purpose' LIKE $1 ORDER BY created_at DESC",
+            "SELECT data::text FROM exec_plans WHERE data->>'purpose' LIKE $1 ORDER BY created_at DESC",
         )
         .bind(&pattern)
         .fetch_all(&self.pool)
