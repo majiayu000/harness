@@ -16,4 +16,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Build web bundle
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run build
       - run: cargo check --workspace --all-features
