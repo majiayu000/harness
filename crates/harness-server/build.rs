@@ -54,13 +54,13 @@ fn main() {
     body.push_str(&format!("pub const ASSET_JS_NAME: &str = \"{}\";\n", js));
     body.push_str(&format!(
         "pub const ASSET_JS: &[u8] = include_bytes!(\"{}\");\n",
-        dist.join("assets").join(&js).display()
+        rust_lit(&dist.join("assets").join(&js))
     ));
     if let Some(css) = css {
         body.push_str(&format!("pub const ASSET_CSS_NAME: &str = \"{}\";\n", css));
         body.push_str(&format!(
             "pub const ASSET_CSS: &[u8] = include_bytes!(\"{}\");\n",
-            dist.join("assets").join(&css).display()
+            rust_lit(&dist.join("assets").join(&css))
         ));
     } else {
         body.push_str("pub const ASSET_CSS_NAME: &str = \"\";\n");
@@ -68,10 +68,18 @@ fn main() {
     }
     body.push_str(&format!(
         "pub const INDEX_HTML: &str = include_str!(\"{}\");\n",
-        index_html.display()
+        rust_lit(&index_html)
     ));
 
     std::fs::write(&manifest, body).expect("write assets_manifest.rs");
+}
+
+/// Render a filesystem path as a Rust string literal safe to embed inside
+/// `include_bytes!`/`include_str!`. On Windows `Path::display()` emits
+/// backslashes which Rust interprets as escape sequences; normalize to
+/// forward slashes so the generated manifest compiles on every platform.
+fn rust_lit(path: &std::path::Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 fn run(cmd: &[&str], dir: &std::path::Path) {
