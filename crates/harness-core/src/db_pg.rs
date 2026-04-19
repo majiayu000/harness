@@ -16,6 +16,31 @@ pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
     Ok(pool)
 }
 
+/// Validates that a schema name contains only ASCII letters, digits, and
+/// underscores, and starts with a letter or underscore. Rejects the name
+/// before it is ever interpolated into SQL, providing defence in depth against
+/// injection if the schema-name construction ever changes.
+fn validate_schema_name(schema: &str) -> anyhow::Result<()> {
+    let mut chars = schema.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => anyhow::bail!("schema name must not be empty"),
+    };
+    if !first.is_ascii_alphabetic() && first != '_' {
+        anyhow::bail!(
+            "schema name must start with a letter or underscore, got: {:?}",
+            schema
+        );
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        anyhow::bail!(
+            "schema name may only contain ASCII letters, digits, and underscores, got: {:?}",
+            schema
+        );
+    }
+    Ok(())
+}
+
 /// Create a Postgres connection pool where every connection has `search_path`
 /// set to `schema`. Used to give each store an isolated schema namespace.
 ///
@@ -25,7 +50,12 @@ pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
 /// silently strips the startup `options` parameter, causing all DDL to fall
 /// back to the default `public` schema and all stores to share a single
 /// `schema_migrations` table (migration-number collision bug).
+///
+/// Returns an error if `schema` contains characters outside `[a-zA-Z0-9_]` or
+/// does not start with a letter or underscore — rejecting invalid names before
+/// they are interpolated into SQL.
 pub async fn pg_open_pool_schematized(database_url: &str, schema: &str) -> anyhow::Result<PgPool> {
+    validate_schema_name(schema)?;
     let opts = PgConnectOptions::from_str(database_url)?.options([("search_path", schema)]);
     let schema_for_hook = schema.to_string();
     let pool = PgPoolOptions::new()
@@ -34,9 +64,6 @@ pub async fn pg_open_pool_schematized(database_url: &str, schema: &str) -> anyho
         .after_connect(move |conn, _meta| {
             let schema = schema_for_hook.clone();
             Box::pin(async move {
-                // Quoted identifier guards against injection from the schema name;
-                // schema here is constructed from a hash hex string so quoting is
-                // defensive in depth rather than strictly required.
                 let stmt = format!("SET search_path TO \"{}\"", schema);
                 sqlx::query(&stmt).execute(conn).await?;
                 Ok(())
@@ -131,5 +158,45 @@ impl<'a> PgMigrator<'a> {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_schema_name;
+
+    #[test]
+    fn valid_schema_names() {
+        for name in ["public", "_priv", "h1a2b3c4d5e6f7a8", "schema_1", "A"] {
+            assert!(
+                validate_schema_name(name).is_ok(),
+                "expected ok for {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_schema_rejected() {
+        assert!(validate_schema_name("").is_err());
+    }
+
+    #[test]
+    fn digit_first_rejected() {
+        assert!(validate_schema_name("1schema").is_err());
+    }
+
+    #[test]
+    fn double_quote_rejected() {
+        assert!(validate_schema_name("sch\"ema").is_err());
+    }
+
+    #[test]
+    fn semicolon_rejected() {
+        assert!(validate_schema_name("s;DROP TABLE").is_err());
+    }
+
+    #[test]
+    fn hyphen_rejected() {
+        assert!(validate_schema_name("my-schema").is_err());
     }
 }
