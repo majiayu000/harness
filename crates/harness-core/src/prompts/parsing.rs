@@ -166,6 +166,24 @@ pub fn is_waiting(output: &str) -> bool {
     last_non_empty_line(output) == Some("WAITING")
 }
 
+/// Return `true` if a Gemini review body contains actionable feedback trigger phrases.
+///
+/// Gemini posts `state=COMMENTED` reviews with zero inline comments when its
+/// feedback lives entirely in the review body as prose. These phrases are used
+/// by Gemini to introduce actionable suggestions in the body text.
+pub fn has_gemini_body_feedback(body: &str) -> bool {
+    let triggers = [
+        "feedback suggests",
+        "review feedback highlights",
+        "a review comment suggests",
+        "feedback was provided",
+    ];
+    body.lines().any(|line| {
+        let lower = line.trim().to_ascii_lowercase();
+        triggers.iter().any(|&t| lower.starts_with(t))
+    })
+}
+
 /// Check if reviewer output indicates quota exhaustion (e.g., Gemini 24h rate limit).
 ///
 /// Requires ≥ 2 co-occurring quota-signal terms, or a single high-specificity phrase,
@@ -287,6 +305,51 @@ pub fn parse_plan_issue(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_has_gemini_body_feedback_trigger_phrases() {
+        assert!(has_gemini_body_feedback(
+            "Feedback suggests adding a timeout to prevent resource leaks."
+        ));
+        assert!(has_gemini_body_feedback(
+            "Review feedback highlights a potential race condition in this function."
+        ));
+        assert!(has_gemini_body_feedback(
+            "A review comment suggests using a constant instead of a magic number."
+        ));
+        assert!(has_gemini_body_feedback(
+            "Feedback was provided regarding the error handling approach."
+        ));
+    }
+
+    #[test]
+    fn test_has_gemini_body_feedback_case_insensitive() {
+        assert!(has_gemini_body_feedback(
+            "FEEDBACK SUGGESTS using a different approach."
+        ));
+        assert!(has_gemini_body_feedback(
+            "REVIEW FEEDBACK HIGHLIGHTS a potential issue."
+        ));
+    }
+
+    #[test]
+    fn test_has_gemini_body_feedback_all_triggers_in_one_body() {
+        let body = "Feedback suggests adding tests.\nReview feedback highlights a bug.\nA review comment suggests renaming.\nFeedback was provided on performance.";
+        assert!(has_gemini_body_feedback(body));
+    }
+
+    #[test]
+    fn test_has_gemini_body_feedback_empty_body_returns_false() {
+        assert!(!has_gemini_body_feedback(""));
+    }
+
+    #[test]
+    fn test_has_gemini_body_feedback_no_trigger_returns_false() {
+        assert!(!has_gemini_body_feedback(
+            "This PR looks good overall. Nice work on the refactoring."
+        ));
+        assert!(!has_gemini_body_feedback("LGTM"));
+    }
 
     #[test]
     fn test_parse_issue_count() {

@@ -121,6 +121,13 @@ pub fn review_prompt(
          1. Run `gh pr view {pr} --json statusCheckRollup` and parse the JSON. \
          CI passes only if the `state` field in the `statusCheckRollup` object is `SUCCESS`\n\
          2. Run `gh api repos/{repo}/pulls/{pr}/reviews` to read review verdicts\n\
+         2b. For any review where the author login contains 'gemini', \
+         the state is 'COMMENTED', and the review has zero inline comments: \
+         read the review 'body' field. If any line begins (case-insensitive) with one of these phrases: \
+         'Feedback suggests', 'Review feedback highlights', 'A review comment suggests', \
+         'Feedback was provided' — treat each such paragraph as an unresolved issue, \
+         include the body text in your analysis, and count it toward ISSUES=<number>. \
+         Do NOT report LGTM while such actionable body feedback remains unaddressed.\n\
          3. Run `gh api repos/{repo}/pulls/{pr}/comments` to read inline review comments\n\
          4. {severity_guidance}\n\
          5. If all CI checks pass and there are no unresolved review comments \
