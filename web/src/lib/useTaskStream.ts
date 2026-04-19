@@ -3,6 +3,7 @@ import { fetchEventSource } from "@microsoft/fetch-event-source";
 import { authHeaders, unauthorizedEvents } from "./api";
 
 const MAX_LINES = 2000;
+const MAX_EVENT_BYTES = 4096;
 
 export interface TaskStreamState {
   lines: string[];
@@ -56,8 +57,12 @@ export function useTaskStream(taskId: string | null): TaskStreamState {
       },
       onmessage: (ev) => {
         if (!ev.data) return;
+        const data =
+          ev.data.length > MAX_EVENT_BYTES
+            ? ev.data.slice(0, MAX_EVENT_BYTES) + " …[truncated]"
+            : ev.data;
         setLines((prev) => {
-          const next = [...prev, ev.data];
+          const next = [...prev, data];
           return next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
         });
       },

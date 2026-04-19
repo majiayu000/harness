@@ -20,8 +20,15 @@ function DiffView({ artifacts }: { artifacts: TaskArtifact[] }) {
   return (
     <div className="p-2 space-y-4">
       {fileEdits.map((a, i) => {
-        let parsed: FileEditContent = {};
-        try { parsed = JSON.parse(a.content) as FileEditContent; } catch { /* ignore malformed */ }
+        let parsed: FileEditContent | null = null;
+        try { parsed = JSON.parse(a.content) as FileEditContent; } catch { /* malformed/truncated */ }
+        if (!parsed) {
+          return (
+            <div key={i} className="font-mono text-[11px] text-danger">
+              [artifact {i + 1}: malformed or truncated content]
+            </div>
+          );
+        }
         const beforeLines = parsed.before ? parsed.before.split("\n") : [];
         const afterLines = parsed.after ? parsed.after.split("\n") : [];
         return (
@@ -44,25 +51,32 @@ function DiffView({ artifacts }: { artifacts: TaskArtifact[] }) {
   );
 }
 
-function ReviewView({ prompts }: { prompts: TaskPrompt[] }) {
-  const reviews = prompts.filter(
-    (p) => p.phase === "review" || p.phase === "cross_review",
+function ReviewView({ prompts, artifacts }: { prompts: TaskPrompt[]; artifacts: TaskArtifact[] }) {
+  const reviewTurns = new Set(
+    prompts
+      .filter((p) => p.phase === "review" || p.phase === "cross_review")
+      .map((p) => p.turn),
   );
-  if (reviews.length === 0) {
+  if (reviewTurns.size === 0) {
     return <div className="p-3 font-mono text-[11px] text-ink-4">—</div>;
+  }
+  const reviewArtifacts = artifacts.filter((a) => reviewTurns.has(a.turn));
+  if (reviewArtifacts.length === 0) {
+    return (
+      <div className="p-3 font-mono text-[11px] text-ink-4">
+        Review output streams live — see the Stream tab.
+      </div>
+    );
   }
   return (
     <div className="p-2 space-y-4">
-      <div className="font-mono text-[10px] text-ink-4">
-        Reviewer findings stream live — see the Stream tab for output.
-      </div>
-      {reviews.map((p, i) => (
+      {reviewArtifacts.map((a, i) => (
         <div key={i} className="space-y-1">
           <div className="font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">
-            {p.phase} · turn {p.turn} · prompt
+            turn {a.turn} · {a.artifact_type}
           </div>
           <pre className="font-mono text-[11px] text-ink-3 whitespace-pre-wrap break-words">
-            {p.prompt}
+            {a.content}
           </pre>
         </div>
       ))}
@@ -150,7 +164,7 @@ export function TaskSlideover({ taskId, onClose }: Props) {
             </pre>
           )}
           {activeTab === "Diff" && <DiffView artifacts={artifacts ?? []} />}
-          {activeTab === "Review" && <ReviewView prompts={prompts ?? []} />}
+          {activeTab === "Review" && <ReviewView prompts={prompts ?? []} artifacts={artifacts ?? []} />}
           {activeTab === "Events" && (
             <div className="p-3 space-y-2">
               {task ? (
