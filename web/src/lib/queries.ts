@@ -19,6 +19,6 @@ export function useOverview() {
 export function useTasks() {
   return useQuery<Task[], Error>({
     queryKey: ["tasks"],
-    queryFn: ({ signal }) => apiJson<Task[]>("/tasks", { signal }),
+    queryFn: ({ signal }) => apiJson<Task[]>("/api/tasks", { signal }),
   });
 }

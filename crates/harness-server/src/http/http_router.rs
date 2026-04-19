@@ -32,6 +32,8 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/tasks/{id}/artifacts", get(get_task_artifacts))
         .route("/tasks/{id}/prompts", get(get_task_prompts))
         .route("/tasks/{id}/stream", get(stream_task_sse))
+        // /api/tasks mirrors /tasks for web-frontend consistency with other /api/* routes.
+        .route("/api/tasks", get(list_tasks))
         .route(
             "/projects",
             post(crate::handlers::projects::register_project)
