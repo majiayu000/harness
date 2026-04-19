@@ -474,10 +474,11 @@ fn gemini_commented_with_trigger_phrase_creates_rework_task() {
 }
 
 #[test]
-fn gemini_commented_without_trigger_phrase_is_dropped() {
-    // Gemini body-only COMMENTED reviews without a trigger phrase are not actionable
-    // (e.g. inline-comment summary lines). The webhook now checks user login and
-    // drops such events instead of dispatching a rework task.
+fn gemini_commented_without_trigger_phrase_creates_rework_task() {
+    // Gemini COMMENTED reviews with a non-empty body are accepted at the webhook
+    // boundary regardless of trigger phrases. The review may carry inline comments
+    // that the downstream agent will discover via the GitHub API, and filtering at
+    // the webhook layer would silently drop actionable inline feedback.
     let payload = serde_json::json!({
         "action": "submitted",
         "review": {
@@ -497,13 +498,10 @@ fn gemini_commented_without_trigger_phrase_is_dropped() {
         parse_github_webhook_task_request("pull_request_review", payload.to_string().as_bytes())
             .unwrap();
     assert!(
-        request.is_none(),
-        "gemini body without trigger phrases should be ignored"
+        request.is_some(),
+        "gemini body without trigger phrases should still create a rework task"
     );
-    assert_eq!(
-        reason,
-        "pr review comment: Gemini body lacks trigger phrases, ignored"
-    );
+    assert_eq!(reason, "pr review comment: actionable feedback");
 }
 
 #[test]
