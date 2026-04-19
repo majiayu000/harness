@@ -343,10 +343,13 @@ async fn run_sequential_subtasks(
     // Single token covers the full sequential run — all steps share one workspace.
     // TTL must span every step: each step can run for up to `turn_timeout`, so
     // a single-step TTL would expire partway through a multi-step chain.
+    // Use saturating arithmetic to avoid panic on absurdly large turn_timeout values.
     let seq_token = CapabilityToken::new(
         0,
         token_write_paths(workspace.clone()),
-        turn_timeout * (total as u32) + Duration::from_secs(60),
+        turn_timeout
+            .saturating_mul(total as u32)
+            .saturating_add(Duration::from_secs(60)),
     );
 
     for (i, spec) in subtasks.into_iter().enumerate() {
@@ -463,7 +466,7 @@ async fn run_concurrent_subtasks(
                 let token = CapabilityToken::new(
                     i,
                     token_write_paths(workspace.clone()),
-                    turn_timeout + Duration::from_secs(60),
+                    turn_timeout.saturating_add(Duration::from_secs(60)),
                 );
                 let req = AgentRequest {
                     prompt: spec.prompt,

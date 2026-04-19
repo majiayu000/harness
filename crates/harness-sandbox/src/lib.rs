@@ -267,6 +267,14 @@ fn linux_bwrap_args(
         SandboxMode::WorkspaceWrite => {
             if let Some(ref paths) = spec.allowed_write_paths {
                 for path in paths {
+                    // Skip /tmp: the --tmpfs mount above already provides a private writable
+                    // tmpfs inside the container.  Binding host /tmp would override that
+                    // private mount and expose the shared host /tmp, breaking per-task
+                    // isolation.  Also skip paths that don't exist on this host (e.g.
+                    // /private/tmp on Linux).
+                    if path == Path::new("/tmp") || !path.exists() {
+                        continue;
+                    }
                     wrapped_args.push(OsString::from("--bind"));
                     wrapped_args.push(path.as_os_str().to_os_string());
                     wrapped_args.push(path.as_os_str().to_os_string());
