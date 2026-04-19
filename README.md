@@ -97,6 +97,46 @@ The facade groups the stable parts of `harness-core`, `harness-protocol`,
 `harness-sandbox`, and `harness-exec` under one crate without forcing callers to
 track internal crate layout changes.
 
+### Database Setup
+
+Harness requires Postgres 14+ (SQLite was removed in v0.x). Set `DATABASE_URL`
+before starting the server — migrations run automatically on first connect.
+
+**Option A — Docker Compose (recommended for local dev):**
+
+```bash
+# Start Postgres container (idempotent — safe to re-run)
+bash scripts/dev-db.sh
+
+# Then export the printed connection string:
+export DATABASE_URL=postgres://harness:harness@localhost:5432/harness
+```
+
+**Option B — docker compose directly:**
+
+```bash
+docker compose up -d postgres
+export DATABASE_URL=postgres://harness:harness@localhost:5432/harness
+```
+
+**Option C — existing Postgres instance:**
+
+```bash
+export DATABASE_URL=postgres://user:password@host:5432/dbname
+```
+
+Copy `.env.example` to `.env` for a reference of all required env vars.
+`.env` is git-ignored; never commit real credentials.
+
+**Running tests against a real database:**
+
+```bash
+DATABASE_URL=postgres://harness:harness@localhost:5432/harness cargo test --workspace
+```
+
+Integration tests that require a database (e.g. `runtime_state_store`,
+`thread_db`, `q_value_store`) skip automatically when `DATABASE_URL` is unset.
+
 ### Run
 
 **HTTP server:**
