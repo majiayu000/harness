@@ -139,9 +139,17 @@ fn seatbelt_policy(spec: &SandboxSpec) -> Result<String, SandboxError> {
         "(allow signal (target self))".to_string(),
         "(allow network-outbound)".to_string(),
         "(allow file-read*)".to_string(),
-        "(allow file-write* (subpath \"/private/tmp\") (subpath \"/tmp\") (subpath \"/var/tmp\"))"
-            .to_string(),
     ];
+
+    // Blanket /tmp write access is omitted when token paths are present.
+    // Token paths already define the write boundary; granting /tmp globally
+    // would allow escape to sibling worktrees housed under the same /tmp tree.
+    if spec.allowed_write_paths.is_none() {
+        lines.push(
+            "(allow file-write* (subpath \"/private/tmp\") (subpath \"/tmp\") (subpath \"/var/tmp\"))"
+                .to_string(),
+        );
+    }
 
     match spec.mode {
         SandboxMode::ReadOnly => {}
@@ -585,6 +593,12 @@ mod tests {
         assert!(
             !policy.contains("(allow file-write* (subpath \"/tmp/project\"))"),
             "policy must not use blanket project_root when token paths are set"
+        );
+        // Blanket /tmp grant must be absent so sibling worktrees under /tmp are
+        // not reachable when the token narrows write scope.
+        assert!(
+            !policy.contains("(allow file-write* (subpath \"/private/tmp\")"),
+            "blanket /tmp grant must be absent when token paths are set"
         );
     }
 

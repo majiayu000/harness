@@ -326,10 +326,12 @@ async fn run_sequential_subtasks(
     };
 
     // Single token covers the full sequential run — all steps share one workspace.
+    // TTL must span every step: each step can run for up to `turn_timeout`, so
+    // a single-step TTL would expire partway through a multi-step chain.
     let seq_token = CapabilityToken::new(
         0,
         vec![workspace.clone()],
-        turn_timeout + Duration::from_secs(60),
+        turn_timeout * (total as u32) + Duration::from_secs(60),
     );
 
     for (i, spec) in subtasks.into_iter().enumerate() {

@@ -99,10 +99,24 @@ impl CodeAgent for CodexAgent {
     }
 
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        if let Some(ref token) = req.capability_token {
+            if token.is_expired() {
+                return Err(harness_core::error::HarnessError::AgentExecution(format!(
+                    "capability token for subtask {} has expired",
+                    token.subtask_index
+                )));
+            }
+        }
+
         self.run_setup_phase(&req.project_root).await?;
 
         let base_args = self.base_args(&req);
-        let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
+        let sandbox_spec = if let Some(ref token) = req.capability_token {
+            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+                .with_allowed_write_paths(token.allowed_write_paths.clone())
+        } else {
+            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+        };
         let wrapped_command =
             wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
                 harness_core::error::HarnessError::AgentExecution(format!(
@@ -180,10 +194,24 @@ impl CodeAgent for CodexAgent {
         req: AgentRequest,
         tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
+        if let Some(ref token) = req.capability_token {
+            if token.is_expired() {
+                return Err(harness_core::error::HarnessError::AgentExecution(format!(
+                    "capability token for subtask {} has expired",
+                    token.subtask_index
+                )));
+            }
+        }
+
         self.run_setup_phase(&req.project_root).await?;
 
         let base_args = self.base_args(&req);
-        let sandbox_spec = SandboxSpec::new(self.sandbox_mode, &req.project_root);
+        let sandbox_spec = if let Some(ref token) = req.capability_token {
+            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+                .with_allowed_write_paths(token.allowed_write_paths.clone())
+        } else {
+            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+        };
         let wrapped_command =
             wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
                 harness_core::error::HarnessError::AgentExecution(format!(
