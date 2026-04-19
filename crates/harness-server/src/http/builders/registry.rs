@@ -104,11 +104,12 @@ pub(crate) async fn build_registry(
                         .find(|project| project_matches_root(project))
                 })
         });
+    let canonical_root = canonical_project_root.as_deref().unwrap_or(project_root);
     let default_project = crate::project_registry::Project {
-        id: harness_core::types::ProjectId::from_path(project_root)
+        id: harness_core::types::ProjectId::from_path(canonical_root)
             .as_str()
             .to_owned(),
-        root: project_root.to_path_buf(),
+        root: canonical_root.to_path_buf(),
         name: default_project_metadata.map(|p| p.name.clone()),
         max_concurrent: default_project_metadata.and_then(|p| p.max_concurrent),
         default_agent: default_project_metadata.and_then(|p| p.default_agent.clone()),
@@ -119,11 +120,15 @@ pub(crate) async fn build_registry(
         tracing::warn!("failed to auto-register default project: {e}");
     }
     for project in &server.startup_projects {
+        let startup_root = project
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| project.root.clone());
         let proj = crate::project_registry::Project {
-            id: harness_core::types::ProjectId::from_path(&project.root)
+            id: harness_core::types::ProjectId::from_path(&startup_root)
                 .as_str()
                 .to_owned(),
-            root: project.root.clone(),
+            root: startup_root,
             name: Some(project.name.clone()),
             max_concurrent: project.max_concurrent,
             default_agent: project.default_agent.clone(),
