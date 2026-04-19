@@ -484,7 +484,7 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
         project_root: None,
         issue: None,
         repo: None,
-        description: None,
+        description: Some("prompt task".to_string()),
         created_at: None,
         priority: 0,
         phase: task_runner::TaskPhase::default(),
@@ -494,6 +494,13 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
+    // Write a triage checkpoint so pending_tasks_with_checkpoint (which JOINs
+    // task_checkpoints) returns this task during recovery.
+    state
+        .core
+        .tasks
+        .write_checkpoint(&task_id, Some("triage done"), None, None, "triage")
+        .await?;
 
     super::super::background::spawn_checkpoint_recovery(&state).await;
 
