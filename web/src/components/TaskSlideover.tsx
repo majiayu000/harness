@@ -52,15 +52,16 @@ function DiffView({ artifacts }: { artifacts: TaskArtifact[] }) {
 }
 
 function ReviewView({ prompts, artifacts }: { prompts: TaskPrompt[]; artifacts: TaskArtifact[] }) {
-  const reviewPrompts = prompts.filter((p) => p.phase === "simplereview");
-  if (reviewPrompts.length === 0) {
+  if (prompts.length === 0) {
     return <div className="p-3 font-mono text-[11px] text-ink-4">—</div>;
   }
-  const reviewTurns = new Set(reviewPrompts.map((p) => p.turn));
+  const reviewTurns = new Set(
+    prompts.filter((p) => p.phase === "simplereview").map((p) => p.turn),
+  );
   const reviewArtifacts = artifacts.filter((a) => reviewTurns.has(a.turn));
   return (
     <div className="p-2 space-y-4">
-      {reviewPrompts.map((p, i) => (
+      {prompts.map((p, i) => (
         <div key={i} className="space-y-1">
           <div className="font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">
             turn {p.turn} · {p.phase}
