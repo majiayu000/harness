@@ -128,7 +128,7 @@ function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
 }
 
 export function Worktrees() {
-  const { cards, isLoading } = useWorktrees();
+  const { cards, isLoading, error } = useWorktrees();
   const { data: overview } = useOverview();
   const queryClient = useQueryClient();
 
@@ -194,12 +194,17 @@ export function Worktrees() {
           </div>
 
           <div className="p-6">
+            {error && (
+              <div className="mb-4 px-3 py-2 border border-danger/40 text-danger font-mono text-[12px] rounded-[3px] bg-danger/5">
+                Failed to load worktrees: {error.message}
+              </div>
+            )}
             {cancelError && (
               <div className="mb-4 px-3 py-2 border border-danger/40 text-danger font-mono text-[12px] rounded-[3px] bg-danger/5">
                 {cancelError}
               </div>
             )}
-            {!isLoading && cards.length === 0 ? (
+            {!isLoading && !error && cards.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-24 text-ink-3">
                 <span className="font-mono text-[13px]">No active worktrees</span>
               </div>
