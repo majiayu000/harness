@@ -225,7 +225,21 @@ async fn shutdown_signal() {
 
 pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let count = state.core.tasks.count();
-    Json(json!({"status": "ok", "tasks": count}))
+    let dirty = state.is_runtime_state_dirty();
+    let degraded = &state.degraded_subsystems;
+    let status = if degraded.is_empty() && !dirty {
+        "ok"
+    } else {
+        "degraded"
+    };
+    Json(json!({
+        "status": status,
+        "tasks": count,
+        "persistence": {
+            "degraded_subsystems": degraded,
+            "runtime_state_dirty": dirty,
+        }
+    }))
 }
 
 /// GET /projects/queue-stats — per-project queue stats alongside the global queue summary.

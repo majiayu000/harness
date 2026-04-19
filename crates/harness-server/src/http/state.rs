@@ -101,6 +101,9 @@ pub struct AppState {
     pub notifications: NotificationServices,
     pub intake: IntakeServices,
     pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
+    /// Subsystem names that degraded to `None` at startup (optional stores only).
+    /// Set once during `build_app_state`; read-only thereafter.
+    pub degraded_subsystems: Vec<&'static str>,
 
     // ── Service layer ────────────────────────────────────────────────────────
     // Trait-based abstractions for independent testability. Each service owns

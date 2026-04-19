@@ -139,6 +139,32 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         Arc::new(AtomicBool::new(in_window))
     };
 
+    let review_store = {
+        let review_db_path = harness_core::config::dirs::default_db_path(&dir, "reviews");
+        match crate::review_store::ReviewStore::open(&review_db_path).await {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!("review store init failed, reviews will not be persisted: {e}");
+                None
+            }
+        }
+    };
+
+    // NOTE: add a matching entry here whenever a new optional store is added.
+    let mut degraded_subsystems: Vec<&'static str> = Vec::new();
+    if storage.q_values.is_none() {
+        degraded_subsystems.push("q_value_store");
+    }
+    if registry.runtime_state_store.is_none() || services.snapshot_load_failed {
+        degraded_subsystems.push("runtime_state_store");
+    }
+    if registry.workspace_mgr.is_none() {
+        degraded_subsystems.push("workspace_manager");
+    }
+    if review_store.is_none() {
+        degraded_subsystems.push("review_store");
+    }
+
     Ok(AppState {
         core: CoreServices {
             server,
@@ -164,18 +190,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             password_reset_rate_limiter: Arc::new(rate_limit::PasswordResetRateLimiter::new(
                 password_reset_rate_limit,
             )),
-            review_store: {
-                let review_db_path = harness_core::config::dirs::default_db_path(&dir, "reviews");
-                match crate::review_store::ReviewStore::open(&review_db_path).await {
-                    Ok(store) => Some(Arc::new(store)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "review store init failed, reviews will not be persisted: {e}"
-                        );
-                        None
-                    }
-                }
-            },
+            review_store,
         },
         concurrency: ConcurrencyServices {
             task_queue: intake.task_queue,
@@ -195,6 +210,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             ws_shutdown_tx: broadcast::channel(1).0,
         },
         interceptors: services.interceptors,
+        degraded_subsystems,
         intake: IntakeServices {
             feishu_intake: intake.feishu_intake,
             github_pollers: intake.github_pollers.into_iter().map(|(_, p)| p).collect(),
