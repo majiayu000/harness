@@ -199,8 +199,30 @@ impl EventStore {
     }
 
     /// Import events from an existing `events.jsonl` file (backward compat).
+    ///
+    /// Fast-paths out when the `events` table already contains rows: on each
+    /// startup we previously re-read the full JSONL and fired one `INSERT
+    /// ... ON CONFLICT DO NOTHING` per line. Against a remote Postgres (e.g.
+    /// Supabase session pooler, ~1s RTT per statement) this added ~N seconds
+    /// to every server boot for N lines in the file, even though every row
+    /// was already in the DB. Checking the table once is a single query.
     async fn migrate_from_jsonl(&self) {
         use std::io::BufRead as _;
+
+        // Fast-path: if any events are already in the DB, assume a prior
+        // successful migration and skip the per-line replay entirely.
+        match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events")
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(n) if n > 0 => return,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "event store: could not check existing event count, will still attempt JSONL migration: {e}"
+                );
+            }
+        }
 
         let path = self.data_dir.join("events.jsonl");
         let file = match std::fs::File::open(&path) {
