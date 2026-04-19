@@ -19,6 +19,7 @@ export interface DashboardRuntimeHost {
   online: boolean;
   last_heartbeat_at: string;
   watched_projects: number;
+  watched_project_roots: string[];
   active_leases: number;
   assignment_pressure: number;
 }

@@ -7,16 +7,19 @@ interface Props {
 
 export function Channels({ projectFilter }: Props) {
   const { data } = useDashboard();
-  const hosts = data?.runtime_hosts ?? [];
+  const allHosts = data?.runtime_hosts ?? [];
+
+  const resolvedRoot = projectFilter
+    ? (data?.projects.find((p) => p.id === projectFilter)?.root ?? projectFilter)
+    : null;
+
+  const hosts = resolvedRoot
+    ? allHosts.filter((h) => h.watched_project_roots.includes(resolvedRoot))
+    : allHosts;
 
   return (
     <div>
       <h3 className="font-mono text-[10.5px] tracking-[0.1em] uppercase text-ink-3 mb-3">Runtime Hosts</h3>
-      {projectFilter && (
-        <div className="mb-3 font-mono text-[11px] text-ink-4 border border-line px-3 py-2">
-          per-project host filtering is unavailable — the backend exposes only a host count per project, not which projects each host watches. showing all hosts.
-        </div>
-      )}
       <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-3">
         {hosts.map((h) => (
           <RuntimeCard
