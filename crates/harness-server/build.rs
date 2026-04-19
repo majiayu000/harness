@@ -2,11 +2,13 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let web_dir: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let workspace_root: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .expect("workspace root")
-        .join("web");
+        .to_path_buf();
+    let web_dir: PathBuf = workspace_root.join("web");
+    let sdk_dir: PathBuf = workspace_root.join("sdk").join("typescript");
 
     // Trigger rerun whenever web source changes.
     for rel in [
@@ -20,6 +22,14 @@ fn main() {
         "src",
     ] {
         println!("cargo:rerun-if-changed={}/{}", web_dir.display(), rel);
+    }
+
+    // The web bundle depends on sdk/typescript (web/package.json uses
+    // file:../sdk/typescript and web/package.json "prebuild" rebuilds the
+    // SDK). Without these triggers, editing only SDK source could leave a
+    // stale embedded bundle until an unrelated web/ edit forces rerun.
+    for rel in ["package.json", "tsconfig.json", "src"] {
+        println!("cargo:rerun-if-changed={}/{}", sdk_dir.display(), rel);
     }
 
     // Skip the build when `HARNESS_SKIP_WEB_BUILD=1` so Rust-only hacking
