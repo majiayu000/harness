@@ -86,11 +86,20 @@ fn run(cmd: &[&str], dir: &std::path::Path) {
 }
 
 /// Extract the first asset filename from `dist/index.html` whose href/src
-/// matches the given prefix and suffix. Returns just the filename component.
+/// matches the given prefix and ends with the given suffix. Scans all
+/// occurrences of `prefix` and returns the filename (between prefix and the
+/// next `"`) when that filename ends with `suffix`.
 fn find_asset(html: &str, prefix: &str, suffix: &str) -> Option<String> {
-    let needle_start = html.find(prefix)?;
-    let after = &html[needle_start + prefix.len()..];
-    let end = after.find(suffix)?;
-    let name = &after[..end + suffix.len()];
-    Some(name.to_string())
+    let mut cursor = 0;
+    while let Some(rel) = html[cursor..].find(prefix) {
+        let start = cursor + rel + prefix.len();
+        let rest = &html[start..];
+        let end = rest.find('"')?;
+        let name = &rest[..end];
+        if name.ends_with(suffix) {
+            return Some(name.to_string());
+        }
+        cursor = start + end;
+    }
+    None
 }
