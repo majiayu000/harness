@@ -25,12 +25,7 @@ fn gc_adopt_task_request(
 }
 
 fn configured_project_id(project_root: &Path) -> ProjectId {
-    ProjectId::from_str(
-        project_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("default"),
-    )
+    ProjectId::from_path(project_root)
 }
 
 async fn log_gc_event(

@@ -26,7 +26,14 @@ async fn resolve_project_from_registry(
         return Ok((Some(project_path), None));
     }
     let id = project_path.to_string_lossy();
+    // Try primary ID first, then name as fallback so `project: "litellm"` still
+    // resolves even though the registry key is now the canonical path.
     match registry.get(&id).await {
+        Ok(Some(p)) => return Ok((Some(p.root), p.default_agent)),
+        Ok(None) => {}
+        Err(e) => return Err(EnqueueTaskError::Internal(e.to_string())),
+    }
+    match registry.get_by_name(&id).await {
         Ok(Some(p)) => Ok((Some(p.root), p.default_agent)),
         Ok(None) => Err(EnqueueTaskError::BadRequest(format!(
             "project '{id}' not found in registry and is not a valid directory"
@@ -893,6 +900,7 @@ mod tests {
             .register(crate::project_registry::Project {
                 id: "my-repo".to_string(),
                 root: std::path::PathBuf::from("/home/user/my-repo"),
+                name: None,
                 max_concurrent: None,
                 default_agent: None,
                 active: true,
@@ -921,6 +929,7 @@ mod tests {
             .register(crate::project_registry::Project {
                 id: "pinned-repo".to_string(),
                 root: std::path::PathBuf::from("/home/user/pinned-repo"),
+                name: None,
                 max_concurrent: None,
                 default_agent: Some("opus".to_string()),
                 active: true,

@@ -502,8 +502,9 @@ impl Project {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
+        let id = ProjectId::from_path(&root);
         Self {
-            id: ProjectId::new(),
+            id,
             root,
             languages: Vec::new(),
             name,

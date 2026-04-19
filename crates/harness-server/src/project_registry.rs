@@ -8,6 +8,11 @@ use std::sync::Arc;
 pub struct Project {
     pub id: String,
     pub root: PathBuf,
+    /// Human-readable name from `[[projects]] name = "..."` config; used as
+    /// a secondary lookup key so `POST /tasks {"project":"litellm"}` resolves
+    /// even though the primary id is the canonical filesystem path.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub max_concurrent: Option<u32>,
     #[serde(default)]
@@ -75,6 +80,14 @@ impl ProjectRegistry {
     pub async fn resolve_path(&self, id: &str) -> anyhow::Result<Option<PathBuf>> {
         Ok(self.get(id).await?.map(|p| p.root))
     }
+
+    /// Find a project by its configured `name` field. Returns the first match.
+    pub async fn get_by_name(&self, name: &str) -> anyhow::Result<Option<Project>> {
+        let projects = self.list().await?;
+        Ok(projects
+            .into_iter()
+            .find(|p| p.name.as_deref() == Some(name)))
+    }
 }
 
 /// Check that `canonical_root` falls under at least one of the
@@ -127,6 +140,7 @@ mod tests {
         let project = Project {
             id: "my-project".to_string(),
             root: PathBuf::from("/tmp/my-project"),
+            name: None,
             max_concurrent: None,
             default_agent: None,
             active: true,
@@ -154,6 +168,7 @@ mod tests {
                 .register(Project {
                     id: format!("p{i}"),
                     root: PathBuf::from(format!("/tmp/p{i}")),
+                    name: None,
                     max_concurrent: None,
                     default_agent: None,
                     active: true,
@@ -176,6 +191,7 @@ mod tests {
             .register(Project {
                 id: "to-delete".to_string(),
                 root: PathBuf::from("/tmp/x"),
+                name: None,
                 max_concurrent: None,
                 default_agent: None,
                 active: true,
@@ -205,6 +221,7 @@ mod tests {
             .register(Project {
                 id: "harness".to_string(),
                 root: PathBuf::from("/home/user/harness"),
+                name: None,
                 max_concurrent: None,
                 default_agent: None,
                 active: true,
@@ -229,6 +246,7 @@ mod tests {
                 .register(Project {
                     id: "persistent".to_string(),
                     root: PathBuf::from("/tmp/persistent"),
+                    name: None,
                     max_concurrent: Some(2),
                     default_agent: Some("claude".to_string()),
                     active: true,

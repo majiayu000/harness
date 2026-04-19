@@ -182,12 +182,7 @@ fn validate_skill_name(name: &str) -> Result<(), String> {
 }
 
 fn project_id_from_root(project_root: &std::path::Path) -> ProjectId {
-    ProjectId::from_str(
-        project_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("default"),
-    )
+    ProjectId::from_path(project_root)
 }
 
 async fn log_learn_event(state: &AppState, hook: &str, decision: Decision, detail: Option<String>) {

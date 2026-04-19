@@ -126,6 +126,7 @@ async fn sync_by_project_id_resolves_registry_root() -> anyhow::Result<()> {
         .register(crate::project_registry::Project {
             id: "demo".to_string(),
             root: project_dir.path().to_path_buf(),
+            name: None,
             max_concurrent: None,
             default_agent: None,
             active: true,

@@ -58,6 +58,7 @@ pub async fn register_project(
     let project = Project {
         id: req.id,
         root,
+        name: None,
         max_concurrent: req.max_concurrent,
         default_agent: req.default_agent,
         active: true,
@@ -107,7 +108,18 @@ pub async fn get_project(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.project_svc.get(&id).await {
+    // Try canonical path ID first, then human-readable name as fallback.
+    let result = match state.project_svc.get(&id).await {
+        Ok(Some(p)) => return (StatusCode::OK, Json(json!(p))),
+        Ok(None) => state.project_svc.get_by_name(&id).await,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
+    };
+    match result {
         Ok(Some(project)) => (StatusCode::OK, Json(json!(project))),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -124,7 +136,34 @@ pub async fn delete_project(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.project_svc.remove(&id).await {
+    // Resolve the canonical registry ID (which may be an absolute path) from
+    // either a direct ID match or a name-based lookup, so callers can use the
+    // human-readable name just as well as the full path key.
+    let canonical_id = match state.project_svc.get(&id).await {
+        Ok(Some(_)) => id.clone(),
+        Ok(None) => match state.project_svc.get_by_name(&id).await {
+            Ok(Some(p)) => p.id,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("project '{id}' not found")})),
+                )
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+            }
+        },
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
+    };
+    match state.project_svc.remove(&canonical_id).await {
         Ok(true) => (StatusCode::OK, Json(json!({"deleted": id}))),
         Ok(false) => (
             StatusCode::NOT_FOUND,

@@ -109,6 +109,7 @@ pub(crate) async fn build_registry(
             .as_str()
             .to_owned(),
         root: project_root.to_path_buf(),
+        name: default_project_metadata.map(|p| p.name.clone()),
         max_concurrent: default_project_metadata.and_then(|p| p.max_concurrent),
         default_agent: default_project_metadata.and_then(|p| p.default_agent.clone()),
         active: true,
@@ -123,6 +124,7 @@ pub(crate) async fn build_registry(
                 .as_str()
                 .to_owned(),
             root: project.root.clone(),
+            name: Some(project.name.clone()),
             max_concurrent: project.max_concurrent,
             default_agent: project.default_agent.clone(),
             active: true,
