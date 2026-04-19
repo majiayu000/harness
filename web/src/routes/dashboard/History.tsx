@@ -9,12 +9,12 @@ export function History({ projectFilter }: Props) {
   const { data } = useDashboard();
   const [filter, setFilter] = useState<"all" | "done" | "failed">("all");
   const [query, setQuery] = useState("");
-  const scopedProject = projectFilter ? data?.projects.find((p) => p.id === projectFilter) : null;
-  const totalDone = scopedProject
-    ? scopedProject.tasks.done
+  const scopedProject = projectFilter ? (data?.projects.find((p) => p.id === projectFilter) ?? null) : null;
+  const totalDone = projectFilter
+    ? (scopedProject?.tasks.done ?? 0)
     : (data?.projects.reduce((a, p) => a + p.tasks.done, 0) ?? 0);
-  const totalFailed = scopedProject
-    ? scopedProject.tasks.failed
+  const totalFailed = projectFilter
+    ? (scopedProject?.tasks.failed ?? 0)
     : (data?.projects.reduce((a, p) => a + p.tasks.failed, 0) ?? 0);
 
   return (
