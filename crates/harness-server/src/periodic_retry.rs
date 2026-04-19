@@ -430,11 +430,9 @@ mod tests {
         let task = stalled_task("t1", "issue:42", "/proj");
         db.insert(&task).await?;
         // Force updated_at into the past so the task qualifies as stalled.
-        sqlx::query(
-            "UPDATE tasks SET updated_at = datetime('now', '-120 minutes') WHERE id = 't1'",
-        )
-        .execute(db.pool_for_test())
-        .await?;
+        sqlx::query("UPDATE tasks SET updated_at = NOW() - INTERVAL '120 minutes' WHERE id = 't1'")
+            .execute(db.pool_for_test())
+            .await?;
 
         let results = db
             .list_stalled_tasks(Duration::from_secs(60 * 60), None)
@@ -457,7 +455,7 @@ mod tests {
             t.status = status;
             db.insert(&t).await?;
             sqlx::query(
-                "UPDATE tasks SET updated_at = datetime('now', '-120 minutes') WHERE id = ?",
+                "UPDATE tasks SET updated_at = NOW() - INTERVAL '120 minutes' WHERE id = $1",
             )
             .bind(id)
             .execute(db.pool_for_test())
@@ -478,11 +476,9 @@ mod tests {
         let mut task = stalled_task("t1", "issue:1", "/proj");
         task.external_id = None;
         db.insert(&task).await?;
-        sqlx::query(
-            "UPDATE tasks SET updated_at = datetime('now', '-120 minutes') WHERE id = 't1'",
-        )
-        .execute(db.pool_for_test())
-        .await?;
+        sqlx::query("UPDATE tasks SET updated_at = NOW() - INTERVAL '120 minutes' WHERE id = 't1'")
+            .execute(db.pool_for_test())
+            .await?;
 
         let results = db
             .list_stalled_tasks(Duration::from_secs(60 * 60), None)
@@ -501,7 +497,7 @@ mod tests {
         db.insert(&t2).await?;
         for id in ["t1", "t2"] {
             sqlx::query(
-                "UPDATE tasks SET updated_at = datetime('now', '-120 minutes') WHERE id = ?",
+                "UPDATE tasks SET updated_at = NOW() - INTERVAL '120 minutes' WHERE id = $1",
             )
             .bind(id)
             .execute(db.pool_for_test())
