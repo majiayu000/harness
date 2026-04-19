@@ -1,5 +1,6 @@
-use harness_core::db::{Db, DbEntity};
+use harness_core::db::{pg_open_pool, pg_open_pool_schematized, Migration, PgMigrator};
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgPool;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,54 +27,87 @@ fn default_active() -> bool {
     true
 }
 
-impl DbEntity for Project {
-    fn table_name() -> &'static str {
-        "projects"
-    }
+static PROJECT_MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    description: "create projects table",
+    sql: "CREATE TABLE IF NOT EXISTS projects (
+        id         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )",
+}];
 
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn create_table_sql() -> &'static str {
-        "CREATE TABLE IF NOT EXISTS projects (
-            id         TEXT PRIMARY KEY,
-            data       TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )"
-    }
-}
-
-/// Registry of projects backed by SQLite. Survives server restarts.
+/// Registry of projects backed by Postgres. Survives server restarts.
 pub struct ProjectRegistry {
-    db: Db<Project>,
+    pool: PgPool,
 }
 
 impl ProjectRegistry {
     pub async fn open(path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
-        let db = Db::open(path).await?;
-        Ok(Arc::new(Self { db }))
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable is not set"))?;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        let schema = format!("h{:016x}", hasher.finish());
+
+        let setup = pg_open_pool(&database_url).await?;
+        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
+            .execute(&setup)
+            .await?;
+        drop(setup);
+
+        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
+        PgMigrator::new(&pool, PROJECT_MIGRATIONS).run().await?;
+        Ok(Arc::new(Self { pool }))
     }
 
     /// Register or update a project.
     pub async fn register(&self, project: Project) -> anyhow::Result<()> {
-        self.db.upsert(&project).await
+        let data = serde_json::to_string(&project)?;
+        sqlx::query(
+            "INSERT INTO projects (id, data) VALUES ($1, $2)
+             ON CONFLICT(id) DO UPDATE SET data = EXCLUDED.data,
+                 updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(&project.id)
+        .bind(&data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// List all registered projects ordered by creation time (newest first).
     pub async fn list(&self) -> anyhow::Result<Vec<Project>> {
-        self.db.list().await
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT data FROM projects ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
     }
 
     /// Get a project by ID.
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<Project>> {
-        self.db.get(id).await
+        let row: Option<(String,)> = sqlx::query_as("SELECT data FROM projects WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
+            None => Ok(None),
+        }
     }
 
     /// Remove a project by ID. Returns `true` if it existed.
     pub async fn remove(&self, id: &str) -> anyhow::Result<bool> {
-        self.db.delete(id).await
+        let result = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Resolve a project ID to its root path. Returns `None` if not found.
@@ -132,10 +166,20 @@ pub fn validate_project_root(root: &std::path::Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    async fn open_test_registry(name: &str) -> anyhow::Result<Option<Arc<ProjectRegistry>>> {
+        if std::env::var("DATABASE_URL").is_err() {
+            return Ok(None);
+        }
+        let dir = tempfile::tempdir()?;
+        let registry = ProjectRegistry::open(&dir.path().join(name)).await?;
+        Ok(Some(registry))
+    }
+
     #[tokio::test]
     async fn register_and_get_roundtrip() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let registry = ProjectRegistry::open(&dir.path().join("projects.db")).await?;
+        let Some(registry) = open_test_registry("projects.db").await? else {
+            return Ok(());
+        };
 
         let project = Project {
             id: "my-project".to_string(),
@@ -160,8 +204,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_returns_all_projects() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let registry = ProjectRegistry::open(&dir.path().join("projects.db")).await?;
+        let Some(registry) = open_test_registry("projects.db").await? else {
+            return Ok(());
+        };
 
         for i in 0..3u32 {
             registry
@@ -184,8 +229,9 @@ mod tests {
 
     #[tokio::test]
     async fn remove_returns_true_when_found() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let registry = ProjectRegistry::open(&dir.path().join("projects.db")).await?;
+        let Some(registry) = open_test_registry("projects.db").await? else {
+            return Ok(());
+        };
 
         registry
             .register(Project {
@@ -206,16 +252,18 @@ mod tests {
 
     #[tokio::test]
     async fn remove_returns_false_when_missing() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let registry = ProjectRegistry::open(&dir.path().join("projects.db")).await?;
+        let Some(registry) = open_test_registry("projects.db").await? else {
+            return Ok(());
+        };
         assert!(!registry.remove("nonexistent").await?);
         Ok(())
     }
 
     #[tokio::test]
     async fn resolve_path_returns_root() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let registry = ProjectRegistry::open(&dir.path().join("projects.db")).await?;
+        let Some(registry) = open_test_registry("projects.db").await? else {
+            return Ok(());
+        };
 
         registry
             .register(Project {
@@ -237,6 +285,9 @@ mod tests {
 
     #[tokio::test]
     async fn survives_reopen() -> anyhow::Result<()> {
+        if std::env::var("DATABASE_URL").is_err() {
+            return Ok(());
+        }
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("projects.db");
 
