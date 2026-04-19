@@ -123,9 +123,10 @@ pub fn review_prompt(
          2. Run `gh api repos/{repo}/pulls/{pr}/reviews` to read review verdicts\n\
          2b. For any review where the author login contains 'gemini', \
          the state is 'COMMENTED', and the review has zero inline comments: \
-         read the review 'body' field. If any line begins (case-insensitive) with one of these phrases: \
+         read the review 'body' field. If the body contains (case-insensitive) any of these phrases \
+         anywhere in a line: \
          'Feedback suggests', 'Review feedback highlights', 'A review comment suggests', \
-         'Feedback was provided' — treat each such paragraph as an unresolved issue, \
+         'Feedback was provided', 'Feedback focuses' — treat each such paragraph as an unresolved issue, \
          include the body text in your analysis, and count it toward ISSUES=<number>. \
          Do NOT report LGTM while such actionable body feedback remains unaddressed.\n\
          3. Run `gh api repos/{repo}/pulls/{pr}/comments` to read inline review comments\n\
