@@ -157,6 +157,7 @@ impl PriorityPermitQueue {
     /// could complete.  A CAS is used to avoid double-release if both this
     /// function and the guard's Drop try to reclaim the permit concurrently.
     fn release(&mut self) {
+        let mut skipped = 0u32;
         loop {
             match self.waiters.pop() {
                 None => {
@@ -168,6 +169,11 @@ impl PriorityPermitQueue {
                     // AcquireGuard::Drop sets this flag while the waiter is
                     // still in the heap, avoiding a guaranteed-to-fail send.
                     if waiter.cancelled.load(AtomicOrdering::SeqCst) {
+                        skipped += 1;
+                        if skipped >= 3 {
+                            self.drain_cancelled();
+                            skipped = 0;
+                        }
                         continue;
                     }
                     // Mark granted BEFORE sending so the guard's Drop can see
