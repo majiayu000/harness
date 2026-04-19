@@ -42,9 +42,8 @@ export function useWorktrees(): { cards: WorktreeCard[]; isLoading: boolean; err
   const isLoading = tasks.isLoading || overview.isLoading;
   const error = tasks.error ?? overview.error ?? null;
 
-  const runningTasks = (tasks.data ?? []).filter(
-    (t) => t.status === "running" || t.status === "queued",
-  );
+  const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
+  const runningTasks = (tasks.data ?? []).filter((t) => !TERMINAL_STATUSES.has(t.status));
 
   const cards: WorktreeCard[] = runningTasks.map((task) => {
     const project = (overview.data?.projects ?? []).find(

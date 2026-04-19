@@ -4,7 +4,7 @@ import { Sidebar, type SidebarSection } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
 import { PaletteFab } from "@/components/PaletteFab";
 import { useWorktrees, useOverview } from "@/lib/queries";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, TOKEN_KEY } from "@/lib/api";
 import type { WorktreeCard } from "@/lib/queries";
 
 function fmtPct(v: number | null): string {
@@ -17,13 +17,25 @@ function fmtBytes(v: number | null): string {
 
 function statusColor(status: string): string {
   switch (status) {
-    case "running":
+    case "implementing":
       return "text-ok border-ok/40";
-    case "queued":
+    case "pending":
+    case "awaiting_deps":
+    case "waiting":
       return "text-sand border-sand/40";
+    case "agent_review":
+    case "reviewing":
+      return "text-rust border-rust/40";
     default:
       return "text-ink-3 border-line-2";
   }
+}
+
+function openStream(taskId: string): void {
+  const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
+  const base = `/tasks/${taskId}/stream`;
+  const url = tok ? `${base}?token=${encodeURIComponent(tok)}` : base;
+  window.open(url, "_blank", "noreferrer");
 }
 
 interface CardProps {
@@ -87,14 +99,13 @@ function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
       </div>
 
       <div className="px-4 py-2.5 flex items-center gap-2">
-        <a
-          href={`/api/tasks/${card.taskId}/stream`}
-          target="_blank"
-          rel="noreferrer"
+        <button
+          type="button"
+          onClick={() => openStream(card.taskId)}
           className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink"
         >
           Logs
-        </a>
+        </button>
         <button
           type="button"
           disabled
@@ -122,12 +133,16 @@ export function Worktrees() {
   const queryClient = useQueryClient();
 
   const [cancelling, setCancelling] = React.useState<Set<string>>(new Set());
+  const [cancelError, setCancelError] = React.useState<string | null>(null);
 
   const handleCancel = async (taskId: string) => {
+    setCancelError(null);
     setCancelling((prev) => new Set(prev).add(taskId));
     try {
       await apiFetch(`/tasks/${taskId}/cancel`, { method: "POST" });
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    } catch (err) {
+      setCancelError(err instanceof Error ? err.message : "Cancel failed");
     } finally {
       setCancelling((prev) => {
         const next = new Set(prev);
@@ -179,6 +194,11 @@ export function Worktrees() {
           </div>
 
           <div className="p-6">
+            {cancelError && (
+              <div className="mb-4 px-3 py-2 border border-danger/40 text-danger font-mono text-[12px] rounded-[3px] bg-danger/5">
+                {cancelError}
+              </div>
+            )}
             {!isLoading && cards.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-24 text-ink-3">
                 <span className="font-mono text-[13px]">No active worktrees</span>

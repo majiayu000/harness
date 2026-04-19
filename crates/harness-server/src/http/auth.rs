@@ -64,6 +64,7 @@ pub(crate) async fn api_auth_middleware(
             | "/auth/reset-password"
             | "/"
             | "/overview"
+            | "/worktrees"
             | "/ws"
     ) || path.starts_with("/assets/")
     {
@@ -75,12 +76,22 @@ pub(crate) async fn api_auth_middleware(
         return next.run(req).await;
     };
 
+    // Bearer header takes priority; fall back to ?token= query param for SSE
+    // clients (EventSource/browser navigation cannot set custom headers).
     let provided = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| {
+            req.uri().query().and_then(|q| {
+                q.split('&')
+                    .find(|p| p.starts_with("token="))
+                    .and_then(|p| p.strip_prefix("token="))
+                    .map(|t| t.to_string())
+            })
+        });
 
     let authorized = provided
         .as_deref()
