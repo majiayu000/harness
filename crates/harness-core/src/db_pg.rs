@@ -17,13 +17,31 @@ pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
 }
 
 /// Create a Postgres connection pool where every connection has `search_path`
-/// set to `schema` via connection startup options. Used in test builds to give
-/// each test its own isolated schema namespace.
+/// set to `schema`. Used to give each store an isolated schema namespace.
+///
+/// Sets search_path via BOTH the connection `options` startup parameter AND an
+/// `after_connect` hook that runs `SET search_path TO <schema>` per connection.
+/// The after_connect hook is required for Supabase pgbouncer pooler, which
+/// silently strips the startup `options` parameter, causing all DDL to fall
+/// back to the default `public` schema and all stores to share a single
+/// `schema_migrations` table (migration-number collision bug).
 pub async fn pg_open_pool_schematized(database_url: &str, schema: &str) -> anyhow::Result<PgPool> {
     let opts = PgConnectOptions::from_str(database_url)?.options([("search_path", schema)]);
+    let schema_for_hook = schema.to_string();
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .acquire_timeout(std::time::Duration::from_secs(10))
+        .after_connect(move |conn, _meta| {
+            let schema = schema_for_hook.clone();
+            Box::pin(async move {
+                // Quoted identifier guards against injection from the schema name;
+                // schema here is constructed from a hash hex string so quoting is
+                // defensive in depth rather than strictly required.
+                let stmt = format!("SET search_path TO \"{}\"", schema);
+                sqlx::query(&stmt).execute(conn).await?;
+                Ok(())
+            })
+        })
         .connect_with(opts)
         .await?;
     Ok(pool)
