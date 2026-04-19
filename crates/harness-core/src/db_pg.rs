@@ -1,4 +1,5 @@
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::ConnectOptions as _;
 use std::collections::HashSet;
 use std::str::FromStr as _;
 
@@ -16,17 +17,35 @@ pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
     Ok(pool)
 }
 
+/// Create a schema in Postgres using a single ephemeral connection.
+///
+/// Prefer this over `pg_open_pool` for one-off administrative DDL (e.g.
+/// `CREATE SCHEMA IF NOT EXISTS`) to avoid opening a full connection pool just
+/// to execute a single statement. Releasing a pool is asynchronous and
+/// connections can linger on the server side; a direct connection is closed
+/// deterministically when this function returns, which prevents pool
+/// exhaustion when many stores are initialised concurrently (e.g. in tests).
+pub async fn pg_create_schema(database_url: &str, schema: &str) -> anyhow::Result<()> {
+    let mut conn = PgConnectOptions::from_str(database_url)?.connect().await?;
+    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
+        .execute(&mut conn)
+        .await?;
+    Ok(())
+}
+
 /// Create a Postgres connection pool where every connection has `search_path`
 /// set to `schema`. Used to give each store an isolated schema namespace.
 ///
-/// Sets search_path via BOTH the connection `options` startup parameter AND an
-/// `after_connect` hook that runs `SET search_path TO <schema>` per connection.
-/// The after_connect hook is required for Supabase pgbouncer pooler, which
-/// silently strips the startup `options` parameter, causing all DDL to fall
-/// back to the default `public` schema and all stores to share a single
-/// `schema_migrations` table (migration-number collision bug).
+/// Sets search_path exclusively via an `after_connect` hook that runs
+/// `SET search_path TO "<schema>"` on every acquired connection.  The startup
+/// `options` parameter is intentionally omitted: Supabase's pgbouncer groups
+/// server-side pools by startup parameters, so including a unique
+/// `search_path=h{hash}` per store would create a distinct pgbouncer pool for
+/// every schema, quickly exhausting Supabase's pool-count limit
+/// (`EMAXPOOLSREACHED`).  The after_connect hook achieves the same isolation
+/// without affecting pgbouncer pool grouping.
 pub async fn pg_open_pool_schematized(database_url: &str, schema: &str) -> anyhow::Result<PgPool> {
-    let opts = PgConnectOptions::from_str(database_url)?.options([("search_path", schema)]);
+    let opts = PgConnectOptions::from_str(database_url)?;
     let schema_for_hook = schema.to_string();
     let pool = PgPoolOptions::new()
         .max_connections(8)

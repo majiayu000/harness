@@ -22,7 +22,7 @@
 //! - `closed`        → 0.0 (PR rejected/abandoned)
 //! - `unknown_closed`→ 0.2 (terminal state but outcome unclear)
 
-use harness_core::db::{pg_open_pool, pg_open_pool_schematized, Migration, PgMigrator};
+use harness_core::db::{pg_create_schema, pg_open_pool_schematized, Migration, PgMigrator};
 use sqlx::postgres::PgPool;
 use std::path::Path;
 
@@ -84,12 +84,7 @@ impl QValueStore {
         path.hash(&mut hasher);
         let schema = format!("h{:016x}", hasher.finish());
 
-        let setup = pg_open_pool(&database_url).await?;
-        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
-            .execute(&setup)
-            .await?;
-        drop(setup);
-
+        pg_create_schema(&database_url, &schema).await?;
         let pool = pg_open_pool_schematized(&database_url, &schema).await?;
         PgMigrator::new(&pool, Q_VALUE_MIGRATIONS).run().await?;
         Ok(Self { pool })

@@ -1,7 +1,7 @@
 use crate::runtime_hosts_state::{PersistedRuntimeHost, PersistedTaskLease};
 use crate::runtime_project_cache_state::PersistedHostProjectCache;
 use chrono::{DateTime, Utc};
-use harness_core::db::{pg_open_pool, pg_open_pool_schematized, Migration, PgMigrator};
+use harness_core::db::{pg_create_schema, pg_open_pool_schematized, Migration, PgMigrator};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPool;
 use std::path::Path;
@@ -73,12 +73,7 @@ impl RuntimeStateStore {
         path.hash(&mut hasher);
         let schema = format!("h{:016x}", hasher.finish());
 
-        let setup = pg_open_pool(&database_url).await?;
-        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
-            .execute(&setup)
-            .await?;
-        drop(setup);
-
+        pg_create_schema(&database_url, &schema).await?;
         let pool = pg_open_pool_schematized(&database_url, &schema).await?;
         PgMigrator::new(&pool, RUNTIME_STATE_MIGRATIONS)
             .run()

@@ -4,12 +4,52 @@ use harness_core::{
     types::{AutoFixAttempt, RuleId},
 };
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Semaphore;
 
-async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<EventStore>> {
+// Supabase session-mode pgbouncer caps client connections (pool_size = 15).
+// Each EventStore holds up to 8 connections; running 27 tests in parallel
+// would exceed that.  Serialise all DB-touching tests behind a permit so at
+// most one test holds an open pool at any time.
+static TEST_DB_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn test_db_semaphore() -> Arc<Semaphore> {
+    TEST_DB_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(1)))
+        .clone()
+}
+
+struct TestStoreGuard {
+    store: EventStore,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl TestStoreGuard {
+    async fn close(self) {
+        self.store.close().await;
+        // _permit is dropped here, releasing the semaphore slot
+    }
+}
+
+impl std::ops::Deref for TestStoreGuard {
+    type Target = EventStore;
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<TestStoreGuard>> {
     if std::env::var("DATABASE_URL").is_err() {
         return Ok(None);
     }
-    Ok(Some(EventStore::new(data_dir).await?))
+    let permit = test_db_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
+    Ok(Some(TestStoreGuard {
+        store: EventStore::new(data_dir).await?,
+        _permit: permit,
+    }))
 }
 
 fn make_event(hook: &str, decision: Decision) -> Event {
@@ -465,6 +505,10 @@ async fn log_with_unreachable_otel_endpoint_still_persists_event() -> anyhow::Re
     if std::env::var("DATABASE_URL").is_err() {
         return Ok(());
     }
+    let _permit = test_db_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
     let config = OtelConfig {
         exporter: OtelExporter::OtlpHttp,
         endpoint: Some("http://127.0.0.1:1".to_string()),
@@ -497,6 +541,10 @@ async fn migrate_from_jsonl_imports_existing_events() -> anyhow::Result<()> {
     if std::env::var("DATABASE_URL").is_err() {
         return Ok(());
     }
+    let _permit = test_db_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
     let event = make_event("pre_tool_use", Decision::Pass);
     let line = serde_json::to_string(&event)?;
     let jsonl_path = dir.path().join("events.jsonl");

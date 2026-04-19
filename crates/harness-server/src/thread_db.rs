@@ -1,5 +1,5 @@
 use anyhow::Context;
-use harness_core::db::{pg_open_pool, pg_open_pool_schematized, Migration, PgMigrator};
+use harness_core::db::{pg_create_schema, pg_open_pool_schematized, Migration, PgMigrator};
 use harness_core::{types::Thread, types::ThreadId, types::ThreadStatus};
 use sqlx::postgres::PgPool;
 use std::path::Path;
@@ -32,12 +32,7 @@ impl ThreadDb {
         path.hash(&mut hasher);
         let schema = format!("h{:016x}", hasher.finish());
 
-        let setup = pg_open_pool(&database_url).await?;
-        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
-            .execute(&setup)
-            .await?;
-        drop(setup);
-
+        pg_create_schema(&database_url, &schema).await?;
         let pool = pg_open_pool_schematized(&database_url, &schema).await?;
         PgMigrator::new(&pool, THREAD_MIGRATIONS).run().await?;
         Ok(Self { pool })
