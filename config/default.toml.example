@@ -1,5 +1,20 @@
 # Harness example configuration — copy to config/default.toml and edit as needed.
 # Start the server with: harness serve --config config/default.toml
+#
+# REQUIRED ENVIRONMENT VARIABLES (set in shell before starting the server):
+#
+#   DATABASE_URL=postgres://harness:harness@localhost:5432/harness
+#       Postgres 14+ connection string. TOML cannot read env vars — this MUST
+#       be exported in your shell (or a .env loader). See .env.example and
+#       scripts/dev-db.sh for a one-command local dev setup.
+#
+#   GITHUB_TOKEN=ghp_...
+#       Personal access token with repo + read:org scope. Required for
+#       GitHub integration (webhooks, auto-review, issue/PR tasks).
+#
+#   GITHUB_WEBHOOK_SECRET=...
+#       HMAC secret matching the value set in GitHub repo → Settings → Webhooks.
+#       Required only when receiving inbound webhook events.
 
 [server]
 transport = "http"
