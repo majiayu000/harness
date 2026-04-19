@@ -73,6 +73,13 @@ describe("<TaskSlideover>", () => {
     expect(screen.getByText("connecting…")).toBeInTheDocument();
   });
 
+  it("Stream tab shows error message when stream fails", () => {
+    vi.mocked(useTaskStream).mockReturnValue({ lines: [], connected: false, error: "Stream request failed: 500" });
+    wrap(<TaskSlideover taskId="abc12345" onClose={() => {}} />);
+    expect(screen.getByText("Stream request failed: 500")).toBeInTheDocument();
+    expect(screen.queryByText("connecting…")).not.toBeInTheDocument();
+  });
+
   it("Stream tab shows lines when connected", () => {
     vi.mocked(useTaskStream).mockReturnValue({ lines: ["line one", "line two"], connected: true, error: null });
     wrap(<TaskSlideover taskId="abc12345" onClose={() => {}} />);
@@ -85,24 +92,25 @@ describe("<TaskSlideover>", () => {
     expect(screen.getByText("—")).toBeInTheDocument();
   });
 
-  it("Diff tab colours + lines with text-ok class", () => {
+  it("Diff tab renders file_edit before/after as coloured lines", () => {
     vi.mocked(useTaskArtifacts).mockReturnValue({
-      data: [{ task_id: "abc12345", turn: 1, artifact_type: "diff", content: "+added line\n-removed line\n@@ context", created_at: "" }],
+      data: [{ task_id: "abc12345", turn: 1, artifact_type: "file_edit", content: JSON.stringify({ path: "src/foo.ts", before: "removed line", after: "added line" }), created_at: "" }],
     } as unknown as ReturnType<typeof useTaskArtifacts>);
     wrap(<TaskSlideover taskId="abc12345" onClose={() => {}} />);
     fireEvent.click(screen.getByText("Diff"));
-    expect(screen.getByText("+added line").className).toContain("text-ok");
     expect(screen.getByText("-removed line").className).toContain("text-danger");
-    expect(screen.getByText("@@ context").className).toContain("text-ink-3");
+    expect(screen.getByText("+added line").className).toContain("text-ok");
+    expect(screen.getByText("src/foo.ts")).toBeInTheDocument();
   });
 
-  it("Review tab shows preformatted prompt text", () => {
+  it("Review tab shows stream note and review prompt text", () => {
     vi.mocked(useTaskPrompts).mockReturnValue({
       data: [{ task_id: "abc12345", turn: 1, phase: "review", prompt: "review content here", created_at: "" }],
     } as ReturnType<typeof useTaskPrompts>);
     wrap(<TaskSlideover taskId="abc12345" onClose={() => {}} />);
     fireEvent.click(screen.getByText("Review"));
     expect(screen.getByText("review content here")).toBeInTheDocument();
+    expect(screen.getByText(/Reviewer findings stream live/)).toBeInTheDocument();
   });
 
   it("Events tab shows task status and turn", () => {

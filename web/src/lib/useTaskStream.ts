@@ -32,9 +32,23 @@ export function useTaskStream(taskId: string | null): TaskStreamState {
     fetchEventSource(`/tasks/${taskId}/stream`, {
       headers: { ...authHeaders(), Accept: "text/event-stream" },
       signal: controller.signal,
+      openWhenHidden: true,
       onopen: async (resp) => {
         if (resp.status === 401) {
           unauthorizedEvents.dispatchEvent(new Event("unauthorized"));
+          controller.abort();
+          return;
+        }
+        if (!resp.ok) {
+          setError(`Stream request failed: ${resp.status}`);
+          setConnected(false);
+          controller.abort();
+          return;
+        }
+        const ct = resp.headers.get("content-type") ?? "";
+        if (!ct.includes("text/event-stream")) {
+          setError(`Unexpected response type (status ${resp.status})`);
+          setConnected(false);
           controller.abort();
           return;
         }
@@ -56,6 +70,8 @@ export function useTaskStream(taskId: string | null): TaskStreamState {
       onclose: () => {
         setConnected(false);
       },
+    }).catch(() => {
+      // onerror rethrows to stop retry; catch here to avoid unhandled rejection.
     });
 
     return () => {

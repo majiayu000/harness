@@ -21,6 +21,13 @@ vi.mock("@microsoft/fetch-event-source", () => ({
   }),
 }));
 
+function sseResponse(status = 200) {
+  return new Response(null, {
+    status,
+    headers: { "content-type": "text/event-stream" },
+  });
+}
+
 describe("useTaskStream", () => {
   beforeEach(() => {
     capturedCallbacks = {};
@@ -48,15 +55,37 @@ describe("useTaskStream", () => {
   it("onopen fires → connected becomes true", async () => {
     const { result } = renderHook(() => useTaskStream("task-1"));
     await act(async () => {
-      await capturedCallbacks.onopen?.(new Response(null, { status: 200 }));
+      await capturedCallbacks.onopen?.(sseResponse());
     });
     expect(result.current.connected).toBe(true);
+  });
+
+  it("onopen with wrong content-type → error set, not connected", async () => {
+    const { result } = renderHook(() => useTaskStream("task-1"));
+    await act(async () => {
+      await capturedCallbacks.onopen?.(
+        new Response(null, { status: 200, headers: { "content-type": "application/json" } }),
+      );
+    });
+    expect(result.current.connected).toBe(false);
+    expect(result.current.error).toMatch(/Unexpected response type/);
+    expect(capturedAbortSignal?.aborted).toBe(true);
+  });
+
+  it("onopen with non-ok status → error set, not connected", async () => {
+    const { result } = renderHook(() => useTaskStream("task-1"));
+    await act(async () => {
+      await capturedCallbacks.onopen?.(new Response(null, { status: 404 }));
+    });
+    expect(result.current.connected).toBe(false);
+    expect(result.current.error).toMatch(/404/);
+    expect(capturedAbortSignal?.aborted).toBe(true);
   });
 
   it("onmessage accumulates lines in order", async () => {
     const { result } = renderHook(() => useTaskStream("task-1"));
     await act(async () => {
-      await capturedCallbacks.onopen?.(new Response(null, { status: 200 }));
+      await capturedCallbacks.onopen?.(sseResponse());
       capturedCallbacks.onmessage?.({ data: "first", event: "", id: "" });
       capturedCallbacks.onmessage?.({ data: "second", event: "", id: "" });
     });
@@ -68,7 +97,7 @@ describe("useTaskStream", () => {
       initialProps: { id: "task-1" },
     });
     await act(async () => {
-      await capturedCallbacks.onopen?.(new Response(null, { status: 200 }));
+      await capturedCallbacks.onopen?.(sseResponse());
       capturedCallbacks.onmessage?.({ data: "old line", event: "", id: "" });
     });
     expect(result.current.lines).toHaveLength(1);
@@ -86,7 +115,7 @@ describe("useTaskStream", () => {
   it("ring buffer: >2000 events drops oldest, keeps newest 2000", async () => {
     const { result } = renderHook(() => useTaskStream("task-1"));
     await act(async () => {
-      await capturedCallbacks.onopen?.(new Response(null, { status: 200 }));
+      await capturedCallbacks.onopen?.(sseResponse());
       for (let i = 0; i < 2001; i++) {
         capturedCallbacks.onmessage?.({ data: `line-${i}`, event: "", id: "" });
       }
@@ -94,6 +123,19 @@ describe("useTaskStream", () => {
     expect(result.current.lines).toHaveLength(2000);
     expect(result.current.lines[0]).toBe("line-1");
     expect(result.current.lines[1999]).toBe("line-2000");
+  });
+
+  it("onerror sets error state and stops retry", async () => {
+    const { result } = renderHook(() => useTaskStream("task-1"));
+    await act(async () => {
+      try {
+        capturedCallbacks.onerror?.(new Error("network failure"));
+      } catch {
+        // onerror rethrows — expected
+      }
+    });
+    expect(result.current.connected).toBe(false);
+    expect(result.current.error).toMatch(/network failure/);
   });
 
   it("401 response dispatches unauthorizedEvents and stops", async () => {

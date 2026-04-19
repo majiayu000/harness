@@ -6,28 +6,40 @@ import type { TaskArtifact, TaskPrompt } from "@/types";
 const TABS = ["Stream", "Diff", "Review", "Events"] as const;
 type Tab = (typeof TABS)[number];
 
+interface FileEditContent {
+  path?: string;
+  before?: string;
+  after?: string;
+}
+
 function DiffView({ artifacts }: { artifacts: TaskArtifact[] }) {
-  const diffs = artifacts.filter((a) => a.artifact_type === "diff");
-  if (diffs.length === 0) {
+  const fileEdits = artifacts.filter((a) => a.artifact_type === "file_edit");
+  if (fileEdits.length === 0) {
     return <div className="p-3 font-mono text-[11px] text-ink-4">—</div>;
   }
   return (
     <div className="p-2 space-y-4">
-      {diffs.map((a, i) => (
-        <div key={i} className="font-mono text-[11px] leading-relaxed">
-          {a.content.split("\n").map((line, j) => {
-            let cls = "text-ink";
-            if (line.startsWith("+")) cls = "text-ok";
-            else if (line.startsWith("-")) cls = "text-danger";
-            else if (line.startsWith("@@")) cls = "text-ink-3";
-            return (
-              <div key={j} className={cls}>
-                {line || "\u00a0"}
-              </div>
-            );
-          })}
-        </div>
-      ))}
+      {fileEdits.map((a, i) => {
+        let parsed: FileEditContent = {};
+        try { parsed = JSON.parse(a.content) as FileEditContent; } catch { /* ignore malformed */ }
+        const beforeLines = parsed.before ? parsed.before.split("\n") : [];
+        const afterLines = parsed.after ? parsed.after.split("\n") : [];
+        return (
+          <div key={i} className="space-y-1">
+            {parsed.path && (
+              <div className="font-mono text-[10px] text-ink-3 mb-1">{parsed.path}</div>
+            )}
+            <div className="font-mono text-[11px] leading-relaxed">
+              {beforeLines.map((line, j) => (
+                <div key={`b${j}`} className="text-danger">{`-${line}`}</div>
+              ))}
+              {afterLines.map((line, j) => (
+                <div key={`a${j}`} className="text-ok">{`+${line}`}</div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -41,10 +53,18 @@ function ReviewView({ prompts }: { prompts: TaskPrompt[] }) {
   }
   return (
     <div className="p-2 space-y-4">
+      <div className="font-mono text-[10px] text-ink-4">
+        Reviewer findings stream live — see the Stream tab for output.
+      </div>
       {reviews.map((p, i) => (
-        <pre key={i} className="font-mono text-[11px] text-ink whitespace-pre-wrap break-words">
-          {p.prompt}
-        </pre>
+        <div key={i} className="space-y-1">
+          <div className="font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">
+            {p.phase} · turn {p.turn} · prompt
+          </div>
+          <pre className="font-mono text-[11px] text-ink-3 whitespace-pre-wrap break-words">
+            {p.prompt}
+          </pre>
+        </div>
       ))}
     </div>
   );
@@ -57,7 +77,7 @@ interface Props {
 
 export function TaskSlideover({ taskId, onClose }: Props) {
   const [activeTab, setActiveTab] = useState<Tab>("Stream");
-  const { lines, connected } = useTaskStream(taskId);
+  const { lines, connected, error } = useTaskStream(taskId);
   const { data: task } = useTask(taskId);
   const { data: artifacts } = useTaskArtifacts(taskId);
   const { data: prompts } = useTaskPrompts(taskId);
@@ -120,9 +140,11 @@ export function TaskSlideover({ taskId, onClose }: Props) {
         <div className="flex-1 overflow-auto">
           {activeTab === "Stream" && (
             <pre className="p-3 font-mono text-[11px] text-ink whitespace-pre-wrap break-words">
-              {!connected && lines.length === 0 && (
+              {error ? (
+                <span className="text-danger">{error}</span>
+              ) : (!connected && lines.length === 0 && (
                 <span className="text-ink-4">connecting…</span>
-              )}
+              ))}
               {lines.join("\n")}
               <div ref={streamEndRef} />
             </pre>
