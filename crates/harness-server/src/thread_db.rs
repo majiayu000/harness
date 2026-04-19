@@ -1,10 +1,9 @@
 use anyhow::Context;
-use harness_core::db::{open_pool, Migration, Migrator};
+use harness_core::db::{pg_open_pool, pg_open_pool_schematized, Migration, PgMigrator};
 use harness_core::{types::Thread, types::ThreadId, types::ThreadStatus};
-use sqlx::sqlite::SqlitePool;
+use sqlx::postgres::PgPool;
 use std::path::Path;
 
-/// Versioned migrations for the threads table.
 static THREAD_MIGRATIONS: &[Migration] = &[Migration {
     version: 1,
     description: "create threads table",
@@ -14,22 +13,34 @@ static THREAD_MIGRATIONS: &[Migration] = &[Migration {
         status      TEXT NOT NULL DEFAULT 'idle',
         turns       TEXT NOT NULL DEFAULT '[]',
         metadata    TEXT NOT NULL DEFAULT '{}',
-        created_at  TEXT NOT NULL,
-        updated_at  TEXT NOT NULL
+        created_at  TIMESTAMPTZ NOT NULL,
+        updated_at  TIMESTAMPTZ NOT NULL
     )",
 }];
 
 #[derive(Clone)]
 pub struct ThreadDb {
-    pool: SqlitePool,
+    pool: PgPool,
 }
 
 impl ThreadDb {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
-        let pool = open_pool(path).await?;
-        let db = Self { pool };
-        Migrator::new(&db.pool, THREAD_MIGRATIONS).run().await?;
-        Ok(db)
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable is not set"))?;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        let schema = format!("h{:016x}", hasher.finish());
+
+        let setup = pg_open_pool(&database_url).await?;
+        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
+            .execute(&setup)
+            .await?;
+        drop(setup);
+
+        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
+        PgMigrator::new(&pool, THREAD_MIGRATIONS).run().await?;
+        Ok(Self { pool })
     }
 
     pub async fn insert(&self, thread: &Thread) -> anyhow::Result<()> {
@@ -37,15 +48,15 @@ impl ThreadDb {
         let metadata_json = serde_json::to_string(&thread.metadata)?;
         sqlx::query(
             "INSERT INTO threads (id, cwd, status, turns, metadata, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(thread.id.as_str())
         .bind(thread.project_root.to_string_lossy().as_ref())
         .bind(thread.status.as_ref())
         .bind(&turns_json)
         .bind(&metadata_json)
-        .bind(thread.created_at.to_rfc3339())
-        .bind(thread.updated_at.to_rfc3339())
+        .bind(thread.created_at)
+        .bind(thread.updated_at)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -55,14 +66,14 @@ impl ThreadDb {
         let turns_json = serde_json::to_string(&thread.turns)?;
         let metadata_json = serde_json::to_string(&thread.metadata)?;
         sqlx::query(
-            "UPDATE threads SET cwd = ?, status = ?, turns = ?, metadata = ?, updated_at = ?
-             WHERE id = ?",
+            "UPDATE threads SET cwd = $1, status = $2, turns = $3, metadata = $4, updated_at = $5
+             WHERE id = $6",
         )
         .bind(thread.project_root.to_string_lossy().as_ref())
         .bind(thread.status.as_ref())
         .bind(&turns_json)
         .bind(&metadata_json)
-        .bind(thread.updated_at.to_rfc3339())
+        .bind(thread.updated_at)
         .bind(thread.id.as_str())
         .execute(&self.pool)
         .await?;
@@ -70,7 +81,7 @@ impl ThreadDb {
     }
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<Thread>> {
-        let row = sqlx::query_as::<_, ThreadRow>("SELECT * FROM threads WHERE id = ?")
+        let row = sqlx::query_as::<_, ThreadRow>("SELECT * FROM threads WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -85,7 +96,7 @@ impl ThreadDb {
     }
 
     pub async fn delete(&self, id: &str) -> anyhow::Result<bool> {
-        let result = sqlx::query("DELETE FROM threads WHERE id = ?")
+        let result = sqlx::query("DELETE FROM threads WHERE id = $1")
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -100,8 +111,8 @@ struct ThreadRow {
     status: String,
     turns: String,
     metadata: String,
-    created_at: String,
-    updated_at: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl ThreadRow {
@@ -117,10 +128,8 @@ impl ThreadRow {
             status,
             turns: serde_json::from_str(&self.turns)?,
             metadata: serde_json::from_str(&self.metadata)?,
-            created_at: chrono::DateTime::parse_from_rfc3339(&self.created_at)
-                .map(|d| d.with_timezone(&chrono::Utc))?,
-            updated_at: chrono::DateTime::parse_from_rfc3339(&self.updated_at)
-                .map(|d| d.with_timezone(&chrono::Utc))?,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
         })
     }
 }
@@ -130,11 +139,20 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    async fn open_test_db() -> anyhow::Result<Option<ThreadDb>> {
+        if std::env::var("DATABASE_URL").is_err() {
+            return Ok(None);
+        }
+        let dir = tempfile::tempdir()?;
+        let db = ThreadDb::open(&dir.path().join("threads.db")).await?;
+        Ok(Some(db))
+    }
+
     #[tokio::test]
     async fn thread_db_roundtrip() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("threads.db");
-        let db = ThreadDb::open(&db_path).await?;
+        let Some(db) = open_test_db().await? else {
+            return Ok(());
+        };
 
         let thread = Thread::new(PathBuf::from("/tmp/project"));
         db.insert(&thread).await?;
@@ -150,9 +168,9 @@ mod tests {
 
     #[tokio::test]
     async fn thread_db_list_and_delete() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("threads.db");
-        let db = ThreadDb::open(&db_path).await?;
+        let Some(db) = open_test_db().await? else {
+            return Ok(());
+        };
 
         let t1 = Thread::new(PathBuf::from("/a"));
         let t2 = Thread::new(PathBuf::from("/b"));
@@ -171,6 +189,9 @@ mod tests {
 
     #[tokio::test]
     async fn thread_db_survives_reopen() -> anyhow::Result<()> {
+        if std::env::var("DATABASE_URL").is_err() {
+            return Ok(());
+        }
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("threads.db");
 
@@ -191,14 +212,14 @@ mod tests {
 
     #[tokio::test]
     async fn thread_db_rejects_unknown_status() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("threads.db");
-        let db = ThreadDb::open(&db_path).await?;
+        let Some(db) = open_test_db().await? else {
+            return Ok(());
+        };
 
         let thread = Thread::new(PathBuf::from("/srv/app"));
         db.insert(&thread).await?;
 
-        sqlx::query("UPDATE threads SET status = ? WHERE id = ?")
+        sqlx::query("UPDATE threads SET status = $1 WHERE id = $2")
             .bind("paused")
             .bind(thread.id.as_str())
             .execute(&db.pool)
@@ -216,8 +237,9 @@ mod tests {
 
     #[tokio::test]
     async fn thread_db_update_roundtrip() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = ThreadDb::open(&dir.path().join("threads.db")).await?;
+        let Some(db) = open_test_db().await? else {
+            return Ok(());
+        };
 
         let mut thread = Thread::new(PathBuf::from("/original"));
         db.insert(&thread).await?;
@@ -238,8 +260,9 @@ mod tests {
 
     #[tokio::test]
     async fn thread_db_metadata_persists() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = ThreadDb::open(&dir.path().join("threads.db")).await?;
+        let Some(db) = open_test_db().await? else {
+            return Ok(());
+        };
 
         let mut thread = Thread::new(PathBuf::from("/meta"));
         thread.metadata = serde_json::json!({"key": "value", "count": 42});
@@ -256,8 +279,9 @@ mod tests {
 
     #[tokio::test]
     async fn thread_db_delete_nonexistent_returns_false() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = ThreadDb::open(&dir.path().join("threads.db")).await?;
+        let Some(db) = open_test_db().await? else {
+            return Ok(());
+        };
 
         let deleted = db.delete("does-not-exist").await?;
         assert!(!deleted);
@@ -266,8 +290,9 @@ mod tests {
 
     #[tokio::test]
     async fn thread_db_get_returns_none_for_missing() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = ThreadDb::open(&dir.path().join("threads.db")).await?;
+        let Some(db) = open_test_db().await? else {
+            return Ok(());
+        };
 
         assert!(db.get("missing-id").await?.is_none());
         Ok(())

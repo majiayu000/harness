@@ -1,24 +1,68 @@
-use harness_core::db::Db;
+use harness_core::db::{pg_open_pool, pg_open_pool_schematized, Migration, PgMigrator};
 use harness_core::{types::ExecPlanId, types::ExecPlanStatus};
 use harness_exec::plan::ExecPlan;
+use sqlx::postgres::PgPool;
 use std::path::Path;
 
+static PLAN_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "create exec_plans table",
+        sql: "CREATE TABLE IF NOT EXISTS exec_plans (
+            id         TEXT PRIMARY KEY,
+            data       TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    },
+    Migration {
+        version: 2,
+        description: "add index on exec_plans(created_at)",
+        sql: "CREATE INDEX IF NOT EXISTS idx_exec_plans_created_at ON exec_plans(created_at)",
+    },
+];
+
 pub struct PlanDb {
-    inner: Db<ExecPlan>,
+    pool: PgPool,
     /// Serializes read-modify-write cycles to prevent lost-update races.
     update_lock: tokio::sync::Mutex<()>,
 }
 
 impl PlanDb {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable is not set"))?;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        let schema = format!("h{:016x}", hasher.finish());
+
+        let setup = pg_open_pool(&database_url).await?;
+        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
+            .execute(&setup)
+            .await?;
+        drop(setup);
+
+        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
+        PgMigrator::new(&pool, PLAN_MIGRATIONS).run().await?;
         Ok(Self {
-            inner: Db::open(path).await?,
+            pool,
             update_lock: tokio::sync::Mutex::new(()),
         })
     }
 
     pub async fn upsert(&self, plan: &ExecPlan) -> anyhow::Result<()> {
-        self.inner.upsert(plan).await
+        let data = serde_json::to_string(plan)?;
+        sqlx::query(
+            "INSERT INTO exec_plans (id, data) VALUES ($1, $2)
+             ON CONFLICT(id) DO UPDATE SET data = EXCLUDED.data,
+                 updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(plan.id.as_str())
+        .bind(&data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Load a plan, apply `f`, persist the result, and return the updated plan.
@@ -30,24 +74,41 @@ impl PlanDb {
         F: FnOnce(&mut ExecPlan),
     {
         let _guard = self.update_lock.lock().await;
-        let Some(mut plan) = self.inner.get(id.as_str()).await? else {
+        let Some(mut plan) = self.get(id).await? else {
             return Ok(None);
         };
         f(&mut plan);
-        self.inner.upsert(&plan).await?;
+        self.upsert(&plan).await?;
         Ok(Some(plan))
     }
 
     pub async fn get(&self, id: &ExecPlanId) -> anyhow::Result<Option<ExecPlan>> {
-        self.inner.get(id.as_str()).await
+        let row: Option<(String,)> = sqlx::query_as("SELECT data FROM exec_plans WHERE id = $1")
+            .bind(id.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<ExecPlan>> {
-        self.inner.list().await
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT data FROM exec_plans ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
     }
 
     pub async fn delete(&self, id: &ExecPlanId) -> anyhow::Result<bool> {
-        self.inner.delete(id.as_str()).await
+        let result = sqlx::query("DELETE FROM exec_plans WHERE id = $1")
+            .bind(id.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Return all plans whose status matches `status`.
@@ -56,12 +117,12 @@ impl PlanDb {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        let sql =
-            "SELECT data FROM exec_plans WHERE json_extract(data, '$.status') = ? ORDER BY created_at DESC";
-        let rows: Vec<(String,)> = sqlx::query_as(sql)
-            .bind(&status_str)
-            .fetch_all(self.inner.pool())
-            .await?;
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data FROM exec_plans WHERE data::jsonb->>'status' = $1 ORDER BY created_at DESC",
+        )
+        .bind(&status_str)
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
             .collect()
@@ -70,12 +131,12 @@ impl PlanDb {
     /// Return all plans whose purpose contains `query` (case-insensitive substring match).
     pub async fn search_by_name(&self, query: &str) -> anyhow::Result<Vec<ExecPlan>> {
         let pattern = format!("%{}%", query);
-        let sql =
-            "SELECT data FROM exec_plans WHERE json_extract(data, '$.purpose') LIKE ? ORDER BY created_at DESC";
-        let rows: Vec<(String,)> = sqlx::query_as(sql)
-            .bind(&pattern)
-            .fetch_all(self.inner.pool())
-            .await?;
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data FROM exec_plans WHERE data::jsonb->>'purpose' LIKE $1 ORDER BY created_at DESC",
+        )
+        .bind(&pattern)
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
             .collect()
@@ -110,8 +171,7 @@ impl PlanDb {
                     continue;
                 }
             };
-            // Skip if already persisted.
-            if self.inner.get(plan.id.as_str()).await?.is_some() {
+            if self.get(&plan.id).await?.is_some() {
                 continue;
             }
             if let Err(e) = self.upsert(&plan).await {
@@ -130,11 +190,21 @@ mod tests {
     use super::*;
     use harness_core::types::ExecPlanStatus;
 
+    async fn open_test_store() -> anyhow::Result<Option<(PlanDb, tempfile::TempDir)>> {
+        if std::env::var("DATABASE_URL").is_err() {
+            return Ok(None);
+        }
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("plans.db");
+        let db = PlanDb::open(&path).await?;
+        Ok(Some((db, dir)))
+    }
+
     #[tokio::test]
     async fn plan_db_roundtrip() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = PlanDb::open(&dir.path().join("plans.db")).await?;
-
+        let Some((db, dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         let plan = ExecPlan::from_spec("Test plan purpose", dir.path())?;
         db.upsert(&plan).await?;
 
@@ -149,17 +219,18 @@ mod tests {
 
     #[tokio::test]
     async fn plan_db_get_missing_returns_none() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = PlanDb::open(&dir.path().join("plans.db")).await?;
+        let Some((db, _dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         assert!(db.get(&ExecPlanId::new()).await?.is_none());
         Ok(())
     }
 
     #[tokio::test]
     async fn plan_db_delete_removes_plan() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = PlanDb::open(&dir.path().join("plans.db")).await?;
-
+        let Some((db, dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         let plan = ExecPlan::from_spec("# Delete me", dir.path())?;
         db.upsert(&plan).await?;
         assert!(db.delete(&plan.id).await?);
@@ -169,17 +240,18 @@ mod tests {
 
     #[tokio::test]
     async fn plan_db_delete_missing_returns_false() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = PlanDb::open(&dir.path().join("plans.db")).await?;
+        let Some((db, _dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         assert!(!db.delete(&ExecPlanId::new()).await?);
         Ok(())
     }
 
     #[tokio::test]
     async fn list_by_status_filters_correctly() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = PlanDb::open(&dir.path().join("plans.db")).await?;
-
+        let Some((db, dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         let draft = ExecPlan::from_spec("# Draft plan", dir.path())?;
         let mut active = ExecPlan::from_spec("# Active plan", dir.path())?;
         active.activate();
@@ -202,9 +274,9 @@ mod tests {
 
     #[tokio::test]
     async fn search_by_name_finds_matching_plans() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = PlanDb::open(&dir.path().join("plans.db")).await?;
-
+        let Some((db, dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         let auth = ExecPlan::from_spec("# Implement authentication", dir.path())?;
         let deploy = ExecPlan::from_spec("# Deploy to production", dir.path())?;
 
@@ -222,10 +294,9 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_from_markdown_dir_imports_plans() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = PlanDb::open(&dir.path().join("plans.db")).await?;
-
-        // Write a minimal ExecPlan markdown file.
+        let Some((db, dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         let plan = ExecPlan::from_spec("# Migration test plan", dir.path())?;
         let md = plan.to_markdown();
         std::fs::write(dir.path().join("plan1.md"), &md)?;
@@ -236,7 +307,6 @@ mod tests {
         let loaded = db.get(&plan.id).await?.expect("migrated plan should exist");
         assert_eq!(loaded.purpose, plan.purpose);
 
-        // Second run should not re-import.
         let count2 = db.migrate_from_markdown_dir(dir.path()).await?;
         assert_eq!(count2, 0);
         Ok(())
@@ -244,8 +314,9 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_from_markdown_dir_skips_nonexistent_dir() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = PlanDb::open(&dir.path().join("plans.db")).await?;
+        let Some((db, dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         let count = db
             .migrate_from_markdown_dir(&dir.path().join("nonexistent"))
             .await?;
@@ -255,9 +326,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_in_txn_persists_mutation() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = PlanDb::open(&dir.path().join("plans.db")).await?;
-
+        let Some((db, dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         let plan = ExecPlan::from_spec("# Update test", dir.path())?;
         db.upsert(&plan).await?;
 
@@ -267,7 +338,6 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("plan should exist after upsert"))?;
         assert_eq!(updated.status, ExecPlanStatus::Active);
 
-        // Reload from DB to confirm the change was persisted, not just returned in-memory.
         let reloaded = db
             .get(&plan.id)
             .await?
@@ -278,8 +348,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_in_txn_returns_none_for_missing_plan() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db = PlanDb::open(&dir.path().join("plans.db")).await?;
+        let Some((db, _dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         let result = db
             .update_in_txn(&ExecPlanId::new(), |p| p.activate())
             .await?;

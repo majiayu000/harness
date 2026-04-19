@@ -1,8 +1,9 @@
 use crate::runtime_hosts_state::{PersistedRuntimeHost, PersistedTaskLease};
 use crate::runtime_project_cache_state::PersistedHostProjectCache;
 use chrono::{DateTime, Utc};
-use harness_core::db::{Db, DbEntity};
+use harness_core::db::{pg_open_pool, pg_open_pool_schematized, Migration, PgMigrator};
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgPool;
 use std::path::Path;
 
 const SNAPSHOT_ID: &str = "runtime-state";
@@ -35,27 +36,19 @@ impl RuntimeStateSnapshot {
     }
 }
 
-impl DbEntity for RuntimeStateSnapshot {
-    fn table_name() -> &'static str {
-        "runtime_state"
-    }
-
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn create_table_sql() -> &'static str {
-        "CREATE TABLE IF NOT EXISTS runtime_state (
-            id         TEXT PRIMARY KEY,
-            data       TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )"
-    }
-}
+static RUNTIME_STATE_MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    description: "create runtime_state table",
+    sql: "CREATE TABLE IF NOT EXISTS runtime_state (
+        id         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )",
+}];
 
 pub struct RuntimeStateStore {
-    inner: Db<RuntimeStateSnapshot>,
+    pool: PgPool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,9 +66,24 @@ impl LoadSnapshotOutcome {
 
 impl RuntimeStateStore {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
-        Ok(Self {
-            inner: Db::open(path).await?,
-        })
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable is not set"))?;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        let schema = format!("h{:016x}", hasher.finish());
+
+        let setup = pg_open_pool(&database_url).await?;
+        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
+            .execute(&setup)
+            .await?;
+        drop(setup);
+
+        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
+        PgMigrator::new(&pool, RUNTIME_STATE_MIGRATIONS)
+            .run()
+            .await?;
+        Ok(Self { pool })
     }
 
     pub async fn load_snapshot(&self) -> anyhow::Result<Option<RuntimeStateSnapshot>> {
@@ -85,8 +93,13 @@ impl RuntimeStateStore {
     pub async fn try_load_snapshot(
         &self,
     ) -> anyhow::Result<(Option<RuntimeStateSnapshot>, LoadSnapshotOutcome)> {
-        let snapshot = match self.inner.get(SNAPSHOT_ID).await? {
-            Some(snapshot) => snapshot,
+        let row: Option<(String,)> = sqlx::query_as("SELECT data FROM runtime_state WHERE id = $1")
+            .bind(SNAPSHOT_ID)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        let snapshot: RuntimeStateSnapshot = match row {
+            Some((data,)) => serde_json::from_str(&data)?,
             None => return Ok((None, LoadSnapshotOutcome::NotFound)),
         };
 
@@ -116,20 +129,44 @@ impl RuntimeStateStore {
         project_caches: Vec<PersistedHostProjectCache>,
     ) -> anyhow::Result<()> {
         let snapshot = RuntimeStateSnapshot::new(hosts, leases, project_caches);
-        self.inner.upsert(&snapshot).await
+        let data = serde_json::to_string(&snapshot)?;
+        sqlx::query(
+            "INSERT INTO runtime_state (id, data) VALUES ($1, $2)
+             ON CONFLICT(id) DO UPDATE SET data = EXCLUDED.data,
+                 updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(SNAPSHOT_ID)
+        .bind(&data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Expose the pool for test helpers that need direct SQL access.
+    #[cfg(test)]
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::db::open_pool;
-    use sqlx::Row;
+
+    async fn open_test_store() -> anyhow::Result<Option<RuntimeStateStore>> {
+        if std::env::var("DATABASE_URL").is_err() {
+            return Ok(None);
+        }
+        let dir = tempfile::tempdir()?;
+        let store = RuntimeStateStore::open(&dir.path().join("runtime_state.db")).await?;
+        Ok(Some(store))
+    }
 
     #[tokio::test]
     async fn runtime_state_store_roundtrip() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let store = RuntimeStateStore::open(&dir.path().join("runtime_state.db")).await?;
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
         store.persist_snapshot(vec![], vec![], vec![]).await?;
 
         let snapshot = store.load_snapshot().await?.expect("snapshot should exist");
@@ -143,12 +180,12 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_state_store_rejects_older_schema_snapshot() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("runtime_state.db");
-        let store = RuntimeStateStore::open(&db_path).await?;
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
         store.persist_snapshot(vec![], vec![], vec![]).await?;
 
-        overwrite_schema_version(&db_path, SNAPSHOT_SCHEMA_VERSION - 1).await?;
+        overwrite_schema_version(&store, SNAPSHOT_SCHEMA_VERSION - 1).await?;
 
         let snapshot = store.load_snapshot().await?;
         assert!(snapshot.is_none());
@@ -158,15 +195,17 @@ mod tests {
     #[tokio::test]
     async fn runtime_state_store_rejects_newer_schema_snapshot_after_reopen() -> anyhow::Result<()>
     {
+        if std::env::var("DATABASE_URL").is_err() {
+            return Ok(());
+        }
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("runtime_state.db");
 
         {
             let store = RuntimeStateStore::open(&db_path).await?;
             store.persist_snapshot(vec![], vec![], vec![]).await?;
+            overwrite_schema_version(&store, SNAPSHOT_SCHEMA_VERSION + 1).await?;
         }
-
-        overwrite_schema_version(&db_path, SNAPSHOT_SCHEMA_VERSION + 1).await?;
 
         let reopened = RuntimeStateStore::open(&db_path).await?;
         let snapshot = reopened.load_snapshot().await?;
@@ -176,6 +215,9 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_state_store_survives_reopen() -> anyhow::Result<()> {
+        if std::env::var("DATABASE_URL").is_err() {
+            return Ok(());
+        }
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("runtime_state.db");
 
@@ -190,20 +232,22 @@ mod tests {
         Ok(())
     }
 
-    async fn overwrite_schema_version(path: &Path, schema_version: u32) -> anyhow::Result<()> {
-        let pool = open_pool(path).await?;
-        let row = sqlx::query("SELECT data FROM runtime_state WHERE id = ?")
+    async fn overwrite_schema_version(
+        store: &RuntimeStateStore,
+        schema_version: u32,
+    ) -> anyhow::Result<()> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT data FROM runtime_state WHERE id = $1")
             .bind(SNAPSHOT_ID)
-            .fetch_one(&pool)
+            .fetch_optional(store.pool())
             .await?;
-        let data: String = row.try_get("data")?;
+        let data = row.ok_or_else(|| anyhow::anyhow!("snapshot not found"))?.0;
         let mut snapshot: RuntimeStateSnapshot = serde_json::from_str(&data)?;
         snapshot.schema_version = schema_version;
         let updated_data = serde_json::to_string(&snapshot)?;
-        sqlx::query("UPDATE runtime_state SET data = ? WHERE id = ?")
+        sqlx::query("UPDATE runtime_state SET data = $1 WHERE id = $2")
             .bind(updated_data)
             .bind(SNAPSHOT_ID)
-            .execute(&pool)
+            .execute(store.pool())
             .await?;
         Ok(())
     }

@@ -22,8 +22,8 @@
 //! - `closed`        → 0.0 (PR rejected/abandoned)
 //! - `unknown_closed`→ 0.2 (terminal state but outcome unclear)
 
-use harness_core::db::{open_pool, Migration, Migrator};
-use sqlx::sqlite::SqlitePool;
+use harness_core::db::{pg_open_pool, pg_open_pool_schematized, Migration, PgMigrator};
+use sqlx::postgres::PgPool;
 use std::path::Path;
 
 /// Default learning rate for Q-value updates.
@@ -43,11 +43,11 @@ static Q_VALUE_MIGRATIONS: &[Migration] = &[
         version: 1,
         description: "create pipeline_events table",
         sql: "CREATE TABLE IF NOT EXISTS pipeline_events (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             task_id          TEXT NOT NULL,
             phase            TEXT NOT NULL,
             experiences_used TEXT NOT NULL DEFAULT '[]',
-            created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     },
     Migration {
@@ -55,10 +55,10 @@ static Q_VALUE_MIGRATIONS: &[Migration] = &[
         description: "create rule_experiences table for Q-value tracking",
         sql: "CREATE TABLE IF NOT EXISTS rule_experiences (
             rule_id         TEXT PRIMARY KEY,
-            q_value         REAL NOT NULL DEFAULT 0.5,
-            retrieval_count INTEGER NOT NULL DEFAULT 0,
-            success_count   INTEGER NOT NULL DEFAULT 0,
-            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            q_value         DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+            retrieval_count BIGINT NOT NULL DEFAULT 0,
+            success_count   BIGINT NOT NULL DEFAULT 0,
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     },
     Migration {
@@ -71,16 +71,28 @@ static Q_VALUE_MIGRATIONS: &[Migration] = &[
 
 /// Persistent store for pipeline events and rule Q-values.
 pub struct QValueStore {
-    pool: SqlitePool,
+    pool: PgPool,
 }
 
 impl QValueStore {
     /// Open (or create) the Q-value store at `path`, running any pending migrations.
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
-        let pool = open_pool(path).await?;
-        let store = Self { pool };
-        Migrator::new(&store.pool, Q_VALUE_MIGRATIONS).run().await?;
-        Ok(store)
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable is not set"))?;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        let schema = format!("h{:016x}", hasher.finish());
+
+        let setup = pg_open_pool(&database_url).await?;
+        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
+            .execute(&setup)
+            .await?;
+        drop(setup);
+
+        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
+        PgMigrator::new(&pool, Q_VALUE_MIGRATIONS).run().await?;
+        Ok(Self { pool })
     }
 
     /// Record which rule/experience IDs were used during a pipeline phase.
@@ -97,7 +109,7 @@ impl QValueStore {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO pipeline_events (task_id, phase, experiences_used, created_at)
-             VALUES (?, ?, ?, datetime('now'))",
+             VALUES ($1, $2, $3, CURRENT_TIMESTAMP)",
         )
         .bind(task_id)
         .bind(phase)
@@ -108,10 +120,10 @@ impl QValueStore {
         for rule_id in experience_ids {
             sqlx::query(
                 "INSERT INTO rule_experiences (rule_id, retrieval_count, updated_at)
-                 VALUES (?, 1, datetime('now'))
+                 VALUES ($1, 1, CURRENT_TIMESTAMP)
                  ON CONFLICT(rule_id) DO UPDATE SET
-                   retrieval_count = retrieval_count + 1,
-                   updated_at      = datetime('now')",
+                   retrieval_count = rule_experiences.retrieval_count + 1,
+                   updated_at      = CURRENT_TIMESTAMP",
             )
             .bind(rule_id)
             .execute(&mut *tx)
@@ -124,7 +136,7 @@ impl QValueStore {
     /// Collect all distinct experience IDs referenced across all pipeline events for a task.
     pub async fn get_experiences_for_task(&self, task_id: &str) -> anyhow::Result<Vec<String>> {
         let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT experiences_used FROM pipeline_events WHERE task_id = ?")
+            sqlx::query_as("SELECT experiences_used FROM pipeline_events WHERE task_id = $1")
                 .bind(task_id)
                 .fetch_all(&self.pool)
                 .await?;
@@ -173,19 +185,15 @@ impl QValueStore {
         let success_delta: i64 = if reward >= 1.0 { 1 } else { 0 };
         let mut tx = self.pool.begin().await?;
         for rule_id in experience_ids {
-            // Insert or update in one statement: Q_new = Q_old + alpha * (reward - Q_old)
             sqlx::query(
                 "INSERT INTO rule_experiences (rule_id, q_value, success_count, updated_at)
-                 VALUES (?, 0.5 + ? * (? - 0.5), ?, datetime('now'))
+                 VALUES ($1, 0.5 + $2 * ($3 - 0.5), $4, CURRENT_TIMESTAMP)
                  ON CONFLICT(rule_id) DO UPDATE SET
-                   q_value       = q_value + ? * (? - q_value),
-                   success_count = success_count + ?,
-                   updated_at    = datetime('now')",
+                   q_value       = rule_experiences.q_value + $2 * ($3 - rule_experiences.q_value),
+                   success_count = rule_experiences.success_count + $4,
+                   updated_at    = CURRENT_TIMESTAMP",
             )
             .bind(rule_id)
-            .bind(alpha)
-            .bind(reward)
-            .bind(success_delta)
             .bind(alpha)
             .bind(reward)
             .bind(success_delta)
@@ -205,7 +213,7 @@ impl QValueStore {
     /// Return the current Q-value for a rule, or `None` if no record exists.
     pub async fn q_value_for(&self, rule_id: &str) -> anyhow::Result<Option<f64>> {
         let row: Option<(f64,)> =
-            sqlx::query_as("SELECT q_value FROM rule_experiences WHERE rule_id = ?")
+            sqlx::query_as("SELECT q_value FROM rule_experiences WHERE rule_id = $1")
                 .bind(rule_id)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -218,16 +226,21 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    async fn open_test_store() -> anyhow::Result<(QValueStore, tempfile::TempDir)> {
+    async fn open_test_store() -> anyhow::Result<Option<(QValueStore, tempfile::TempDir)>> {
+        if std::env::var("DATABASE_URL").is_err() {
+            return Ok(None);
+        }
         let dir = tempdir()?;
         let path = dir.path().join("q_values.db");
         let store = QValueStore::open(&path).await?;
-        Ok((store, dir))
+        Ok(Some((store, dir)))
     }
 
     #[tokio::test]
     async fn record_and_retrieve_pipeline_event() -> anyhow::Result<()> {
-        let (store, _dir) = open_test_store().await?;
+        let Some((store, _dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         store
             .record_pipeline_event("task-1", "implement", &["rule-A", "rule-B"])
             .await?;
@@ -238,7 +251,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_experiences_deduplicates_across_phases() -> anyhow::Result<()> {
-        let (store, _dir) = open_test_store().await?;
+        let Some((store, _dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         store
             .record_pipeline_event("task-2", "triage", &["rule-A"])
             .await?;
@@ -252,7 +267,9 @@ mod tests {
 
     #[tokio::test]
     async fn q_value_update_merged_increases_q_value() -> anyhow::Result<()> {
-        let (store, _dir) = open_test_store().await?;
+        let Some((store, _dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         store
             .record_pipeline_event("task-3", "implement", &["rule-X"])
             .await?;
@@ -271,7 +288,9 @@ mod tests {
 
     #[tokio::test]
     async fn q_value_update_closed_decreases_q_value() -> anyhow::Result<()> {
-        let (store, _dir) = open_test_store().await?;
+        let Some((store, _dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         store
             .record_pipeline_event("task-4", "implement", &["rule-Y"])
             .await?;
@@ -290,7 +309,9 @@ mod tests {
 
     #[tokio::test]
     async fn q_value_update_noop_for_empty_ids() -> anyhow::Result<()> {
-        let (store, _dir) = open_test_store().await?;
+        let Some((store, _dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         store
             .apply_q_update(&[], REWARD_MERGED, DEFAULT_ALPHA)
             .await?;
@@ -301,7 +322,9 @@ mod tests {
 
     #[tokio::test]
     async fn retrieval_count_incremented_via_record_pipeline_event() -> anyhow::Result<()> {
-        let (store, _dir) = open_test_store().await?;
+        let Some((store, _dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         store
             .record_pipeline_event("task-5", "plan", &["rule-Z"])
             .await?;
@@ -309,7 +332,7 @@ mod tests {
             .record_pipeline_event("task-5", "implement", &["rule-Z"])
             .await?;
         let row: Option<(i64,)> =
-            sqlx::query_as("SELECT retrieval_count FROM rule_experiences WHERE rule_id = ?")
+            sqlx::query_as("SELECT retrieval_count FROM rule_experiences WHERE rule_id = $1")
                 .bind("rule-Z")
                 .fetch_optional(&store.pool)
                 .await?;
@@ -322,7 +345,9 @@ mod tests {
 
     #[tokio::test]
     async fn success_count_incremented_only_on_merged_reward() -> anyhow::Result<()> {
-        let (store, _dir) = open_test_store().await?;
+        let Some((store, _dir)) = open_test_store().await? else {
+            return Ok(());
+        };
         store
             .record_pipeline_event("task-6", "implement", &["rule-W"])
             .await?;
@@ -333,7 +358,7 @@ mod tests {
             .apply_q_update(&experiences, REWARD_CLOSED, DEFAULT_ALPHA)
             .await?;
         let row: Option<(i64,)> =
-            sqlx::query_as("SELECT success_count FROM rule_experiences WHERE rule_id = ?")
+            sqlx::query_as("SELECT success_count FROM rule_experiences WHERE rule_id = $1")
                 .bind("rule-W")
                 .fetch_optional(&store.pool)
                 .await?;
@@ -348,7 +373,7 @@ mod tests {
             .apply_q_update(&experiences, REWARD_MERGED, DEFAULT_ALPHA)
             .await?;
         let row: Option<(i64,)> =
-            sqlx::query_as("SELECT success_count FROM rule_experiences WHERE rule_id = ?")
+            sqlx::query_as("SELECT success_count FROM rule_experiences WHERE rule_id = $1")
                 .bind("rule-W")
                 .fetch_optional(&store.pool)
                 .await?;
