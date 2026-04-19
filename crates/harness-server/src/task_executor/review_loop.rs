@@ -82,6 +82,9 @@ pub(crate) async fn run_review_loop(
     // Tracks the most recent non-waiting review output for Jaccard loop detection.
     let mut prev_review_output: Option<String> = None;
 
+    const QUOTA_EXHAUSTED_THRESHOLD: u32 = 3;
+    let mut quota_exhausted_rounds: u32 = 0;
+
     // Review loop.
     // Use an explicit counter so WAITING responses don't consume a round — `continue`
     // inside a `for` loop would silently advance the iterator even without a real review.
@@ -206,11 +209,12 @@ pub(crate) async fn run_review_loop(
 
         let raw_lgtm = prompts::is_lgtm(&output);
         let waiting = prompts::is_waiting(&output);
+        let quota_exhausted = !raw_lgtm && !waiting && prompts::is_quota_exhausted(&output);
         // If post-execute validation failed this round, block LGTM acceptance even
         // if the reviewer approved — the local validator caught an issue that must be
         // fixed before the PR can be marked done.
         let lgtm = raw_lgtm && pending_test_failure.is_none();
-        let fixed = !lgtm && !waiting;
+        let fixed = !lgtm && !waiting && !quota_exhausted;
 
         // Parse issue count before the Jaccard check so loop detection can distinguish
         // genuine forward progress (decreasing issue count) from true stuck loops.
@@ -220,7 +224,8 @@ pub(crate) async fn run_review_loop(
         // too similar indicate the reviewer is stuck repeating itself without making progress.
         // Skip when the raw output is an approval: repeated LGTM is legitimate convergence
         // (e.g., reviewer approves again after a test-gate previously blocked acceptance).
-        if !waiting && !raw_lgtm {
+        // Quota-exhausted rounds are also skipped — they contain no real review content.
+        if !waiting && !raw_lgtm && !quota_exhausted {
             if let Some(ref prev) = prev_review_output {
                 let score = jaccard_word_similarity(prev, &output);
                 if score >= jaccard_threshold {
@@ -254,7 +259,7 @@ pub(crate) async fn run_review_loop(
             prev_review_output = None;
         }
 
-        if !waiting {
+        if !waiting && !quota_exhausted {
             issue_counts.push(current_issues);
         }
 
@@ -298,6 +303,84 @@ pub(crate) async fn run_review_loop(
                 sleep(Duration::from_secs(wait_secs)).await;
                 continue;
             }
+        }
+
+        // Quota-exhausted: reviewer posted a quota warning instead of a real review.
+        // Don't consume a round — sleep and retry. After K consecutive quota rounds,
+        // run the test gate as a heuristic graduation check.
+        if quota_exhausted {
+            quota_exhausted_rounds += 1;
+            tracing::info!(
+                round,
+                quota_exhausted_rounds,
+                "PR #{pr_num} reviewer quota exhausted; not consuming a review round"
+            );
+            mutate_and_persist(store, task_id, |s| {
+                s.rounds.push(RoundResult {
+                    turn: round,
+                    action: "review".into(),
+                    result: "quota_exhausted".into(),
+                    detail: None,
+                    first_token_latency_ms: None,
+                });
+            })
+            .await?;
+
+            if quota_exhausted_rounds >= QUOTA_EXHAUSTED_THRESHOLD && !lgtm_test_gate_rejected {
+                tracing::info!(
+                    task_id = %task_id,
+                    quota_exhausted_rounds,
+                    "quota-heuristic graduation: running test gate after {} quota-exhausted rounds",
+                    quota_exhausted_rounds
+                );
+                match super::run_test_gate(
+                    project,
+                    &project_config.validation.pre_push,
+                    project_config.validation.test_gate_timeout_secs,
+                    cargo_env,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            task_id = %task_id,
+                            quota_exhausted_rounds,
+                            "quota-heuristic graduation: tests passed — marking done"
+                        );
+                        mutate_and_persist(store, task_id, |s| {
+                            s.status = TaskStatus::Done;
+                            s.turn = round.saturating_add(1);
+                            s.error = Some(format!(
+                                "LGTM via quota-heuristic: external reviewer quota exhausted after {} rounds, tests passed",
+                                quota_exhausted_rounds
+                            ));
+                        })
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(_test_output) => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            quota_exhausted_rounds,
+                            "quota-heuristic graduation: tests failed — marking failed"
+                        );
+                        mutate_and_persist(store, task_id, |s| {
+                            s.status = TaskStatus::Failed;
+                            s.turn = round.saturating_add(1);
+                            s.error = Some(format!(
+                                "Quota-heuristic: tests failed after {} quota-exhausted rounds",
+                                quota_exhausted_rounds
+                            ));
+                        })
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+
+            update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
+            sleep(Duration::from_secs(wait_secs)).await;
+            continue; // Don't increment round — quota rounds are free
         }
 
         let result_label = if lgtm { "lgtm" } else { "fixed" };
@@ -395,6 +478,9 @@ pub(crate) async fn run_review_loop(
         // Also treat a test gate rejection as a "fixed" round — the agent needs
         // to push a fix and get a fresh review before LGTM can be accepted.
         prev_fixed = fixed || pending_test_failure.is_some();
+        if fixed {
+            quota_exhausted_rounds = 0;
+        }
         tracing::info!("PR #{pr_num} fixed at round {round}; waiting for bot re-review");
         if round < max_rounds {
             waiting_count += 1;
