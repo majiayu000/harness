@@ -20,7 +20,7 @@ export class ApiError extends Error {
   }
 }
 
-function authHeaders(): Record<string, string> {
+export function authHeaders(): Record<string, string> {
   const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
   return tok ? { Authorization: `Bearer ${tok}` } : {};
 }

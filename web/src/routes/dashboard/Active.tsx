@@ -1,4 +1,6 @@
+import { useState } from "react";
 import { useTasks } from "@/lib/queries";
+import { TaskSlideover } from "@/components/TaskSlideover";
 import type { Task } from "@/types";
 
 interface Column {
@@ -30,10 +32,13 @@ function columnOf(status: string): string {
   return "other";
 }
 
-function TaskCard({ task }: { task: Task }) {
+function TaskCard({ task, onClick }: { task: Task; onClick: () => void }) {
   const title = task.description?.trim() || task.repo || task.id.slice(0, 8);
   return (
-    <div className="border border-line bg-bg px-2.5 py-2 mb-2 last:mb-0 hover:border-line-3 transition-colors">
+    <div
+      onClick={onClick}
+      className="border border-line bg-bg px-2.5 py-2 mb-2 last:mb-0 hover:border-line-3 transition-colors cursor-pointer"
+    >
       <div className="text-[12.5px] text-ink leading-snug line-clamp-2" title={title}>
         {title}
       </div>
@@ -57,6 +62,7 @@ function TaskCard({ task }: { task: Task }) {
 }
 
 export function Active() {
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const { data, isLoading, isError } = useTasks();
 
   const active = (data ?? []).filter((t) => !TERMINAL_STATUSES.has(t.status));
@@ -71,44 +77,47 @@ export function Active() {
   const showOther = other.length > 0;
 
   return (
-    <div
-      className="grid gap-3"
-      style={{ gridTemplateColumns: `repeat(${COLUMNS.length + (showOther ? 1 : 0)}, 1fr)` }}
-    >
-      {COLUMNS.map((col) => {
-        const rows = grouped[col.key];
-        return (
-          <div key={col.key} className="border border-line bg-bg-1 min-h-[200px] flex flex-col">
+    <>
+      <div
+        className="grid gap-3"
+        style={{ gridTemplateColumns: `repeat(${COLUMNS.length + (showOther ? 1 : 0)}, 1fr)` }}
+      >
+        {COLUMNS.map((col) => {
+          const rows = grouped[col.key];
+          return (
+            <div key={col.key} className="border border-line bg-bg-1 min-h-[200px] flex flex-col">
+              <div className="px-3 py-2 border-b border-line font-mono text-[10.5px] tracking-[0.1em] uppercase text-ink-3 flex justify-between flex-none">
+                <span>{col.label}</span>
+                <span className="text-ink-2">{rows.length}</span>
+              </div>
+              <div className="p-2 flex-1 overflow-auto">
+                {rows.length === 0 && (
+                  <div className="text-ink-4 font-mono text-[11px] p-1">
+                    {isLoading ? "loading…" : isError ? "error" : "—"}
+                  </div>
+                )}
+                {rows.map((t) => (
+                  <TaskCard key={t.id} task={t} onClick={() => setSelectedTaskId(t.id)} />
+                ))}
+              </div>
+            </div>
+          );
+        })}
+        {showOther && (
+          <div className="border border-line bg-bg-1 min-h-[200px] flex flex-col">
             <div className="px-3 py-2 border-b border-line font-mono text-[10.5px] tracking-[0.1em] uppercase text-ink-3 flex justify-between flex-none">
-              <span>{col.label}</span>
-              <span className="text-ink-2">{rows.length}</span>
+              <span>Other</span>
+              <span className="text-ink-2">{other.length}</span>
             </div>
             <div className="p-2 flex-1 overflow-auto">
-              {rows.length === 0 && (
-                <div className="text-ink-4 font-mono text-[11px] p-1">
-                  {isLoading ? "loading…" : isError ? "error" : "—"}
-                </div>
-              )}
-              {rows.map((t) => (
-                <TaskCard key={t.id} task={t} />
+              {other.map((t) => (
+                <TaskCard key={t.id} task={t} onClick={() => setSelectedTaskId(t.id)} />
               ))}
             </div>
           </div>
-        );
-      })}
-      {showOther && (
-        <div className="border border-line bg-bg-1 min-h-[200px] flex flex-col">
-          <div className="px-3 py-2 border-b border-line font-mono text-[10.5px] tracking-[0.1em] uppercase text-ink-3 flex justify-between flex-none">
-            <span>Other</span>
-            <span className="text-ink-2">{other.length}</span>
-          </div>
-          <div className="p-2 flex-1 overflow-auto">
-            {other.map((t) => (
-              <TaskCard key={t.id} task={t} />
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
+        )}
+      </div>
+      <TaskSlideover taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} />
+    </>
   );
 }
