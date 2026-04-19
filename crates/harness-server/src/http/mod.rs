@@ -14,16 +14,6 @@ use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-// Items re-exported into test scope via `use super::*` in tests.rs.
-#[cfg(test)]
-use axum::{
-    extract::DefaultBodyLimit,
-    routing::{get, post},
-    Router,
-};
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicU64};
-
 pub(crate) mod auth;
 pub(crate) mod background;
 pub(crate) mod builders;
