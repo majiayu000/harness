@@ -134,7 +134,7 @@ export function Overview() {
             </div>
           </Panel>
 
-          <div className="grid grid-cols-[1.6fr_1fr]">
+          <div id="observability" className="grid grid-cols-[1.6fr_1fr] scroll-mt-12">
             <Panel title="Cluster activity" sub="hourly buckets" className="border-r border-line">
               <div className="p-5">
                 {(data?.heatmap.rows ?? []).map((r) => (
