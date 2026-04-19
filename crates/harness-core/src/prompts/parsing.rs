@@ -177,10 +177,11 @@ pub fn has_gemini_body_feedback(body: &str) -> bool {
         "review feedback highlights",
         "a review comment suggests",
         "feedback was provided",
+        "feedback focuses",
     ];
     body.lines().any(|line| {
         let lower = line.trim().to_ascii_lowercase();
-        triggers.iter().any(|&t| lower.starts_with(t))
+        triggers.iter().any(|&t| lower.contains(t))
     })
 }
 
@@ -349,6 +350,20 @@ mod tests {
             "This PR looks good overall. Nice work on the refactoring."
         ));
         assert!(!has_gemini_body_feedback("LGTM"));
+    }
+
+    #[test]
+    fn test_has_gemini_body_feedback_mid_sentence_matches() {
+        // Real Gemini bodies embed trigger phrases inside sentences, not at line start.
+        assert!(has_gemini_body_feedback(
+            "## Code Review\n\nThe review feedback highlights a potential null dereference on line 42."
+        ));
+        assert!(has_gemini_body_feedback(
+            "Overall the code is clean, but feedback suggests extracting the retry logic."
+        ));
+        assert!(has_gemini_body_feedback(
+            "The feedback focuses on error propagation across async boundaries."
+        ));
     }
 
     #[test]

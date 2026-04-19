@@ -3,7 +3,6 @@ use crate::task_executor::pr_detection::{
     parse_harness_mention_command, HarnessMentionCommand,
 };
 use crate::task_runner::CreateTaskRequest;
-use harness_core::prompts::has_gemini_body_feedback;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -51,19 +50,12 @@ struct GitHubPullRequestRef {
 }
 
 #[derive(Debug, Deserialize)]
-struct GitHubUserRef {
-    login: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct GitHubReviewRef {
     state: String,
     #[serde(default)]
     body: Option<String>,
     #[serde(default)]
     html_url: Option<String>,
-    #[serde(default)]
-    user: Option<GitHubUserRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,19 +206,6 @@ pub(crate) fn parse_github_webhook_task_request(
                     let body = parsed.review.body.as_deref().unwrap_or("").trim();
                     if body.is_empty() {
                         return Ok((None, "pr review comment: empty body ignored".to_string()));
-                    }
-                    let is_gemini = parsed
-                        .review
-                        .user
-                        .as_ref()
-                        .map(|u| u.login.to_ascii_lowercase().contains("gemini"))
-                        .unwrap_or(false);
-                    if is_gemini && !has_gemini_body_feedback(body) {
-                        return Ok((
-                            None,
-                            "pr review comment: gemini body has no actionable trigger phrases"
-                                .to_string(),
-                        ));
                     }
                     Ok((
                         Some(pr_rework_task_request(&parsed)),
