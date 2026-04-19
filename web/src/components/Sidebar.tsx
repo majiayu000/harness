@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 export interface SidebarItem {
   id: string;
   label: string;
-  href: string;
+  href?: string;
   icon?: React.ReactNode;
   count?: number;
   active?: boolean;
@@ -20,9 +20,17 @@ interface Props {
   userInitials?: string;
   userName?: string;
   userEmail?: string;
+  onItemClick?: (id: string) => void;
 }
 
-export function Sidebar({ env, sections, userInitials = "MJ", userName = "majiayu", userEmail = "mj@harness.local" }: Props) {
+export function Sidebar({
+  env,
+  sections,
+  userInitials = "MJ",
+  userName = "majiayu",
+  userEmail = "mj@harness.local",
+  onItemClick,
+}: Props) {
   return (
     <aside className="border-r border-line bg-bg-1 flex flex-col min-h-0 w-[240px]">
       <div className="px-[18px] py-4 flex items-center gap-2.5 border-b border-line">
@@ -44,29 +52,47 @@ export function Sidebar({ env, sections, userInitials = "MJ", userName = "majiay
             <div className="font-mono text-[10px] tracking-[0.14em] uppercase text-ink-4 px-2.5 pt-3.5 pb-1.5">
               {section.label}
             </div>
-            {section.items.map((item) => (
-              <Link
-                key={item.id}
-                to={item.href}
-                className={`flex items-center gap-2.5 px-2.5 py-[7px] rounded-[4px] text-[13px] cursor-pointer relative ${
-                  item.active
-                    ? "bg-bg-2 text-ink before:content-[''] before:absolute before:-left-2 before:top-2 before:bottom-2 before:w-0.5 before:bg-rust"
-                    : "text-ink-2 hover:bg-bg-2 hover:text-ink"
-                }`}
-              >
-                {item.icon && <span className="w-[15px] h-[15px] text-ink-3 flex-none">{item.icon}</span>}
-                {item.label}
-                {typeof item.count === "number" && (
-                  <span
-                    className={`ml-auto font-mono text-[10.5px] px-1.5 py-[1px] border rounded-[10px] min-w-[22px] text-center ${
-                      item.active ? "text-rust border-rust" : "text-ink-3 border-line-2"
-                    }`}
+            {section.items.map((item) => {
+              const itemClass = `flex items-center gap-2.5 px-2.5 py-[7px] rounded-[4px] text-[13px] cursor-pointer relative ${
+                item.active
+                  ? "bg-bg-2 text-ink before:content-[''] before:absolute before:-left-2 before:top-2 before:bottom-2 before:w-0.5 before:bg-rust"
+                  : "text-ink-2 hover:bg-bg-2 hover:text-ink"
+              }`;
+              const body = (
+                <>
+                  {item.icon && <span className="w-[15px] h-[15px] text-ink-3 flex-none">{item.icon}</span>}
+                  {item.label}
+                  {typeof item.count === "number" && (
+                    <span
+                      className={`ml-auto font-mono text-[10.5px] px-1.5 py-[1px] border rounded-[10px] min-w-[22px] text-center ${
+                        item.active ? "text-rust border-rust" : "text-ink-3 border-line-2"
+                      }`}
+                    >
+                      {item.count}
+                    </span>
+                  )}
+                </>
+              );
+
+              if (!item.href && onItemClick) {
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={`${itemClass} w-full text-left bg-transparent border-0`}
+                    onClick={() => onItemClick(item.id)}
                   >
-                    {item.count}
-                  </span>
-                )}
-              </Link>
-            ))}
+                    {body}
+                  </button>
+                );
+              }
+
+              return (
+                <Link key={item.id} to={item.href!} className={itemClass}>
+                  {body}
+                </Link>
+              );
+            })}
           </div>
         ))}
       </nav>

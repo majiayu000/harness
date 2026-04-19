@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { Sidebar, SidebarSection } from "./Sidebar";
 
 describe("<Sidebar>", () => {
@@ -31,5 +31,25 @@ describe("<Sidebar>", () => {
     );
     expect(screen.getByText("Overview")).toBeInTheDocument();
     expect(screen.getByText("4")).toBeInTheDocument();
+  });
+
+  it("invokes onItemClick with the item id for items without an href", () => {
+    const onItemClick = vi.fn();
+    const sections: SidebarSection[] = [
+      {
+        label: "Operations",
+        items: [
+          { id: "history", label: "History" },
+          { id: "channels", label: "Channels" },
+        ],
+      },
+    ];
+    render(
+      <MemoryRouter>
+        <Sidebar env="local" sections={sections} onItemClick={onItemClick} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByText("History"));
+    expect(onItemClick).toHaveBeenCalledWith("history");
   });
 });

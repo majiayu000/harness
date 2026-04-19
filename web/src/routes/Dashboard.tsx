@@ -19,10 +19,10 @@ export function Dashboard() {
     {
       label: "Operations",
       items: [
-        { id: "board", label: "Active", active: tab === "board", href: "/" },
-        { id: "history", label: "History", active: tab === "history", href: "/" },
-        { id: "channels", label: "Channels", active: tab === "channels", href: "/" },
-        { id: "submit", label: "Submit", active: tab === "submit", href: "/" },
+        { id: "board", label: "Active", active: tab === "board" },
+        { id: "history", label: "History", active: tab === "history" },
+        { id: "channels", label: "Channels", active: tab === "channels" },
+        { id: "submit", label: "Submit", active: tab === "submit" },
       ],
     },
     {
@@ -33,14 +33,11 @@ export function Dashboard() {
 
   return (
     <div className="grid grid-cols-[240px_1fr] h-screen overflow-hidden">
-      <aside
-        onClick={(e) => {
-          const a = (e.target as HTMLElement).closest("[data-tab]");
-          if (a instanceof HTMLElement) setTab(a.dataset.tab as Tab);
-        }}
-      >
-        <Sidebar env="local" sections={sections} />
-      </aside>
+      <Sidebar
+        env="local"
+        sections={sections}
+        onItemClick={(id) => setTab(id as Tab)}
+      />
       <main className="flex flex-col min-h-0 min-w-0">
         <TopBar
           breadcrumb={[{ label: "harness" }, { label: "Tasks", current: true }]}
