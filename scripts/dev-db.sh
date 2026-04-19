@@ -7,19 +7,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-echo "Starting Postgres container..."
-docker compose -f "$REPO_ROOT/docker-compose.yml" up -d postgres
-
-echo "Waiting for Postgres to be ready (max 30s)..."
-deadline=$(( $(date +%s) + 30 ))
-until docker compose -f "$REPO_ROOT/docker-compose.yml" exec -T postgres \
-    pg_isready -U harness -d harness -q 2>/dev/null; do
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    echo "ERROR: Postgres did not become ready within 30 seconds." >&2
-    exit 1
-  fi
-  sleep 1
-done
+echo "Starting Postgres container and waiting until healthy..."
+docker compose -f "$REPO_ROOT/docker-compose.yml" up -d --wait postgres
 
 echo ""
 echo "Postgres is ready. Set the following in your shell:"
