@@ -13,6 +13,7 @@ use harness_core::db::Migration;
 /// v14 – add description column for task observability after restart.
 /// v15 – add (status, updated_at DESC) index for project-agnostic terminal queries.
 /// v18 – add version column for optimistic locking.
+/// v19 – convert JSON columns from TEXT to JSONB for native validation and operators.
 pub(super) static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -132,5 +133,10 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
         version: 18,
         description: "add version column for optimistic locking",
         sql: "ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
+    },
+    Migration {
+        version: 19,
+        description: "convert JSON columns from TEXT to JSONB",
+        sql: "ALTER TABLE tasks ALTER COLUMN rounds TYPE JSONB USING rounds::jsonb;               ALTER TABLE tasks ALTER COLUMN depends_on TYPE JSONB USING depends_on::jsonb;               ALTER TABLE tasks ALTER COLUMN phase TYPE JSONB USING phase::jsonb;               ALTER TABLE tasks ALTER COLUMN request_settings TYPE JSONB USING request_settings::jsonb",
     },
 ];

@@ -64,12 +64,12 @@ impl TaskDb {
             .request_settings
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok());
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE tasks SET status = $1, turn = $2, pr_url = $3, rounds = $4, error = $5, \
                     source = $6, external_id = $7, repo = $8, depends_on = $9, project = $10, \
                     priority = $11, phase = $12, description = $13, request_settings = $14, \
                     updated_at = CURRENT_TIMESTAMP, version = version + 1 \
-             WHERE id = $15",
+             WHERE id = $15 AND version = $16",
         )
         .bind(status)
         .bind(state.turn as i64)
@@ -91,8 +91,15 @@ impl TaskDb {
         .bind(state.description.as_deref())
         .bind(settings_json.as_deref())
         .bind(&state.id.0)
+        .bind(state.version)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(anyhow::anyhow!(
+                "concurrent update conflict on task {}",
+                state.id.0
+            ));
+        }
         Ok(())
     }
 

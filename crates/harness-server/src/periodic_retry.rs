@@ -406,6 +406,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             request_settings: None,
+            version: 0,
         }
     }
 

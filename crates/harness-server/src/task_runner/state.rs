@@ -75,6 +75,9 @@ pub struct TaskState {
     /// requested rather than silently falling back to server defaults.
     #[serde(skip)]
     pub request_settings: Option<PersistedRequestSettings>,
+    /// Optimistic locking counter. Loaded from DB on every get(); checked on update().
+    #[serde(default)]
+    pub version: i32,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -139,6 +142,7 @@ impl TaskState {
             plan_output: None,
             repo: None,
             request_settings: None,
+            version: 0,
         }
     }
 

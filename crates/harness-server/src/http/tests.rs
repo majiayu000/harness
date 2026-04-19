@@ -1560,6 +1560,7 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        version: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -1627,6 +1628,7 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        version: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;

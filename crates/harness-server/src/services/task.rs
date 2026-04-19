@@ -160,6 +160,7 @@ mod tests {
             plan_output: None,
             repo: None,
             request_settings: None,
+            version: 0,
         };
         state.source = Some("github".to_string());
         store.insert(&state).await;
@@ -201,6 +202,7 @@ mod tests {
             plan_output: None,
             repo: None,
             request_settings: None,
+            version: 0,
         };
         store.insert(&parent_state).await;
 
@@ -226,6 +228,7 @@ mod tests {
             plan_output: None,
             repo: None,
             request_settings: None,
+            version: 0,
         };
         store.insert(&child_state).await;
 

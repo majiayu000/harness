@@ -47,6 +47,167 @@ pub async fn pg_open_pool_schematized(database_url: &str, schema: &str) -> anyho
     Ok(pool)
 }
 
+/// Split a SQL string into individual statements, correctly handling:
+/// - Single-quoted string literals (including escaped `''`)
+/// - Double-quoted identifiers (including escaped `""`)
+/// - Line comments (`--`)
+/// - Block comments (`/* */`)
+/// - Dollar-quoted strings (`$$...$$` or `$tag$...$tag$`)
+fn pg_split_statements(sql: &str) -> Vec<String> {
+    let mut statements: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = sql.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            // Line comment: -- ... \n
+            '-' if chars.peek() == Some(&'-') => {
+                current.push(ch);
+                if let Some(c) = chars.next() {
+                    current.push(c);
+                }
+                for c in chars.by_ref() {
+                    current.push(c);
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            // Block comment: /* ... */
+            '/' if chars.peek() == Some(&'*') => {
+                current.push(ch);
+                if let Some(c) = chars.next() {
+                    current.push(c);
+                }
+                loop {
+                    match chars.next() {
+                        None => break,
+                        Some(c) => {
+                            current.push(c);
+                            if c == '*' && chars.peek() == Some(&'/') {
+                                if let Some(c) = chars.next() {
+                                    current.push(c);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            // Single-quoted string: '...' with '' escape
+            '\'' => {
+                current.push(ch);
+                loop {
+                    match chars.next() {
+                        None => break,
+                        Some(c) => {
+                            current.push(c);
+                            if c == '\'' {
+                                if chars.peek() == Some(&'\'') {
+                                    if let Some(q) = chars.next() {
+                                        current.push(q);
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Double-quoted identifier: "..." with "" escape
+            '"' => {
+                current.push(ch);
+                loop {
+                    match chars.next() {
+                        None => break,
+                        Some(c) => {
+                            current.push(c);
+                            if c == '"' {
+                                if chars.peek() == Some(&'"') {
+                                    if let Some(q) = chars.next() {
+                                        current.push(q);
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Dollar-quoted string: $tag$...$tag$ (tag may be empty: $$...$$)
+            '$' => {
+                let mut tag = String::from('$');
+                let mut is_dollar_quote = false;
+                let mut speculative: Vec<char> = Vec::new();
+                loop {
+                    match chars.peek().copied() {
+                        Some(c) if c.is_ascii_alphanumeric() || c == '_' => {
+                            let Some(c) = chars.next() else {
+                                break;
+                            };
+                            speculative.push(c);
+                            tag.push(c);
+                        }
+                        Some('$') => {
+                            if chars.next().is_none() {
+                                break;
+                            }
+                            tag.push('$');
+                            is_dollar_quote = true;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                if is_dollar_quote {
+                    current.push_str(&tag);
+                    let mut body = String::new();
+                    loop {
+                        match chars.next() {
+                            None => {
+                                current.push_str(&body);
+                                break;
+                            }
+                            Some(c) => {
+                                body.push(c);
+                                if body.ends_with(&tag) {
+                                    current.push_str(&body);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    current.push('$');
+                    for c in speculative {
+                        current.push(c);
+                    }
+                }
+            }
+            // Statement separator
+            ';' => {
+                let stmt = current.trim().to_string();
+                if !stmt.is_empty() {
+                    statements.push(stmt);
+                }
+                current.clear();
+            }
+            c => {
+                current.push(c);
+            }
+        }
+    }
+
+    let trailing = current.trim().to_string();
+    if !trailing.is_empty() {
+        statements.push(trailing);
+    }
+
+    statements
+}
+
 fn pg_duplicate_column_error(statement: &str, error: &sqlx::Error) -> bool {
     if !statement.to_ascii_uppercase().contains("ADD COLUMN") {
         return false;
@@ -106,13 +267,9 @@ impl<'a> PgMigrator<'a> {
 
     async fn apply(&self, migration: &Migration) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        for raw in migration.sql.split(';') {
-            let stmt = raw.trim();
-            if stmt.is_empty() {
-                continue;
-            }
-            if let Err(e) = sqlx::query(stmt).execute(&mut *tx).await {
-                if pg_duplicate_column_error(stmt, &e) {
+        for stmt in pg_split_statements(migration.sql) {
+            if let Err(e) = sqlx::query(&stmt).execute(&mut *tx).await {
+                if pg_duplicate_column_error(&stmt, &e) {
                     continue;
                 }
                 return Err(anyhow::anyhow!(
@@ -131,5 +288,56 @@ impl<'a> PgMigrator<'a> {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pg_split_statements;
+
+    #[test]
+    fn single_statement_no_semicolon() {
+        let stmts = pg_split_statements("SELECT 1");
+        assert_eq!(stmts, vec!["SELECT 1"]);
+    }
+
+    #[test]
+    fn two_statements_separated_by_semicolon() {
+        let stmts = pg_split_statements("SELECT 1; SELECT 2");
+        assert_eq!(stmts, vec!["SELECT 1", "SELECT 2"]);
+    }
+
+    #[test]
+    fn semicolon_inside_string_literal_not_split() {
+        let stmts = pg_split_statements("SELECT ';' AS x");
+        assert_eq!(stmts, vec!["SELECT \';\' AS x"]);
+    }
+
+    #[test]
+    fn semicolon_in_line_comment_not_split() {
+        let stmts = pg_split_statements("SELECT 1 -- comment;\n, 2");
+        assert_eq!(stmts, vec!["SELECT 1 -- comment;\n, 2"]);
+    }
+
+    #[test]
+    fn semicolon_in_block_comment_not_split() {
+        let stmts = pg_split_statements("SELECT /* block; comment */ 1");
+        assert_eq!(stmts, vec!["SELECT /* block; comment */ 1"]);
+    }
+
+    #[test]
+    fn dollar_quoted_block_not_split() {
+        let sql = "DO $$ BEGIN PERFORM 1; END $$";
+        let stmts = pg_split_statements(sql);
+        assert_eq!(stmts, vec!["DO $$ BEGIN PERFORM 1; END $$"]);
+    }
+
+    #[test]
+    fn v17_migration_produces_exactly_two_statements() {
+        let sql = "CREATE TABLE IF NOT EXISTS task_prompts (\n            id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n            task_id    TEXT NOT NULL,\n            UNIQUE(task_id)\n        ); CREATE INDEX IF NOT EXISTS idx_task_prompts_task_id\n           ON task_prompts(task_id)";
+        let stmts = pg_split_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].starts_with("CREATE TABLE"));
+        assert!(stmts[1].starts_with("CREATE INDEX"));
     }
 }

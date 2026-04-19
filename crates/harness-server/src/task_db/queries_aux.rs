@@ -139,9 +139,13 @@ impl TaskDb {
         &self,
     ) -> anyhow::Result<Vec<(TaskState, TaskCheckpoint)>> {
         let rows = sqlx::query_as::<_, PendingCheckpointRow>(
-            "SELECT t.id, t.status, t.turn, t.pr_url, t.rounds, t.error, t.source, \
-                    t.external_id, t.parent_id, t.created_at, t.repo, t.depends_on, \
-                    t.project, t.priority, t.phase, t.description, t.request_settings, \
+            "SELECT t.id, t.status, t.turn, t.pr_url, \
+                    t.rounds::text AS rounds, t.error, t.source, \
+                    t.external_id, t.parent_id, t.created_at, t.repo, \
+                    t.depends_on::text AS depends_on, \
+                    t.project, t.priority, \
+                    t.phase::text AS phase, t.description, \
+                    t.request_settings::text AS request_settings, t.version, \
                     c.triage_output, c.plan_output, c.pr_url AS ck_pr_url, \
                     c.last_phase, \
                     TO_CHAR(c.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ck_updated_at \
@@ -175,6 +179,7 @@ impl TaskDb {
                 phase: row.phase,
                 description: row.description,
                 request_settings: row.request_settings,
+                version: row.version,
             };
             let task_state = match task_row.try_into_task_state() {
                 Ok(s) => s,
