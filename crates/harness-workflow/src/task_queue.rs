@@ -421,7 +421,17 @@ impl TaskQueue {
         let project_limits: DashMap<String, usize> = config
             .per_project
             .iter()
-            .map(|(k, v)| (k.clone(), *v))
+            .map(|(k, v)| {
+                if !std::path::Path::new(k).is_absolute() {
+                    tracing::warn!(
+                        key = k.as_str(),
+                        "concurrency.per_project key is not an absolute path; \
+                         it will not match any project at runtime — \
+                         keys must be canonical filesystem paths (use ProjectId::from_path)"
+                    );
+                }
+                (k.clone(), *v)
+            })
             .collect();
         Self {
             global_queue: Arc::new(Mutex::new(PriorityPermitQueue::new(

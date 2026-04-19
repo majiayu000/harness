@@ -45,6 +45,26 @@ define_id!(TurnId);
 define_id!(AgentId);
 define_id!(SignalId);
 define_id!(ProjectId);
+
+impl ProjectId {
+    /// Derive a canonical project identity from a filesystem path.
+    ///
+    /// Calls `std::fs::canonicalize` to resolve symlinks and relative
+    /// components, falling back to the raw path string when canonicalize
+    /// fails (e.g. the path does not yet exist at registration time).
+    /// This is the single normalization point — all subsystems (registry,
+    /// queue, config `per_project`) must use this constructor so that the
+    /// same physical directory always maps to the same key.
+    pub fn from_path(root: &std::path::Path) -> Self {
+        let s = root
+            .canonicalize()
+            .unwrap_or_else(|_| root.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        Self(s)
+    }
+}
+
 define_id!(DraftId);
 define_id!(SkillId);
 define_id!(ExecPlanId);
@@ -703,6 +723,32 @@ pub struct MetricFilters {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ── ProjectId::from_path tests ────────────────────────────────────────────
+
+    #[test]
+    fn project_id_from_existing_dir_is_canonical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = ProjectId::from_path(dir.path());
+        let canonical = dir.path().canonicalize().expect("canonicalize");
+        assert_eq!(id.as_str(), canonical.to_string_lossy().as_ref());
+    }
+
+    #[test]
+    fn project_id_from_nonexistent_path_falls_back_to_raw() {
+        let path = PathBuf::from("/nonexistent/harness/project");
+        let id = ProjectId::from_path(&path);
+        assert_eq!(id.as_str(), "/nonexistent/harness/project");
+    }
+
+    #[test]
+    fn project_id_from_path_and_from_str_agree_on_canonical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical = dir.path().canonicalize().expect("canonicalize");
+        let via_path = ProjectId::from_path(dir.path());
+        let via_str = ProjectId::from_str(&canonical.to_string_lossy());
+        assert_eq!(via_path, via_str);
+    }
 
     #[test]
     fn grade_from_score_all_boundaries() {

@@ -105,7 +105,9 @@ pub(crate) async fn build_registry(
                 })
         });
     let default_project = crate::project_registry::Project {
-        id: "default".to_string(),
+        id: harness_core::types::ProjectId::from_path(project_root)
+            .as_str()
+            .to_owned(),
         root: project_root.to_path_buf(),
         max_concurrent: default_project_metadata.and_then(|p| p.max_concurrent),
         default_agent: default_project_metadata.and_then(|p| p.default_agent.clone()),
@@ -117,7 +119,9 @@ pub(crate) async fn build_registry(
     }
     for project in &server.startup_projects {
         let proj = crate::project_registry::Project {
-            id: project.name.clone(),
+            id: harness_core::types::ProjectId::from_path(&project.root)
+                .as_str()
+                .to_owned(),
             root: project.root.clone(),
             max_concurrent: project.max_concurrent,
             default_agent: project.default_agent.clone(),
@@ -222,7 +226,12 @@ mod tests {
         // The default project is always auto-registered; registry should have exactly 1 entry.
         let projects = bundle.project_registry.list().await.expect("list projects");
         assert_eq!(projects.len(), 1, "expected only the default project");
-        assert_eq!(projects[0].id, "default");
+        // ID is the canonical path of the project root, not the literal "default".
+        let canonical = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        assert_eq!(projects[0].id, canonical.to_string_lossy().as_ref());
     }
 
     #[tokio::test]

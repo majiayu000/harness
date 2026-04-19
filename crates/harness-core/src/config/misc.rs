@@ -68,8 +68,21 @@ pub struct ConcurrencyConfig {
     /// Seconds of silence from the agent stream before declaring a stall. Default: 300.
     #[serde(default = "default_stall_timeout_secs")]
     pub stall_timeout_secs: u64,
-    /// Per-project concurrency limits. Maps project path string → max concurrent tasks.
+    /// Per-project concurrency limits.
+    ///
+    /// Maps **canonical filesystem path** → max concurrent tasks for that project.
+    /// Keys must be the absolute, canonical path to the project root — the same
+    /// value produced by `ProjectId::from_path(&root)` — because the queue and
+    /// registry both key on that form. Non-absolute keys are accepted but will
+    /// never match any project at runtime (a warning is emitted on startup).
+    ///
     /// Projects not listed here use the global `max_concurrent_tasks` limit.
+    ///
+    /// Example:
+    /// ```toml
+    /// [concurrency.per_project]
+    /// "/home/user/my-project" = 2
+    /// ```
     #[serde(default)]
     pub per_project: HashMap<String, usize>,
     /// Maximum total agent API calls across all phases (implementation + validation retries +
