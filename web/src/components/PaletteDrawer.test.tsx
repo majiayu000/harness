@@ -4,13 +4,13 @@ import { PaletteProvider } from "@/lib/palette";
 import { PaletteDrawer } from "./PaletteDrawer";
 
 describe("<PaletteDrawer>", () => {
-  it("lists all 10 palettes", () => {
+  it("lists all 11 palettes", () => {
     render(
       <PaletteProvider>
         <PaletteDrawer open onClose={() => {}} />
       </PaletteProvider>,
     );
-    for (const name of ["Ember", "Forge", "Ink", "Bloom", "Terminal", "Mint", "Linen", "Porcelain", "Pixel", "Multica"]) {
+    for (const name of ["Ember", "Forge", "Ink", "Bloom", "Terminal", "Mint", "Linen", "Porcelain", "Pixel", "Multica", "Quartz"]) {
       expect(screen.getByText(name)).toBeInTheDocument();
     }
   });

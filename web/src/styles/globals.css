@@ -95,6 +95,13 @@ html[data-palette="multica"] body {
   background-attachment: fixed;
 }
 
+html[data-palette="quartz"] {
+  --bg: #fbfbf9; --bg-1: #f6f5f1; --bg-2: #eeede7; --bg-3: #e4e2da;
+  --line: #e6e5df; --line-2: #d0cec3; --line-3: #b5b2a4;
+  --ink: #1a1a16; --ink-2: #3d3d35; --ink-3: #6b6a5f; --ink-4: #98968a;
+  --rust: #d97706; --rust-deep: #a34a00;
+}
+
 html, body {
   margin: 0;
   padding: 0;
