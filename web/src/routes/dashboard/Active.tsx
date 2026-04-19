@@ -65,7 +65,7 @@ export function Active({ projectFilter }: Props) {
 
   const active = (data ?? [])
     .filter((t) => !TERMINAL_STATUSES.has(t.status))
-    .filter((t) => !projectFilter || t.project === projectFilter);
+    .filter((t) => !projectFilter || t.project === projectFilter || t.project?.split("/").at(-1) === projectFilter);
   const grouped: Record<string, Task[]> = {};
   for (const c of COLUMNS) grouped[c.key] = [];
   const other: Task[] = [];

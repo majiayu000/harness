@@ -5,12 +5,12 @@ interface Props {
   projectFilter?: string | null;
 }
 
-export function Channels({ projectFilter }: Props) {
+export function Channels(_: Props) {
   const { data } = useDashboard();
   const allHosts = data?.runtime_hosts ?? [];
-  const hosts = projectFilter
-    ? allHosts.filter((h) => h.capabilities.includes(projectFilter))
-    : allHosts;
+  // Backend exposes watched_projects as a count only, not the project ids,
+  // so per-project host filtering is not possible — always show all hosts.
+  const hosts = allHosts;
 
   return (
     <div>

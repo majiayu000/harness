@@ -22,7 +22,8 @@ export function Submit({ projectFilter }: Props) {
     setBusy(true);
     setMsg(null);
     try {
-      const body = JSON.stringify({ title, description: desc, project: project.trim() || undefined });
+      const prompt = title.trim() + (desc.trim() ? `\n\n${desc.trim()}` : "");
+      const body = JSON.stringify({ prompt, project: project.trim() || undefined });
       const resp = await apiFetch("/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
