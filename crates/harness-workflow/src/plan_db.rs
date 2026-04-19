@@ -124,14 +124,12 @@ impl PlanDb {
 
     /// Return all plans whose status matches `status`.
     pub async fn list_by_status(&self, status: ExecPlanStatus) -> anyhow::Result<Vec<ExecPlan>> {
-        let status_str = serde_json::to_value(status)?
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+        let filter = serde_json::json!({ "status": status });
+        let filter_str = serde_json::to_string(&filter)?;
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT data::text FROM exec_plans WHERE data->>'status' = $1 ORDER BY created_at DESC",
+            "SELECT data::text FROM exec_plans WHERE data @> $1::jsonb ORDER BY created_at DESC",
         )
-        .bind(&status_str)
+        .bind(&filter_str)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -200,20 +198,32 @@ impl PlanDb {
 mod tests {
     use super::*;
     use harness_core::types::ExecPlanStatus;
+    use std::sync::OnceLock;
+    use tokio::sync::{Semaphore, SemaphorePermit};
 
-    async fn open_test_store() -> anyhow::Result<Option<(PlanDb, tempfile::TempDir)>> {
+    // Serialize plan_db tests to stay within the Supabase session-mode
+    // connection limit (15). Each pool uses up to 8 connections; concurrent
+    // tests would exhaust the limit. One test at a time uses ≤8 connections.
+    static DB_GATE: OnceLock<Semaphore> = OnceLock::new();
+    fn db_gate() -> &'static Semaphore {
+        DB_GATE.get_or_init(|| Semaphore::new(1))
+    }
+
+    async fn open_test_store(
+    ) -> anyhow::Result<Option<(PlanDb, tempfile::TempDir, SemaphorePermit<'static>)>> {
         if std::env::var("DATABASE_URL").is_err() {
             return Ok(None);
         }
+        let permit = db_gate().acquire().await?;
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("plans.db");
         let db = PlanDb::open(&path).await?;
-        Ok(Some((db, dir)))
+        Ok(Some((db, dir, permit)))
     }
 
     #[tokio::test]
     async fn plan_db_roundtrip() -> anyhow::Result<()> {
-        let Some((db, dir)) = open_test_store().await? else {
+        let Some((db, dir, _permit)) = open_test_store().await? else {
             return Ok(());
         };
         let plan = ExecPlan::from_spec("Test plan purpose", dir.path())?;
@@ -230,7 +240,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_db_get_missing_returns_none() -> anyhow::Result<()> {
-        let Some((db, _dir)) = open_test_store().await? else {
+        let Some((db, _dir, _permit)) = open_test_store().await? else {
             return Ok(());
         };
         assert!(db.get(&ExecPlanId::new()).await?.is_none());
@@ -239,7 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_db_delete_removes_plan() -> anyhow::Result<()> {
-        let Some((db, dir)) = open_test_store().await? else {
+        let Some((db, dir, _permit)) = open_test_store().await? else {
             return Ok(());
         };
         let plan = ExecPlan::from_spec("# Delete me", dir.path())?;
@@ -251,7 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_db_delete_missing_returns_false() -> anyhow::Result<()> {
-        let Some((db, _dir)) = open_test_store().await? else {
+        let Some((db, _dir, _permit)) = open_test_store().await? else {
             return Ok(());
         };
         assert!(!db.delete(&ExecPlanId::new()).await?);
@@ -260,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_by_status_filters_correctly() -> anyhow::Result<()> {
-        let Some((db, dir)) = open_test_store().await? else {
+        let Some((db, dir, _permit)) = open_test_store().await? else {
             return Ok(());
         };
         let draft = ExecPlan::from_spec("# Draft plan", dir.path())?;
@@ -285,7 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_by_name_finds_matching_plans() -> anyhow::Result<()> {
-        let Some((db, dir)) = open_test_store().await? else {
+        let Some((db, dir, _permit)) = open_test_store().await? else {
             return Ok(());
         };
         let auth = ExecPlan::from_spec("# Implement authentication", dir.path())?;
@@ -305,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_from_markdown_dir_imports_plans() -> anyhow::Result<()> {
-        let Some((db, dir)) = open_test_store().await? else {
+        let Some((db, dir, _permit)) = open_test_store().await? else {
             return Ok(());
         };
         let plan = ExecPlan::from_spec("# Migration test plan", dir.path())?;
@@ -325,7 +335,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_from_markdown_dir_skips_nonexistent_dir() -> anyhow::Result<()> {
-        let Some((db, dir)) = open_test_store().await? else {
+        let Some((db, dir, _permit)) = open_test_store().await? else {
             return Ok(());
         };
         let count = db
@@ -337,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_in_txn_persists_mutation() -> anyhow::Result<()> {
-        let Some((db, dir)) = open_test_store().await? else {
+        let Some((db, dir, _permit)) = open_test_store().await? else {
             return Ok(());
         };
         let plan = ExecPlan::from_spec("# Update test", dir.path())?;
@@ -359,13 +369,91 @@ mod tests {
 
     #[tokio::test]
     async fn update_in_txn_returns_none_for_missing_plan() -> anyhow::Result<()> {
-        let Some((db, _dir)) = open_test_store().await? else {
+        let Some((db, _dir, _permit)) = open_test_store().await? else {
             return Ok(());
         };
-        let result = db
+        let result: Option<ExecPlan> = db
             .update_in_txn(&ExecPlanId::new(), |p| p.activate())
             .await?;
         assert!(result.is_none());
+        Ok(())
+    }
+
+    /// Verifies the upgrade contract: a database with v1+v2 migrations (data TEXT)
+    /// is correctly upgraded to v3 (JSONB column) and v4 (GIN index), and that
+    /// pre-existing TEXT rows survive the `USING data::jsonb` cast.
+    #[tokio::test]
+    async fn migration_contract_text_to_jsonb_gin() -> anyhow::Result<()> {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return Ok(());
+        };
+        let _permit = db_gate().acquire().await?;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("migrate_contract");
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        let schema = format!("h{:016x}", hasher.finish());
+
+        let setup = pg_open_pool(&database_url).await?;
+        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
+            .execute(&setup)
+            .await?;
+        drop(setup);
+
+        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
+
+        // Simulate a pre-existing v1+v2 database where data is TEXT
+        PgMigrator::new(&pool, &PLAN_MIGRATIONS[..2]).run().await?;
+
+        // Insert a row with valid JSON stored as TEXT
+        let plan_id = ExecPlanId::new();
+        sqlx::query("INSERT INTO exec_plans (id, data) VALUES ($1, $2)")
+            .bind(plan_id.as_str())
+            .bind(r#"{"id":"test","status":"draft","purpose":"migration contract"}"#)
+            .execute(&pool)
+            .await?;
+
+        // Apply the remaining migrations (v3: TEXT→JSONB, v4: GIN index)
+        PgMigrator::new(&pool, PLAN_MIGRATIONS).run().await?;
+
+        // Assert: data column is now jsonb
+        let (col_type,): (String,) = sqlx::query_as(
+            "SELECT data_type FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name   = 'exec_plans'
+               AND column_name  = 'data'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            col_type, "jsonb",
+            "data column must be jsonb after migration"
+        );
+
+        // Assert: GIN index was created
+        let idx: Option<(String,)> = sqlx::query_as(
+            "SELECT indexname::text FROM pg_indexes
+             WHERE schemaname = current_schema()
+               AND tablename  = 'exec_plans'
+               AND indexname  = 'idx_exec_plans_data_gin'",
+        )
+        .fetch_optional(&pool)
+        .await?;
+        assert!(
+            idx.is_some(),
+            "idx_exec_plans_data_gin must exist after migration"
+        );
+
+        // Assert: pre-existing TEXT row survived the JSONB conversion
+        let (data,): (String,) = sqlx::query_as("SELECT data::text FROM exec_plans WHERE id = $1")
+            .bind(plan_id.as_str())
+            .fetch_one(&pool)
+            .await?;
+        let parsed: serde_json::Value = serde_json::from_str(&data)?;
+        assert_eq!(parsed["status"], serde_json::json!("draft"));
+
         Ok(())
     }
 }
