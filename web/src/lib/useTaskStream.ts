@@ -8,18 +8,21 @@ const MAX_EVENT_BYTES = 4096;
 export interface TaskStreamState {
   lines: string[];
   connected: boolean;
+  done: boolean;
   error: string | null;
 }
 
 export function useTaskStream(taskId: string | null): TaskStreamState {
   const [lines, setLines] = useState<string[]>([]);
   const [connected, setConnected] = useState(false);
+  const [done, setDone] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!taskId) {
       setLines([]);
       setConnected(false);
+      setDone(false);
       setError(null);
       return;
     }
@@ -28,6 +31,7 @@ export function useTaskStream(taskId: string | null): TaskStreamState {
 
     setLines([]);
     setConnected(false);
+    setDone(false);
     setError(null);
 
     fetchEventSource(`/tasks/${taskId}/stream`, {
@@ -74,6 +78,7 @@ export function useTaskStream(taskId: string | null): TaskStreamState {
       },
       onclose: () => {
         setConnected(false);
+        setDone(true);
       },
     }).catch(() => {
       // onerror rethrows to stop retry; catch here to avoid unhandled rejection.
@@ -84,5 +89,5 @@ export function useTaskStream(taskId: string | null): TaskStreamState {
     };
   }, [taskId]);
 
-  return { lines, connected, error };
+  return { lines, connected, done, error };
 }

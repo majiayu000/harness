@@ -52,34 +52,40 @@ function DiffView({ artifacts }: { artifacts: TaskArtifact[] }) {
 }
 
 function ReviewView({ prompts, artifacts }: { prompts: TaskPrompt[]; artifacts: TaskArtifact[] }) {
-  const reviewTurns = new Set(
-    prompts
-      .filter((p) => p.phase === "review" || p.phase === "cross_review")
-      .map((p) => p.turn),
-  );
-  if (reviewTurns.size === 0) {
+  const reviewPrompts = prompts.filter((p) => p.phase === "simplereview");
+  if (reviewPrompts.length === 0) {
     return <div className="p-3 font-mono text-[11px] text-ink-4">—</div>;
   }
+  const reviewTurns = new Set(reviewPrompts.map((p) => p.turn));
   const reviewArtifacts = artifacts.filter((a) => reviewTurns.has(a.turn));
-  if (reviewArtifacts.length === 0) {
-    return (
-      <div className="p-3 font-mono text-[11px] text-ink-4">
-        Review output streams live — see the Stream tab.
-      </div>
-    );
-  }
   return (
     <div className="p-2 space-y-4">
-      {reviewArtifacts.map((a, i) => (
+      {reviewPrompts.map((p, i) => (
         <div key={i} className="space-y-1">
           <div className="font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">
-            turn {a.turn} · {a.artifact_type}
+            turn {p.turn} · {p.phase}
           </div>
           <pre className="font-mono text-[11px] text-ink-3 whitespace-pre-wrap break-words">
-            {a.content}
+            {p.prompt}
           </pre>
         </div>
       ))}
+      {reviewArtifacts.length === 0 ? (
+        <div className="font-mono text-[11px] text-ink-4">
+          Reviewer findings stream live — see the Stream tab.
+        </div>
+      ) : (
+        reviewArtifacts.map((a, i) => (
+          <div key={`a${i}`} className="space-y-1">
+            <div className="font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">
+              turn {a.turn} · {a.artifact_type}
+            </div>
+            <pre className="font-mono text-[11px] text-ink-3 whitespace-pre-wrap break-words">
+              {a.content}
+            </pre>
+          </div>
+        ))
+      )}
     </div>
   );
 }
@@ -91,7 +97,7 @@ interface Props {
 
 export function TaskSlideover({ taskId, onClose }: Props) {
   const [activeTab, setActiveTab] = useState<Tab>("Stream");
-  const { lines, connected, error } = useTaskStream(taskId);
+  const { lines, connected, done, error } = useTaskStream(taskId);
   const { data: task } = useTask(taskId);
   const { data: artifacts } = useTaskArtifacts(taskId);
   const { data: prompts } = useTaskPrompts(taskId);
@@ -156,9 +162,11 @@ export function TaskSlideover({ taskId, onClose }: Props) {
             <pre className="p-3 font-mono text-[11px] text-ink whitespace-pre-wrap break-words">
               {error ? (
                 <span className="text-danger">{error}</span>
-              ) : (!connected && lines.length === 0 && (
+              ) : done && lines.length === 0 ? (
+                <span className="text-ink-4">—</span>
+              ) : !connected && lines.length === 0 ? (
                 <span className="text-ink-4">connecting…</span>
-              ))}
+              ) : null}
               {lines.join("\n")}
               <div ref={streamEndRef} />
             </pre>
@@ -192,6 +200,19 @@ export function TaskSlideover({ taskId, onClose }: Props) {
                 </>
               ) : (
                 <div className="text-ink-4 font-mono text-[11px]">loading…</div>
+              )}
+              {prompts && prompts.length > 0 && (
+                <div className="mt-3 space-y-1 border-t border-line pt-3">
+                  {[...prompts].slice(-20).reverse().map((p, i) => (
+                    <div key={i} className="flex items-center gap-2 font-mono text-[11px]">
+                      <span className="text-ink-3 flex-none">t{p.turn}</span>
+                      <span className="text-ink">{p.phase}</span>
+                      <span className="text-ink-4 ml-auto text-[10px]">
+                        {new Date(p.created_at).toLocaleTimeString()}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               )}
             </div>
           )}

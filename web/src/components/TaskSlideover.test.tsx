@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TaskSlideover } from "./TaskSlideover";
 
 vi.mock("@/lib/useTaskStream", () => ({
-  useTaskStream: vi.fn(() => ({ lines: [], connected: false, error: null })),
+  useTaskStream: vi.fn(() => ({ lines: [], connected: false, done: false, error: null })),
 }));
 
 vi.mock("@/lib/queries", () => ({
@@ -23,7 +23,7 @@ function wrap(ui: React.ReactElement) {
 
 describe("<TaskSlideover>", () => {
   beforeEach(() => {
-    vi.mocked(useTaskStream).mockReturnValue({ lines: [], connected: false, error: null });
+    vi.mocked(useTaskStream).mockReturnValue({ lines: [], connected: false, done: false, error: null });
     vi.mocked(useTask).mockReturnValue({ data: null } as unknown as ReturnType<typeof useTask>);
     vi.mocked(useTaskArtifacts).mockReturnValue({ data: [] } as unknown as ReturnType<typeof useTaskArtifacts>);
     vi.mocked(useTaskPrompts).mockReturnValue({ data: [] } as unknown as ReturnType<typeof useTaskPrompts>);
@@ -74,14 +74,14 @@ describe("<TaskSlideover>", () => {
   });
 
   it("Stream tab shows error message when stream fails", () => {
-    vi.mocked(useTaskStream).mockReturnValue({ lines: [], connected: false, error: "Stream request failed: 500" });
+    vi.mocked(useTaskStream).mockReturnValue({ lines: [], connected: false, done: false, error: "Stream request failed: 500" });
     wrap(<TaskSlideover taskId="abc12345" onClose={() => {}} />);
     expect(screen.getByText("Stream request failed: 500")).toBeInTheDocument();
     expect(screen.queryByText("connecting…")).not.toBeInTheDocument();
   });
 
   it("Stream tab shows lines when connected", () => {
-    vi.mocked(useTaskStream).mockReturnValue({ lines: ["line one", "line two"], connected: true, error: null });
+    vi.mocked(useTaskStream).mockReturnValue({ lines: ["line one", "line two"], connected: true, done: false, error: null });
     wrap(<TaskSlideover taskId="abc12345" onClose={() => {}} />);
     expect(screen.getByText(/line one/)).toBeInTheDocument();
   });
@@ -105,7 +105,7 @@ describe("<TaskSlideover>", () => {
 
   it("Review tab shows stream note and review prompt text", () => {
     vi.mocked(useTaskPrompts).mockReturnValue({
-      data: [{ task_id: "abc12345", turn: 1, phase: "review", prompt: "review content here", created_at: "" }],
+      data: [{ task_id: "abc12345", turn: 1, phase: "simplereview", prompt: "review content here", created_at: "" }],
     } as ReturnType<typeof useTaskPrompts>);
     wrap(<TaskSlideover taskId="abc12345" onClose={() => {}} />);
     fireEvent.click(screen.getByText("Review"));
