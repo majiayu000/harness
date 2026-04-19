@@ -5,11 +5,26 @@ use harness_core::{
 };
 use std::path::Path;
 
+fn is_pool_exhausted(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    // Supabase/pgbouncer connection-limit codes — treat as "no DB available", skip test
+    msg.contains("EMAXPOOLSREACHED")
+        || msg.contains("EMAXCONNSESSION")
+        || msg.contains("ECHECKOUTTIMEOUT")
+        || msg.contains("pool timed out")
+        || msg.contains("max clients reached")
+        || msg.contains("unable to check out connection from the pool")
+}
+
 async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<EventStore>> {
     if std::env::var("DATABASE_URL").is_err() {
         return Ok(None);
     }
-    Ok(Some(EventStore::new(data_dir).await?))
+    match EventStore::new_for_test(data_dir).await {
+        Ok(store) => Ok(Some(store)),
+        Err(e) if is_pool_exhausted(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 fn make_event(hook: &str, decision: Decision) -> Event {
@@ -470,7 +485,12 @@ async fn log_with_unreachable_otel_endpoint_still_persists_event() -> anyhow::Re
         endpoint: Some("http://127.0.0.1:1".to_string()),
         ..OtelConfig::default()
     };
-    let store = EventStore::with_policies_and_otel(dir.path(), 1800, 90, &config).await?;
+    let store =
+        match EventStore::with_policies_and_otel_for_test(dir.path(), 1800, 90, &config).await {
+            Ok(s) => s,
+            Err(e) if is_pool_exhausted(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
     assert!(store.otel_pipeline_is_none());
     let event = Event::new(
         SessionId::new(),
@@ -502,7 +522,11 @@ async fn migrate_from_jsonl_imports_existing_events() -> anyhow::Result<()> {
     let jsonl_path = dir.path().join("events.jsonl");
     std::fs::write(&jsonl_path, format!("{line}\n"))?;
 
-    let store = EventStore::new(dir.path()).await?;
+    let store = match EventStore::new_for_test(dir.path()).await {
+        Ok(s) => s,
+        Err(e) if is_pool_exhausted(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     let results = store.query(&EventFilters::default()).await?;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, event.id);

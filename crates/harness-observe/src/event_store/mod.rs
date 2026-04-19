@@ -660,6 +660,90 @@ impl EventStore {
             .unwrap_or_else(|e| e.into_inner())
             .is_none()
     }
+
+    /// Test-only variant of with_policies_and_otel using small pool sizes.
+    #[cfg(test)]
+    pub(crate) async fn with_policies_and_otel_for_test(
+        data_dir: &Path,
+        session_renewal_secs: u64,
+        log_retention_days: u32,
+        otel_config: &OtelConfig,
+    ) -> anyhow::Result<Self> {
+        let mut store = Self::new_for_test(data_dir).await?;
+        store.session_renewal_secs = session_renewal_secs;
+        if let Err(e) = store.purge_old_events(log_retention_days).await {
+            tracing::warn!("event store: failed to purge old events: {e}");
+        }
+        let pipeline = match crate::otel_export::OtelPipeline::from_config(otel_config).await {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                tracing::warn!(
+                    "OpenTelemetry initialization failed; continuing without export: {err}"
+                );
+                None
+            }
+        };
+        *store
+            .otel_pipeline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = pipeline;
+        Ok(store)
+    }
+
+    /// Test-only constructor using max_connections(2) to prevent pool exhaustion
+    /// when many tests run in parallel against a shared Postgres instance.
+    #[cfg(test)]
+    pub(crate) async fn new_for_test(data_dir: &Path) -> anyhow::Result<Self> {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        use std::str::FromStr as _;
+
+        std::fs::create_dir_all(data_dir)?;
+        let data_dir = data_dir.to_path_buf();
+
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable is not set"))?;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        data_dir.join("events.db").hash(&mut hasher);
+        let schema = format!("h{:016x}", hasher.finish());
+
+        let setup = PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect(&database_url)
+            .await?;
+        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
+            .execute(&setup)
+            .await?;
+        drop(setup);
+
+        let schema_for_hook = schema.clone();
+        let opts =
+            PgConnectOptions::from_str(&database_url)?.options([("search_path", schema.as_str())]);
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .after_connect(move |conn, _meta| {
+                let schema = schema_for_hook.clone();
+                Box::pin(async move {
+                    let stmt = format!("SET search_path TO \"{}\"", schema);
+                    sqlx::query(&stmt).execute(conn).await?;
+                    Ok(())
+                })
+            })
+            .connect_with(opts)
+            .await?;
+        PgMigrator::new(&pool, EVENT_MIGRATIONS).run().await?;
+
+        let store = Self {
+            pool,
+            data_dir,
+            otel_pipeline: Mutex::new(None),
+            session_renewal_secs: 1800,
+        };
+        store.migrate_from_jsonl().await;
+        Ok(store)
+    }
 }
 
 #[cfg(test)]
