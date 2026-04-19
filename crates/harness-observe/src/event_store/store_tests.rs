@@ -14,6 +14,8 @@ fn is_pool_exhausted(e: &anyhow::Error) -> bool {
         || msg.contains("pool timed out")
         || msg.contains("max clients reached")
         || msg.contains("unable to check out connection from the pool")
+        // SSL negotiation failure — Supabase TLS handshake error, treat as unavailable
+        || msg.contains("unexpected response from SSLRequest")
 }
 
 async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<EventStore>> {

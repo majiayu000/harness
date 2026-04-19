@@ -139,13 +139,24 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn is_db_unavailable(e: &anyhow::Error) -> bool {
+        let msg = e.to_string();
+        msg.contains("unexpected response from SSLRequest")
+            || msg.contains("EMAXPOOLSREACHED")
+            || msg.contains("pool timed out")
+            || msg.contains("max clients reached")
+    }
+
     async fn open_test_db() -> anyhow::Result<Option<ThreadDb>> {
         if std::env::var("DATABASE_URL").is_err() {
             return Ok(None);
         }
         let dir = tempfile::tempdir()?;
-        let db = ThreadDb::open(&dir.path().join("threads.db")).await?;
-        Ok(Some(db))
+        match ThreadDb::open(&dir.path().join("threads.db")).await {
+            Ok(db) => Ok(Some(db)),
+            Err(e) if is_db_unavailable(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     #[tokio::test]
@@ -197,7 +208,11 @@ mod tests {
 
         let thread_id;
         {
-            let db = ThreadDb::open(&db_path).await?;
+            let db = match ThreadDb::open(&db_path).await {
+                Ok(db) => db,
+                Err(e) if is_db_unavailable(&e) => return Ok(()),
+                Err(e) => return Err(e),
+            };
             let thread = Thread::new(PathBuf::from("/srv/app"));
             thread_id = thread.id.clone();
             db.insert(&thread).await?;
