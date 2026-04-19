@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -7,11 +7,13 @@ import type { Task } from "@/types";
 
 vi.mock("@/lib/queries", () => ({
   useTasks: vi.fn(),
+  useDashboard: vi.fn(),
 }));
 
-import { useTasks } from "@/lib/queries";
+import { useTasks, useDashboard } from "@/lib/queries";
 
 const mockUseTasks = useTasks as ReturnType<typeof vi.fn>;
+const mockUseDashboard = useDashboard as ReturnType<typeof vi.fn>;
 
 function makeTask(id: string, project: string | null, status = "running"): Task {
   return {
@@ -49,6 +51,10 @@ const tasks = [
 ];
 
 describe("<Active>", () => {
+  beforeEach(() => {
+    mockUseDashboard.mockReturnValue({ data: undefined });
+  });
+
   it("filters to matching project when projectFilter is set", () => {
     mockUseTasks.mockReturnValue({ data: tasks, isLoading: false, isError: false });
     wrap(<Active projectFilter="harness" />);
