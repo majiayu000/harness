@@ -56,13 +56,27 @@ pub fn wrap_command(
     args: &[OsString],
     spec: &SandboxSpec,
 ) -> Result<WrappedCommand, SandboxError> {
-    if spec.mode == SandboxMode::DangerFullAccess {
+    // DangerFullAccess bypasses sandboxing only when no token paths narrow the write
+    // scope.  If allowed_write_paths is set (from a CapabilityToken), we upgrade to
+    // WorkspaceWrite so the token's isolation is actually enforced.
+    if spec.mode == SandboxMode::DangerFullAccess && spec.allowed_write_paths.is_none() {
         return Ok(WrappedCommand {
             program: program.to_path_buf(),
             args: args.to_vec(),
             engine: SandboxEngine::None,
         });
     }
+
+    let owned;
+    let spec: &SandboxSpec = if spec.mode == SandboxMode::DangerFullAccess {
+        owned = SandboxSpec {
+            mode: SandboxMode::WorkspaceWrite,
+            ..spec.clone()
+        };
+        &owned
+    } else {
+        spec
+    };
 
     #[cfg(target_os = "macos")]
     {
@@ -196,20 +210,24 @@ fn linux_landlock_args(
         }
     };
 
-    let workspace_arg = spec
-        .allowed_write_paths
-        .as_ref()
-        .and_then(|p| p.first())
-        .unwrap_or(&spec.project_root);
-
     let mut wrapped_args = vec![
         OsString::from("--mode"),
         OsString::from(spec.mode.to_string()),
-        OsString::from("--workspace"),
-        workspace_arg.as_os_str().to_os_string(),
         OsString::from("--network"),
         OsString::from(network_mode),
     ];
+
+    // Pass every write path as a separate --workspace flag so multi-path tokens are
+    // fully honoured.  Previously only the first entry was forwarded, silently
+    // dropping any remaining paths in the Vec<PathBuf>.
+    let write_paths: &[PathBuf] = spec
+        .allowed_write_paths
+        .as_deref()
+        .unwrap_or(std::slice::from_ref(&spec.project_root));
+    for path in write_paths {
+        wrapped_args.push(OsString::from("--workspace"));
+        wrapped_args.push(path.as_os_str().to_os_string());
+    }
 
     for protected_path in protected_paths(&spec.project_root) {
         wrapped_args.push(OsString::from("--readonly-path"));
@@ -620,5 +638,90 @@ mod tests {
         assert_eq!(wrapped.engine, SandboxEngine::None);
         assert_eq!(wrapped.program, PathBuf::from("/usr/bin/env"));
         assert_eq!(wrapped.args, original_args);
+    }
+
+    #[test]
+    fn danger_mode_with_token_paths_enforces_workspace_write_policy() {
+        // Issue 1: DangerFullAccess + allowed_write_paths must NOT be a passthrough.
+        // The effective mode must be WorkspaceWrite so the token paths are enforced.
+        let spec = SandboxSpec {
+            mode: SandboxMode::DangerFullAccess,
+            project_root: PathBuf::from("/tmp/project"),
+            allowed_write_paths: Some(vec![PathBuf::from("/tmp/worktree-0")]),
+        };
+        // Verify the effective spec (WorkspaceWrite mode) produces the correct policy.
+        let effective = SandboxSpec {
+            mode: SandboxMode::WorkspaceWrite,
+            ..spec.clone()
+        };
+        let policy = seatbelt_policy(&effective).expect("should build policy");
+        assert!(
+            policy.contains("(allow file-write* (subpath \"/tmp/worktree-0\"))"),
+            "token path must appear in policy"
+        );
+        assert!(
+            !policy.contains("(allow file-write* (subpath \"/tmp/project\"))"),
+            "project root must not be granted write access by the token path"
+        );
+    }
+
+    #[test]
+    fn landlock_args_pass_all_token_paths() {
+        // Issue 2: all allowed_write_paths must appear as --workspace flags, not just first.
+        let spec = SandboxSpec {
+            mode: SandboxMode::WorkspaceWrite,
+            project_root: PathBuf::from("/tmp/project"),
+            allowed_write_paths: Some(vec![
+                PathBuf::from("/tmp/worktree-0"),
+                PathBuf::from("/tmp"),
+                PathBuf::from("/var/tmp"),
+            ]),
+        };
+        let args = linux_landlock_args(Path::new("/usr/bin/codex"), &[], &spec).unwrap();
+        let workspace_values: Vec<OsString> = args
+            .windows(2)
+            .filter(|w| w[0] == "--workspace")
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(
+            workspace_values.len(),
+            3,
+            "all three token paths must appear as --workspace args"
+        );
+        assert!(workspace_values.contains(&OsString::from("/tmp/worktree-0")));
+        assert!(workspace_values.contains(&OsString::from("/tmp")));
+        assert!(workspace_values.contains(&OsString::from("/var/tmp")));
+    }
+
+    #[test]
+    fn seatbelt_token_with_tmp_in_paths_allows_tmp_writes() {
+        // Issue 3: when token paths include /tmp, the policy must still allow /tmp writes
+        // (the blanket grant is replaced by per-path grants from the token).
+        let spec = SandboxSpec {
+            mode: SandboxMode::WorkspaceWrite,
+            project_root: PathBuf::from("/workspace/project"),
+            allowed_write_paths: Some(vec![
+                PathBuf::from("/workspace/harness-worktree-0"),
+                PathBuf::from("/tmp"),
+                PathBuf::from("/private/tmp"),
+                PathBuf::from("/var/tmp"),
+            ]),
+        };
+        let policy = seatbelt_policy(&spec).expect("should build policy");
+        assert!(
+            policy.contains("(allow file-write* (subpath \"/tmp\"))"),
+            "/tmp must be writable when included in token paths"
+        );
+        assert!(
+            policy.contains("(allow file-write* (subpath \"/private/tmp\"))"),
+            "/private/tmp must be writable when included in token paths"
+        );
+        // The blanket triple-path /tmp grant must NOT appear — it's been replaced by
+        // individual per-path grants from the token.
+        assert!(
+            !policy
+                .contains("(subpath \"/private/tmp\") (subpath \"/tmp\") (subpath \"/var/tmp\")"),
+            "blanket /tmp grant must not appear when token paths are set"
+        );
     }
 }

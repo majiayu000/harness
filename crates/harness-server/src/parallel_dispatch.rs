@@ -4,7 +4,7 @@ use harness_core::{
     agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, capability::CapabilityToken,
     types::ContextItem,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::time::Duration;
 
@@ -39,6 +39,21 @@ const PARALLEL_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "swift", "cpp", "c", "h", "toml",
     "yaml", "yml", "json", "sh", "md",
 ];
+
+/// Build the `allowed_write_paths` list for a capability token.
+///
+/// The sandbox policy suppresses the blanket `/tmp` grant whenever token paths
+/// are present (to prevent sibling-worktree escape via shared `/tmp`).  To
+/// preserve temp-file access for Claude/Codex and child tools we include the
+/// standard temp directories explicitly alongside the workspace path.
+fn token_write_paths(workspace: PathBuf) -> Vec<PathBuf> {
+    vec![
+        workspace,
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"), // macOS: /tmp is a symlink to /private/tmp
+        PathBuf::from("/var/tmp"),
+    ]
+}
 
 /// Well-known filenames that have no extension but represent source files.
 const EXTENSIONLESS_FILENAMES: &[&str] = &[
@@ -330,7 +345,7 @@ async fn run_sequential_subtasks(
     // a single-step TTL would expire partway through a multi-step chain.
     let seq_token = CapabilityToken::new(
         0,
-        vec![workspace.clone()],
+        token_write_paths(workspace.clone()),
         turn_timeout * (total as u32) + Duration::from_secs(60),
     );
 
@@ -447,7 +462,7 @@ async fn run_concurrent_subtasks(
                 let context = context.clone();
                 let token = CapabilityToken::new(
                     i,
-                    vec![workspace.clone()],
+                    token_write_paths(workspace.clone()),
                     turn_timeout + Duration::from_secs(60),
                 );
                 let req = AgentRequest {
