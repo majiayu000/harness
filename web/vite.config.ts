@@ -10,8 +10,18 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      // Every harness-server route the React app actually hits in dev.
+      // Keep in sync with crates/harness-server/src/http/http_router.rs.
+      // Do NOT proxy /, /overview, /favicon.ico, or /assets/* — those
+      // are served by Vite during dev.
       "/api": "http://localhost:9800",
+      "/tasks": "http://localhost:9800",
+      "/projects": "http://localhost:9800",
+      "/rpc": "http://localhost:9800",
       "/health": "http://localhost:9800",
+      "/signals": "http://localhost:9800",
+      "/webhook": "http://localhost:9800",
+      "/auth": "http://localhost:9800",
       "/ws": { target: "ws://localhost:9800", ws: true },
     },
   },
