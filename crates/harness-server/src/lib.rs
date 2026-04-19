@@ -13,6 +13,7 @@
 // paths inside this crate continue to resolve without modification.
 pub use harness_workflow::checkpoint;
 pub use harness_workflow::circuit_breaker;
+pub mod assets;
 pub mod complexity_router;
 pub mod contract_validator;
 pub mod dashboard;

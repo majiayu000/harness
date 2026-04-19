@@ -1,0 +1,114 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Default palette applied at :root; data-palette overrides below. */
+:root {
+  --bg: #0e0c09;
+  --bg-1: #16130e;
+  --bg-2: #1c1812;
+  --bg-3: #221c15;
+  --line: #2a241c;
+  --line-2: #3a3226;
+  --line-3: #4a4030;
+  --ink: #f1ebe0;
+  --ink-2: #c8bfae;
+  --ink-3: #8a8070;
+  --ink-4: #5a5346;
+  --rust: #e26a2c;
+  --rust-deep: #b14a15;
+  --rust-soft: #ffa36a;
+  --moss: #8da35a;
+  --sand: #d8c39a;
+  --plum: #b07ab0;
+  --sky: #6fa5c9;
+  --danger: #d65a4a;
+  --warn: #cf9b3a;
+  --ok: #7aae52;
+}
+
+html[data-palette="ember"] {
+  --bg: #0e0c09; --bg-1: #16130e; --bg-2: #1c1812; --bg-3: #221c15;
+  --line: #2a241c; --line-2: #3a3226; --line-3: #4a4030;
+  --ink: #f1ebe0; --ink-2: #c8bfae; --ink-3: #8a8070; --ink-4: #5a5346;
+  --rust: #e26a2c; --rust-deep: #b14a15;
+}
+html[data-palette="forge"] {
+  --bg: #0a0c10; --bg-1: #11141a; --bg-2: #171b23; --bg-3: #1f242e;
+  --line: #222833; --line-2: #323a49; --line-3: #42495a;
+  --ink: #e6ebf4; --ink-2: #b4bcca; --ink-3: #7a8394; --ink-4: #4c5465;
+  --rust: #f5a524; --rust-deep: #b97406;
+}
+html[data-palette="ink"] {
+  --bg: #06070a; --bg-1: #0c0e13; --bg-2: #12151c; --bg-3: #181c26;
+  --line: #1c2029; --line-2: #2b3140; --line-3: #3a4255;
+  --ink: #eef2f8; --ink-2: #b8bec9; --ink-3: #737a88; --ink-4: #474c58;
+  --rust: #53d4ff; --rust-deep: #1e8ab3;
+}
+html[data-palette="bloom"] {
+  --bg: #0c0a12; --bg-1: #13101c; --bg-2: #1a1625; --bg-3: #231d2f;
+  --line: #261f33; --line-2: #382e4a; --line-3: #4c3f63;
+  --ink: #f3edfb; --ink-2: #c7bde0; --ink-3: #8b82a6; --ink-4: #554f6b;
+  --rust: #ff5fae; --rust-deep: #bc2d7d;
+}
+html[data-palette="terminal"] {
+  --bg: #060a06; --bg-1: #0a110a; --bg-2: #0f180f; --bg-3: #152115;
+  --line: #1b2a1b; --line-2: #2a3f2a; --line-3: #3a563a;
+  --ink: #c7f4bf; --ink-2: #8fd383; --ink-3: #5a9553; --ink-4: #386234;
+  --rust: #7aff7a; --rust-deep: #339a33;
+}
+html[data-palette="mint"] {
+  --bg: #f4efe6; --bg-1: #ebe4d6; --bg-2: #e0d7c3; --bg-3: #d4c9af;
+  --line: #c8bea8; --line-2: #a89d85; --line-3: #8a7f68;
+  --ink: #1e1b16; --ink-2: #3d3930; --ink-3: #6b6554; --ink-4: #938c78;
+  --rust: #1f7a54; --rust-deep: #0f5a3c;
+}
+html[data-palette="linen"] {
+  --bg: #fbf7ee; --bg-1: #f3ecdc; --bg-2: #eadfc5; --bg-3: #ddd0b0;
+  --line: #d6c9a8; --line-2: #b6a581; --line-3: #8f7f5e;
+  --ink: #141820; --ink-2: #353c4a; --ink-3: #6a7180; --ink-4: #a09a88;
+  --rust: #2747cf; --rust-deep: #15307f;
+}
+html[data-palette="porcelain"] {
+  --bg: #f6f5f2; --bg-1: #ecebe6; --bg-2: #dfded6; --bg-3: #d0cec3;
+  --line: #cbc9bf; --line-2: #a6a498; --line-3: #808074;
+  --ink: #1a1a1a; --ink-2: #3d3d3d; --ink-3: #6f6f6d; --ink-4: #9a988f;
+  --rust: #d84a2f; --rust-deep: #9a2e18;
+}
+html[data-palette="pixel"] {
+  --bg: #14161f; --bg-1: #1c1f2c; --bg-2: #252938; --bg-3: #2f3448;
+  --line: #2f3448; --line-2: #434966; --line-3: #565d80;
+  --ink: #e8ecf4; --ink-2: #b0b8cc; --ink-3: #7a8299; --ink-4: #4f566d;
+  --rust: #f4b860; --rust-deep: #c68a3a;
+}
+html[data-palette="multica"] {
+  --bg: #0a0b14; --bg-1: #111324; --bg-2: #181b33; --bg-3: #1f2340;
+  --line: #242945; --line-2: #373d63; --line-3: #4a5180;
+  --ink: #f2f1fb; --ink-2: #c7c4e0; --ink-3: #8a88ad; --ink-4: #55557a;
+  --rust: #ff7a59; --rust-deep: #d14a2a;
+}
+html[data-palette="multica"] body {
+  background:
+    radial-gradient(1000px 600px at 90% -10%, rgba(167,139,250,.14), transparent 55%),
+    radial-gradient(800px 500px at -10% 30%, rgba(111,224,199,.08), transparent 55%),
+    var(--bg);
+  background-attachment: fixed;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection { background: var(--rust); color: #fff; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--line-3); }
+::-webkit-scrollbar-track { background: transparent; }
