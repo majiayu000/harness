@@ -18,11 +18,17 @@ pub async fn learn_rules(
     let project_root = validate_root!(&project_root, id, &state.core.home_dir);
     let target_project_id = project_id_from_root(&project_root);
 
-    let draft_contents =
-        match collect_adopted_draft_contents(state, &target_project_id, "learn_rules").await {
-            Ok(d) => d,
-            Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-        };
+    let draft_contents = match collect_adopted_draft_contents(
+        state,
+        &target_project_id,
+        &project_root,
+        "learn_rules",
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+    };
 
     if draft_contents.is_empty() {
         log_learn_event(
@@ -90,11 +96,17 @@ pub async fn learn_skills(
     let project_root = validate_root!(&project_root, id, &state.core.home_dir);
     let target_project_id = project_id_from_root(&project_root);
 
-    let draft_contents =
-        match collect_adopted_draft_contents(state, &target_project_id, "learn_skills").await {
-            Ok(d) => d,
-            Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-        };
+    let draft_contents = match collect_adopted_draft_contents(
+        state,
+        &target_project_id,
+        &project_root,
+        "learn_skills",
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+    };
 
     if draft_contents.is_empty() {
         log_learn_event(
@@ -182,12 +194,7 @@ fn validate_skill_name(name: &str) -> Result<(), String> {
 }
 
 fn project_id_from_root(project_root: &std::path::Path) -> ProjectId {
-    ProjectId::from_str(
-        project_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("default"),
-    )
+    ProjectId::from_path(project_root)
 }
 
 async fn log_learn_event(state: &AppState, hook: &str, decision: Decision, detail: Option<String>) {
@@ -201,8 +208,16 @@ async fn log_learn_event(state: &AppState, hook: &str, decision: Decision, detai
 async fn collect_adopted_draft_contents(
     state: &AppState,
     project_id: &ProjectId,
+    project_root: &std::path::Path,
     learn_hook: &str,
 ) -> Result<Vec<String>, String> {
+    // Legacy IDs used the basename (or "default") before canonical-path unification.
+    let legacy_id = ProjectId::from_str(
+        project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("default"),
+    );
     let last_learn_ts = state
         .observability
         .events
@@ -221,7 +236,7 @@ async fn collect_adopted_draft_contents(
         .iter()
         .filter(|d| {
             d.status == DraftStatus::Adopted
-                && d.signal.project_id == *project_id
+                && (d.signal.project_id == *project_id || d.signal.project_id == legacy_id)
                 && last_learn_ts.map(|ts| d.generated_at > ts).unwrap_or(true)
         })
         .flat_map(|d| d.artifacts.iter().map(|a| a.content.clone()))

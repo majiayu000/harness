@@ -17,6 +17,9 @@ pub trait ProjectService: Send + Sync {
     /// Retrieve a project by its registered ID.
     async fn get(&self, id: &str) -> anyhow::Result<Option<Project>>;
 
+    /// Retrieve a project by its human-readable `name` field.
+    async fn get_by_name(&self, name: &str) -> anyhow::Result<Option<Project>>;
+
     /// List all registered projects.
     async fn list(&self) -> anyhow::Result<Vec<Project>>;
 
@@ -52,6 +55,10 @@ impl ProjectService for DefaultProjectService {
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Project>> {
         self.registry.get(id).await
+    }
+
+    async fn get_by_name(&self, name: &str) -> anyhow::Result<Option<Project>> {
+        self.registry.get_by_name(name).await
     }
 
     async fn list(&self) -> anyhow::Result<Vec<Project>> {
@@ -103,6 +110,16 @@ mod tests {
             Ok(self.store.read().await.get(id).cloned())
         }
 
+        async fn get_by_name(&self, name: &str) -> anyhow::Result<Option<Project>> {
+            Ok(self
+                .store
+                .read()
+                .await
+                .values()
+                .find(|p| p.name.as_deref() == Some(name))
+                .cloned())
+        }
+
         async fn list(&self) -> anyhow::Result<Vec<Project>> {
             Ok(self.store.read().await.values().cloned().collect())
         }
@@ -124,6 +141,7 @@ mod tests {
         Project {
             id: id.to_string(),
             root: PathBuf::from(root),
+            name: None,
             max_concurrent: None,
             default_agent: None,
             active: true,

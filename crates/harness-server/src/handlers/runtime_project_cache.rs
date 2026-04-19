@@ -106,8 +106,21 @@ async fn resolve_project_token(
             .map_err(|e| format!("invalid project path '{token}': {e}"));
     }
 
+    // Try primary ID first (canonical path), then name as fallback so
+    // `project: "litellm"` still resolves when the registry key is the canonical path.
     match state.project_svc.resolve_path(token).await {
-        Ok(Some(root)) => root
+        Ok(Some(root)) => {
+            return root
+                .canonicalize()
+                .map(|canon| (Some(token.to_string()), canon))
+                .map_err(|e| format!("project '{token}' root is not accessible: {e}"));
+        }
+        Ok(None) => {}
+        Err(e) => return Err(format!("failed to resolve project '{token}': {e}")),
+    }
+    match state.project_svc.get_by_name(token).await {
+        Ok(Some(p)) => p
+            .root
             .canonicalize()
             .map(|canon| (Some(token.to_string()), canon))
             .map_err(|e| format!("project '{token}' root is not accessible: {e}")),

@@ -1012,10 +1012,11 @@ mod startup_tests {
             .project_registry
             .as_ref()
             .expect("project registry should be initialized");
+        let canonical_id = project_root.canonicalize()?.to_string_lossy().into_owned();
         let project = registry
-            .get("named")
+            .get(&canonical_id)
             .await?
-            .expect("startup project should be registered");
+            .ok_or_else(|| anyhow::anyhow!("startup project should be registered"))?;
 
         assert_eq!(project.default_agent.as_deref(), Some("codex"));
         assert_eq!(project.max_concurrent, Some(7));
@@ -1050,10 +1051,11 @@ mod startup_tests {
             .project_registry
             .as_ref()
             .expect("project registry should be initialized");
+        let canonical_id = project_root.canonicalize()?.to_string_lossy().into_owned();
         let project = registry
-            .get("default")
+            .get(&canonical_id)
             .await?
-            .expect("default project should be registered");
+            .ok_or_else(|| anyhow::anyhow!("default project should be registered"))?;
 
         assert_eq!(project.root.canonicalize()?, project_root.canonicalize()?);
         assert_eq!(project.default_agent.as_deref(), Some("claude"));
@@ -1088,10 +1090,16 @@ mod startup_tests {
             .project_registry
             .as_ref()
             .expect("project registry should be initialized");
+        let canonical_id = sandbox
+            .path()
+            .join("project")
+            .canonicalize()?
+            .to_string_lossy()
+            .into_owned();
         let project = registry
-            .get("partial")
+            .get(&canonical_id)
             .await?
-            .expect("startup project should be registered");
+            .ok_or_else(|| anyhow::anyhow!("startup project should be registered"))?;
 
         assert_eq!(project.default_agent.as_deref(), Some("claude"));
         assert_eq!(project.max_concurrent, None);
@@ -1130,10 +1138,11 @@ mod startup_tests {
             .project_registry
             .as_ref()
             .expect("project registry should be initialized");
+        let canonical_id = override_root.canonicalize()?.to_string_lossy().into_owned();
         let project = registry
-            .get("default")
+            .get(&canonical_id)
             .await?
-            .expect("default project should be registered");
+            .ok_or_else(|| anyhow::anyhow!("default project should be registered"))?;
 
         assert_eq!(project.root.canonicalize()?, override_root.canonicalize()?);
         assert_eq!(project.default_agent, None);

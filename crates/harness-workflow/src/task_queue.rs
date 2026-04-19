@@ -421,7 +421,32 @@ impl TaskQueue {
         let project_limits: DashMap<String, usize> = config
             .per_project
             .iter()
-            .map(|(k, v)| (k.clone(), *v))
+            .map(|(k, v)| {
+                let p = std::path::Path::new(k);
+                if !p.is_absolute() {
+                    tracing::warn!(
+                        key = k.as_str(),
+                        "concurrency.per_project key is not an absolute path; \
+                         it will not match any project at runtime — \
+                         keys must be canonical filesystem paths (use ProjectId::from_path)"
+                    );
+                    return (k.clone(), *v);
+                }
+                // Canonicalize to resolve symlinks / `..` / trailing components so
+                // the key matches the canonical path stored by the registry/queue.
+                let canonical = std::fs::canonicalize(p)
+                    .unwrap_or_else(|_| p.to_path_buf())
+                    .to_string_lossy()
+                    .into_owned();
+                if canonical != *k {
+                    tracing::debug!(
+                        original = k.as_str(),
+                        canonical = canonical.as_str(),
+                        "concurrency.per_project key canonicalized"
+                    );
+                }
+                (canonical, *v)
+            })
             .collect();
         Self {
             global_queue: Arc::new(Mutex::new(PriorityPermitQueue::new(
