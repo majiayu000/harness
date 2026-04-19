@@ -15,3 +15,10 @@ docs/artifacts/
 .worktrees/
 web/node_modules/
 web/dist/
+
+# SDK build artifacts (TypeScript bindings)
+sdk/typescript/node_modules/
+sdk/typescript/dist/
+
+# macOS finder metadata
+.DS_Store
