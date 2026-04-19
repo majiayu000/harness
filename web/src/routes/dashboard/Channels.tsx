@@ -1,9 +1,16 @@
 import { useDashboard } from "@/lib/queries";
 import { RuntimeCard } from "@/components/RuntimeCard";
 
-export function Channels() {
+interface Props {
+  projectFilter?: string | null;
+}
+
+export function Channels({ projectFilter }: Props) {
   const { data } = useDashboard();
-  const hosts = data?.runtime_hosts ?? [];
+  const allHosts = data?.runtime_hosts ?? [];
+  const hosts = projectFilter
+    ? allHosts.filter((h) => h.capabilities.includes(projectFilter))
+    : allHosts;
 
   return (
     <div>

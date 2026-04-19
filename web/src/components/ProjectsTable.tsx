@@ -59,7 +59,7 @@ export function ProjectsTable({ projects }: Props) {
             <tr
               key={p.id}
               className="cursor-pointer hover:bg-bg-1 transition-colors"
-              onClick={() => nav("/")}
+              onClick={() => nav("/?project=" + encodeURIComponent(p.id))}
             >
               <td className="px-4 py-3 border-b border-line align-middle">
                 <div className="flex items-center gap-2.5">

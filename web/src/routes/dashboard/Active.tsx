@@ -56,10 +56,16 @@ function TaskCard({ task }: { task: Task }) {
   );
 }
 
-export function Active() {
+interface Props {
+  projectFilter?: string | null;
+}
+
+export function Active({ projectFilter }: Props) {
   const { data, isLoading, isError } = useTasks();
 
-  const active = (data ?? []).filter((t) => !TERMINAL_STATUSES.has(t.status));
+  const active = (data ?? [])
+    .filter((t) => !TERMINAL_STATUSES.has(t.status))
+    .filter((t) => !projectFilter || t.project === projectFilter);
   const grouped: Record<string, Task[]> = {};
   for (const c of COLUMNS) grouped[c.key] = [];
   const other: Task[] = [];

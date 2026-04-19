@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { Sidebar, type SidebarSection } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -14,6 +15,8 @@ type Tab = "board" | "history" | "channels" | "submit";
 export function Dashboard() {
   const [tab, setTab] = useState<Tab>("board");
   const { isError } = useDashboard();
+  const [searchParams] = useSearchParams();
+  const projectFilter = searchParams.get("project");
 
   const sections: SidebarSection[] = [
     {
@@ -40,15 +43,19 @@ export function Dashboard() {
       />
       <main className="flex flex-col min-h-0 min-w-0">
         <TopBar
-          breadcrumb={[{ label: "harness" }, { label: "Tasks", current: true }]}
+          breadcrumb={
+            projectFilter
+              ? [{ label: "harness", href: "/overview" }, { label: projectFilter, current: true }]
+              : [{ label: "harness" }, { label: "Tasks", current: true }]
+          }
           searchPlaceholder="Search tasks…"
           actions={<StatusBadge ok={!isError} />}
         />
         <div className="flex-1 overflow-auto min-h-0 p-6">
-          {tab === "board" && <Active />}
-          {tab === "history" && <History />}
-          {tab === "channels" && <Channels />}
-          {tab === "submit" && <Submit />}
+          {tab === "board" && <Active projectFilter={projectFilter} />}
+          {tab === "history" && <History projectFilter={projectFilter} />}
+          {tab === "channels" && <Channels projectFilter={projectFilter} />}
+          {tab === "submit" && <Submit projectFilter={projectFilter} />}
         </div>
       </main>
       <PaletteFab />
