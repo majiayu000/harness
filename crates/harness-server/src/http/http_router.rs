@@ -16,6 +16,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(crate::dashboard::index))
         .route("/overview", get(crate::overview::index))
+        .route(
+            "/assets/{filename}",
+            axum::routing::get(crate::assets::serve),
+        )
         .route("/favicon.ico", get(crate::dashboard::favicon))
         .route("/health", get(health_check))
         .route("/rpc", post(handle_rpc))

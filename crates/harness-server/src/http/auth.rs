@@ -32,7 +32,8 @@ pub(crate) fn resolve_api_token(
 ///
 /// Exempts `/health`, `/webhook`, `/webhook/feishu`, `/signals`, `/favicon.ico`,
 /// `/auth/reset-password`, `/` (dashboard HTML), `/overview` (system overview
-/// HTML), and `/ws` (WebSocket upgrade).
+/// HTML), `/assets/*` (hashed React bundle assets), and `/ws` (WebSocket
+/// upgrade).
 /// The dashboard HTML no longer embeds the token, so it is safe to serve without
 /// auth. `/ws` is exempt from *this middleware* because the WebSocket upgrade
 /// cannot carry a body and must be handled before axum reads headers twice;
@@ -64,7 +65,8 @@ pub(crate) async fn api_auth_middleware(
             | "/"
             | "/overview"
             | "/ws"
-    ) {
+    ) || path.starts_with("/assets/")
+    {
         return next.run(req).await;
     }
 
