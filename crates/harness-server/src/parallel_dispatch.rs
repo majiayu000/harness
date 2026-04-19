@@ -1,9 +1,10 @@
 use crate::task_runner::TaskId;
 use crate::workspace::WorkspaceManager;
 use harness_core::{
-    agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, types::ContextItem,
+    agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, capability::CapabilityToken,
+    types::ContextItem,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::time::Duration;
 
@@ -38,6 +39,21 @@ const PARALLEL_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "swift", "cpp", "c", "h", "toml",
     "yaml", "yml", "json", "sh", "md",
 ];
+
+/// Build the `allowed_write_paths` list for a capability token.
+///
+/// The sandbox policy suppresses the blanket `/tmp` grant whenever token paths
+/// are present (to prevent sibling-worktree escape via shared `/tmp`).  To
+/// preserve temp-file access for Claude/Codex and child tools we include the
+/// standard temp directories explicitly alongside the workspace path.
+fn token_write_paths(workspace: PathBuf) -> Vec<PathBuf> {
+    vec![
+        workspace,
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"), // macOS: /tmp is a symlink to /private/tmp
+        PathBuf::from("/var/tmp"),
+    ]
+}
 
 /// Well-known filenames that have no extension but represent source files.
 const EXTENSIONLESS_FILENAMES: &[&str] = &[
@@ -324,11 +340,24 @@ async fn run_sequential_subtasks(
         }
     };
 
+    // Single token covers the full sequential run — all steps share one workspace.
+    // TTL must span every step: each step can run for up to `turn_timeout`, so
+    // a single-step TTL would expire partway through a multi-step chain.
+    // Use saturating arithmetic to avoid panic on absurdly large turn_timeout values.
+    let seq_token = CapabilityToken::new(
+        0,
+        token_write_paths(workspace.clone()),
+        turn_timeout
+            .saturating_mul(total as u32)
+            .saturating_add(Duration::from_secs(60)),
+    );
+
     for (i, spec) in subtasks.into_iter().enumerate() {
         let req = AgentRequest {
             prompt: spec.prompt,
             project_root: workspace.clone(),
             context: context.clone(),
+            capability_token: Some(seq_token.clone()),
             ..Default::default()
         };
         // Spawn into a task so a panic in agent.execute surfaces as JoinError
@@ -434,10 +463,16 @@ async fn run_concurrent_subtasks(
                 sub_ids.push(Some(sub_id));
                 let agent = agent.clone();
                 let context = context.clone();
+                let token = CapabilityToken::new(
+                    i,
+                    token_write_paths(workspace.clone()),
+                    turn_timeout.saturating_add(Duration::from_secs(60)),
+                );
                 let req = AgentRequest {
                     prompt: spec.prompt,
                     project_root: workspace,
                     context,
+                    capability_token: Some(token),
                     ..Default::default()
                 };
                 let sem = Arc::clone(&sem);

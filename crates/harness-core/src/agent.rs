@@ -1,3 +1,4 @@
+use crate::capability::CapabilityToken;
 use crate::types::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,13 @@ pub struct AgentRequest {
     /// workspace-isolated builds to prevent cargo lock contention.
     #[serde(default)]
     pub env_vars: HashMap<String, String>,
+    /// Scoped write capability issued at dispatch time.
+    ///
+    /// When set, the agent checks expiry before spawning and the sandbox
+    /// policy is narrowed to the token's `allowed_write_paths` instead of
+    /// the blanket `project_root`. `None` means no token restriction.
+    #[serde(skip)]
+    pub capability_token: Option<CapabilityToken>,
 }
 
 impl AgentRequest {
@@ -71,6 +79,7 @@ impl Default for AgentRequest {
             context: Vec::new(),
             execution_phase: None,
             env_vars: HashMap::new(),
+            capability_token: None,
         }
     }
 }
@@ -162,6 +171,8 @@ pub struct TurnRequest {
     pub allowed_tools: Vec<String>,
     pub context: Vec<ContextItem>,
     pub timeout_secs: Option<u64>,
+    /// Scoped write capability; checked for expiry before spawning.
+    pub capability_token: Option<CapabilityToken>,
 }
 
 /// Streaming agent adapter — coexists with legacy CodeAgent trait.

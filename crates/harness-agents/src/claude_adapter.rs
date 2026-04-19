@@ -38,6 +38,17 @@ impl AgentAdapter for ClaudeAdapter {
         req: TurnRequest,
         tx: mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
+        // Check token expiry before spawning.
+        // See also: claude.rs — both files must stay in sync on this check.
+        if let Some(ref token) = req.capability_token {
+            if token.is_expired() {
+                return Err(harness_core::error::HarnessError::AgentExecution(format!(
+                    "capability token for subtask {} has expired",
+                    token.subtask_index
+                )));
+            }
+        }
+
         let model = req.model.as_deref().unwrap_or(&self.default_model);
         let mut cmd = Command::new(&self.cli_path);
         // Prompt MUST follow -p immediately: Claude CLI parses `-p <VALUE>`.
