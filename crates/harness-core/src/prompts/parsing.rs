@@ -166,6 +166,27 @@ pub fn is_waiting(output: &str) -> bool {
     last_non_empty_line(output) == Some("WAITING")
 }
 
+/// Check if reviewer output indicates quota exhaustion (e.g., Gemini 24h rate limit).
+///
+/// Requires ≥ 2 co-occurring quota-signal terms, or a single high-specificity phrase,
+/// to prevent false positives from reviews that incidentally mention "quota" in code.
+pub fn is_quota_exhausted(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    // High-specificity phrase: shortcut without requiring two co-occurring indicators.
+    if lower.contains("start processing again") {
+        return true;
+    }
+    let indicators = [
+        "quota",
+        "rate limit",
+        "24 hour",
+        "processing again",
+        "will be processed",
+        "not available",
+    ];
+    indicators.iter().filter(|&&s| lower.contains(s)).count() >= 2
+}
+
 /// Extract `ISSUES=N` from agent output (any line). Returns `None` if absent.
 pub fn parse_issue_count(output: &str) -> Option<u32> {
     for line in output.lines().rev() {
@@ -282,6 +303,40 @@ mod tests {
         assert!(is_waiting("WAITING\n"));
         assert!(!is_waiting("LGTM"));
         assert!(!is_waiting("FIXED"));
+    }
+
+    #[test]
+    fn test_is_quota_exhausted_gemini_exact_phrase() {
+        // Gemini's actual quota-warning phrasing triggers the high-specificity shortcut.
+        assert!(is_quota_exhausted(
+            "I will start processing again in 24 hours once the quota resets."
+        ));
+    }
+
+    #[test]
+    fn test_is_quota_exhausted_two_co_occurring_indicators() {
+        assert!(is_quota_exhausted(
+            "rate limit exceeded, quota exhausted for today"
+        ));
+    }
+
+    #[test]
+    fn test_is_quota_exhausted_false_for_lgtm() {
+        assert!(!is_quota_exhausted("LGTM"));
+    }
+
+    #[test]
+    fn test_is_quota_exhausted_false_for_normal_review() {
+        let review = "\
+The implementation looks clean. I noticed a potential edge case in the error \
+handler: when the input is empty the function returns Ok(()) without logging, \
+which could mask silent failures.\nISSUES=1\nFIXED";
+        assert!(!is_quota_exhausted(review));
+    }
+
+    #[test]
+    fn test_is_quota_exhausted_false_for_empty_string() {
+        assert!(!is_quota_exhausted(""));
     }
 
     #[test]
