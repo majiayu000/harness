@@ -144,6 +144,7 @@ pub(crate) async fn run_turn_lifecycle(
             allowed_tools: vec![],
             context: vec![],
             timeout_secs: None,
+            capability_token: None,
         };
         Box::pin(async move { adapter_arc.start_turn(turn_req, event_tx).await })
     } else {

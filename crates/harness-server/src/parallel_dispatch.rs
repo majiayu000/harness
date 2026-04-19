@@ -1,7 +1,8 @@
 use crate::task_runner::TaskId;
 use crate::workspace::WorkspaceManager;
 use harness_core::{
-    agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, types::ContextItem,
+    agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, capability::CapabilityToken,
+    types::ContextItem,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -324,11 +325,19 @@ async fn run_sequential_subtasks(
         }
     };
 
+    // Single token covers the full sequential run — all steps share one workspace.
+    let seq_token = CapabilityToken::new(
+        0,
+        vec![workspace.clone()],
+        turn_timeout + Duration::from_secs(60),
+    );
+
     for (i, spec) in subtasks.into_iter().enumerate() {
         let req = AgentRequest {
             prompt: spec.prompt,
             project_root: workspace.clone(),
             context: context.clone(),
+            capability_token: Some(seq_token.clone()),
             ..Default::default()
         };
         // Spawn into a task so a panic in agent.execute surfaces as JoinError
@@ -434,10 +443,16 @@ async fn run_concurrent_subtasks(
                 sub_ids.push(Some(sub_id));
                 let agent = agent.clone();
                 let context = context.clone();
+                let token = CapabilityToken::new(
+                    i,
+                    vec![workspace.clone()],
+                    turn_timeout + Duration::from_secs(60),
+                );
                 let req = AgentRequest {
                     prompt: spec.prompt,
                     project_root: workspace,
                     context,
+                    capability_token: Some(token),
                     ..Default::default()
                 };
                 let sem = Arc::clone(&sem);

@@ -22,12 +22,25 @@ pub enum SandboxEngine {
 pub struct SandboxSpec {
     pub mode: SandboxMode,
     pub project_root: PathBuf,
+    /// When set, sandbox write policy uses these specific paths instead of the
+    /// blanket `project_root` allow. Populated from a `CapabilityToken`.
+    pub allowed_write_paths: Option<Vec<PathBuf>>,
 }
 
 impl SandboxSpec {
     pub fn new(mode: SandboxMode, project_root: impl Into<PathBuf>) -> Self {
         let project_root = canonicalize_project_root(project_root.into());
-        Self { mode, project_root }
+        Self {
+            mode,
+            project_root,
+            allowed_write_paths: None,
+        }
+    }
+
+    /// Narrow write access to the given paths instead of the full `project_root`.
+    pub fn with_allowed_write_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.allowed_write_paths = Some(paths);
+        self
     }
 }
 
@@ -133,10 +146,19 @@ fn seatbelt_policy(spec: &SandboxSpec) -> Result<String, SandboxError> {
     match spec.mode {
         SandboxMode::ReadOnly => {}
         SandboxMode::WorkspaceWrite => {
-            lines.push(format!(
-                "(allow file-write* (subpath \"{}\"))",
-                workspace_path
-            ));
+            if let Some(ref paths) = spec.allowed_write_paths {
+                for path in paths {
+                    lines.push(format!(
+                        "(allow file-write* (subpath \"{}\"))",
+                        seatbelt_escape_path(path)?
+                    ));
+                }
+            } else {
+                lines.push(format!(
+                    "(allow file-write* (subpath \"{}\"))",
+                    workspace_path
+                ));
+            }
             for protected_path in protected_paths(&spec.project_root) {
                 lines.push(format!(
                     "(deny file-write* (subpath \"{}\"))",
@@ -166,11 +188,17 @@ fn linux_landlock_args(
         }
     };
 
+    let workspace_arg = spec
+        .allowed_write_paths
+        .as_ref()
+        .and_then(|p| p.first())
+        .unwrap_or(&spec.project_root);
+
     let mut wrapped_args = vec![
         OsString::from("--mode"),
         OsString::from(spec.mode.to_string()),
         OsString::from("--workspace"),
-        spec.project_root.as_os_str().to_os_string(),
+        workspace_arg.as_os_str().to_os_string(),
         OsString::from("--network"),
         OsString::from(network_mode),
     ];
@@ -211,9 +239,17 @@ fn linux_bwrap_args(
             wrapped_args.push(OsString::from("--unshare-net"));
         }
         SandboxMode::WorkspaceWrite => {
-            wrapped_args.push(OsString::from("--bind"));
-            wrapped_args.push(spec.project_root.as_os_str().to_os_string());
-            wrapped_args.push(spec.project_root.as_os_str().to_os_string());
+            if let Some(ref paths) = spec.allowed_write_paths {
+                for path in paths {
+                    wrapped_args.push(OsString::from("--bind"));
+                    wrapped_args.push(path.as_os_str().to_os_string());
+                    wrapped_args.push(path.as_os_str().to_os_string());
+                }
+            } else {
+                wrapped_args.push(OsString::from("--bind"));
+                wrapped_args.push(spec.project_root.as_os_str().to_os_string());
+                wrapped_args.push(spec.project_root.as_os_str().to_os_string());
+            }
             for protected_path in protected_paths(&spec.project_root) {
                 if protected_path.exists() {
                     wrapped_args.push(OsString::from("--ro-bind"));
@@ -535,6 +571,31 @@ mod tests {
             .join("project");
         let spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, unresolved);
         assert_eq!(spec.project_root, expected);
+    }
+
+    #[test]
+    fn seatbelt_uses_token_paths_not_project_root() {
+        let mut spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, "/tmp/project");
+        spec.allowed_write_paths = Some(vec![PathBuf::from("/tmp/harness-worktree-0")]);
+        let policy = seatbelt_policy(&spec).unwrap();
+        assert!(
+            policy.contains("(allow file-write* (subpath \"/tmp/harness-worktree-0\"))"),
+            "policy should reference token path"
+        );
+        assert!(
+            !policy.contains("(allow file-write* (subpath \"/tmp/project\"))"),
+            "policy must not use blanket project_root when token paths are set"
+        );
+    }
+
+    #[test]
+    fn seatbelt_token_includes_tmp() {
+        let spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, "/tmp/project");
+        let policy = seatbelt_policy(&spec).unwrap();
+        assert!(
+            policy.contains("/tmp"),
+            "/tmp must always be writable in the base policy"
+        );
     }
 
     #[test]
