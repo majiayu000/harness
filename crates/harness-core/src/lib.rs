@@ -3,6 +3,7 @@ pub mod agents_md;
 pub mod capability;
 pub mod config;
 pub mod db;
+pub mod db_pg;
 pub mod error;
 pub mod interceptor;
 pub mod lang_detect;
