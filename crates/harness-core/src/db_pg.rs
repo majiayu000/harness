@@ -41,6 +41,19 @@ fn validate_schema_name(schema: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Creates the Postgres schema `schema` if it does not already exist.
+///
+/// Validates the schema name before any SQL interpolation — this is the single
+/// mandatory entry-point for schema creation so the name is always checked
+/// regardless of which store calls it.
+pub async fn pg_create_schema_if_not_exists(pool: &PgPool, schema: &str) -> anyhow::Result<()> {
+    validate_schema_name(schema)?;
+    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Create a Postgres connection pool where every connection has `search_path`
 /// set to `schema`. Used to give each store an isolated schema namespace.
 ///
