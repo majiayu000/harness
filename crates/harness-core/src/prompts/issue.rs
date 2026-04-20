@@ -118,11 +118,23 @@ pub fn implement_from_issue(
              3. Implement the change with the minimum necessary modifications\n\
              4. Run `cargo check` and `cargo test` — fix any failures before proceeding\n\
              5. Create a feature branch, commit with a descriptive message, push\n\
-             6. Create a PR with `gh pr create`. Include \"Closes #{issue}\" in the PR body \
-so that GitHub and harness can identify this PR as closing the issue."
+             6. Create a PR with `gh pr create` (see the mandatory PR body contract below)."
         ),
         context: git_line,
-        dynamic_payload: "On the last line of your output, print PR_URL=<full PR URL>".to_string(),
+        dynamic_payload: format!(
+            "PR body contract (the validator the reviewer uses checks these):\n\
+             - The body MUST contain a line that reads exactly:\n\
+             \n\
+             Closes #{issue}\n\
+             \n\
+             Use one of `Closes`, `Fixes`, or `Resolves` (GitHub closing keywords). \
+             The line must stand on its own and the issue number must match. \
+             Without it GitHub will not auto-close the issue when the PR merges, \
+             and the harness dashboard cannot back-link the PR to its originating issue.\n\
+             \n\
+             After creating the PR, on the last line of your output, \
+             print `PR_URL=<full PR URL>`."
+        ),
     }
 }
 
@@ -214,6 +226,12 @@ mod tests {
         let p = implement_from_issue(42, None, None).to_prompt_string();
         assert!(p.contains("issue #42"));
         assert!(p.contains("PR_URL="));
+        // PR body contract must be present so the agent has a hard
+        // instruction — not a soft guideline buried in the step list.
+        assert!(
+            p.contains("Closes #42"),
+            "prompt must tell the agent to include `Closes #N` in the body"
+        );
     }
 
     #[test]
@@ -225,6 +243,10 @@ mod tests {
         assert!(s.contains("Senior Engineer"));
         assert!(s.contains("cargo check"));
         assert!(s.contains("gh pr create"));
+        // The Closes-keyword contract lives in dynamic_payload; assert it
+        // survives round-tripping through to_prompt_string so tasks that
+        // render only part of the prompt still carry the requirement.
+        assert!(s.contains("Closes #42"));
         assert!(parts.context.is_empty());
     }
 
