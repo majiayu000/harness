@@ -62,12 +62,12 @@ describe("PaletteProvider", () => {
     expect(screen.getByTestId("current").textContent).toBe("ember");
   });
 
-  it("exposes 10 palettes", () => {
+  it("exposes 11 palettes", () => {
     render(
       <PaletteProvider>
         <Probe />
       </PaletteProvider>,
     );
-    expect(screen.getByTestId("count").textContent).toBe("10");
+    expect(screen.getByTestId("count").textContent).toBe("11");
   });
 });

@@ -20,7 +20,8 @@ export type PaletteId =
   | "linen"
   | "porcelain"
   | "pixel"
-  | "multica";
+  | "multica"
+  | "quartz";
 
 export interface PaletteDescriptor {
   id: PaletteId;
@@ -40,6 +41,7 @@ export const PALETTES: readonly PaletteDescriptor[] = [
   { id: "porcelain", name: "Porcelain", sub: "neutral · crimson", swatch: ["#f6f5f2", "#d0cec3", "#d84a2f", "#1a1a1a"] },
   { id: "pixel", name: "Pixel", sub: "muted · 8-bit amber", swatch: ["#14161f", "#2f3448", "#f4b860", "#e8ecf4"] },
   { id: "multica", name: "Multica", sub: "cosmic · aurora", swatch: ["#0a0b14", "#1f2340", "#ff7a59", "#f2f1fb"] },
+  { id: "quartz", name: "Quartz", sub: "workspace · light · amber", swatch: ["#fbfbf9", "#e4e2da", "#d97706", "#1a1a16"] },
 ] as const;
 
 const VALID_IDS = new Set<string>(PALETTES.map((p) => p.id));
