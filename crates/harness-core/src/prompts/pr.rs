@@ -157,9 +157,22 @@ pub fn check_existing_pr(
         "Check PR #{pr}:{freshness_check}\n\
          1. Run `gh pr view {pr} --json statusCheckRollup` — parse the JSON. \
          CI passes only if the `state` field in the `statusCheckRollup` object is `SUCCESS`\n\
-         2. `gh api repos/{repo}/pulls/{pr}/comments` — read inline review comments\n\
-         3. If CI passes and there are no unresolved review comments, print LGTM on the last line\n\
-         4. Otherwise fix each comment, commit, push, \
+         2. Run `gh api repos/{repo}/pulls/{pr}/reviews` to read review verdicts\n\
+         2b. From those reviews, select those where the author login contains 'gemini' \
+         and the state is 'COMMENTED'; sort by submitted_at descending and take the MOST RECENT one only. \
+         Record that review's id and body. \
+         (Older Gemini COMMENTED reviews are superseded and must be ignored.)\n\
+         3. Run `gh api repos/{repo}/pulls/{pr}/comments` to read inline review comments; \
+         group results by pull_request_review_id.\n\
+         3b. If the most recent Gemini COMMENTED review from step 2b exists and its review id does not \
+         appear in any inline comment's pull_request_review_id field (i.e. zero linked inline comments): \
+         check whether its body contains (case-insensitive) any of these phrases anywhere in a line: \
+         'Feedback suggests', 'Review feedback highlights', 'A review comment suggests', \
+         'Feedback was provided', 'Feedback focuses'. \
+         If any such phrase is found, treat each matching paragraph as an unresolved issue. \
+         Do NOT report LGTM while such actionable body feedback remains unaddressed.\n\
+         4. If CI passes and there are no unresolved review comments, print LGTM on the last line\n\
+         5. Otherwise fix each comment, commit, push, \
          then run `gh pr comment {pr} --body {body}` to trigger re-review, \
          and print FIXED on the last line\n\n\
          Always print PR_URL=https://github.com/{repo}/pull/{pr} on a separate line of your output."
@@ -269,6 +282,37 @@ mod tests {
         assert!(
             p.contains(r"'it'\''s a test'"),
             "single quote must be escaped"
+        );
+    }
+
+    #[test]
+    fn test_check_existing_pr_fetches_reviews_and_body_feedback() {
+        let p = check_existing_pr(
+            10,
+            "/gemini review",
+            "owner/repo",
+            "gemini-code-assist[bot]",
+            false,
+        );
+        // Must also fetch the reviews endpoint (not only inline comments)
+        assert!(
+            p.contains("repos/owner/repo/pulls/10/reviews"),
+            "must fetch reviews endpoint to catch Gemini body-only feedback"
+        );
+        // Must scope to the most recent Gemini COMMENTED review only
+        assert!(
+            p.contains("MOST RECENT"),
+            "must limit to most recent Gemini COMMENTED review to avoid stale feedback"
+        );
+        // Must check for body-only trigger phrases
+        assert!(
+            p.contains("Feedback suggests"),
+            "must list body-only trigger phrases"
+        );
+        // Must still check inline comments
+        assert!(
+            p.contains("repos/owner/repo/pulls/10/comments"),
+            "must still fetch inline comments"
         );
     }
 }
