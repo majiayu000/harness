@@ -566,10 +566,9 @@ pub(crate) async fn password_reset(
         "password reset requested"
     );
 
+    // TODO: wire up SMTP/transactional email before enabling this endpoint
     (
-        StatusCode::OK,
-        Json(
-            json!({"status": "ok", "message": "If that email is registered, a reset link has been sent."}),
-        ),
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"error": "password reset is not yet implemented"})),
     )
 }
