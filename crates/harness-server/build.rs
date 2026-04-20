@@ -36,8 +36,10 @@ fn main() {
     // during development doesn't pay the bundle cost. The check at the bottom
     // of this file still fails if dist/ is missing and the skip flag is off.
     if std::env::var("HARNESS_SKIP_WEB_BUILD").ok().as_deref() != Some("1") {
-        run(&["bun", "install", "--frozen-lockfile"], &web_dir);
-        run(&["bun", "run", "build"], &web_dir);
+        let bun = find_bun();
+        let bun_str = bun.to_str().unwrap_or("bun");
+        run(&[bun_str, "install", "--frozen-lockfile"], &web_dir);
+        run(&[bun_str, "run", "build"], &web_dir);
     }
 
     let dist = web_dir.join("dist");
@@ -90,6 +92,19 @@ fn main() {
 /// forward slashes so the generated manifest compiles on every platform.
 fn rust_lit(path: &std::path::Path) -> String {
     path.display().to_string().replace('\\', "/")
+}
+
+/// Return the path to the `bun` binary. Cargo build scripts may run with a
+/// restricted PATH that omits shell-profile additions (e.g. `~/.bun/bin`),
+/// so fall back to the default install location before giving up.
+fn find_bun() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = PathBuf::from(home).join(".bun/bin/bun");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from("bun")
 }
 
 fn run(cmd: &[&str], dir: &std::path::Path) {

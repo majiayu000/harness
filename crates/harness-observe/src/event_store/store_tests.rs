@@ -4,12 +4,49 @@ use harness_core::{
     types::{AutoFixAttempt, RuleId},
 };
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
-async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<EventStore>> {
+// Supabase session pooler caps simultaneous clients at pool_size (15).
+// Gate all test DB connections through a semaphore so concurrent tests
+// never exceed that limit.
+static DB_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+fn db_semaphore() -> Arc<tokio::sync::Semaphore> {
+    DB_SEMAPHORE
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(3)))
+        .clone()
+}
+
+struct TestStore {
+    inner: EventStore,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl TestStore {
+    async fn close(self) {
+        self.inner.close().await;
+    }
+}
+
+impl std::ops::Deref for TestStore {
+    type Target = EventStore;
+    fn deref(&self) -> &EventStore {
+        &self.inner
+    }
+}
+
+async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<TestStore>> {
     if std::env::var("DATABASE_URL").is_err() {
         return Ok(None);
     }
-    Ok(Some(EventStore::new(data_dir).await?))
+    let permit = db_semaphore()
+        .acquire_owned()
+        .await
+        .expect("semaphore never closed");
+    Ok(Some(TestStore {
+        inner: EventStore::new(data_dir).await?,
+        _permit: permit,
+    }))
 }
 
 fn make_event(hook: &str, decision: Decision) -> Event {

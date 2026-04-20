@@ -9,7 +9,9 @@ use std::sync::OnceLock;
 // Postgres pool helpers and PgMigrator live in the sibling db_pg module.
 // Re-export them here so existing callers using `harness_core::db::*` continue
 // to work without any import changes.
-pub use crate::db_pg::{pg_open_pool, pg_open_pool_schematized, PgMigrator};
+pub use crate::db_pg::{
+    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, PgMigrator,
+};
 
 static SQLITE_TRANSACTIONAL_PREFIXES: OnceLock<Vec<&'static str>> = OnceLock::new();
 

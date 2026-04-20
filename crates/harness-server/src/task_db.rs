@@ -5,7 +5,9 @@ mod types;
 
 pub use types::{RecoveryResult, TaskArtifact, TaskCheckpoint, TaskPrompt};
 
-use harness_core::db::{pg_open_pool, pg_open_pool_schematized, PgMigrator};
+use harness_core::db::{
+    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, PgMigrator,
+};
 use migrations::TASK_MIGRATIONS;
 use sqlx::postgres::PgPool;
 use std::path::Path;
@@ -30,10 +32,8 @@ impl TaskDb {
         let schema = format!("h{:016x}", hasher.finish());
 
         let setup = pg_open_pool(&database_url).await?;
-        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
-            .execute(&setup)
-            .await?;
-        drop(setup);
+        pg_create_schema_if_not_exists(&setup, &schema).await?;
+        setup.close().await;
 
         let pool = pg_open_pool_schematized(&database_url, &schema).await?;
         Self::from_pg_pool(pool).await
