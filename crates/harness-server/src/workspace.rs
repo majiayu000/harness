@@ -36,14 +36,14 @@ fn git_command() -> tokio::process::Command {
     cmd
 }
 
-struct ActiveWorkspace {
-    workspace_path: PathBuf,
-    source_repo: PathBuf,
+pub(crate) struct ActiveWorkspace {
+    pub(crate) workspace_path: PathBuf,
+    pub(crate) source_repo: PathBuf,
 }
 
 pub struct WorkspaceManager {
     pub(crate) config: WorkspaceConfig,
-    active: DashMap<TaskId, ActiveWorkspace>,
+    pub(crate) active: DashMap<TaskId, ActiveWorkspace>,
 }
 
 impl WorkspaceManager {
@@ -249,6 +249,11 @@ impl WorkspaceManager {
     /// Return the workspace path for the given task if it is active.
     pub fn get_workspace(&self, task_id: &TaskId) -> Option<PathBuf> {
         self.active.get(task_id).map(|e| e.workspace_path.clone())
+    }
+
+    /// Number of worktrees currently checked out and not yet reaped.
+    pub fn live_count(&self) -> u64 {
+        self.active.len() as u64
     }
 
     /// Remove workspaces for all given terminal task IDs. Errors are logged, not returned.
