@@ -1,4 +1,4 @@
-import { useTasks } from "@/lib/queries";
+import { useTasks, useDashboard } from "@/lib/queries";
 import type { Task } from "@/types";
 
 interface Column {
@@ -56,10 +56,21 @@ function TaskCard({ task }: { task: Task }) {
   );
 }
 
-export function Active() {
-  const { data, isLoading, isError } = useTasks();
+interface Props {
+  projectFilter?: string | null;
+}
 
-  const active = (data ?? []).filter((t) => !TERMINAL_STATUSES.has(t.status));
+export function Active({ projectFilter }: Props) {
+  const { data, isLoading, isError } = useTasks();
+  const { data: dashboard } = useDashboard();
+
+  const resolvedRoot = projectFilter
+    ? (dashboard?.projects.find((p) => p.id === projectFilter)?.root ?? projectFilter)
+    : null;
+
+  const active = (data ?? [])
+    .filter((t) => !TERMINAL_STATUSES.has(t.status))
+    .filter((t) => !resolvedRoot || t.project === resolvedRoot);
   const grouped: Record<string, Task[]> = {};
   for (const c of COLUMNS) grouped[c.key] = [];
   const other: Task[] = [];

@@ -1,12 +1,21 @@
 import { useState } from "react";
 import { useDashboard } from "@/lib/queries";
 
-export function History() {
+interface Props {
+  projectFilter?: string | null;
+}
+
+export function History({ projectFilter }: Props) {
   const { data } = useDashboard();
   const [filter, setFilter] = useState<"all" | "done" | "failed">("all");
   const [query, setQuery] = useState("");
-  const totalDone = data?.projects.reduce((a, p) => a + p.tasks.done, 0) ?? 0;
-  const totalFailed = data?.projects.reduce((a, p) => a + p.tasks.failed, 0) ?? 0;
+  const scopedProject = projectFilter ? (data?.projects.find((p) => p.id === projectFilter) ?? null) : null;
+  const totalDone = projectFilter
+    ? (scopedProject?.tasks.done ?? 0)
+    : (data?.projects.reduce((a, p) => a + p.tasks.done, 0) ?? 0);
+  const totalFailed = projectFilter
+    ? (scopedProject?.tasks.failed ?? 0)
+    : (data?.projects.reduce((a, p) => a + p.tasks.failed, 0) ?? 0);
 
   return (
     <div>

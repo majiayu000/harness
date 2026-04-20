@@ -177,11 +177,12 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         .list_hosts()
         .into_iter()
         .map(|host| {
-            let watched_projects = state
-                .runtime_project_cache
-                .get_host_cache(&host.id)
-                .map(|snapshot| snapshot.project_count)
-                .unwrap_or(0);
+            let snapshot = state.runtime_project_cache.get_host_cache(&host.id);
+            let watched_projects = snapshot.as_ref().map(|s| s.project_count).unwrap_or(0);
+            let watched_project_roots: Vec<&str> = snapshot
+                .as_ref()
+                .map(|s| s.projects.iter().map(|p| p.root.as_str()).collect())
+                .unwrap_or_default();
             let active_leases = state.runtime_hosts.active_lease_count(&host.id);
             let assignment_pressure = active_leases as f64 / watched_projects.max(1) as f64;
             json!({
@@ -191,6 +192,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                 "online": host.online,
                 "last_heartbeat_at": host.last_heartbeat_at,
                 "watched_projects": watched_projects,
+                "watched_project_roots": watched_project_roots,
                 "active_leases": active_leases,
                 "assignment_pressure": assignment_pressure,
             })

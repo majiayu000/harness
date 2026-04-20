@@ -1,8 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { ProjectsTable } from "./ProjectsTable";
 import type { OverviewProject } from "@/types";
+
+const mockNavigate = vi.fn();
+vi.mock("react-router-dom", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("react-router-dom")>();
+  return { ...actual, useNavigate: () => mockNavigate };
+});
 
 const p: OverviewProject = {
   id: "harness",
@@ -37,5 +43,15 @@ describe("<ProjectsTable>", () => {
       </MemoryRouter>,
     );
     expect(screen.getByText(/no projects registered/i)).toBeInTheDocument();
+  });
+  it("navigates with project query param on row click", () => {
+    mockNavigate.mockClear();
+    render(
+      <MemoryRouter>
+        <ProjectsTable projects={[p]} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByText("harness").closest("tr")!);
+    expect(mockNavigate).toHaveBeenCalledWith("/?project=harness");
   });
 });

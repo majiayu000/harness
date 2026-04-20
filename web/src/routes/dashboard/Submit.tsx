@@ -1,11 +1,20 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { apiFetch } from "@/lib/api";
 
-export function Submit() {
+interface Props {
+  projectFilter?: string | null;
+}
+
+export function Submit({ projectFilter }: Props) {
   const [title, setTitle] = useState("");
   const [desc, setDesc] = useState("");
+  const [project, setProject] = useState(projectFilter ?? "");
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setProject(projectFilter ?? "");
+  }, [projectFilter]);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -13,7 +22,8 @@ export function Submit() {
     setBusy(true);
     setMsg(null);
     try {
-      const body = JSON.stringify({ title, description: desc });
+      const prompt = title.trim() + (desc.trim() ? `\n\n${desc.trim()}` : "");
+      const body = JSON.stringify({ prompt, project: project.trim() || undefined });
       const resp = await apiFetch("/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -23,6 +33,7 @@ export function Submit() {
       setMsg(`created task ${json.id ?? "?"}`);
       setTitle("");
       setDesc("");
+      setProject(projectFilter ?? "");
     } catch (e) {
       setMsg((e as Error).message);
     } finally {
@@ -32,6 +43,15 @@ export function Submit() {
 
   return (
     <form onSubmit={submit} className="max-w-[640px] border border-line bg-bg-1 p-5 space-y-4">
+      <div>
+        <label className="block font-mono text-[10.5px] tracking-[0.1em] uppercase text-ink-3 mb-1">Project</label>
+        <input
+          value={project}
+          onChange={(e) => setProject(e.target.value)}
+          placeholder="project id (optional)"
+          className="w-full h-[30px] bg-bg border border-line-2 px-2.5 text-ink font-mono text-[12px] rounded-[3px]"
+        />
+      </div>
       <div>
         <label className="block font-mono text-[10.5px] tracking-[0.1em] uppercase text-ink-3 mb-1">Title</label>
         <input
