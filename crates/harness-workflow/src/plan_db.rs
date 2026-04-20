@@ -23,7 +23,7 @@ static PLAN_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         description: "convert exec_plans.data from TEXT to JSONB",
-        sql: "ALTER TABLE exec_plans ALTER COLUMN data TYPE JSONB USING data::jsonb",
+        sql: "ALTER TABLE exec_plans ALTER COLUMN data TYPE JSONB USING replace(data, '\\u0000', '')::jsonb",
     },
     Migration {
         version: 4,
@@ -63,9 +63,10 @@ impl PlanDb {
 
     pub async fn upsert(&self, plan: &ExecPlan) -> anyhow::Result<()> {
         let data = serde_json::to_string(plan)?;
-        // PostgreSQL JSONB rejects \u0000; strip NUL bytes before the cast.
-        let data = if data.contains('\0') {
-            data.replace('\0', "")
+        // PostgreSQL JSONB rejects \u0000; serde_json encodes NUL as the
+        // 6-char escape sequence, so strip that form (not the literal byte).
+        let data = if data.contains("\\u0000") {
+            data.replace("\\u0000", "")
         } else {
             data
         };
