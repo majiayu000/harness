@@ -118,8 +118,15 @@ pub fn implement_from_issue(
              3. Implement the change with the minimum necessary modifications\n\
              4. Run `cargo check` and `cargo test` — fix any failures before proceeding\n\
              5. Create a feature branch, commit with a descriptive message, push\n\
-             6. Create a PR with `gh pr create`. Include \"Closes #{issue}\" in the PR body \
-so that GitHub and harness can identify this PR as closing the issue."
+             6. Draft the PR body in `/tmp/pr_body.md`. Follow \
+`.github/pull_request_template.md` (Summary + Test plan sections) and end \
+with a line reading exactly `Closes #{issue}` so GitHub auto-closes the issue \
+on merge.\n\
+             7. Validate the body before publishing: \
+`scripts/pr_body_check.sh --file /tmp/pr_body.md --issue {issue}` — this \
+must exit 0. Fix the body and re-run until it passes.\n\
+             8. Publish with `gh pr create --body-file /tmp/pr_body.md` (do NOT \
+use `--body`; the validator only guards the file-backed path)."
         ),
         context: git_line,
         dynamic_payload: "On the last line of your output, print PR_URL=<full PR URL>".to_string(),
