@@ -39,7 +39,7 @@ export function Overview() {
       label: "Fleet",
       items: [
         { id: "tasks", label: "All tasks", href: "/overview#projects", count: data?.kpi.active_tasks },
-        { id: "worktrees", label: "Worktrees", href: "/overview#projects", count: data?.kpi.worktrees.used },
+        { id: "worktrees", label: "Worktrees", href: "/worktrees", count: data?.kpi.worktrees.used },
       ],
     },
     {
