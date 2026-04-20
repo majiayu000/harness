@@ -56,7 +56,7 @@ impl ProjectRegistry {
 
         let setup = pg_open_pool(&database_url).await?;
         pg_create_schema_if_not_exists(&setup, &schema).await?;
-        drop(setup);
+        setup.close().await;
 
         let pool = pg_open_pool_schematized(&database_url, &schema).await?;
         PgMigrator::new(&pool, PROJECT_MIGRATIONS).run().await?;

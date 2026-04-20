@@ -6,10 +6,10 @@ use crate::db::Migration;
 
 /// Create a Postgres connection pool for the given DATABASE_URL.
 ///
-/// Uses 8 max connections with a 10-second acquire timeout.
+/// Uses 3 max connections with a 10-second acquire timeout.
 pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
     let pool = PgPoolOptions::new()
-        .max_connections(8)
+        .max_connections(3)
         .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(database_url)
         .await?;
@@ -67,22 +67,22 @@ pub async fn pg_create_schema_if_not_exists(pool: &PgPool, schema: &str) -> anyh
 /// Create a Postgres connection pool where every connection has `search_path`
 /// set to `schema`. Used to give each store an isolated schema namespace.
 ///
-/// Sets search_path via BOTH the connection `options` startup parameter AND an
-/// `after_connect` hook that runs `SET search_path TO <schema>` per connection.
-/// The after_connect hook is required for Supabase pgbouncer pooler, which
-/// silently strips the startup `options` parameter, causing all DDL to fall
-/// back to the default `public` schema and all stores to share a single
-/// `schema_migrations` table (migration-number collision bug).
+/// Sets search_path exclusively via an `after_connect` hook that runs
+/// `SET search_path TO <schema>` per connection. The hook approach is required
+/// for Supabase pgbouncer/Supavisor compatibility: startup `options` parameters
+/// are silently stripped by pgbouncer, and unique startup params cause Supavisor
+/// to create a separate pool object per schema (hitting EMAXPOOLSREACHED under
+/// concurrent test load). The after_connect hook is reliable for all backends.
 ///
 /// Returns an error if `schema` contains characters outside `[a-zA-Z0-9_]` or
 /// does not start with a letter or underscore — rejecting invalid names before
 /// they are interpolated into SQL.
 pub async fn pg_open_pool_schematized(database_url: &str, schema: &str) -> anyhow::Result<PgPool> {
     validate_schema_name(schema)?;
-    let opts = PgConnectOptions::from_str(database_url)?.options([("search_path", schema)]);
+    let opts = PgConnectOptions::from_str(database_url)?;
     let schema_for_hook = schema.to_string();
     let pool = PgPoolOptions::new()
-        .max_connections(8)
+        .max_connections(3)
         .acquire_timeout(std::time::Duration::from_secs(10))
         .after_connect(move |conn, _meta| {
             let schema = schema_for_hook.clone();
