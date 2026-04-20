@@ -63,6 +63,12 @@ impl PlanDb {
 
     pub async fn upsert(&self, plan: &ExecPlan) -> anyhow::Result<()> {
         let data = serde_json::to_string(plan)?;
+        // PostgreSQL JSONB rejects \u0000; strip NUL bytes before the cast.
+        let data = if data.contains('\0') {
+            data.replace('\0', "")
+        } else {
+            data
+        };
         sqlx::query(
             "INSERT INTO exec_plans (id, data) VALUES ($1, $2::jsonb)
              ON CONFLICT(id) DO UPDATE SET data = EXCLUDED.data,
@@ -376,6 +382,25 @@ mod tests {
             .update_in_txn(&ExecPlanId::new(), |p| p.activate())
             .await?;
         assert!(result.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upsert_sanitizes_nul_bytes() -> anyhow::Result<()> {
+        let Some((db, dir, _permit)) = open_test_store().await? else {
+            return Ok(());
+        };
+        // PostgreSQL JSONB rejects \u0000; a spec with an embedded NUL must not fail.
+        let plan = ExecPlan::from_spec("# a\0b", dir.path())?;
+        db.upsert(&plan).await?;
+        let loaded = db
+            .get(&plan.id)
+            .await?
+            .expect("plan should exist after nul-stripped upsert");
+        assert!(
+            loaded.purpose.contains('a'),
+            "purpose should contain 'a' after NUL stripping"
+        );
         Ok(())
     }
 
