@@ -44,10 +44,12 @@ impl PlanDb {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable is not set"))?;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        path.hash(&mut hasher);
-        let schema = format!("h{:016x}", hasher.finish());
+        use sha2::{Digest, Sha256};
+        let path_bytes = path.to_string_lossy().into_owned();
+        let digest = Sha256::digest(path_bytes.as_bytes());
+        let mut schema_bytes = [0u8; 8];
+        schema_bytes.copy_from_slice(&digest[..8]);
+        let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
 
         let setup = pg_open_pool(&database_url).await?;
         pg_create_schema_if_not_exists(&setup, &schema).await?;
@@ -417,10 +419,12 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("migrate_contract");
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        path.hash(&mut hasher);
-        let schema = format!("h{:016x}", hasher.finish());
+        use sha2::{Digest, Sha256};
+        let path_bytes = path.to_string_lossy().into_owned();
+        let digest = Sha256::digest(path_bytes.as_bytes());
+        let mut schema_bytes = [0u8; 8];
+        schema_bytes.copy_from_slice(&digest[..8]);
+        let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
 
         let setup = pg_open_pool(&database_url).await?;
         sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
