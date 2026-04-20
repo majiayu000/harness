@@ -50,12 +50,29 @@ struct GitHubPullRequestRef {
 }
 
 #[derive(Debug, Deserialize)]
+struct GitHubUserRef {
+    #[serde(default)]
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GitHubReviewRef {
     state: String,
     #[serde(default)]
     body: Option<String>,
     #[serde(default)]
     html_url: Option<String>,
+    #[serde(default)]
+    user: Option<GitHubUserRef>,
+}
+
+fn has_gemini_body_feedback(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("feedback suggests")
+        || lower.contains("review feedback highlights")
+        || lower.contains("a review comment suggests")
+        || lower.contains("feedback was provided")
+        || lower.contains("feedback focuses")
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,10 +224,23 @@ pub(crate) fn parse_github_webhook_task_request(
                     if body.is_empty() {
                         return Ok((None, "pr review comment: empty body ignored".to_string()));
                     }
-                    Ok((
-                        Some(pr_rework_task_request(&parsed)),
-                        "pr review comment: actionable feedback".to_string(),
-                    ))
+                    let login = parsed
+                        .review
+                        .user
+                        .as_ref()
+                        .map(|u| u.login.as_str())
+                        .unwrap_or("");
+                    let is_gemini = login.to_ascii_lowercase().contains("gemini");
+                    let reason = if is_gemini {
+                        if has_gemini_body_feedback(body) {
+                            "pr review comment: gemini body feedback"
+                        } else {
+                            "pr review comment: gemini non-trigger body"
+                        }
+                    } else {
+                        "pr review comment: actionable feedback"
+                    };
+                    Ok((Some(pr_rework_task_request(&parsed)), reason.to_string()))
                 }
                 _ => Ok((None, "unsupported review state".to_string())),
             }
