@@ -497,3 +497,90 @@ async fn task_admission_succeeds_no_pressure() {
         "acquire must succeed when pressure flag is false"
     );
 }
+
+// ── saturation / cancellation stress tests ───────────────────────────────────
+
+#[tokio::test]
+async fn cancelled_acquire_releases_permit_for_next_waiter() {
+    let q = Arc::new(TaskQueue::new(&config(1, 16)));
+
+    // Hold the single global slot.
+    let holder = q.acquire("proj", 0).await.unwrap();
+
+    // Waiter parks on the queue.
+    let q2 = q.clone();
+    let waiter = tokio::spawn(async move { q2.acquire("proj", 0).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Cancel the waiter, then release the holder.
+    waiter.abort();
+    let _ = waiter.await;
+    drop(holder);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // The permit must be available for a new acquire.
+    let result = timeout(Duration::from_millis(100), q.acquire("proj", 0)).await;
+    assert!(result.is_ok(), "permit leaked after waiter cancellation");
+}
+
+#[tokio::test]
+async fn queue_recovers_after_repeated_cancellations() {
+    let q = Arc::new(TaskQueue::new(&config(1, 64)));
+
+    // Hold the slot so all incoming acquires queue up.
+    let holder = q.acquire("proj", 0).await.unwrap();
+
+    // Spawn and immediately abort 20 waiters to flood the heap with cancelled entries.
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let q2 = q.clone();
+        let h = tokio::spawn(async move { q2.acquire("proj", 0).await });
+        handles.push(h);
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    for h in handles {
+        h.abort();
+        let _ = h.await;
+    }
+
+    // Release the held slot — drain_cancelled threshold must kick in and clear the heap.
+    drop(holder);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let result = timeout(Duration::from_millis(100), q.acquire("proj", 0)).await;
+    assert!(
+        result.is_ok(),
+        "queue did not recover after repeated cancellations"
+    );
+}
+
+#[tokio::test]
+async fn server_stays_responsive_after_saturation_and_abort() {
+    let q = Arc::new(TaskQueue::new(&config(2, 32)));
+
+    // Fill both global slots.
+    let p1 = q.acquire("proj", 0).await.unwrap();
+    let p2 = q.acquire("proj", 0).await.unwrap();
+
+    // Saturate the queue with waiters then abort them all.
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let q2 = q.clone();
+        handles.push(tokio::spawn(async move { q2.acquire("proj", 0).await }));
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    for h in handles {
+        h.abort();
+        let _ = h.await;
+    }
+
+    // Release both slots — server must become responsive again.
+    drop(p1);
+    drop(p2);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let r1 = timeout(Duration::from_millis(100), q.acquire("proj", 0)).await;
+    let r2 = timeout(Duration::from_millis(100), q.acquire("proj", 0)).await;
+    assert!(r1.is_ok(), "first post-saturation acquire failed");
+    assert!(r2.is_ok(), "second post-saturation acquire failed");
+}
