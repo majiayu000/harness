@@ -27,7 +27,10 @@ impl TaskDb {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable is not set"))?;
         use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(db_path.as_os_str().as_encoded_bytes());
+        let path_utf8 = db_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", db_path))?;
+        let digest = Sha256::digest(path_utf8.as_bytes());
         let mut schema_bytes = [0u8; 8];
         schema_bytes.copy_from_slice(&digest[..8]);
         let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
