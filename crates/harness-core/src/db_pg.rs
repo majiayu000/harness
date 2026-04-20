@@ -17,7 +17,8 @@ pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
 }
 
 /// Validates that a schema name contains only ASCII letters, digits, and
-/// underscores, and starts with a letter or underscore. Rejects the name
+/// underscores, starts with a letter or underscore, and fits within
+/// PostgreSQL's 63-byte identifier limit (NAMEDATALEN-1). Rejects the name
 /// before it is ever interpolated into SQL, providing defence in depth against
 /// injection if the schema-name construction ever changes.
 fn validate_schema_name(schema: &str) -> anyhow::Result<()> {
@@ -35,6 +36,15 @@ fn validate_schema_name(schema: &str) -> anyhow::Result<()> {
     if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
         anyhow::bail!(
             "schema name may only contain ASCII letters, digits, and underscores, got: {:?}",
+            schema
+        );
+    }
+    // PostgreSQL silently truncates identifiers to 63 bytes (NAMEDATALEN-1).
+    // Two names differing only after byte 63 would alias to the same schema.
+    if schema.len() > 63 {
+        anyhow::bail!(
+            "schema name exceeds PostgreSQL's 63-byte identifier limit ({} bytes): {:?}",
+            schema.len(),
             schema
         );
     }
@@ -211,5 +221,23 @@ mod tests {
     #[test]
     fn hyphen_rejected() {
         assert!(validate_schema_name("my-schema").is_err());
+    }
+
+    #[test]
+    fn exactly_63_bytes_accepted() {
+        let name = "a".repeat(63);
+        assert!(
+            validate_schema_name(&name).is_ok(),
+            "63-byte name should be valid"
+        );
+    }
+
+    #[test]
+    fn over_63_bytes_rejected() {
+        let name = "a".repeat(64);
+        assert!(
+            validate_schema_name(&name).is_err(),
+            "64-byte name should be rejected"
+        );
     }
 }
