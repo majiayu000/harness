@@ -65,6 +65,120 @@ pub async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> 
     make_state_inner(dir, dir, AgentRegistry::new("test")).await
 }
 
+pub async fn make_test_state_with_config(
+    dir: &std::path::Path,
+    config: HarnessConfig,
+) -> anyhow::Result<Arc<AppState>> {
+    let rate_limit = config.server.password_reset_rate_limit_per_hour;
+    let server = Arc::new(HarnessServer::new(
+        config,
+        ThreadManager::new(),
+        AgentRegistry::new("test"),
+    ));
+    let tasks = crate::task_runner::TaskStore::open(&harness_core::config::dirs::default_db_path(
+        dir, "tasks",
+    ))
+    .await?;
+    let events = Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
+    let signal_detector = harness_gc::signal_detector::SignalDetector::new(
+        server.config.gc.signal_thresholds.clone().into(),
+        harness_core::types::ProjectId::new(),
+    );
+    let draft_store = harness_gc::draft_store::DraftStore::new(dir)?;
+    let gc_agent = Arc::new(harness_gc::gc_agent::GcAgent::new(
+        server.config.gc.clone(),
+        signal_detector,
+        draft_store,
+        dir.to_path_buf(),
+    ));
+    let thread_db = crate::thread_db::ThreadDb::open(&harness_core::config::dirs::default_db_path(
+        dir, "threads",
+    ))
+    .await?;
+    let (notification_tx, _) = tokio::sync::broadcast::channel(64);
+    let task_queue = Arc::new(crate::task_queue::TaskQueue::new(&Default::default()));
+    let project_svc = crate::services::project::DefaultProjectService::new(
+        crate::project_registry::ProjectRegistry::open(
+            &harness_core::config::dirs::default_db_path(dir, "projects"),
+        )
+        .await?,
+        dir.to_path_buf(),
+    );
+    let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+    let execution_svc = crate::services::execution::DefaultExecutionService::new(
+        tasks.clone(),
+        server.agent_registry.clone(),
+        Arc::new(server.config.clone()),
+        Default::default(),
+        events.clone(),
+        vec![],
+        None,
+        task_queue.clone(),
+        None,
+        None,
+        vec![],
+    );
+    Ok(Arc::new(AppState {
+        core: crate::http::CoreServices {
+            server,
+            project_root: dir.to_path_buf(),
+            home_dir: std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| dir.to_path_buf()),
+            tasks,
+            thread_db: Some(thread_db),
+            plan_db: None,
+            plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+            project_registry: None,
+            runtime_state_store: None,
+            q_values: None,
+            maintenance_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+        engines: crate::http::EngineServices {
+            skills: Default::default(),
+            rules: Default::default(),
+            gc_agent,
+        },
+        observability: crate::http::ObservabilityServices {
+            events,
+            signal_rate_limiter: Arc::new(crate::http::rate_limit::SignalRateLimiter::new(100)),
+            password_reset_rate_limiter: Arc::new(
+                crate::http::rate_limit::PasswordResetRateLimiter::new(rate_limit),
+            ),
+            review_store: None,
+        },
+        concurrency: crate::http::ConcurrencyServices {
+            task_queue,
+            workspace_mgr: None,
+        },
+        runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
+        runtime_project_cache: Arc::new(
+            crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
+        ),
+        runtime_state_persist_lock: tokio::sync::Mutex::new(()),
+        runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
+        notifications: crate::http::NotificationServices {
+            notification_tx,
+            notification_lagged_total: Arc::new(AtomicU64::new(0)),
+            notification_lag_log_every: 1,
+            notify_tx: None,
+            initializing: Arc::new(AtomicBool::new(true)),
+            initialized: Arc::new(AtomicBool::new(true)),
+            ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
+        },
+        interceptors: vec![],
+        degraded_subsystems: vec![],
+        intake: crate::http::IntakeServices {
+            feishu_intake: None,
+            github_pollers: vec![],
+            completion_callback: None,
+        },
+        project_svc,
+        task_svc,
+        execution_svc,
+    }))
+}
+
 pub async fn make_test_state_with_registry(
     dir: &std::path::Path,
     agent_registry: AgentRegistry,
