@@ -8,6 +8,50 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
+#[derive(Clone, Copy)]
+pub(crate) enum QueueDomain {
+    Primary,
+    Review,
+}
+
+impl QueueDomain {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Review => "review",
+        }
+    }
+}
+
+fn queue_timeout_message(
+    queue: &crate::task_queue::TaskQueue,
+    project_id: &str,
+    domain: QueueDomain,
+) -> String {
+    let diag = queue.diagnostics(project_id);
+    let project_holding = diag.project_running + diag.project_awaiting_global;
+    let project_full = project_holding >= diag.project_limit;
+    let global_full = diag.global_running >= diag.global_limit;
+    let reason = match (global_full, project_full, domain) {
+        (_, _, QueueDomain::Review) => "review capacity domain full",
+        (true, true, _) => "global and project capacity saturated",
+        (true, false, _) => "global capacity saturated",
+        (false, true, _) => "project capacity saturated",
+        (false, false, _) => "permit wait exceeded timeout",
+    };
+    format!(
+        "{reason} (domain={}, global_running={}, global_queued={}, global_limit={}, project_running={}, project_waiting={}, project_awaiting_global={}, project_limit={})",
+        domain.label(),
+        diag.global_running,
+        diag.global_queued,
+        diag.global_limit,
+        diag.project_running,
+        diag.project_waiting_for_project,
+        diag.project_awaiting_global,
+        diag.project_limit,
+    )
+}
+
 /// Resolve a project path-or-ID through the registry.
 ///
 /// If `project` is `None` or already points to an existing directory it is
@@ -175,7 +219,15 @@ pub(crate) fn select_agent(
 
 pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
+    req: task_runner::CreateTaskRequest,
+) -> Result<task_runner::TaskId, EnqueueTaskError> {
+    enqueue_task_in_domain(state, req, QueueDomain::Primary).await
+}
+
+pub(crate) async fn enqueue_task_in_domain(
+    state: &Arc<AppState>,
     mut req: task_runner::CreateTaskRequest,
+    queue_domain: QueueDomain,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
     let now = chrono::Utc::now();
     if state
@@ -274,15 +326,18 @@ pub(crate) async fn enqueue_task(
     }
 
     // Acquire permit; 30 s timeout prevents orphan futures on client disconnect.
+    let queue = match queue_domain {
+        QueueDomain::Primary => state.concurrency.task_queue.clone(),
+        QueueDomain::Review => state.concurrency.review_task_queue.clone(),
+    };
     let permit = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        state
-            .concurrency
-            .task_queue
-            .acquire(&project_id, req.priority),
+        queue.acquire(&project_id, req.priority),
     )
     .await
-    .map_err(|_| EnqueueTaskError::Internal("queue acquisition timed out".to_string()))?
+    .map_err(|_| {
+        EnqueueTaskError::Internal(queue_timeout_message(&queue, &project_id, queue_domain))
+    })?
     .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
 
     let agent = select_agent(
@@ -398,10 +453,19 @@ fn build_conflict_groups(file_refs: &[Vec<String>]) -> Vec<Vec<usize>> {
 /// semaphore before competing for the per-project concurrency slot. Sharing the
 /// same `Semaphore(1)` across multiple tasks in a conflict group serialises their
 /// execution and prevents concurrent edits to the same files.
-async fn enqueue_task_background(
+pub(crate) async fn enqueue_task_background(
+    state: Arc<AppState>,
+    req: task_runner::CreateTaskRequest,
+    group_sem: Option<Arc<tokio::sync::Semaphore>>,
+) -> Result<task_runner::TaskId, EnqueueTaskError> {
+    enqueue_task_background_in_domain(state, req, group_sem, QueueDomain::Primary).await
+}
+
+pub(crate) async fn enqueue_task_background_in_domain(
     state: Arc<AppState>,
     mut req: task_runner::CreateTaskRequest,
     group_sem: Option<Arc<tokio::sync::Semaphore>>,
+    queue_domain: QueueDomain,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
     let now = chrono::Utc::now();
     if state
@@ -497,6 +561,10 @@ async fn enqueue_task_background(
     // The HTTP handler returns the task_id before this future completes.
     {
         let task_id2 = task_id.clone();
+        let queue = match queue_domain {
+            QueueDomain::Primary => state.concurrency.task_queue.clone(),
+            QueueDomain::Review => state.concurrency.review_task_queue.clone(),
+        };
         tokio::spawn(async move {
             // Acquire the group serialisation permit before competing for the
             // per-project concurrency slot, then pass it into spawn_preregistered_task
@@ -506,12 +574,7 @@ async fn enqueue_task_background(
             } else {
                 None
             };
-            match state
-                .concurrency
-                .task_queue
-                .acquire(&project_id, req.priority)
-                .await
-            {
+            match queue.acquire(&project_id, req.priority).await {
                 Ok(permit) => {
                     task_runner::spawn_preregistered_task(
                         task_id2,
@@ -531,11 +594,19 @@ async fn enqueue_task_background(
                     .await;
                 }
                 Err(e) => {
-                    // Queue is full; mark the pre-registered task as failed.
+                    let queue_error =
+                        format!("{} queue admission failed: {e}", queue_domain.label());
+                    tracing::error!(
+                        task_id = %task_id2.0,
+                        project = %project_id,
+                        domain = queue_domain.label(),
+                        error = %queue_error,
+                        "background task admission failed"
+                    );
                     if let Err(persist_err) =
                         task_runner::mutate_and_persist(&state.core.tasks, &task_id2, |s| {
                             s.status = task_runner::TaskStatus::Failed;
-                            s.error = Some(format!("task queue full: {e}"));
+                            s.error = Some(queue_error.clone());
                         })
                         .await
                     {

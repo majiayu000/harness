@@ -704,9 +704,14 @@ async fn run_review_tick(
         ..CreateTaskRequest::default()
     };
 
-    let primary_review_id = task_routes::enqueue_task(state, review_req)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to enqueue periodic review: {e}"))?;
+    let primary_review_id = task_routes::enqueue_task_background_in_domain(
+        state.clone(),
+        review_req,
+        None,
+        task_routes::QueueDomain::Review,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to enqueue periodic review: {e}"))?;
     tracing::info!(
         task_id = %primary_review_id,
         agent = %review_agent,
@@ -803,7 +808,14 @@ async fn run_review_tick(
                 project: Some(project_root_for_poll.clone()),
                 ..CreateTaskRequest::default()
             };
-            match task_routes::enqueue_task(&state_for_synthesis, req).await {
+            match task_routes::enqueue_task_background_in_domain(
+                state_for_synthesis.clone(),
+                req,
+                None,
+                task_routes::QueueDomain::Review,
+            )
+            .await
+            {
                 Ok(task_id) => {
                     tracing::info!(
                         task_id = %task_id,
@@ -879,7 +891,14 @@ async fn run_review_tick(
                     project: Some(project_root_for_poll.clone()),
                     ..CreateTaskRequest::default()
                 };
-                match task_routes::enqueue_task(&state_for_synthesis, synth_req).await {
+                match task_routes::enqueue_task_background_in_domain(
+                    state_for_synthesis.clone(),
+                    synth_req,
+                    None,
+                    task_routes::QueueDomain::Review,
+                )
+                .await
+                {
                     Ok(synth_id) => {
                         tracing::info!(
                             task_id = %synth_id,
@@ -1544,6 +1563,7 @@ mod tests {
         assert_eq!(config.interval_hours, 24);
         assert!(config.interval_secs.is_none());
         assert_eq!(config.timeout_secs, 900);
+        assert_eq!(config.max_concurrent_tasks, 2);
         assert!(config.agent.is_none());
         assert_eq!(config.strategy, ReviewStrategy::Single);
     }
@@ -1558,6 +1578,7 @@ mod tests {
             agent: Some("codex".to_string()),
             strategy: ReviewStrategy::Cross,
             timeout_secs: 600,
+            max_concurrent_tasks: 3,
         };
         assert!(config.enabled);
         assert!(config.run_on_startup);
@@ -1565,6 +1586,7 @@ mod tests {
         assert_eq!(config.agent.as_deref(), Some("codex"));
         assert_eq!(config.strategy, ReviewStrategy::Cross);
         assert_eq!(config.timeout_secs, 600);
+        assert_eq!(config.max_concurrent_tasks, 3);
     }
 
     #[test]

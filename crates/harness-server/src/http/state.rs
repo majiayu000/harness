@@ -48,6 +48,7 @@ pub struct ObservabilityServices {
 /// Concurrency services: task queue and workspace isolation.
 pub struct ConcurrencyServices {
     pub task_queue: Arc<crate::task_queue::TaskQueue>,
+    pub review_task_queue: Arc<crate::task_queue::TaskQueue>,
     pub workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
 }
 

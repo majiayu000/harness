@@ -362,7 +362,11 @@ async fn run_repo_sprint(
         return;
     }
 
-    let max_slots = 4usize; // matches max_concurrent in config
+    let project_id = project_root.to_string_lossy().into_owned();
+    let max_slots = state
+        .concurrency
+        .task_queue
+        .effective_project_limit(&project_id);
     let start = tokio::time::Instant::now();
 
     'sprint: loop {

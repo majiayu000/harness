@@ -8,6 +8,7 @@ use super::{engines::EnginesBundle, registry::RegistryBundle, storage::StorageBu
 /// Outputs of the intake initialization phase.
 pub(crate) struct IntakeBundle {
     pub task_queue: Arc<crate::task_queue::TaskQueue>,
+    pub review_task_queue: Arc<crate::task_queue::TaskQueue>,
     pub feishu_intake: Option<Arc<crate::intake::feishu::FeishuIntake>>,
     /// GitHub pollers keyed as `"github:{owner/repo}"` for per-repo routing.
     /// The same `Arc` instances are shared with the completion callback.
@@ -28,7 +29,7 @@ pub(crate) async fn build_intake(
     project_root: &Path,
     data_dir: &Path,
 ) -> anyhow::Result<IntakeBundle> {
-    // ── Task queue ────────────────────────────────────────────────────────────
+    // ── Task queues ───────────────────────────────────────────────────────────
     let memory_pressure =
         server
             .config
@@ -39,14 +40,21 @@ pub(crate) async fn build_intake(
                 tracing::info!(threshold_mb, poll_secs, "memory pressure monitor enabled");
                 crate::memory_monitor::start(threshold_mb, poll_secs)
             });
+    let issue_queue_config = runtime_issue_concurrency_config(server);
+    let review_queue_config = runtime_review_concurrency_config(server);
     let task_queue = Arc::new(crate::task_queue::TaskQueue::new_with_pressure(
-        &server.config.concurrency,
+        &issue_queue_config,
+        memory_pressure.clone(),
+    ));
+    let review_task_queue = Arc::new(crate::task_queue::TaskQueue::new_with_pressure(
+        &review_queue_config,
         memory_pressure,
     ));
     tracing::debug!(
-        max_concurrent = server.config.concurrency.max_concurrent_tasks,
-        max_queue_size = server.config.concurrency.max_queue_size,
-        "task queue initialized"
+        max_concurrent = issue_queue_config.max_concurrent_tasks,
+        max_queue_size = issue_queue_config.max_queue_size,
+        review_max_concurrent = review_queue_config.max_concurrent_tasks,
+        "task queues initialized"
     );
 
     // ── Feishu intake ─────────────────────────────────────────────────────────
@@ -224,10 +232,59 @@ pub(crate) async fn build_intake(
 
     Ok(IntakeBundle {
         task_queue,
+        review_task_queue,
         feishu_intake,
         github_pollers,
         completion_callback,
     })
+}
+
+fn runtime_issue_concurrency_config(
+    server: &HarnessServer,
+) -> harness_core::config::misc::ConcurrencyConfig {
+    let mut config = server.config.concurrency.clone();
+    let mut derived_total = 0usize;
+
+    for project in &server.startup_projects {
+        let Some(limit) = project.max_concurrent.map(|value| value as usize) else {
+            continue;
+        };
+        let canonical = project
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| project.root.clone())
+            .to_string_lossy()
+            .into_owned();
+        config.per_project.entry(canonical).or_insert(limit);
+        derived_total = derived_total.saturating_add(limit);
+    }
+
+    if derived_total > 0 {
+        config.max_concurrent_tasks = config.max_concurrent_tasks.max(derived_total);
+    }
+
+    config
+}
+
+fn runtime_review_concurrency_config(
+    server: &HarnessServer,
+) -> harness_core::config::misc::ConcurrencyConfig {
+    let mut config = server.config.concurrency.clone();
+    config.max_concurrent_tasks = server.config.review.max_concurrent_tasks.max(1);
+    config.per_project = server
+        .startup_projects
+        .iter()
+        .map(|project| {
+            let canonical = project
+                .root
+                .canonicalize()
+                .unwrap_or_else(|_| project.root.clone())
+                .to_string_lossy()
+                .into_owned();
+            (canonical, 1usize)
+        })
+        .collect();
+    config
 }
 
 #[cfg(test)]
@@ -285,5 +342,61 @@ mod tests {
             bundle.github_pollers.is_empty(),
             "github_pollers should be empty without config"
         );
+    }
+
+    #[test]
+    fn runtime_issue_concurrency_uses_startup_project_limits() {
+        let mut server = HarnessServer::new(
+            HarnessConfig::default(),
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        );
+        server.config.concurrency.max_concurrent_tasks = 6;
+        server.startup_projects = vec![
+            harness_core::config::ProjectEntry {
+                name: "a".to_string(),
+                root: std::path::PathBuf::from("/tmp/a"),
+                default: false,
+                default_agent: None,
+                max_concurrent: Some(4),
+            },
+            harness_core::config::ProjectEntry {
+                name: "b".to_string(),
+                root: std::path::PathBuf::from("/tmp/b"),
+                default: false,
+                default_agent: None,
+                max_concurrent: Some(8),
+            },
+        ];
+
+        let cfg = runtime_issue_concurrency_config(&server);
+
+        assert_eq!(cfg.max_concurrent_tasks, 12);
+        assert_eq!(cfg.per_project.len(), 2);
+        assert!(cfg.per_project.values().any(|v| *v == 4));
+        assert!(cfg.per_project.values().any(|v| *v == 8));
+    }
+
+    #[test]
+    fn runtime_review_concurrency_uses_dedicated_domain() {
+        let mut server = HarnessServer::new(
+            HarnessConfig::default(),
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        );
+        server.config.review.max_concurrent_tasks = 3;
+        server.startup_projects = vec![harness_core::config::ProjectEntry {
+            name: "a".to_string(),
+            root: std::path::PathBuf::from("/tmp/a"),
+            default: false,
+            default_agent: None,
+            max_concurrent: Some(8),
+        }];
+
+        let cfg = runtime_review_concurrency_config(&server);
+
+        assert_eq!(cfg.max_concurrent_tasks, 3);
+        assert_eq!(cfg.per_project.len(), 1);
+        assert!(cfg.per_project.values().all(|v| *v == 1));
     }
 }

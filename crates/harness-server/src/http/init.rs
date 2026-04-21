@@ -201,6 +201,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         },
         concurrency: ConcurrencyServices {
             task_queue: intake.task_queue,
+            review_task_queue: intake.review_task_queue,
             workspace_mgr: registry.workspace_mgr,
         },
         runtime_hosts: services.runtime_hosts,
