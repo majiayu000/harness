@@ -77,7 +77,7 @@ pub(super) struct RecoveryRow {
 /// When adding a field to `TaskRow`, add the column here once and all queries
 /// pick it up automatically.  The `task_row_columns_match_struct` test below
 /// will fail if this list drifts from the struct definition.
-pub(super) const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description, request_settings";
+pub(super) const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, updated_at, repo, depends_on, project, priority, phase, description, request_settings";
 
 #[derive(sqlx::FromRow)]
 pub(super) struct TaskRow {
@@ -91,6 +91,7 @@ pub(super) struct TaskRow {
     pub(super) external_id: Option<String>,
     pub(super) parent_id: Option<String>,
     pub(super) created_at: Option<DateTime<Utc>>,
+    pub(super) updated_at: Option<DateTime<Utc>>,
     pub(super) repo: Option<String>,
     pub(super) depends_on: String,
     pub(super) project: Option<String>,
@@ -117,6 +118,7 @@ pub(super) struct PendingCheckpointRow {
     pub(super) external_id: Option<String>,
     pub(super) parent_id: Option<String>,
     pub(super) created_at: Option<DateTime<Utc>>,
+    pub(super) updated_at: Option<DateTime<Utc>>,
     pub(super) repo: Option<String>,
     pub(super) depends_on: String,
     pub(super) project: Option<String>,
@@ -164,6 +166,7 @@ impl TaskRow {
             external_id,
             parent_id,
             created_at,
+            updated_at,
             repo,
             depends_on,
             project,
@@ -214,6 +217,7 @@ impl TaskRow {
             issue: None,
             description,
             created_at: created_at.map(|dt| dt.to_rfc3339()),
+            updated_at: updated_at.map(|dt| dt.to_rfc3339()),
             priority: priority.clamp(0, 255) as u8,
             phase: decoded_phase,
             triage_output: None,

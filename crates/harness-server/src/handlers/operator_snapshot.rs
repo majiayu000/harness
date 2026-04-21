@@ -24,8 +24,12 @@ const MAX_ERROR_LEN: usize = 200;
 pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
     let generated_at = Utc::now();
 
+    // Bound the retry-event query to the last 2 hours so the endpoint does not
+    // scan unbounded history on long-lived instances.  We only need `.last()`,
+    // so any window that comfortably covers one retry interval is sufficient.
     let retry_filter = EventFilters {
         hook: Some("periodic_retry:summary".to_string()),
+        since: Some(generated_at - chrono::Duration::hours(2)),
         ..Default::default()
     };
     // Collect all subsections concurrently — they are independent.
@@ -75,7 +79,7 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "—".to_string()),
                 "status":       t.status.as_ref(),
-                "stalled_since": t.created_at.as_deref().unwrap_or("—"),
+                "stalled_since": t.updated_at.as_deref().unwrap_or("—"),
             })
         })
         .collect();
@@ -97,7 +101,13 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
                 .as_deref()
                 .map(|e| {
                     if e.len() > MAX_ERROR_LEN {
-                        format!("{}…", &e[..MAX_ERROR_LEN])
+                        // Walk back to a valid char boundary to avoid panicking
+                        // on multi-byte UTF-8 characters at the cut point.
+                        let mut boundary = MAX_ERROR_LEN;
+                        while boundary > 0 && !e.is_char_boundary(boundary) {
+                            boundary -= 1;
+                        }
+                        format!("{}…", &e[..boundary])
                     } else {
                         e.to_string()
                     }
@@ -111,7 +121,7 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "—".to_string()),
                 "error":      error,
-                "failed_at":  t.created_at.as_deref().unwrap_or("—"),
+                "failed_at":  t.updated_at.as_deref().unwrap_or("—"),
             })
         })
         .collect();
@@ -267,6 +277,7 @@ mod tests {
                 repo: None,
                 description: None,
                 created_at: None,
+                updated_at: None,
                 priority: 0,
                 phase: crate::task_runner::TaskPhase::Implement,
                 triage_output: None,
@@ -321,6 +332,7 @@ mod tests {
             repo: None,
             description: None,
             created_at: None,
+            updated_at: None,
             priority: 0,
             phase: crate::task_runner::TaskPhase::Implement,
             triage_output: None,
@@ -348,6 +360,64 @@ mod tests {
             "error should be truncated, got len {}",
             error_str.len()
         );
+        Ok(())
+    }
+
+    /// Regression test: multi-byte UTF-8 at the truncation boundary must not panic.
+    /// A 3-byte emoji repeated so that the cut falls mid-character verifies the
+    /// is_char_boundary walk-back in the truncation logic.
+    #[tokio::test]
+    async fn unicode_error_truncation_does_not_panic() -> anyhow::Result<()> {
+        let _lock = test_helpers::HOME_LOCK.lock().await;
+        let dir = test_helpers::tempdir_in_home("harness-test-op-snap-unicode-")?;
+        let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+
+        // "€" is 3 bytes; repeat enough times that the 200-byte cut falls mid-char.
+        let unicode_error = "€".repeat(100); // 300 bytes total
+        let task = crate::task_runner::TaskState {
+            id: harness_core::types::TaskId("unicode-task".to_string()),
+            status: crate::task_runner::TaskStatus::Failed,
+            turn: 1,
+            pr_url: None,
+            rounds: vec![],
+            error: Some(unicode_error),
+            source: None,
+            external_id: Some("issue:unicode".to_string()),
+            parent_id: None,
+            depends_on: vec![],
+            subtask_ids: vec![],
+            project_root: Some(std::path::PathBuf::from("/test/proj")),
+            issue: None,
+            repo: None,
+            description: None,
+            created_at: None,
+            updated_at: None,
+            priority: 0,
+            phase: crate::task_runner::TaskPhase::Implement,
+            triage_output: None,
+            plan_output: None,
+            request_settings: None,
+        };
+        state.core.tasks.insert(&task).await;
+
+        let app = Router::new()
+            .route("/api/operator-snapshot", get(operator_snapshot))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/api/operator-snapshot")
+            .body(axum::body::Body::empty())?;
+        // Must not panic (no 500).
+        let resp = tower::ServiceExt::oneshot(app, req).await?;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let failures = body["recent_failures"].as_array().expect("array");
+        assert!(!failures.is_empty());
+        let error_str = failures[0]["error"].as_str().expect("string");
+        // Result must be valid UTF-8 (serde_json already guarantees this) and bounded.
+        assert!(error_str.len() <= MAX_ERROR_LEN + 4);
         Ok(())
     }
 }

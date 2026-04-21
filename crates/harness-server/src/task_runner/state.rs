@@ -57,6 +57,9 @@ pub struct TaskState {
     /// ISO 8601 creation timestamp. Set at spawn time and persisted to the tasks DB.
     #[serde(default)]
     pub created_at: Option<String>,
+    /// ISO 8601 last-updated timestamp. Populated when loaded from the DB.
+    #[serde(default)]
+    pub updated_at: Option<String>,
     /// Scheduling priority: 0 = normal (default), 1 = high, 2 = critical.
     /// Persisted to DB and used by TaskQueue::acquire to skip lower-priority waiters.
     #[serde(default)]
@@ -133,6 +136,7 @@ impl TaskState {
             issue: None,
             description: None,
             created_at: Some(chrono::Utc::now().to_rfc3339()),
+            updated_at: None,
             priority: 0,
             phase: TaskPhase::default(),
             triage_output: None,
