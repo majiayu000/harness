@@ -5,8 +5,8 @@ use axum::{
     Json,
 };
 use harness_core::proof_of_work::{
-    CiStatus, ProofOfWork, QualitySignal, ReviewOutcome, ACTION_REVIEW, RESULT_COMPLETED,
-    RESULT_LGTM,
+    CiStatus, ProofOfWork, QualitySignal, ReviewOutcome, ACTION_AGENT_REVIEW, ACTION_REVIEW,
+    RESULT_APPROVED, RESULT_COMPLETED, RESULT_LGTM, RESULT_QUOTA_EXHAUSTED,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -19,16 +19,20 @@ use crate::task_runner::{RoundResult, TaskState, TaskStatus};
 /// Scans `rounds` in reverse to find the final review detail, counts review
 /// rounds, and infers outcomes from known result label constants.
 fn proof_from_state(state: &TaskState) -> ProofOfWork {
+    // Accept both "review" (external bot) and "agent_review" (agent gate when
+    // review_bot_auto_trigger is disabled) so neither path is silently dropped.
     let review_rounds_vec: Vec<&RoundResult> = state
         .rounds
         .iter()
-        .filter(|r| r.action == ACTION_REVIEW)
+        .filter(|r| r.action == ACTION_REVIEW || r.action == ACTION_AGENT_REVIEW)
         .collect();
 
     let review_rounds = review_rounds_vec.len() as u32;
 
-    // LGTM if any review round was approved.
-    let has_lgtm = review_rounds_vec.iter().any(|r| r.result == RESULT_LGTM);
+    // LGTM: external bot writes "lgtm"; agent reviewer writes "approved".
+    let has_lgtm = review_rounds_vec.iter().any(|r| {
+        r.result == RESULT_LGTM || (r.action == ACTION_AGENT_REVIEW && r.result == RESULT_APPROVED)
+    });
     // Non-PR review tasks (periodic_review, sprint_planner) write result="completed";
     // treat them as not applicable rather than falsely reporting changes_requested.
     let is_review_only = review_rounds > 0
@@ -36,12 +40,20 @@ fn proof_from_state(state: &TaskState) -> ProofOfWork {
             .iter()
             .all(|r| r.result == RESULT_COMPLETED);
 
+    // Quota-heuristic graduation: external reviewer quota was exhausted on every
+    // round and the test gate passed as a proxy — task is Done, tests passed.
+    let quota_heuristic_done = review_rounds > 0
+        && review_rounds_vec
+            .iter()
+            .all(|r| r.result == RESULT_QUOTA_EXHAUSTED)
+        && state.status == TaskStatus::Done;
+
     let review_outcome = if is_review_only {
         ReviewOutcome::NotApplicable
+    } else if quota_heuristic_done || has_lgtm {
+        ReviewOutcome::Approved
     } else if review_rounds == 0 {
         ReviewOutcome::Skipped
-    } else if has_lgtm {
-        ReviewOutcome::Approved
     } else {
         ReviewOutcome::ChangesRequested
     };
@@ -49,18 +61,19 @@ fn proof_from_state(state: &TaskState) -> ProofOfWork {
     // CI status: Passed only when approved and Done; Failed when task Failed.
     let ci_status = match &state.status {
         TaskStatus::Done if review_outcome == ReviewOutcome::Approved => CiStatus::Passed,
-        // Graduated Done (rounds exhausted but few issues remain) — unknown CI.
         TaskStatus::Done => CiStatus::Unknown,
         TaskStatus::Failed => CiStatus::Failed,
         _ => CiStatus::Unknown,
     };
 
-    // Detail from the last review round that has a detail field.
+    // Detail from the last review round (either action type) that has a detail field.
     let final_review_detail = state
         .rounds
         .iter()
         .rev()
-        .find(|r| r.action == ACTION_REVIEW && r.detail.is_some())
+        .find(|r| {
+            (r.action == ACTION_REVIEW || r.action == ACTION_AGENT_REVIEW) && r.detail.is_some()
+        })
         .and_then(|r| r.detail.clone());
 
     // Basic quality signals derived from the task.

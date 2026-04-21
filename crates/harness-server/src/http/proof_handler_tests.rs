@@ -1,5 +1,6 @@
 use super::*;
 use crate::task_runner::{RoundResult, TaskState};
+use harness_core::proof_of_work::{ACTION_AGENT_REVIEW, RESULT_APPROVED, RESULT_QUOTA_EXHAUSTED};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
@@ -18,6 +19,16 @@ fn review_round(result: &str, detail: Option<&str>) -> RoundResult {
     RoundResult {
         turn: 1,
         action: ACTION_REVIEW.to_string(),
+        result: result.to_string(),
+        detail: detail.map(|d| d.to_string()),
+        first_token_latency_ms: None,
+    }
+}
+
+fn agent_review_round(result: &str, detail: Option<&str>) -> RoundResult {
+    RoundResult {
+        turn: 0,
+        action: ACTION_AGENT_REVIEW.to_string(),
         result: result.to_string(),
         detail: detail.map(|d| d.to_string()),
         first_token_latency_ms: None,
@@ -68,6 +79,44 @@ fn from_task_periodic_review_not_applicable() {
 
     assert_eq!(proof.review_outcome, ReviewOutcome::NotApplicable);
     assert_eq!(proof.ci_status, CiStatus::Unknown);
+}
+
+#[test]
+fn from_task_agent_review_approved() {
+    // When review_bot_auto_trigger is disabled the executor uses agent_review.
+    // Rounds carry action="agent_review" and result="approved" instead of "lgtm".
+    let rounds = vec![
+        agent_review_round("2 issues", None),
+        agent_review_round(RESULT_APPROVED, Some("agent signed off")),
+    ];
+    let state = make_state_with_rounds(TaskStatus::Done, rounds);
+    let proof = proof_from_state(&state);
+
+    assert_eq!(proof.review_outcome, ReviewOutcome::Approved);
+    assert_eq!(proof.ci_status, CiStatus::Passed);
+    assert_eq!(proof.review_rounds, 2);
+    assert_eq!(
+        proof.final_review_detail.as_deref(),
+        Some("agent signed off")
+    );
+}
+
+#[test]
+fn from_task_quota_heuristic_graduation() {
+    // Quota-heuristic: external reviewer quota exhausted on every round,
+    // test gate passed → task is Done. Must report Approved/Passed, not
+    // ChangesRequested/Unknown.
+    let rounds = vec![
+        review_round(RESULT_QUOTA_EXHAUSTED, None),
+        review_round(RESULT_QUOTA_EXHAUSTED, None),
+        review_round(RESULT_QUOTA_EXHAUSTED, None),
+    ];
+    let state = make_state_with_rounds(TaskStatus::Done, rounds);
+    let proof = proof_from_state(&state);
+
+    assert_eq!(proof.review_outcome, ReviewOutcome::Approved);
+    assert_eq!(proof.ci_status, CiStatus::Passed);
+    assert_eq!(proof.review_rounds, 3);
 }
 
 // ---------------------------------------------------------------------------

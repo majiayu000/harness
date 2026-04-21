@@ -66,8 +66,17 @@ pub const RESULT_LGTM: &str = "lgtm";
 /// Result label written by the pipeline when a non-PR review task completes.
 pub const RESULT_COMPLETED: &str = "completed";
 
-/// Action label for review rounds.
+/// Result label written by the agent reviewer when it approves the PR.
+pub const RESULT_APPROVED: &str = "approved";
+
+/// Result label written when the external reviewer quota is exhausted.
+pub const RESULT_QUOTA_EXHAUSTED: &str = "quota_exhausted";
+
+/// Action label for review rounds (external bot path).
 pub const ACTION_REVIEW: &str = "review";
+
+/// Action label for agent-review rounds (used when review_bot_auto_trigger is disabled).
+pub const ACTION_AGENT_REVIEW: &str = "agent_review";
 
 #[cfg(test)]
 mod tests {
