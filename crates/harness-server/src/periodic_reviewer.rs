@@ -704,14 +704,10 @@ async fn run_review_tick(
         ..CreateTaskRequest::default()
     };
 
-    let primary_review_id = task_routes::enqueue_task_background_in_domain(
-        state.clone(),
-        review_req,
-        None,
-        task_routes::QueueDomain::Review,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("failed to enqueue periodic review: {e}"))?;
+    let primary_review_id =
+        task_routes::enqueue_task_in_domain(state, review_req, task_routes::QueueDomain::Review)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to enqueue periodic review: {e}"))?;
     tracing::info!(
         task_id = %primary_review_id,
         agent = %review_agent,
@@ -808,10 +804,9 @@ async fn run_review_tick(
                 project: Some(project_root_for_poll.clone()),
                 ..CreateTaskRequest::default()
             };
-            match task_routes::enqueue_task_background_in_domain(
-                state_for_synthesis.clone(),
+            match task_routes::enqueue_task_in_domain(
+                &state_for_synthesis,
                 req,
-                None,
                 task_routes::QueueDomain::Review,
             )
             .await
@@ -891,10 +886,9 @@ async fn run_review_tick(
                     project: Some(project_root_for_poll.clone()),
                     ..CreateTaskRequest::default()
                 };
-                match task_routes::enqueue_task_background_in_domain(
-                    state_for_synthesis.clone(),
+                match task_routes::enqueue_task_in_domain(
+                    &state_for_synthesis,
                     synth_req,
-                    None,
                     task_routes::QueueDomain::Review,
                 )
                 .await

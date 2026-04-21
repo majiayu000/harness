@@ -384,7 +384,18 @@ async fn run_repo_sprint(
         return;
     }
 
-    let project_id = project_root.to_string_lossy().into_owned();
+    let project_id = match crate::task_runner::resolve_canonical_project(Some(project_root.clone()))
+        .await
+    {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(e) => {
+            tracing::warn!(
+                repo,
+                "intake: failed to canonicalize project root for slot limit lookup, using raw path: {e}"
+            );
+            project_root.to_string_lossy().into_owned()
+        }
+    };
     let max_slots = state
         .concurrency
         .task_queue

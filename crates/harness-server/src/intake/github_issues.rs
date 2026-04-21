@@ -228,15 +228,6 @@ impl IntakeSource for GitHubIssuesPoller {
     }
 
     async fn poll(&self) -> anyhow::Result<Vec<IncomingIssue>> {
-        let pruned = self.prune_missing_task_entries().await?;
-        if pruned > 0 {
-            tracing::info!(
-                repo = %self.repo,
-                pruned,
-                "intake: pruned stale dispatched entries whose task IDs do not exist in the current task store"
-            );
-        }
-
         let mut args = vec![
             "issue",
             "list",

@@ -249,12 +249,7 @@ fn runtime_issue_concurrency_config(
         let Some(limit) = project.max_concurrent.map(|value| value as usize) else {
             continue;
         };
-        let canonical = project
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| project.root.clone())
-            .to_string_lossy()
-            .into_owned();
+        let canonical = project.root.to_string_lossy().into_owned();
         config.per_project.entry(canonical).or_insert(limit);
         derived_total = derived_total.saturating_add(limit);
     }
@@ -275,12 +270,7 @@ fn runtime_review_concurrency_config(
         .startup_projects
         .iter()
         .map(|project| {
-            let canonical = project
-                .root
-                .canonicalize()
-                .unwrap_or_else(|_| project.root.clone())
-                .to_string_lossy()
-                .into_owned();
+            let canonical = project.root.to_string_lossy().into_owned();
             (canonical, 1usize)
         })
         .collect();
