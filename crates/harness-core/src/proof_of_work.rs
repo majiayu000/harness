@@ -10,6 +10,8 @@ pub enum ReviewOutcome {
     ChangesRequested,
     /// No review rounds were executed.
     Skipped,
+    /// Review was informational only (e.g. periodic_review, sprint_planner) — no PR was reviewed.
+    NotApplicable,
 }
 
 /// Outcome of the CI/test gate for a completed task.
@@ -60,6 +62,9 @@ impl ProofOfWork {
 
 /// Result label written by the review loop when the reviewer approves.
 pub const RESULT_LGTM: &str = "lgtm";
+
+/// Result label written by the pipeline when a non-PR review task completes.
+pub const RESULT_COMPLETED: &str = "completed";
 
 /// Action label for review rounds.
 pub const ACTION_REVIEW: &str = "review";

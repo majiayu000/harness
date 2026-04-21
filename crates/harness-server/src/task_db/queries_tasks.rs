@@ -24,9 +24,9 @@ impl TaskDb {
         sqlx::query(
             "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, \
              parent_id, created_at, repo, depends_on, project, priority, phase, description, \
-             request_settings) \
+             request_settings, issue) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                     COALESCE($10, CURRENT_TIMESTAMP), $11, $12, $13, $14, $15, $16, $17)",
+                     COALESCE($10, CURRENT_TIMESTAMP), $11, $12, $13, $14, $15, $16, $17, $18)",
         )
         .bind(&state.id.0)
         .bind(status)
@@ -50,6 +50,7 @@ impl TaskDb {
         .bind(&phase_json)
         .bind(state.description.as_deref())
         .bind(settings_json.as_deref())
+        .bind(state.issue.map(|n| n as i64))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -68,8 +69,8 @@ impl TaskDb {
             "UPDATE tasks SET status = $1, turn = $2, pr_url = $3, rounds = $4, error = $5, \
                     source = $6, external_id = $7, repo = $8, depends_on = $9, project = $10, \
                     priority = $11, phase = $12, description = $13, request_settings = $14, \
-                    updated_at = CURRENT_TIMESTAMP, version = version + 1 \
-             WHERE id = $15",
+                    issue = $15, updated_at = CURRENT_TIMESTAMP, version = version + 1 \
+             WHERE id = $16",
         )
         .bind(status)
         .bind(state.turn as i64)
@@ -90,6 +91,7 @@ impl TaskDb {
         .bind(&phase_json)
         .bind(state.description.as_deref())
         .bind(settings_json.as_deref())
+        .bind(state.issue.map(|n| n as i64))
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;

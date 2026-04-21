@@ -133,4 +133,9 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
         description: "add version column for optimistic locking",
         sql: "ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
     },
+    Migration {
+        version: 19,
+        description: "add issue column for github issue number persistence",
+        sql: "ALTER TABLE tasks ADD COLUMN issue BIGINT",
+    },
 ];

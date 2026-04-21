@@ -77,7 +77,7 @@ pub(super) struct RecoveryRow {
 /// When adding a field to `TaskRow`, add the column here once and all queries
 /// pick it up automatically.  The `task_row_columns_match_struct` test below
 /// will fail if this list drifts from the struct definition.
-pub(super) const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description, request_settings";
+pub(super) const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description, request_settings, issue";
 
 #[derive(sqlx::FromRow)]
 pub(super) struct TaskRow {
@@ -98,6 +98,7 @@ pub(super) struct TaskRow {
     pub(super) phase: String,
     pub(super) description: Option<String>,
     pub(super) request_settings: Option<String>,
+    pub(super) issue: Option<i64>,
 }
 
 /// Combined row for the pending-tasks-with-checkpoint JOIN query.
@@ -124,6 +125,7 @@ pub(super) struct PendingCheckpointRow {
     pub(super) phase: String,
     pub(super) description: Option<String>,
     pub(super) request_settings: Option<String>,
+    pub(super) issue: Option<i64>,
     // Checkpoint columns (aliased)
     pub(super) triage_output: Option<String>,
     pub(super) plan_output: Option<String>,
@@ -171,6 +173,7 @@ impl TaskRow {
             phase,
             description,
             request_settings,
+            issue,
         } = self;
 
         let decoded_request_settings: Option<crate::task_runner::PersistedRequestSettings> =
@@ -211,7 +214,7 @@ impl TaskRow {
             depends_on: decoded_depends_on,
             subtask_ids: Vec::new(),
             project_root: project.map(PathBuf::from),
-            issue: None,
+            issue: issue.map(|n| n as u64),
             description,
             created_at: created_at.map(|dt| dt.to_rfc3339()),
             priority: priority.clamp(0, 255) as u8,

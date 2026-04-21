@@ -5,7 +5,8 @@ use axum::{
     Json,
 };
 use harness_core::proof_of_work::{
-    CiStatus, ProofOfWork, QualitySignal, ReviewOutcome, ACTION_REVIEW, RESULT_LGTM,
+    CiStatus, ProofOfWork, QualitySignal, ReviewOutcome, ACTION_REVIEW, RESULT_COMPLETED,
+    RESULT_LGTM,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -28,8 +29,16 @@ fn proof_from_state(state: &TaskState) -> ProofOfWork {
 
     // LGTM if any review round was approved.
     let has_lgtm = review_rounds_vec.iter().any(|r| r.result == RESULT_LGTM);
+    // Non-PR review tasks (periodic_review, sprint_planner) write result="completed";
+    // treat them as not applicable rather than falsely reporting changes_requested.
+    let is_review_only = review_rounds > 0
+        && review_rounds_vec
+            .iter()
+            .all(|r| r.result == RESULT_COMPLETED);
 
-    let review_outcome = if review_rounds == 0 {
+    let review_outcome = if is_review_only {
+        ReviewOutcome::NotApplicable
+    } else if review_rounds == 0 {
         ReviewOutcome::Skipped
     } else if has_lgtm {
         ReviewOutcome::Approved
@@ -134,60 +143,5 @@ pub(crate) async fn get_task_proof(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::task_runner::{RoundResult, TaskState};
-
-    fn make_state_with_rounds(status: TaskStatus, rounds: Vec<RoundResult>) -> TaskState {
-        let mut s = TaskState::new(harness_core::types::TaskId("test-id".to_string()));
-        s.status = status;
-        s.rounds = rounds;
-        s
-    }
-
-    fn review_round(result: &str, detail: Option<&str>) -> RoundResult {
-        RoundResult {
-            turn: 1,
-            action: ACTION_REVIEW.to_string(),
-            result: result.to_string(),
-            detail: detail.map(|d| d.to_string()),
-            first_token_latency_ms: None,
-        }
-    }
-
-    #[test]
-    fn from_task_done_with_approved_review() {
-        let rounds = vec![
-            review_round("fixed", None),
-            review_round(RESULT_LGTM, Some("all good")),
-        ];
-        let state = make_state_with_rounds(TaskStatus::Done, rounds);
-        let proof = proof_from_state(&state);
-
-        assert_eq!(proof.review_outcome, ReviewOutcome::Approved);
-        assert_eq!(proof.ci_status, CiStatus::Passed);
-        assert_eq!(proof.review_rounds, 2);
-        assert_eq!(proof.final_review_detail.as_deref(), Some("all good"));
-    }
-
-    #[test]
-    fn from_task_done_ci_failed_no_lgtm() {
-        let rounds = vec![review_round("fixed", None)];
-        let state = make_state_with_rounds(TaskStatus::Failed, rounds);
-        let proof = proof_from_state(&state);
-
-        assert_eq!(proof.review_outcome, ReviewOutcome::ChangesRequested);
-        assert_eq!(proof.ci_status, CiStatus::Failed);
-    }
-
-    #[test]
-    fn from_task_no_review_rounds() {
-        let state = make_state_with_rounds(TaskStatus::Done, vec![]);
-        let proof = proof_from_state(&state);
-
-        assert_eq!(proof.review_outcome, ReviewOutcome::Skipped);
-        assert_eq!(proof.ci_status, CiStatus::Unknown);
-        assert_eq!(proof.review_rounds, 0);
-        assert!(proof.final_review_detail.is_none());
-    }
-}
+#[path = "proof_handler_tests.rs"]
+mod tests;

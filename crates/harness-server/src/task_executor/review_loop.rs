@@ -384,12 +384,17 @@ pub(crate) async fn run_review_loop(
         }
 
         let result_label = if lgtm { "lgtm" } else { "fixed" };
+        let review_detail = if output.is_empty() {
+            None
+        } else {
+            Some(output.clone())
+        };
         mutate_and_persist(store, task_id, |s| {
             s.rounds.push(RoundResult {
                 turn: round,
                 action: "review".into(),
                 result: result_label.into(),
-                detail: None,
+                detail: review_detail,
                 first_token_latency_ms: None,
             });
         })
