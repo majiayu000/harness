@@ -4,6 +4,8 @@ use std::str::FromStr as _;
 
 use crate::db::Migration;
 
+const DEFAULT_PG_MAX_CONNECTIONS: u32 = 8;
+
 /// Resolve the effective Postgres connection string.
 ///
 /// Precedence:
@@ -29,10 +31,10 @@ pub fn resolve_database_url(configured_database_url: Option<&str>) -> anyhow::Re
 
 /// Create a Postgres connection pool for the given DATABASE_URL.
 ///
-/// Uses 3 max connections with a 10-second acquire timeout.
+/// Uses 8 max connections with a 10-second acquire timeout.
 pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
     let pool = PgPoolOptions::new()
-        .max_connections(3)
+        .max_connections(DEFAULT_PG_MAX_CONNECTIONS)
         .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(database_url)
         .await?;
@@ -105,7 +107,7 @@ pub async fn pg_open_pool_schematized(database_url: &str, schema: &str) -> anyho
     let opts = PgConnectOptions::from_str(database_url)?;
     let schema_for_hook = schema.to_string();
     let pool = PgPoolOptions::new()
-        .max_connections(3)
+        .max_connections(DEFAULT_PG_MAX_CONNECTIONS)
         .acquire_timeout(std::time::Duration::from_secs(10))
         .after_connect(move |conn, _meta| {
             let schema = schema_for_hook.clone();

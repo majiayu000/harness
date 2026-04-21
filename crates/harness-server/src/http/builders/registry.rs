@@ -43,9 +43,10 @@ pub(crate) async fn build_registry(
     }
 
     // ── Plan DB + cache ───────────────────────────────────────────────────────
-    let plan_db = crate::plan_db::PlanDb::open(&harness_core::config::dirs::default_db_path(
-        data_dir, "plans",
-    ))
+    let plan_db = crate::plan_db::PlanDb::open_with_database_url(
+        &harness_core::config::dirs::default_db_path(data_dir, "plans"),
+        configured_database_url,
+    )
     .await?;
 
     let plans_md_dir = data_dir.join("plans");
