@@ -6,6 +6,7 @@ pub mod gc;
 pub mod health;
 pub mod learn;
 pub mod observe;
+pub mod operator_snapshot;
 pub mod overview;
 pub mod preflight;
 pub mod projects;

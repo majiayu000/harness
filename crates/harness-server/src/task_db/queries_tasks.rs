@@ -630,6 +630,20 @@ impl TaskDb {
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 
+    /// Return the most recent `limit` failed tasks, newest first.
+    pub async fn list_recent_failed(&self, limit: i64) -> anyhow::Result<Vec<TaskState>> {
+        let sql = format!(
+            "SELECT {TASK_ROW_COLUMNS} FROM tasks \
+             WHERE status = 'failed' \
+             ORDER BY updated_at DESC LIMIT $1"
+        );
+        let rows = sqlx::query_as::<_, TaskRow>(&sql)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(TaskRow::try_into_task_state).collect()
+    }
+
     /// Expose the raw pool for test-only SQL setup (e.g. back-dating `updated_at`).
     #[cfg(test)]
     pub(crate) fn pool_for_test(&self) -> &sqlx::PgPool {

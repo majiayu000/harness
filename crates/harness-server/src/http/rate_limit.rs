@@ -2,6 +2,18 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
+/// Read-only snapshot of [`SignalRateLimiter`] state.
+pub struct SignalLimiterSnapshot {
+    pub tracked_sources: usize,
+    pub limit_per_minute: u32,
+}
+
+/// Read-only snapshot of [`PasswordResetRateLimiter`] state.
+pub struct PasswordResetLimiterSnapshot {
+    pub tracked_identifiers: usize,
+    pub limit_per_hour: usize,
+}
+
 /// Per-identifier rate limiter for `POST /auth/reset-password`.
 ///
 /// Uses a 1-hour rolling window per email address to prevent brute-force
@@ -32,6 +44,15 @@ impl PasswordResetRateLimiter {
             timestamps: Mutex::new(HashMap::new()),
             max_per_hour: max_per_hour as usize,
             max_tracked_keys,
+        }
+    }
+
+    /// Return a read-only snapshot of the current limiter state.
+    pub fn snapshot(&self) -> PasswordResetLimiterSnapshot {
+        let map = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
+        PasswordResetLimiterSnapshot {
+            tracked_identifiers: map.len(),
+            limit_per_hour: self.max_per_hour,
         }
     }
 
@@ -83,6 +104,15 @@ impl SignalRateLimiter {
         }
     }
 
+    /// Return a read-only snapshot of the current limiter state.
+    pub fn snapshot(&self) -> SignalLimiterSnapshot {
+        let counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        SignalLimiterSnapshot {
+            tracked_sources: counts.len(),
+            limit_per_minute: self.max_per_minute,
+        }
+    }
+
     /// Returns `true` if the request is within the rate limit and increments the counter.
     pub fn check_and_increment(&self, source: &str) -> bool {
         let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
@@ -102,7 +132,7 @@ impl SignalRateLimiter {
 
 #[cfg(test)]
 mod tests {
-    use super::PasswordResetRateLimiter;
+    use super::{PasswordResetRateLimiter, SignalRateLimiter};
 
     #[test]
     fn allows_requests_within_limit() {
@@ -135,5 +165,30 @@ mod tests {
         assert!(limiter.check_and_increment("b@example.com"));
         assert!(!limiter.check_and_increment("c@example.com"));
         assert!(limiter.check_and_increment("a@example.com"));
+    }
+
+    #[test]
+    fn signal_snapshot_empty_on_fresh_limiter() {
+        let limiter = SignalRateLimiter::new(60);
+        let snap = limiter.snapshot();
+        assert_eq!(snap.tracked_sources, 0);
+        assert_eq!(snap.limit_per_minute, 60);
+    }
+
+    #[test]
+    fn signal_snapshot_tracks_after_increment() {
+        let limiter = SignalRateLimiter::new(60);
+        limiter.check_and_increment("src1");
+        let snap = limiter.snapshot();
+        assert_eq!(snap.tracked_sources, 1);
+    }
+
+    #[test]
+    fn signal_snapshot_is_read_only() {
+        let limiter = SignalRateLimiter::new(60);
+        limiter.check_and_increment("src1");
+        let snap1 = limiter.snapshot();
+        let snap2 = limiter.snapshot();
+        assert_eq!(snap1.tracked_sources, snap2.tracked_sources);
     }
 }

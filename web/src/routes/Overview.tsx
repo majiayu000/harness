@@ -11,6 +11,7 @@ import { AlertList } from "@/components/AlertList";
 import { StatusBadge } from "@/components/StatusBadge";
 import { PaletteFab } from "@/components/PaletteFab";
 import { useOverview } from "@/lib/queries";
+import { OperatorPanel } from "./overview/OperatorPanel";
 import { fmtInt, fmtPct, fmtScore } from "@/lib/format";
 
 const SERIES_COLORS = [
@@ -149,6 +150,8 @@ export function Overview() {
               </Panel>
             </Panel>
           </div>
+
+          <OperatorPanel />
         </div>
       </main>
       <PaletteFab />

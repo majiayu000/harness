@@ -25,3 +25,10 @@ pub use spawn::{
 pub use state::{RoundResult, TaskState, TaskSummary};
 pub use store::{mutate_and_persist, update_status, TaskStore};
 pub use types::{TaskId, TaskPhase, TaskStatus};
+
+impl TaskStore {
+    /// Return the most recent `limit` failed tasks, newest first.
+    pub async fn list_recent_failed(&self, limit: i64) -> anyhow::Result<Vec<TaskState>> {
+        self.db.list_recent_failed(limit).await
+    }
+}
