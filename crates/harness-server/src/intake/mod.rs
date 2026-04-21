@@ -253,6 +253,28 @@ fn validate_dag(
     }
 }
 
+fn ready_issues(
+    all_task_issues: &std::collections::HashSet<u64>,
+    completed: &std::collections::HashSet<u64>,
+    cancelled_sprint: &std::collections::HashSet<u64>,
+    running: &std::collections::HashMap<u64, TaskId>,
+    deps: &std::collections::HashMap<u64, Vec<u64>>,
+) -> Vec<u64> {
+    all_task_issues
+        .iter()
+        .filter(|&&issue| {
+            !completed.contains(&issue)
+                && !cancelled_sprint.contains(&issue)
+                && !running.contains_key(&issue)
+                && deps
+                    .get(&issue)
+                    .map(|d| d.iter().all(|dep| completed.contains(dep)))
+                    .unwrap_or(true)
+        })
+        .copied()
+        .collect()
+}
+
 /// Run sprint planner + DAG-based slot-filling execution for a single repo.
 async fn run_repo_sprint(
     state: &Arc<AppState>,
@@ -383,19 +405,13 @@ async fn run_repo_sprint(
         }
 
         // Find ready tasks: not started, not completed, not cancelled, all deps satisfied.
-        let ready: Vec<u64> = all_task_issues
-            .iter()
-            .filter(|&&issue| {
-                !completed.contains(&issue)
-                    && !cancelled_sprint.contains(&issue)
-                    && !running.contains_key(&issue)
-                    && deps
-                        .get(&issue)
-                        .map(|d| d.iter().all(|dep| completed.contains(dep)))
-                        .unwrap_or(true)
-            })
-            .copied()
-            .collect();
+        let ready = ready_issues(
+            &all_task_issues,
+            &completed,
+            &cancelled_sprint,
+            &running,
+            &deps,
+        );
 
         // Fill available slots.
         let available = max_slots.saturating_sub(running.len());
@@ -449,10 +465,18 @@ async fn run_repo_sprint(
                     source.unmark_dispatched(&ext_id).await;
                     break 'sprint;
                 }
-                Err(e) => {
-                    tracing::error!(repo, external_id = %ext_id, "intake: failed to spawn: {e:?}");
+                Err(crate::services::execution::EnqueueTaskError::BadRequest(e)) => {
+                    tracing::error!(repo, external_id = %ext_id, "intake: failed to spawn permanently: {e}");
                     source.unmark_dispatched(&ext_id).await;
                     completed.insert(issue_num);
+                }
+                Err(crate::services::execution::EnqueueTaskError::Internal(e)) => {
+                    tracing::warn!(
+                        repo,
+                        external_id = %ext_id,
+                        "intake: failed to spawn transiently, will retry: {e}"
+                    );
+                    source.unmark_dispatched(&ext_id).await;
                 }
             }
         }
@@ -465,6 +489,23 @@ async fn run_repo_sprint(
                 .filter(|i| !cancelled_sprint.contains(i))
                 .collect();
             if !pending.is_empty() {
+                let retryable_ready = ready_issues(
+                    &all_task_issues,
+                    &completed,
+                    &cancelled_sprint,
+                    &running,
+                    &deps,
+                );
+                if !retryable_ready.is_empty() {
+                    tracing::warn!(
+                        repo,
+                        ready = ?retryable_ready,
+                        pending = ?pending,
+                        "intake: no tasks running but ready work remains; likely capacity or transient enqueue failure, will retry"
+                    );
+                    tokio::time::sleep(TASK_POLL_INTERVAL).await;
+                    continue;
+                }
                 tracing::error!(
                     repo,
                     stranded = ?pending,
@@ -788,6 +829,35 @@ mod tests {
         // Simulates the caller filtering out dep 10 (a skipped issue) before calling validate_dag.
         let deps = make_deps(&[(1, &[]), (2, &[])]);
         assert!(validate_dag(&issues, &deps).is_ok());
+    }
+
+    #[test]
+    fn ready_issues_returns_root_when_dependency_not_completed() {
+        let issues = make_issues(&[41, 42]);
+        let deps = make_deps(&[(41, &[]), (42, &[41])]);
+        let ready = ready_issues(
+            &issues,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &deps,
+        );
+        assert_eq!(ready, vec![41]);
+    }
+
+    #[test]
+    fn ready_issues_excludes_dependent_until_upstream_completed() {
+        let issues = make_issues(&[41, 42]);
+        let deps = make_deps(&[(41, &[]), (42, &[41])]);
+        let completed = make_issues(&[41]);
+        let ready = ready_issues(
+            &issues,
+            &completed,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &deps,
+        );
+        assert_eq!(ready, vec![42]);
     }
 
     #[test]
