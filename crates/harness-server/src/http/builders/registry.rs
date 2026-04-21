@@ -25,9 +25,14 @@ pub(crate) async fn build_registry(
     project_root: &Path,
     tasks: &Arc<crate::task_runner::TaskStore>,
 ) -> anyhow::Result<RegistryBundle> {
+    let configured_database_url = server.config.server.database_url.as_deref();
     // ── Thread DB ─────────────────────────────────────────────────────────────
     let thread_db_path = harness_core::config::dirs::default_db_path(data_dir, "threads");
-    let thread_db = crate::thread_db::ThreadDb::open(&thread_db_path).await?;
+    let thread_db = crate::thread_db::ThreadDb::open_with_database_url(
+        &thread_db_path,
+        configured_database_url,
+    )
+    .await?;
 
     // Load persisted threads into the in-memory ThreadManager cache.
     for thread in thread_db.list().await? {
@@ -69,8 +74,9 @@ pub(crate) async fn build_registry(
     }
 
     // ── Project registry ──────────────────────────────────────────────────────
-    let project_registry = crate::project_registry::ProjectRegistry::open(
+    let project_registry = crate::project_registry::ProjectRegistry::open_with_database_url(
         &harness_core::config::dirs::default_db_path(data_dir, "projects"),
+        configured_database_url,
     )
     .await?;
 
@@ -178,7 +184,12 @@ pub(crate) async fn build_registry(
     let runtime_state_store = {
         let runtime_state_db_path =
             harness_core::config::dirs::default_db_path(data_dir, "runtime_state");
-        match crate::runtime_state_store::RuntimeStateStore::open(&runtime_state_db_path).await {
+        match crate::runtime_state_store::RuntimeStateStore::open_with_database_url(
+            &runtime_state_db_path,
+            configured_database_url,
+        )
+        .await
+        {
             Ok(store) => Some(Arc::new(store)),
             Err(e) => {
                 tracing::warn!(

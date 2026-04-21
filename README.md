@@ -99,8 +99,9 @@ track internal crate layout changes.
 
 ### Database Setup
 
-Harness requires Postgres 14+ (SQLite was removed in v0.x). Set `DATABASE_URL`
-before starting the server — migrations run automatically on first connect.
+Harness requires Postgres 14+ (SQLite was removed in v0.x). Configure
+`server.database_url` in your TOML config before starting the server —
+migrations run automatically on first connect.
 
 **Option A — Docker Compose (recommended for local dev):**
 
@@ -108,25 +109,26 @@ before starting the server — migrations run automatically on first connect.
 # Start Postgres container (idempotent — safe to re-run)
 bash scripts/dev-db.sh
 
-# Then export the printed connection string:
-export DATABASE_URL=postgres://harness:harness@localhost:5432/harness
+# Then set `server.database_url = "postgres://harness:harness@localhost:5432/harness"`
+# in your config file (for example `config/default.toml`).
 ```
 
 **Option B — docker compose directly:**
 
 ```bash
 docker compose up -d postgres
-export DATABASE_URL=postgres://harness:harness@localhost:5432/harness
+# Then set `server.database_url = "postgres://harness:harness@localhost:5432/harness"`
+# in your config file.
 ```
 
 **Option C — existing Postgres instance:**
 
-```bash
-export DATABASE_URL=postgres://user:password@host:5432/dbname
-```
+Set `server.database_url` to any existing Postgres 14+ instance:
 
-Copy `.env.example` to `.env` for a reference of all required env vars.
-`.env` is git-ignored; never commit real credentials.
+```toml
+[server]
+database_url = "postgres://user:password@host:5432/dbname"
+```
 
 **Running tests against a real database:**
 

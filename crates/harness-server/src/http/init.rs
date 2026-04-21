@@ -81,7 +81,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     }
 
     // Phase 1: storage — dir validation (symlink check, chmod), task DB, q_value DB.
-    let storage = builders::storage::build_storage(&dir).await?;
+    let storage =
+        builders::storage::build_storage(&dir, server.config.server.database_url.as_deref())
+            .await?;
 
     // Phase 2: engines — rule engine, event store (+purge task), GC agent, skill store.
     // Depends on: storage (none directly, but must precede registry which uses storage.tasks).
@@ -141,7 +143,12 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     let review_store = {
         let review_db_path = harness_core::config::dirs::default_db_path(&dir, "reviews");
-        match crate::review_store::ReviewStore::open(&review_db_path).await {
+        match crate::review_store::ReviewStore::open_with_database_url(
+            &review_db_path,
+            server.config.server.database_url.as_deref(),
+        )
+        .await
+        {
             Ok(store) => Some(Arc::new(store)),
             Err(e) => {
                 tracing::warn!("review store init failed, reviews will not be persisted: {e}");

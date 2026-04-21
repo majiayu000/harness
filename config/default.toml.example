@@ -3,11 +3,6 @@
 #
 # REQUIRED ENVIRONMENT VARIABLES (set in shell before starting the server):
 #
-#   DATABASE_URL=postgres://harness:harness@localhost:5432/harness
-#       Postgres 14+ connection string. TOML cannot read env vars — this MUST
-#       be exported in your shell (or a .env loader). See .env.example and
-#       scripts/dev-db.sh for a one-command local dev setup.
-#
 #   GITHUB_TOKEN=ghp_...
 #       Personal access token with repo + read:org scope. Required for
 #       GitHub integration (webhooks, auto-review, issue/PR tasks).
@@ -19,6 +14,7 @@
 [server]
 transport = "http"
 http_addr = "127.0.0.1:9800"
+database_url = "postgres://harness:harness@localhost:5432/harness"
 # Absolute path required — the server does not expand `~`.
 # Default on Linux:  ~/.local/share/harness
 # Default on macOS:  ~/Library/Application Support/harness

@@ -15,7 +15,10 @@ pub(crate) struct StorageBundle {
 ///
 /// On Unix this function refuses to proceed if `data_dir` is a symbolic link
 /// to prevent symlink-hijacking attacks on the persistent data directory.
-pub(crate) async fn build_storage(data_dir: &Path) -> anyhow::Result<StorageBundle> {
+pub(crate) async fn build_storage(
+    data_dir: &Path,
+    configured_database_url: Option<&str>,
+) -> anyhow::Result<StorageBundle> {
     std::fs::create_dir_all(data_dir)?;
 
     #[cfg(unix)]
@@ -38,20 +41,22 @@ pub(crate) async fn build_storage(data_dir: &Path) -> anyhow::Result<StorageBund
 
     let db_path = harness_core::config::dirs::default_db_path(data_dir, "tasks");
     tracing::debug!("task db: {}", db_path.display());
-    let tasks = TaskStore::open(&db_path).await?;
+    let tasks = TaskStore::open_with_database_url(&db_path, configured_database_url).await?;
 
     let q_values_db_path = harness_core::config::dirs::default_db_path(data_dir, "q_values");
     tracing::debug!("q_value db: {}", q_values_db_path.display());
-    let q_values = match QValueStore::open(&q_values_db_path).await {
-        Ok(store) => Some(Arc::new(store)),
-        Err(e) => {
-            tracing::warn!(
-                path = %q_values_db_path.display(),
-                "q_value store init failed, rule utility tracking will be disabled: {e}"
-            );
-            None
-        }
-    };
+    let q_values =
+        match QValueStore::open_with_database_url(&q_values_db_path, configured_database_url).await
+        {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!(
+                    path = %q_values_db_path.display(),
+                    "q_value store init failed, rule utility tracking will be disabled: {e}"
+                );
+                None
+            }
+        };
 
     Ok(StorageBundle { tasks, q_values })
 }
@@ -63,7 +68,7 @@ mod tests {
     #[tokio::test]
     async fn happy_path_both_dbs_open() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let bundle = build_storage(dir.path())
+        let bundle = build_storage(dir.path(), None)
             .await
             .expect("build_storage should succeed");
         // Both stores are accessible; q_values may be Some or None depending on
@@ -80,7 +85,7 @@ mod tests {
         let real_dir = tempfile::tempdir().expect("real tempdir");
         let link_path = real_dir.path().join("symlink_data");
         std::os::unix::fs::symlink(real_dir.path(), &link_path).expect("create symlink");
-        let result = build_storage(&link_path).await;
+        let result = build_storage(&link_path, None).await;
         let err = result.err().expect("expected Err for symlink data_dir");
         let msg = err.to_string();
         assert!(
