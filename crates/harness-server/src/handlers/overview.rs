@@ -134,7 +134,15 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
     // ---- runtime fleet ----
     let runtime_hosts = state.runtime_hosts.list_hosts();
     let mut runtimes_json: Vec<Value> = Vec::with_capacity(runtime_hosts.len());
-    let mut worktrees_used: u64 = 0;
+    // Local single-host worktrees managed by WorkspaceManager, plus any leases
+    // held by remote runtime hosts. Without the workspace_mgr term, single-host
+    // deployments (no registered runtimes) always report 0.
+    let local_worktrees = state
+        .concurrency
+        .workspace_mgr
+        .as_ref()
+        .map_or(0, |m| m.live_count());
+    let mut worktrees_used: u64 = local_worktrees;
     for host in &runtime_hosts {
         let active_leases = state.runtime_hosts.active_lease_count(&host.id) as u64;
         worktrees_used = worktrees_used.saturating_add(active_leases);
@@ -479,6 +487,52 @@ mod tests {
         assert_eq!(
             body["throughput"]["hours"].as_array().unwrap().len(),
             THROUGHPUT_BUCKETS
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worktrees_used_includes_local_workspace_manager() -> anyhow::Result<()> {
+        let _lock = test_helpers::HOME_LOCK.lock().await;
+        let dir = test_helpers::tempdir_in_home("harness-test-overview-wt-")?;
+        let mut state = test_helpers::make_test_state(dir.path()).await?;
+
+        // Seed the workspace manager with 3 live entries (no real git ops needed).
+        let ws_config = harness_core::config::misc::WorkspaceConfig {
+            root: dir.path().join("ws"),
+            ..Default::default()
+        };
+        let mgr = Arc::new(crate::workspace::WorkspaceManager::new(ws_config)?);
+        for i in 0..3u64 {
+            mgr.active.insert(
+                harness_core::types::TaskId(format!("fake-{i}")),
+                crate::workspace::ActiveWorkspace {
+                    workspace_path: dir.path().join(format!("ws/fake-{i}")),
+                    source_repo: dir.path().to_path_buf(),
+                },
+            );
+        }
+        state.concurrency.workspace_mgr = Some(mgr);
+
+        let app = Router::new()
+            .route("/api/overview", get(overview))
+            .with_state(Arc::new(state));
+
+        let req = axum::http::Request::builder()
+            .uri("/api/overview")
+            .body(axum::body::Body::empty())?;
+
+        let resp = tower::ServiceExt::oneshot(app, req).await?;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+        assert_eq!(
+            body["kpi"]["worktrees"]["used"].as_u64(),
+            Some(3),
+            "kpi.worktrees.used should count local workspace manager entries"
         );
 
         Ok(())
