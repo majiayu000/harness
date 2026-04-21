@@ -80,7 +80,7 @@ enabled = false
 # interval_hours = 24
 # agent = "codex"
 # strategy = "single" # or "cross" for dual-review + synthesis
-# timeout_secs = 3600
+# timeout_secs = 10800
 # max_concurrent_tasks = 2
 
 # Register projects below (can also pass --project-root / --project on CLI).
