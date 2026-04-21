@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use super::{
     auth, get_task, get_task_artifacts, get_task_prompts, github_webhook, handle_rpc, health_check,
-    ingest_signal, intake_status, list_tasks, password_reset, project_queue_stats, state::AppState,
-    stream_task_sse, task_routes,
+    ingest_signal, intake_status, list_tasks, password_reset, project_queue_stats, proof_handler,
+    state::AppState, stream_task_sse, task_routes,
 };
 
 pub(super) fn build_router(state: Arc<AppState>) -> Router {
@@ -30,6 +30,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/tasks/batch", post(task_routes::create_tasks_batch))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/cancel", post(task_routes::cancel_task))
+        .route("/tasks/{id}/proof", get(proof_handler::get_task_proof))
         .route("/tasks/{id}/artifacts", get(get_task_artifacts))
         .route("/tasks/{id}/prompts", get(get_task_prompts))
         .route("/tasks/{id}/stream", get(stream_task_sse))
