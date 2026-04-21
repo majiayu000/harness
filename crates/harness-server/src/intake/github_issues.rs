@@ -4,9 +4,22 @@ use dashmap::DashMap;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::{IncomingIssue, IntakeSource, TaskCompletionResult};
 use crate::task_runner::TaskId;
+
+#[async_trait]
+pub(crate) trait DispatchedTaskChecker: Send + Sync {
+    async fn exists(&self, task_id: &TaskId) -> anyhow::Result<bool>;
+}
+
+#[async_trait]
+impl DispatchedTaskChecker for crate::task_runner::TaskStore {
+    async fn exists(&self, task_id: &TaskId) -> anyhow::Result<bool> {
+        self.exists_with_db_fallback(task_id).await
+    }
+}
 
 pub struct GitHubIssuesPoller {
     repo: String,
@@ -14,6 +27,7 @@ pub struct GitHubIssuesPoller {
     project_root: Option<PathBuf>,
     dispatched: DashMap<String, TaskId>,
     persist_path: Option<PathBuf>,
+    task_checker: Option<Arc<dyn DispatchedTaskChecker>>,
 }
 
 impl GitHubIssuesPoller {
@@ -30,7 +44,16 @@ impl GitHubIssuesPoller {
             project_root: repo_config.project_root.as_ref().map(PathBuf::from),
             dispatched,
             persist_path,
+            task_checker: None,
         }
+    }
+
+    pub(crate) fn with_task_checker(
+        mut self,
+        task_checker: Arc<dyn DispatchedTaskChecker>,
+    ) -> Self {
+        self.task_checker = Some(task_checker);
+        self
     }
 
     fn load_dispatched(path: Option<&Path>) -> DashMap<String, TaskId> {
@@ -88,6 +111,54 @@ impl GitHubIssuesPoller {
             }
             Err(e) => tracing::warn!("failed to serialize dispatched state: {e}"),
         }
+    }
+
+    fn is_synthetic_skip_marker(task_id: &TaskId) -> bool {
+        task_id.0.starts_with("skip-")
+    }
+
+    async fn prune_missing_task_entries(&self) -> anyhow::Result<usize> {
+        let Some(task_checker) = &self.task_checker else {
+            return Ok(0);
+        };
+
+        let dispatched: Vec<(String, TaskId)> = self
+            .dispatched
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        let mut stale_issue_ids = Vec::new();
+
+        for (issue_id, task_id) in dispatched {
+            if Self::is_synthetic_skip_marker(&task_id) {
+                continue;
+            }
+            match task_checker.exists(&task_id).await {
+                Ok(true) => {}
+                Ok(false) => stale_issue_ids.push(issue_id),
+                Err(e) => {
+                    tracing::warn!(
+                        repo = %self.repo,
+                        issue_id,
+                        task_id = %task_id.0,
+                        "intake: failed to verify dispatched task existence: {e}"
+                    );
+                }
+            }
+        }
+
+        if !stale_issue_ids.is_empty() {
+            for issue_id in &stale_issue_ids {
+                self.dispatched.remove(issue_id);
+            }
+            self.persist_dispatched();
+        }
+
+        Ok(stale_issue_ids.len())
+    }
+
+    pub async fn reconcile_dispatched_with_store(&self) -> anyhow::Result<usize> {
+        self.prune_missing_task_entries().await
     }
 }
 
@@ -157,6 +228,15 @@ impl IntakeSource for GitHubIssuesPoller {
     }
 
     async fn poll(&self) -> anyhow::Result<Vec<IncomingIssue>> {
+        let pruned = self.prune_missing_task_entries().await?;
+        if pruned > 0 {
+            tracing::info!(
+                repo = %self.repo,
+                pruned,
+                "intake: pruned stale dispatched entries whose task IDs do not exist in the current task store"
+            );
+        }
+
         let mut args = vec![
             "issue",
             "list",
@@ -252,6 +332,19 @@ impl IntakeSource for GitHubIssuesPoller {
 mod tests {
     use super::*;
     use crate::task_runner::TaskStatus;
+    use std::collections::HashSet;
+    use tokio::sync::RwLock;
+
+    struct FakeTaskChecker {
+        existing: RwLock<HashSet<String>>,
+    }
+
+    #[async_trait]
+    impl DispatchedTaskChecker for FakeTaskChecker {
+        async fn exists(&self, task_id: &TaskId) -> anyhow::Result<bool> {
+            Ok(self.existing.read().await.contains(&task_id.0))
+        }
+    }
 
     fn make_dispatched(ids: &[&str]) -> DashMap<String, TaskId> {
         let map = DashMap::new();
@@ -464,5 +557,66 @@ mod tests {
         };
         let poller = GitHubIssuesPoller::new(&repo_cfg, None);
         assert_eq!(poller.name(), "github");
+    }
+
+    #[tokio::test]
+    async fn reconcile_prunes_missing_dispatched_tasks_but_keeps_skip_markers() {
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: None,
+        };
+        let checker = Arc::new(FakeTaskChecker {
+            existing: RwLock::new(
+                ["live-task".to_string()]
+                    .into_iter()
+                    .collect::<HashSet<String>>(),
+            ),
+        });
+        let poller = GitHubIssuesPoller::new(&repo_cfg, None).with_task_checker(checker);
+        poller.dispatched.insert(
+            "1".to_string(),
+            harness_core::types::TaskId("missing-task".to_string()),
+        );
+        poller.dispatched.insert(
+            "2".to_string(),
+            harness_core::types::TaskId("live-task".to_string()),
+        );
+        poller.dispatched.insert(
+            "3".to_string(),
+            harness_core::types::TaskId("skip-3".to_string()),
+        );
+
+        let pruned = poller
+            .reconcile_dispatched_with_store()
+            .await
+            .expect("reconcile should succeed");
+
+        assert_eq!(pruned, 1, "only the missing real task should be pruned");
+        assert!(!poller.dispatched.contains_key("1"));
+        assert!(poller.dispatched.contains_key("2"));
+        assert!(poller.dispatched.contains_key("3"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_without_task_checker_is_noop() {
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: None,
+        };
+        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
+        poller.dispatched.insert(
+            "1".to_string(),
+            harness_core::types::TaskId("missing-task".to_string()),
+        );
+
+        let pruned = poller
+            .reconcile_dispatched_with_store()
+            .await
+            .expect("reconcile should succeed");
+
+        assert_eq!(pruned, 0);
+        assert!(poller.dispatched.contains_key("1"));
     }
 }

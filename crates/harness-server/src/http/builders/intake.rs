@@ -76,31 +76,40 @@ pub(crate) async fn build_intake(
     // Keyed as "github:{owner/repo}" for per-repo routing in the callback;
     // a "github" fallback entry (first poller) supports tasks persisted before
     // this multi-repo routing was introduced.
-    let github_pollers: Vec<(String, Arc<dyn crate::intake::IntakeSource>)> = server
+    let mut github_pollers: Vec<(String, Arc<dyn crate::intake::IntakeSource>)> = Vec::new();
+    if let Some(cfg) = server
         .config
         .intake
         .github
         .as_ref()
         .filter(|cfg| cfg.enabled)
-        .map(|cfg| {
-            cfg.effective_repos()
-                .into_iter()
-                .map(|repo_cfg| {
-                    tracing::info!(
-                        repo = %repo_cfg.repo,
-                        label = %repo_cfg.label,
-                        "intake: GitHub Issues poller registered"
-                    );
-                    let key = format!("github:{}", repo_cfg.repo);
-                    let poller = Arc::new(crate::intake::github_issues::GitHubIssuesPoller::new(
-                        &repo_cfg,
-                        Some(data_dir),
-                    )) as Arc<dyn crate::intake::IntakeSource>;
-                    (key, poller)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    {
+        for repo_cfg in cfg.effective_repos() {
+            tracing::info!(
+                repo = %repo_cfg.repo,
+                label = %repo_cfg.label,
+                "intake: GitHub Issues poller registered"
+            );
+            let key = format!("github:{}", repo_cfg.repo);
+            let poller =
+                crate::intake::github_issues::GitHubIssuesPoller::new(&repo_cfg, Some(data_dir))
+                    .with_task_checker(storage.tasks.clone());
+            match poller.reconcile_dispatched_with_store().await {
+                Ok(pruned) if pruned > 0 => tracing::info!(
+                    repo = %repo_cfg.repo,
+                    pruned,
+                    "intake: pruned stale GitHub dispatched entries at startup"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    repo = %repo_cfg.repo,
+                    "intake: failed to reconcile GitHub dispatched entries at startup: {e}"
+                ),
+            }
+            let poller = Arc::new(poller) as Arc<dyn crate::intake::IntakeSource>;
+            github_pollers.push((key, poller));
+        }
+    }
 
     // ── Quality trigger ───────────────────────────────────────────────────────
     let quality_trigger = {
