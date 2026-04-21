@@ -100,6 +100,15 @@ impl CodeAgent for AnthropicApiAgent {
     }
 
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        if let Some(ref token) = req.capability_token {
+            if token.is_expired() {
+                return Err(harness_core::error::HarnessError::AgentExecution(format!(
+                    "capability token for subtask {} has expired",
+                    token.subtask_index
+                )));
+            }
+        }
+
         let body = self.build_request(&req);
 
         let resp = self
@@ -158,6 +167,15 @@ impl CodeAgent for AnthropicApiAgent {
         req: AgentRequest,
         tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
+        if let Some(ref token) = req.capability_token {
+            if token.is_expired() {
+                return Err(harness_core::error::HarnessError::AgentExecution(format!(
+                    "capability token for subtask {} has expired",
+                    token.subtask_index
+                )));
+            }
+        }
+
         let resp = self.execute(req).await?;
         crate::streaming::send_stream_item(
             &tx,
@@ -263,5 +281,78 @@ mod tests {
         assert_eq!(agent.base_url, config.base_url);
         assert_eq!(agent.default_model, config.default_model);
         assert_eq!(agent.max_tokens, 3072);
+    }
+
+    #[tokio::test]
+    async fn execute_returns_error_for_expired_capability_token() {
+        use harness_core::capability::CapabilityToken;
+        use std::time::{Duration, SystemTime};
+
+        let agent = AnthropicApiAgent::new(
+            "test-key".to_string(),
+            "https://api.example.com".to_string(),
+            "claude-default".to_string(),
+            2048,
+        );
+
+        let past = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let expired_token = CapabilityToken {
+            token_id: "00000000-0000-0000-0000-000000000000".parse().unwrap(),
+            subtask_index: 3,
+            allowed_write_paths: vec![],
+            issued_at: past,
+            expires_at: past + Duration::from_secs(60),
+        };
+
+        let req = AgentRequest {
+            capability_token: Some(expired_token),
+            ..AgentRequest::default()
+        };
+
+        let err = agent
+            .execute(req)
+            .await
+            .expect_err("should fail when capability token is expired");
+        assert!(
+            err.to_string().contains("expired"),
+            "error message should mention expiry, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_returns_error_for_expired_capability_token() {
+        use harness_core::capability::CapabilityToken;
+        use std::time::{Duration, SystemTime};
+
+        let agent = AnthropicApiAgent::new(
+            "test-key".to_string(),
+            "https://api.example.com".to_string(),
+            "claude-default".to_string(),
+            2048,
+        );
+
+        let past = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let expired_token = CapabilityToken {
+            token_id: "00000000-0000-0000-0000-000000000000".parse().unwrap(),
+            subtask_index: 7,
+            allowed_write_paths: vec![],
+            issued_at: past,
+            expires_at: past + Duration::from_secs(60),
+        };
+
+        let req = AgentRequest {
+            capability_token: Some(expired_token),
+            ..AgentRequest::default()
+        };
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let err = agent
+            .execute_stream(req, tx)
+            .await
+            .expect_err("should fail when capability token is expired");
+        assert!(
+            err.to_string().contains("expired"),
+            "error message should mention expiry, got: {err}"
+        );
     }
 }
