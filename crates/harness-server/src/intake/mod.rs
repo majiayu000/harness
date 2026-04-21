@@ -73,8 +73,8 @@ pub struct IntakeOrchestrator {
     planner_agent: Option<String>,
 }
 
-/// Timeout for waiting on a single task or round to complete (30 minutes).
-const TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Timeout for waiting on a single task or sprint coordination window (3 hours).
+const TASK_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// Polling interval when waiting for task completion.
 const TASK_POLL_INTERVAL: Duration = Duration::from_secs(15);
