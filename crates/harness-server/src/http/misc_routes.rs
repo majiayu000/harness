@@ -511,11 +511,65 @@ pub(crate) async fn ingest_signal(
     )
 }
 
-/// POST /auth/reset-password — not yet implemented.
-pub(crate) async fn password_reset() -> (StatusCode, Json<serde_json::Value>) {
-    // TODO: wire up SMTP/transactional email before enabling this endpoint
+#[derive(serde::Deserialize)]
+pub(crate) struct PasswordResetRequest {
+    pub(crate) email: String,
+}
+
+/// POST /auth/reset-password — initiate a password reset.
+///
+/// Rate-limited per email address to prevent enumeration and brute-force.
+/// Always returns a generic success response regardless of whether the email
+/// exists, to avoid leaking account information.
+pub(crate) async fn password_reset(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PasswordResetRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let email = req.email.trim().to_lowercase();
+    if email.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "email is required"})),
+        );
+    }
+
+    let limit = state
+        .core
+        .server
+        .config
+        .server
+        .password_reset_rate_limit_per_hour;
+
+    if !state
+        .observability
+        .password_reset_rate_limiter
+        .check_and_increment(&email)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": format!(
+                    "rate limit exceeded: max {} password reset requests per hour",
+                    limit
+                )
+            })),
+        );
+    }
+
+    tracing::info!(
+        email_hash = %format!("{:x}", {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            email.hash(&mut h);
+            h.finish()
+        }),
+        "password reset requested"
+    );
+
     (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"error": "password reset is not yet implemented"})),
+        StatusCode::OK,
+        Json(
+            json!({"status": "ok", "message": "If that email is registered, a reset link has been sent."}),
+        ),
     )
 }

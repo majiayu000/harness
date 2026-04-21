@@ -22,7 +22,7 @@ async fn response_json(response: axum::response::Response) -> anyhow::Result<ser
 }
 
 #[tokio::test]
-async fn password_reset_returns_501_not_implemented() -> anyhow::Result<()> {
+async fn password_reset_returns_generic_success() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state =
         make_test_state_with_config(dir.path(), harness_core::config::HarnessConfig::default())
@@ -41,14 +41,84 @@ async fn password_reset_returns_501_not_implemented() -> anyhow::Result<()> {
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await?;
+    assert_eq!(json["status"], "ok");
+    assert_eq!(
+        json["message"],
+        "If that email is registered, a reset link has been sent."
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn password_reset_rejects_blank_email() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state =
+        make_test_state_with_config(dir.path(), harness_core::config::HarnessConfig::default())
+            .await?;
+    let app = password_reset_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/reset-password")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"email": "   "}).to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = response_json(response).await?;
+    assert_eq!(json["error"], "email is required");
+    Ok(())
+}
+
+#[tokio::test]
+async fn password_reset_rate_limit_uses_normalized_email() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state =
+        make_test_state_with_config(dir.path(), harness_core::config::HarnessConfig::default())
+            .await?;
+    let app = password_reset_app(state);
+
+    for _ in 0..5 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/reset-password")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"email": "  USER@example.com  "}).to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/reset-password")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"email": "user@example.com"}).to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     let json = response_json(response).await?;
     assert!(
         json["error"]
             .as_str()
             .unwrap_or("")
-            .contains("not yet implemented"),
-        "expected 'not yet implemented' in error body, got: {json}"
+            .contains("rate limit exceeded"),
+        "expected rate limit error body, got: {json}"
     );
     Ok(())
 }
@@ -78,6 +148,6 @@ async fn password_reset_exempt_from_auth() -> anyhow::Result<()> {
         StatusCode::UNAUTHORIZED,
         "password reset endpoint must not require auth"
     );
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::OK);
     Ok(())
 }
