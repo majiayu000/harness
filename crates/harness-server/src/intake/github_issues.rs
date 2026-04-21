@@ -60,7 +60,10 @@ impl GitHubIssuesPoller {
         };
         let dm = DashMap::new();
         for (k, v) in map {
-            dm.insert(k, harness_core::types::TaskId(v));
+            dm.insert(
+                normalize_issue_external_id(&k),
+                harness_core::types::TaskId(v),
+            );
         }
         dm
     }
@@ -89,6 +92,19 @@ impl GitHubIssuesPoller {
             Err(e) => tracing::warn!("failed to serialize dispatched state: {e}"),
         }
     }
+}
+
+fn normalize_issue_external_id(external_id: &str) -> String {
+    let trimmed = external_id.trim();
+    trimmed
+        .strip_prefix("issue:")
+        .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn dispatched_contains_issue(dispatched: &DashMap<String, TaskId>, issue_id: &str) -> bool {
+    dispatched.contains_key(issue_id) || dispatched.contains_key(&format!("issue:{issue_id}"))
 }
 
 /// Raw GitHub issue fields returned by `gh issue list --json`.
@@ -129,7 +145,10 @@ fn parse_gh_output(
         issues.iter().map(|i| i.number.to_string()).collect();
     let new_issues = issues
         .into_iter()
-        .filter(|issue| !dispatched.contains_key(&issue.number.to_string()))
+        .filter(|issue| {
+            let issue_id = issue.number.to_string();
+            !dispatched_contains_issue(dispatched, &issue_id)
+        })
         .map(|issue| IncomingIssue {
             source: "github".to_string(),
             external_id: issue.number.to_string(),
@@ -196,7 +215,11 @@ impl IntakeSource for GitHubIssuesPoller {
             .dispatched
             .iter()
             .map(|e| e.key().clone())
-            .filter(|id| !parsed.open_issue_ids.contains(id))
+            .filter(|id| {
+                !parsed
+                    .open_issue_ids
+                    .contains(&normalize_issue_external_id(id))
+            })
             .collect();
         if !stale.is_empty() {
             for id in &stale {
@@ -214,13 +237,14 @@ impl IntakeSource for GitHubIssuesPoller {
 
     async fn mark_dispatched(&self, external_id: &str, task_id: &TaskId) -> anyhow::Result<()> {
         self.dispatched
-            .insert(external_id.to_string(), task_id.clone());
+            .insert(normalize_issue_external_id(external_id), task_id.clone());
         self.persist_dispatched();
         Ok(())
     }
 
     async fn unmark_dispatched(&self, external_id: &str) {
-        self.dispatched.remove(external_id);
+        self.dispatched
+            .remove(&normalize_issue_external_id(external_id));
         self.persist_dispatched();
     }
 
@@ -241,7 +265,8 @@ impl IntakeSource for GitHubIssuesPoller {
         // retry them later if they remain open. Done tasks and permanent failures stay
         // dispatched to avoid re-processing.
         if (result.status.is_failure() || result.status.is_cancelled()) && !needs_manual {
-            self.dispatched.remove(external_id);
+            self.dispatched
+                .remove(&normalize_issue_external_id(external_id));
             self.persist_dispatched();
         }
         Ok(())
@@ -315,6 +340,25 @@ mod tests {
         assert_eq!(parsed.new_issues.len(), 1);
         assert_eq!(parsed.new_issues[0].external_id, "3");
         assert_eq!(parsed.open_issue_ids.len(), 3);
+    }
+
+    #[test]
+    fn parse_gh_output_filters_canonical_dispatched_issue_keys() {
+        let json = br#"[
+            {"number": 1, "title": "A", "body": null, "url": "u1", "labels": [], "createdAt": null},
+            {"number": 2, "title": "B", "body": null, "url": "u2", "labels": [], "createdAt": null},
+            {"number": 3, "title": "C", "body": null, "url": "u3", "labels": [], "createdAt": null}
+        ]"#;
+
+        let dispatched = make_dispatched(&["1"]);
+        dispatched.insert(
+            "issue:2".to_string(),
+            harness_core::types::TaskId("task-2".to_string()),
+        );
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
+
+        assert_eq!(parsed.new_issues.len(), 1);
+        assert_eq!(parsed.new_issues[0].external_id, "3");
     }
 
     #[test]
@@ -452,6 +496,34 @@ mod tests {
         assert!(
             !poller.dispatched.contains_key(external_id),
             "issue must be removed from dispatched after transient failure so poller can retry"
+        );
+    }
+
+    #[test]
+    fn on_task_complete_transient_failure_removes_canonical_external_id_from_dispatched() {
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: None,
+        };
+        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
+        poller.dispatched.insert(
+            "88".to_string(),
+            harness_core::types::TaskId("task-88".to_string()),
+        );
+
+        let result = TaskCompletionResult {
+            status: TaskStatus::Failed,
+            pr_url: None,
+            error: Some("triage phase agent error".to_string()),
+            summary: "transient failure".to_string(),
+        };
+
+        futures::executor::block_on(poller.on_task_complete("issue:88", &result)).unwrap();
+
+        assert!(
+            !poller.dispatched.contains_key("88"),
+            "canonical external_id should remove the raw GitHub issue key"
         );
     }
 
