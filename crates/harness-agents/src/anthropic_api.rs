@@ -167,15 +167,6 @@ impl CodeAgent for AnthropicApiAgent {
         req: AgentRequest,
         tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
-        if let Some(ref token) = req.capability_token {
-            if token.is_expired() {
-                return Err(harness_core::error::HarnessError::AgentExecution(format!(
-                    "capability token for subtask {} has expired",
-                    token.subtask_index
-                )));
-            }
-        }
-
         let resp = self.execute(req).await?;
         crate::streaming::send_stream_item(
             &tx,
