@@ -88,10 +88,33 @@ fn configured_github_webhook_project_root(
         })
 }
 
+enum GitHubWebhookProjectRootError {
+    RepoNotConfigured(String),
+    RegistryLookup(String),
+}
+
+fn github_webhook_project_root_error_response(
+    error: GitHubWebhookProjectRootError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        // Treat unknown repositories as ignored so GitHub does not retry
+        // an event for a repo this harness instance is not configured to
+        // serve. Registry failures remain internal errors.
+        GitHubWebhookProjectRootError::RepoNotConfigured(reason) => (
+            StatusCode::OK,
+            Json(json!({ "status": "ignored", "reason": reason })),
+        ),
+        GitHubWebhookProjectRootError::RegistryLookup(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        ),
+    }
+}
+
 async fn resolve_github_webhook_project_root(
     state: &Arc<AppState>,
     repo: &str,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, GitHubWebhookProjectRootError> {
     if let Some(project_root) = configured_github_webhook_project_root(
         state.core.server.config.intake.github.as_ref(),
         &state.core.project_root,
@@ -101,30 +124,34 @@ async fn resolve_github_webhook_project_root(
     }
 
     if let Some(registry) = state.core.project_registry.as_deref() {
-        if let Some(project) = registry
-            .get(repo)
-            .await
-            .map_err(|error| format!("project registry lookup failed: {error}"))?
-        {
+        if let Some(project) = registry.get(repo).await.map_err(|error| {
+            GitHubWebhookProjectRootError::RegistryLookup(format!(
+                "project registry lookup failed: {error}"
+            ))
+        })? {
             return Ok(project.root);
         }
-        if let Some(project) = registry
-            .get_by_name(repo)
-            .await
-            .map_err(|error| format!("project registry lookup failed: {error}"))?
-        {
+        if let Some(project) = registry.get_by_name(repo).await.map_err(|error| {
+            GitHubWebhookProjectRootError::RegistryLookup(format!(
+                "project registry lookup failed: {error}"
+            ))
+        })? {
             return Ok(project.root);
         }
     }
 
-    Err(format!(
+    Err(GitHubWebhookProjectRootError::RepoNotConfigured(format!(
         "webhook repository '{repo}' is not configured in intake.github and was not found in the project registry"
-    ))
+    )))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::configured_github_webhook_project_root;
+    use super::{
+        configured_github_webhook_project_root, github_webhook_project_root_error_response,
+        GitHubWebhookProjectRootError,
+    };
+    use axum::http::StatusCode;
     use harness_core::config::intake::{GitHubIntakeConfig, GitHubRepoConfig};
     use std::path::PathBuf;
 
@@ -190,6 +217,34 @@ mod tests {
             configured_github_webhook_project_root(Some(&github), &default_root, "org/repo-b");
 
         assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn unconfigured_github_repo_returns_ignored_response() {
+        let (status, body) = github_webhook_project_root_error_response(
+            GitHubWebhookProjectRootError::RepoNotConfigured(
+                "webhook repository 'org/repo-b' is not configured".to_string(),
+            ),
+        );
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["status"], "ignored");
+        assert!(body.0["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not configured"));
+    }
+
+    #[test]
+    fn registry_lookup_failures_return_internal_server_error() {
+        let (status, body) = github_webhook_project_root_error_response(
+            GitHubWebhookProjectRootError::RegistryLookup(
+                "project registry lookup failed: boom".to_string(),
+            ),
+        );
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0["error"], "project registry lookup failed: boom");
     }
 }
 
@@ -278,7 +333,7 @@ pub(crate) async fn github_webhook(
         req.project = Some(match req.repo.as_deref() {
             Some(repo) => match resolve_github_webhook_project_root(&state, repo).await {
                 Ok(project_root) => project_root,
-                Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+                Err(error) => return github_webhook_project_root_error_response(error),
             },
             None => state.core.project_root.clone(),
         });
