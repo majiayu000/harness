@@ -118,6 +118,19 @@ pub struct TaskSummary {
     pub project: Option<String>,
 }
 
+/// Lightweight recent-failure row used by the operator snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentFailureTask {
+    pub id: TaskId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub failed_at: Option<String>,
+}
+
 impl TaskState {
     pub(crate) fn new(id: TaskId) -> Self {
         Self {

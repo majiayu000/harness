@@ -153,6 +153,16 @@ pub(super) struct TaskSummaryRow {
     pub(super) description: Option<String>,
 }
 
+/// Lightweight row for operator snapshot recent-failure queries.
+#[derive(sqlx::FromRow)]
+pub(super) struct RecentFailureRow {
+    pub(super) id: String,
+    pub(super) external_id: Option<String>,
+    pub(super) project: Option<String>,
+    pub(super) error: Option<String>,
+    pub(super) updated_at: Option<DateTime<Utc>>,
+}
+
 impl TaskRow {
     pub(super) fn try_into_task_state(self) -> anyhow::Result<TaskState> {
         let Self {
@@ -261,5 +271,44 @@ impl TaskSummaryRow {
             subtask_ids: Vec::new(),
             project: self.project,
         })
+    }
+}
+
+impl RecentFailureRow {
+    pub(super) fn into_recent_failure(self) -> crate::task_runner::RecentFailureTask {
+        crate::task_runner::RecentFailureTask {
+            id: harness_core::types::TaskId(self.id),
+            external_id: self.external_id,
+            project: self.project,
+            error: self.error,
+            failed_at: self.updated_at.map(|dt| dt.to_rfc3339()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RecentFailureRow;
+    use chrono::TimeZone;
+
+    #[test]
+    fn recent_failure_row_maps_updated_at_to_failed_at() {
+        let row = RecentFailureRow {
+            id: "task-123".to_string(),
+            external_id: Some("issue:123".to_string()),
+            project: Some("/tmp/project-a".to_string()),
+            error: Some("boom".to_string()),
+            updated_at: Some(chrono::Utc.with_ymd_and_hms(2026, 4, 21, 5, 34, 0).unwrap()),
+        };
+
+        let mapped = row.into_recent_failure();
+        assert_eq!(mapped.id.0, "task-123");
+        assert_eq!(mapped.external_id.as_deref(), Some("issue:123"));
+        assert_eq!(mapped.project.as_deref(), Some("/tmp/project-a"));
+        assert_eq!(mapped.error.as_deref(), Some("boom"));
+        assert_eq!(
+            mapped.failed_at.as_deref(),
+            Some("2026-04-21T05:34:00+00:00")
+        );
     }
 }

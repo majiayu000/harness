@@ -116,12 +116,9 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
             json!({
                 "task_id":    t.id.0,
                 "external_id": t.external_id.as_deref().unwrap_or("—"),
-                "project":    t.project_root.as_ref()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "—".to_string()),
+                "project":    t.project.as_deref().unwrap_or("—"),
                 "error":      error,
-                "failed_at":  t.updated_at.as_deref().unwrap_or("—"),
+                "failed_at":  t.failed_at.as_deref().unwrap_or("—"),
             })
         })
         .collect();
