@@ -221,7 +221,28 @@ async fn make_test_state_with_agent(
 ) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
     let mut config = harness_core::config::HarnessConfig::default();
     config.server.github_webhook_secret = webhook_secret.map(ToString::to_string);
+    build_test_state_with_agent(dir, config).await
+}
 
+async fn make_test_state_with_agent_and_repo(
+    dir: &std::path::Path,
+    webhook_secret: Option<&str>,
+    repo: &str,
+) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = webhook_secret.map(ToString::to_string);
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        repo: repo.to_string(),
+        ..Default::default()
+    });
+    build_test_state_with_agent(dir, config).await
+}
+
+async fn build_test_state_with_agent(
+    dir: &std::path::Path,
+    config: harness_core::config::HarnessConfig,
+) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
     let capturing = CapturingAgent::new();
     let mut registry = harness_agents::registry::AgentRegistry::new("test");
     registry.register("test", capturing.clone());
@@ -470,7 +491,8 @@ async fn token_usage_route_is_registered() -> anyhow::Result<()> {
 async fn webhook_issue_mention_creates_issue_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "majiayu000/harness").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -504,7 +526,8 @@ async fn webhook_issue_mention_creates_issue_task() -> anyhow::Result<()> {
 async fn webhook_review_on_pr_creates_pr_review_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "majiayu000/harness").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -538,7 +561,8 @@ async fn webhook_review_on_pr_creates_pr_review_task() -> anyhow::Result<()> {
 async fn webhook_fix_ci_on_pr_creates_fix_ci_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "majiayu000/harness").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -1183,7 +1207,8 @@ async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Resu
     let dir = tempfile::tempdir()?;
     init_fake_git_repo(dir.path())?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "org/repo").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -1219,7 +1244,8 @@ async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Resu
 async fn webhook_pull_request_review_changes_requested_creates_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "org/repo").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 

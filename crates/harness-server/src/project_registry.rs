@@ -30,16 +30,24 @@ fn default_active() -> bool {
     true
 }
 
-static PROJECT_MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description: "create projects table",
-    sql: "CREATE TABLE IF NOT EXISTS projects (
-        id         TEXT PRIMARY KEY,
-        data       TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )",
-}];
+static PROJECT_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "create projects table",
+        sql: "CREATE TABLE IF NOT EXISTS projects (
+            id         TEXT PRIMARY KEY,
+            data       TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    },
+    Migration {
+        version: 2,
+        description: "index project name lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_projects_name_created_at
+              ON projects ((data::jsonb ->> 'name'), created_at DESC)",
+    },
+];
 
 /// Registry of projects backed by Postgres. Survives server restarts.
 pub struct ProjectRegistry {
