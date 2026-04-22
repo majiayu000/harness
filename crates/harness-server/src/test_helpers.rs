@@ -71,15 +71,6 @@ pub async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> 
     .await
 }
 
-pub async fn make_test_state_with_config(
-    dir: &std::path::Path,
-    config: HarnessConfig,
-) -> anyhow::Result<Arc<AppState>> {
-    Ok(Arc::new(
-        make_state_inner(dir, dir, AgentRegistry::new("test"), config).await?,
-    ))
-}
-
 pub async fn make_test_state_with_registry(
     dir: &std::path::Path,
     agent_registry: AgentRegistry,

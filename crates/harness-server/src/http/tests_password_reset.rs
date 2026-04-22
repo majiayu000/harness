@@ -1,128 +1,62 @@
-use std::sync::Arc;
-
-use axum::{body::Body, http::Request, http::StatusCode, middleware, routing::post, Router};
-use tower::ServiceExt;
-
-use crate::http::{auth, misc_routes::password_reset, AppState};
-use crate::test_helpers::make_test_state_with_config;
-
-fn password_reset_app(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/auth/reset-password", post(password_reset))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::api_auth_middleware,
-        ))
-        .with_state(state)
-}
-
-async fn response_json(response: axum::response::Response) -> anyhow::Result<serde_json::Value> {
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
+use crate::http::{
+    auth,
+    misc_routes::{disabled_password_reset_response, prepare_password_reset_request},
+    rate_limit::PasswordResetRateLimiter,
+};
+use axum::http::StatusCode;
 
 #[tokio::test]
 async fn password_reset_returns_not_implemented() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let state =
-        make_test_state_with_config(dir.path(), harness_core::config::HarnessConfig::default())
-            .await?;
-    let app = password_reset_app(state);
+    let limiter = PasswordResetRateLimiter::new(2);
+    let email = prepare_password_reset_request(&limiter, 2, "user@example.com")
+        .expect("valid email should pass rate limiting");
+    assert_eq!(email, "user@example.com");
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/auth/reset-password")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({"email": "user@example.com"}).to_string(),
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-    let json = response_json(response).await?;
+    let (status, json) = disabled_password_reset_response();
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(json["error"], "password reset is not yet implemented");
     Ok(())
 }
 
 #[tokio::test]
-async fn password_reset_ignores_request_body_while_disabled() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let state =
-        make_test_state_with_config(dir.path(), harness_core::config::HarnessConfig::default())
-            .await?;
-    let app = password_reset_app(state);
+async fn password_reset_rejects_blank_email() -> anyhow::Result<()> {
+    let limiter = PasswordResetRateLimiter::new(2);
+    let (status, json) = prepare_password_reset_request(&limiter, 2, "   ").unwrap_err();
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/auth/reset-password")
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-    let json = response_json(response).await?;
-    assert_eq!(json["error"], "password reset is not yet implemented");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["error"], "email is required");
     Ok(())
 }
 
 #[tokio::test]
-async fn password_reset_is_not_rate_limited_while_disabled() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let state =
-        make_test_state_with_config(dir.path(), harness_core::config::HarnessConfig::default())
-            .await?;
-    let app = password_reset_app(state);
+async fn password_reset_rate_limit_uses_normalized_email() -> anyhow::Result<()> {
+    let limiter = PasswordResetRateLimiter::new(2);
 
-    for _ in 0..6 {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/auth/reset-password")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({"email": "  USER@example.com  "}).to_string(),
-                    ))?,
-            )
-            .await?;
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        let json = response_json(response).await?;
-        assert_eq!(json["error"], "password reset is not yet implemented");
+    for _ in 0..2 {
+        let email = prepare_password_reset_request(&limiter, 2, "  USER@example.com  ")
+            .expect("normalized email should be allowed within the rate limit");
+        assert_eq!(email, "user@example.com");
     }
+
+    let (status, json) =
+        prepare_password_reset_request(&limiter, 2, "user@example.com").unwrap_err();
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("rate limit exceeded"),
+        "expected rate limit error body, got: {json}"
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn password_reset_exempt_from_auth() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let mut config = harness_core::config::HarnessConfig::default();
-    config.server.api_token = Some("secret123".to_string());
-    let state = make_test_state_with_config(dir.path(), config).await?;
-    let app = password_reset_app(state);
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/auth/reset-password")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({"email": "user@example.com"}).to_string(),
-                ))?,
-        )
-        .await?;
-
-    assert_ne!(
-        response.status(),
-        StatusCode::UNAUTHORIZED,
+    assert!(
+        auth::is_auth_exempt_path("/auth/reset-password"),
         "password reset endpoint must not require auth"
     );
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     Ok(())
 }

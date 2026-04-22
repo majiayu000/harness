@@ -105,6 +105,22 @@ pub(crate) fn resolve_api_token(
         })
 }
 
+pub(crate) fn is_auth_exempt_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/health"
+            | "/webhook"
+            | "/webhook/feishu"
+            | "/signals"
+            | "/favicon.ico"
+            | "/auth/reset-password"
+            | "/"
+            | "/overview"
+            | "/worktrees"
+            | "/ws"
+    ) || path.starts_with("/assets/")
+}
+
 /// Bearer token authentication middleware.
 ///
 /// Exempts `/health`, `/webhook`, `/webhook/feishu`, `/signals`, `/favicon.ico`,
@@ -131,20 +147,7 @@ pub(crate) async fn api_auth_middleware(
     // Exempt paths: static assets, public health probes, and endpoints that
     // carry no secrets (/ no longer embeds the token; /ws streams only
     // task-status events).
-    if matches!(
-        path,
-        "/health"
-            | "/webhook"
-            | "/webhook/feishu"
-            | "/signals"
-            | "/favicon.ico"
-            | "/auth/reset-password"
-            | "/"
-            | "/overview"
-            | "/worktrees"
-            | "/ws"
-    ) || path.starts_with("/assets/")
-    {
+    if is_auth_exempt_path(path) {
         return next.run(req).await;
     }
 
