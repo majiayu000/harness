@@ -75,6 +75,31 @@ fn awaiting_deps_recovery_failure_reason(
     }
 }
 
+fn recovered_queue_domain(task: &task_runner::TaskState) -> task_routes::QueueDomain {
+    let is_periodic_review = matches!(task.source.as_deref(), Some("periodic_review"))
+        || task
+            .request_settings
+            .as_ref()
+            .and_then(|settings| settings.system_prompt_restart_bundle.as_ref())
+            .is_some_and(|bundle| bundle.kind == "periodic_review");
+
+    if is_periodic_review {
+        task_routes::QueueDomain::Review
+    } else {
+        task_routes::QueueDomain::Primary
+    }
+}
+
+fn recovered_task_queue(
+    state: &AppState,
+    task: &task_runner::TaskState,
+) -> Arc<crate::task_queue::TaskQueue> {
+    match recovered_queue_domain(task) {
+        task_routes::QueueDomain::Primary => state.concurrency.task_queue.clone(),
+        task_routes::QueueDomain::Review => state.concurrency.review_task_queue.clone(),
+    }
+}
+
 /// Spawn background watcher for AwaitingDeps tasks.
 /// Uses Weak<AppState> to avoid a reference cycle; the loop exits when AppState is dropped.
 pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
@@ -245,12 +270,8 @@ pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
                         return;
                     }
 
-                    let permit = match state
-                        .concurrency
-                        .task_queue
-                        .acquire(&project_id, task.priority)
-                        .await
-                    {
+                    let queue = recovered_task_queue(&state, &task);
+                    let permit = match queue.acquire(&project_id, task.priority).await {
                         Ok(p) => p,
                         Err(e) => {
                             let reason =
@@ -627,12 +648,8 @@ pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
 
                 // Issue 1: acquire permit here inside the spawned future so serve()
                 // is never blocked waiting for a concurrency slot.
-                let permit = match state
-                    .concurrency
-                    .task_queue
-                    .acquire(&project_id, task.priority)
-                    .await
-                {
+                let queue = recovered_task_queue(&state, &task);
+                let permit = match queue.acquire(&project_id, task.priority).await {
                     Ok(p) => p,
                     Err(e) => {
                         let reason =
@@ -1387,6 +1404,16 @@ mod tests {
         }
     }
 
+    fn task_with_source_and_settings(
+        source: Option<&str>,
+        settings: task_runner::PersistedRequestSettings,
+    ) -> task_runner::TaskState {
+        task_runner::TaskState {
+            source: source.map(ToString::to_string),
+            ..task_with_settings(settings)
+        }
+    }
+
     #[test]
     fn checkpoint_recovery_fails_closed_when_issue_identity_is_lost() {
         let task = task_with_settings(issue_task_settings("extra context"));
@@ -1429,5 +1456,40 @@ mod tests {
                 "manual prompt-only task cannot be recovered after restart: original prompt text is not persisted",
             )
         );
+    }
+
+    #[test]
+    fn recovered_queue_domain_uses_review_queue_for_periodic_review_bundle_without_source() {
+        let task = task_with_settings(task_runner::PersistedRequestSettings {
+            system_prompt_restart_bundle: Some(
+                task_runner::SystemPromptRestartBundle::periodic_review(
+                    task_runner::PeriodicReviewPromptInputs {
+                        project_root: "/tmp/project".to_string(),
+                        since_arg: "2026-04-20T00:00:00Z".to_string(),
+                        review_type: "mixed".to_string(),
+                        guard_scan_output: None,
+                    },
+                ),
+            ),
+            ..Default::default()
+        });
+
+        assert!(matches!(
+            recovered_queue_domain(&task),
+            crate::http::task_routes::QueueDomain::Review
+        ));
+    }
+
+    #[test]
+    fn recovered_queue_domain_uses_primary_queue_for_non_review_tasks() {
+        let task = task_with_source_and_settings(
+            Some("github"),
+            task_runner::PersistedRequestSettings::default(),
+        );
+
+        assert!(matches!(
+            recovered_queue_domain(&task),
+            crate::http::task_routes::QueueDomain::Primary
+        ));
     }
 }

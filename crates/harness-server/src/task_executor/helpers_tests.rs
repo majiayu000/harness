@@ -186,6 +186,36 @@ fn wrap<T: TurnInterceptor + 'static>(t: T) -> Arc<dyn TurnInterceptor> {
     Arc::new(t)
 }
 
+fn task_with_prompt_settings(
+    description: &str,
+    settings: crate::task_runner::PersistedRequestSettings,
+) -> crate::task_runner::TaskState {
+    crate::task_runner::TaskState {
+        id: crate::task_runner::TaskId::new(),
+        status: crate::task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: None,
+        issue: None,
+        repo: None,
+        description: Some(description.to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: crate::task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: Some(settings),
+    }
+}
+
 // ── run_pre_execute ───────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -245,6 +275,43 @@ async fn run_pre_execute_stops_chain_at_first_block() {
     assert!(
         !second_called.load(Ordering::SeqCst),
         "interceptor after block must not be called"
+    );
+}
+
+#[test]
+fn legacy_manual_prompt_only_tasks_still_skip_prompt_persistence() {
+    let task = task_with_prompt_settings(
+        "prompt task",
+        crate::task_runner::PersistedRequestSettings::default(),
+    );
+    assert!(
+        should_skip_prompt_persistence(Some(&task)),
+        "legacy manual prompt-only tasks must not persist prompt text"
+    );
+}
+
+#[test]
+fn restart_bundle_keeps_system_prompt_tasks_persistable_without_origin_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let task = task_with_prompt_settings(
+        "prompt task",
+        crate::task_runner::PersistedRequestSettings {
+            system_prompt_restart_bundle: Some(
+                crate::task_runner::SystemPromptRestartBundle::periodic_review(
+                    crate::task_runner::PeriodicReviewPromptInputs {
+                        project_root: dir.path().display().to_string(),
+                        since_arg: "2026-04-20T00:00:00Z".to_string(),
+                        review_type: "mixed".to_string(),
+                        guard_scan_output: None,
+                    },
+                ),
+            ),
+            ..Default::default()
+        },
+    );
+    assert!(
+        !should_skip_prompt_persistence(Some(&task)),
+        "restart bundles must keep system-generated prompt tasks eligible for prompt persistence"
     );
 }
 

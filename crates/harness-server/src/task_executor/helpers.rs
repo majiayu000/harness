@@ -12,6 +12,26 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
+fn should_skip_prompt_persistence(task: Option<&crate::task_runner::TaskState>) -> bool {
+    let Some(task) = task else {
+        return false;
+    };
+    let Some(settings) = task.request_settings.as_ref() else {
+        return false;
+    };
+
+    if settings.is_manual_prompt_only() {
+        return true;
+    }
+
+    // Legacy prompt-only rows predate prompt_task_origin. Preserve the old
+    // description-based privacy fallback unless a restart bundle proves the
+    // prompt is system-generated and safe to reconstruct.
+    settings.prompt_task_origin.is_none()
+        && settings.system_prompt_restart_bundle.is_none()
+        && task.description.as_deref() == Some("prompt task")
+}
+
 /// Truncate validation error output to `max_chars` to avoid bloating agent prompts.
 /// Preserves the first portion which typically contains the most actionable info.
 pub(crate) fn truncate_validation_error(error: &str, max_chars: usize) -> String {
@@ -557,16 +577,12 @@ pub(crate) async fn run_agent_streaming(
     // Persist redacted prompt before req is consumed by execute_stream.
     // Skip only true manual prompt-only tasks: system-generated prompt tasks
     // are typed in request_settings and may be durably reconstructed.
-    let is_manual_prompt_only = store
-        .get(task_id)
-        .and_then(|s| s.request_settings)
-        .is_some_and(|settings| settings.is_manual_prompt_only());
-    let is_prompt_only = is_manual_prompt_only;
+    let skip_prompt_persistence = should_skip_prompt_persistence(store.get(task_id).as_ref());
     let phase_str = req
         .execution_phase
         .map(|p| format!("{p:?}").to_lowercase())
         .unwrap_or_else(|| "unknown".into());
-    if !is_prompt_only {
+    if !skip_prompt_persistence {
         let redacted_prompt = crate::redact::redact_secrets(&req.prompt, &req.env_vars);
         if let Err(e) = store
             .save_prompt(task_id, turn, &phase_str, &redacted_prompt)
