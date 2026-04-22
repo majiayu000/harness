@@ -12,6 +12,12 @@ pub struct ServerConfig {
     pub data_dir: PathBuf,
     #[serde(default = "default_project_root")]
     pub project_root: PathBuf,
+    /// Postgres connection string for all persistent server stores.
+    ///
+    /// When set, this wins over the legacy `DATABASE_URL` environment variable
+    /// fallback used by lower-level store initializers.
+    #[serde(default)]
+    pub database_url: Option<String>,
     #[serde(default)]
     pub github_webhook_secret: Option<String>,
     #[serde(default = "default_notification_broadcast_capacity")]
@@ -135,6 +141,7 @@ impl fmt::Debug for ServerConfig {
             http_addr,
             data_dir,
             project_root,
+            database_url,
             github_webhook_secret,
             notification_broadcast_capacity,
             notification_lag_log_every,
@@ -153,6 +160,7 @@ impl fmt::Debug for ServerConfig {
             .field("http_addr", http_addr)
             .field("data_dir", data_dir)
             .field("project_root", project_root)
+            .field("database_url", &database_url.as_ref().map(|_| "[REDACTED]"))
             .field(
                 "github_webhook_secret",
                 &github_webhook_secret.as_ref().map(|_| "[REDACTED]"),
@@ -185,6 +193,7 @@ impl Default for ServerConfig {
             http_addr: SocketAddr::from(([127, 0, 0, 1], 9800)),
             data_dir: dirs_data_dir().join("harness"),
             project_root: default_project_root(),
+            database_url: None,
             github_webhook_secret: None,
             notification_broadcast_capacity: default_notification_broadcast_capacity(),
             notification_lag_log_every: default_notification_lag_log_every(),

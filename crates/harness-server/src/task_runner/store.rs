@@ -32,7 +32,14 @@ pub struct TaskStore {
 
 impl TaskStore {
     pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
-        let db = TaskDb::open(db_path).await?;
+        Self::open_with_database_url(db_path, None).await
+    }
+
+    pub async fn open_with_database_url(
+        db_path: &std::path::Path,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let db = TaskDb::open_with_database_url(db_path, configured_database_url).await?;
 
         // 1. Event replay: runs BEFORE recover_in_progress so event-sourced
         //    data (pr_url, terminal status) wins over checkpoint data.

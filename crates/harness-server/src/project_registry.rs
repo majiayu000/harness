@@ -1,5 +1,6 @@
 use harness_core::db::{
-    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, Migration, PgMigrator,
+    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, resolve_database_url,
+    Migration, PgMigrator,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPool;
@@ -47,8 +48,14 @@ pub struct ProjectRegistry {
 
 impl ProjectRegistry {
     pub async fn open(path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
-        let database_url = std::env::var("DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable is not set"))?;
+        Self::open_with_database_url(path, None).await
+    }
+
+    pub async fn open_with_database_url(
+        path: &std::path::Path,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let database_url = resolve_database_url(configured_database_url)?;
         use sha2::{Digest, Sha256};
         let path_utf8 = path
             .to_str()
