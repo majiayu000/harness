@@ -21,13 +21,20 @@ const MAX_TASKS: usize = 20;
 /// Maximum length of a task error string before truncation.
 const MAX_ERROR_LEN: usize = 200;
 
+fn display_project_name(raw: &str) -> Option<String> {
+    raw.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned)
+}
+
 fn stalled_task_json(t: &crate::task_runner::TaskState) -> Value {
     json!({
         "task_id":      t.id.0,
         "external_id":  t.external_id.as_deref().unwrap_or("—"),
         "project":      t.project_root.as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
+            .and_then(|p| display_project_name(&p.to_string_lossy()))
             .unwrap_or_else(|| "—".to_string()),
         "status":       t.status.as_ref(),
         "stalled_since": t.updated_at.as_deref(),
@@ -57,8 +64,7 @@ fn recent_failure_json(t: &crate::task_runner::RecentFailureTask) -> Value {
         "task_id":    t.id.0,
         "external_id": t.external_id.as_deref().unwrap_or("—"),
         "project":    t.project.as_deref()
-            .and_then(|p| std::path::Path::new(p).file_name())
-            .map(|n| n.to_string_lossy().into_owned())
+            .and_then(display_project_name)
             .unwrap_or_else(|| "—".to_string()),
         "error":      error,
         "failed_at":  t.failed_at.as_deref(),
@@ -328,6 +334,47 @@ mod tests {
             failed_json["project"] == "failed",
             "expected recent failure project to serialize as basename only",
         );
+    }
+
+    #[test]
+    fn project_names_strip_windows_and_unix_separators() {
+        let stalled_task = crate::task_runner::TaskState {
+            id: harness_core::types::TaskId("stalled-windows".to_string()),
+            status: crate::task_runner::TaskStatus::Implementing,
+            turn: 1,
+            pr_url: None,
+            rounds: vec![],
+            error: None,
+            source: None,
+            external_id: Some("issue:windows".to_string()),
+            parent_id: None,
+            depends_on: vec![],
+            subtask_ids: vec![],
+            project_root: Some(std::path::PathBuf::from(r"C:\Users\alice\secret-repo")),
+            issue: None,
+            repo: None,
+            description: None,
+            created_at: None,
+            updated_at: Some("2026-04-22T00:00:00Z".to_string()),
+            priority: 0,
+            phase: crate::task_runner::TaskPhase::Implement,
+            triage_output: None,
+            plan_output: None,
+            request_settings: None,
+        };
+        let failed_task = crate::task_runner::RecentFailureTask {
+            id: harness_core::types::TaskId("failed-windows".to_string()),
+            external_id: Some("issue:windows-failed".to_string()),
+            project: Some(r"C:\Users\bob\another-repo".to_string()),
+            error: Some("boom".to_string()),
+            failed_at: Some("2026-04-22T00:00:00Z".to_string()),
+        };
+
+        let stalled_json = stalled_task_json(&stalled_task);
+        let failed_json = recent_failure_json(&failed_task);
+
+        assert_eq!(stalled_json["project"], "secret-repo");
+        assert_eq!(failed_json["project"], "another-repo");
     }
 
     #[tokio::test]
