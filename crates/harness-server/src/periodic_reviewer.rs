@@ -652,6 +652,18 @@ async fn last_review_timestamp(state: &Arc<AppState>, hook_key: &str) -> Option<
     events.iter().map(|e| e.ts).max()
 }
 
+fn ensure_review_queue_limit(state: &Arc<AppState>, project_root: &std::path::Path) {
+    let canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    state
+        .concurrency
+        .review_task_queue
+        .set_project_limit(&canonical, 1);
+}
+
 async fn run_review_tick(
     state: &Arc<AppState>,
     config: &ReviewConfig,
@@ -771,6 +783,8 @@ async fn run_review_tick(
         );
     }
 
+    ensure_review_queue_limit(state, project_root);
+
     let review_req = CreateTaskRequest {
         prompt: Some(base_prompt.clone()),
         agent: Some(review_agent.clone()),
@@ -780,9 +794,10 @@ async fn run_review_tick(
         ..CreateTaskRequest::default()
     };
 
-    let primary_review_id = task_routes::enqueue_task(state, review_req)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to enqueue periodic review: {e}"))?;
+    let primary_review_id =
+        task_routes::enqueue_task_in_domain(state, review_req, task_routes::QueueDomain::Review)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to enqueue periodic review: {e}"))?;
     tracing::info!(
         task_id = %primary_review_id,
         agent = %review_agent,
@@ -879,7 +894,13 @@ async fn run_review_tick(
                 project: Some(project_root_for_poll.clone()),
                 ..CreateTaskRequest::default()
             };
-            match task_routes::enqueue_task(&state_for_synthesis, req).await {
+            match task_routes::enqueue_task_in_domain(
+                &state_for_synthesis,
+                req,
+                task_routes::QueueDomain::Review,
+            )
+            .await
+            {
                 Ok(task_id) => {
                     tracing::info!(
                         task_id = %task_id,
@@ -955,7 +976,13 @@ async fn run_review_tick(
                     project: Some(project_root_for_poll.clone()),
                     ..CreateTaskRequest::default()
                 };
-                match task_routes::enqueue_task(&state_for_synthesis, synth_req).await {
+                match task_routes::enqueue_task_in_domain(
+                    &state_for_synthesis,
+                    synth_req,
+                    task_routes::QueueDomain::Review,
+                )
+                .await
+                {
                     Ok(synth_id) => {
                         tracing::info!(
                             task_id = %synth_id,
@@ -1620,6 +1647,7 @@ mod tests {
         assert_eq!(config.interval_hours, 24);
         assert!(config.interval_secs.is_none());
         assert_eq!(config.timeout_secs, 900);
+        assert_eq!(config.max_concurrent_tasks, 2);
         assert!(config.agent.is_none());
         assert_eq!(config.strategy, ReviewStrategy::Single);
     }
@@ -1634,6 +1662,7 @@ mod tests {
             agent: Some("codex".to_string()),
             strategy: ReviewStrategy::Cross,
             timeout_secs: 600,
+            max_concurrent_tasks: 3,
         };
         assert!(config.enabled);
         assert!(config.run_on_startup);
@@ -1641,6 +1670,7 @@ mod tests {
         assert_eq!(config.agent.as_deref(), Some("codex"));
         assert_eq!(config.strategy, ReviewStrategy::Cross);
         assert_eq!(config.timeout_secs, 600);
+        assert_eq!(config.max_concurrent_tasks, 3);
     }
 
     #[test]

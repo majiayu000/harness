@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{server::HarnessServer, task_runner};
@@ -8,6 +8,7 @@ use super::{engines::EnginesBundle, registry::RegistryBundle, storage::StorageBu
 /// Outputs of the intake initialization phase.
 pub(crate) struct IntakeBundle {
     pub task_queue: Arc<crate::task_queue::TaskQueue>,
+    pub review_task_queue: Arc<crate::task_queue::TaskQueue>,
     pub feishu_intake: Option<Arc<crate::intake::feishu::FeishuIntake>>,
     /// GitHub pollers keyed as `"github:{owner/repo}"` for per-repo routing.
     /// The same `Arc` instances are shared with the completion callback.
@@ -24,11 +25,11 @@ pub(crate) async fn build_intake(
     server: &Arc<HarnessServer>,
     storage: &StorageBundle,
     engines: &EnginesBundle,
-    _registry: &RegistryBundle,
+    registry: &RegistryBundle,
     project_root: &Path,
     data_dir: &Path,
 ) -> anyhow::Result<IntakeBundle> {
-    // ── Task queue ────────────────────────────────────────────────────────────
+    // ── Task queues ───────────────────────────────────────────────────────────
     let memory_pressure =
         server
             .config
@@ -39,14 +40,21 @@ pub(crate) async fn build_intake(
                 tracing::info!(threshold_mb, poll_secs, "memory pressure monitor enabled");
                 crate::memory_monitor::start(threshold_mb, poll_secs)
             });
+    let issue_queue_config = runtime_issue_concurrency_config(server);
+    let review_queue_config = runtime_review_concurrency_config(server, registry).await;
     let task_queue = Arc::new(crate::task_queue::TaskQueue::new_with_pressure(
-        &server.config.concurrency,
+        &issue_queue_config,
+        memory_pressure.clone(),
+    ));
+    let review_task_queue = Arc::new(crate::task_queue::TaskQueue::new_with_pressure(
+        &review_queue_config,
         memory_pressure,
     ));
     tracing::debug!(
-        max_concurrent = server.config.concurrency.max_concurrent_tasks,
-        max_queue_size = server.config.concurrency.max_queue_size,
-        "task queue initialized"
+        max_concurrent = issue_queue_config.max_concurrent_tasks,
+        max_queue_size = issue_queue_config.max_queue_size,
+        review_max_concurrent = review_queue_config.max_concurrent_tasks,
+        "task queues initialized"
     );
 
     // ── Feishu intake ─────────────────────────────────────────────────────────
@@ -76,31 +84,40 @@ pub(crate) async fn build_intake(
     // Keyed as "github:{owner/repo}" for per-repo routing in the callback;
     // a "github" fallback entry (first poller) supports tasks persisted before
     // this multi-repo routing was introduced.
-    let github_pollers: Vec<(String, Arc<dyn crate::intake::IntakeSource>)> = server
+    let mut github_pollers: Vec<(String, Arc<dyn crate::intake::IntakeSource>)> = Vec::new();
+    if let Some(cfg) = server
         .config
         .intake
         .github
         .as_ref()
         .filter(|cfg| cfg.enabled)
-        .map(|cfg| {
-            cfg.effective_repos()
-                .into_iter()
-                .map(|repo_cfg| {
-                    tracing::info!(
-                        repo = %repo_cfg.repo,
-                        label = %repo_cfg.label,
-                        "intake: GitHub Issues poller registered"
-                    );
-                    let key = format!("github:{}", repo_cfg.repo);
-                    let poller = Arc::new(crate::intake::github_issues::GitHubIssuesPoller::new(
-                        &repo_cfg,
-                        Some(data_dir),
-                    )) as Arc<dyn crate::intake::IntakeSource>;
-                    (key, poller)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    {
+        for repo_cfg in cfg.effective_repos() {
+            tracing::info!(
+                repo = %repo_cfg.repo,
+                label = %repo_cfg.label,
+                "intake: GitHub Issues poller registered"
+            );
+            let key = format!("github:{}", repo_cfg.repo);
+            let poller =
+                crate::intake::github_issues::GitHubIssuesPoller::new(&repo_cfg, Some(data_dir))
+                    .with_task_checker(storage.tasks.clone());
+            match poller.reconcile_dispatched_with_store().await {
+                Ok(pruned) if pruned > 0 => tracing::info!(
+                    repo = %repo_cfg.repo,
+                    pruned,
+                    "intake: pruned stale GitHub dispatched entries at startup"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    repo = %repo_cfg.repo,
+                    "intake: failed to reconcile GitHub dispatched entries at startup: {e}"
+                ),
+            }
+            let poller = Arc::new(poller) as Arc<dyn crate::intake::IntakeSource>;
+            github_pollers.push((key, poller));
+        }
+    }
 
     // ── Quality trigger ───────────────────────────────────────────────────────
     let quality_trigger = {
@@ -215,10 +232,68 @@ pub(crate) async fn build_intake(
 
     Ok(IntakeBundle {
         task_queue,
+        review_task_queue,
         feishu_intake,
         github_pollers,
         completion_callback,
     })
+}
+
+fn runtime_issue_concurrency_config(
+    server: &HarnessServer,
+) -> harness_core::config::misc::ConcurrencyConfig {
+    let mut config = server.config.concurrency.clone();
+
+    for project in &server.startup_projects {
+        let Some(limit) = project.max_concurrent.map(|value| value as usize) else {
+            continue;
+        };
+        let canonical = queue_project_key(&project.root);
+        config.per_project.insert(canonical, limit);
+    }
+
+    config
+}
+
+async fn runtime_review_concurrency_config(
+    server: &HarnessServer,
+    registry: &RegistryBundle,
+) -> harness_core::config::misc::ConcurrencyConfig {
+    let mut config = server.config.concurrency.clone();
+    config.max_concurrent_tasks = server.config.review.max_concurrent_tasks.max(1);
+    config.per_project = server
+        .startup_projects
+        .iter()
+        .map(|project| (queue_project_key(&project.root), 1usize))
+        .collect();
+    if config.per_project.is_empty() {
+        config.per_project.insert(
+            queue_project_key(&server.config.server.project_root),
+            1usize,
+        );
+    }
+    match registry.project_registry.list().await {
+        Ok(projects) => {
+            for project in projects.into_iter().filter(|project| project.active) {
+                config
+                    .per_project
+                    .entry(queue_project_key(&project.root))
+                    .or_insert(1usize);
+            }
+        }
+        Err(e) => tracing::warn!(
+            "intake: failed to pre-seed review queue limits from project registry: {e}"
+        ),
+    }
+    config
+}
+
+fn queue_project_key(path: &Path) -> String {
+    canonicalize_for_queue(path).to_string_lossy().into_owned()
+}
+
+fn canonicalize_for_queue(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -275,6 +350,121 @@ mod tests {
         assert!(
             bundle.github_pollers.is_empty(),
             "github_pollers should be empty without config"
+        );
+    }
+
+    #[test]
+    fn runtime_issue_concurrency_uses_startup_project_limits() {
+        let mut server = HarnessServer::new(
+            HarnessConfig::default(),
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        );
+        server.config.concurrency.max_concurrent_tasks = 6;
+        server
+            .config
+            .concurrency
+            .per_project
+            .insert("/tmp/a".to_string(), 2);
+        server.startup_projects = vec![
+            harness_core::config::ProjectEntry {
+                name: "a".to_string(),
+                root: std::path::PathBuf::from("/tmp/a"),
+                default: false,
+                default_agent: None,
+                max_concurrent: Some(4),
+            },
+            harness_core::config::ProjectEntry {
+                name: "b".to_string(),
+                root: std::path::PathBuf::from("/tmp/b"),
+                default: false,
+                default_agent: None,
+                max_concurrent: Some(8),
+            },
+        ];
+
+        let cfg = runtime_issue_concurrency_config(&server);
+
+        assert_eq!(cfg.max_concurrent_tasks, 6);
+        assert_eq!(cfg.per_project.len(), 2);
+        assert_eq!(cfg.per_project.get("/tmp/a"), Some(&4));
+        assert_eq!(cfg.per_project.get("/tmp/b"), Some(&8));
+    }
+
+    #[tokio::test]
+    async fn runtime_review_concurrency_uses_dedicated_domain() {
+        let mut server = HarnessServer::new(
+            HarnessConfig::default(),
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        );
+        server.config.review.max_concurrent_tasks = 3;
+        server.startup_projects = vec![harness_core::config::ProjectEntry {
+            name: "a".to_string(),
+            root: std::path::PathBuf::from("/tmp/a"),
+            default: false,
+            default_agent: None,
+            max_concurrent: Some(8),
+        }];
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, _, _, registry) = make_minimal_bundles(dir.path()).await;
+        let cfg = runtime_review_concurrency_config(&server, &registry).await;
+
+        assert_eq!(cfg.max_concurrent_tasks, 3);
+        assert_eq!(cfg.per_project.get("/tmp/a"), Some(&1));
+        assert!(cfg.per_project.values().all(|v| *v == 1));
+    }
+
+    #[tokio::test]
+    async fn runtime_review_concurrency_falls_back_to_server_project_root() {
+        let mut server = HarnessServer::new(
+            HarnessConfig::default(),
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        );
+        server.config.review.max_concurrent_tasks = 2;
+        server.config.server.project_root = std::path::PathBuf::from("/tmp/fallback");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, _, _, registry) = make_minimal_bundles(dir.path()).await;
+        let cfg = runtime_review_concurrency_config(&server, &registry).await;
+
+        assert_eq!(cfg.max_concurrent_tasks, 2);
+        assert_eq!(cfg.per_project.get("/tmp/fallback"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn runtime_review_concurrency_includes_registry_projects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (server, _storage, _engines, registry) = make_minimal_bundles(temp.path()).await;
+        let runtime_project_root = temp.path().join("runtime-project");
+        std::fs::create_dir_all(&runtime_project_root).expect("create runtime project");
+        registry
+            .project_registry
+            .register(crate::project_registry::Project {
+                id: "runtime-project".to_string(),
+                root: runtime_project_root.clone(),
+                name: Some("runtime-project".to_string()),
+                default_agent: None,
+                max_concurrent: None,
+                active: true,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .expect("register runtime project");
+
+        let cfg = runtime_review_concurrency_config(&server, &registry).await;
+
+        assert_eq!(
+            cfg.per_project.get(
+                &runtime_project_root
+                    .canonicalize()
+                    .expect("canonical runtime root")
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            Some(&1)
         );
     }
 }

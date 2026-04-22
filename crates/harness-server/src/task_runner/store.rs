@@ -125,6 +125,18 @@ impl TaskStore {
         self.db.get(id.0.as_str()).await
     }
 
+    /// Return `true` when the task exists in either the in-memory cache or the
+    /// backing database.
+    ///
+    /// Used by intake reconciliation to detect stale persisted dispatch markers
+    /// after a task-storage backend change (for example SQLite -> Postgres).
+    pub async fn exists_with_db_fallback(&self, id: &TaskId) -> anyhow::Result<bool> {
+        if self.cache.contains_key(id) {
+            return Ok(true);
+        }
+        self.db.exists_by_id(id.0.as_str()).await
+    }
+
     /// Return the status of a dependency task with a single DB lookup.
     ///
     /// Checks the in-memory cache first; falls back to a lightweight

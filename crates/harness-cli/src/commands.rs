@@ -371,8 +371,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     engine.load(&project)?;
                     let violations = engine.scan(&project).await?;
                     // Persist rule scan results for observability/GC even when running via CLI.
-                    match harness_observe::event_store::EventStore::with_policies_and_otel(
+                    match harness_observe::event_store::EventStore::with_policies_and_otel_with_database_url(
                         &config.server.data_dir,
+                        config.server.database_url.as_deref(),
                         config.observe.session_renewal_secs,
                         config.observe.log_retention_days,
                         &config.otel,

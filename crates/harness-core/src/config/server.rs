@@ -442,17 +442,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn server_config_deserializes_database_url_from_toml() {
+        let toml_str = r#"
+            transport = "http"
+            http_addr = "127.0.0.1:9800"
+            data_dir = "/tmp/harness"
+            project_root = "/tmp/project"
+            database_url = "postgres://harness:harness@localhost:5432/harness"
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.database_url.as_deref(),
+            Some("postgres://harness:harness@localhost:5432/harness")
+        );
+    }
+
     // --- existing tests ---
 
     #[test]
     fn server_config_debug_redacts_secrets() {
         let config = ServerConfig {
+            database_url: Some("postgres://harness:harness@localhost:5432/harness".to_string()),
             github_webhook_secret: Some("wh-secret-abc".to_string()),
             api_token: Some("tok-xyz".to_string()),
             github_token: Some("gh-token-123".to_string()),
             ..ServerConfig::default()
         };
         let debug_output = format!("{config:?}");
+        assert!(
+            !debug_output.contains("postgres://harness:harness@localhost:5432/harness"),
+            "database_url must not appear in Debug output"
+        );
         assert!(
             !debug_output.contains("wh-secret-abc"),
             "github_webhook_secret must not appear in Debug output"
@@ -475,6 +496,10 @@ mod tests {
     fn server_config_debug_shows_none_for_absent_secrets() {
         let config = ServerConfig::default();
         let debug_output = format!("{config:?}");
+        assert!(
+            debug_output.contains("database_url: None"),
+            "absent database_url should show as None"
+        );
         assert!(
             debug_output.contains("github_webhook_secret: None"),
             "absent github_webhook_secret should show as None"

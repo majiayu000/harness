@@ -476,6 +476,7 @@ mod tests {
         assert_eq!(config.review.interval_hours, 24);
         assert!(config.review.interval_secs.is_none());
         assert_eq!(config.review.timeout_secs, 900);
+        assert_eq!(config.review.max_concurrent_tasks, 2);
         assert!(config.review.agent.is_none());
     }
 
@@ -487,6 +488,7 @@ mod tests {
         assert_eq!(config.interval_hours, 24);
         assert!(config.interval_secs.is_none());
         assert_eq!(config.timeout_secs, 900);
+        assert_eq!(config.max_concurrent_tasks, 2);
         assert!(config.agent.is_none());
     }
 
@@ -499,6 +501,7 @@ mod tests {
             interval_secs = 600
             agent = "claude"
             timeout_secs = 1200
+            max_concurrent_tasks = 3
         "#;
         let config: ReviewConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
@@ -507,6 +510,7 @@ mod tests {
         assert_eq!(config.interval_secs, Some(600));
         assert_eq!(config.agent.as_deref(), Some("claude"));
         assert_eq!(config.timeout_secs, 1200);
+        assert_eq!(config.max_concurrent_tasks, 3);
     }
 
     #[test]
@@ -518,6 +522,7 @@ mod tests {
         assert!(config.interval_secs.is_none());
         assert!(config.agent.is_none());
         assert_eq!(config.timeout_secs, 900);
+        assert_eq!(config.max_concurrent_tasks, 2);
     }
 
     #[test]
@@ -652,6 +657,9 @@ mod tests {
         assert!(config.repo.is_empty());
         assert_eq!(config.label, "harness");
         assert_eq!(config.poll_interval_secs, 30);
+        assert_eq!(config.sprint_timeout_secs, 3 * 60 * 60);
+        assert_eq!(config.retry_backoff_base_secs, 15);
+        assert_eq!(config.retry_backoff_max_secs, 120);
     }
 
     #[test]
@@ -661,12 +669,18 @@ mod tests {
             repo = "owner/repo"
             label = "autofix"
             poll_interval_secs = 60
+            sprint_timeout_secs = 7200
+            retry_backoff_base_secs = 10
+            retry_backoff_max_secs = 90
         "#;
         let config: GitHubIntakeConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
         assert_eq!(config.repo, "owner/repo");
         assert_eq!(config.label, "autofix");
         assert_eq!(config.poll_interval_secs, 60);
+        assert_eq!(config.sprint_timeout_secs, 7200);
+        assert_eq!(config.retry_backoff_base_secs, 10);
+        assert_eq!(config.retry_backoff_max_secs, 90);
     }
 
     #[test]

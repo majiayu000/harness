@@ -35,8 +35,9 @@ pub async fn run_gc(
                     .to_string(),
             };
 
-            let event_store = EventStore::with_policies_and_otel(
+            let event_store = EventStore::with_policies_and_otel_with_database_url(
                 data_dir,
+                config.server.database_url.as_deref(),
                 config.observe.session_renewal_secs,
                 config.observe.log_retention_days,
                 &config.otel,

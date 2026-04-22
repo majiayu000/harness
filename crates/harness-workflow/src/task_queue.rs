@@ -22,6 +22,18 @@ pub struct QueueStats {
     pub limit: usize,
 }
 
+/// Runtime queue pressure snapshot for diagnostics.
+#[derive(Debug, Clone)]
+pub struct QueueDiagnostics {
+    pub global_running: usize,
+    pub global_queued: usize,
+    pub global_limit: usize,
+    pub project_running: usize,
+    pub project_waiting_for_project: usize,
+    pub project_awaiting_global: usize,
+    pub project_limit: usize,
+}
+
 /// Acquired execution slot. Dropping this releases both the global and project slots.
 pub struct TaskPermit {
     _global_release: PermitReleaseHandle,
@@ -227,6 +239,12 @@ impl PriorityPermitQueue {
 
     fn waiter_count(&self) -> usize {
         self.waiters.len()
+    }
+
+    /// Reconfigure queue capacity while preserving already-issued permits.
+    fn reconfigure_capacity(&mut self, old_capacity: usize, new_capacity: usize) {
+        let issued = old_capacity.saturating_sub(self.available);
+        self.available = new_capacity.saturating_sub(issued);
     }
 }
 
@@ -638,6 +656,61 @@ impl TaskQueue {
     /// Global execution limit.
     pub fn global_limit(&self) -> usize {
         self.global_limit
+    }
+
+    /// Effective project limit after applying per-project overrides.
+    pub fn effective_project_limit(&self, project_id: &str) -> usize {
+        self.project_limit(project_id)
+    }
+
+    /// Upsert the effective limit for a project and reconfigure any existing
+    /// project queue so future acquisitions honor the new cap.
+    pub fn set_project_limit(&self, project_id: &str, limit: usize) {
+        let old_limit = self.project_limit(project_id);
+        self.project_limits.insert(project_id.to_string(), limit);
+        if let Some(project_queue) = self.project_queues.get(project_id) {
+            project_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reconfigure_capacity(old_limit, limit);
+        }
+    }
+
+    /// Snapshot queue pressure for diagnostics and admission-failure logging.
+    pub fn diagnostics(&self, project_id: &str) -> QueueDiagnostics {
+        let project_limit = self.project_limit(project_id);
+        let global_running = self.running_count();
+        let global_queued = self.queued_count();
+        let project_awaiting_global = self
+            .project_awaiting_global
+            .get(project_id)
+            .map(|c| c.load(AtomicOrdering::Relaxed))
+            .unwrap_or(0);
+        if let Some(pq) = self.project_queues.get(project_id) {
+            let q = pq.lock().unwrap_or_else(|e| e.into_inner());
+            let holding_project = project_limit.saturating_sub(q.available_permits());
+            let project_waiting_for_project = q.waiter_count();
+            let project_running = holding_project.saturating_sub(project_awaiting_global);
+            QueueDiagnostics {
+                global_running,
+                global_queued,
+                global_limit: self.global_limit,
+                project_running,
+                project_waiting_for_project,
+                project_awaiting_global,
+                project_limit,
+            }
+        } else {
+            QueueDiagnostics {
+                global_running,
+                global_queued,
+                global_limit: self.global_limit,
+                project_running: 0,
+                project_waiting_for_project: 0,
+                project_awaiting_global,
+                project_limit,
+            }
+        }
     }
 
     /// Stats for a specific project (tasks that have acquired a project slot).

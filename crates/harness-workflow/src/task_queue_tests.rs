@@ -206,6 +206,25 @@ async fn project_stats_reflect_running_and_queued() {
     assert_eq!(stats2.queued, 1);
 }
 
+#[tokio::test]
+async fn set_project_limit_reconfigures_existing_project_queue() {
+    let q = Arc::new(TaskQueue::new(&config(4, 16)));
+
+    let _p1 = q.acquire("proj", 0).await.unwrap();
+    let _p2 = q.acquire("proj", 0).await.unwrap();
+    assert_eq!(q.project_stats("proj").running, 2);
+
+    q.set_project_limit("proj", 1);
+    assert_eq!(q.effective_project_limit("proj"), 1);
+
+    let q2 = q.clone();
+    let blocked = timeout(Duration::from_millis(50), q2.acquire("proj", 0)).await;
+    assert!(
+        blocked.is_err(),
+        "existing project queue should honor the updated lower limit"
+    );
+}
+
 // --- Priority tests ---
 
 #[tokio::test]
