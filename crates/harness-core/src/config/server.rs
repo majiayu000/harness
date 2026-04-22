@@ -81,6 +81,7 @@ impl ServerConfig {
     /// - `HARNESS_HTTP_ADDR`       — `http_addr` (parsed as `SocketAddr`)
     /// - `HARNESS_DATA_DIR`        — `data_dir`
     /// - `HARNESS_PROJECT_ROOT`    — `project_root`
+    /// - `HARNESS_DATABASE_URL`    — `database_url`
     /// - `HARNESS_API_TOKEN`       — `api_token`
     /// - `GITHUB_TOKEN`            — `github_token`
     /// - `GITHUB_WEBHOOK_SECRET`   — `github_webhook_secret`
@@ -93,6 +94,11 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("HARNESS_PROJECT_ROOT") {
             if !v.is_empty() {
                 self.project_root = std::path::PathBuf::from(v);
+            }
+        }
+        if let Ok(v) = std::env::var("HARNESS_DATABASE_URL") {
+            if !v.is_empty() {
+                self.database_url = Some(v);
             }
         }
         if let Ok(v) = std::env::var("HARNESS_API_TOKEN") {
@@ -304,6 +310,39 @@ mod tests {
     }
 
     #[test]
+    fn env_override_database_url() {
+        temp_env::with_vars(
+            [(
+                "HARNESS_DATABASE_URL",
+                Some("postgres://env-user:env-pass@env-host:5432/envdb"),
+            )],
+            || {
+                let mut cfg = ServerConfig::default();
+                cfg.apply_env_overrides().unwrap();
+                assert_eq!(
+                    cfg.database_url,
+                    Some("postgres://env-user:env-pass@env-host:5432/envdb".to_string())
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn env_override_empty_database_url_does_not_override_toml_url() {
+        temp_env::with_vars([("HARNESS_DATABASE_URL", Some(""))], || {
+            let mut cfg = ServerConfig {
+                database_url: Some("postgres://cfg-user:cfg-pass@cfg-host:5432/cfgdb".to_string()),
+                ..ServerConfig::default()
+            };
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(
+                cfg.database_url,
+                Some("postgres://cfg-user:cfg-pass@cfg-host:5432/cfgdb".to_string())
+            );
+        });
+    }
+
+    #[test]
     fn env_override_api_token() {
         temp_env::with_vars([("HARNESS_API_TOKEN", Some("tok-test"))], || {
             let mut cfg = ServerConfig::default();
@@ -383,6 +422,7 @@ mod tests {
                 ("HARNESS_HTTP_ADDR", None::<&str>),
                 ("HARNESS_DATA_DIR", None::<&str>),
                 ("HARNESS_PROJECT_ROOT", None::<&str>),
+                ("HARNESS_DATABASE_URL", None::<&str>),
                 ("HARNESS_API_TOKEN", None::<&str>),
                 ("GITHUB_TOKEN", None::<&str>),
             ],
@@ -395,6 +435,7 @@ mod tests {
                 cfg.apply_env_overrides().unwrap();
                 assert_eq!(cfg.http_addr, http_addr_before);
                 assert_eq!(cfg.data_dir, data_dir_before);
+                assert_eq!(cfg.database_url, None);
                 assert_eq!(cfg.api_token, None);
                 assert_eq!(cfg.github_token, None);
             },
