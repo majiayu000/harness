@@ -30,7 +30,7 @@ const GIT_LOCAL_ENV_VARS: &[&str] = &[
     "GIT_COMMON_DIR",
 ];
 
-const OWNER_RECORD_FILE: &str = ".harness-workspace-owner.json";
+const OWNER_RECORD_FILE: &str = "harness-workspace-owner.json";
 
 fn git_command() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("git");
@@ -138,7 +138,10 @@ pub struct WorkspaceManager {
 }
 
 impl WorkspaceManager {
-    pub fn new(config: WorkspaceConfig) -> anyhow::Result<Self> {
+    pub fn new(mut config: WorkspaceConfig) -> anyhow::Result<Self> {
+        if !config.root.is_absolute() {
+            config.root = std::env::current_dir()?.join(&config.root);
+        }
         std::fs::create_dir_all(&config.root)?;
         Ok(Self {
             config,
@@ -696,12 +699,33 @@ async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn owner_record_path(workspace_path: &Path) -> PathBuf {
-    workspace_path.join(OWNER_RECORD_FILE)
+fn workspace_git_dir(workspace_path: &Path) -> anyhow::Result<PathBuf> {
+    let dot_git = workspace_path.join(".git");
+    let metadata = std::fs::metadata(&dot_git)?;
+    if metadata.is_dir() {
+        return Ok(dot_git);
+    }
+
+    let gitdir = std::fs::read_to_string(&dot_git)?;
+    let relative = gitdir
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .ok_or_else(|| anyhow::anyhow!("invalid gitdir metadata at {:?}", dot_git))?;
+    let gitdir_path = Path::new(relative);
+    Ok(if gitdir_path.is_absolute() {
+        gitdir_path.to_path_buf()
+    } else {
+        workspace_path.join(gitdir_path)
+    })
+}
+
+fn owner_record_path(workspace_path: &Path) -> anyhow::Result<PathBuf> {
+    Ok(workspace_git_dir(workspace_path)?.join(OWNER_RECORD_FILE))
 }
 
 fn read_owner_record(workspace_path: &Path) -> Option<WorkspaceOwnerRecord> {
-    let bytes = std::fs::read(owner_record_path(workspace_path)).ok()?;
+    let bytes = std::fs::read(owner_record_path(workspace_path).ok()?).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -710,7 +734,7 @@ fn write_owner_record(
     owner_record: &WorkspaceOwnerRecord,
 ) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec(owner_record)?;
-    std::fs::write(owner_record_path(workspace_path), bytes)?;
+    std::fs::write(owner_record_path(workspace_path)?, bytes)?;
     Ok(())
 }
 
@@ -796,6 +820,8 @@ async fn infer_workspace_source_repo(workspace_path: &Path) -> Option<PathBuf> {
 }
 
 async fn is_registered_worktree(source_repo: &Path, workspace_path: &Path) -> bool {
+    let expected_path =
+        std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf());
     git_command()
         .args([
             "-C",
@@ -812,7 +838,9 @@ async fn is_registered_worktree(source_repo: &Path, workspace_path: &Path) -> bo
         .map(|stdout| {
             stdout.lines().any(|line| {
                 line.strip_prefix("worktree ")
-                    .is_some_and(|listed| listed == workspace_path.to_string_lossy())
+                    .map(PathBuf::from)
+                    .and_then(|listed| std::fs::canonicalize(&listed).ok().or(Some(listed)))
+                    .is_some_and(|listed| listed == expected_path)
             })
         })
         .unwrap_or(false)
@@ -835,6 +863,11 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn async_env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     struct ScopedEnvVar {
@@ -986,6 +1019,42 @@ mod tests {
 
         mgr.remove_workspace(&task_id).await.expect("remove");
         assert!(mgr.get_workspace(&task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn create_workspace_persists_owner_record_outside_checkout_root() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let task_id = harness_core::types::TaskId("test-task-owner-record".to_string());
+
+        let lease = mgr
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .await
+            .expect("create");
+
+        let metadata_path = owner_record_path(&lease.workspace_path).expect("owner record path");
+        assert!(
+            metadata_path.exists(),
+            "owner record should be written into git metadata"
+        );
+        assert!(
+            !lease
+                .workspace_path
+                .join(format!(".{OWNER_RECORD_FILE}"))
+                .exists()
+                && !lease.workspace_path.join(OWNER_RECORD_FILE).exists(),
+            "owner record must not dirty the checkout root"
+        );
+
+        mgr.remove_workspace(&task_id).await.expect("remove");
     }
 
     #[tokio::test]
@@ -1307,6 +1376,55 @@ mod tests {
             }),
             "startup cleanup must prune the owning repo entry"
         );
+    }
+
+    struct CwdGuard(PathBuf);
+
+    impl CwdGuard {
+        fn switch_to(path: &Path) -> anyhow::Result<Self> {
+            let original = std::env::current_dir()?;
+            std::env::set_current_dir(path)?;
+            Ok(Self(original))
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn is_registered_worktree_matches_relative_workspace_paths() {
+        let _guard = async_env_lock().lock().await;
+
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let _cwd_guard = CwdGuard::switch_to(sandbox.path()).expect("switch cwd");
+
+        let source = sandbox.path().join("source");
+        std::fs::create_dir_all(&source).expect("create source");
+        init_git_repo(&source);
+        let branch = current_branch(&source);
+
+        let config = WorkspaceConfig {
+            root: PathBuf::from("workspaces"),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let task_id = harness_core::types::TaskId("test-task-relative-path".to_string());
+
+        mgr.create_workspace(&task_id, &source, "origin", &branch, 1)
+            .await
+            .expect("create");
+        let relative_workspace_path =
+            PathBuf::from("workspaces").join(sanitize_task_id(&task_id.0));
+
+        assert!(
+            is_registered_worktree(&source, &relative_workspace_path).await,
+            "registered worktree lookup should canonicalize relative paths"
+        );
+
+        mgr.remove_workspace(&task_id).await.expect("remove");
     }
 
     #[tokio::test]
