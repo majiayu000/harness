@@ -63,6 +63,9 @@ impl ProofOfWork {
 /// Result label written by the review loop when the reviewer approves.
 pub const RESULT_LGTM: &str = "lgtm";
 
+/// Result label written by the review loop when the reviewer requests fixes.
+pub const RESULT_FIXED: &str = "fixed";
+
 /// Result label written by the pipeline when a non-PR review task completes.
 pub const RESULT_COMPLETED: &str = "completed";
 

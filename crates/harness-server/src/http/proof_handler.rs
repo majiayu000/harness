@@ -16,8 +16,8 @@ use crate::task_runner::{TaskState, TaskStatus};
 
 /// Derive a `ProofOfWork` from a `TaskState`.
 ///
-/// Scans `rounds` in reverse to find the final review detail, counts review
-/// rounds, and infers outcomes from known result label constants.
+/// Scans `rounds` in order to track the final review round's detail, if any,
+/// and infer outcomes from known result label constants.
 fn proof_from_state(state: &TaskState) -> ProofOfWork {
     let mut review_rounds = 0u32;
     let mut has_lgtm = false;

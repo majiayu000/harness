@@ -3,7 +3,9 @@ use crate::task_executor::review_loop::run_review_loop;
 use crate::task_runner::{CreateTaskRequest, RoundResult, TaskState};
 use async_trait::async_trait;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
-use harness_core::proof_of_work::{ACTION_AGENT_REVIEW, RESULT_APPROVED, RESULT_QUOTA_EXHAUSTED};
+use harness_core::proof_of_work::{
+    ACTION_AGENT_REVIEW, RESULT_APPROVED, RESULT_FIXED, RESULT_QUOTA_EXHAUSTED,
+};
 use harness_core::types::{Capability, TokenUsage};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -86,7 +88,7 @@ fn agent_review_round(result: &str, detail: Option<&str>) -> RoundResult {
 #[test]
 fn from_task_done_with_approved_review() {
     let rounds = vec![
-        review_round("fixed", None),
+        review_round(RESULT_FIXED, None),
         review_round(RESULT_LGTM, Some("all good")),
     ];
     let state = make_state_with_rounds(TaskStatus::Done, rounds);
@@ -101,7 +103,7 @@ fn from_task_done_with_approved_review() {
 
 #[test]
 fn from_task_done_ci_failed_no_lgtm() {
-    let rounds = vec![review_round("fixed", None)];
+    let rounds = vec![review_round(RESULT_FIXED, None)];
     let state = make_state_with_rounds(TaskStatus::Failed, rounds);
     let proof = proof_from_state(&state);
 
@@ -176,7 +178,7 @@ fn from_task_quota_heuristic_graduation() {
 #[test]
 fn from_task_mixed_quota_heuristic_graduation() {
     let rounds = vec![
-        review_round("fixed", Some("addressed initial feedback")),
+        review_round(RESULT_FIXED, Some("addressed initial feedback")),
         review_round(RESULT_QUOTA_EXHAUSTED, None),
         review_round(RESULT_QUOTA_EXHAUSTED, None),
         review_round(RESULT_QUOTA_EXHAUSTED, None),
@@ -198,7 +200,7 @@ fn from_task_mixed_quota_heuristic_graduation() {
 #[test]
 fn from_task_uses_actual_final_review_round_detail() {
     let rounds = vec![
-        review_round("fixed", Some("older feedback")),
+        review_round(RESULT_FIXED, Some("older feedback")),
         review_round(RESULT_QUOTA_EXHAUSTED, None),
     ];
     let state = make_state_with_rounds(TaskStatus::Done, rounds);
@@ -440,7 +442,7 @@ async fn proof_endpoint_route_coverage() -> anyhow::Result<()> {
         let id = harness_core::types::TaskId("failed-task".to_string());
         let mut task = TaskState::new(id);
         task.status = TaskStatus::Failed;
-        task.rounds = vec![review_round("fixed", Some("needs more work"))];
+        task.rounds = vec![review_round(RESULT_FIXED, Some("needs more work"))];
         state.core.tasks.insert(&task).await;
 
         let resp = proof_route(state.clone())
@@ -468,7 +470,7 @@ async fn proof_endpoint_route_coverage() -> anyhow::Result<()> {
             RoundResult {
                 turn: 1,
                 action: ACTION_REVIEW.to_string(),
-                result: "fixed".to_string(),
+                result: RESULT_FIXED.to_string(),
                 detail: None,
                 first_token_latency_ms: None,
             },

@@ -6,6 +6,9 @@ use crate::task_runner::{
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::error::HarnessError;
 use harness_core::prompts;
+use harness_core::proof_of_work::{
+    ACTION_REVIEW, RESULT_FIXED, RESULT_LGTM, RESULT_QUOTA_EXHAUSTED,
+};
 use harness_core::tool_isolation::validate_tool_usage;
 use harness_core::types::{Event, ExecutionPhase, SessionId};
 use std::collections::HashMap;
@@ -318,8 +321,8 @@ pub(crate) async fn run_review_loop(
             mutate_and_persist(store, task_id, |s| {
                 s.rounds.push(RoundResult {
                     turn: round,
-                    action: "review".into(),
-                    result: "quota_exhausted".into(),
+                    action: ACTION_REVIEW.into(),
+                    result: RESULT_QUOTA_EXHAUSTED.into(),
                     detail: None,
                     first_token_latency_ms: None,
                 });
@@ -383,7 +386,7 @@ pub(crate) async fn run_review_loop(
             continue; // Don't increment round — quota rounds are free
         }
 
-        let result_label = if lgtm { "lgtm" } else { "fixed" };
+        let result_label = if lgtm { RESULT_LGTM } else { RESULT_FIXED };
         let review_detail = if output.is_empty() {
             None
         } else {
@@ -392,7 +395,7 @@ pub(crate) async fn run_review_loop(
         mutate_and_persist(store, task_id, |s| {
             s.rounds.push(RoundResult {
                 turn: round,
-                action: "review".into(),
+                action: ACTION_REVIEW.into(),
                 result: result_label.into(),
                 detail: review_detail,
                 first_token_latency_ms: None,
@@ -420,7 +423,6 @@ pub(crate) async fn run_review_loop(
             },
         );
         ev.detail = Some(format!("pr={pr_num}"));
-        let result_label = if lgtm { "lgtm" } else { "fixed" };
         ev.reason = Some(format!("round {round}: {result_label}"));
         if let Err(e) = events.log(&ev).await {
             tracing::warn!("failed to log pr_review event: {e}");
