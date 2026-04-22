@@ -19,10 +19,6 @@ impl TaskDb {
             .request_settings
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok());
-        let system_input_json = state
-            .system_input
-            .as_ref()
-            .and_then(|input| serde_json::to_string(input).ok());
         let created_at_dt: Option<DateTime<Utc>> = state
             .created_at
             .as_deref()
@@ -58,7 +54,7 @@ impl TaskDb {
         .bind(&phase_json)
         .bind(state.description.as_deref())
         .bind(settings_json.as_deref())
-        .bind(system_input_json.as_deref())
+        .bind(None::<&str>)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -74,10 +70,6 @@ impl TaskDb {
             .request_settings
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok());
-        let system_input_json = state
-            .system_input
-            .as_ref()
-            .and_then(|input| serde_json::to_string(input).ok());
         sqlx::query(
             "UPDATE tasks SET task_kind = $1, status = $2, turn = $3, pr_url = $4, rounds = $5, \
                     error = $6, source = $7, external_id = $8, repo = $9, depends_on = $10, \
@@ -105,7 +97,7 @@ impl TaskDb {
         .bind(&phase_json)
         .bind(state.description.as_deref())
         .bind(settings_json.as_deref())
-        .bind(system_input_json.as_deref())
+        .bind(None::<&str>)
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -408,7 +400,7 @@ impl TaskDb {
             let sql = format!(
                 "SELECT t.id, t.task_kind, t.source, t.external_id, t.description, \
                         t.status, t.turn, t.pr_url AS task_pr_url, \
-                        t.system_input, \
+                        t.system_input, t.request_settings, \
                         c.triage_output, c.plan_output, c.pr_url AS ck_pr_url \
                  FROM tasks t \
                  LEFT JOIN task_checkpoints c ON t.id = c.task_id \
@@ -432,10 +424,15 @@ impl TaskDb {
                 row.external_id.as_deref(),
                 row.description.as_deref(),
             )?;
-            let system_input: Option<crate::task_runner::SystemTaskInput> = row
-                .system_input
-                .as_deref()
-                .and_then(|value| serde_json::from_str(value).ok());
+            let has_restart_data = row.system_input.is_some()
+                || row
+                    .request_settings
+                    .as_deref()
+                    .and_then(|s| {
+                        serde_json::from_str::<crate::task_runner::PersistedRequestSettings>(s).ok()
+                    })
+                    .map(|s| s.system_prompt_restart_bundle.is_some())
+                    .unwrap_or(false);
             let effective_pr_url = row
                 .task_pr_url
                 .as_deref()
@@ -451,7 +448,7 @@ impl TaskDb {
 
             if task_kind.recovery_status().is_some() {
                 if let Some(recovery_status) = task_kind.recovery_status() {
-                    if system_input.is_some() {
+                    if has_restart_data {
                         sqlx::query(
                             "UPDATE tasks SET status = $1, error = NULL, \
                              updated_at = CURRENT_TIMESTAMP WHERE id = $2",

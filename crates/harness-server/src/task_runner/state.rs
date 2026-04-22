@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use super::request::{PersistedRequestSettings, SystemTaskInput};
+use super::request::PersistedRequestSettings;
 use super::types::{TaskId, TaskKind, TaskPhase, TaskStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,10 +79,6 @@ pub struct TaskState {
     /// requested rather than silently falling back to server defaults.
     #[serde(skip)]
     pub request_settings: Option<PersistedRequestSettings>,
-    /// Restart-safe prompt snapshot for trusted system-generated prompt tasks.
-    /// Persisted internally for recovery only; never expose it via the public task API.
-    #[serde(skip)]
-    pub system_input: Option<SystemTaskInput>,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -166,7 +162,6 @@ impl TaskState {
             plan_output: None,
             repo: None,
             request_settings: None,
-            system_input: None,
         }
     }
 

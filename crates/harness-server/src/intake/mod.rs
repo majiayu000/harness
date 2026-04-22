@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::http::AppState;
-use crate::task_runner::{TaskId, TaskStatus};
+use crate::task_runner::{
+    CreateTaskRequest, SprintPlannerIssueSummaryInput, SprintPlannerPromptInputs,
+    SystemPromptRestartBundle, TaskId, TaskStatus,
+};
 
 pub mod feishu;
 pub mod github_issues;
@@ -522,14 +525,12 @@ async fn run_repo_sprint(
     let issue_summary = build_issue_summary(&issues);
     let planner_prompt = harness_core::prompts::sprint_plan_prompt(&issue_summary);
 
-    let planner_req = crate::task_runner::CreateTaskRequest {
-        prompt: Some(planner_prompt.clone()),
+    let planner_req = CreateTaskRequest {
+        prompt: Some(planner_prompt),
         agent: planner_agent.map(String::from),
         project: Some(project_root.clone()),
         source: Some("sprint_planner".to_string()),
-        system_input: Some(crate::task_runner::SystemTaskInput::SprintPlanner {
-            prompt: planner_prompt,
-        }),
+        system_prompt_restart_bundle: Some(build_sprint_planner_restart_bundle(&issues)),
         ..Default::default()
     };
 
@@ -997,6 +998,28 @@ fn build_issue_summary(issues: &[(Arc<dyn IntakeSource>, IncomingIssue)]) -> Str
         .join("\n")
 }
 
+fn build_sprint_planner_prompt_inputs(
+    issues: &[(Arc<dyn IntakeSource>, IncomingIssue)],
+) -> SprintPlannerPromptInputs {
+    SprintPlannerPromptInputs {
+        issues: issues
+            .iter()
+            .map(|(_, issue)| SprintPlannerIssueSummaryInput {
+                external_id: issue.external_id.clone(),
+                title: issue.title.clone(),
+                labels: issue.labels.clone(),
+                repo: issue.repo.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn build_sprint_planner_restart_bundle(
+    issues: &[(Arc<dyn IntakeSource>, IncomingIssue)],
+) -> SystemPromptRestartBundle {
+    SystemPromptRestartBundle::sprint_planner(build_sprint_planner_prompt_inputs(issues))
+}
+
 fn status_unblocks_dependents(status: &TaskStatus) -> bool {
     matches!(status, TaskStatus::Done | TaskStatus::Failed)
 }
@@ -1208,6 +1231,62 @@ pub(crate) fn build_prompt_from_issue(issue: &IncomingIssue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    struct TestSource;
+
+    #[async_trait]
+    impl IntakeSource for TestSource {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        async fn poll(&self) -> anyhow::Result<Vec<IncomingIssue>> {
+            Ok(Vec::new())
+        }
+
+        async fn mark_dispatched(
+            &self,
+            _external_id: &str,
+            _task_id: &TaskId,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn unmark_dispatched(&self, _external_id: &str) {}
+
+        async fn on_task_complete(
+            &self,
+            _external_id: &str,
+            _result: &TaskCompletionResult,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn planner_issue(
+        external_id: &str,
+        title: &str,
+        labels: &[&str],
+        repo: Option<&str>,
+    ) -> (Arc<dyn IntakeSource>, IncomingIssue) {
+        (
+            Arc::new(TestSource),
+            IncomingIssue {
+                source: "github".to_string(),
+                external_id: external_id.to_string(),
+                identifier: format!("#{external_id}"),
+                title: title.to_string(),
+                description: None,
+                repo: repo.map(ToOwned::to_owned),
+                url: None,
+                priority: None,
+                labels: labels.iter().map(|label| (*label).to_string()).collect(),
+                created_at: None,
+                project_root: None,
+            },
+        )
+    }
 
     fn make_deps(pairs: &[(u64, &[u64])]) -> std::collections::HashMap<u64, Vec<u64>> {
         pairs
@@ -1651,6 +1730,39 @@ mod tests {
         let prompt = build_prompt_from_issue(&issue);
         assert!(prompt.contains("URL: N/A"));
         assert!(prompt.contains("No description."));
+    }
+
+    #[test]
+    fn sprint_planner_restart_bundle_serializes_minimal_issue_summary_inputs() {
+        let issues = vec![
+            planner_issue("42", "Fix login", &["p1", "bug"], Some("owner/repo")),
+            planner_issue("77", "Tighten auth", &[], None),
+        ];
+
+        let inputs = build_sprint_planner_prompt_inputs(&issues);
+
+        assert_eq!(inputs.issues.len(), 2);
+        assert_eq!(inputs.issues[0].external_id, "42");
+        assert_eq!(inputs.issues[0].title, "Fix login");
+        assert_eq!(inputs.issues[0].labels, vec!["p1", "bug"]);
+        assert_eq!(inputs.issues[0].repo.as_deref(), Some("owner/repo"));
+        assert_eq!(inputs.issues[1].external_id, "77");
+        assert_eq!(inputs.issues[1].labels, Vec::<String>::new());
+        assert_eq!(inputs.issues[1].repo, None);
+    }
+
+    #[test]
+    fn sprint_planner_restart_bundle_rebuilds_current_prompt() {
+        let issues = vec![
+            planner_issue("42", "Fix login", &["p1", "bug"], Some("owner/repo")),
+            planner_issue("77", "Tighten auth", &[], None),
+        ];
+
+        let bundle = build_sprint_planner_restart_bundle(&issues);
+        let prompt = bundle.rebuild_prompt().expect("bundle rebuilds prompt");
+        let expected = harness_core::prompts::sprint_plan_prompt(&build_issue_summary(&issues));
+
+        assert_eq!(prompt, expected);
     }
 
     #[test]

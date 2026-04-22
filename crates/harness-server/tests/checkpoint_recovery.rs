@@ -35,7 +35,6 @@ fn make_task(id: &str, status: TaskStatus) -> TaskState {
         plan_output: None,
         repo: None,
         request_settings: None,
-        system_input: None,
     }
 }
 
@@ -266,14 +265,23 @@ async fn restart_with_triage_checkpoint_resumes_task() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn restart_with_review_system_input_resumes_task() -> anyhow::Result<()> {
+    use harness_server::task_runner::{
+        PeriodicReviewPromptInputs, PersistedRequestSettings, SystemPromptRestartBundle,
+    };
     let store = setup_store(|db| async move {
         let mut task = make_task("t-review-system", TaskStatus::ReviewGenerating);
         task.task_kind = TaskKind::Review;
-        task.system_input = Some(
-            harness_server::task_runner::SystemTaskInput::PeriodicReview {
-                prompt: "review prompt".to_string(),
-            },
-        );
+        task.request_settings = Some(PersistedRequestSettings {
+            system_prompt_restart_bundle: Some(SystemPromptRestartBundle::periodic_review(
+                PeriodicReviewPromptInputs {
+                    project_root: "/tmp/proj".to_string(),
+                    since_arg: "2024-01-01T00:00:00Z".to_string(),
+                    review_type: "standard".to_string(),
+                    guard_scan_output: None,
+                },
+            )),
+            ..Default::default()
+        });
         db.insert(&task).await?;
         Ok(())
     })
@@ -288,20 +296,31 @@ async fn restart_with_review_system_input_resumes_task() -> anyhow::Result<()> {
         task.status
     );
     assert_eq!(task.task_kind, TaskKind::Review);
-    assert!(task.system_input.is_some());
     Ok(())
 }
 
 #[tokio::test]
 async fn restart_with_planner_system_input_resumes_task() -> anyhow::Result<()> {
+    use harness_server::task_runner::{
+        PersistedRequestSettings, SprintPlannerIssueSummaryInput, SprintPlannerPromptInputs,
+        SystemPromptRestartBundle,
+    };
     let store = setup_store(|db| async move {
         let mut task = make_task("t-planner-system", TaskStatus::PlannerGenerating);
         task.task_kind = TaskKind::Planner;
-        task.system_input = Some(
-            harness_server::task_runner::SystemTaskInput::SprintPlanner {
-                prompt: "planner prompt".to_string(),
-            },
-        );
+        task.request_settings = Some(PersistedRequestSettings {
+            system_prompt_restart_bundle: Some(SystemPromptRestartBundle::sprint_planner(
+                SprintPlannerPromptInputs {
+                    issues: vec![SprintPlannerIssueSummaryInput {
+                        external_id: "issue:1".to_string(),
+                        title: "Test issue".to_string(),
+                        labels: vec![],
+                        repo: None,
+                    }],
+                },
+            )),
+            ..Default::default()
+        });
         db.insert(&task).await?;
         Ok(())
     })
@@ -316,7 +335,6 @@ async fn restart_with_planner_system_input_resumes_task() -> anyhow::Result<()> 
         task.status
     );
     assert_eq!(task.task_kind, TaskKind::Planner);
-    assert!(task.system_input.is_some());
     Ok(())
 }
 

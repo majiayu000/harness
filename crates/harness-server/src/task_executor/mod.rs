@@ -180,7 +180,7 @@ async fn run_non_implementation_task(
     turns_used_acc: &mut u32,
     task_start: Instant,
 ) -> anyhow::Result<()> {
-    let Some(system_input) = store.get(task_id).and_then(|state| state.system_input) else {
+    let Some(ref prompt_str) = req.prompt else {
         anyhow::bail!(
             "{} task is missing restart-safe input metadata",
             task_kind.as_ref()
@@ -190,7 +190,7 @@ async fn run_non_implementation_task(
     update_status(store, task_id, task_kind.execution_status(), 1).await?;
 
     let mut prompt = implement_pipeline::prepend_constitution(
-        system_input.prompt().to_string(),
+        prompt_str.clone(),
         server_config.server.constitution_enabled,
     );
     let skill_additions = helpers::inject_skills_into_prompt(skills, &prompt).await;

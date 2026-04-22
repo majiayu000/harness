@@ -8,6 +8,98 @@ use super::types::{TaskId, TaskKind};
 /// `0` = normal (default), `1` = high, `2` = critical.
 pub const MAX_TASK_PRIORITY: u8 = 2;
 
+const SYSTEM_PROMPT_RESTART_BUNDLE_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptTaskOrigin {
+    Manual,
+    SystemGenerated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeriodicReviewPromptInputs {
+    pub project_root: String,
+    pub since_arg: String,
+    pub review_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guard_scan_output: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SprintPlannerIssueSummaryInput {
+    pub external_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SprintPlannerPromptInputs {
+    pub issues: Vec<SprintPlannerIssueSummaryInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SystemPromptRestartBundle {
+    pub version: u8,
+    pub kind: String,
+    pub data: serde_json::Value,
+}
+
+impl SystemPromptRestartBundle {
+    pub fn periodic_review(inputs: PeriodicReviewPromptInputs) -> Self {
+        Self {
+            version: SYSTEM_PROMPT_RESTART_BUNDLE_VERSION,
+            kind: "periodic_review".to_string(),
+            data: serde_json::json!({
+                "project_root": inputs.project_root,
+                "since_arg": inputs.since_arg,
+                "review_type": inputs.review_type,
+                "guard_scan_output": inputs.guard_scan_output,
+            }),
+        }
+    }
+
+    pub fn sprint_planner(inputs: SprintPlannerPromptInputs) -> Self {
+        Self {
+            version: SYSTEM_PROMPT_RESTART_BUNDLE_VERSION,
+            kind: "sprint_planner".to_string(),
+            data: serde_json::json!({ "issues": inputs.issues }),
+        }
+    }
+
+    pub(crate) fn rebuild_prompt(&self) -> Result<String, String> {
+        match (self.version, self.kind.as_str()) {
+            (SYSTEM_PROMPT_RESTART_BUNDLE_VERSION, "periodic_review") => {
+                let inputs: PeriodicReviewPromptInputs =
+                    serde_json::from_value(self.data.clone()).map_err(|err| {
+                        format!("invalid periodic_review restart bundle payload: {err}")
+                    })?;
+                Ok(harness_core::prompts::periodic_review_prompt_with_guard_scan(
+                    &inputs.project_root,
+                    &inputs.since_arg,
+                    &inputs.review_type,
+                    inputs.guard_scan_output.as_deref(),
+                ))
+            }
+            (SYSTEM_PROMPT_RESTART_BUNDLE_VERSION, "sprint_planner") => {
+                let inputs: SprintPlannerPromptInputs =
+                    serde_json::from_value(self.data.clone()).map_err(|err| {
+                        format!("invalid sprint_planner restart bundle payload: {err}")
+                    })?;
+                Ok(harness_core::prompts::sprint_plan_prompt(
+                    &build_sprint_issue_summary(&inputs),
+                ))
+            }
+            (version, kind) => Err(format!(
+                "unsupported system prompt restart bundle version/kind: version={version}, kind={kind}"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateTaskRequest {
     /// Free-text task description (prompt, issue URL, etc.).
@@ -78,39 +170,17 @@ pub struct CreateTaskRequest {
     /// Higher values are served first when multiple tasks are waiting for a slot.
     #[serde(default)]
     pub priority: u8,
-    /// Restart-safe metadata for trusted system-generated prompt tasks.
-    /// Never accepted from or exposed to external HTTP callers.
+    /// Structured restart-safe inputs for system-generated prompt-only tasks.
+    ///
+    /// Internal-only: arbitrary API callers must not inject raw prompt recovery
+    /// metadata. Scheduler-created tasks attach a bundle explicitly in Rust code.
     #[serde(skip)]
-    pub system_input: Option<SystemTaskInput>,
+    pub system_prompt_restart_bundle: Option<SystemPromptRestartBundle>,
 }
 
 impl CreateTaskRequest {
-    /// Classify task kind using only trusted internal metadata for system tasks.
-    ///
-    /// External callers may set `source`, but they cannot populate `system_input`
-    /// because the field is `#[serde(skip)]`. That makes `system_input` the trust
-    /// boundary for review/planner lifecycle selection.
     pub fn task_kind(&self) -> TaskKind {
-        match self.system_input.as_ref() {
-            Some(SystemTaskInput::PeriodicReview { .. }) => TaskKind::Review,
-            Some(SystemTaskInput::SprintPlanner { .. }) => TaskKind::Planner,
-            None => TaskKind::classify(None, self.issue, self.pr),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SystemTaskInput {
-    PeriodicReview { prompt: String },
-    SprintPlanner { prompt: String },
-}
-
-impl SystemTaskInput {
-    pub fn prompt(&self) -> &str {
-        match self {
-            Self::PeriodicReview { prompt } | Self::SprintPlanner { prompt } => prompt,
-        }
+        TaskKind::classify(None, self.issue, self.pr)
     }
 }
 
@@ -148,6 +218,13 @@ pub struct PersistedRequestSettings {
     /// Pure prompt tasks and PR tasks leave this `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_prompt: Option<String>,
+    /// Typed classification for prompt-only tasks so privacy and restart logic
+    /// no longer depend on the `"prompt task"` description placeholder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_task_origin: Option<PromptTaskOrigin>,
+    /// Restart-safe structured inputs for system-generated prompt-only tasks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt_restart_bundle: Option<SystemPromptRestartBundle>,
     /// Primary prompt for prompt-only tasks (no issue or pr).
     ///
     /// Kept in memory so that `AwaitingDeps` tasks can reconstruct the original
@@ -164,6 +241,17 @@ pub struct PersistedRequestSettings {
 
 impl PersistedRequestSettings {
     pub(crate) fn from_req(req: &CreateTaskRequest) -> Self {
+        let prompt_task_origin = if req.issue.is_none() && req.pr.is_none() && req.prompt.is_some()
+        {
+            Some(if req.system_prompt_restart_bundle.is_some() {
+                PromptTaskOrigin::SystemGenerated
+            } else {
+                PromptTaskOrigin::Manual
+            })
+        } else {
+            None
+        };
+
         Self {
             agent: req.agent.clone(),
             max_rounds: req.max_rounds,
@@ -186,6 +274,8 @@ impl PersistedRequestSettings {
             } else {
                 None
             },
+            prompt_task_origin,
+            system_prompt_restart_bundle: req.system_prompt_restart_bundle.clone(),
             // For prompt-only tasks (no issue/pr), store the prompt so that
             // AwaitingDeps tasks can reconstruct the original request when deps resolve.
             prompt: if req.issue.is_none() && req.pr.is_none() {
@@ -209,6 +299,7 @@ impl PersistedRequestSettings {
         req.retry_max_backoff_ms = self.retry_max_backoff_ms;
         req.stall_timeout_secs = self.stall_timeout_secs;
         req.turn_timeout_secs = self.turn_timeout_secs;
+        req.system_prompt_restart_bundle = self.system_prompt_restart_bundle.clone();
         // Restore the additional prompt context for recovered issue tasks.
         if self.additional_prompt.is_some() {
             req.prompt = self.additional_prompt.clone();
@@ -217,6 +308,25 @@ impl PersistedRequestSettings {
         if self.prompt.is_some() {
             req.prompt = self.prompt.clone();
         }
+    }
+
+    pub(crate) fn is_manual_prompt_only(&self) -> bool {
+        self.prompt_task_origin == Some(PromptTaskOrigin::Manual)
+    }
+
+    pub(crate) fn is_system_generated_prompt_only(&self) -> bool {
+        self.prompt_task_origin == Some(PromptTaskOrigin::SystemGenerated)
+    }
+
+    pub(crate) fn rebuild_system_prompt(&self) -> Result<Option<String>, String> {
+        if !self.is_system_generated_prompt_only() {
+            return Ok(None);
+        }
+        let bundle = self
+            .system_prompt_restart_bundle
+            .as_ref()
+            .ok_or_else(|| "system-generated prompt task is missing restart bundle".to_string())?;
+        bundle.rebuild_prompt().map(Some)
     }
 }
 
@@ -245,13 +355,12 @@ impl Default for CreateTaskRequest {
             parent_task_id: None,
             depends_on: Vec::new(),
             priority: 0,
-            system_input: None,
+            system_prompt_restart_bundle: None,
         }
     }
 }
 
 pub(super) fn summarize_request_description(req: &CreateTaskRequest) -> Option<String> {
-    let task_kind = req.task_kind();
     // Only persist structured safe labels — never raw prompt text, which may contain
     // credentials or customer data.
     if let Some(n) = req.issue {
@@ -260,14 +369,34 @@ pub(super) fn summarize_request_description(req: &CreateTaskRequest) -> Option<S
     if let Some(n) = req.pr {
         return Some(format!("PR #{n}"));
     }
-    if req.prompt.is_some() {
-        return Some(match task_kind {
-            TaskKind::Review => "periodic review".to_string(),
-            TaskKind::Planner => "sprint planner".to_string(),
-            TaskKind::Issue | TaskKind::Pr | TaskKind::Prompt => "prompt task".to_string(),
-        });
+    // Prompt-only tasks: store a generic label so that:
+    //   (a) sibling-awareness can include them (prevents parallel agents stomping the same files),
+    //   (b) operators can identify crashed tasks in the DB/dashboard after a restart.
+    // The prompt itself is deliberately not stored.
+    if req.prompt.is_some() || req.system_prompt_restart_bundle.is_some() {
+        return Some("prompt task".to_string());
     }
     None
+}
+
+fn build_sprint_issue_summary(inputs: &SprintPlannerPromptInputs) -> String {
+    inputs
+        .issues
+        .iter()
+        .map(|issue| {
+            let labels = if issue.labels.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", issue.labels.join(", "))
+            };
+            let repo = issue.repo.as_deref().unwrap_or("");
+            format!(
+                "- #{}: {}{} ({})",
+                issue.external_id, issue.title, labels, repo
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub async fn fill_missing_repo_from_project(req: &mut CreateTaskRequest) {
@@ -360,5 +489,63 @@ mod tests {
         settings.apply_to_req(&mut restored);
         assert!(restored.skip_triage);
         assert!(restored.force_execute);
+    }
+
+    #[test]
+    fn request_settings_roundtrip_preserves_system_prompt_bundle() {
+        let settings = PersistedRequestSettings {
+            wait_secs: 120,
+            retry_base_backoff_ms: 10_000,
+            retry_max_backoff_ms: 300_000,
+            stall_timeout_secs: 300,
+            turn_timeout_secs: 3_600,
+            prompt_task_origin: Some(PromptTaskOrigin::SystemGenerated),
+            system_prompt_restart_bundle: Some(SystemPromptRestartBundle::periodic_review(
+                PeriodicReviewPromptInputs {
+                    project_root: "/tmp/project".to_string(),
+                    since_arg: "2026-04-20T00:00:00Z".to_string(),
+                    review_type: "mixed".to_string(),
+                    guard_scan_output: Some("guard output".to_string()),
+                },
+            )),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&settings).expect("settings serialize");
+        let decoded: PersistedRequestSettings =
+            serde_json::from_str(&json).expect("settings deserialize");
+
+        assert_eq!(decoded.prompt_task_origin, settings.prompt_task_origin);
+        assert_eq!(
+            decoded.system_prompt_restart_bundle,
+            settings.system_prompt_restart_bundle
+        );
+    }
+
+    #[test]
+    fn rebuild_system_prompt_fails_closed_on_unsupported_bundle_version() {
+        let settings = PersistedRequestSettings {
+            wait_secs: 120,
+            retry_base_backoff_ms: 10_000,
+            retry_max_backoff_ms: 300_000,
+            stall_timeout_secs: 300,
+            turn_timeout_secs: 3_600,
+            prompt_task_origin: Some(PromptTaskOrigin::SystemGenerated),
+            system_prompt_restart_bundle: Some(SystemPromptRestartBundle {
+                version: 99,
+                kind: "periodic_review".to_string(),
+                data: serde_json::json!({
+                    "project_root": "/tmp/project",
+                    "since_arg": "2026-04-20T00:00:00Z",
+                    "review_type": "mixed"
+                }),
+            }),
+            ..Default::default()
+        };
+
+        let err = settings
+            .rebuild_system_prompt()
+            .expect_err("unsupported bundle must fail");
+        assert!(err.contains("unsupported system prompt restart bundle"));
     }
 }

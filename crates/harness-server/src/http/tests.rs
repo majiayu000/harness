@@ -54,9 +54,10 @@ impl CodeAgent for CapturingAgent {
 
     async fn execute_stream(
         &self,
-        _req: AgentRequest,
+        req: AgentRequest,
         _tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
+        self.prompts.lock().await.push(req.prompt);
         Ok(())
     }
 }
@@ -279,6 +280,34 @@ async fn build_test_state_with_agent(
 fn init_fake_git_repo(root: &std::path::Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(root.join(".git"))?;
     Ok(())
+}
+
+fn system_prompt_settings(
+    bundle: task_runner::SystemPromptRestartBundle,
+) -> task_runner::PersistedRequestSettings {
+    task_runner::PersistedRequestSettings {
+        wait_secs: 120,
+        retry_base_backoff_ms: 10_000,
+        retry_max_backoff_ms: 300_000,
+        stall_timeout_secs: 300,
+        turn_timeout_secs: 3_600,
+        agent: Some("test".to_string()),
+        prompt_task_origin: Some(task_runner::PromptTaskOrigin::SystemGenerated),
+        system_prompt_restart_bundle: Some(bundle),
+        ..Default::default()
+    }
+}
+
+fn manual_prompt_only_settings() -> task_runner::PersistedRequestSettings {
+    task_runner::PersistedRequestSettings {
+        wait_secs: 120,
+        retry_base_backoff_ms: 10_000,
+        retry_max_backoff_ms: 300_000,
+        stall_timeout_secs: 300,
+        turn_timeout_secs: 3_600,
+        prompt_task_origin: Some(task_runner::PromptTaskOrigin::Manual),
+        ..Default::default()
+    }
 }
 
 fn task_app(state: Arc<AppState>) -> Router {
@@ -951,9 +980,18 @@ async fn get_task_hides_internal_system_input_metadata() -> anyhow::Result<()> {
         phase: task_runner::TaskPhase::Review,
         triage_output: None,
         plan_output: None,
-        request_settings: None,
-        system_input: Some(task_runner::SystemTaskInput::PeriodicReview {
-            prompt: "review prompt".to_string(),
+        request_settings: Some(task_runner::PersistedRequestSettings {
+            system_prompt_restart_bundle: Some(
+                task_runner::SystemPromptRestartBundle::periodic_review(
+                    task_runner::PeriodicReviewPromptInputs {
+                        project_root: "/tmp/proj".to_string(),
+                        since_arg: "2024-01-01T00:00:00Z".to_string(),
+                        review_type: "standard".to_string(),
+                        guard_scan_output: None,
+                    },
+                ),
+            ),
+            ..Default::default()
         }),
     };
     let task_id = task.id.to_string();
@@ -963,7 +1001,7 @@ async fn get_task_hides_internal_system_input_metadata() -> anyhow::Result<()> {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
     let task_json: serde_json::Value = serde_json::from_slice(&body)?;
     assert_eq!(task_json["id"], task_id);
-    assert!(task_json.get("system_input").is_none());
+    assert!(task_json.get("request_settings").is_none());
     Ok(())
 }
 
@@ -1229,9 +1267,6 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: Some(task_runner::SystemTaskInput::PeriodicReview {
-            prompt: "review prompt".to_string(),
-        }),
     };
     let planner_task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
@@ -1257,9 +1292,6 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: Some(task_runner::SystemTaskInput::SprintPlanner {
-            prompt: "planner prompt".to_string(),
-        }),
     };
     state.core.tasks.insert(&review_task).await;
     state.core.tasks.insert(&planner_task).await;
@@ -1939,7 +1971,6 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: None,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -1981,16 +2012,23 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
 }
 
 #[tokio::test]
-async fn pr_recovery_redispatches_prompt_tasks_with_pr_urls() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let state = make_test_state(dir.path()).await?;
+async fn checkpoint_recovery_redispatches_periodic_review_prompt_task() -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = crate::test_helpers::tempdir_in_home("harness-http-test-")?;
+    let (state, agent) = make_test_state_with_agent(dir.path(), None).await?;
+    let expected_prompt = harness_core::prompts::periodic_review_prompt_with_guard_scan(
+        &dir.path().display().to_string(),
+        "2026-04-20T00:00:00Z",
+        "mixed",
+        Some("guard findings"),
+    );
 
     let task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
         task_kind: task_runner::TaskKind::Prompt,
         status: task_runner::TaskStatus::Pending,
         turn: 0,
-        pr_url: Some("not-a-valid-pr-url".to_string()),
+        pr_url: None,
         rounds: vec![],
         error: None,
         source: None,
@@ -1998,60 +2036,150 @@ async fn pr_recovery_redispatches_prompt_tasks_with_pr_urls() -> anyhow::Result<
         parent_id: None,
         depends_on: vec![],
         subtask_ids: vec![],
-        project_root: None,
+        project_root: Some(dir.path().to_path_buf()),
         issue: None,
         repo: None,
-        description: None,
+        description: Some("prompt task".to_string()),
         created_at: None,
         updated_at: None,
         priority: 0,
         phase: task_runner::TaskPhase::default(),
         triage_output: None,
         plan_output: None,
-        request_settings: None,
-        system_input: None,
+        request_settings: Some(system_prompt_settings(
+            task_runner::SystemPromptRestartBundle::periodic_review(
+                task_runner::PeriodicReviewPromptInputs {
+                    project_root: dir.path().display().to_string(),
+                    since_arg: "2026-04-20T00:00:00Z".to_string(),
+                    review_type: "mixed".to_string(),
+                    guard_scan_output: Some("guard findings".to_string()),
+                },
+            ),
+        )),
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
+    // Write a checkpoint so the task appears in pending_tasks_with_checkpoint().
+    state
+        .core
+        .tasks
+        .write_checkpoint(&task_id, Some("triage output"), None, None, "triage_done")
+        .await?;
 
-    super::background::spawn_pr_recovery(&state);
+    super::background::spawn_checkpoint_recovery(&state).await;
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if let Some(t) = state.core.tasks.get(&task_id) {
-            if matches!(t.status, task_runner::TaskStatus::Failed) {
-                break;
-            }
+        let prompts = agent.prompts.lock().await.clone();
+        if prompts.iter().any(|prompt| !prompt.is_empty()) {
+            break;
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("prompt task was not re-dispatched within 5 seconds after pr_recovery");
+            panic!("periodic_review prompt was not redispatched within 5 seconds");
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    let final_state = state
-        .core
-        .tasks
-        .get(&task_id)
-        .expect("task must still exist");
-    assert!(matches!(
-        final_state.status,
-        task_runner::TaskStatus::Failed
-    ));
+    let prompts = agent.prompts.lock().await.clone();
+    assert!(prompts.iter().any(|prompt| !prompt.is_empty()));
+    assert!(prompts
+        .iter()
+        .any(|prompt| prompt.contains(expected_prompt.as_str())));
     assert!(
-        final_state
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("unparseable pr_url"),
-        "error should mention unparseable pr_url, got: {:?}",
-        final_state.error
+        state.core.tasks.get(&task_id).is_some(),
+        "task must still exist"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
+async fn checkpoint_recovery_redispatches_sprint_planner_prompt_task() -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = crate::test_helpers::tempdir_in_home("harness-http-test-")?;
+    let (state, agent) = make_test_state_with_agent(dir.path(), None).await?;
+    let issue_summary = "- #42: Fix login [p1, bug] (owner/repo)\n- #77: Tighten auth ()";
+    let expected_prompt = harness_core::prompts::sprint_plan_prompt(issue_summary);
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Prompt,
+        status: task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("sprint_planner".to_string()),
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: None,
+        repo: None,
+        description: Some("prompt task".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: Some(system_prompt_settings(
+            task_runner::SystemPromptRestartBundle::sprint_planner(
+                task_runner::SprintPlannerPromptInputs {
+                    issues: vec![
+                        task_runner::SprintPlannerIssueSummaryInput {
+                            external_id: "42".to_string(),
+                            title: "Fix login".to_string(),
+                            labels: vec!["p1".to_string(), "bug".to_string()],
+                            repo: Some("owner/repo".to_string()),
+                        },
+                        task_runner::SprintPlannerIssueSummaryInput {
+                            external_id: "77".to_string(),
+                            title: "Tighten auth".to_string(),
+                            labels: vec![],
+                            repo: None,
+                        },
+                    ],
+                },
+            ),
+        )),
+    };
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+    state
+        .core
+        .tasks
+        .write_checkpoint(&task_id, Some("triage output"), None, None, "triage_done")
+        .await?;
+
+    super::background::spawn_checkpoint_recovery(&state).await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let prompts = agent.prompts.lock().await.clone();
+        if prompts.iter().any(|prompt| !prompt.is_empty()) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("sprint_planner prompt was not redispatched within 5 seconds");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let prompts = agent.prompts.lock().await.clone();
+    assert!(prompts.iter().any(|prompt| !prompt.is_empty()));
+    assert!(prompts
+        .iter()
+        .any(|prompt| prompt.contains(expected_prompt.as_str())));
+    assert!(
+        state.core.tasks.get(&task_id).is_some(),
+        "task must still exist"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpoint_recovery_marks_manual_prompt_task_failed() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
 
@@ -2078,21 +2206,18 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
         phase: task_runner::TaskPhase::default(),
         triage_output: None,
         plan_output: None,
-        request_settings: None,
-        system_input: None,
+        request_settings: Some(manual_prompt_only_settings()),
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
-    // Write a checkpoint so the task appears in pending_tasks_with_checkpoint().
     state
         .core
         .tasks
-        .write_checkpoint(&task_id, None, Some("plan output"), None, "plan")
+        .write_checkpoint(&task_id, Some("triage output"), None, None, "triage_done")
         .await?;
 
     super::background::spawn_checkpoint_recovery(&state).await;
 
-    // The spawned tokio task updates the cache; give it a moment to complete.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if let Some(t) = state.core.tasks.get(&task_id) {
@@ -2101,7 +2226,7 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("prompt task was not marked Failed within 5 seconds after checkpoint_recovery");
+            panic!("manual prompt task was not marked Failed within 5 seconds after checkpoint_recovery");
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -2120,21 +2245,93 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
             .error
             .as_deref()
             .unwrap_or("")
-            .contains("prompt task"),
-        "error should mention prompt task recovery failure, got: {:?}",
+            .contains("manual prompt-only task"),
+        "error should mention manual prompt-only recovery failure, got: {:?}",
         final_state.error
     );
     Ok(())
 }
 
-#[test]
-fn recovery_queue_domain_routes_review_tasks_to_review_capacity() {
-    assert_eq!(
-        super::background::recovery_queue_domain(task_runner::TaskKind::Review),
-        super::task_routes::QueueDomain::Review
+#[tokio::test]
+async fn checkpoint_recovery_fails_closed_on_invalid_system_prompt_bundle() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Prompt,
+        status: task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("periodic_review".to_string()),
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: None,
+        repo: None,
+        description: Some("prompt task".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: Some(system_prompt_settings(
+            task_runner::SystemPromptRestartBundle {
+                version: 99,
+                kind: "periodic_review".to_string(),
+                data: serde_json::json!({
+                    "project_root": dir.path().display().to_string(),
+                    "since_arg": "2026-04-20T00:00:00Z",
+                    "review_type": "mixed"
+                }),
+            },
+        )),
+    };
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+    state
+        .core
+        .tasks
+        .write_checkpoint(&task_id, Some("triage output"), None, None, "triage_done")
+        .await?;
+
+    super::background::spawn_checkpoint_recovery(&state).await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(t) = state.core.tasks.get(&task_id) {
+            if matches!(t.status, task_runner::TaskStatus::Failed) {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("invalid bundle task was not marked Failed within 5 seconds after checkpoint_recovery");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let final_state = state
+        .core
+        .tasks
+        .get(&task_id)
+        .expect("task must still exist");
+    assert!(matches!(
+        final_state.status,
+        task_runner::TaskStatus::Failed
+    ));
+    assert!(
+        final_state
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("unsupported system prompt restart bundle"),
+        "error should mention prompt task recovery failure, got: {:?}",
+        final_state.error
     );
-    assert_eq!(
-        super::background::recovery_queue_domain(task_runner::TaskKind::Planner),
-        super::task_routes::QueueDomain::Primary
-    );
+    Ok(())
 }

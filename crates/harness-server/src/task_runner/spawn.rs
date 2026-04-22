@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use super::request::{
     detect_main_worktree, summarize_request_description, CreateTaskRequest,
-    PersistedRequestSettings, SystemTaskInput,
+    PersistedRequestSettings,
 };
 use super::state::{RoundResult, TaskState};
 use super::store::{mutate_and_persist, TaskStore};
@@ -85,10 +85,6 @@ fn classify_task_kind(req: &CreateTaskRequest) -> TaskKind {
     req.task_kind()
 }
 
-fn system_input_for_request(req: &CreateTaskRequest) -> Option<SystemTaskInput> {
-    req.system_input.clone()
-}
-
 fn refresh_preregistered_task_metadata(
     entry: &mut TaskState,
     req: &CreateTaskRequest,
@@ -104,7 +100,6 @@ fn refresh_preregistered_task_metadata(
     entry.project_root = Some(project_root);
     entry.issue = req.issue;
     entry.description = description;
-    entry.system_input = system_input_for_request(req);
 }
 
 #[cfg(test)]
@@ -307,7 +302,6 @@ pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskReques
     state.phase = state.task_kind.default_phase();
     state.description = summarize_request_description(req);
     state.request_settings = Some(PersistedRequestSettings::from_req(req));
-    state.system_input = system_input_for_request(req);
     store.insert(&state).await;
     // Register stream channel now so SSE clients can subscribe before execution begins.
     store.register_task_stream(&task_id);
@@ -388,7 +382,6 @@ where
         state.priority = req.priority;
         state.phase = state.task_kind.default_phase();
         state.request_settings = Some(PersistedRequestSettings::from_req(&req));
-        state.system_input = system_input_for_request(&req);
         store.insert(&state).await;
         // Register stream channel before spawning so SSE clients can subscribe immediately.
         store.register_task_stream(&task_id);
@@ -813,7 +806,6 @@ pub async fn spawn_task_awaiting_deps(
     state.phase = state.task_kind.default_phase();
     state.description = summarize_request_description(&req);
     state.request_settings = Some(PersistedRequestSettings::from_req(&req));
-    state.system_input = system_input_for_request(&req);
     // Persist the caller's resolved project root so that duplicate detection
     // (which keys on project_root + external_id) and the dep-watcher's project
     // path resolution both work correctly for waiting tasks.
@@ -1647,51 +1639,6 @@ mod tests {
         assert!(is_non_decomposable_prompt_source(Some("sprint_planner")));
         assert!(!is_non_decomposable_prompt_source(Some("github")));
         assert!(!is_non_decomposable_prompt_source(None));
-    }
-
-    #[test]
-    fn request_task_kind_trusts_only_internal_system_input() {
-        let spoofed = CreateTaskRequest {
-            prompt: Some("review this".to_string()),
-            source: Some("periodic_review".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(spoofed.task_kind(), TaskKind::Prompt);
-
-        let trusted = CreateTaskRequest {
-            prompt: Some("review this".to_string()),
-            source: Some("periodic_review".to_string()),
-            system_input: Some(SystemTaskInput::PeriodicReview {
-                prompt: "review this".to_string(),
-            }),
-            ..Default::default()
-        };
-        assert_eq!(trusted.task_kind(), TaskKind::Review);
-    }
-
-    #[test]
-    fn system_input_for_request_clones_only_explicit_internal_metadata() {
-        let spoofed = CreateTaskRequest {
-            prompt: Some("review this".to_string()),
-            source: Some("periodic_review".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(system_input_for_request(&spoofed), None);
-
-        let trusted = CreateTaskRequest {
-            prompt: Some("review this".to_string()),
-            source: Some("periodic_review".to_string()),
-            system_input: Some(SystemTaskInput::PeriodicReview {
-                prompt: "review this".to_string(),
-            }),
-            ..Default::default()
-        };
-        assert_eq!(
-            system_input_for_request(&trusted),
-            Some(SystemTaskInput::PeriodicReview {
-                prompt: "review this".to_string(),
-            })
-        );
     }
 
     // --- dependency scheduling tests ---

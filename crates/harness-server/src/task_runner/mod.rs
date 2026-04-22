@@ -16,8 +16,9 @@ pub type CompletionCallback =
 // Re-export everything that was previously public from the flat task_runner.rs.
 pub use metrics::{DashboardCounts, LlmMetricsInputs, ProjectCounts};
 pub use request::{
-    fill_missing_repo_from_project, CreateTaskRequest, PersistedRequestSettings, SystemTaskInput,
-    MAX_TASK_PRIORITY,
+    fill_missing_repo_from_project, CreateTaskRequest, PeriodicReviewPromptInputs,
+    PersistedRequestSettings, PromptTaskOrigin, SprintPlannerIssueSummaryInput,
+    SprintPlannerPromptInputs, SystemPromptRestartBundle, MAX_TASK_PRIORITY,
 };
 pub use spawn::{
     check_awaiting_deps, effective_turn_timeout, prompt_requires_plan, register_pending_task,

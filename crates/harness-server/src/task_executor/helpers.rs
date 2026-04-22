@@ -555,12 +555,13 @@ pub(crate) async fn run_agent_streaming(
     let turn_start = Instant::now();
 
     // Persist redacted prompt before req is consumed by execute_stream.
-    // Skip prompt-only tasks: their prompts may contain user-supplied credentials
-    // and must not be written at rest (per the privacy contract in task_runner.rs).
-    let is_prompt_only = store
+    // Skip only true manual prompt-only tasks: system-generated prompt tasks
+    // are typed in request_settings and may be durably reconstructed.
+    let is_manual_prompt_only = store
         .get(task_id)
-        .map(|s| matches!(s.task_kind, crate::task_runner::TaskKind::Prompt))
-        .unwrap_or(false);
+        .and_then(|s| s.request_settings)
+        .is_some_and(|settings| settings.is_manual_prompt_only());
+    let is_prompt_only = is_manual_prompt_only;
     let phase_str = req
         .execution_phase
         .map(|p| format!("{p:?}").to_lowercase())

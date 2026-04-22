@@ -1,6 +1,8 @@
 use crate::http::task_routes;
 use crate::http::AppState;
-use crate::task_runner::CreateTaskRequest;
+use crate::task_runner::{
+    CreateTaskRequest, PeriodicReviewPromptInputs, SystemPromptRestartBundle,
+};
 use chrono::{DateTime, Utc};
 use harness_core::{
     config::misc::ReviewConfig,
@@ -725,6 +727,20 @@ fn ensure_review_queue_limit(state: &Arc<AppState>, project_root: &std::path::Pa
         .set_project_limit(&canonical, 1);
 }
 
+fn build_periodic_review_restart_bundle(
+    project_root: &std::path::Path,
+    since_arg: &str,
+    review_type: ReviewType,
+    guard_scan_output: Option<&str>,
+) -> SystemPromptRestartBundle {
+    SystemPromptRestartBundle::periodic_review(PeriodicReviewPromptInputs {
+        project_root: project_root.display().to_string(),
+        since_arg: since_arg.to_string(),
+        review_type: review_type.as_str().to_string(),
+        guard_scan_output: guard_scan_output.map(ToOwned::to_owned),
+    })
+}
+
 async fn run_review_tick(
     state: &Arc<AppState>,
     config: &ReviewConfig,
@@ -852,9 +868,12 @@ async fn run_review_tick(
         turn_timeout_secs: config.timeout_secs,
         source: Some("periodic_review".to_string()),
         project: Some(project_root.clone()),
-        system_input: Some(crate::task_runner::SystemTaskInput::PeriodicReview {
-            prompt: base_prompt.clone(),
-        }),
+        system_prompt_restart_bundle: Some(build_periodic_review_restart_bundle(
+            project_root,
+            &since_arg,
+            project.review_type,
+            guard_scan_output.as_deref(),
+        )),
         ..CreateTaskRequest::default()
     };
 
@@ -906,6 +925,7 @@ async fn run_review_tick(
     // correct repository — without this they fall back to main-worktree
     // detection and can execute against the wrong project.
     let project_root_for_poll = project_root.clone();
+    let review_type_for_poll = project.review_type;
     // Capture the scan boundary before the review agents run. Using this
     // timestamp (rather than Utc::now() after synthesis completes) as the
     // watermark ensures that commits arriving while secondary/synthesis agents
@@ -956,9 +976,12 @@ async fn run_review_tick(
                 turn_timeout_secs: timeout_secs,
                 source: Some("periodic_review".to_string()),
                 project: Some(project_root_for_poll.clone()),
-                system_input: Some(crate::task_runner::SystemTaskInput::PeriodicReview {
-                    prompt: base_prompt.clone(),
-                }),
+                system_prompt_restart_bundle: Some(build_periodic_review_restart_bundle(
+                    &project_root_for_poll,
+                    &since_arg,
+                    review_type_for_poll,
+                    guard_scan_output.as_deref(),
+                )),
                 ..CreateTaskRequest::default()
             };
             match task_routes::enqueue_task_in_domain(
@@ -1036,14 +1059,11 @@ async fn run_review_tick(
                     secondary_text,
                 );
                 let synth_req = CreateTaskRequest {
-                    prompt: Some(synthesis_prompt.clone()),
+                    prompt: Some(synthesis_prompt),
                     agent: Some(primary_agent_for_synthesis.clone()),
                     turn_timeout_secs: timeout_secs,
                     source: Some("periodic_review".to_string()),
                     project: Some(project_root_for_poll.clone()),
-                    system_input: Some(crate::task_runner::SystemTaskInput::PeriodicReview {
-                        prompt: synthesis_prompt,
-                    }),
                     ..CreateTaskRequest::default()
                 };
                 match task_routes::enqueue_task_in_domain(
@@ -2207,6 +2227,45 @@ mod tests {
         };
         assert_eq!(req.source.as_deref(), Some("periodic_review"));
         assert_eq!(req.project.as_deref(), Some(root.as_path()));
+    }
+
+    #[test]
+    fn periodic_review_restart_bundle_captures_enqueue_inputs() {
+        let root = std::path::PathBuf::from("/tmp/project");
+        let bundle = build_periodic_review_restart_bundle(
+            &root,
+            "2026-04-20T00:00:00Z",
+            ReviewType::Rust,
+            Some("guard findings"),
+        );
+        let inputs: PeriodicReviewPromptInputs =
+            serde_json::from_value(bundle.data).expect("bundle payload decodes");
+
+        assert_eq!(inputs.project_root, root.display().to_string());
+        assert_eq!(inputs.since_arg, "2026-04-20T00:00:00Z");
+        assert_eq!(inputs.review_type, "rust");
+        assert_eq!(inputs.guard_scan_output.as_deref(), Some("guard findings"));
+    }
+
+    #[test]
+    fn periodic_review_restart_bundle_rebuilds_current_prompt() {
+        let root = std::path::PathBuf::from("/tmp/project");
+        let bundle = build_periodic_review_restart_bundle(
+            &root,
+            "2026-04-20T00:00:00Z",
+            ReviewType::Mixed,
+            Some("guard findings"),
+        );
+
+        let prompt = bundle.rebuild_prompt().expect("bundle rebuilds prompt");
+        let expected = harness_core::prompts::periodic_review_prompt_with_guard_scan(
+            &root.display().to_string(),
+            "2026-04-20T00:00:00Z",
+            "mixed",
+            Some("guard findings"),
+        );
+
+        assert_eq!(prompt, expected);
     }
 
     // --- build_fix_prompt tests (SEC-01 / issue #612) ---
