@@ -110,6 +110,32 @@ fn startup_project_delay(
     }
 }
 
+struct StartupDelayOutcome {
+    delay: Duration,
+    last_review_ts: Option<DateTime<Utc>>,
+    overdue: bool,
+    elapsed: Option<chrono::Duration>,
+}
+
+fn startup_delay_outcome(
+    run_on_startup: bool,
+    interval: Duration,
+    last_review_ts: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> StartupDelayOutcome {
+    let interval_chrono =
+        chrono::Duration::from_std(interval).unwrap_or_else(|_| chrono::Duration::hours(24));
+    let elapsed = last_review_ts.map(|ts| now.signed_duration_since(ts));
+    let overdue = elapsed.is_some_and(|elapsed| elapsed >= interval_chrono);
+    let delay = startup_project_delay(run_on_startup, interval, last_review_ts, now);
+    StartupDelayOutcome {
+        delay,
+        last_review_ts,
+        overdue,
+        elapsed,
+    }
+}
+
 async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     let interval = config.effective_interval();
 
@@ -132,32 +158,33 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // On startup, compute the per-project remaining time and the global minimum.
     // Only projects whose individual delay falls within the minimum sleep window
     // are run on the first tick; others wait for the regular interval loop.
-    let interval_chrono =
-        chrono::Duration::from_std(interval).unwrap_or_else(|_| chrono::Duration::hours(24));
-    let startup_now = Utc::now();
+    let default_startup_delay = if config.run_on_startup {
+        Duration::ZERO
+    } else {
+        interval
+    };
     let mut min_delay = interval;
     let mut project_delays: Vec<Duration> = Vec::with_capacity(projects.len());
     for project in &projects {
         let hook_key = project_hook_key(&project.name, &project.root);
         let last_review_ts = last_review_timestamp(&state, &hook_key).await;
-        let delay =
-            startup_project_delay(config.run_on_startup, interval, last_review_ts, startup_now);
-        match last_review_ts {
+        let outcome =
+            startup_delay_outcome(config.run_on_startup, interval, last_review_ts, Utc::now());
+        match outcome.last_review_ts {
             Some(last_ts) => {
-                let elapsed = startup_now.signed_duration_since(last_ts);
-                if elapsed >= interval_chrono {
+                if outcome.overdue {
                     if config.run_on_startup {
                         tracing::info!(
                             project = %project.name,
                             last_review = %last_ts,
-                            elapsed_hours = elapsed.num_hours(),
+                            elapsed_hours = outcome.elapsed.map(|e| e.num_hours()).unwrap_or_default(),
                             "scheduler: periodic review overdue, triggering now"
                         );
                     } else {
                         tracing::info!(
                             project = %project.name,
                             last_review = %last_ts,
-                            next_in_secs = delay.as_secs(),
+                            next_in_secs = outcome.delay.as_secs(),
                             "scheduler: startup review suppressed for overdue project; deferring until next interval"
                         );
                     }
@@ -165,7 +192,7 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
                     tracing::info!(
                         project = %project.name,
                         last_review = %last_ts,
-                        next_in_secs = delay.as_secs(),
+                        next_in_secs = outcome.delay.as_secs(),
                         "scheduler: periodic review not yet due, sleeping"
                     );
                 }
@@ -179,15 +206,15 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
                 } else {
                     tracing::info!(
                         project = %project.name,
-                        next_in_secs = delay.as_secs(),
+                        next_in_secs = outcome.delay.as_secs(),
                         "scheduler: startup review suppressed for first run; deferring until next interval"
                     );
                 }
             }
         }
-        project_delays.push(delay);
-        if delay < min_delay {
-            min_delay = delay;
+        project_delays.push(outcome.delay);
+        if outcome.delay < min_delay {
+            min_delay = outcome.delay;
         }
     }
 
@@ -224,11 +251,6 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // Projects whose remaining time exceeds min_delay are deferred to the regular
     // interval loop, avoiding unnecessary task/quota spikes on restart.
     for project in &projects {
-        let default_startup_delay = if config.run_on_startup {
-            Duration::ZERO
-        } else {
-            interval
-        };
         let project_delay = *startup_delay_by_name
             .get(&project.name)
             .unwrap_or(&default_startup_delay);
