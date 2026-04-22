@@ -291,6 +291,135 @@ fn validate_dag(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedTaskSkip {
+    issue: u64,
+    upstream: u64,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SprintPlanNormalization {
+    tasks: Vec<harness_core::prompts::SprintTask>,
+    dropped_completed_edges: Vec<(u64, u64)>,
+    skipped_tasks: Vec<NormalizedTaskSkip>,
+}
+
+fn normalize_sprint_tasks(
+    tasks: Vec<harness_core::prompts::SprintTask>,
+    planner_skips: &std::collections::HashSet<u64>,
+    completed_issues: &std::collections::HashSet<u64>,
+) -> SprintPlanNormalization {
+    let mut tasks = tasks;
+    let mut removed_tasks: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut dropped_completed_edges = Vec::new();
+    let mut skipped_tasks = Vec::new();
+
+    loop {
+        let current_issues: std::collections::HashSet<u64> =
+            tasks.iter().map(|t| t.issue).collect();
+        let mut changed = false;
+        let mut next_tasks = Vec::with_capacity(tasks.len());
+
+        for mut task in tasks {
+            let mut filtered_deps = Vec::with_capacity(task.depends_on.len());
+            let mut skip_detail: Option<NormalizedTaskSkip> = None;
+
+            for dep in task.depends_on {
+                if planner_skips.contains(&dep) {
+                    continue;
+                }
+                if removed_tasks.contains(&dep) {
+                    skip_detail = Some(NormalizedTaskSkip {
+                        issue: task.issue,
+                        upstream: dep,
+                        reason: format!(
+                            "upstream issue {dep} was removed from this sprint during intake normalization"
+                        ),
+                    });
+                    break;
+                }
+                if current_issues.contains(&dep) {
+                    filtered_deps.push(dep);
+                    continue;
+                }
+                if completed_issues.contains(&dep) {
+                    dropped_completed_edges.push((task.issue, dep));
+                    changed = true;
+                    continue;
+                }
+                skip_detail = Some(NormalizedTaskSkip {
+                    issue: task.issue,
+                    upstream: dep,
+                    reason: format!(
+                        "upstream issue {dep} is outside the sprint plan and not completed"
+                    ),
+                });
+                break;
+            }
+
+            if let Some(skip) = skip_detail {
+                removed_tasks.insert(task.issue);
+                skipped_tasks.push(skip);
+                changed = true;
+                continue;
+            }
+
+            task.depends_on = filtered_deps;
+            next_tasks.push(task);
+        }
+
+        if !changed {
+            return SprintPlanNormalization {
+                tasks: next_tasks,
+                dropped_completed_edges,
+                skipped_tasks,
+            };
+        }
+
+        tasks = next_tasks;
+    }
+}
+
+fn parse_issue_external_id(external_id: &str) -> Option<u64> {
+    external_id
+        .strip_prefix("issue:")
+        .unwrap_or(external_id)
+        .parse()
+        .ok()
+}
+
+async fn completed_issue_numbers_for_project(
+    tasks: &crate::task_runner::TaskStore,
+    project_id: &str,
+) -> std::collections::HashSet<u64> {
+    match tasks.list_all_with_terminal().await {
+        Ok(all_tasks) => all_tasks
+            .into_iter()
+            .filter(|task| {
+                matches!(task.status, TaskStatus::Done)
+                    && task
+                        .project_root
+                        .as_ref()
+                        .map(|path| path.to_string_lossy() == project_id)
+                        .unwrap_or(false)
+            })
+            .filter_map(|task| {
+                task.external_id
+                    .as_deref()
+                    .and_then(parse_issue_external_id)
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                project = project_id,
+                "intake: failed to inspect terminal tasks during sprint normalization: {e}"
+            );
+            std::collections::HashSet::new()
+        }
+    }
+}
+
 fn ready_issues(
     all_task_issues: &std::collections::HashSet<u64>,
     completed: &std::collections::HashSet<u64>,
@@ -426,7 +555,7 @@ async fn run_repo_sprint(
         return;
     };
 
-    let Some(plan) = harness_core::prompts::parse_sprint_plan(&planner_output) else {
+    let Some(mut plan) = harness_core::prompts::parse_sprint_plan(&planner_output) else {
         if let Some(workflows) = state.core.project_workflow_store.as_ref() {
             if let Err(e) = workflows
                 .record_degraded(&project_id, Some(repo), "failed to parse sprint plan")
@@ -456,7 +585,47 @@ async fn run_repo_sprint(
             .map(|(src, issue)| (issue.external_id.clone(), (src, issue)))
             .collect();
 
-    // 2. Mark skipped.
+    let project_id = match crate::task_runner::resolve_canonical_project(Some(project_root.clone()))
+        .await
+    {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(e) => {
+            tracing::warn!(
+                repo,
+                "intake: failed to canonicalize project root for slot limit lookup, using raw path: {e}"
+            );
+            project_root.to_string_lossy().into_owned()
+        }
+    };
+
+    let completed_issues =
+        completed_issue_numbers_for_project(state.core.tasks.as_ref(), &project_id).await;
+    let planner_skip_set: std::collections::HashSet<u64> =
+        plan.skip.iter().map(|skip| skip.issue).collect();
+    let normalized =
+        normalize_sprint_tasks(plan.tasks.clone(), &planner_skip_set, &completed_issues);
+    for (issue, upstream) in &normalized.dropped_completed_edges {
+        tracing::info!(
+            repo,
+            issue = *issue,
+            upstream = *upstream,
+            normalization = "drop_completed_upstream_edge",
+            "intake: repaired sprint dependency outside plan"
+        );
+    }
+    for skip in &normalized.skipped_tasks {
+        tracing::warn!(
+            repo,
+            issue = skip.issue,
+            upstream = skip.upstream,
+            normalization = "skip_task_missing_upstream",
+            reason = %skip.reason,
+            "intake: skipped task during sprint normalization"
+        );
+    }
+    plan.tasks = normalized.tasks;
+
+    // 2. Mark planner-directed skips.
     for skip in &plan.skip {
         let ext_id = skip.issue.to_string();
         if let Some((source, _)) = issue_map.get(&ext_id) {
@@ -477,29 +646,17 @@ async fn run_repo_sprint(
     let all_task_issues: std::collections::HashSet<u64> =
         plan.tasks.iter().map(|t| t.issue).collect();
 
-    // Build the dep map, filtering out any dep IDs that belong to skipped issues
-    // so they are not flagged as missing upstreams.
-    let skip_set: std::collections::HashSet<u64> = plan.skip.iter().map(|s| s.issue).collect();
     let deps: std::collections::HashMap<u64, Vec<u64>> = plan
         .tasks
         .iter()
-        .map(|t| {
-            let filtered: Vec<u64> = t
-                .depends_on
-                .iter()
-                .copied()
-                .filter(|dep| !skip_set.contains(dep))
-                .collect();
-            (t.issue, filtered)
-        })
+        .map(|t| (t.issue, t.depends_on.clone()))
         .collect();
 
-    // Validate DAG before starting execution.
+    // Validate DAG after normalization.
     if let Err(e) = validate_dag(&all_task_issues, &deps) {
-        tracing::error!(repo, error = %e, "intake: invalid sprint DAG — aborting");
+        tracing::error!(repo, error = %e, "intake: invalid sprint DAG after normalization — aborting");
         return;
     }
-
     let start = tokio::time::Instant::now();
     let mut transient_retry_count = 0u32;
     let mut project_workflow_monitoring_started = false;
@@ -1046,6 +1203,83 @@ mod tests {
         // Simulates the caller filtering out dep 10 (a skipped issue) before calling validate_dag.
         let deps = make_deps(&[(1, &[]), (2, &[])]);
         assert!(validate_dag(&issues, &deps).is_ok());
+    }
+
+    fn make_tasks(pairs: &[(u64, &[u64])]) -> Vec<harness_core::prompts::SprintTask> {
+        pairs
+            .iter()
+            .map(|&(issue, deps)| harness_core::prompts::SprintTask {
+                issue,
+                depends_on: deps.to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn normalize_sprint_tasks_drops_completed_missing_upstream() {
+        let normalized = normalize_sprint_tasks(
+            make_tasks(&[(1, &[]), (2, &[99])]),
+            &std::collections::HashSet::new(),
+            &make_issues(&[99]),
+        );
+
+        assert!(normalized.skipped_tasks.is_empty());
+        assert_eq!(normalized.dropped_completed_edges, vec![(2, 99)]);
+        assert_eq!(normalized.tasks, make_tasks(&[(1, &[]), (2, &[])]));
+    }
+
+    #[test]
+    fn normalize_sprint_tasks_skips_unresolved_missing_upstream() {
+        let normalized = normalize_sprint_tasks(
+            make_tasks(&[(1, &[]), (2, &[99])]),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(normalized.dropped_completed_edges.is_empty());
+        assert_eq!(normalized.tasks, make_tasks(&[(1, &[])]));
+        assert_eq!(
+            normalized.skipped_tasks,
+            vec![NormalizedTaskSkip {
+                issue: 2,
+                upstream: 99,
+                reason: "upstream issue 99 is outside the sprint plan and not completed"
+                    .to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn normalize_sprint_tasks_handles_mixed_valid_and_invalid_edges() {
+        let normalized = normalize_sprint_tasks(
+            make_tasks(&[(1, &[]), (2, &[1]), (3, &[7]), (4, &[99]), (5, &[4])]),
+            &std::collections::HashSet::new(),
+            &make_issues(&[7]),
+        );
+
+        assert_eq!(normalized.dropped_completed_edges, vec![(3, 7)]);
+        assert_eq!(
+            normalized.tasks,
+            make_tasks(&[(1, &[]), (2, &[1]), (3, &[])])
+        );
+        assert_eq!(
+            normalized.skipped_tasks,
+            vec![
+                NormalizedTaskSkip {
+                    issue: 4,
+                    upstream: 99,
+                    reason: "upstream issue 99 is outside the sprint plan and not completed"
+                        .to_string(),
+                },
+                NormalizedTaskSkip {
+                    issue: 5,
+                    upstream: 4,
+                    reason:
+                        "upstream issue 4 was removed from this sprint during intake normalization"
+                            .to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
