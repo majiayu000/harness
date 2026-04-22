@@ -10,6 +10,8 @@
 
 [Documentation](docs/) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
+<img src="docs/images/harness-card.png" alt="Harness repository card" width="920" />
+
 </div>
 
 ---
