@@ -11,7 +11,7 @@ export interface StalledTask {
   external_id: string;
   project: string;
   status: string;
-  stalled_since: string;
+  stalled_since: string | null;
 }
 
 export interface RecentFailure {
@@ -19,7 +19,7 @@ export interface RecentFailure {
   external_id: string;
   project: string;
   error: string;
-  failed_at: string;
+  failed_at: string | null;
 }
 
 export interface SignalIngestionLimits {

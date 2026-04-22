@@ -2,8 +2,11 @@ import { Panel } from "@/components/Panel";
 import { useOperatorSnapshot } from "@/lib/queries";
 import type { RecentFailure, StalledTask } from "@/types";
 
-function timeAgo(iso: string): string {
-  const secs = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+function timeAgo(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const time = new Date(iso).getTime();
+  if (Number.isNaN(time)) return "—";
+  const secs = Math.max(0, Math.floor((Date.now() - time) / 1000));
   if (secs < 60) return `${secs}s`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m`;
   if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
@@ -82,20 +85,24 @@ export function OperatorPanel() {
         <div className="px-4 py-2 font-mono text-[10px] text-ink-3 uppercase tracking-wider border-b border-line">
           Rate limits
         </div>
-        <table className="w-full font-mono text-[11px]">
-          <tbody>
-            <tr className={`border-b border-line ${(sig?.tracked_sources ?? 0) > 0 ? "bg-sand/10" : ""}`}>
-              <td className="px-4 py-1.5 text-ink-2">Signal ingestion</td>
-              <td className="px-4 py-1.5 text-ink-1 text-right">{sig?.tracked_sources ?? 0}</td>
-              <td className="px-4 py-1.5 text-ink-4 text-right">/ {sig?.limit_per_minute ?? 0} /min</td>
-            </tr>
-            <tr className={(pw?.tracked_identifiers ?? 0) > 0 ? "bg-sand/10" : ""}>
-              <td className="px-4 py-1.5 text-ink-2">Password reset</td>
-              <td className="px-4 py-1.5 text-ink-1 text-right">{pw?.tracked_identifiers ?? 0}</td>
-              <td className="px-4 py-1.5 text-ink-4 text-right">/ {pw?.limit_per_hour ?? 0} /hr</td>
-            </tr>
-          </tbody>
-        </table>
+        {isError ? (
+          <p className="px-4 py-3 font-mono text-[11px] text-danger">Operator snapshot unavailable.</p>
+        ) : (
+          <table className="w-full font-mono text-[11px]">
+            <tbody>
+              <tr className={`border-b border-line ${(sig?.tracked_sources ?? 0) > 0 ? "bg-sand/10" : ""}`}>
+                <td className="px-4 py-1.5 text-ink-2">Signal ingestion</td>
+                <td className="px-4 py-1.5 text-ink-1 text-right">{sig?.tracked_sources ?? 0}</td>
+                <td className="px-4 py-1.5 text-ink-4 text-right">/ {sig?.limit_per_minute ?? 0} /min</td>
+              </tr>
+              <tr className={(pw?.tracked_identifiers ?? 0) > 0 ? "bg-sand/10" : ""}>
+                <td className="px-4 py-1.5 text-ink-2">Password reset</td>
+                <td className="px-4 py-1.5 text-ink-1 text-right">{pw?.tracked_identifiers ?? 0}</td>
+                <td className="px-4 py-1.5 text-ink-4 text-right">/ {pw?.limit_per_hour ?? 0} /hr</td>
+              </tr>
+            </tbody>
+          </table>
+        )}
       </div>
 
       {/* Recent failures */}

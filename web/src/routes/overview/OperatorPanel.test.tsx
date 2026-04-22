@@ -22,7 +22,15 @@ function makeSnapshot(): OperatorSnapshotPayload {
     generated_at: "2026-04-22T00:00:00Z",
     retry: {
       last_tick: null,
-      stalled_tasks: [],
+      stalled_tasks: [
+        {
+          task_id: "stalled-1",
+          external_id: "issue:1",
+          project: "proj",
+          status: "running",
+          stalled_since: null,
+        },
+      ],
     },
     rate_limits: {
       signal_ingestion: {
@@ -34,7 +42,15 @@ function makeSnapshot(): OperatorSnapshotPayload {
         limit_per_hour: 5,
       },
     },
-    recent_failures: [],
+    recent_failures: [
+      {
+        task_id: "failed-1",
+        external_id: "issue:2",
+        project: "proj",
+        error: "boom",
+        failed_at: null,
+      },
+    ],
   };
 }
 
@@ -47,12 +63,14 @@ describe("<OperatorPanel>", () => {
 
     wrap(<OperatorPanel />);
 
-    expect(screen.getAllByText("Operator snapshot unavailable.").length).toBe(2);
+    expect(screen.getAllByText("Operator snapshot unavailable.").length).toBe(3);
     expect(screen.queryByText("No retry ticks recorded yet.")).not.toBeInTheDocument();
     expect(screen.queryByText("No recent failures.")).not.toBeInTheDocument();
+    expect(screen.queryByText("/ 0 /min")).not.toBeInTheDocument();
+    expect(screen.queryByText("/ 0 /hr")).not.toBeInTheDocument();
   });
 
-  it("still shows the empty-state copy when the operator snapshot query succeeds with no data yet", () => {
+  it("renders missing timestamps as placeholders instead of invalid relative ages", () => {
     mockUseOperatorSnapshot.mockReturnValue({
       data: makeSnapshot(),
       isError: false,
@@ -61,7 +79,8 @@ describe("<OperatorPanel>", () => {
     wrap(<OperatorPanel />);
 
     expect(screen.getByText("No retry ticks recorded yet.")).toBeInTheDocument();
-    expect(screen.getByText("No recent failures.")).toBeInTheDocument();
     expect(screen.queryByText("Operator snapshot unavailable.")).not.toBeInTheDocument();
+    expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText(/NaN/)).not.toBeInTheDocument();
   });
 });

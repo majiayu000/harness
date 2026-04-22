@@ -43,6 +43,25 @@ impl PasswordResetRateLimiter {
         });
     }
 
+    fn prune_identifier_entry(
+        map: &mut HashMap<String, VecDeque<Instant>>,
+        identifier: &str,
+        now: Instant,
+    ) {
+        if let Some(timestamps) = map.get_mut(identifier) {
+            while let Some(&front) = timestamps.front() {
+                if now.duration_since(front) >= Self::WINDOW {
+                    timestamps.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if timestamps.is_empty() {
+                map.remove(identifier);
+            }
+        }
+    }
+
     fn active_identifier_count(map: &HashMap<String, VecDeque<Instant>>, now: Instant) -> usize {
         map.values()
             .filter(|timestamps| {
@@ -111,9 +130,13 @@ impl PasswordResetRateLimiter {
         let mut map = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
 
-        Self::prune_expired_timestamps(&mut map, now);
+        Self::prune_identifier_entry(&mut map, identifier, now);
 
         // Reject new identifiers when map is at capacity (memory-DoS guard).
+        if !map.contains_key(identifier) && map.len() >= self.max_tracked_keys {
+            Self::prune_expired_timestamps(&mut map, now);
+        }
+
         if !map.contains_key(identifier) && map.len() >= self.max_tracked_keys {
             return false;
         }
@@ -294,5 +317,22 @@ mod tests {
         assert!(limiter.check_and_increment("fresh@example.com"));
         assert_eq!(limiter.len_for_test(), 1);
         assert!(limiter.contains_for_test("fresh@example.com"));
+    }
+
+    #[test]
+    fn password_reset_hot_path_only_prunes_requested_identifier() {
+        let limiter = PasswordResetRateLimiter::new_with_cap(10, 10);
+        let now = Instant::now();
+        let expired = now - (PasswordResetRateLimiter::window() + Duration::from_secs(1));
+
+        limiter.insert_for_test(
+            "active@example.com",
+            VecDeque::from([now - Duration::from_secs(5)]),
+        );
+        limiter.insert_for_test("expired@example.com", VecDeque::from([expired]));
+
+        assert!(limiter.check_and_increment("active@example.com"));
+        assert_eq!(limiter.len_for_test(), 2);
+        assert!(limiter.contains_for_test("expired@example.com"));
     }
 }

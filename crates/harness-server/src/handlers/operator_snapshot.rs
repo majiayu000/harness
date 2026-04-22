@@ -84,7 +84,7 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "—".to_string()),
                 "status":       t.status.as_ref(),
-                "stalled_since": t.updated_at.as_deref().unwrap_or("—"),
+                "stalled_since": t.updated_at.as_deref(),
             })
         })
         .collect();
@@ -117,9 +117,12 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
             json!({
                 "task_id":    t.id.0,
                 "external_id": t.external_id.as_deref().unwrap_or("—"),
-                "project":    t.project.as_deref().unwrap_or("—"),
+                "project":    t.project.as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "—".to_string()),
                 "error":      error,
-                "failed_at":  t.failed_at.as_deref().unwrap_or("—"),
+                "failed_at":  t.failed_at.as_deref(),
             })
         })
         .collect();
@@ -255,6 +258,99 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes)?;
 
         assert_eq!(body["recent_failures"].as_array().map(|a| a.len()), Some(0),);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_timestamps_serialize_as_null() -> anyhow::Result<()> {
+        let _lock = test_helpers::HOME_LOCK.lock().await;
+        let dir = test_helpers::tempdir_in_home("harness-test-op-snap-null-ts-")?;
+        let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+
+        let stalled_task = crate::task_runner::TaskState {
+            id: harness_core::types::TaskId("stalled-task".to_string()),
+            status: crate::task_runner::TaskStatus::Implementing,
+            turn: 1,
+            pr_url: None,
+            rounds: vec![],
+            error: None,
+            source: None,
+            external_id: Some("issue:stalled".to_string()),
+            parent_id: None,
+            depends_on: vec![],
+            subtask_ids: vec![],
+            project_root: Some(std::path::PathBuf::from("/test/stalled")),
+            issue: None,
+            repo: None,
+            description: None,
+            created_at: Some("2026-04-22T00:00:00Z".to_string()),
+            updated_at: None,
+            priority: 0,
+            phase: crate::task_runner::TaskPhase::Implement,
+            triage_output: None,
+            plan_output: None,
+            request_settings: None,
+        };
+        state.core.tasks.insert(&stalled_task).await;
+
+        let failed_task = crate::task_runner::TaskState {
+            id: harness_core::types::TaskId("failed-task".to_string()),
+            status: crate::task_runner::TaskStatus::Failed,
+            turn: 1,
+            pr_url: None,
+            rounds: vec![],
+            error: Some("boom".to_string()),
+            source: None,
+            external_id: Some("issue:failed".to_string()),
+            parent_id: None,
+            depends_on: vec![],
+            subtask_ids: vec![],
+            project_root: Some(std::path::PathBuf::from("/test/failed")),
+            issue: None,
+            repo: None,
+            description: None,
+            created_at: Some("2026-04-22T00:00:00Z".to_string()),
+            updated_at: None,
+            priority: 0,
+            phase: crate::task_runner::TaskPhase::Implement,
+            triage_output: None,
+            plan_output: None,
+            request_settings: None,
+        };
+        state.core.tasks.insert(&failed_task).await;
+
+        let app = Router::new()
+            .route("/api/operator-snapshot", get(operator_snapshot))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/api/operator-snapshot")
+            .body(axum::body::Body::empty())?;
+        let resp = tower::ServiceExt::oneshot(app, req).await?;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+        let stalled = body["retry"]["stalled_tasks"].as_array().expect("array");
+        assert!(
+            stalled
+                .iter()
+                .any(|task| task["task_id"] == "stalled-task" && task["stalled_since"].is_null()),
+            "expected stalled_since to serialize as null",
+        );
+
+        let failures = body["recent_failures"].as_array().expect("array");
+        assert!(
+            failures
+                .iter()
+                .any(|task| task["task_id"] == "failed-task" && task["failed_at"].is_null()),
+            "expected failed_at to serialize as null",
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|task| task["task_id"] == "failed-task" && task["project"] == "failed"),
+            "expected recent failure project to serialize as basename only",
+        );
         Ok(())
     }
 
