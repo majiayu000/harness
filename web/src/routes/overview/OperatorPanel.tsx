@@ -41,7 +41,7 @@ function FailureRow({ failure }: { failure: RecentFailure }) {
 }
 
 export function OperatorPanel() {
-  const { data } = useOperatorSnapshot();
+  const { data, isError } = useOperatorSnapshot();
 
   const tick = data?.retry.last_tick ?? null;
   const stalled = data?.retry.stalled_tasks ?? [];
@@ -56,7 +56,9 @@ export function OperatorPanel() {
         <div className="px-4 py-2 font-mono text-[10px] text-ink-3 uppercase tracking-wider border-b border-line">
           Retry pressure
         </div>
-        {tick ? (
+        {isError ? (
+          <p className="px-4 py-3 font-mono text-[11px] text-danger">Operator snapshot unavailable.</p>
+        ) : tick ? (
           <div className="flex">
             <Counter label="checked" value={tick.checked} />
             <Counter label="retried" value={tick.retried} />
@@ -101,7 +103,9 @@ export function OperatorPanel() {
         <div className="px-4 py-2 font-mono text-[10px] text-ink-3 uppercase tracking-wider border-b border-line">
           Recent failures
         </div>
-        {failures.length === 0 ? (
+        {isError ? (
+          <p className="px-4 py-3 font-mono text-[11px] text-danger">Operator snapshot unavailable.</p>
+        ) : failures.length === 0 ? (
           <p className="px-4 py-3 font-mono text-[11px] text-ink-4">No recent failures.</p>
         ) : (
           failures.map((f) => <FailureRow key={f.task_id} failure={f} />)

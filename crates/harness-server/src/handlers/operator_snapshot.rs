@@ -42,11 +42,20 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
         state.core.tasks.list_recent_failed(MAX_TASKS as i64),
     );
 
+    let retry_events = match retry_events_res {
+        Ok(events) => events,
+        Err(e) => return error_response(format!("failed to query retry events: {e}")),
+    };
+    let stalled_tasks = match stalled_res {
+        Ok(tasks) => tasks,
+        Err(e) => return error_response(format!("failed to query stalled tasks: {e}")),
+    };
+    let failed_tasks = match failed_res {
+        Ok(tasks) => tasks,
+        Err(e) => return error_response(format!("failed to query recent failures: {e}")),
+    };
+
     // ---- retry section ----
-    let retry_events = retry_events_res.unwrap_or_else(|e| {
-        tracing::warn!("operator_snapshot: failed to query retry events: {e}");
-        Vec::new()
-    });
     // query returns ASC order; the last element is the most recent tick.
     let last_tick: Value = retry_events
         .last()
@@ -63,10 +72,6 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
         })
         .unwrap_or(Value::Null);
 
-    let stalled_tasks = stalled_res.unwrap_or_else(|e| {
-        tracing::warn!("operator_snapshot: failed to query stalled tasks: {e}");
-        Vec::new()
-    });
     let stalled_json: Vec<Value> = stalled_tasks
         .iter()
         .take(MAX_TASKS)
@@ -89,10 +94,6 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
     let pw_snap = state.observability.password_reset_rate_limiter.snapshot();
 
     // ---- recent failures section ----
-    let failed_tasks = failed_res.unwrap_or_else(|e| {
-        tracing::warn!("operator_snapshot: failed to query recent failures: {e}");
-        Vec::new()
-    });
     let failures_json: Vec<Value> = failed_tasks
         .iter()
         .map(|t| {
@@ -143,6 +144,14 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
     });
 
     (StatusCode::OK, Json(body))
+}
+
+fn error_response(message: String) -> (StatusCode, Json<Value>) {
+    tracing::error!("operator_snapshot: {message}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": message })),
+    )
 }
 
 #[cfg(test)]

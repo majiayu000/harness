@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Read-only snapshot of [`SignalRateLimiter`] state.
 pub struct SignalLimiterSnapshot {
@@ -28,7 +28,57 @@ pub struct PasswordResetRateLimiter {
 }
 
 impl PasswordResetRateLimiter {
-    const WINDOW: std::time::Duration = std::time::Duration::from_secs(3600);
+    const WINDOW: Duration = Duration::from_secs(3600);
+
+    fn prune_expired_timestamps(map: &mut HashMap<String, VecDeque<Instant>>, now: Instant) {
+        map.retain(|_, timestamps| {
+            while let Some(&front) = timestamps.front() {
+                if now.duration_since(front) >= Self::WINDOW {
+                    timestamps.pop_front();
+                } else {
+                    break;
+                }
+            }
+            !timestamps.is_empty()
+        });
+    }
+
+    fn active_identifier_count(map: &HashMap<String, VecDeque<Instant>>, now: Instant) -> usize {
+        map.values()
+            .filter(|timestamps| {
+                timestamps
+                    .iter()
+                    .any(|timestamp| now.duration_since(*timestamp) < Self::WINDOW)
+            })
+            .count()
+    }
+
+    #[cfg(test)]
+    fn insert_for_test(&self, identifier: &str, timestamps: VecDeque<Instant>) {
+        let mut map = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
+        map.insert(identifier.to_string(), timestamps);
+    }
+
+    #[cfg(test)]
+    fn window() -> Duration {
+        Self::WINDOW
+    }
+
+    #[cfg(test)]
+    fn len_for_test(&self) -> usize {
+        self.timestamps
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
+    #[cfg(test)]
+    fn contains_for_test(&self, identifier: &str) -> bool {
+        self.timestamps
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(identifier)
+    }
 
     pub fn new(max_per_hour: u32) -> Self {
         Self {
@@ -51,7 +101,7 @@ impl PasswordResetRateLimiter {
     pub fn snapshot(&self) -> PasswordResetLimiterSnapshot {
         let map = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
         PasswordResetLimiterSnapshot {
-            tracked_identifiers: map.len(),
+            tracked_identifiers: Self::active_identifier_count(&map, Instant::now()),
             limit_per_hour: self.max_per_hour,
         }
     }
@@ -61,19 +111,7 @@ impl PasswordResetRateLimiter {
         let mut map = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
 
-        // Evict timestamps outside the rolling window for this identifier.
-        if let Some(entry) = map.get_mut(identifier) {
-            while let Some(&front) = entry.front() {
-                if now.duration_since(front) >= Self::WINDOW {
-                    entry.pop_front();
-                } else {
-                    break;
-                }
-            }
-            if entry.is_empty() {
-                map.remove(identifier);
-            }
-        }
+        Self::prune_expired_timestamps(&mut map, now);
 
         // Reject new identifiers when map is at capacity (memory-DoS guard).
         if !map.contains_key(identifier) && map.len() >= self.max_tracked_keys {
@@ -97,6 +135,25 @@ pub struct SignalRateLimiter {
 }
 
 impl SignalRateLimiter {
+    const WINDOW: Duration = Duration::from_secs(60);
+
+    fn prune_expired_counts(counts: &mut HashMap<String, (u32, Instant)>, now: Instant) {
+        counts.retain(|_, (_, window_start)| now.duration_since(*window_start) < Self::WINDOW);
+    }
+
+    fn active_source_count(counts: &HashMap<String, (u32, Instant)>, now: Instant) -> usize {
+        counts
+            .values()
+            .filter(|(_, window_start)| now.duration_since(*window_start) < Self::WINDOW)
+            .count()
+    }
+
+    #[cfg(test)]
+    fn insert_for_test(&self, source: &str, count: u32, window_start: Instant) {
+        let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        counts.insert(source.to_string(), (count, window_start));
+    }
+
     pub fn new(max_per_minute: u32) -> Self {
         Self {
             counts: Mutex::new(HashMap::new()),
@@ -108,7 +165,7 @@ impl SignalRateLimiter {
     pub fn snapshot(&self) -> SignalLimiterSnapshot {
         let counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
         SignalLimiterSnapshot {
-            tracked_sources: counts.len(),
+            tracked_sources: Self::active_source_count(&counts, Instant::now()),
             limit_per_minute: self.max_per_minute,
         }
     }
@@ -117,8 +174,11 @@ impl SignalRateLimiter {
     pub fn check_and_increment(&self, source: &str) -> bool {
         let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
+
+        Self::prune_expired_counts(&mut counts, now);
+
         let entry = counts.entry(source.to_string()).or_insert((0, now));
-        if now.duration_since(entry.1) >= std::time::Duration::from_secs(60) {
+        if now.duration_since(entry.1) >= Self::WINDOW {
             *entry = (1, now);
             true
         } else if entry.0 < self.max_per_minute {
@@ -133,6 +193,8 @@ impl SignalRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::{PasswordResetRateLimiter, SignalRateLimiter};
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn allows_requests_within_limit() {
@@ -190,5 +252,47 @@ mod tests {
         let snap1 = limiter.snapshot();
         let snap2 = limiter.snapshot();
         assert_eq!(snap1.tracked_sources, snap2.tracked_sources);
+    }
+
+    #[test]
+    fn signal_snapshot_excludes_expired_sources() {
+        let limiter = SignalRateLimiter::new(60);
+        let now = Instant::now();
+        limiter.insert_for_test("active", 1, now - Duration::from_secs(5));
+        limiter.insert_for_test("expired", 1, now - Duration::from_secs(61));
+
+        let snap = limiter.snapshot();
+
+        assert_eq!(snap.tracked_sources, 1);
+    }
+
+    #[test]
+    fn password_reset_snapshot_excludes_expired_identifiers() {
+        let limiter = PasswordResetRateLimiter::new(5);
+        let now = Instant::now();
+        limiter.insert_for_test(
+            "active@example.com",
+            VecDeque::from([now - Duration::from_secs(30)]),
+        );
+        limiter.insert_for_test(
+            "expired@example.com",
+            VecDeque::from([now - (PasswordResetRateLimiter::window() + Duration::from_secs(1))]),
+        );
+
+        let snap = limiter.snapshot();
+
+        assert_eq!(snap.tracked_identifiers, 1);
+    }
+
+    #[test]
+    fn password_reset_prunes_expired_identifiers_before_capacity_check() {
+        let limiter = PasswordResetRateLimiter::new_with_cap(10, 1);
+        let expired =
+            Instant::now() - (PasswordResetRateLimiter::window() + Duration::from_secs(1));
+        limiter.insert_for_test("expired@example.com", VecDeque::from([expired]));
+
+        assert!(limiter.check_and_increment("fresh@example.com"));
+        assert_eq!(limiter.len_for_test(), 1);
+        assert!(limiter.contains_for_test("fresh@example.com"));
     }
 }
