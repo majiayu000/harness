@@ -111,10 +111,10 @@ fn proof_from_state(state: &TaskState) -> ProofOfWork {
     }
 }
 
-/// GET /tasks/{id}/proof — machine-readable proof-of-work for a completed task.
+/// GET /tasks/{id}/proof — machine-readable proof-of-work for a terminal task.
 ///
 /// Returns 404 when the task does not exist, 422 when the task has not yet
-/// reached the `Done` state.
+/// reached a terminal state.
 pub(crate) async fn get_task_proof(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
@@ -140,11 +140,11 @@ pub(crate) async fn get_task_proof(
         }
     };
 
-    if task.status != TaskStatus::Done {
+    if !matches!(task.status, TaskStatus::Done | TaskStatus::Failed) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({
-                "error": "proof-of-work is only available for completed tasks",
+                "error": "proof-of-work is only available for terminal tasks",
                 "status": task.status.as_ref(),
             })),
         )

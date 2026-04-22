@@ -365,7 +365,7 @@ async fn proof_endpoint_route_coverage() -> anyhow::Result<()> {
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "404 case");
     }
 
-    // --- 422: task exists but is not Done ---
+    // --- 422: task exists but is not terminal ---
     {
         let id = harness_core::types::TaskId("pending-task".to_string());
         state.core.tasks.insert(&TaskState::new(id)).await;
@@ -382,6 +382,43 @@ async fn proof_endpoint_route_coverage() -> anyhow::Result<()> {
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             "422 case"
         );
+    }
+
+    // --- 200: Failed task with review detail still returns proof ---
+    {
+        let id = harness_core::types::TaskId("failed-task".to_string());
+        let mut task = TaskState::new(id);
+        task.status = TaskStatus::Failed;
+        task.error = Some("tests failed after review".to_string());
+        task.rounds = vec![RoundResult {
+            turn: 1,
+            action: ACTION_REVIEW.to_string(),
+            result: "changes_requested".to_string(),
+            detail: Some("unit test gate failed".to_string()),
+            first_token_latency_ms: None,
+        }];
+        state.core.tasks.insert(&task).await;
+
+        let resp = proof_route(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/failed-task/proof")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK, "failed-task 200");
+        let body = resp.into_body().collect().await?.to_bytes();
+        let proof: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(proof["task_id"], "failed-task");
+        assert_eq!(proof["review_outcome"], "changes_requested");
+        assert_eq!(proof["ci_status"], "failed");
+        assert_eq!(proof["final_review_detail"], "unit test gate failed");
+        assert!(proof["quality_signals"]
+            .as_array()
+            .is_some_and(|signals| signals.iter().any(|signal| {
+                signal["label"] == "completion_note"
+                    && signal["value"] == "tests failed after review"
+            })));
     }
 
     // --- 200: Done task with LGTM rounds, issue preserved from cache ---
