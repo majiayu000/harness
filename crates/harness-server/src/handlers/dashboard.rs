@@ -249,6 +249,9 @@ mod tests {
     #[tokio::test]
     async fn dashboard_returns_ok_with_expected_shape() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let dir = crate::test_helpers::tempdir_in_home("harness-test-dashboard-")?;
         let state = make_test_state(dir.path()).await?;
         let state = Arc::new(state);
@@ -289,6 +292,9 @@ mod tests {
     #[tokio::test]
     async fn dashboard_global_fields_are_numeric() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let dir = crate::test_helpers::tempdir_in_home("harness-test-dashboard-")?;
         let state = Arc::new(make_test_state(dir.path()).await?);
 
@@ -322,6 +328,9 @@ mod tests {
     #[tokio::test]
     async fn dashboard_host_assignment_pressure_zero_when_idle() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let dir = crate::test_helpers::tempdir_in_home("harness-test-dashboard-")?;
         let state = make_test_state(dir.path()).await?;
 

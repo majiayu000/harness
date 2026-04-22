@@ -448,6 +448,9 @@ mod tests {
     #[tokio::test]
     async fn overview_returns_expected_shape() -> anyhow::Result<()> {
         let _lock = test_helpers::HOME_LOCK.lock().await;
+        if !test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let dir = test_helpers::tempdir_in_home("harness-test-overview-")?;
         let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
 
@@ -495,6 +498,9 @@ mod tests {
     #[tokio::test]
     async fn worktrees_used_includes_local_workspace_manager() -> anyhow::Result<()> {
         let _lock = test_helpers::HOME_LOCK.lock().await;
+        if !test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let dir = test_helpers::tempdir_in_home("harness-test-overview-wt-")?;
         let mut state = test_helpers::make_test_state(dir.path()).await?;
 
