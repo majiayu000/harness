@@ -349,9 +349,7 @@ impl RecentFailureRow {
         crate::task_runner::RecentFailureTask {
             id: harness_core::types::TaskId(self.id),
             failure_kind: match self.failure_kind.as_deref() {
-                Some(kind) => kind
-                    .parse::<crate::task_runner::TaskFailureKind>()
-                    .ok(),
+                Some(kind) => kind.parse::<crate::task_runner::TaskFailureKind>().ok(),
                 None => Some(crate::task_runner::TaskFailureKind::Task),
             },
             external_id: self.external_id,
