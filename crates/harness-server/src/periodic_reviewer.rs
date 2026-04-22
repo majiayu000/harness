@@ -115,6 +115,7 @@ struct StartupDelayOutcome {
     last_review_ts: Option<DateTime<Utc>>,
     overdue: bool,
     elapsed: Option<chrono::Duration>,
+    reused_startup_delay: bool,
 }
 
 fn startup_delay_outcome(
@@ -133,6 +134,7 @@ fn startup_delay_outcome(
         last_review_ts,
         overdue,
         elapsed,
+        reused_startup_delay: false,
     }
 }
 
@@ -162,8 +164,17 @@ fn startup_delay_for_rescanned_project_outcome(
             last_review_ts,
             overdue: false,
             elapsed: last_review_ts.map(|ts| now.signed_duration_since(ts)),
+            reused_startup_delay: true,
         },
         None => startup_delay_outcome(run_on_startup, interval, last_review_ts, now),
+    }
+}
+
+fn startup_rescan_remaining_delay(outcome: &StartupDelayOutcome, min_delay: Duration) -> Duration {
+    if outcome.reused_startup_delay {
+        outcome.delay.saturating_sub(min_delay)
+    } else {
+        outcome.delay
     }
 }
 
@@ -174,7 +185,7 @@ async fn startup_delay_for_rescanned_project(
     run_on_startup: bool,
     interval: Duration,
     now: DateTime<Utc>,
-) -> Duration {
+) -> StartupDelayOutcome {
     let hook_key = project_hook_key(&project.name, &project.root);
     let last_review_ts = last_review_timestamp(state, &hook_key).await;
     startup_delay_for_rescanned_project_outcome(
@@ -185,7 +196,6 @@ async fn startup_delay_for_rescanned_project(
         last_review_ts,
         now,
     )
-    .delay
 }
 
 async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
@@ -298,7 +308,7 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // Projects whose remaining time exceeds min_delay are deferred to the regular
     // interval loop, avoiding unnecessary task/quota spikes on restart.
     for project in &projects {
-        let project_delay = startup_delay_for_rescanned_project(
+        let outcome = startup_delay_for_rescanned_project(
             &state,
             &startup_delay_by_name,
             project,
@@ -307,17 +317,15 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
             Utc::now(),
         )
         .await;
-        if project_delay > min_delay {
+        let remaining_delay = startup_rescan_remaining_delay(&outcome, min_delay);
+        if !remaining_delay.is_zero() {
             tracing::debug!(
                 project = %project.name,
-                remaining_secs = (project_delay - min_delay).as_secs(),
+                remaining_secs = remaining_delay.as_secs(),
                 "scheduler: project not yet due at startup, deferring to next scheduled tick"
             );
             // Anchor deferred schedule relative to now (after sleep elapsed).
-            next_run_map.insert(
-                project.name.clone(),
-                Instant::now() + project_delay.saturating_sub(min_delay),
-            );
+            next_run_map.insert(project.name.clone(), Instant::now() + remaining_delay);
             continue;
         }
         let review_state = state_map[&project.name].clone();
@@ -1845,6 +1853,41 @@ mod tests {
         assert_eq!(
             outcome.last_review_ts,
             Some(now - chrono::Duration::minutes(15))
+        );
+        assert!(!outcome.reused_startup_delay);
+    }
+
+    #[test]
+    fn startup_rescan_preserves_missing_project_remaining_delay_after_sleep() {
+        let min_delay = Duration::from_secs(300);
+        let outcome = StartupDelayOutcome {
+            delay: Duration::from_secs(2700),
+            last_review_ts: None,
+            overdue: false,
+            elapsed: None,
+            reused_startup_delay: false,
+        };
+
+        assert_eq!(
+            startup_rescan_remaining_delay(&outcome, min_delay),
+            Duration::from_secs(2700)
+        );
+    }
+
+    #[test]
+    fn startup_rescan_subtracts_elapsed_sleep_for_original_project_delay() {
+        let min_delay = Duration::from_secs(300);
+        let outcome = StartupDelayOutcome {
+            delay: Duration::from_secs(2700),
+            last_review_ts: None,
+            overdue: false,
+            elapsed: None,
+            reused_startup_delay: true,
+        };
+
+        assert_eq!(
+            startup_rescan_remaining_delay(&outcome, min_delay),
+            Duration::from_secs(2400)
         );
     }
 
