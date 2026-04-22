@@ -1,12 +1,8 @@
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64},
-    Arc, OnceLock,
+    Arc,
 };
-use std::time::Duration;
-
-use harness_core::db::pg_open_pool;
-use tokio::sync::OnceCell;
 
 /// Serialises every test that reads or mutates the process-global `HOME` env
 /// var.  `tokio::test` runs tests concurrently in the same process; without
@@ -14,14 +10,6 @@ use tokio::sync::OnceCell;
 /// that calls `validate_project_root` (which reads `HOME`), leading to
 /// spurious "project root must be within HOME" failures.
 pub static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-static DB_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
-static DB_STATE_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
-
-fn db_state_lock() -> Arc<tokio::sync::Mutex<()>> {
-    DB_STATE_LOCK
-        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-}
 
 /// RAII guard that restores `HOME` on drop, **including on panic**.
 pub struct HomeGuard {
@@ -74,33 +62,15 @@ pub fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
 }
 
 pub async fn db_tests_enabled() -> bool {
-    if std::env::var("DATABASE_URL").is_err() {
-        return false;
-    }
-
-    *DB_AVAILABLE
-        .get_or_init(|| async {
-            let Ok(database_url) = std::env::var("DATABASE_URL") else {
-                return false;
-            };
-            match tokio::time::timeout(Duration::from_secs(2), pg_open_pool(&database_url)).await {
-                Ok(Ok(pool)) => {
-                    pool.close().await;
-                    true
-                }
-                _ => false,
-            }
-        })
-        .await
+    harness_core::db::db_tests_enabled().await
 }
 
-pub async fn acquire_db_state_guard() -> tokio::sync::OwnedMutexGuard<()> {
-    db_state_lock().lock_owned().await
+pub async fn acquire_db_state_guard() -> anyhow::Result<harness_core::db::DbTestGuard> {
+    harness_core::db::acquire_db_test_guard().await
 }
 
 pub fn is_pool_timeout(err: &anyhow::Error) -> bool {
-    err.to_string()
-        .contains("pool timed out while waiting for an open connection")
+    harness_core::db::is_pool_timeout(err)
 }
 
 pub async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
@@ -133,7 +103,7 @@ async fn make_state_inner(
     agent_registry: AgentRegistry,
 ) -> anyhow::Result<AppState> {
     #[cfg(test)]
-    let db_state_guard = Some(acquire_db_state_guard().await);
+    let db_state_guard = Some(acquire_db_state_guard().await?);
     let server = Arc::new(HarnessServer::new(
         HarnessConfig::default(),
         ThreadManager::new(),

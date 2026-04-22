@@ -1,55 +1,14 @@
 use super::*;
 use harness_core::{
     config::misc::OtelExporter,
-    db::pg_open_pool,
+    db::{acquire_db_test_guard, db_tests_enabled, is_pool_timeout},
     types::{AutoFixAttempt, RuleId},
 };
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
-use tokio::sync::OnceCell;
-
-// Supabase session pooler caps simultaneous clients at pool_size (15).
-// Serialize these DB-backed tests so one test process does not exhaust the
-// shared external session budget for the whole workspace.
-static DB_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
-static DB_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
-
-fn db_semaphore() -> Arc<tokio::sync::Semaphore> {
-    DB_SEMAPHORE
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone()
-}
-
-async fn db_tests_enabled() -> bool {
-    if std::env::var("DATABASE_URL").is_err() {
-        return false;
-    }
-
-    *DB_AVAILABLE
-        .get_or_init(|| async {
-            let Ok(database_url) = std::env::var("DATABASE_URL") else {
-                return false;
-            };
-            match tokio::time::timeout(Duration::from_secs(2), pg_open_pool(&database_url)).await {
-                Ok(Ok(pool)) => {
-                    pool.close().await;
-                    true
-                }
-                _ => false,
-            }
-        })
-        .await
-}
-
-fn is_pool_timeout(err: &anyhow::Error) -> bool {
-    err.to_string()
-        .contains("pool timed out while waiting for an open connection")
-}
 
 struct TestStore {
     inner: EventStore,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _guard: harness_core::db::DbTestGuard,
 }
 
 impl TestStore {
@@ -69,14 +28,11 @@ async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<TestStore>> {
     if !db_tests_enabled().await {
         return Ok(None);
     }
-    let permit = db_semaphore()
-        .acquire_owned()
-        .await
-        .expect("semaphore never closed");
+    let guard = acquire_db_test_guard().await?;
     match EventStore::new(data_dir).await {
         Ok(inner) => Ok(Some(TestStore {
             inner,
-            _permit: permit,
+            _guard: guard,
         })),
         Err(err) if is_pool_timeout(&err) => Ok(None),
         Err(err) => Err(err),
@@ -541,10 +497,7 @@ async fn log_with_unreachable_otel_endpoint_still_persists_event() -> anyhow::Re
         endpoint: Some("http://127.0.0.1:1".to_string()),
         ..OtelConfig::default()
     };
-    let permit = db_semaphore()
-        .acquire_owned()
-        .await
-        .expect("semaphore never closed");
+    let _guard = acquire_db_test_guard().await?;
     let store = match EventStore::with_policies_and_otel(dir.path(), 1800, 90, &config).await {
         Ok(store) => store,
         Err(err) if is_pool_timeout(&err) => return Ok(()),
@@ -567,7 +520,6 @@ async fn log_with_unreachable_otel_endpoint_still_persists_event() -> anyhow::Re
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].id, event.id);
     store.close().await;
-    drop(permit);
     Ok(())
 }
 

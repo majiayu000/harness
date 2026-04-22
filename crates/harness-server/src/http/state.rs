@@ -91,7 +91,7 @@ pub struct AppState {
     pub observability: ObservabilityServices,
     pub concurrency: ConcurrencyServices,
     #[cfg(test)]
-    pub _db_state_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    pub _db_state_guard: Option<harness_core::db::DbTestGuard>,
     pub runtime_hosts: Arc<crate::runtime_hosts::RuntimeHostManager>,
     pub runtime_project_cache: Arc<crate::runtime_project_cache::RuntimeProjectCacheManager>,
     /// Serializes runtime snapshot writes to avoid out-of-order persistence.

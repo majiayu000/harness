@@ -1,21 +1,168 @@
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use std::collections::HashSet;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
+use std::sync::{Arc, OnceLock};
 
 use crate::db::Migration;
 
 const DEFAULT_PG_MAX_CONNECTIONS: u32 = 8;
-const SUPABASE_POOLER_MAX_CONNECTIONS: u32 = 1;
+const DB_TEST_LOCK_STALE_SECS: u64 = 300;
+static DB_TEST_PROCESS_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+static DB_TEST_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn pg_max_connections(database_url: &str) -> u32 {
-    // Supabase's session pooler has a tight session cap relative to the
-    // number of independent Postgres-backed stores the workspace tests create.
-    // Budget one session per store there to avoid test-time pool starvation.
-    if database_url.contains(".pooler.supabase.com") {
-        SUPABASE_POOLER_MAX_CONNECTIONS
-    } else {
-        DEFAULT_PG_MAX_CONNECTIONS
+fn db_test_process_lock() -> Arc<tokio::sync::Mutex<()>> {
+    DB_TEST_PROCESS_LOCK
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+fn db_test_lock_path() -> PathBuf {
+    std::env::temp_dir().join("harness-db-tests.lock")
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[after_comm + 1..].split_whitespace().collect();
+    fields.get(19)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn db_test_lock_is_stale(lock_path: &Path, meta: &std::fs::Metadata) -> bool {
+    if let Ok(content) = std::fs::read_to_string(lock_path) {
+        let trimmed = content.trim();
+        let (pid_opt, stored_start_opt) = if let Some((pid, start)) = trimmed.split_once(':') {
+            (pid.parse::<u32>().ok(), start.parse::<u64>().ok())
+        } else {
+            (trimmed.parse::<u32>().ok(), None)
+        };
+        if let Some(pid) = pid_opt {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                return true;
+            }
+            if let (Some(stored), Some(current)) = (stored_start_opt, read_proc_start_time(pid)) {
+                if stored != current {
+                    return true;
+                }
+            }
+            return false;
+        }
     }
+    meta.modified()
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs() > DB_TEST_LOCK_STALE_SECS)
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn db_test_lock_is_stale(_lock_path: &Path, meta: &std::fs::Metadata) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs() > DB_TEST_LOCK_STALE_SECS)
+        .unwrap_or(false)
+}
+
+struct DbTestFileLock {
+    path: PathBuf,
+}
+
+impl DbTestFileLock {
+    fn try_acquire(lock_path: &Path) -> anyhow::Result<Option<Self>> {
+        if let Ok(meta) = std::fs::metadata(lock_path) {
+            if db_test_lock_is_stale(lock_path, &meta) {
+                let _ = std::fs::remove_file(lock_path);
+            }
+        }
+
+        let pid = std::process::id();
+        #[cfg(target_os = "linux")]
+        let lock_content = {
+            let start = read_proc_start_time(pid).unwrap_or(0);
+            format!("{pid}:{start}")
+        };
+        #[cfg(not(target_os = "linux"))]
+        let lock_content = pid.to_string();
+
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(mut file) => {
+                let _ = file.write_all(lock_content.as_bytes());
+                Ok(Some(Self {
+                    path: lock_path.to_path_buf(),
+                }))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+impl Drop for DbTestFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub struct DbTestGuard {
+    _process_guard: tokio::sync::OwnedMutexGuard<()>,
+    _file_lock: DbTestFileLock,
+}
+
+pub async fn acquire_db_test_guard() -> anyhow::Result<DbTestGuard> {
+    let process_guard = db_test_process_lock().lock_owned().await;
+    let lock_path = db_test_lock_path();
+    loop {
+        if let Some(file_lock) = DbTestFileLock::try_acquire(&lock_path)? {
+            return Ok(DbTestGuard {
+                _process_guard: process_guard,
+                _file_lock: file_lock,
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+pub async fn db_tests_enabled() -> bool {
+    if DB_TEST_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return false;
+    };
+
+    let available = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        pg_open_pool(&database_url),
+    )
+    .await
+    {
+        Ok(Ok(pool)) => {
+            pool.close().await;
+            true
+        }
+        _ => false,
+    };
+
+    if available {
+        DB_TEST_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    available
+}
+
+pub fn is_pool_timeout(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<sqlx::Error>()
+        .map(|sqlx_err| matches!(sqlx_err, sqlx::Error::PoolTimedOut))
+        .unwrap_or(false)
 }
 
 /// Resolve the effective Postgres connection string.
@@ -43,11 +190,10 @@ pub fn resolve_database_url(configured_database_url: Option<&str>) -> anyhow::Re
 
 /// Create a Postgres connection pool for the given DATABASE_URL.
 ///
-/// Uses 8 max connections by default, or 1 for Supabase pooler URLs, with a
-/// 10-second acquire timeout.
+/// Uses 8 max connections with a 10-second acquire timeout.
 pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
     let pool = PgPoolOptions::new()
-        .max_connections(pg_max_connections(database_url))
+        .max_connections(DEFAULT_PG_MAX_CONNECTIONS)
         .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(database_url)
         .await?;
@@ -120,7 +266,7 @@ pub async fn pg_open_pool_schematized(database_url: &str, schema: &str) -> anyho
     let opts = PgConnectOptions::from_str(database_url)?;
     let schema_for_hook = schema.to_string();
     let pool = PgPoolOptions::new()
-        .max_connections(pg_max_connections(database_url))
+        .max_connections(DEFAULT_PG_MAX_CONNECTIONS)
         .acquire_timeout(std::time::Duration::from_secs(10))
         .after_connect(move |conn, _meta| {
             let schema = schema_for_hook.clone();
@@ -224,9 +370,7 @@ impl<'a> PgMigrator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        pg_max_connections, resolve_database_url, validate_schema_name, DEFAULT_PG_MAX_CONNECTIONS,
-    };
+    use super::{resolve_database_url, validate_schema_name, DEFAULT_PG_MAX_CONNECTIONS};
 
     #[test]
     fn valid_schema_names() {
@@ -282,15 +426,8 @@ mod tests {
     }
 
     #[test]
-    fn supabase_pooler_urls_use_single_connection() {
-        let url = "postgresql://user:pass@aws-1-ap-northeast-1.pooler.supabase.com:5432/postgres";
-        assert_eq!(pg_max_connections(url), 1);
-    }
-
-    #[test]
-    fn direct_postgres_urls_keep_default_connection_budget() {
-        let url = "postgresql://user:pass@db.example.internal:5432/postgres";
-        assert_eq!(pg_max_connections(url), DEFAULT_PG_MAX_CONNECTIONS);
+    fn postgres_pool_budget_stays_at_default() {
+        assert_eq!(DEFAULT_PG_MAX_CONNECTIONS, 8);
     }
 
     #[test]

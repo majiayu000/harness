@@ -355,7 +355,7 @@ mod tests {
                 workspace_mgr: None,
             },
             #[cfg(test)]
-            _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
+            _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await?),
             runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
             runtime_project_cache: Arc::new(
                 crate::runtime_project_cache::RuntimeProjectCacheManager::new(),

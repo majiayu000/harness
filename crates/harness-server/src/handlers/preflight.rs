@@ -400,6 +400,7 @@ COMPLEXITY: complex"
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
         }
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await?;
         let temp = tempfile::tempdir()?;
         let events = Arc::new(harness_observe::event_store::EventStore::new(temp.path()).await?);
         let session_id = SessionId::new();
@@ -455,6 +456,7 @@ COMPLEXITY: complex"
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
         }
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await?;
         let temp = tempfile::tempdir()?;
         let err = run_preflight(
             Arc::new(StaticAgent {
@@ -482,6 +484,7 @@ COMPLEXITY: complex"
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
         }
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await?;
         let temp = tempfile::tempdir()?;
 
         let err = run_preflight(

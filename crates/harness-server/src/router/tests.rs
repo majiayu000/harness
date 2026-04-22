@@ -99,7 +99,7 @@ async fn make_test_state_with_config_and_registry(
             workspace_mgr: None,
         },
         #[cfg(test)]
-        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
+        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await?),
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
@@ -1424,7 +1424,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             workspace_mgr: None,
         },
         #[cfg(test)]
-        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
+        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await?),
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
