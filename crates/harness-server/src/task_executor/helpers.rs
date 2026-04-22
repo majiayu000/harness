@@ -45,6 +45,19 @@ pub(crate) struct TurnExecutionFailure {
     pub failure: TurnFailure,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RunAgentStreamingOptions {
+    pub persist_artifacts: bool,
+}
+
+impl Default for RunAgentStreamingOptions {
+    fn default() -> Self {
+        Self {
+            persist_artifacts: true,
+        }
+    }
+}
+
 pub(crate) fn telemetry_for_timeout(
     prompt_built_at: DateTime<Utc>,
     agent_started_at: DateTime<Utc>,
@@ -617,6 +630,29 @@ pub(crate) async fn run_agent_streaming(
     prompt_built_at: DateTime<Utc>,
     agent_started_at: DateTime<Utc>,
 ) -> Result<TurnExecutionSuccess, TurnExecutionFailure> {
+    run_agent_streaming_with_options(
+        agent,
+        req,
+        task_id,
+        store,
+        turn,
+        prompt_built_at,
+        agent_started_at,
+        RunAgentStreamingOptions::default(),
+    )
+    .await
+}
+
+pub(crate) async fn run_agent_streaming_with_options(
+    agent: &dyn CodeAgent,
+    req: AgentRequest,
+    task_id: &TaskId,
+    store: &TaskStore,
+    turn: u32,
+    prompt_built_at: DateTime<Utc>,
+    agent_started_at: DateTime<Utc>,
+    options: RunAgentStreamingOptions,
+) -> Result<TurnExecutionSuccess, TurnExecutionFailure> {
     let turn_start = Instant::now();
 
     // Persist redacted prompt before req is consumed by execute_stream.
@@ -741,7 +777,9 @@ pub(crate) async fn run_agent_streaming(
                                 }
                             }
                             StreamItem::ItemCompleted { item: completed_item } => {
-                                persist_artifact(store, task_id, turn, completed_item).await;
+                                if options.persist_artifacts {
+                                    persist_artifact(store, task_id, turn, completed_item).await;
+                                }
                             }
                             StreamItem::TokenUsage { usage } => {
                                 token_usage = usage.clone();

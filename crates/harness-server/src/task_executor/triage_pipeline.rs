@@ -1,4 +1,7 @@
-use super::helpers::{build_task_event, run_agent_streaming, telemetry_for_timeout};
+use super::helpers::{
+    build_task_event, run_agent_streaming, run_agent_streaming_with_options, telemetry_for_timeout,
+    RunAgentStreamingOptions,
+};
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskPhase, TaskStatus, TaskStore,
 };
@@ -94,7 +97,7 @@ pub(crate) async fn run_plan_for_prompt(
 
     let plan_resp = match tokio::time::timeout(
         turn_timeout,
-        run_agent_streaming(
+        run_agent_streaming_with_options(
             agent,
             plan_req,
             task_id,
@@ -102,6 +105,9 @@ pub(crate) async fn run_plan_for_prompt(
             0,
             prompt_built_at,
             agent_started_at,
+            RunAgentStreamingOptions {
+                persist_artifacts: false,
+            },
         ),
     )
     .await

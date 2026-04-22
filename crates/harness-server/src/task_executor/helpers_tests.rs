@@ -190,6 +190,7 @@ fn wrap<T: TurnInterceptor + 'static>(t: T) -> Arc<dyn TurnInterceptor> {
 enum StreamScenario {
     StreamingSuccess,
     NonStreamingSuccess,
+    ArtifactSuccess,
     UpstreamFailure,
 }
 
@@ -232,6 +233,21 @@ impl CodeAgent for TestStreamingAgent {
                 tx.send(StreamItem::ItemCompleted {
                     item: harness_core::types::Item::AgentReasoning {
                         content: "final response".to_string(),
+                    },
+                })
+                .await
+                .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+                tx.send(StreamItem::Done)
+                    .await
+                    .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+                Ok(())
+            }
+            StreamScenario::ArtifactSuccess => {
+                tx.send(StreamItem::ItemCompleted {
+                    item: harness_core::types::Item::ToolCall {
+                        name: "test-tool".to_string(),
+                        input: serde_json::json!({}),
+                        output: Some(serde_json::json!("ok")),
                     },
                 })
                 .await
@@ -643,6 +659,40 @@ async fn run_agent_streaming_classifies_upstream_failure() {
 
     assert_eq!(failure.failure.kind, TurnFailureKind::Upstream);
     assert_eq!(failure.failure.upstream_status, Some(500));
+}
+
+#[tokio::test]
+async fn run_agent_streaming_can_skip_artifact_persistence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = crate::task_runner::TaskStore::open(&dir.path().join("tasks.db"))
+        .await
+        .expect("task store");
+    let task_id = crate::task_runner::TaskId::new();
+    let task = crate::task_runner::TaskState::new(task_id.clone());
+    store.insert(&task).await;
+
+    run_agent_streaming_with_options(
+        &TestStreamingAgent {
+            scenario: StreamScenario::ArtifactSuccess,
+        },
+        make_req(),
+        &task_id,
+        &store,
+        1,
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+        RunAgentStreamingOptions {
+            persist_artifacts: false,
+        },
+    )
+    .await
+    .expect("artifact streaming success");
+
+    let artifacts = store.list_artifacts(&task_id).await.expect("artifacts");
+    assert!(
+        artifacts.is_empty(),
+        "artifact persistence should be disabled when requested"
+    );
 }
 
 // ── truncate_validation_error ─────────────────────────────────────────────────

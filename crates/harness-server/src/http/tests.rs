@@ -1061,9 +1061,27 @@ async fn closed_task_sse_replay_includes_observability_fields() -> anyhow::Resul
     use http_body_util::BodyExt;
     let body = response.into_body().collect().await?.to_bytes();
     let body_text = String::from_utf8(body.to_vec())?;
-    assert!(body_text.contains("telemetry="));
-    assert!(body_text.contains("failure="));
-    assert!(body_text.contains(""kind":"timeout""));
+    let mut saw_telemetry = false;
+    let mut saw_failure = false;
+    let mut saw_timeout_failure = false;
+    for line in body_text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let item: StreamItem = serde_json::from_str(data)?;
+        if let StreamItem::MessageDelta { text } = item {
+            saw_telemetry |= text.contains("telemetry=");
+            if let Some((_, failure_json)) = text.split_once("\nfailure=") {
+                saw_failure = true;
+                let failure: TurnFailure = serde_json::from_str(failure_json.trim())?;
+                saw_timeout_failure |= failure.kind == TurnFailureKind::Timeout;
+            }
+        }
+    }
+    assert!(saw_telemetry);
+    assert!(saw_failure);
+    assert!(saw_timeout_failure);
+
     Ok(())
 }
 
