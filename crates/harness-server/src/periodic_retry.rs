@@ -413,9 +413,48 @@ mod tests {
     use crate::task_db::TaskDb;
     use crate::task_runner::{TaskState, TaskStatus};
     use crate::test_helpers;
-    use harness_core::types::TaskId;
+    use harness_agents::registry::AgentRegistry;
+    use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+    use harness_core::types::{Capability, TaskId, TokenUsage};
     use harness_observe::event_store::EventStore;
     use std::sync::Arc;
+
+    struct RetryTestAgent;
+
+    #[async_trait::async_trait]
+    impl CodeAgent for RetryTestAgent {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+
+        async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+            Ok(AgentResponse {
+                output: String::new(),
+                stderr: String::new(),
+                items: vec![],
+                token_usage: TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    cost_usd: 0.0,
+                },
+                model: "test".to_string(),
+                exit_code: Some(0),
+            })
+        }
+
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            _tx: tokio::sync::mpsc::Sender<StreamItem>,
+        ) -> harness_core::error::Result<()> {
+            Ok(())
+        }
+    }
 
     fn stalled_task(id: &str, external_id: &str, project: &str) -> TaskState {
         TaskState {
@@ -642,7 +681,9 @@ mod tests {
             return Ok(());
         }
         let dir = test_helpers::tempdir_in_home("harness-test-retry-ws-")?;
-        let mut state = test_helpers::make_test_state(dir.path()).await?;
+        let mut registry = AgentRegistry::new("test");
+        registry.register("test", Arc::new(RetryTestAgent));
+        let mut state = test_helpers::make_test_state_with_registry(dir.path(), registry).await?;
 
         let workspace_root = dir.path().join("workspaces");
         let workspace_mgr = Arc::new(crate::workspace::WorkspaceManager::new(
@@ -687,9 +728,8 @@ mod tests {
             "original stalled task should be cancelled before retry"
         );
         assert!(
-            tasks.iter().any(|t| t.id != task_id
-                && matches!(t.status, TaskStatus::Pending | TaskStatus::Implementing)),
-            "retry tick should enqueue a successor task after cleanup"
+            tasks.iter().any(|t| t.id != task_id),
+            "retry tick should enqueue a successor task after cleanup even if it finishes quickly"
         );
         Ok(())
     }
