@@ -7,6 +7,9 @@ export interface Task {
   task_kind: string;
   status: string;
   turn: number;
+  agent_active: boolean;
+  active_phase: string | null;
+  phase_started_at: string | null;
   pr_url: string | null;
   error: string | null;
   source: string | null;

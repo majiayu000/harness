@@ -1,6 +1,14 @@
+export interface DashboardActivePhases {
+  triage: number;
+  plan: number;
+  implement: number;
+  review: number;
+}
+
 export interface DashboardProjectTasks {
   running: number;
   queued: number;
+  active_phases: DashboardActivePhases;
   done: number;
   failed: number;
 }
@@ -34,6 +42,7 @@ export interface DashboardLlmMetrics {
 export interface DashboardGlobal {
   running: number;
   queued: number;
+  active_phases: DashboardActivePhases;
   max_concurrent: number;
   uptime_secs: number;
   done: number;

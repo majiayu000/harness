@@ -3,6 +3,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use harness_core::types::EventFilters;
 use harness_observe::{quality::QualityGrader, stats};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Rolling window for dashboard event queries. Keeps each `/api/dashboard` poll
@@ -14,6 +15,57 @@ const DASHBOARD_EVENT_WINDOW_DAYS: i64 = 30;
 /// so `uptime_secs` reflects true server uptime rather than time since first dashboard hit.
 pub(crate) static SERVER_START: std::sync::OnceLock<std::time::Instant> =
     std::sync::OnceLock::new();
+
+#[derive(Default, Clone)]
+struct ActivePhaseCounts {
+    triage: u64,
+    plan: u64,
+    implement: u64,
+    review: u64,
+}
+
+impl ActivePhaseCounts {
+    fn record(&mut self, phase: &crate::task_runner::TaskPhase) {
+        match phase {
+            crate::task_runner::TaskPhase::Triage => self.triage += 1,
+            crate::task_runner::TaskPhase::Plan => self.plan += 1,
+            crate::task_runner::TaskPhase::Implement => self.implement += 1,
+            crate::task_runner::TaskPhase::Review => self.review += 1,
+            crate::task_runner::TaskPhase::Terminal => {}
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "triage": self.triage,
+            "plan": self.plan,
+            "implement": self.implement,
+            "review": self.review,
+        })
+    }
+}
+
+fn collect_active_phase_counts(
+    task_views: &[crate::task_runner::TaskSummaryView],
+) -> (ActivePhaseCounts, HashMap<String, ActivePhaseCounts>) {
+    let mut global_active_phases = ActivePhaseCounts::default();
+    let mut project_active_phases: HashMap<String, ActivePhaseCounts> = HashMap::new();
+    for task in task_views {
+        if !task.agent_active {
+            continue;
+        }
+        if let Some(ref phase) = task.active_phase {
+            global_active_phases.record(phase);
+            if let Some(ref project) = task.task.project {
+                project_active_phases
+                    .entry(project.clone())
+                    .or_default()
+                    .record(phase);
+            }
+        }
+    }
+    (global_active_phases, project_active_phases)
+}
 
 /// GET /api/dashboard — JSON summary of all registered projects and global concurrency.
 ///
@@ -27,6 +79,17 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     let uptime_secs = start.elapsed().as_secs();
 
     let tq = &state.concurrency.task_queue;
+    let task_views = match state.core.tasks.list_all_summaries_with_terminal().await {
+        Ok(summaries) => summaries
+            .into_iter()
+            .map(|summary| state.core.tasks.decorate_summary(summary))
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!("dashboard: failed to list task summaries: {e}");
+            Vec::new()
+        }
+    };
+    let (global_active_phases, project_active_phases) = collect_active_phase_counts(&task_views);
 
     // Global and per-project done/failed counts from in-memory cache in one pass,
     // avoiding both full TaskState cloning and double iteration.
@@ -162,6 +225,11 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                     "tasks": {
                         "running": qs.running,
                         "queued": qs.queued,
+                        "active_phases": project_active_phases
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_default()
+                            .json(),
                         "done": done,
                         "failed": failed,
                     },
@@ -211,6 +279,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         "global": {
             "running": tq.running_count(),
             "queued": tq.queued_count(),
+            "active_phases": global_active_phases.json(),
             "max_concurrent": tq.global_limit(),
             "uptime_secs": uptime_secs,
             "done": global_done,
@@ -232,6 +301,7 @@ mod tests {
     use axum::{body::to_bytes, routing::get, Router};
     use harness_agents::registry::AgentRegistry;
     use harness_core::config::HarnessConfig;
+    use harness_core::types::TaskId as CoreTaskId;
     use std::sync::Arc;
 
     async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
@@ -368,5 +438,95 @@ mod tests {
             "idle host must have 0.0 assignment_pressure"
         );
         Ok(())
+    }
+
+    #[test]
+    fn collect_active_phase_counts_includes_pending_triage_and_plan() {
+        let project = "/tmp/demo".to_string();
+        let views = vec![
+            crate::task_runner::TaskSummary {
+                id: CoreTaskId("triage".to_string()),
+                status: crate::task_runner::TaskStatus::Pending,
+                turn: 0,
+                pr_url: None,
+                error: None,
+                source: None,
+                parent_id: None,
+                external_id: None,
+                repo: None,
+                description: None,
+                created_at: None,
+                phase: crate::task_runner::TaskPhase::Triage,
+                depends_on: Vec::new(),
+                subtask_ids: Vec::new(),
+                project: Some(project.clone()),
+            }
+            .view(Some("2026-04-22T00:00:00Z".to_string())),
+            crate::task_runner::TaskSummary {
+                id: CoreTaskId("plan".to_string()),
+                status: crate::task_runner::TaskStatus::Pending,
+                turn: 0,
+                pr_url: None,
+                error: None,
+                source: None,
+                parent_id: None,
+                external_id: None,
+                repo: None,
+                description: None,
+                created_at: None,
+                phase: crate::task_runner::TaskPhase::Plan,
+                depends_on: Vec::new(),
+                subtask_ids: Vec::new(),
+                project: Some(project.clone()),
+            }
+            .view(Some("2026-04-22T00:01:00Z".to_string())),
+            crate::task_runner::TaskSummary {
+                id: CoreTaskId("implement".to_string()),
+                status: crate::task_runner::TaskStatus::Implementing,
+                turn: 1,
+                pr_url: None,
+                error: None,
+                source: None,
+                parent_id: None,
+                external_id: None,
+                repo: None,
+                description: None,
+                created_at: None,
+                phase: crate::task_runner::TaskPhase::Implement,
+                depends_on: Vec::new(),
+                subtask_ids: Vec::new(),
+                project: Some(project.clone()),
+            }
+            .view(Some("2026-04-22T00:02:00Z".to_string())),
+            crate::task_runner::TaskSummary {
+                id: CoreTaskId("idle".to_string()),
+                status: crate::task_runner::TaskStatus::Pending,
+                turn: 0,
+                pr_url: None,
+                error: None,
+                source: None,
+                parent_id: None,
+                external_id: None,
+                repo: None,
+                description: None,
+                created_at: None,
+                phase: crate::task_runner::TaskPhase::Implement,
+                depends_on: Vec::new(),
+                subtask_ids: Vec::new(),
+                project: Some(project.clone()),
+            }
+            .view(Some("2026-04-22T00:03:00Z".to_string())),
+        ];
+
+        let (global, by_project) = collect_active_phase_counts(&views);
+        assert_eq!(global.triage, 1);
+        assert_eq!(global.plan, 1);
+        assert_eq!(global.implement, 1);
+        assert_eq!(global.review, 0);
+
+        let project_counts = by_project.get(&project).expect("project counts present");
+        assert_eq!(project_counts.triage, 1);
+        assert_eq!(project_counts.plan, 1);
+        assert_eq!(project_counts.implement, 1);
     }
 }

@@ -140,6 +140,28 @@ pub struct RecentFailureTask {
     pub failed_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskView {
+    #[serde(flatten)]
+    pub task: TaskState,
+    pub agent_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_phase: Option<TaskPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_started_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskSummaryView {
+    #[serde(flatten)]
+    pub task: TaskSummary,
+    pub agent_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_phase: Option<TaskPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_started_at: Option<String>,
+}
+
 impl TaskState {
     pub(crate) fn new(id: TaskId) -> Self {
         Self {
@@ -193,5 +215,76 @@ impl TaskState {
                 .map(|p| p.to_string_lossy().into_owned()),
             workflow: None,
         }
+    }
+}
+
+pub fn active_agent_phase(status: &TaskStatus, phase: &TaskPhase) -> Option<TaskPhase> {
+    match status {
+        TaskStatus::Pending => match phase {
+            TaskPhase::Triage | TaskPhase::Plan => Some(phase.clone()),
+            _ => None,
+        },
+        TaskStatus::Implementing => Some(TaskPhase::Implement),
+        TaskStatus::AgentReview | TaskStatus::Reviewing => Some(TaskPhase::Review),
+        _ => None,
+    }
+}
+
+pub fn task_agent_active(status: &TaskStatus, phase: &TaskPhase) -> bool {
+    active_agent_phase(status, phase).is_some()
+}
+
+impl TaskState {
+    pub fn view(self, phase_started_at: Option<String>) -> TaskView {
+        let agent_active = task_agent_active(&self.status, &self.phase);
+        let active_phase = active_agent_phase(&self.status, &self.phase);
+        TaskView {
+            task: self,
+            agent_active,
+            active_phase,
+            phase_started_at,
+        }
+    }
+}
+
+impl TaskSummary {
+    pub fn view(self, phase_started_at: Option<String>) -> TaskSummaryView {
+        let agent_active = task_agent_active(&self.status, &self.phase);
+        let active_phase = active_agent_phase(&self.status, &self.phase);
+        TaskSummaryView {
+            task: self,
+            agent_active,
+            active_phase,
+            phase_started_at,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_core::types::TaskId as CoreTaskId;
+
+    #[test]
+    fn pending_triage_is_reported_as_active_agent_work() {
+        let mut task = TaskState::new(CoreTaskId("t-triage".to_string()));
+        task.phase = TaskPhase::Triage;
+
+        let view = task.view(Some("2026-04-22T00:00:00Z".to_string()));
+        assert!(view.agent_active);
+        assert_eq!(view.active_phase, Some(TaskPhase::Triage));
+        assert_eq!(
+            view.phase_started_at.as_deref(),
+            Some("2026-04-22T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn pending_implement_is_reported_as_idle() {
+        let task = TaskState::new(CoreTaskId("t-pending".to_string()));
+
+        let view = task.view(Some("2026-04-22T00:00:00Z".to_string()));
+        assert!(!view.agent_active);
+        assert_eq!(view.active_phase, None);
     }
 }

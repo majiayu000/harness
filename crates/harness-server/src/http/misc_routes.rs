@@ -510,7 +510,11 @@ pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
                     };
                 }
             }
-            Json(summaries).into_response()
+            let views: Vec<_> = summaries
+                .into_iter()
+                .map(|summary| state.core.tasks.decorate_summary(summary))
+                .collect();
+            Json(views).into_response()
         }
         Err(e) => {
             tracing::error!("list_tasks: database error: {e}");
@@ -533,7 +537,7 @@ pub(crate) async fn get_task(
         .get_with_db_fallback(&harness_core::types::TaskId(id))
         .await
     {
-        Ok(Some(task)) => Json(task).into_response(),
+        Ok(Some(task)) => Json(state.core.tasks.decorate_task(task)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "task not found"})),

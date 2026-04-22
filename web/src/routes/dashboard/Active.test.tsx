@@ -15,12 +15,20 @@ import { useTasks, useDashboard } from "@/lib/queries";
 const mockUseTasks = useTasks as ReturnType<typeof vi.fn>;
 const mockUseDashboard = useDashboard as ReturnType<typeof vi.fn>;
 
-function makeTask(id: string, project: string | null, status = "running", task_kind = "issue"): Task {
+function makeTask(
+  id: string,
+  project: string | null,
+  status = "running",
+  overrides: Partial<Task> = {},
+): Task {
   return {
     id,
-    task_kind,
+    task_kind: "issue",
     status,
     turn: 1,
+    agent_active: status === "running" || status === "implementing",
+    active_phase: status === "running" || status === "implementing" ? "implement" : null,
+    phase_started_at: null,
     pr_url: null,
     error: null,
     source: null,
@@ -34,6 +42,7 @@ function makeTask(id: string, project: string | null, status = "running", task_k
     subtask_ids: [],
     project,
     workflow: null,
+    ...overrides,
   };
 }
 
@@ -87,7 +96,7 @@ describe("<Active>", () => {
     wrap(<Active projectFilter="nonexistent" />);
     expect(screen.queryByText("t1")).not.toBeInTheDocument();
     expect(screen.queryByText("t2")).not.toBeInTheDocument();
-    const dashes = screen.getAllByText("—");
+    const dashes = screen.getAllByText("\u2014");
     expect(dashes.length).toBeGreaterThan(0);
   });
 
@@ -111,21 +120,24 @@ describe("<Active>", () => {
     expect(columnCount("Pending")).toBe("0");
   });
 
-  it("groups planner and review lifecycle statuses outside implementing", () => {
+  it("surfaces pending triage and plan work before implementing", () => {
     mockUseTasks.mockReturnValue({
       data: [
-        makeTask("planner-task", "harness", "planner_waiting", "planner"),
-        makeTask("review-task", "harness", "review_generating", "review"),
-        makeTask("impl-task", "harness", "implementing", "issue"),
+        makeTask("pending-idle", "harness", "pending", { agent_active: false, active_phase: null }),
+        makeTask("triage-live", "harness", "pending", { agent_active: true, active_phase: "triage" }),
+        makeTask("plan-live", "harness", "pending", { agent_active: true, active_phase: "plan" }),
       ],
       isLoading: false,
       isError: false,
     });
-    wrap(<Active />);
-    expect(screen.getByText("Planning")).toBeInTheDocument();
-    expect(screen.getByText("Review")).toBeInTheDocument();
-    expect(screen.getByText("planner-task")).toBeInTheDocument();
-    expect(screen.getByText("review-task")).toBeInTheDocument();
-    expect(screen.getByText("impl-task")).toBeInTheDocument();
+    wrap(<Active projectFilter="harness" />);
+
+    const triageColumn = screen.getByText("Triage").parentElement?.parentElement;
+    const planColumn = screen.getByText("Plan").parentElement?.parentElement;
+    const pendingColumn = screen.getByText("Pending").parentElement?.parentElement;
+
+    expect(within(triageColumn!).getByText("triage-live")).toBeInTheDocument();
+    expect(within(planColumn!).getByText("plan-live")).toBeInTheDocument();
+    expect(within(pendingColumn!).getByText("pending-idle")).toBeInTheDocument();
   });
 });

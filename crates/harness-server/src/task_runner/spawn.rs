@@ -600,12 +600,12 @@ where
         if req.issue.is_none() && req.pr.is_none() && !task_kind.is_non_decomposable_prompt() {
             if let Some(ref prompt) = req.prompt {
                 if prompt_requires_plan(prompt) {
-                    mutate_and_persist(&store, &id, |s| {
-                        if s.phase == TaskPhase::Implement {
-                            s.phase = TaskPhase::Plan;
-                        }
-                    })
-                    .await?;
+                    if store
+                        .get(&id)
+                        .is_some_and(|s| s.phase == TaskPhase::Implement)
+                    {
+                        store.transition_phase(&id, TaskPhase::Plan).await?;
+                    }
                     tracing::info!(
                         task_id = %id.0,
                         "planning gate: complex prompt — forcing Plan phase before Implement"

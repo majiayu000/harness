@@ -8,8 +8,8 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use super::metrics::{DashboardCounts, LlmMetricsInputs, ProjectCounts};
-use super::state::{TaskState, TaskSummary};
-use super::types::{TaskId, TaskStatus};
+use super::state::{TaskState, TaskSummary, TaskSummaryView, TaskView};
+use super::types::{TaskId, TaskPhase, TaskStatus};
 use super::CompletionCallback;
 
 /// Broadcast channel capacity for per-task stream events.
@@ -34,6 +34,7 @@ struct RecoveredPrStatusUpdate {
 
 pub struct TaskStore {
     pub(crate) cache: DashMap<TaskId, TaskState>,
+    phase_started_at: DashMap<TaskId, String>,
     pub(super) db: TaskDb,
     persist_locks: DashMap<TaskId, Arc<Mutex<()>>>,
     /// Per-task broadcast channels for real-time stream forwarding to SSE clients.
@@ -100,6 +101,7 @@ impl TaskStore {
         };
 
         let cache = DashMap::new();
+        let phase_started_at = DashMap::new();
         let persist_locks = DashMap::new();
         // Only load active (non-terminal) tasks into the in-memory cache to prevent
         // unbounded memory growth from historical completed tasks.
@@ -117,10 +119,16 @@ impl TaskStore {
         ];
         for task in db.list_by_status(active_statuses).await? {
             persist_locks.insert(task.id.clone(), Arc::new(Mutex::new(())));
+            let phase_ts = task
+                .created_at
+                .clone()
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+            phase_started_at.insert(task.id.clone(), phase_ts);
             cache.insert(task.id.clone(), task);
         }
         let store = Arc::new(Self {
             cache,
+            phase_started_at,
             db,
             persist_locks,
             stream_txs: DashMap::new(),
@@ -133,6 +141,39 @@ impl TaskStore {
 
     pub fn get(&self, id: &TaskId) -> Option<TaskState> {
         self.cache.get(id).map(|r| r.value().clone())
+    }
+
+    pub fn phase_started_at(&self, id: &TaskId) -> Option<String> {
+        self.phase_started_at.get(id).map(|ts| ts.value().clone())
+    }
+
+    pub fn decorate_summary(&self, summary: TaskSummary) -> TaskSummaryView {
+        let phase_started_at = self
+            .phase_started_at(&summary.id)
+            .or_else(|| summary.created_at.clone());
+        summary.view(phase_started_at)
+    }
+
+    pub fn decorate_task(&self, task: TaskState) -> TaskView {
+        let phase_started_at = self
+            .phase_started_at(&task.id)
+            .or_else(|| task.created_at.clone());
+        task.view(phase_started_at)
+    }
+
+    pub async fn transition_phase(&self, id: &TaskId, phase: TaskPhase) -> anyhow::Result<()> {
+        let mut changed = false;
+        if let Some(mut entry) = self.cache.get_mut(id) {
+            if entry.phase != phase {
+                entry.phase = phase;
+                changed = true;
+            }
+        }
+        if changed {
+            self.phase_started_at
+                .insert(id.clone(), chrono::Utc::now().to_rfc3339());
+        }
+        self.persist(id).await
     }
 
     /// Look up a task by ID, checking the in-memory cache first.
@@ -809,6 +850,13 @@ impl TaskStore {
         self.persist_locks
             .entry(state.id.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())));
+        self.phase_started_at.insert(
+            state.id.clone(),
+            state
+                .created_at
+                .clone()
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+        );
         self.cache.insert(state.id.clone(), state.clone());
         if let Err(e) = self.db.insert(state).await {
             tracing::error!("task_db insert failed: {e}");
@@ -1116,11 +1164,25 @@ pub async fn update_status(
     turn: u32,
 ) -> anyhow::Result<()> {
     let status_str = status.as_ref().to_string();
+    let mapped_phase = match status {
+        TaskStatus::Implementing => Some(TaskPhase::Implement),
+        TaskStatus::AgentReview | TaskStatus::Reviewing => Some(TaskPhase::Review),
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled => Some(TaskPhase::Terminal),
+        _ => None,
+    };
     mutate_and_persist(store, task_id, |s| {
         s.status = status;
         s.turn = turn;
+        if let Some(ref phase) = mapped_phase {
+            s.phase = phase.clone();
+        }
     })
     .await?;
+    if mapped_phase.is_some() {
+        store
+            .phase_started_at
+            .insert(task_id.clone(), chrono::Utc::now().to_rfc3339());
+    }
     store.log_event(crate::event_replay::TaskEvent::StatusChanged {
         task_id: task_id.0.clone(),
         ts: crate::event_replay::now_ts(),

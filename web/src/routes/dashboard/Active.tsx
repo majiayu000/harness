@@ -1,11 +1,10 @@
 import { useTasks, useDashboard } from "@/lib/queries";
-import type { Task, WorkflowSummary } from "@/types";
+import type { Task } from "@/types";
 
 interface Column {
   key: string;
   label: string;
-  workflowStates: string[];
-  fallbackTaskStatuses: string[];
+  matches: (task: Task) => boolean;
 }
 
 /**
@@ -18,59 +17,67 @@ const COLUMNS: Column[] = [
   {
     key: "pending",
     label: "Pending",
-    workflowStates: ["discovered", "scheduled"],
-    fallbackTaskStatuses: ["pending", "queued", "awaiting_deps"],
+    matches: (task) => ["pending", "queued"].includes(task.status) && !task.agent_active,
+  },
+  {
+    key: "triage",
+    label: "Triage",
+    matches: (task) => task.agent_active && task.active_phase === "triage",
+  },
+  {
+    key: "plan",
+    label: "Plan",
+    matches: (task) => task.agent_active && task.active_phase === "plan",
   },
   {
     key: "implementing",
     label: "Implementing",
-    workflowStates: ["implementing"],
-    fallbackTaskStatuses: ["implementing", "running", "triage", "plan"],
-  },
-  {
-    key: "planning",
-    label: "Planning",
-    workflowStates: [],
-    fallbackTaskStatuses: ["planner_generating", "planner_waiting"],
+    matches: (task) =>
+      task.status === "implementing" || (task.agent_active && task.active_phase === "implement"),
   },
   {
     key: "review",
     label: "Review",
-    workflowStates: [],
-    fallbackTaskStatuses: ["review_generating", "review_waiting"],
+    matches: (task) =>
+      ["agent_review", "reviewing_agent", "reviewing"].includes(task.status) ||
+      (task.agent_active && task.active_phase === "review"),
   },
   {
     key: "feedback",
     label: "Feedback",
-    workflowStates: ["pr_open", "awaiting_feedback", "addressing_feedback"],
-    fallbackTaskStatuses: ["agent_review", "reviewing_agent", "waiting", "reviewing"],
+    matches: (task) =>
+      ["pr_open", "awaiting_feedback", "addressing_feedback"].includes(
+        task.workflow?.state ?? "",
+      ) || ["agent_review", "reviewing"].includes(task.status),
   },
   {
     key: "ready",
     label: "Ready",
-    workflowStates: ["ready_to_merge"],
-    fallbackTaskStatuses: [],
+    matches: (task) => task.workflow?.state === "ready_to_merge",
   },
   {
     key: "blocked",
     label: "Blocked",
-    workflowStates: ["blocked", "degraded", "paused"],
-    fallbackTaskStatuses: [],
+    matches: (task) =>
+      ["blocked", "degraded", "paused"].includes(task.workflow?.state ?? ""),
   },
+  { key: "waiting", label: "Waiting", matches: (task) => task.status === "waiting" },
 ];
 
 const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
 
-function columnOf(taskStatus: string, workflowState?: string | null): string {
-  if (workflowState) {
-    for (const c of COLUMNS) {
-      if (c.workflowStates.includes(workflowState)) return c.key;
-    }
-  }
+function taskColumn(task: Task): string {
   for (const c of COLUMNS) {
-    if (c.fallbackTaskStatuses.includes(taskStatus)) return c.key;
+    if (c.matches(task)) return c.key;
   }
   return "other";
+}
+
+function formatPhaseTime(ts: string | null): string | null {
+  if (!ts) return null;
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function workflowLabel(state: string): string {
@@ -118,8 +125,11 @@ function workflowLabel(state: string): string {
   }
 }
 
-function TaskCard({ task, workflow }: { task: Task; workflow?: WorkflowSummary | null }) {
+function TaskCard({ task }: { task: Task }) {
   const title = task.description?.trim() || task.repo || task.id.slice(0, 8);
+  const phaseLabel = task.active_phase ?? task.phase;
+  const phaseTime = formatPhaseTime(task.phase_started_at);
+  const workflow = task.workflow ?? null;
   return (
     <div className="border border-line bg-bg px-2.5 py-2 mb-2 last:mb-0 hover:border-line-3 transition-colors">
       <div className="text-[12.5px] text-ink leading-snug line-clamp-2" title={title}>
@@ -138,6 +148,12 @@ function TaskCard({ task, workflow }: { task: Task; workflow?: WorkflowSummary |
               force-execute
             </span>
           ) : null}
+        </div>
+      )}
+      {(phaseLabel || phaseTime) && (
+        <div className="mt-1 font-mono text-[10px] text-ink-3 uppercase tracking-[0.08em]">
+          {phaseLabel ?? "phase"}
+          {phaseTime ? ` · ${phaseTime}` : ""}
         </div>
       )}
       <div className="mt-1.5 flex items-center justify-between gap-2 font-mono text-[10px] text-ink-3">
@@ -186,8 +202,7 @@ export function Active({ projectFilter }: Props) {
   for (const c of COLUMNS) grouped[c.key] = [];
   const other: Task[] = [];
   for (const t of active) {
-    const workflow = t.workflow ?? null;
-    const col = columnOf(t.status, workflow?.state ?? null);
+    const col = taskColumn(t);
     if (col === "other") other.push(t);
     else grouped[col].push(t);
   }
@@ -213,7 +228,7 @@ export function Active({ projectFilter }: Props) {
                 </div>
               )}
               {rows.map((t) => (
-                <TaskCard key={t.id} task={t} workflow={t.workflow ?? null} />
+                <TaskCard key={t.id} task={t} />
               ))}
             </div>
           </div>
@@ -227,7 +242,7 @@ export function Active({ projectFilter }: Props) {
           </div>
             <div className="p-2 flex-1 overflow-auto">
               {other.map((t) => (
-                <TaskCard key={t.id} task={t} workflow={t.workflow ?? null} />
+                <TaskCard key={t.id} task={t} />
               ))}
             </div>
           </div>

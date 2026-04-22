@@ -25,11 +25,7 @@ pub(crate) async fn run_plan_for_prompt(
 ) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
     let prompt_text = req.prompt.as_deref().unwrap_or_default();
     tracing::info!(task_id = %task_id, "pipeline: starting plan phase for prompt-only task");
-
-    mutate_and_persist(store, task_id, |state| {
-        state.phase = TaskPhase::Plan;
-    })
-    .await?;
+    store.transition_phase(task_id, TaskPhase::Plan).await?;
 
     let plan_prompt = prompts::plan_for_prompt_task(prompt_text);
 
@@ -56,9 +52,11 @@ pub(crate) async fn run_plan_for_prompt(
     let plan_text = plan_resp.output.clone();
     mutate_and_persist(store, task_id, |state| {
         state.plan_output = Some(plan_text.clone());
-        state.phase = TaskPhase::Implement;
     })
     .await?;
+    store
+        .transition_phase(task_id, TaskPhase::Implement)
+        .await?;
     // NOTE: intentionally no write_checkpoint() here.  Prompt-only tasks cannot
     // be recovered after a crash (http.rs startup recovery hard-fails them because
     // the original prompt is not persisted — by design, to avoid writing
@@ -87,10 +85,7 @@ pub(crate) async fn run_triage_plan_pipeline(
 ) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
     // --- Phase 1: Triage ---
     tracing::info!(task_id = %task_id, issue, "pipeline: starting triage phase");
-    mutate_and_persist(store, task_id, |state| {
-        state.phase = TaskPhase::Triage;
-    })
-    .await?;
+    store.transition_phase(task_id, TaskPhase::Triage).await?;
 
     let triage_prompt = prompts::triage_prompt(issue).to_prompt_string();
     let triage_req = AgentRequest {
@@ -132,10 +127,10 @@ pub(crate) async fn run_triage_plan_pipeline(
         prompts::TriageDecision::Skip => {
             mutate_and_persist(store, task_id, |state| {
                 state.status = crate::task_runner::TaskStatus::Done;
-                state.phase = TaskPhase::Terminal;
                 state.error = Some("Triage: skipped — not worth implementing".to_string());
             })
             .await?;
+            store.transition_phase(task_id, TaskPhase::Terminal).await?;
             anyhow::bail!("triage decided to skip issue #{issue}");
         }
         prompts::TriageDecision::NeedsClarification => {
@@ -154,10 +149,7 @@ pub(crate) async fn run_triage_plan_pipeline(
 
     // --- Phase 2: Plan ---
     tracing::info!(task_id = %task_id, issue, "pipeline: starting plan phase");
-    mutate_and_persist(store, task_id, |state| {
-        state.phase = TaskPhase::Plan;
-    })
-    .await?;
+    store.transition_phase(task_id, TaskPhase::Plan).await?;
 
     let plan_prompt = prompts::plan_prompt(issue, &triage_resp.output).to_prompt_string();
     let plan_req = AgentRequest {
@@ -179,9 +171,11 @@ pub(crate) async fn run_triage_plan_pipeline(
     let plan_text = plan_resp.output.clone();
     mutate_and_persist(store, task_id, |state| {
         state.plan_output = Some(plan_text.clone());
-        state.phase = TaskPhase::Implement;
     })
     .await?;
+    store
+        .transition_phase(task_id, TaskPhase::Implement)
+        .await?;
     if let Err(e) = store
         .write_checkpoint(task_id, None, Some(&plan_text), None, "plan_done")
         .await
