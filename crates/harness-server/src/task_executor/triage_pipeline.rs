@@ -114,7 +114,7 @@ pub(crate) async fn run_plan_for_prompt(
                 0,
                 "plan",
                 "completed",
-                Some(success.response.output.clone()),
+                None,
                 Some(success.telemetry.clone()),
                 None,
                 Decision::Complete,
@@ -176,17 +176,13 @@ pub(crate) async fn run_plan_for_prompt(
 
     let plan_text = plan_resp.output.clone();
     mutate_and_persist(store, task_id, |state| {
-        state.plan_output = Some(plan_text.clone());
         state.phase = TaskPhase::Implement;
     })
     .await?;
-    // NOTE: intentionally no write_checkpoint() here.  Prompt-only tasks cannot
-    // be recovered after a crash (http.rs startup recovery hard-fails them because
-    // the original prompt is not persisted — by design, to avoid writing
-    // credentials/customer data to disk).  Writing the plan blob to the checkpoint
-    // table would therefore provide no resumability benefit while writing
-    // prompt-derived content (which often echoes or summarises the raw prompt) to
-    // the on-disk SQLite store, violating the same privacy invariant.
+    // NOTE: prompt-only task plans stay in-memory only. The returned `plan_text`
+    // feeds the immediate implement phase, but we intentionally do not persist
+    // it in task state, round detail, or checkpoints because it can echo raw
+    // user prompt content, including secrets.
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete (prompt-only)");
     Ok((Some(plan_text), prompts::TriageComplexity::Medium, 1))
