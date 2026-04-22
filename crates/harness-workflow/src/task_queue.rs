@@ -240,6 +240,12 @@ impl PriorityPermitQueue {
     fn waiter_count(&self) -> usize {
         self.waiters.len()
     }
+
+    /// Reconfigure queue capacity while preserving already-issued permits.
+    fn reconfigure_capacity(&mut self, old_capacity: usize, new_capacity: usize) {
+        let issued = old_capacity.saturating_sub(self.available);
+        self.available = new_capacity.saturating_sub(issued);
+    }
 }
 
 /// Tracks which phase of `acquire` is active for cleanup purposes.
@@ -655,6 +661,19 @@ impl TaskQueue {
     /// Effective project limit after applying per-project overrides.
     pub fn effective_project_limit(&self, project_id: &str) -> usize {
         self.project_limit(project_id)
+    }
+
+    /// Upsert the effective limit for a project and reconfigure any existing
+    /// project queue so future acquisitions honor the new cap.
+    pub fn set_project_limit(&self, project_id: &str, limit: usize) {
+        let old_limit = self.project_limit(project_id);
+        self.project_limits.insert(project_id.to_string(), limit);
+        if let Some(project_queue) = self.project_queues.get(project_id) {
+            project_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reconfigure_capacity(old_limit, limit);
+        }
     }
 
     /// Snapshot queue pressure for diagnostics and admission-failure logging.

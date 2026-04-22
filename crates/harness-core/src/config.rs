@@ -657,6 +657,9 @@ mod tests {
         assert!(config.repo.is_empty());
         assert_eq!(config.label, "harness");
         assert_eq!(config.poll_interval_secs, 30);
+        assert_eq!(config.sprint_timeout_secs, 3 * 60 * 60);
+        assert_eq!(config.retry_backoff_base_secs, 15);
+        assert_eq!(config.retry_backoff_max_secs, 120);
     }
 
     #[test]
@@ -666,12 +669,18 @@ mod tests {
             repo = "owner/repo"
             label = "autofix"
             poll_interval_secs = 60
+            sprint_timeout_secs = 7200
+            retry_backoff_base_secs = 10
+            retry_backoff_max_secs = 90
         "#;
         let config: GitHubIntakeConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
         assert_eq!(config.repo, "owner/repo");
         assert_eq!(config.label, "autofix");
         assert_eq!(config.poll_interval_secs, 60);
+        assert_eq!(config.sprint_timeout_secs, 7200);
+        assert_eq!(config.retry_backoff_base_secs, 10);
+        assert_eq!(config.retry_backoff_max_secs, 90);
     }
 
     #[test]

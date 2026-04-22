@@ -25,7 +25,7 @@ pub(crate) async fn build_intake(
     server: &Arc<HarnessServer>,
     storage: &StorageBundle,
     engines: &EnginesBundle,
-    _registry: &RegistryBundle,
+    registry: &RegistryBundle,
     project_root: &Path,
     data_dir: &Path,
 ) -> anyhow::Result<IntakeBundle> {
@@ -41,7 +41,7 @@ pub(crate) async fn build_intake(
                 crate::memory_monitor::start(threshold_mb, poll_secs)
             });
     let issue_queue_config = runtime_issue_concurrency_config(server);
-    let review_queue_config = runtime_review_concurrency_config(server);
+    let review_queue_config = runtime_review_concurrency_config(server, registry).await;
     let task_queue = Arc::new(crate::task_queue::TaskQueue::new_with_pressure(
         &issue_queue_config,
         memory_pressure.clone(),
@@ -255,8 +255,9 @@ fn runtime_issue_concurrency_config(
     config
 }
 
-fn runtime_review_concurrency_config(
+async fn runtime_review_concurrency_config(
     server: &HarnessServer,
+    registry: &RegistryBundle,
 ) -> harness_core::config::misc::ConcurrencyConfig {
     let mut config = server.config.concurrency.clone();
     config.max_concurrent_tasks = server.config.review.max_concurrent_tasks.max(1);
@@ -270,6 +271,19 @@ fn runtime_review_concurrency_config(
             queue_project_key(&server.config.server.project_root),
             1usize,
         );
+    }
+    match registry.project_registry.list().await {
+        Ok(projects) => {
+            for project in projects.into_iter().filter(|project| project.active) {
+                config
+                    .per_project
+                    .entry(queue_project_key(&project.root))
+                    .or_insert(1usize);
+            }
+        }
+        Err(e) => tracing::warn!(
+            "intake: failed to pre-seed review queue limits from project registry: {e}"
+        ),
     }
     config
 }
@@ -377,8 +391,8 @@ mod tests {
         assert_eq!(cfg.per_project.get("/tmp/b"), Some(&8));
     }
 
-    #[test]
-    fn runtime_review_concurrency_uses_dedicated_domain() {
+    #[tokio::test]
+    async fn runtime_review_concurrency_uses_dedicated_domain() {
         let mut server = HarnessServer::new(
             HarnessConfig::default(),
             ThreadManager::new(),
@@ -393,15 +407,17 @@ mod tests {
             max_concurrent: Some(8),
         }];
 
-        let cfg = runtime_review_concurrency_config(&server);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, _, _, registry) = make_minimal_bundles(dir.path()).await;
+        let cfg = runtime_review_concurrency_config(&server, &registry).await;
 
         assert_eq!(cfg.max_concurrent_tasks, 3);
-        assert_eq!(cfg.per_project.len(), 1);
+        assert_eq!(cfg.per_project.get("/tmp/a"), Some(&1));
         assert!(cfg.per_project.values().all(|v| *v == 1));
     }
 
-    #[test]
-    fn runtime_review_concurrency_falls_back_to_server_project_root() {
+    #[tokio::test]
+    async fn runtime_review_concurrency_falls_back_to_server_project_root() {
         let mut server = HarnessServer::new(
             HarnessConfig::default(),
             ThreadManager::new(),
@@ -410,9 +426,45 @@ mod tests {
         server.config.review.max_concurrent_tasks = 2;
         server.config.server.project_root = std::path::PathBuf::from("/tmp/fallback");
 
-        let cfg = runtime_review_concurrency_config(&server);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, _, _, registry) = make_minimal_bundles(dir.path()).await;
+        let cfg = runtime_review_concurrency_config(&server, &registry).await;
 
         assert_eq!(cfg.max_concurrent_tasks, 2);
         assert_eq!(cfg.per_project.get("/tmp/fallback"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn runtime_review_concurrency_includes_registry_projects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (server, _storage, _engines, registry) = make_minimal_bundles(temp.path()).await;
+        let runtime_project_root = temp.path().join("runtime-project");
+        std::fs::create_dir_all(&runtime_project_root).expect("create runtime project");
+        registry
+            .project_registry
+            .register(crate::project_registry::Project {
+                id: "runtime-project".to_string(),
+                root: runtime_project_root.clone(),
+                name: Some("runtime-project".to_string()),
+                default_agent: None,
+                max_concurrent: None,
+                active: true,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .expect("register runtime project");
+
+        let cfg = runtime_review_concurrency_config(&server, &registry).await;
+
+        assert_eq!(
+            cfg.per_project.get(
+                &runtime_project_root
+                    .canonicalize()
+                    .expect("canonical runtime root")
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            Some(&1)
+        );
     }
 }

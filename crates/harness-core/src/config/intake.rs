@@ -35,6 +35,18 @@ pub struct GitHubIntakeConfig {
     /// Agent name for the sprint planner. None = use server default.
     #[serde(default)]
     pub planner_agent: Option<String>,
+    /// Maximum seconds to wait for sprint planning / coordination before the
+    /// sprint is abandoned for this poll cycle. Default: 10800 (3 hours).
+    #[serde(default = "default_sprint_timeout_secs")]
+    pub sprint_timeout_secs: u64,
+    /// Base seconds for exponential backoff after transient enqueue failures.
+    /// Default: 15.
+    #[serde(default = "default_retry_backoff_base_secs")]
+    pub retry_backoff_base_secs: u64,
+    /// Maximum seconds for capped exponential backoff after transient enqueue
+    /// failures. Default: 120.
+    #[serde(default = "default_retry_backoff_max_secs")]
+    pub retry_backoff_max_secs: u64,
 }
 
 /// Expand config into a flat list of (repo, label, project_root) tuples.
@@ -64,6 +76,18 @@ fn default_poll_interval_secs() -> u64 {
     30
 }
 
+fn default_sprint_timeout_secs() -> u64 {
+    3 * 60 * 60
+}
+
+fn default_retry_backoff_base_secs() -> u64 {
+    15
+}
+
+fn default_retry_backoff_max_secs() -> u64 {
+    120
+}
+
 impl Default for GitHubIntakeConfig {
     fn default() -> Self {
         Self {
@@ -73,6 +97,9 @@ impl Default for GitHubIntakeConfig {
             poll_interval_secs: default_poll_interval_secs(),
             repos: Vec::new(),
             planner_agent: None,
+            sprint_timeout_secs: default_sprint_timeout_secs(),
+            retry_backoff_base_secs: default_retry_backoff_base_secs(),
+            retry_backoff_max_secs: default_retry_backoff_max_secs(),
         }
     }
 }

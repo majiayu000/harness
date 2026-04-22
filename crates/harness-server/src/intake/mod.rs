@@ -71,10 +71,10 @@ pub struct IntakeOrchestrator {
     sources: Vec<Arc<dyn IntakeSource>>,
     poll_interval: Duration,
     planner_agent: Option<String>,
+    sprint_timeout: Duration,
+    retry_backoff_base: Duration,
+    retry_backoff_max: Duration,
 }
-
-/// Timeout for waiting on a single task or sprint coordination window (3 hours).
-const TASK_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// Polling interval when waiting for task completion.
 const TASK_POLL_INTERVAL: Duration = Duration::from_secs(15);
@@ -84,11 +84,17 @@ impl IntakeOrchestrator {
         sources: Vec<Arc<dyn IntakeSource>>,
         poll_interval: Duration,
         planner_agent: Option<String>,
+        sprint_timeout: Duration,
+        retry_backoff_base: Duration,
+        retry_backoff_max: Duration,
     ) -> Self {
         Self {
             sources,
             poll_interval,
             planner_agent,
+            sprint_timeout,
+            retry_backoff_base,
+            retry_backoff_max,
         }
     }
 
@@ -161,8 +167,20 @@ impl IntakeOrchestrator {
         for (repo, issues) in by_repo {
             let state = Arc::clone(state);
             let planner_agent = self.planner_agent.clone();
+            let sprint_timeout = self.sprint_timeout;
+            let retry_backoff_base = self.retry_backoff_base;
+            let retry_backoff_max = self.retry_backoff_max;
             handles.push(tokio::spawn(async move {
-                run_repo_sprint(&state, &repo, issues, planner_agent.as_deref()).await;
+                run_repo_sprint(
+                    &state,
+                    &repo,
+                    issues,
+                    planner_agent.as_deref(),
+                    sprint_timeout,
+                    retry_backoff_base,
+                    retry_backoff_max,
+                )
+                .await;
             }));
         }
 
@@ -281,6 +299,9 @@ async fn run_repo_sprint(
     repo: &str,
     issues: Vec<(Arc<dyn IntakeSource>, IncomingIssue)>,
     planner_agent: Option<&str>,
+    sprint_timeout: Duration,
+    retry_backoff_base: Duration,
+    retry_backoff_max: Duration,
 ) {
     tracing::info!(
         repo,
@@ -316,7 +337,9 @@ async fn run_repo_sprint(
         }
     };
 
-    let Some(planner_output) = poll_task_output(&state.core.tasks, &planner_task_id).await else {
+    let Some(planner_output) =
+        poll_task_output(&state.core.tasks, &planner_task_id, sprint_timeout).await
+    else {
         tracing::error!(repo, task_id = %planner_task_id, "intake: sprint planner failed");
         return;
     };
@@ -396,11 +419,8 @@ async fn run_repo_sprint(
             project_root.to_string_lossy().into_owned()
         }
     };
-    let max_slots = state
-        .concurrency
-        .task_queue
-        .effective_project_limit(&project_id);
     let start = tokio::time::Instant::now();
+    let mut transient_retry_count = 0u32;
 
     'sprint: loop {
         // All done?
@@ -410,7 +430,7 @@ async fn run_repo_sprint(
         if completed.len() + cancelled_sprint.len() >= all_task_issues.len() {
             break;
         }
-        if start.elapsed() > TASK_TIMEOUT {
+        if start.elapsed() > sprint_timeout {
             tracing::warn!(repo, "intake: DAG execution timed out");
             break;
         }
@@ -425,7 +445,8 @@ async fn run_repo_sprint(
         );
 
         // Fill available slots.
-        let available = max_slots.saturating_sub(running.len());
+        let available =
+            sprint_available_slots(&state.concurrency.task_queue.diagnostics(&project_id));
         for &issue_num in ready.iter().take(available) {
             let ext_id = issue_num.to_string();
             let Some((source, issue)) = issue_map.get(&ext_id) else {
@@ -466,6 +487,7 @@ async fn run_repo_sprint(
                         tracing::warn!(external_id = %ext_id, "intake: mark_dispatched update failed: {e}");
                     }
                     running.insert(issue_num, task_id);
+                    transient_retry_count = 0;
                 }
                 Err(crate::services::execution::EnqueueTaskError::MaintenanceWindow { .. }) => {
                     tracing::info!(
@@ -508,13 +530,20 @@ async fn run_repo_sprint(
                     &deps,
                 );
                 if !retryable_ready.is_empty() {
+                    let backoff = transient_retry_delay(
+                        retry_backoff_base,
+                        retry_backoff_max,
+                        transient_retry_count,
+                    );
+                    transient_retry_count = transient_retry_count.saturating_add(1);
                     tracing::warn!(
                         repo,
                         ready = ?retryable_ready,
                         pending = ?pending,
+                        backoff_secs = backoff.as_secs(),
                         "intake: no tasks running but ready work remains; likely capacity or transient enqueue failure, will retry"
                     );
-                    tokio::time::sleep(TASK_POLL_INTERVAL).await;
+                    tokio::time::sleep(backoff).await;
                     continue;
                 }
                 tracing::error!(
@@ -557,6 +586,9 @@ async fn run_repo_sprint(
         for issue_num in newly_done {
             running.remove(&issue_num);
             completed.insert(issue_num);
+        }
+        if had_completed {
+            transient_retry_count = 0;
         }
         if running.is_empty() {
             continue;
@@ -618,11 +650,12 @@ fn status_unblocks_dependents(status: &TaskStatus) -> bool {
 async fn poll_task_output(
     store: &crate::task_runner::TaskStore,
     task_id: &TaskId,
+    timeout: Duration,
 ) -> Option<String> {
     let start = tokio::time::Instant::now();
     loop {
         tokio::time::sleep(TASK_POLL_INTERVAL).await;
-        if start.elapsed() > TASK_TIMEOUT {
+        if start.elapsed() > timeout {
             tracing::warn!(task_id = %task_id, "intake: task polling timed out");
             return None;
         }
@@ -653,6 +686,20 @@ async fn poll_task_output(
     }
 }
 
+fn sprint_available_slots(diag: &crate::task_queue::QueueDiagnostics) -> usize {
+    let project_headroom = diag
+        .project_limit
+        .saturating_sub(diag.project_running + diag.project_awaiting_global);
+    let global_headroom = diag.global_limit.saturating_sub(diag.global_running);
+    project_headroom.min(global_headroom)
+}
+
+fn transient_retry_delay(base: Duration, max: Duration, attempt: u32) -> Duration {
+    let factor = 1u32.checked_shl(attempt.min(6)).unwrap_or(64);
+    let secs = base.as_secs().saturating_mul(u64::from(factor));
+    Duration::from_secs(secs.min(max.as_secs()))
+}
+
 /// Build an `IntakeOrchestrator` from config, registering all enabled sources.
 ///
 /// `github_sources` must be the same `Arc<dyn IntakeSource>` instances used by
@@ -668,11 +715,21 @@ pub fn build_orchestrator(
     let mut sources: Vec<Arc<dyn IntakeSource>> = Vec::new();
     let mut poll_interval = Duration::from_secs(30);
     let mut planner_agent = None;
+    let mut sprint_timeout = Duration::from_secs(3 * 60 * 60);
+    let mut retry_backoff_base = Duration::from_secs(15);
+    let mut retry_backoff_max = Duration::from_secs(120);
 
     if let Some(gh_config) = &config.github {
         if gh_config.enabled {
             poll_interval = Duration::from_secs(gh_config.poll_interval_secs);
             planner_agent = gh_config.planner_agent.clone();
+            sprint_timeout = Duration::from_secs(gh_config.sprint_timeout_secs);
+            retry_backoff_base = Duration::from_secs(gh_config.retry_backoff_base_secs);
+            retry_backoff_max = Duration::from_secs(
+                gh_config
+                    .retry_backoff_max_secs
+                    .max(gh_config.retry_backoff_base_secs),
+            );
             if github_sources.is_empty() {
                 // Fallback: build fresh pollers when no shared instances are supplied
                 // (e.g. during testing or when called without pre-built sources).
@@ -709,7 +766,14 @@ pub fn build_orchestrator(
         }
     }
 
-    IntakeOrchestrator::new(sources, poll_interval, planner_agent)
+    IntakeOrchestrator::new(
+        sources,
+        poll_interval,
+        planner_agent,
+        sprint_timeout,
+        retry_backoff_base,
+        retry_backoff_max,
+    )
 }
 
 pub(crate) fn build_prompt_from_issue(issue: &IncomingIssue) -> String {
@@ -882,6 +946,37 @@ mod tests {
         assert!(status_unblocks_dependents(&TaskStatus::Failed));
     }
 
+    #[test]
+    fn sprint_available_slots_clamps_to_global_headroom() {
+        let diag = crate::task_queue::QueueDiagnostics {
+            global_running: 3,
+            global_queued: 0,
+            global_limit: 4,
+            project_running: 1,
+            project_waiting_for_project: 0,
+            project_awaiting_global: 0,
+            project_limit: 8,
+        };
+        assert_eq!(sprint_available_slots(&diag), 1);
+    }
+
+    #[test]
+    fn transient_retry_delay_grows_exponentially_and_caps() {
+        let base = Duration::from_secs(15);
+        let max = Duration::from_secs(120);
+        assert_eq!(transient_retry_delay(base, max, 0), Duration::from_secs(15));
+        assert_eq!(transient_retry_delay(base, max, 1), Duration::from_secs(30));
+        assert_eq!(transient_retry_delay(base, max, 2), Duration::from_secs(60));
+        assert_eq!(
+            transient_retry_delay(base, max, 3),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            transient_retry_delay(base, max, 5),
+            Duration::from_secs(120)
+        );
+    }
+
     // --- existing tests ---
 
     #[test]
@@ -955,12 +1050,18 @@ mod tests {
             repo: "owner/repo".to_string(),
             label: "harness".to_string(),
             poll_interval_secs: 60,
+            sprint_timeout_secs: 7200,
+            retry_backoff_base_secs: 10,
+            retry_backoff_max_secs: 90,
             ..Default::default()
         });
         let orchestrator = build_orchestrator(&config, None, None, vec![]);
         assert_eq!(orchestrator.sources.len(), 1);
         assert_eq!(orchestrator.sources[0].name(), "github");
         assert_eq!(orchestrator.poll_interval, Duration::from_secs(60));
+        assert_eq!(orchestrator.sprint_timeout, Duration::from_secs(7200));
+        assert_eq!(orchestrator.retry_backoff_base, Duration::from_secs(10));
+        assert_eq!(orchestrator.retry_backoff_max, Duration::from_secs(90));
     }
 
     #[test]

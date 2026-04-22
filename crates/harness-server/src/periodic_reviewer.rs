@@ -576,6 +576,18 @@ async fn last_review_timestamp(state: &Arc<AppState>, hook_key: &str) -> Option<
     events.iter().map(|e| e.ts).max()
 }
 
+fn ensure_review_queue_limit(state: &Arc<AppState>, project_root: &std::path::Path) {
+    let canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    state
+        .concurrency
+        .review_task_queue
+        .set_project_limit(&canonical, 1);
+}
+
 async fn run_review_tick(
     state: &Arc<AppState>,
     config: &ReviewConfig,
@@ -694,6 +706,8 @@ async fn run_review_tick(
             "scheduler: review.strategy=cross but no secondary reviewer available; degrading to single"
         );
     }
+
+    ensure_review_queue_limit(state, project_root);
 
     let review_req = CreateTaskRequest {
         prompt: Some(base_prompt.clone()),

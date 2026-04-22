@@ -83,6 +83,14 @@ enabled = false
 # timeout_secs = 10800
 # max_concurrent_tasks = 2
 
+# [intake.github]
+# enabled = true
+# poll_interval_secs = 300
+# planner_agent = "claude"
+# sprint_timeout_secs = 10800
+# retry_backoff_base_secs = 15
+# retry_backoff_max_secs = 120
+
 # Register projects below (can also pass --project-root / --project on CLI).
 # [[projects]]
 # name = "my-project"
