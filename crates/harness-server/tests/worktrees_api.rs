@@ -189,7 +189,8 @@ async fn get_worktrees_returns_live_workspace_records() -> anyhow::Result<()> {
     assert_eq!(override_row["path_short"], "worktrees/active-override");
     assert_eq!(override_row["source_repo"], repo_root.display().to_string());
     assert_eq!(override_row["repo"], "majiayu000/harness");
-    assert_eq!(override_row["status"], "implementing");
+    // Startup recovery resumes in-flight tasks as pending while preserving phase/checkpoints.
+    assert_eq!(override_row["status"], "pending");
     assert_eq!(override_row["phase"], "implement");
     assert_eq!(override_row["turn"], 3);
     assert_eq!(override_row["max_turns"], 7);
@@ -220,7 +221,7 @@ async fn get_worktrees_returns_live_workspace_records() -> anyhow::Result<()> {
         .iter()
         .find(|row| row["task_id"] == "active-fallback")
         .expect("fallback row");
-    assert_eq!(fallback_row["status"], "reviewing");
+    assert_eq!(fallback_row["status"], "pending");
     assert_eq!(fallback_row["phase"], "review");
     assert_eq!(fallback_row["max_turns"], 21);
 
