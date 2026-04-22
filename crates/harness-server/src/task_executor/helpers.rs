@@ -17,7 +17,7 @@ fn should_skip_prompt_persistence(task: Option<&crate::task_runner::TaskState>) 
         return false;
     };
     let Some(settings) = task.request_settings.as_ref() else {
-        return false;
+        return task.description.as_deref() == Some("prompt task");
     };
 
     if settings.is_manual_prompt_only() {

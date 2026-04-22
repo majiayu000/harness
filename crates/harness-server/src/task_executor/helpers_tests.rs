@@ -291,6 +291,19 @@ fn legacy_manual_prompt_only_tasks_still_skip_prompt_persistence() {
 }
 
 #[test]
+fn prompt_task_description_still_skips_prompt_persistence_without_request_settings() {
+    let mut task = task_with_prompt_settings(
+        "prompt task",
+        crate::task_runner::PersistedRequestSettings::default(),
+    );
+    task.request_settings = None;
+    assert!(
+        should_skip_prompt_persistence(Some(&task)),
+        "legacy prompt-only rows without request settings must not persist prompt text"
+    );
+}
+
+#[test]
 fn restart_bundle_keeps_system_prompt_tasks_persistable_without_origin_flag() {
     let dir = tempfile::tempdir().unwrap();
     let task = task_with_prompt_settings(

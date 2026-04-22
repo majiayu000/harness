@@ -1214,12 +1214,8 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                 // Only wait for a permit once recovery has proven the task can
                 // actually be re-dispatched. Otherwise guaranteed-failure
                 // tasks sit behind unrelated work and delay intake cleanup.
-                let permit = match state
-                    .concurrency
-                    .task_queue
-                    .acquire(&project_id, task.priority)
-                    .await
-                {
+                let queue = recovered_task_queue(&state, &task);
+                let permit = match queue.acquire(&project_id, task.priority).await {
                     Ok(p) => p,
                     Err(e) => {
                         let reason =
