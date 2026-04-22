@@ -15,7 +15,12 @@ pub(crate) struct StorageBundle {
 ///
 /// On Unix this function refuses to proceed if `data_dir` is a symbolic link
 /// to prevent symlink-hijacking attacks on the persistent data directory.
-pub(crate) async fn build_storage(
+#[cfg(test)]
+pub(crate) async fn build_storage(data_dir: &Path) -> anyhow::Result<StorageBundle> {
+    build_storage_with_database_url(data_dir, None).await
+}
+
+pub(crate) async fn build_storage_with_database_url(
     data_dir: &Path,
     configured_database_url: Option<&str>,
 ) -> anyhow::Result<StorageBundle> {
@@ -68,7 +73,7 @@ mod tests {
     #[tokio::test]
     async fn happy_path_both_dbs_open() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let bundle = build_storage(dir.path(), None)
+        let bundle = build_storage(dir.path())
             .await
             .expect("build_storage should succeed");
         // Both stores are accessible; q_values may be Some or None depending on
@@ -85,7 +90,7 @@ mod tests {
         let real_dir = tempfile::tempdir().expect("real tempdir");
         let link_path = real_dir.path().join("symlink_data");
         std::os::unix::fs::symlink(real_dir.path(), &link_path).expect("create symlink");
-        let result = build_storage(&link_path, None).await;
+        let result = build_storage(&link_path).await;
         let err = result.err().expect("expected Err for symlink data_dir");
         let msg = err.to_string();
         assert!(

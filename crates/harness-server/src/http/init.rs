@@ -81,9 +81,11 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     }
 
     // Phase 1: storage — dir validation (symlink check, chmod), task DB, q_value DB.
-    let storage =
-        builders::storage::build_storage(&dir, server.config.server.database_url.as_deref())
-            .await?;
+    let storage = builders::storage::build_storage_with_database_url(
+        &dir,
+        server.config.server.database_url.as_deref(),
+    )
+    .await?;
 
     // Phase 2: engines — rule engine, event store (+purge task), GC agent, skill store.
     // Depends on: storage (none directly, but must precede registry which uses storage.tasks).

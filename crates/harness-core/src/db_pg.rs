@@ -5,7 +5,6 @@ use std::str::FromStr as _;
 use crate::db::Migration;
 
 const DEFAULT_PG_MAX_CONNECTIONS: u32 = 8;
-
 /// Resolve the effective Postgres connection string.
 ///
 /// Precedence:

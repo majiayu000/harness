@@ -316,7 +316,7 @@ mod tests {
             ThreadManager::new(),
             AgentRegistry::new("test"),
         ));
-        let storage = crate::http::builders::storage::build_storage(dir, None)
+        let storage = crate::http::builders::storage::build_storage(dir)
             .await
             .expect("storage");
         let engines = crate::http::builders::engines::build_engines(&server, dir, dir)
