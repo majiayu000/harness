@@ -844,6 +844,15 @@ impl TaskStore {
     /// `gh` CLI failures are treated as transient network errors; the task is left
     /// Pending so it will be retried normally.
     pub async fn validate_recovered_tasks(&self, completion_callback: Option<CompletionCallback>) {
+        self.validate_recovered_tasks_with_gh("gh", completion_callback)
+            .await;
+    }
+
+    async fn validate_recovered_tasks_with_gh(
+        &self,
+        gh_bin: &str,
+        completion_callback: Option<CompletionCallback>,
+    ) {
         let candidates: Vec<(TaskId, String)> = self
             .cache
             .iter()
@@ -869,22 +878,19 @@ impl TaskStore {
         );
 
         for (task_id, pr_url) in candidates {
-            let Some((owner, repo, number)) = super::spawn::parse_pr_url(&pr_url) else {
+            if super::spawn::parse_pr_url(&pr_url).is_none() {
                 tracing::warn!(
                     task_id = %task_id.0,
                     pr_url,
                     "could not parse PR URL; leaving pending"
                 );
                 continue;
-            };
+            }
 
-            let pr_ref = format!("{owner}/{repo}#{number}");
-            // kill_on_drop(true) ensures the child process is killed when the
-            // timeout future is dropped, preventing zombie `gh` processes during
-            // startup when many tasks are recovered concurrently.
-            let mut cmd = tokio::process::Command::new("gh");
-            cmd.args(["pr", "view", &pr_ref, "--json", "state", "--jq", ".state"])
-                .kill_on_drop(true);
+            // Pass the stored PR URL directly. `gh pr view` accepts URLs, but
+            // treats `owner/repo#number` as a branch name.
+            let mut cmd = tokio::process::Command::new(gh_bin);
+            cmd.args(recovered_pr_view_args(&pr_url)).kill_on_drop(true);
             let gh_result =
                 tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await;
 
@@ -964,6 +970,10 @@ impl TaskStore {
             }
         }
     }
+}
+
+fn recovered_pr_view_args(pr_url: &str) -> [&str; 7] {
+    ["pr", "view", pr_url, "--json", "state", "--jq", ".state"]
 }
 
 pub async fn update_status(
@@ -1123,6 +1133,27 @@ mod tests {
         assert!(state.project_root.is_none());
         assert!(state.issue.is_none());
         assert!(state.description.is_none());
+    }
+
+    #[test]
+    fn recovered_pr_view_args_use_stored_pr_url() {
+        let expected_url = "https://github.com/acme/repo/pull/42";
+        let args = recovered_pr_view_args(expected_url);
+        assert!(
+            args.contains(&expected_url),
+            "expected gh to receive PR URL, got args: {:?}",
+            args
+        );
+        assert!(
+            args[2] == expected_url,
+            "expected PR URL to be passed positionally, got args: {:?}",
+            args
+        );
+        assert!(
+            !args[2].contains("acme/repo#42"),
+            "gh should not receive repo-qualified refs: {:?}",
+            args
+        );
     }
 
     #[tokio::test]
