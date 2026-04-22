@@ -1,8 +1,10 @@
 use crate::task_db::TaskDb;
 use dashmap::DashMap;
+use futures::StreamExt;
 use harness_core::agent::StreamItem;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use super::metrics::{DashboardCounts, LlmMetricsInputs, ProjectCounts};
@@ -13,6 +15,22 @@ use super::CompletionCallback;
 /// Broadcast channel capacity for per-task stream events.
 /// When the buffer is full, the oldest events are dropped for lagging receivers.
 const TASK_STREAM_CAPACITY: usize = 512;
+const RECOVERED_PR_VIEW_TIMEOUT: Duration = Duration::from_secs(10);
+const RECOVERED_PR_VALIDATION_CONCURRENCY: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveredPrCandidate {
+    task_id: TaskId,
+    pr_url: String,
+}
+
+#[derive(Debug)]
+struct RecoveredPrStatusUpdate {
+    task_id: TaskId,
+    pr_url: String,
+    state: String,
+    status: TaskStatus,
+}
 
 pub struct TaskStore {
     pub(crate) cache: DashMap<TaskId, TaskState>,
@@ -863,20 +881,16 @@ impl TaskStore {
     /// `gh` CLI failures are treated as transient network errors; the task is left
     /// Pending so it will be retried normally.
     pub async fn validate_recovered_tasks(&self, completion_callback: Option<CompletionCallback>) {
-        let candidates: Vec<(TaskId, String)> = self
-            .cache
-            .iter()
-            .filter_map(|e| {
-                let task = e.value();
-                if matches!(task.status, TaskStatus::Pending) {
-                    task.pr_url
-                        .as_ref()
-                        .map(|url| (task.id.clone(), url.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        self.validate_recovered_tasks_with_gh("gh", completion_callback)
+            .await;
+    }
+
+    async fn validate_recovered_tasks_with_gh(
+        &self,
+        gh_bin: &str,
+        completion_callback: Option<CompletionCallback>,
+    ) {
+        let candidates = self.collect_recovered_pr_candidates();
 
         if candidates.is_empty() {
             return;
@@ -887,101 +901,150 @@ impl TaskStore {
             candidates.len()
         );
 
-        for (task_id, pr_url) in candidates {
-            let Some((owner, repo, number)) = super::spawn::parse_pr_url(&pr_url) else {
-                tracing::warn!(
-                    task_id = %task_id.0,
-                    pr_url,
-                    "could not parse PR URL; leaving pending"
-                );
+        // Probe PR states concurrently, but keep persistence and callbacks
+        // serialized so terminal-state side effects preserve their current order.
+        let mut results = futures::stream::iter(candidates)
+            .map(|candidate| check_recovered_pr_state(gh_bin, candidate))
+            .buffer_unordered(RECOVERED_PR_VALIDATION_CONCURRENCY);
+
+        while let Some(result) = results.next().await {
+            let Some(RecoveredPrStatusUpdate {
+                task_id,
+                pr_url,
+                state,
+                status,
+            }) = result
+            else {
                 continue;
             };
 
-            let pr_ref = format!("{owner}/{repo}#{number}");
-            // kill_on_drop(true) ensures the child process is killed when the
-            // timeout future is dropped, preventing zombie `gh` processes during
-            // startup when many tasks are recovered concurrently.
-            let mut cmd = tokio::process::Command::new("gh");
-            cmd.args(["pr", "view", &pr_ref, "--json", "state", "--jq", ".state"])
-                .kill_on_drop(true);
-            let gh_result =
-                tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await;
-
-            let output = match gh_result {
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        task_id = %task_id.0,
-                        pr_url,
-                        "gh pr view timed out after 10s; leaving pending"
-                    );
-                    continue;
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        task_id = %task_id.0,
-                        pr_url,
-                        "gh CLI error: {e}; leaving pending"
-                    );
-                    continue;
-                }
-                Ok(Ok(out)) => out,
-            };
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(
+            if let Some(mut entry) = self.cache.get_mut(&task_id) {
+                entry.status = status;
+            }
+            // Persist before invoking the callback. If persist fails the task
+            // remains `pending` in SQLite; firing the callback anyway would push
+            // external state (Feishu notifications, GitHub intake cleanup) into a
+            // terminal state while the DB still thinks the task is pending. On
+            // the next restart the same task would be recovered and trigger the
+            // same side-effects again (state split). Skip the callback so the
+            // task can be safely retried on the next restart.
+            if let Err(e) = self.persist(&task_id).await {
+                tracing::error!(
                     task_id = %task_id.0,
-                    pr_url,
-                    "gh pr view failed: {stderr}; leaving pending"
+                    "failed to persist PR state update: {e}; skipping completion callback to avoid state split"
                 );
                 continue;
             }
-
-            let state = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .to_uppercase();
-            let new_status = match state.as_str() {
-                "MERGED" => Some(TaskStatus::Done),
-                "CLOSED" => Some(TaskStatus::Failed),
-                _ => None,
-            };
-
-            if let Some(status) = new_status {
-                if let Some(mut entry) = self.cache.get_mut(&task_id) {
-                    entry.status = status;
+            tracing::info!(
+                task_id = %task_id.0,
+                pr_url,
+                "startup recovery: PR state {state} → task status updated"
+            );
+            if let Some(cb) = &completion_callback {
+                if let Some(final_state) = self.get(&task_id) {
+                    cb(final_state).await;
                 }
-                // Persist before invoking the callback. If persist fails the task
-                // remains `pending` in SQLite; firing the callback anyway would push
-                // external state (Feishu notifications, GitHub intake cleanup) into a
-                // terminal state while the DB still thinks the task is pending. On
-                // the next restart the same task would be recovered and trigger the
-                // same side-effects again (state split). Skip the callback so the
-                // task can be safely retried on the next restart.
-                if let Err(e) = self.persist(&task_id).await {
-                    tracing::error!(
-                        task_id = %task_id.0,
-                        "failed to persist PR state update: {e}; skipping completion callback to avoid state split"
-                    );
-                    continue;
-                }
-                tracing::info!(
-                    task_id = %task_id.0,
-                    pr_url,
-                    "startup recovery: PR state {state} → task status updated"
-                );
-                if let Some(cb) = &completion_callback {
-                    if let Some(final_state) = self.get(&task_id) {
-                        cb(final_state).await;
-                    }
-                }
-            } else {
-                tracing::info!(
-                    task_id = %task_id.0,
-                    pr_url,
-                    "startup recovery: PR state {state} → leaving pending"
-                );
             }
         }
+    }
+
+    fn collect_recovered_pr_candidates(&self) -> Vec<RecoveredPrCandidate> {
+        self.cache
+            .iter()
+            .filter_map(|entry| recovered_pr_candidate(entry.value()))
+            .collect()
+    }
+}
+
+fn recovered_pr_view_args(pr_url: &str) -> [&str; 7] {
+    ["pr", "view", pr_url, "--json", "state", "--jq", ".state"]
+}
+
+fn recovered_pr_candidate(task: &TaskState) -> Option<RecoveredPrCandidate> {
+    if !matches!(task.status, TaskStatus::Pending) {
+        return None;
+    }
+    let pr_url = task.pr_url.as_ref()?.clone();
+    if super::spawn::parse_pr_url(&pr_url).is_none() {
+        tracing::warn!(
+            task_id = %task.id.0,
+            pr_url,
+            "could not parse PR URL; leaving pending"
+        );
+        return None;
+    }
+    Some(RecoveredPrCandidate {
+        task_id: task.id.clone(),
+        pr_url,
+    })
+}
+
+async fn check_recovered_pr_state(
+    gh_bin: &str,
+    candidate: RecoveredPrCandidate,
+) -> Option<RecoveredPrStatusUpdate> {
+    let RecoveredPrCandidate { task_id, pr_url } = candidate;
+
+    // kill_on_drop(true) ensures the child process is killed when the timeout
+    // future is dropped, preventing zombie `gh` processes during startup when
+    // many tasks are recovered concurrently.
+    let mut cmd = tokio::process::Command::new(gh_bin);
+    cmd.args(recovered_pr_view_args(&pr_url)).kill_on_drop(true);
+    let gh_result = tokio::time::timeout(RECOVERED_PR_VIEW_TIMEOUT, cmd.output()).await;
+
+    let output = match gh_result {
+        Err(_elapsed) => {
+            tracing::warn!(
+                task_id = %task_id.0,
+                pr_url,
+                "gh pr view timed out after 10s; leaving pending"
+            );
+            return None;
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                task_id = %task_id.0,
+                pr_url,
+                "gh CLI error: {e}; leaving pending"
+            );
+            return None;
+        }
+        Ok(Ok(out)) => out,
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!(
+            task_id = %task_id.0,
+            pr_url,
+            "gh pr view failed: {stderr}; leaving pending"
+        );
+        return None;
+    }
+
+    let state = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_uppercase();
+    let new_status = match state.as_str() {
+        "MERGED" => Some(TaskStatus::Done),
+        "CLOSED" => Some(TaskStatus::Failed),
+        _ => None,
+    };
+
+    if let Some(status) = new_status {
+        Some(RecoveredPrStatusUpdate {
+            task_id,
+            pr_url,
+            state,
+            status,
+        })
+    } else {
+        tracing::info!(
+            task_id = %task_id.0,
+            pr_url,
+            "startup recovery: PR state {state} → leaving pending"
+        );
+        None
     }
 }
 
@@ -1022,6 +1085,30 @@ pub async fn mutate_and_persist(
 mod tests {
     use super::super::state::TaskState;
     use super::*;
+
+    #[test]
+    fn collect_recovered_pr_candidates_filters_invalid_urls() {
+        let mut valid = TaskState::new(harness_core::types::TaskId("valid".to_string()));
+        valid.pr_url = Some("https://github.com/acme/myrepo/pull/42".to_string());
+
+        let mut invalid = TaskState::new(harness_core::types::TaskId("invalid".to_string()));
+        invalid.pr_url = Some("not-a-pr-url".to_string());
+
+        let mut inflight = TaskState::new(harness_core::types::TaskId("inflight".to_string()));
+        inflight.status = TaskStatus::Implementing;
+        inflight.pr_url = Some("https://github.com/acme/myrepo/pull/7".to_string());
+
+        let pending_without_pr = TaskState::new(harness_core::types::TaskId("no-pr".to_string()));
+        let tasks = [valid, invalid, inflight, pending_without_pr];
+        let candidates: Vec<_> = tasks.iter().filter_map(recovered_pr_candidate).collect();
+        assert_eq!(
+            candidates,
+            vec![RecoveredPrCandidate {
+                task_id: harness_core::types::TaskId("valid".to_string()),
+                pr_url: "https://github.com/acme/myrepo/pull/42".to_string(),
+            }]
+        );
+    }
 
     #[tokio::test]
     async fn task_stream_subscribe_and_publish() -> anyhow::Result<()> {
@@ -1142,6 +1229,27 @@ mod tests {
         assert!(state.project_root.is_none());
         assert!(state.issue.is_none());
         assert!(state.description.is_none());
+    }
+
+    #[test]
+    fn recovered_pr_view_args_use_stored_pr_url() {
+        let expected_url = "https://github.com/acme/repo/pull/42";
+        let args = recovered_pr_view_args(expected_url);
+        assert!(
+            args.contains(&expected_url),
+            "expected gh to receive PR URL, got args: {:?}",
+            args
+        );
+        assert!(
+            args[2] == expected_url,
+            "expected PR URL to be passed positionally, got args: {:?}",
+            args
+        );
+        assert!(
+            !args[2].contains("acme/repo#42"),
+            "gh should not receive repo-qualified refs: {:?}",
+            args
+        );
     }
 
     #[tokio::test]
