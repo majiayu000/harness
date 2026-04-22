@@ -3,6 +3,7 @@ use dashmap::DashMap;
 use harness_core::config::misc::WorkspaceConfig;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::time::{timeout, Duration};
 
 /// Git hook invocations inherit repository-local environment variables such as
@@ -39,6 +40,16 @@ fn git_command() -> tokio::process::Command {
 pub(crate) struct ActiveWorkspace {
     pub(crate) workspace_path: PathBuf,
     pub(crate) source_repo: PathBuf,
+    pub(crate) created_at: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceEntry {
+    pub task_id: TaskId,
+    pub workspace_path: PathBuf,
+    pub source_repo: PathBuf,
+    pub branch: String,
+    pub created_at: SystemTime,
 }
 
 pub struct WorkspaceManager {
@@ -90,6 +101,7 @@ impl WorkspaceManager {
                     vac.insert(ActiveWorkspace {
                         workspace_path: workspace_path.clone(),
                         source_repo: source_repo.to_path_buf(),
+                        created_at: SystemTime::now(),
                     });
                 }
             }
@@ -254,6 +266,23 @@ impl WorkspaceManager {
     /// Number of worktrees currently checked out and not yet reaped.
     pub fn live_count(&self) -> u64 {
         self.active.len() as u64
+    }
+
+    /// Snapshot active worktrees in a stable order for API/UI consumers.
+    pub fn entries(&self) -> Vec<WorkspaceEntry> {
+        let mut entries: Vec<WorkspaceEntry> = self
+            .active
+            .iter()
+            .map(|entry| WorkspaceEntry {
+                task_id: entry.key().clone(),
+                workspace_path: entry.workspace_path.clone(),
+                source_repo: entry.source_repo.clone(),
+                branch: format!("harness/{}", entry.key().0),
+                created_at: entry.created_at,
+            })
+            .collect();
+        entries.sort_by(|a, b| a.task_id.0.cmp(&b.task_id.0));
+        entries
     }
 
     /// Remove workspaces for all given terminal task IDs. Errors are logged, not returned.
@@ -789,5 +818,78 @@ mod tests {
                 "workspace for {id:?} should have been cleaned up"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn entries_return_single_workspace_metadata() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let task_id = harness_core::types::TaskId("entries-task-001".to_string());
+
+        let ws_path = mgr
+            .create_workspace(&task_id, source.path(), "origin", &branch)
+            .await
+            .expect("create");
+
+        let entries = mgr.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].task_id, task_id);
+        assert_eq!(entries[0].workspace_path, ws_path);
+        assert_eq!(entries[0].source_repo, source.path());
+        assert_eq!(entries[0].branch, "harness/entries-task-001");
+        assert!(entries[0].created_at <= SystemTime::now());
+    }
+
+    #[tokio::test]
+    async fn entries_preserve_parallel_and_sequential_workspace_ids() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+
+        let seq_task = harness_core::types::TaskId("parent-task-seq".to_string());
+        let parallel_task = harness_core::types::TaskId("parent-task-p2".to_string());
+
+        mgr.create_workspace(&seq_task, source.path(), "origin", &branch)
+            .await
+            .expect("create seq");
+        mgr.create_workspace(&parallel_task, source.path(), "origin", &branch)
+            .await
+            .expect("create parallel");
+
+        let entries = mgr.entries();
+        let seq_entry = entries
+            .iter()
+            .find(|entry| entry.task_id == seq_task)
+            .expect("seq entry");
+        assert_eq!(seq_entry.branch, "harness/parent-task-seq");
+        assert!(
+            seq_entry.workspace_path.ends_with("parent-task-seq"),
+            "seq workspace should preserve suffix"
+        );
+
+        let parallel_entry = entries
+            .iter()
+            .find(|entry| entry.task_id == parallel_task)
+            .expect("parallel entry");
+        assert_eq!(parallel_entry.branch, "harness/parent-task-p2");
+        assert!(
+            parallel_entry.workspace_path.ends_with("parent-task-p2"),
+            "parallel workspace should preserve suffix"
+        );
     }
 }

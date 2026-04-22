@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fmtInt, fmtScore, fmtPct, relativeAgo } from "./format";
+import { fmtInt, fmtScore, fmtPct, formatDurationShort, relativeAgo } from "./format";
 
 describe("fmtInt", () => {
   it("formats integers with thousands separators", () => {
@@ -30,6 +30,19 @@ describe("fmtPct", () => {
   });
   it("em-dashes missing", () => {
     expect(fmtPct(null)).toBe("—");
+  });
+});
+
+describe("formatDurationShort", () => {
+  it("formats seconds, minutes, hours, and days", () => {
+    expect(formatDurationShort(45)).toBe("45s");
+    expect(formatDurationShort(120)).toBe("2m");
+    expect(formatDurationShort(10_800)).toBe("3h");
+    expect(formatDurationShort(172_800)).toBe("2d");
+  });
+
+  it("returns em-dash for missing values", () => {
+    expect(formatDurationShort(null)).toBe("—");
   });
 });
 

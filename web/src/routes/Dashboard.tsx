@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Sidebar, type SidebarSection } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
@@ -12,11 +12,26 @@ import { useDashboard } from "@/lib/queries";
 
 type Tab = "board" | "history" | "channels" | "submit";
 
+function resolveTab(value: string | null): Tab {
+  switch (value) {
+    case "history":
+    case "channels":
+    case "submit":
+      return value;
+    default:
+      return "board";
+  }
+}
+
 export function Dashboard() {
-  const [tab, setTab] = useState<Tab>("board");
-  const { isError } = useDashboard();
   const [searchParams] = useSearchParams();
+  const [tab, setTab] = useState<Tab>(() => resolveTab(searchParams.get("tab")));
+  const { isError } = useDashboard();
   const projectFilter = searchParams.get("project");
+
+  useEffect(() => {
+    setTab(resolveTab(searchParams.get("tab")));
+  }, [searchParams]);
 
   const sections: SidebarSection[] = [
     {

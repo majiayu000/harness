@@ -3,36 +3,63 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Sidebar, type SidebarSection } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
 import { PaletteFab } from "@/components/PaletteFab";
-import { useWorktrees, useOverview } from "@/lib/queries";
+import { useOverview, useWorktrees } from "@/lib/queries";
 import { apiFetch, TOKEN_KEY } from "@/lib/api";
-import type { WorktreeCard } from "@/lib/queries";
+import { formatDurationShort } from "@/lib/format";
+import type { Worktree } from "@/types";
 
-function fmtPct(v: number | null): string {
-  return v != null ? `${v.toFixed(1)}%` : "—";
+function titleCase(value: string): string {
+  return value
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 }
 
-function fmtBytes(v: number | null): string {
-  return v != null ? `${(v / 1_073_741_824).toFixed(1)} GB` : "—";
+function statusOrder(status: string): number {
+  switch (status) {
+    case "failed":
+      return 0;
+    case "agent_review":
+    case "reviewing":
+      return 1;
+    case "implementing":
+      return 2;
+    case "pending":
+    case "awaiting_deps":
+    case "waiting":
+      return 3;
+    default:
+      return 4;
+  }
+}
+
+function sortWorktrees(worktrees: Worktree[]): Worktree[] {
+  return [...worktrees].sort((a, b) => {
+    const byStatus = statusOrder(a.status) - statusOrder(b.status);
+    if (byStatus !== 0) return byStatus;
+    return a.task_id.localeCompare(b.task_id);
+  });
 }
 
 function statusColor(status: string): string {
   switch (status) {
+    case "failed":
+      return "text-danger border-danger/40 bg-danger/5";
     case "implementing":
     case "planner_generating":
-      return "text-ok border-ok/40";
+      return "text-ok border-ok/40 bg-ok/5";
     case "review_generating":
-      return "text-rust border-rust/40";
+    case "agent_review":
+    case "reviewing":
+      return "text-rust border-rust/40 bg-rust/5";
     case "review_waiting":
     case "planner_waiting":
     case "pending":
     case "awaiting_deps":
     case "waiting":
-      return "text-sand border-sand/40";
-    case "agent_review":
-    case "reviewing":
-      return "text-rust border-rust/40";
+      return "text-sand border-sand/40 bg-sand/10";
     default:
-      return "text-ink-3 border-line-2";
+      return "text-ink-3 border-line-2 bg-bg-2";
   }
 }
 
@@ -44,96 +71,116 @@ function openStream(taskId: string): void {
 }
 
 interface CardProps {
-  card: WorktreeCard;
+  worktree: Worktree;
   onCancel: (taskId: string) => void;
   cancelling: boolean;
 }
 
-function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
-  const pct = card.maxTurns != null ? Math.round((card.turn / card.maxTurns) * 100) : null;
+function WorktreeCardItem({ worktree, onCancel, cancelling }: CardProps) {
+  const pct = worktree.max_turns != null && worktree.max_turns > 0
+    ? Math.min(100, Math.round((worktree.turn / worktree.max_turns) * 100))
+    : null;
+  const leftBorder = worktree.status === "failed" ? "border-l-2 border-l-danger" : "border-l-2 border-l-transparent";
 
   return (
-    <div className="border border-line rounded-[4px] bg-bg-1 flex flex-col gap-0 overflow-hidden">
-      <div className="px-4 py-3 flex items-center gap-2 border-b border-line">
-        <span className="font-mono text-[13px] text-ink font-medium truncate" title={card.pathShort}>
-          {card.pathShort}
-        </span>
-        <span className="font-mono text-[10.5px] px-1.5 py-[1px] border border-line-2 text-ink-3 rounded-[3px] flex-none">
-          {card.taskId.slice(0, 8)}
-        </span>
-        <span className="font-mono text-[10.5px] px-1.5 py-[1px] border border-line-2 text-ink-3 rounded-[3px] flex-none">
-          {card.branch}
-        </span>
-        <span
-          className={`ml-auto font-mono text-[10.5px] px-1.5 py-[1px] border rounded-[10px] ${statusColor(card.status)}`}
-        >
-          {card.status}
-        </span>
+    <article className={`border border-line rounded-[4px] bg-bg-1 overflow-hidden ${leftBorder}`}>
+      <div className="px-4 py-3 border-b border-line space-y-3">
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-[10.5px] px-1.5 py-[1px] border border-line-2 text-ink-3 rounded-[3px]">
+            {worktree.repo}
+          </span>
+          <span
+            className={`font-mono text-[10.5px] px-1.5 py-[1px] border rounded-[10px] ${statusColor(worktree.status)}`}
+          >
+            {titleCase(worktree.status)}
+          </span>
+          <span className="ml-auto font-mono text-[10.5px] text-ink-4 uppercase tracking-[0.1em]">
+            {titleCase(worktree.phase)}
+          </span>
+        </div>
+        <div>
+          <div className="text-[15px] leading-6 text-ink font-medium truncate">{worktree.description}</div>
+          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-ink-3">
+            <span>{worktree.task_id}</span>
+            <span>{worktree.branch}</span>
+            <span title={worktree.workspace_path}>{worktree.path_short}</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="px-4 py-3 border-b border-line grid grid-cols-3 gap-3">
+        <div>
+          <div className="font-mono text-[10px] text-ink-4 uppercase tracking-[0.1em]">Project</div>
+          <div className="font-mono text-[12px] text-ink">{worktree.project}</div>
+        </div>
+        <div>
+          <div className="font-mono text-[10px] text-ink-4 uppercase tracking-[0.1em]">Age</div>
+          <div className="font-mono text-[12px] text-ink">{formatDurationShort(worktree.duration_secs)}</div>
+        </div>
+        <div>
+          <div className="font-mono text-[10px] text-ink-4 uppercase tracking-[0.1em]">Source</div>
+          <div className="font-mono text-[12px] text-ink truncate" title={worktree.source_repo}>
+            {worktree.source_repo}
+          </div>
+        </div>
       </div>
 
       {pct != null && (
-        <div className="px-4 py-2 border-b border-line">
+        <div className="px-4 py-3 border-b border-line">
           <div className="flex items-center gap-2 mb-1">
             <span className="font-mono text-[10.5px] text-ink-3">
-              turn {card.turn}/{card.maxTurns}
+              turn {worktree.turn}/{worktree.max_turns}
             </span>
             <span className="ml-auto font-mono text-[10.5px] text-ink-3">{pct}%</span>
           </div>
           <div className="h-[3px] bg-bg-2 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-rust rounded-full"
-              style={{ width: `${pct}%` }}
-            />
+            <div className="h-full bg-rust rounded-full" style={{ width: `${pct}%` }} />
           </div>
         </div>
       )}
 
-      <div className="px-4 py-2 grid grid-cols-3 border-b border-line">
-        <div>
-          <div className="font-mono text-[10px] text-ink-4 uppercase tracking-[0.1em]">CPU</div>
-          <div className="font-mono text-[12px] text-ink">{fmtPct(card.cpuPct)}</div>
-        </div>
-        <div>
-          <div className="font-mono text-[10px] text-ink-4 uppercase tracking-[0.1em]">RAM</div>
-          <div className="font-mono text-[12px] text-ink">{fmtPct(card.ramPct)}</div>
-        </div>
-        <div>
-          <div className="font-mono text-[10px] text-ink-4 uppercase tracking-[0.1em]">Disk</div>
-          <div className="font-mono text-[12px] text-ink">{fmtBytes(card.diskBytes)}</div>
-        </div>
-      </div>
-
       <div className="px-4 py-2.5 flex items-center gap-2">
         <button
           type="button"
-          onClick={() => openStream(card.taskId)}
+          onClick={() => openStream(worktree.task_id)}
           className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink"
         >
           Logs
         </button>
-        <button
-          type="button"
-          disabled
-          title="Coming soon"
-          className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-4 rounded-[3px] cursor-not-allowed"
-        >
-          Shell
-        </button>
+        {worktree.pr_url ? (
+          <a
+            href={worktree.pr_url}
+            target="_blank"
+            rel="noreferrer"
+            className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink"
+          >
+            PR
+          </a>
+        ) : (
+          <button
+            type="button"
+            disabled
+            title="PR not created yet"
+            className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-4 rounded-[3px] cursor-not-allowed"
+          >
+            PR
+          </button>
+        )}
         <button
           type="button"
           disabled={cancelling}
-          onClick={() => onCancel(card.taskId)}
+          onClick={() => onCancel(worktree.task_id)}
           className="ml-auto font-mono text-[11.5px] px-3 py-1 border border-danger/40 text-danger rounded-[3px] hover:bg-danger/5 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {cancelling ? "Cancelling…" : "Cancel"}
         </button>
       </div>
-    </div>
+    </article>
   );
 }
 
 export function Worktrees() {
-  const { cards, isLoading, error } = useWorktrees();
+  const { data: worktrees = [], isLoading, error } = useWorktrees();
   const { data: overview } = useOverview();
   const queryClient = useQueryClient();
 
@@ -145,7 +192,10 @@ export function Worktrees() {
     setCancelling((prev) => new Set(prev).add(taskId));
     try {
       await apiFetch(`/tasks/${taskId}/cancel`, { method: "POST" });
-      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["worktrees"] }),
+        queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+      ]);
     } catch (err) {
       setCancelError(err instanceof Error ? err.message : "Cancel failed");
     } finally {
@@ -156,6 +206,8 @@ export function Worktrees() {
       });
     }
   };
+
+  const sortedWorktrees = sortWorktrees(worktrees);
 
   const sections: SidebarSection[] = [
     {
@@ -171,7 +223,7 @@ export function Worktrees() {
       label: "Fleet",
       items: [
         { id: "tasks", label: "All tasks", href: "/overview#projects", count: overview?.kpi.active_tasks },
-        { id: "worktrees", label: "Worktrees", href: "/worktrees", active: true, count: cards.length },
+        { id: "worktrees", label: "Worktrees", href: "/worktrees", active: true, count: sortedWorktrees.length },
       ],
     },
     {
@@ -194,7 +246,7 @@ export function Worktrees() {
               Fleet <em className="font-serif italic text-rust font-normal">worktrees</em>
             </h1>
             <span className="font-mono text-[12px] text-ink-3 ml-1">
-              {isLoading ? "loading…" : `${cards.length} active`}
+              {isLoading ? "loading…" : `${sortedWorktrees.length} active`}
             </span>
           </div>
 
@@ -209,18 +261,27 @@ export function Worktrees() {
                 {cancelError}
               </div>
             )}
-            {!isLoading && !error && cards.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-24 text-ink-3">
-                <span className="font-mono text-[13px]">No active worktrees</span>
+            {!isLoading && !error && sortedWorktrees.length === 0 ? (
+              <div className="border border-dashed border-line-2 rounded-[4px] bg-bg-1 px-6 py-16 text-center">
+                <div className="font-mono text-[13px] text-ink-3">No active worktrees</div>
+                <p className="mt-2 mb-5 text-sm text-ink-3">
+                  Submit a task to create a dedicated workspace and track it here.
+                </p>
+                <a
+                  href="/dashboard?tab=submit"
+                  className="inline-flex items-center justify-center font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink"
+                >
+                  Open submit tab
+                </a>
               </div>
             ) : (
               <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] gap-4">
-                {cards.map((card) => (
+                {sortedWorktrees.map((worktree) => (
                   <WorktreeCardItem
-                    key={card.taskId}
-                    card={card}
+                    key={worktree.task_id}
+                    worktree={worktree}
                     onCancel={handleCancel}
-                    cancelling={cancelling.has(card.taskId)}
+                    cancelling={cancelling.has(worktree.task_id)}
                   />
                 ))}
               </div>

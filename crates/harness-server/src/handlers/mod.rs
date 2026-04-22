@@ -16,6 +16,7 @@ pub mod runtime_project_cache;
 pub mod skills;
 pub mod thread;
 pub mod token_usage;
+pub mod worktrees;
 
 #[cfg(test)]
 mod runtime_project_cache_api_tests;

@@ -115,6 +115,7 @@ pub(crate) fn is_auth_exempt_path(path: &str) -> bool {
             | "/favicon.ico"
             | "/auth/reset-password"
             | "/"
+            | "/dashboard"
             | "/overview"
             | "/worktrees"
             | "/ws"
@@ -124,7 +125,7 @@ pub(crate) fn is_auth_exempt_path(path: &str) -> bool {
 /// Bearer token authentication middleware.
 ///
 /// Exempts `/health`, `/webhook`, `/webhook/feishu`, `/signals`, `/favicon.ico`,
-/// `/auth/reset-password`, `/` (dashboard HTML), `/overview` (system overview
+/// `/auth/reset-password`, `/` and `/dashboard` (dashboard HTML), `/overview` (system overview
 /// HTML), `/assets/*` (hashed React bundle assets), and `/ws` (WebSocket
 /// upgrade).
 /// The dashboard HTML no longer embeds the token, so it is safe to serve without

@@ -16,6 +16,7 @@ use super::{
 pub(super) fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(crate::dashboard::index))
+        .route("/dashboard", get(crate::dashboard::index))
         .route("/overview", get(crate::overview::index))
         .route("/worktrees", get(crate::dashboard::index))
         .route(
@@ -51,6 +52,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/operator-snapshot",
             get(crate::handlers::operator_snapshot::operator_snapshot),
         )
+        .route("/api/worktrees", get(crate::handlers::worktrees::worktrees))
         .route("/api/intake", get(intake_status))
         .route(
             "/api/workflows/issues/by-issue",

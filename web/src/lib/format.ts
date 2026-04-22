@@ -19,6 +19,14 @@ export function fmtPct(n: number | null | undefined): string {
   return n.toFixed(1);
 }
 
+export function formatDurationShort(seconds: number | null | undefined): string {
+  if (!isFiniteNumber(seconds)) return EM_DASH;
+  if (seconds < 60) return `${Math.floor(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
+
 export function relativeAgo(then: Date | string, now: Date = new Date()): string {
   const thenDate = typeof then === "string" ? new Date(then) : then;
   const seconds = Math.max(0, Math.floor((now.getTime() - thenDate.getTime()) / 1000));
