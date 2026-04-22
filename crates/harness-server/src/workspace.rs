@@ -552,7 +552,8 @@ impl WorkspaceManager {
             };
 
             if should_remove {
-                cleanup_workspace_path(source_repo, &path).await?;
+                let cleanup_repo = resolve_cleanup_source_repo(source_repo, &path, task).await;
+                cleanup_workspace_path(&cleanup_repo, &path).await?;
                 summary.removed += 1;
             } else {
                 summary.preserved += 1;
@@ -762,6 +763,36 @@ async fn cleanup_workspace_path(source_repo: &Path, workspace_path: &Path) -> an
     }
 
     Ok(())
+}
+
+async fn resolve_cleanup_source_repo(
+    default_source_repo: &Path,
+    workspace_path: &Path,
+    task: Option<&TaskSummary>,
+) -> PathBuf {
+    if let Some(project_root) = task.and_then(|task| task.project.as_deref()) {
+        return PathBuf::from(project_root);
+    }
+
+    infer_workspace_source_repo(workspace_path)
+        .await
+        .unwrap_or_else(|| default_source_repo.to_path_buf())
+}
+
+async fn infer_workspace_source_repo(workspace_path: &Path) -> Option<PathBuf> {
+    git_command()
+        .args([
+            "-C",
+            &workspace_path.to_string_lossy(),
+            "rev-parse",
+            "--show-toplevel",
+        ])
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|stdout| PathBuf::from(stdout.trim()))
 }
 
 async fn is_registered_worktree(source_repo: &Path, workspace_path: &Path) -> bool {
@@ -1199,6 +1230,82 @@ mod tests {
         assert!(
             !lease.workspace_path.exists(),
             "generation drift should be cleaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_startup_cleans_up_with_workspace_owning_repo() {
+        let source_a = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source_a.path());
+        let branch_a = current_branch(source_a.path());
+
+        let source_b = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source_b.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr_a = WorkspaceManager::new(config.clone()).expect("mgr a");
+        let mgr_b = WorkspaceManager::new(config).expect("mgr b");
+        let task_id = harness_core::types::TaskId("startup-owning-repo-task".to_string());
+
+        let lease = mgr_a
+            .create_workspace(&task_id, source_a.path(), "origin", &branch_a, 1)
+            .await
+            .expect("create workspace");
+        assert!(lease.workspace_path.exists());
+
+        let task_summary = crate::task_runner::TaskSummary {
+            id: task_id,
+            status: crate::task_runner::TaskStatus::Pending,
+            failure_kind: None,
+            turn: 0,
+            pr_url: None,
+            error: None,
+            source: None,
+            parent_id: None,
+            external_id: None,
+            repo: None,
+            description: None,
+            created_at: None,
+            phase: crate::task_runner::TaskPhase::Implement,
+            depends_on: vec![],
+            subtask_ids: vec![],
+            project: Some(source_a.path().to_string_lossy().into_owned()),
+            workspace_path: Some(lease.workspace_path.to_string_lossy().into_owned()),
+            workspace_owner: Some(mgr_a.owner_session.clone()),
+            run_generation: 2,
+        };
+
+        let summary = mgr_b
+            .reconcile_startup(source_b.path(), &[task_summary])
+            .await
+            .expect("startup reconcile");
+        assert_eq!(summary.removed, 1);
+        assert!(
+            !lease.workspace_path.exists(),
+            "generation drift should be cleaned"
+        );
+
+        let listed = String::from_utf8(
+            run_git(&[
+                "-C",
+                &source_a.path().to_string_lossy(),
+                "worktree",
+                "list",
+                "--porcelain",
+            ])
+            .stdout,
+        )
+        .expect("utf8");
+        assert!(
+            !listed.lines().any(|line| {
+                line.strip_prefix("worktree ")
+                    .is_some_and(|entry| entry == lease.workspace_path.to_string_lossy())
+            }),
+            "startup cleanup must prune the owning repo entry"
         );
     }
 
