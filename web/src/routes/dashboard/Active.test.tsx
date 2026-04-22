@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
+<<<<<<< HEAD
 import { render, screen, within } from "@testing-library/react";
+=======
+import { fireEvent, render, screen } from "@testing-library/react";
+>>>>>>> 996596d (Expose persisted task prompts from dashboard cards)
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Active } from "./Active";
 import type { Task } from "@/types";
@@ -66,7 +70,7 @@ describe("<Active>", () => {
 
   it("filters to matching project when projectFilter is set", () => {
     mockUseTasks.mockReturnValue({ data: tasks, isLoading: false, isError: false });
-    wrap(<Active projectFilter="harness" />);
+    wrap(<Active projectFilter="harness" onOpenTask={() => {}} />);
     expect(screen.getByText("t1")).toBeInTheDocument();
     expect(screen.getByText("t3")).toBeInTheDocument();
     expect(screen.queryByText("t2")).not.toBeInTheDocument();
@@ -75,7 +79,7 @@ describe("<Active>", () => {
 
   it("shows all non-terminal tasks when no projectFilter", () => {
     mockUseTasks.mockReturnValue({ data: tasks, isLoading: false, isError: false });
-    wrap(<Active />);
+    wrap(<Active onOpenTask={() => {}} />);
     expect(screen.getByText("t1")).toBeInTheDocument();
     expect(screen.getByText("t2")).toBeInTheDocument();
     expect(screen.getByText("t3")).toBeInTheDocument();
@@ -84,13 +88,14 @@ describe("<Active>", () => {
 
   it("shows empty columns when projectFilter matches no tasks", () => {
     mockUseTasks.mockReturnValue({ data: tasks, isLoading: false, isError: false });
-    wrap(<Active projectFilter="nonexistent" />);
+    wrap(<Active projectFilter="nonexistent" onOpenTask={() => {}} />);
     expect(screen.queryByText("t1")).not.toBeInTheDocument();
     expect(screen.queryByText("t2")).not.toBeInTheDocument();
     const dashes = screen.getAllByText("—");
     expect(dashes.length).toBeGreaterThan(0);
   });
 
+<<<<<<< HEAD
   it("groups tasks by workflow state before falling back to task status", () => {
     const ready = {
       ...makeTask("ready-task", "harness", "implementing"),
@@ -109,6 +114,30 @@ describe("<Active>", () => {
     expect(columnCount("Feedback")).toBe("1");
     expect(columnCount("Implementing")).toBe("0");
     expect(columnCount("Pending")).toBe("0");
+=======
+  it("opens detail for a clicked kanban card", () => {
+    const onOpenTask = vi.fn();
+    mockUseTasks.mockReturnValue({ data: tasks, isLoading: false, isError: false });
+
+    wrap(<Active onOpenTask={onOpenTask} />);
+    fireEvent.click(screen.getByRole("button", { name: /t1/i }));
+
+    expect(onOpenTask).toHaveBeenCalledWith("t1");
+  });
+
+  it("opens detail for prompt-only task cards too", () => {
+    const onOpenTask = vi.fn();
+    mockUseTasks.mockReturnValue({
+      data: [makeTask("prompt-task", null, "pending")],
+      isLoading: false,
+      isError: false,
+    });
+
+    wrap(<Active onOpenTask={onOpenTask} />);
+    fireEvent.click(screen.getByRole("button", { name: /prompt-task/i }));
+
+    expect(onOpenTask).toHaveBeenCalledWith("prompt-task");
+>>>>>>> 996596d (Expose persisted task prompts from dashboard cards)
   });
 
   it("groups planner and review lifecycle statuses outside implementing", () => {

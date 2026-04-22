@@ -73,6 +73,7 @@ function columnOf(taskStatus: string, workflowState?: string | null): string {
   return "other";
 }
 
+<<<<<<< HEAD
 function workflowLabel(state: string): string {
   switch (state) {
     case "discovered":
@@ -152,13 +153,31 @@ function TaskCard({ task, workflow }: { task: Task; workflow?: WorkflowSummary |
           concern: {workflow.plan_concern}
         </div>
       )}
+=======
+function TaskCard({ task, onOpenTask }: { task: Task; onOpenTask: (taskId: string) => void }) {
+  const title = task.description?.trim() || task.repo || task.id.slice(0, 8);
+  return (
+    <div className="mb-2 border border-line bg-bg transition-colors last:mb-0 hover:border-line-3">
+      <button
+        type="button"
+        onClick={() => onOpenTask(task.id)}
+        className="block w-full cursor-pointer px-2.5 py-2 text-left"
+      >
+        <div className="text-[12.5px] leading-snug text-ink line-clamp-2" title={title}>
+          {title}
+        </div>
+        <div className="mt-1.5 flex items-center justify-between gap-2 font-mono text-[10px] text-ink-3">
+          <span className="truncate">{task.repo ?? "—"}</span>
+          {task.turn > 0 && <span>turn {task.turn}</span>}
+        </div>
+      </button>
+>>>>>>> 996596d (Expose persisted task prompts from dashboard cards)
       {task.pr_url && (
         <a
           href={task.pr_url}
           target="_blank"
           rel="noreferrer"
-          onClick={(e) => e.stopPropagation()}
-          className="mt-1 block font-mono text-[10px] text-rust hover:underline truncate"
+          className="mt-1 block truncate px-2.5 pb-2 font-mono text-[10px] text-rust hover:underline"
         >
           {task.pr_url.replace(/^https:\/\/github\.com\//, "")}
         </a>
@@ -169,9 +188,10 @@ function TaskCard({ task, workflow }: { task: Task; workflow?: WorkflowSummary |
 
 interface Props {
   projectFilter?: string | null;
+  onOpenTask: (taskId: string) => void;
 }
 
-export function Active({ projectFilter }: Props) {
+export function Active({ projectFilter, onOpenTask }: Props) {
   const { data, isLoading, isError } = useTasks();
   const { data: dashboard } = useDashboard();
 
@@ -213,7 +233,11 @@ export function Active({ projectFilter }: Props) {
                 </div>
               )}
               {rows.map((t) => (
+<<<<<<< HEAD
                 <TaskCard key={t.id} task={t} workflow={t.workflow ?? null} />
+=======
+                <TaskCard key={t.id} task={t} onOpenTask={onOpenTask} />
+>>>>>>> 996596d (Expose persisted task prompts from dashboard cards)
               ))}
             </div>
           </div>
@@ -225,11 +249,18 @@ export function Active({ projectFilter }: Props) {
             <span>Other</span>
             <span className="text-ink-2">{other.length}</span>
           </div>
+<<<<<<< HEAD
             <div className="p-2 flex-1 overflow-auto">
               {other.map((t) => (
                 <TaskCard key={t.id} task={t} workflow={t.workflow ?? null} />
               ))}
             </div>
+=======
+          <div className="p-2 flex-1 overflow-auto">
+            {other.map((t) => (
+              <TaskCard key={t.id} task={t} onOpenTask={onOpenTask} />
+            ))}
+>>>>>>> 996596d (Expose persisted task prompts from dashboard cards)
           </div>
       )}
     </div>

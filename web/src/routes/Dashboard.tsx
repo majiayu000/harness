@@ -4,6 +4,7 @@ import { Sidebar, type SidebarSection } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
 import { StatusBadge } from "@/components/StatusBadge";
 import { PaletteFab } from "@/components/PaletteFab";
+import { TaskSlideover } from "@/components/TaskSlideover";
 import { Active } from "./dashboard/Active";
 import { History } from "./dashboard/History";
 import { Channels } from "./dashboard/Channels";
@@ -14,6 +15,7 @@ type Tab = "board" | "history" | "channels" | "submit";
 
 export function Dashboard() {
   const [tab, setTab] = useState<Tab>("board");
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const { isError } = useDashboard();
   const [searchParams] = useSearchParams();
   const projectFilter = searchParams.get("project");
@@ -39,7 +41,10 @@ export function Dashboard() {
       <Sidebar
         env="local"
         sections={sections}
-        onItemClick={(id) => setTab(id as Tab)}
+        onItemClick={(id) => {
+          setTab(id as Tab);
+          setSelectedTaskId(null);
+        }}
       />
       <main className="flex flex-col min-h-0 min-w-0">
         <TopBar
@@ -52,12 +57,22 @@ export function Dashboard() {
           actions={<StatusBadge ok={!isError} />}
         />
         <div className="flex-1 overflow-auto min-h-0 p-6">
-          {tab === "board" && <Active projectFilter={projectFilter} />}
+          {tab === "board" && (
+            <Active
+              projectFilter={projectFilter}
+              onOpenTask={(taskId) => setSelectedTaskId(taskId)}
+            />
+          )}
           {tab === "history" && <History projectFilter={projectFilter} />}
           {tab === "channels" && <Channels projectFilter={projectFilter} />}
           {tab === "submit" && <Submit projectFilter={projectFilter} />}
         </div>
       </main>
+      <TaskSlideover
+        taskId={selectedTaskId}
+        open={selectedTaskId !== null}
+        onClose={() => setSelectedTaskId(null)}
+      />
       <PaletteFab />
     </div>
   );

@@ -1,6 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
 import { apiJson } from "./api";
+<<<<<<< HEAD
 import type { DashboardPayload, OperatorSnapshotPayload, OverviewPayload, Task } from "@/types";
+=======
+import type { DashboardPayload, OverviewPayload, Task, TaskDetail, TaskPromptRecord } from "@/types";
+>>>>>>> 996596d (Expose persisted task prompts from dashboard cards)
 
 export function useDashboard() {
   return useQuery<DashboardPayload, Error>({
@@ -28,6 +32,36 @@ export function useTasks() {
   return useQuery<Task[], Error>({
     queryKey: ["tasks"],
     queryFn: ({ signal }) => apiJson<Task[]>("/tasks", { signal }),
+  });
+}
+
+function hasTaskId(id: string | null): id is string {
+  return Boolean(id?.trim());
+}
+
+function comparePromptRecords(a: TaskPromptRecord, b: TaskPromptRecord): number {
+  if (a.turn !== b.turn) return a.turn - b.turn;
+  const timestampComparison = (a.created_at ?? "").localeCompare(b.created_at ?? "");
+  if (timestampComparison !== 0) return timestampComparison;
+  return (a.phase ?? "").localeCompare(b.phase ?? "");
+}
+
+export function useTaskDetail(id: string | null) {
+  return useQuery<TaskDetail, Error>({
+    queryKey: ["tasks", id, "detail"],
+    enabled: hasTaskId(id),
+    queryFn: ({ signal }) => apiJson<TaskDetail>(`/tasks/${id}`, { signal }),
+  });
+}
+
+export function useTaskPrompts(id: string | null) {
+  return useQuery<TaskPromptRecord[], Error>({
+    queryKey: ["tasks", id, "prompts"],
+    enabled: hasTaskId(id),
+    queryFn: async ({ signal }) => {
+      const prompts = await apiJson<TaskPromptRecord[]>(`/tasks/${id}/prompts`, { signal });
+      return [...prompts].sort(comparePromptRecords);
+    },
   });
 }
 

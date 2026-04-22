@@ -29,3 +29,25 @@ export interface WorkflowSummary {
   force_execute?: boolean;
   plan_concern?: string | null;
 }
+
+export interface TaskRound {
+  turn: number;
+  action: string;
+  result: string;
+  detail?: string | null;
+  first_token_latency_ms?: number | null;
+}
+
+export interface TaskDetail extends Task {
+  external_id?: string | null;
+  rounds: TaskRound[];
+  priority?: number;
+}
+
+export interface TaskPromptRecord {
+  task_id: string;
+  turn: number;
+  phase: string | null;
+  prompt: string;
+  created_at: string | null;
+}
