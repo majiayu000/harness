@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{server::HarnessServer, task_runner};
@@ -243,19 +243,13 @@ fn runtime_issue_concurrency_config(
     server: &HarnessServer,
 ) -> harness_core::config::misc::ConcurrencyConfig {
     let mut config = server.config.concurrency.clone();
-    let mut derived_total = 0usize;
 
     for project in &server.startup_projects {
         let Some(limit) = project.max_concurrent.map(|value| value as usize) else {
             continue;
         };
-        let canonical = project.root.to_string_lossy().into_owned();
+        let canonical = queue_project_key(&project.root);
         config.per_project.insert(canonical, limit);
-        derived_total = derived_total.saturating_add(limit);
-    }
-
-    if derived_total > 0 {
-        config.max_concurrent_tasks = config.max_concurrent_tasks.max(derived_total);
     }
 
     config
@@ -269,12 +263,23 @@ fn runtime_review_concurrency_config(
     config.per_project = server
         .startup_projects
         .iter()
-        .map(|project| {
-            let canonical = project.root.to_string_lossy().into_owned();
-            (canonical, 1usize)
-        })
+        .map(|project| (queue_project_key(&project.root), 1usize))
         .collect();
+    if config.per_project.is_empty() {
+        config.per_project.insert(
+            queue_project_key(&server.config.server.project_root),
+            1usize,
+        );
+    }
     config
+}
+
+fn queue_project_key(path: &Path) -> String {
+    canonicalize_for_queue(path).to_string_lossy().into_owned()
+}
+
+fn canonicalize_for_queue(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -366,7 +371,7 @@ mod tests {
 
         let cfg = runtime_issue_concurrency_config(&server);
 
-        assert_eq!(cfg.max_concurrent_tasks, 12);
+        assert_eq!(cfg.max_concurrent_tasks, 6);
         assert_eq!(cfg.per_project.len(), 2);
         assert_eq!(cfg.per_project.get("/tmp/a"), Some(&4));
         assert_eq!(cfg.per_project.get("/tmp/b"), Some(&8));
@@ -393,5 +398,21 @@ mod tests {
         assert_eq!(cfg.max_concurrent_tasks, 3);
         assert_eq!(cfg.per_project.len(), 1);
         assert!(cfg.per_project.values().all(|v| *v == 1));
+    }
+
+    #[test]
+    fn runtime_review_concurrency_falls_back_to_server_project_root() {
+        let mut server = HarnessServer::new(
+            HarnessConfig::default(),
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        );
+        server.config.review.max_concurrent_tasks = 2;
+        server.config.server.project_root = std::path::PathBuf::from("/tmp/fallback");
+
+        let cfg = runtime_review_concurrency_config(&server);
+
+        assert_eq!(cfg.max_concurrent_tasks, 2);
+        assert_eq!(cfg.per_project.get("/tmp/fallback"), Some(&1));
     }
 }
