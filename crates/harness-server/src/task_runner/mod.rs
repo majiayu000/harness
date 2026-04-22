@@ -22,6 +22,13 @@ pub use spawn::{
     check_awaiting_deps, effective_turn_timeout, prompt_requires_plan, register_pending_task,
     resolve_canonical_project, spawn_preregistered_task, spawn_task, spawn_task_awaiting_deps,
 };
-pub use state::{RoundResult, TaskState, TaskSummary};
+pub use state::{RecentFailureTask, RoundResult, TaskState, TaskSummary};
 pub use store::{mutate_and_persist, update_status, TaskStore};
 pub use types::{TaskId, TaskPhase, TaskStatus};
+
+impl TaskStore {
+    /// Return the most recent `limit` failed tasks, newest first.
+    pub async fn list_recent_failed(&self, limit: i64) -> anyhow::Result<Vec<RecentFailureTask>> {
+        self.db.list_recent_failed(limit).await
+    }
+}

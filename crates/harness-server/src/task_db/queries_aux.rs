@@ -140,7 +140,7 @@ impl TaskDb {
     ) -> anyhow::Result<Vec<(TaskState, TaskCheckpoint)>> {
         let rows = sqlx::query_as::<_, PendingCheckpointRow>(
             "SELECT t.id, t.status, t.turn, t.pr_url, t.rounds, t.error, t.source, \
-                    t.external_id, t.parent_id, t.created_at, t.repo, t.depends_on, \
+                    t.external_id, t.parent_id, t.created_at, t.updated_at, t.repo, t.depends_on, \
                     t.project, t.priority, t.phase, t.description, t.request_settings, \
                     c.triage_output, c.plan_output, c.pr_url AS ck_pr_url, \
                     c.last_phase, \
@@ -168,6 +168,7 @@ impl TaskDb {
                 external_id: row.external_id,
                 parent_id: row.parent_id,
                 created_at: row.created_at,
+                updated_at: row.updated_at,
                 repo: row.repo,
                 depends_on: row.depends_on,
                 project: row.project,

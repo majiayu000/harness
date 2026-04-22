@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { apiJson } from "./api";
-import type { DashboardPayload, OverviewPayload, Task } from "@/types";
+import type { DashboardPayload, OperatorSnapshotPayload, OverviewPayload, Task } from "@/types";
 
 export function useDashboard() {
   return useQuery<DashboardPayload, Error>({
@@ -13,6 +13,14 @@ export function useOverview() {
   return useQuery<OverviewPayload, Error>({
     queryKey: ["overview"],
     queryFn: ({ signal }) => apiJson<OverviewPayload>("/api/overview", { signal }),
+  });
+}
+
+export function useOperatorSnapshot() {
+  return useQuery<OperatorSnapshotPayload, Error>({
+    queryKey: ["operator-snapshot"],
+    queryFn: ({ signal }) => apiJson<OperatorSnapshotPayload>("/api/operator-snapshot", { signal }),
+    refetchInterval: 30_000,
   });
 }
 
