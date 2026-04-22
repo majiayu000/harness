@@ -172,7 +172,8 @@ async fn make_state_inner(
             review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
-            task_queue,
+            task_queue: task_queue.clone(),
+            review_task_queue: task_queue,
             workspace_mgr: None,
         },
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),

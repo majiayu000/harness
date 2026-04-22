@@ -20,7 +20,9 @@ use crate::task_runner::{TaskState, TaskStatus};
 /// and infer outcomes from known result label constants.
 fn proof_from_state(state: &TaskState) -> ProofOfWork {
     let mut review_rounds = 0u32;
-    let mut has_lgtm = false;
+    let mut has_external_lgtm = false;
+    let mut has_agent_lgtm = false;
+    let mut saw_external_review = false;
     let mut saw_executed_review = false;
     let mut review_only = true;
     let mut final_review_detail = None;
@@ -39,8 +41,12 @@ fn proof_from_state(state: &TaskState) -> ProofOfWork {
         review_rounds += 1;
         saw_executed_review = true;
         review_only &= round.result == RESULT_COMPLETED;
-        has_lgtm |= round.result == RESULT_LGTM
-            || (round.action == ACTION_AGENT_REVIEW && round.result == RESULT_APPROVED);
+        if round.action == ACTION_REVIEW {
+            saw_external_review = true;
+            has_external_lgtm |= round.result == RESULT_LGTM;
+        } else {
+            has_agent_lgtm |= round.result == RESULT_APPROVED;
+        }
     }
 
     let is_review_only = saw_executed_review && review_only;
@@ -49,6 +55,7 @@ fn proof_from_state(state: &TaskState) -> ProofOfWork {
             .error
             .as_deref()
             .is_some_and(|note| note.starts_with("LGTM via quota-heuristic:"));
+    let has_lgtm = has_external_lgtm || (!saw_external_review && has_agent_lgtm);
 
     let review_outcome = if is_review_only {
         ReviewOutcome::NotApplicable

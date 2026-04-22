@@ -153,6 +153,24 @@ fn from_task_agent_review_approved() {
 }
 
 #[test]
+fn from_task_external_review_overrides_prior_agent_approval() {
+    let rounds = vec![
+        agent_review_round(RESULT_APPROVED, Some("agent signed off")),
+        review_round(RESULT_FIXED, Some("follow-up fixes still required")),
+    ];
+    let state = make_state_with_rounds(TaskStatus::Done, rounds);
+    let proof = proof_from_state(&state);
+
+    assert_eq!(proof.review_outcome, ReviewOutcome::ChangesRequested);
+    assert_eq!(proof.ci_status, CiStatus::Unknown);
+    assert_eq!(proof.review_rounds, 2);
+    assert_eq!(
+        proof.final_review_detail.as_deref(),
+        Some("follow-up fixes still required")
+    );
+}
+
+#[test]
 fn from_task_quota_heuristic_graduation() {
     // Quota-heuristic: external reviewer quota exhausted on every round,
     // test gate passed → task is Done. Must report Approved/Passed, not
@@ -303,6 +321,7 @@ async fn make_proof_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            review_task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             workspace_mgr: None,
         },
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),

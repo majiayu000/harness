@@ -150,6 +150,7 @@ async fn make_test_state_with(
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            review_task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             workspace_mgr: None,
         },
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
