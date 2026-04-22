@@ -776,10 +776,10 @@ pub(crate) async fn run_agent_streaming_with_options(
                                     .await;
                                 }
                             }
-                            StreamItem::ItemCompleted { item: completed_item } => {
-                                if options.persist_artifacts {
-                                    persist_artifact(store, task_id, turn, completed_item).await;
-                                }
+                            StreamItem::ItemCompleted { item: completed_item }
+                                if options.persist_artifacts =>
+                            {
+                                persist_artifact(store, task_id, turn, completed_item).await;
                             }
                             StreamItem::TokenUsage { usage } => {
                                 token_usage = usage.clone();
