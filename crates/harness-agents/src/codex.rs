@@ -260,6 +260,19 @@ impl CodeAgent for CodexAgent {
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
         let stream_result = stream_child_output(&mut child, &tx, self.name(), idle_timeout).await;
+        let stream_send_failed = matches!(
+            &stream_result,
+            Err(harness_core::error::HarnessError::AgentExecution(message))
+                if message.contains("stream send failed")
+        );
+        if stream_result.is_err() {
+            #[cfg(unix)]
+            crate::kill_process_group(&child);
+            let _ = child.start_kill();
+        }
+        if stream_send_failed {
+            return Err(stream_result.expect_err("stream send failures return an error"));
+        }
         if let Some(stderr_task) = stderr_task {
             let _ = stderr_task.await;
         }
@@ -597,10 +610,9 @@ exit 1
         let (dir, script) = write_executable_script(
             r#"
 printf 'first\n'
-sleep 0.5
+sleep 0.1
 printf 'second\n'
-sleep 0.5
-printf 'third\n'
+sleep 30
 "#,
         );
         let agent = CodexAgent::new(script, SandboxMode::DangerFullAccess);

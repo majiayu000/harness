@@ -58,6 +58,14 @@ async fn record_phase_observability(
     Ok(())
 }
 
+fn redact_prompt_plan_failure(failure: TurnFailure) -> TurnFailure {
+    TurnFailure {
+        message: None,
+        body_excerpt: None,
+        ..failure
+    }
+}
+
 /// Run a plan step for a complex prompt-only task when the planning gate has
 /// forced `TaskPhase::Plan`.
 ///
@@ -130,6 +138,7 @@ pub(crate) async fn run_plan_for_prompt(
             success.response
         }
         Ok(Err(failure)) => {
+            let persisted_failure = redact_prompt_plan_failure(failure.failure.clone());
             record_phase_observability(
                 store,
                 events,
@@ -139,7 +148,7 @@ pub(crate) async fn run_plan_for_prompt(
                 "failed",
                 None,
                 Some(failure.telemetry),
-                Some(failure.failure),
+                Some(persisted_failure),
                 Decision::Block,
                 Some("prompt task plan failed".to_string()),
             )
@@ -639,6 +648,8 @@ mod tests {
 
     struct PromptPlanningAgent;
 
+    struct FailingPromptPlanningAgent;
+
     #[async_trait]
     impl CodeAgent for PromptPlanningAgent {
         fn name(&self) -> &str {
@@ -676,6 +687,33 @@ mod tests {
                 .await
                 .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl CodeAgent for FailingPromptPlanningAgent {
+        fn name(&self) -> &str {
+            "prompt-planner"
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+
+        async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+            Err(HarnessError::AgentExecution(
+                "planner echoed secret prompt".to_string(),
+            ))
+        }
+
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            _tx: tokio::sync::mpsc::Sender<StreamItem>,
+        ) -> harness_core::error::Result<()> {
+            Err(HarnessError::AgentExecution(
+                "planner exited with exit status: 1: stdout_tail=[secret prompt]".to_string(),
+            ))
         }
     }
 
@@ -733,5 +771,93 @@ mod tests {
             events[0].reason.as_deref(),
             Some("prompt task plan completed")
         );
+    }
+
+    #[tokio::test]
+    async fn run_plan_for_prompt_redacts_failure_metadata_before_persisting() {
+        if std::env::var("DATABASE_URL").is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::task_runner::TaskStore::open(&dir.path().join("tasks.db"))
+            .await
+            .expect("task store");
+        let events = EventStore::new(dir.path()).await.expect("event store");
+        let task_id = crate::task_runner::TaskId::new();
+        let mut task = crate::task_runner::TaskState::new(task_id.clone());
+        task.description = Some("prompt task".to_string());
+        store.insert(&task).await;
+
+        let req = CreateTaskRequest {
+            prompt: Some("secret prompt".to_string()),
+            ..Default::default()
+        };
+
+        let err = run_plan_for_prompt(
+            &FailingPromptPlanningAgent,
+            &store,
+            &task_id,
+            &events,
+            &HashMap::new(),
+            dir.path(),
+            &req,
+        )
+        .await
+        .expect_err("prompt plan should fail");
+        assert!(
+            err.to_string().contains("plan phase agent error"),
+            "unexpected error: {err}"
+        );
+
+        let task = store.get(&task_id).expect("task state");
+        assert_eq!(task.rounds.len(), 1);
+        let failure = task.rounds[0].failure.as_ref().expect("round failure");
+        assert!(
+            failure.message.is_none(),
+            "failure message should be redacted"
+        );
+        assert!(
+            failure.body_excerpt.is_none(),
+            "failure body excerpt should be redacted"
+        );
+
+        let events = events
+            .query(&EventFilters {
+                hook: Some("task_plan".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("query events");
+        assert_eq!(events.len(), 1);
+        let failure = events[0]
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.failure.as_ref())
+            .expect("event failure metadata");
+        assert!(
+            failure.message.is_none(),
+            "event failure message should be redacted"
+        );
+        assert!(
+            failure.body_excerpt.is_none(),
+            "event failure body excerpt should be redacted"
+        );
+    }
+
+    #[test]
+    fn redact_prompt_plan_failure_clears_message_and_excerpt() {
+        let failure = TurnFailure {
+            kind: harness_core::types::TurnFailureKind::Unknown,
+            provider: Some("codex".to_string()),
+            upstream_status: Some(1),
+            message: Some("secret prompt".to_string()),
+            body_excerpt: Some("still secret".to_string()),
+        };
+
+        let redacted = redact_prompt_plan_failure(failure);
+        assert_eq!(redacted.provider.as_deref(), Some("codex"));
+        assert_eq!(redacted.upstream_status, Some(1));
+        assert!(redacted.message.is_none());
+        assert!(redacted.body_excerpt.is_none());
     }
 }
