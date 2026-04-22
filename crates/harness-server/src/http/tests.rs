@@ -1673,3 +1673,53 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn issue_survives_update_and_pending_checkpoint_round_trip() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tasks = task_runner::TaskStore::open(&harness_core::config::dirs::default_db_path(
+        dir.path(),
+        "tasks",
+    ))
+    .await?;
+
+    let mut task = task_runner::TaskState::new(task_runner::TaskId::new());
+    task.issue = Some(42);
+    task.description = Some("issue #42".to_string());
+    task.external_id = Some("issue:42".to_string());
+    let task_id = task.id.clone();
+    tasks.insert(&task).await;
+
+    task_runner::mutate_and_persist(&tasks, &task_id, |s| {
+        s.turn = 3;
+        s.issue = Some(77);
+        s.description = Some("issue #77".to_string());
+    })
+    .await?;
+
+    tasks
+        .write_checkpoint(&task_id, None, Some("plan output"), None, "plan")
+        .await?;
+
+    tasks.cache.remove(&task_id);
+
+    let reloaded = tasks
+        .get_with_db_fallback(&task_id)
+        .await?
+        .expect("task should reload from db");
+    assert_eq!(reloaded.issue, Some(77), "issue should survive update()");
+    assert_eq!(reloaded.turn, 3, "turn should reflect mutate_and_persist()");
+
+    let pending = tasks.pending_tasks_with_checkpoint().await?;
+    let (recovered_task, checkpoint) = pending
+        .into_iter()
+        .find(|(task, _)| task.id == task_id)
+        .expect("task should appear in pending_tasks_with_checkpoint()");
+    assert_eq!(
+        recovered_task.issue,
+        Some(77),
+        "issue should survive pending checkpoint SELECT round-trip"
+    );
+    assert_eq!(checkpoint.plan_output.as_deref(), Some("plan output"));
+    Ok(())
+}

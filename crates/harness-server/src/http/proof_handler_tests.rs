@@ -1,8 +1,56 @@
 use super::*;
-use crate::task_runner::{RoundResult, TaskState};
+use crate::task_executor::review_loop::run_review_loop;
+use crate::task_runner::{CreateTaskRequest, RoundResult, TaskState};
+use async_trait::async_trait;
+use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::proof_of_work::{ACTION_AGENT_REVIEW, RESULT_APPROVED, RESULT_QUOTA_EXHAUSTED};
+use harness_core::types::{Capability, TokenUsage};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
+use tokio::sync::Mutex;
+
+struct StaticProjectService {
+    root: PathBuf,
+}
+
+#[async_trait]
+impl crate::services::project::ProjectService for StaticProjectService {
+    async fn register(&self, _project: crate::project_registry::Project) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get(&self, _id: &str) -> anyhow::Result<Option<crate::project_registry::Project>> {
+        Ok(None)
+    }
+
+    async fn get_by_name(
+        &self,
+        _name: &str,
+    ) -> anyhow::Result<Option<crate::project_registry::Project>> {
+        Ok(None)
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<crate::project_registry::Project>> {
+        Ok(vec![])
+    }
+
+    async fn remove(&self, _id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn resolve_path(&self, _id: &str) -> anyhow::Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
+    fn default_root(&self) -> &Path {
+        &self.root
+    }
+}
+
+fn make_project_service(root: PathBuf) -> Arc<dyn crate::services::project::ProjectService> {
+    Arc::new(StaticProjectService { root })
+}
 
 // ---------------------------------------------------------------------------
 // Pure-logic unit tests (proof_from_state helper — no DB, no async)
@@ -152,12 +200,7 @@ async fn make_proof_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>
         dir, "threads",
     ))
     .await?;
-    let project_svc_tmp = crate::project_registry::ProjectRegistry::open(
-        &harness_core::config::dirs::default_db_path(dir, "projects"),
-    )
-    .await?;
-    let project_svc =
-        crate::services::project::DefaultProjectService::new(project_svc_tmp, dir.to_path_buf());
+    let project_svc = make_project_service(dir.to_path_buf());
     let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
     let execution_svc = crate::services::execution::DefaultExecutionService::new(
         tasks.clone(),
@@ -241,6 +284,59 @@ fn proof_route(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
         .route("/tasks/{id}/proof", axum::routing::get(get_task_proof))
         .with_state(state)
+}
+
+struct SequenceAgent {
+    outputs: Mutex<Vec<AgentResponse>>,
+}
+
+impl SequenceAgent {
+    fn new(outputs: Vec<AgentResponse>) -> Self {
+        Self {
+            outputs: Mutex::new(outputs.into_iter().rev().collect()),
+        }
+    }
+}
+
+#[async_trait]
+impl CodeAgent for SequenceAgent {
+    fn name(&self) -> &str {
+        "sequence-agent"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![]
+    }
+
+    async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        self.outputs.lock().await.pop().ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution("no mock response available".into())
+        })
+    }
+
+    async fn execute_stream(
+        &self,
+        _req: AgentRequest,
+        _tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+}
+
+fn mock_agent_response(output: &str) -> AgentResponse {
+    AgentResponse {
+        output: output.to_string(),
+        stderr: String::new(),
+        items: vec![],
+        token_usage: TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cost_usd: 0.0,
+        },
+        model: "mock".into(),
+        exit_code: Some(0),
+    }
 }
 
 /// Route-level coverage: 404 / 422 / 200 / DB-fallback / review-only.
@@ -384,5 +480,87 @@ async fn proof_endpoint_route_coverage() -> anyhow::Result<()> {
         );
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn proof_endpoint_uses_review_loop_persisted_detail() -> anyhow::Result<()> {
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use std::collections::HashMap;
+    use tokio::time::{Duration, Instant};
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir()?;
+    let state = make_proof_state(dir.path()).await?;
+
+    let task_id = harness_core::types::TaskId("review-loop-task".to_string());
+    let mut task = TaskState::new(task_id.clone());
+    task.status = TaskStatus::Reviewing;
+    task.pr_url = Some("https://github.com/owner/repo/pull/7".to_string());
+    task.issue = Some(876);
+    state.core.tasks.insert(&task).await;
+
+    let agent = SequenceAgent::new(vec![mock_agent_response(
+        "ISSUES=0\nDetailed reviewer verdict\nLGTM",
+    )]);
+    let mut turns_used = 0;
+    let mut turns_used_acc = 0;
+    let project_config = harness_core::config::project::ProjectConfig::default();
+    let review_config = harness_core::config::agents::AgentReviewConfig::default();
+
+    run_review_loop(
+        &state.core.tasks,
+        &task_id,
+        &agent,
+        &review_config,
+        &project_config,
+        &CreateTaskRequest {
+            issue: Some(876),
+            ..CreateTaskRequest::default()
+        },
+        &state.observability.events,
+        &Arc::new(vec![]),
+        &[],
+        dir.path(),
+        &HashMap::from([("HARNESS_PROOF_TEST".to_string(), "1".to_string())]),
+        Some("https://github.com/owner/repo/pull/7".to_string()),
+        7,
+        None,
+        1,
+        0,
+        1,
+        false,
+        false,
+        Duration::from_secs(5),
+        &mut turns_used,
+        &mut turns_used_acc,
+        Instant::now(),
+        "owner/repo".to_string(),
+        0.95,
+    )
+    .await?;
+
+    state.core.tasks.cache.remove(&task_id);
+
+    let resp = proof_route(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/tasks/review-loop-task/proof")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = resp.into_body().collect().await?.to_bytes();
+    let proof: serde_json::Value = serde_json::from_slice(&body)?;
+
+    assert_eq!(proof["review_outcome"], "approved");
+    assert_eq!(proof["review_rounds"], 1);
+    assert_eq!(proof["issue"], 876);
+    assert_eq!(
+        proof["final_review_detail"],
+        "ISSUES=0\nDetailed reviewer verdict\nLGTM"
+    );
     Ok(())
 }
