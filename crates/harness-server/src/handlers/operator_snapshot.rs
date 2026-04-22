@@ -63,10 +63,10 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
             let detail = ev.detail.as_deref()?;
             let parsed: serde_json::Value = serde_json::from_str(detail).ok()?;
             Some(json!({
-                "checked": parsed["checked"],
-                "retried": parsed["retried"],
-                "stuck":   parsed["stuck"],
-                "skipped": parsed["skipped"],
+                "checked": parsed["checked"].as_u64().unwrap_or(0),
+                "retried": parsed["retried"].as_u64().unwrap_or(0),
+                "stuck":   parsed["stuck"].as_u64().unwrap_or(0),
+                "skipped": parsed["skipped"].as_u64().unwrap_or(0),
                 "at":      ev.ts.to_rfc3339(),
             }))
         })
@@ -351,6 +351,40 @@ mod tests {
                 .any(|task| task["task_id"] == "failed-task" && task["project"] == "failed"),
             "expected recent failure project to serialize as basename only",
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_retry_counters_fallback_to_zero() -> anyhow::Result<()> {
+        let _lock = test_helpers::HOME_LOCK.lock().await;
+        let dir = test_helpers::tempdir_in_home("harness-test-op-snap-bad-tick-")?;
+        let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+
+        let mut event = harness_core::types::Event::new(
+            harness_core::types::SessionId::new(),
+            "periodic_retry:summary",
+            "retry_scheduler",
+            harness_core::types::Decision::Pass,
+        );
+        event.detail = Some(r#"{"checked":"bad","retried":7,"stuck":null}"#.to_string());
+        state.observability.events.log(&event).await?;
+
+        let app = Router::new()
+            .route("/api/operator-snapshot", get(operator_snapshot))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/api/operator-snapshot")
+            .body(axum::body::Body::empty())?;
+        let resp = tower::ServiceExt::oneshot(app, req).await?;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+        let tick = &body["retry"]["last_tick"];
+        assert_eq!(tick["checked"], 0);
+        assert_eq!(tick["retried"], 7);
+        assert_eq!(tick["stuck"], 0);
+        assert_eq!(tick["skipped"], 0);
         Ok(())
     }
 

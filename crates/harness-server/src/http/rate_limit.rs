@@ -66,8 +66,8 @@ impl PasswordResetRateLimiter {
         map.values()
             .filter(|timestamps| {
                 timestamps
-                    .iter()
-                    .any(|timestamp| now.duration_since(*timestamp) < Self::WINDOW)
+                    .back()
+                    .is_some_and(|last| now.duration_since(*last) < Self::WINDOW)
             })
             .count()
     }
