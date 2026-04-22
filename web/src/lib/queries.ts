@@ -39,13 +39,6 @@ function hasTaskId(id: string | null): id is string {
   return Boolean(id?.trim());
 }
 
-function comparePromptRecords(a: TaskPromptRecord, b: TaskPromptRecord): number {
-  if (a.turn !== b.turn) return a.turn - b.turn;
-  const timestampComparison = (a.created_at ?? "").localeCompare(b.created_at ?? "");
-  if (timestampComparison !== 0) return timestampComparison;
-  return (a.phase ?? "").localeCompare(b.phase ?? "");
-}
-
 export function useTaskDetail(id: string | null) {
   return useQuery<TaskDetail, Error>({
     queryKey: ["tasks", id, "detail"],
@@ -58,10 +51,7 @@ export function useTaskPrompts(id: string | null) {
   return useQuery<TaskPromptRecord[], Error>({
     queryKey: ["tasks", id, "prompts"],
     enabled: hasTaskId(id),
-    queryFn: async ({ signal }) => {
-      const prompts = await apiJson<TaskPromptRecord[]>(`/tasks/${id}/prompts`, { signal });
-      return [...prompts].sort(comparePromptRecords);
-    },
+    queryFn: ({ signal }) => apiJson<TaskPromptRecord[]>(`/tasks/${id}/prompts`, { signal }),
   });
 }
 

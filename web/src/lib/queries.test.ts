@@ -147,22 +147,22 @@ describe("task detail queries", () => {
     );
   });
 
-  it("fetches prompts from /tasks/{id}/prompts and sorts them chronologically", async () => {
+  it("fetches prompts from /tasks/{id}/prompts and preserves backend ordering", async () => {
     global.fetch = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify([
           {
             task_id: "task-123",
-            turn: 2,
-            phase: "implement",
-            prompt: "retry prompt",
-            created_at: "2026-04-22T13:00:02Z",
+            turn: 1,
+            phase: "plan",
+            prompt: "planner prompt",
+            created_at: "2026-04-22T13:00:01Z",
           },
           {
             task_id: "task-123",
             turn: 1,
-            phase: "plan",
-            prompt: "planner prompt",
+            phase: "implement",
+            prompt: "implement prompt",
             created_at: "2026-04-22T13:00:01Z",
           },
         ]),
@@ -173,7 +173,7 @@ describe("task detail queries", () => {
     const { result } = renderHook(() => useTaskPrompts("task-123"), { wrapper: makeWrapper() });
 
     await waitFor(() => expect(result.current.data).toHaveLength(2));
-    expect(result.current.data?.map((prompt) => prompt.turn)).toEqual([1, 2]);
+    expect(result.current.data?.map((prompt) => prompt.phase)).toEqual(["plan", "implement"]);
     expect(global.fetch).toHaveBeenCalledWith(
       "/tasks/task-123/prompts",
       expect.objectContaining({
