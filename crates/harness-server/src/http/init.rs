@@ -488,6 +488,7 @@ pub(crate) fn build_completion_callback(
             };
             let result = crate::intake::TaskCompletionResult {
                 status: task.status.clone(),
+                failure_kind: task.effective_failure_kind(),
                 pr_url: task.pr_url.clone(),
                 error: task.error.clone(),
                 summary,

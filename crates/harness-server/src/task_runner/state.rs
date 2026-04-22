@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use super::request::{PersistedRequestSettings, SystemTaskInput};
-use super::types::{TaskId, TaskKind, TaskPhase, TaskStatus};
+use super::types::{TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoundResult {
@@ -22,6 +22,8 @@ pub struct TaskState {
     pub id: TaskId,
     pub task_kind: TaskKind,
     pub status: TaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<TaskFailureKind>,
     pub turn: u32,
     pub pr_url: Option<String>,
     pub rounds: Vec<RoundResult>,
@@ -45,8 +47,19 @@ pub struct TaskState {
     pub subtask_ids: Vec<TaskId>,
     /// Resolved project root for this task. Set at spawn time and persisted to the database.
     /// Used by sibling-awareness lookups and exposed via TaskSummary for observability.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<PathBuf>,
+    /// Workspace path used for isolated execution. Persisted for observability and
+    /// deterministic stale-workspace reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<PathBuf>,
+    /// Stable server/session token that currently owns the workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_owner: Option<String>,
+    /// Monotonic execution generation for this task. Incremented before each
+    /// workspace admission so stale ownership can be reconciled deterministically.
+    #[serde(default)]
+    pub run_generation: u32,
     /// GitHub issue number if this is an issue-based task. Set at spawn time; not persisted.
     #[serde(skip)]
     pub issue: Option<u64>,
@@ -91,6 +104,8 @@ pub struct TaskSummary {
     pub id: TaskId,
     pub task_kind: TaskKind,
     pub status: TaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<TaskFailureKind>,
     pub turn: u32,
     pub pr_url: Option<String>,
     pub error: Option<String>,
@@ -122,6 +137,15 @@ pub struct TaskSummary {
     /// Resolved project root path. Persisted to the database for observability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Persisted workspace path for lifecycle diagnostics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    /// Persisted workspace owner token for lifecycle diagnostics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_owner: Option<String>,
+    /// Monotonic execution generation for this task.
+    #[serde(default)]
+    pub run_generation: u32,
     /// Issue workflow state summary, when this task belongs to an issue workflow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow: Option<harness_workflow::issue_lifecycle::IssueWorkflowInstance>,
@@ -132,20 +156,39 @@ pub struct TaskSummary {
 pub struct RecentFailureTask {
     pub id: TaskId,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<TaskFailureKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_owner: Option<String>,
+    #[serde(default)]
+    pub run_generation: u32,
     pub error: Option<String>,
     #[serde(default)]
     pub failed_at: Option<String>,
 }
 
 impl TaskState {
+    pub fn effective_failure_kind(&self) -> Option<TaskFailureKind> {
+        self.failure_kind.clone().or_else(|| {
+            if self.status.is_failure() {
+                Some(TaskFailureKind::Task)
+            } else {
+                None
+            }
+        })
+    }
+
     pub(crate) fn new(id: TaskId) -> Self {
         Self {
             id,
             task_kind: TaskKind::default(),
             status: TaskStatus::Pending,
+            failure_kind: None,
             turn: 0,
             pr_url: None,
             rounds: Vec::new(),
@@ -156,6 +199,9 @@ impl TaskState {
             depends_on: Vec::new(),
             subtask_ids: Vec::new(),
             project_root: None,
+            workspace_path: None,
+            workspace_owner: None,
+            run_generation: 0,
             issue: None,
             description: None,
             created_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -175,6 +221,7 @@ impl TaskState {
             id: self.id.clone(),
             task_kind: self.task_kind,
             status: self.status.clone(),
+            failure_kind: self.effective_failure_kind(),
             turn: self.turn,
             pr_url: self.pr_url.clone(),
             error: self.error.clone(),
@@ -191,6 +238,12 @@ impl TaskState {
                 .project_root
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            workspace_path: self
+                .workspace_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            workspace_owner: self.workspace_owner.clone(),
+            run_generation: self.run_generation,
             workflow: None,
         }
     }

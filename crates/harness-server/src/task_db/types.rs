@@ -82,13 +82,14 @@ pub(super) struct RecoveryRow {
 /// When adding a field to `TaskRow`, add the column here once and all queries
 /// pick it up automatically.  The `task_row_columns_match_struct` test below
 /// will fail if this list drifts from the struct definition.
-pub(super) const TASK_ROW_COLUMNS: &str = "id, task_kind, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, updated_at, repo, depends_on, project, priority, phase, description, request_settings, system_input";
+pub(super) const TASK_ROW_COLUMNS: &str = "id, task_kind, status, failure_kind, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, updated_at, repo, depends_on, project, workspace_path, workspace_owner, run_generation, priority, phase, description, request_settings, system_input";
 
 #[derive(sqlx::FromRow)]
 pub(super) struct TaskRow {
     pub(super) id: String,
     pub(super) task_kind: String,
     pub(super) status: String,
+    pub(super) failure_kind: Option<String>,
     pub(super) turn: i64,
     pub(super) pr_url: Option<String>,
     pub(super) rounds: String,
@@ -101,6 +102,9 @@ pub(super) struct TaskRow {
     pub(super) repo: Option<String>,
     pub(super) depends_on: String,
     pub(super) project: Option<String>,
+    pub(super) workspace_path: Option<String>,
+    pub(super) workspace_owner: Option<String>,
+    pub(super) run_generation: i64,
     pub(super) priority: i64,
     pub(super) phase: String,
     pub(super) description: Option<String>,
@@ -149,6 +153,7 @@ pub(super) struct TaskSummaryRow {
     pub(super) id: String,
     pub(super) task_kind: String,
     pub(super) status: String,
+    pub(super) failure_kind: Option<String>,
     pub(super) turn: i64,
     pub(super) pr_url: Option<String>,
     pub(super) error: Option<String>,
@@ -159,6 +164,9 @@ pub(super) struct TaskSummaryRow {
     pub(super) repo: Option<String>,
     pub(super) depends_on: String,
     pub(super) project: Option<String>,
+    pub(super) workspace_path: Option<String>,
+    pub(super) workspace_owner: Option<String>,
+    pub(super) run_generation: i64,
     pub(super) phase: String,
     pub(super) description: Option<String>,
 }
@@ -167,8 +175,12 @@ pub(super) struct TaskSummaryRow {
 #[derive(sqlx::FromRow)]
 pub(super) struct RecentFailureRow {
     pub(super) id: String,
+    pub(super) failure_kind: Option<String>,
     pub(super) external_id: Option<String>,
     pub(super) project: Option<String>,
+    pub(super) workspace_path: Option<String>,
+    pub(super) workspace_owner: Option<String>,
+    pub(super) run_generation: i64,
     pub(super) error: Option<String>,
     pub(super) updated_at: Option<DateTime<Utc>>,
 }
@@ -186,6 +198,7 @@ impl TaskRow {
             id,
             task_kind,
             status,
+            failure_kind,
             turn,
             pr_url,
             rounds,
@@ -198,6 +211,9 @@ impl TaskRow {
             repo,
             depends_on,
             project,
+            workspace_path,
+            workspace_owner,
+            run_generation,
             priority,
             phase,
             description,
@@ -243,6 +259,11 @@ impl TaskRow {
             id: harness_core::types::TaskId(id),
             task_kind: decoded_task_kind,
             status: status.parse::<TaskStatus>()?,
+            failure_kind: failure_kind
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .unwrap_or(None),
             turn: turn as u32,
             pr_url,
             rounds: decoded_rounds,
@@ -253,6 +274,9 @@ impl TaskRow {
             depends_on: decoded_depends_on,
             subtask_ids: Vec::new(),
             project_root: project.map(PathBuf::from),
+            workspace_path: workspace_path.map(PathBuf::from),
+            workspace_owner,
+            run_generation: run_generation.max(0) as u32,
             issue: None,
             description,
             created_at: created_at.map(|dt| dt.to_rfc3339()),
@@ -294,6 +318,11 @@ impl TaskSummaryRow {
             id: TaskId(self.id),
             task_kind: decoded_task_kind,
             status: self.status.parse::<crate::task_runner::TaskStatus>()?,
+            failure_kind: match self.failure_kind.as_deref() {
+                Some(kind) => Some(kind.parse::<crate::task_runner::TaskFailureKind>()?),
+                None if self.status == "failed" => Some(crate::task_runner::TaskFailureKind::Task),
+                None => None,
+            },
             turn: self.turn as u32,
             pr_url: self.pr_url,
             error: self.error,
@@ -307,6 +336,9 @@ impl TaskSummaryRow {
             depends_on,
             subtask_ids: Vec::new(),
             project: self.project,
+            workspace_path: self.workspace_path,
+            workspace_owner: self.workspace_owner,
+            run_generation: self.run_generation.max(0) as u32,
             workflow: None,
         })
     }
@@ -316,8 +348,17 @@ impl RecentFailureRow {
     pub(super) fn into_recent_failure(self) -> crate::task_runner::RecentFailureTask {
         crate::task_runner::RecentFailureTask {
             id: harness_core::types::TaskId(self.id),
+            failure_kind: match self.failure_kind.as_deref() {
+                Some(kind) => kind
+                    .parse::<crate::task_runner::TaskFailureKind>()
+                    .ok(),
+                None => Some(crate::task_runner::TaskFailureKind::Task),
+            },
             external_id: self.external_id,
             project: self.project,
+            workspace_path: self.workspace_path,
+            workspace_owner: self.workspace_owner,
+            run_generation: self.run_generation.max(0) as u32,
             error: self.error,
             failed_at: self.updated_at.map(|dt| dt.to_rfc3339()),
         }
@@ -333,16 +374,27 @@ mod tests {
     fn recent_failure_row_maps_updated_at_to_failed_at() {
         let row = RecentFailureRow {
             id: "task-123".to_string(),
+            failure_kind: None,
             external_id: Some("issue:123".to_string()),
             project: Some("/tmp/project-a".to_string()),
+            workspace_path: Some("/tmp/ws/task-123".to_string()),
+            workspace_owner: Some("session-a".to_string()),
+            run_generation: 3,
             error: Some("boom".to_string()),
             updated_at: Some(chrono::Utc.with_ymd_and_hms(2026, 4, 21, 5, 34, 0).unwrap()),
         };
 
         let mapped = row.into_recent_failure();
         assert_eq!(mapped.id.0, "task-123");
+        assert_eq!(
+            mapped.failure_kind,
+            Some(crate::task_runner::TaskFailureKind::Task)
+        );
         assert_eq!(mapped.external_id.as_deref(), Some("issue:123"));
         assert_eq!(mapped.project.as_deref(), Some("/tmp/project-a"));
+        assert_eq!(mapped.workspace_path.as_deref(), Some("/tmp/ws/task-123"));
+        assert_eq!(mapped.workspace_owner.as_deref(), Some("session-a"));
+        assert_eq!(mapped.run_generation, 3);
         assert_eq!(mapped.error.as_deref(), Some("boom"));
         assert_eq!(
             mapped.failed_at.as_deref(),

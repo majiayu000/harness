@@ -332,10 +332,16 @@ impl IntakeSource for GitHubIssuesPoller {
             .as_deref()
             .map(|e| e.contains("manual resolution required"))
             .unwrap_or(false);
+        let is_workspace_lifecycle = matches!(
+            result.failure_kind,
+            Some(crate::task_runner::TaskFailureKind::WorkspaceLifecycle)
+        );
         // Remove transient failed or cancelled issues from dispatched so the poller can
         // retry them later if they remain open. Done tasks and permanent failures stay
         // dispatched to avoid re-processing.
-        if (result.status.is_failure() || result.status.is_cancelled()) && !needs_manual {
+        if ((result.status.is_failure() && is_workspace_lifecycle) || result.status.is_cancelled())
+            && !needs_manual
+        {
             self.dispatched
                 .remove(&normalize_issue_external_id(external_id));
             self.persist_dispatched();
@@ -509,6 +515,7 @@ mod tests {
 
         let result = TaskCompletionResult {
             status: TaskStatus::Cancelled,
+            failure_kind: None,
             pr_url: None,
             error: Some("cancelled".to_string()),
             summary: "cancelled".to_string(),
@@ -537,6 +544,7 @@ mod tests {
 
         let result = TaskCompletionResult {
             status: TaskStatus::Failed,
+            failure_kind: Some(crate::task_runner::TaskFailureKind::WorkspaceLifecycle),
             pr_url: None,
             error: Some(
                 "pr:77 is conflicting and rebase was not pushed; manual resolution required"
@@ -570,6 +578,7 @@ mod tests {
 
         let result = TaskCompletionResult {
             status: TaskStatus::Failed,
+            failure_kind: Some(crate::task_runner::TaskFailureKind::WorkspaceLifecycle),
             pr_url: None,
             error: Some("no PR number found in agent output; task requires PR_URL".to_string()),
             summary: "transient failure".to_string(),
@@ -598,6 +607,7 @@ mod tests {
 
         let result = TaskCompletionResult {
             status: TaskStatus::Failed,
+            failure_kind: Some(crate::task_runner::TaskFailureKind::WorkspaceLifecycle),
             pr_url: None,
             error: Some("triage phase agent error".to_string()),
             summary: "transient failure".to_string(),
@@ -608,6 +618,35 @@ mod tests {
         assert!(
             !poller.dispatched.contains_key("88"),
             "canonical external_id should remove the raw GitHub issue key"
+        );
+    }
+
+    #[test]
+    fn on_task_complete_task_failure_keeps_dispatched() {
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: None,
+        };
+        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
+        poller.dispatched.insert(
+            "99".to_string(),
+            harness_core::types::TaskId("task-99".to_string()),
+        );
+
+        let result = TaskCompletionResult {
+            status: TaskStatus::Failed,
+            failure_kind: Some(crate::task_runner::TaskFailureKind::Task),
+            pr_url: None,
+            error: Some("implementation test failure".to_string()),
+            summary: "task failure".to_string(),
+        };
+
+        futures::executor::block_on(poller.on_task_complete("99", &result)).unwrap();
+
+        assert!(
+            poller.dispatched.contains_key("99"),
+            "non-lifecycle task failures should stay dispatched"
         );
     }
 

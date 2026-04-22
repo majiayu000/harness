@@ -29,6 +29,10 @@ fn stalled_task_json(t: &crate::task_runner::TaskState) -> Value {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "—".to_string()),
+        "workspace_path": t.workspace_path.as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        "workspace_owner": t.workspace_owner.clone(),
+        "run_generation": t.run_generation,
         "status":       t.status.as_ref(),
         "stalled_since": t.updated_at.as_deref(),
     })
@@ -55,11 +59,15 @@ fn recent_failure_json(t: &crate::task_runner::RecentFailureTask) -> Value {
 
     json!({
         "task_id":    t.id.0,
+        "failure_kind": t.failure_kind.as_ref().map(|kind| kind.as_ref()),
         "external_id": t.external_id.as_deref().unwrap_or("—"),
         "project":    t.project.as_deref()
             .and_then(|p| std::path::Path::new(p).file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "—".to_string()),
+        "workspace_path": t.workspace_path.as_deref(),
+        "workspace_owner": t.workspace_owner.as_deref(),
+        "run_generation": t.run_generation,
         "error":      error,
         "failed_at":  t.failed_at.as_deref(),
     })
@@ -276,6 +284,7 @@ mod tests {
             id: harness_core::types::TaskId("stalled-task".to_string()),
             task_kind: crate::task_runner::TaskKind::Issue,
             status: crate::task_runner::TaskStatus::Implementing,
+            failure_kind: None,
             turn: 1,
             pr_url: None,
             rounds: vec![],
@@ -286,6 +295,9 @@ mod tests {
             depends_on: vec![],
             subtask_ids: vec![],
             project_root: Some(std::path::PathBuf::from("/test/stalled")),
+            workspace_path: None,
+            workspace_owner: None,
+            run_generation: 0,
             issue: None,
             repo: None,
             description: None,
@@ -302,8 +314,12 @@ mod tests {
 
         let failed_task = crate::task_runner::RecentFailureTask {
             id: harness_core::types::TaskId("failed-task".to_string()),
+            failure_kind: Some(crate::task_runner::TaskFailureKind::Task),
             external_id: Some("issue:failed".to_string()),
             project: Some("/test/failed".to_string()),
+            workspace_path: None,
+            workspace_owner: None,
+            run_generation: 0,
             error: Some("boom".to_string()),
             failed_at: None,
         };
@@ -402,6 +418,7 @@ mod tests {
                 id: harness_core::types::TaskId(format!("fail-task-{i}")),
                 task_kind: crate::task_runner::TaskKind::Issue,
                 status: crate::task_runner::TaskStatus::Failed,
+                failure_kind: Some(crate::task_runner::TaskFailureKind::Task),
                 turn: 1,
                 pr_url: None,
                 rounds: vec![],
@@ -412,6 +429,9 @@ mod tests {
                 depends_on: vec![],
                 subtask_ids: vec![],
                 project_root: Some(std::path::PathBuf::from("/test/proj")),
+                workspace_path: None,
+                workspace_owner: None,
+                run_generation: 0,
                 issue: None,
                 repo: None,
                 description: None,
@@ -459,6 +479,7 @@ mod tests {
             id: harness_core::types::TaskId("trunc-task".to_string()),
             task_kind: crate::task_runner::TaskKind::Issue,
             status: crate::task_runner::TaskStatus::Failed,
+            failure_kind: Some(crate::task_runner::TaskFailureKind::Task),
             turn: 1,
             pr_url: None,
             rounds: vec![],
@@ -469,6 +490,9 @@ mod tests {
             depends_on: vec![],
             subtask_ids: vec![],
             project_root: Some(std::path::PathBuf::from("/test/proj")),
+            workspace_path: None,
+            workspace_owner: None,
+            run_generation: 0,
             issue: None,
             repo: None,
             description: None,
@@ -520,6 +544,7 @@ mod tests {
             id: harness_core::types::TaskId("unicode-task".to_string()),
             task_kind: crate::task_runner::TaskKind::Issue,
             status: crate::task_runner::TaskStatus::Failed,
+            failure_kind: Some(crate::task_runner::TaskFailureKind::Task),
             turn: 1,
             pr_url: None,
             rounds: vec![],
@@ -530,6 +555,9 @@ mod tests {
             depends_on: vec![],
             subtask_ids: vec![],
             project_root: Some(std::path::PathBuf::from("/test/proj")),
+            workspace_path: None,
+            workspace_owner: None,
+            run_generation: 0,
             issue: None,
             repo: None,
             description: None,

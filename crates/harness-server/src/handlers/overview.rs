@@ -516,6 +516,8 @@ mod tests {
                 crate::workspace::ActiveWorkspace {
                     workspace_path: dir.path().join(format!("ws/fake-{i}")),
                     source_repo: dir.path().to_path_buf(),
+                    owner_session: format!("session-{i}"),
+                    run_generation: 1,
                 },
             );
         }

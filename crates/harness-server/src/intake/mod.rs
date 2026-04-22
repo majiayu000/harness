@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::http::AppState;
-use crate::task_runner::{TaskId, TaskStatus};
+use crate::task_runner::{TaskFailureKind, TaskId, TaskStatus};
 
 pub mod feishu;
 pub mod github_issues;
@@ -35,6 +35,7 @@ pub struct IncomingIssue {
 /// Result passed to `IntakeSource::on_task_complete`.
 pub struct TaskCompletionResult {
     pub status: TaskStatus,
+    pub failure_kind: Option<TaskFailureKind>,
     pub pr_url: Option<String>,
     pub error: Option<String>,
     pub summary: String,

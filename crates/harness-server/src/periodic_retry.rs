@@ -175,6 +175,38 @@ async fn run_retry_tick(
             }
             state.core.tasks.abort_task(&task.id);
 
+            if let (Some(wmgr), Some(project_root)) = (
+                state.concurrency.workspace_mgr.as_ref(),
+                task.project_root.as_ref(),
+            ) {
+                if let Err(e) = wmgr
+                    .cleanup_workspace_for_retry(
+                        &task.id,
+                        project_root,
+                        task.workspace_path.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        task_id = %task.id.0,
+                        "periodic_retry: workspace cleanup before retry failed: {e}; restoring task status"
+                    );
+                    if let Err(e2) = state
+                        .core
+                        .tasks
+                        .restore_status_preserve_staleness(&task.id, original_status)
+                        .await
+                    {
+                        tracing::error!(
+                            task_id = %task.id.0,
+                            "periodic_retry: failed to restore task status after workspace cleanup failure: {e2}"
+                        );
+                    }
+                    skipped += 1;
+                    continue;
+                }
+            }
+
             // Restore original execution limits so the retry honours the same
             // agent, budgets, timeouts, and prompt context as the original
             // request rather than silently falling back to server defaults.
@@ -380,14 +412,17 @@ mod tests {
     use super::*;
     use crate::task_db::TaskDb;
     use crate::task_runner::{TaskState, TaskStatus};
+    use crate::test_helpers;
     use harness_core::types::TaskId;
     use harness_observe::event_store::EventStore;
+    use std::sync::Arc;
 
     fn stalled_task(id: &str, external_id: &str, project: &str) -> TaskState {
         TaskState {
             id: TaskId(id.to_string()),
             task_kind: crate::task_runner::TaskKind::Issue,
             status: TaskStatus::Implementing,
+            failure_kind: None,
             turn: 1,
             pr_url: None,
             rounds: vec![],
@@ -398,6 +433,9 @@ mod tests {
             depends_on: vec![],
             subtask_ids: vec![],
             project_root: Some(std::path::PathBuf::from(project)),
+            workspace_path: None,
+            workspace_owner: None,
+            run_generation: 0,
             issue: None,
             repo: None,
             description: None,
@@ -594,6 +632,65 @@ mod tests {
             })
             .await?;
         assert_eq!(stored[0].decision, Decision::Pass);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_tick_cleans_workspace_before_reenqueue() -> anyhow::Result<()> {
+        let _lock = test_helpers::HOME_LOCK.lock().await;
+        if !test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let dir = test_helpers::tempdir_in_home("harness-test-retry-ws-")?;
+        let mut state = test_helpers::make_test_state(dir.path()).await?;
+
+        let workspace_root = dir.path().join("workspaces");
+        let workspace_mgr = Arc::new(crate::workspace::WorkspaceManager::new(
+            harness_core::config::misc::WorkspaceConfig {
+                root: workspace_root.clone(),
+                ..Default::default()
+            },
+        )?);
+        state.concurrency.workspace_mgr = Some(workspace_mgr);
+        let state = Arc::new(state);
+
+        let task_id = TaskId("retry-task".to_string());
+        let workspace_path = workspace_root.join("retry-task");
+        std::fs::create_dir_all(&workspace_path)?;
+
+        let mut task = stalled_task("retry-task", "issue:42", dir.path().to_str().unwrap());
+        task.id = task_id.clone();
+        task.source = Some("github".to_string());
+        task.workspace_path = Some(workspace_path.clone());
+        task.workspace_owner = Some("old-session".to_string());
+        task.run_generation = 1;
+        state.core.tasks.insert(&task).await;
+
+        let config = RetrySchedulerConfig {
+            enabled: true,
+            interval_secs: 60,
+            stale_threshold_mins: 0,
+            cooldown_mins: 0,
+            max_retries: 1,
+        };
+        run_retry_tick(&state, &config, Duration::from_secs(0)).await?;
+
+        assert!(
+            !workspace_path.exists(),
+            "stale workspace should be removed before retry enqueue"
+        );
+        let tasks = state.core.tasks.list_all_with_terminal().await?;
+        assert!(
+            tasks
+                .iter()
+                .any(|t| t.id == task_id && t.status == TaskStatus::Cancelled),
+            "original stalled task should be cancelled before retry"
+        );
+        assert!(
+            tasks.iter().any(|t| t.id != task_id
+                && matches!(t.status, TaskStatus::Pending | TaskStatus::Implementing)),
+            "retry tick should enqueue a successor task after cleanup"
+        );
         Ok(())
     }
 }
