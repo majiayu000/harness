@@ -73,6 +73,10 @@ pub(crate) struct TaskContext {
     pub project: std::path::PathBuf,
 }
 
+fn should_run_issue_triage(skip_triage: bool, has_existing_pr: bool) -> bool {
+    !skip_triage && !has_existing_pr
+}
+
 /// Run the project's test commands as a hard gate before accepting LGTM.
 ///
 /// When `custom_cmds` is non-empty (from `validation.pre_push` in project config),
@@ -265,15 +269,22 @@ pub(crate) async fn run_task(
             .ok()
             .flatten()
             .is_some();
-        if !has_existing_pr {
+        if has_existing_pr {
+            // Fresh issue task reusing an existing PR — treat as resumed for conflict gating.
+            was_resumed_pr = true;
+            (None, prompts::TriageComplexity::Medium, 0u32)
+        } else if !should_run_issue_triage(req.skip_triage, has_existing_pr) {
+            tracing::info!(
+                task_id = %task_id,
+                issue,
+                "issue request opted to skip triage/plan pipeline"
+            );
+            (None, prompts::TriageComplexity::Medium, 0u32)
+        } else {
             triage_pipeline::run_triage_plan_pipeline(
                 agent, store, task_id, issue, &cargo_env, &project, req,
             )
             .await?
-        } else {
-            // Fresh issue task reusing an existing PR — treat as resumed for conflict gating.
-            was_resumed_pr = true;
-            (None, prompts::TriageComplexity::Medium, 0u32)
         }
     } else {
         // Planning gate (task_runner) may have forced TaskPhase::Plan for a
@@ -720,6 +731,13 @@ mod tests {
             implement_pipeline::task_needs_pr_url(&req),
             "issue task must require PR_URL"
         );
+    }
+
+    #[test]
+    fn issue_triage_runs_only_when_not_skipped_and_no_existing_pr() {
+        assert!(should_run_issue_triage(false, false));
+        assert!(!should_run_issue_triage(true, false));
+        assert!(!should_run_issue_triage(false, true));
     }
 
     #[test]

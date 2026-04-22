@@ -60,8 +60,9 @@ const AGENT_INTERNAL_PREFIXES: &[&str] = &[
 /// These contain source code keywords but are not real errors.
 fn looks_like_code_content(line: &str) -> bool {
     let trimmed = line.trim_start();
+    let had_indent = trimmed.len() != line.len();
     // Lines starting with a digit followed by whitespace are numbered source lines.
-    trimmed
+    if trimmed
         .as_bytes()
         .first()
         .is_some_and(|b| b.is_ascii_digit())
@@ -73,10 +74,113 @@ fn looks_like_code_content(line: &str) -> bool {
                     .get(pos)
                     .is_some_and(|b| b.is_ascii_whitespace())
             })
+    {
+        return true;
+    }
+
+    // Diff hunks and inline patch content frequently contain words like
+    // "warn"/"error" but should stay debug-only.
+    if trimmed.starts_with('+')
+        || trimmed.starts_with('-')
+        || trimmed.starts_with("@@")
+        || trimmed.starts_with("diff --git")
+    {
+        return true;
+    }
+
+    if had_indent {
+        const INDENTED_CODE_PREFIXES: &[&str] = &[
+            "\"",
+            "//",
+            "/*",
+            "#[",
+            "tracing::",
+            "sqlx::",
+            "tokio::",
+            "let ",
+            "fn ",
+            "pub ",
+            "impl ",
+            "struct ",
+            "enum ",
+            "match ",
+            "if ",
+            "for ",
+            "while ",
+            "loop",
+            "return ",
+            "Err(",
+            "Ok(",
+            "Some(",
+            "None",
+            ".",
+        ];
+        if INDENTED_CODE_PREFIXES
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+        {
+            return true;
+        }
+        if trimmed.ends_with('{')
+            || trimmed.ends_with('}')
+            || trimmed.ends_with(',')
+            || trimmed.ends_with(");")
+            || trimmed.ends_with(")]")
+            || trimmed.ends_with("=>")
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn looks_like_git_commit_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some((hash, rest)) = trimmed.split_once(' ') else {
+        return false;
+    };
+    (7..=40).contains(&hash.len())
+        && hash.chars().all(|c| c.is_ascii_hexdigit())
+        && !rest.is_empty()
+}
+
+fn looks_like_search_result(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some((path, rest)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let Some((line_no, _tail)) = rest.split_once(':') else {
+        return false;
+    };
+    !path.is_empty()
+        && !line_no.is_empty()
+        && line_no.chars().all(|c| c.is_ascii_digit())
+        && (path.starts_with("./")
+            || path.starts_with('/')
+            || path.contains('/')
+            || path.ends_with(".rs")
+            || path.ends_with(".md")
+            || path.ends_with(".toml"))
+}
+
+fn looks_like_markdown_prompt_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with('#')
+        || trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("> ")
+        || trimmed.starts_with("Pass: ")
+        || trimmed.starts_with("Warn: ")
+        || trimmed.starts_with("Block: ")
 }
 
 fn is_agent_internal(line: &str) -> bool {
-    if looks_like_code_content(line) {
+    if looks_like_code_content(line)
+        || looks_like_git_commit_line(line)
+        || looks_like_search_result(line)
+        || looks_like_markdown_prompt_line(line)
+    {
         return true;
     }
     let lower = line.to_lowercase();
@@ -484,5 +588,67 @@ mod tests {
         let long_line = "x".repeat(2000);
         // Should not panic
         log_captured_stderr(&long_line, "agent");
+    }
+
+    #[test]
+    fn looks_like_code_content_matches_indented_rust_fragments() {
+        assert!(looks_like_code_content(
+            "                        tracing::warn!("
+        ));
+        assert!(looks_like_code_content(
+            "                                error = %e,"
+        ));
+        assert!(looks_like_code_content(
+            "                                \"scheduler: failed to load registry project config, skipping\""
+        ));
+    }
+
+    #[test]
+    fn looks_like_code_content_matches_patch_lines() {
+        assert!(looks_like_code_content(
+            "+        // Incomplete %XX should be left as-is, not panic"
+        ));
+        assert!(looks_like_code_content(
+            "+                Err(e) => tracing::warn!("
+        ));
+    }
+
+    #[test]
+    fn looks_like_code_content_does_not_hide_real_warning_lines() {
+        assert!(!looks_like_code_content("warning: unused import"));
+        assert!(!looks_like_code_content(
+            "agent execution failed: codex exited with status 1"
+        ));
+    }
+
+    #[test]
+    fn looks_like_git_commit_line_matches_history_output() {
+        assert!(looks_like_git_commit_line(
+            "7f84b9a fix(lifecycle): add Item::Error for agent-not-found and stall paths"
+        ));
+        assert!(looks_like_git_commit_line(
+            "fb15c77 Merge pull request #352 from majiayu000/feat/issue-88-warn-missing-preflight-skill"
+        ));
+    }
+
+    #[test]
+    fn looks_like_search_result_matches_path_line_output() {
+        assert!(looks_like_search_result(
+            "./rules/go/quality.md:20:Return errors instead. `panic` only in `main()` for truly unrecoverable states."
+        ));
+        assert!(looks_like_search_result(
+            "./crates/harness-server/src/http/background.rs:382:                            format!(\"startup recovery: failed to acquire concurrency permit: {e}\");"
+        ));
+    }
+
+    #[test]
+    fn looks_like_markdown_prompt_line_matches_headings_and_bullets() {
+        assert!(looks_like_markdown_prompt_line("## Warnings"));
+        assert!(looks_like_markdown_prompt_line(
+            "- <action to resolve block/warn>"
+        ));
+        assert!(looks_like_markdown_prompt_line(
+            "Pass: <N> | Warn: <N> | Block: <N>"
+        ));
     }
 }

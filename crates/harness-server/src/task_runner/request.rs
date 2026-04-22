@@ -14,6 +14,10 @@ pub struct CreateTaskRequest {
     pub prompt: Option<String>,
     /// GitHub issue number to implement from.
     pub issue: Option<u64>,
+    /// When true, issue-backed tasks bypass the triage/plan pipeline and go
+    /// straight to implementation using the legacy direct-implement path.
+    #[serde(default)]
+    pub skip_triage: bool,
     /// GitHub PR number to review/fix.
     pub pr: Option<u64>,
     /// Explicit agent name; if omitted, uses the default agent.
@@ -82,6 +86,8 @@ pub struct PersistedRequestSettings {
     pub max_rounds: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
+    #[serde(default)]
+    pub skip_triage: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_budget_usd: Option<f64>,
     pub wait_secs: u64,
@@ -117,6 +123,7 @@ impl PersistedRequestSettings {
             agent: req.agent.clone(),
             max_rounds: req.max_rounds,
             max_turns: req.max_turns,
+            skip_triage: req.skip_triage,
             max_budget_usd: req.max_budget_usd,
             wait_secs: req.wait_secs,
             retry_base_backoff_ms: req.retry_base_backoff_ms,
@@ -146,6 +153,7 @@ impl PersistedRequestSettings {
         req.agent = self.agent.clone();
         req.max_rounds = self.max_rounds;
         req.max_turns = self.max_turns;
+        req.skip_triage = self.skip_triage;
         req.max_budget_usd = self.max_budget_usd;
         req.wait_secs = self.wait_secs;
         req.retry_base_backoff_ms = self.retry_base_backoff_ms;
@@ -168,6 +176,7 @@ impl Default for CreateTaskRequest {
         Self {
             prompt: None,
             issue: None,
+            skip_triage: false,
             pr: None,
             agent: None,
             project: None,
@@ -261,4 +270,38 @@ pub(super) fn default_turn_timeout() -> u64 {
 
 pub(super) fn default_stall_timeout() -> u64 {
     300
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_task_request_deserializes_skip_triage() {
+        let req: CreateTaskRequest =
+            serde_json::from_str(r#"{"issue": 749, "skip_triage": true}"#).expect("deserialize");
+        assert_eq!(req.issue, Some(749));
+        assert!(req.skip_triage);
+    }
+
+    #[test]
+    fn create_task_request_default_skip_triage_is_false() {
+        let req = CreateTaskRequest::default();
+        assert!(!req.skip_triage);
+    }
+
+    #[test]
+    fn persisted_request_settings_roundtrip_preserves_skip_triage() {
+        let req = CreateTaskRequest {
+            issue: Some(42),
+            skip_triage: true,
+            ..CreateTaskRequest::default()
+        };
+        let settings = PersistedRequestSettings::from_req(&req);
+        assert!(settings.skip_triage);
+
+        let mut restored = CreateTaskRequest::default();
+        settings.apply_to_req(&mut restored);
+        assert!(restored.skip_triage);
+    }
 }
