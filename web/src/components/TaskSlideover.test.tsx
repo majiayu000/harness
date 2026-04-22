@@ -21,6 +21,7 @@ const detail: TaskDetail = {
   error: null,
   source: "dashboard",
   parent_id: null,
+  external_id: null,
   repo: "majiayu000/harness",
   description: "Prompt task",
   created_at: "2026-04-22T13:00:00Z",
@@ -112,5 +113,31 @@ describe("<TaskSlideover>", () => {
     fireEvent.keyDown(window, { key: "Escape" });
 
     expect(onClose).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not emit duplicate key warnings for repeated round actions", () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockUseTaskDetail.mockReturnValue({
+      data: {
+        ...detail,
+        rounds: [
+          { turn: 2, action: "transient_retry", result: "retrying after transient failure" },
+          { turn: 2, action: "transient_retry", result: "retry succeeded" },
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    });
+
+    render(<TaskSlideover taskId="task-12345678" open onClose={() => {}} />);
+
+    expect(screen.getAllByText(/transient_retry/)).toHaveLength(2);
+    expect(
+      consoleError.mock.calls.some(([message]) =>
+        String(message).includes("Each child in a list should have a unique"),
+      ),
+    ).toBe(false);
+
+    consoleError.mockRestore();
   });
 });

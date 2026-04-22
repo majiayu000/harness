@@ -1,10 +1,13 @@
 import { useQuery } from "@tanstack/react-query";
 import { apiJson } from "./api";
-<<<<<<< HEAD
-import type { DashboardPayload, OperatorSnapshotPayload, OverviewPayload, Task } from "@/types";
-=======
-import type { DashboardPayload, OverviewPayload, Task, TaskDetail, TaskPromptRecord } from "@/types";
->>>>>>> 996596d (Expose persisted task prompts from dashboard cards)
+import type {
+  DashboardPayload,
+  OperatorSnapshotPayload,
+  OverviewPayload,
+  Task,
+  TaskDetail,
+  TaskPromptRecord,
+} from "@/types";
 
 export function useDashboard() {
   return useQuery<DashboardPayload, Error>({

@@ -1,10 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-<<<<<<< HEAD
-import { render, screen, within } from "@testing-library/react";
-=======
-import { fireEvent, render, screen } from "@testing-library/react";
->>>>>>> 996596d (Expose persisted task prompts from dashboard cards)
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Active } from "./Active";
 import type { Task } from "@/types";
@@ -95,7 +91,6 @@ describe("<Active>", () => {
     expect(dashes.length).toBeGreaterThan(0);
   });
 
-<<<<<<< HEAD
   it("groups tasks by workflow state before falling back to task status", () => {
     const ready = {
       ...makeTask("ready-task", "harness", "implementing"),
@@ -106,7 +101,7 @@ describe("<Active>", () => {
       workflow: { state: "addressing_feedback", pr_number: 124 },
     };
     mockUseTasks.mockReturnValue({ data: [ready, feedback], isLoading: false, isError: false });
-    wrap(<Active projectFilter="harness" />);
+    wrap(<Active projectFilter="harness" onOpenTask={() => {}} />);
 
     expect(screen.getByText("wf Ready To Merge")).toBeInTheDocument();
     expect(screen.getByText("wf Addressing Feedback")).toBeInTheDocument();
@@ -114,7 +109,8 @@ describe("<Active>", () => {
     expect(columnCount("Feedback")).toBe("1");
     expect(columnCount("Implementing")).toBe("0");
     expect(columnCount("Pending")).toBe("0");
-=======
+  });
+
   it("opens detail for a clicked kanban card", () => {
     const onOpenTask = vi.fn();
     mockUseTasks.mockReturnValue({ data: tasks, isLoading: false, isError: false });
@@ -137,7 +133,6 @@ describe("<Active>", () => {
     fireEvent.click(screen.getByRole("button", { name: /prompt-task/i }));
 
     expect(onOpenTask).toHaveBeenCalledWith("prompt-task");
->>>>>>> 996596d (Expose persisted task prompts from dashboard cards)
   });
 
   it("groups planner and review lifecycle statuses outside implementing", () => {

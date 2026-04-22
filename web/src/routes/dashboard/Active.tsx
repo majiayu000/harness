@@ -73,7 +73,6 @@ function columnOf(taskStatus: string, workflowState?: string | null): string {
   return "other";
 }
 
-<<<<<<< HEAD
 function workflowLabel(state: string): string {
   switch (state) {
     case "discovered":
@@ -119,42 +118,15 @@ function workflowLabel(state: string): string {
   }
 }
 
-function TaskCard({ task, workflow }: { task: Task; workflow?: WorkflowSummary | null }) {
-  const title = task.description?.trim() || task.repo || task.id.slice(0, 8);
-  return (
-    <div className="border border-line bg-bg px-2.5 py-2 mb-2 last:mb-0 hover:border-line-3 transition-colors">
-      <div className="text-[12.5px] text-ink leading-snug line-clamp-2" title={title}>
-        {title}
-      </div>
-      {workflow && (
-        <div className="mt-1 flex flex-wrap items-center gap-1">
-          <span className="border border-line bg-bg-1 px-1.5 py-[1px] font-mono text-[10px] text-ink-2">
-            wf {workflowLabel(workflow.state)}
-          </span>
-          {workflow.pr_number ? (
-            <span className="font-mono text-[10px] text-ink-3">PR #{workflow.pr_number}</span>
-          ) : null}
-          {workflow.force_execute ? (
-            <span className="border border-rust/40 bg-rust/10 px-1.5 py-[1px] font-mono text-[10px] text-rust">
-              force-execute
-            </span>
-          ) : null}
-        </div>
-      )}
-      <div className="mt-1.5 flex items-center justify-between gap-2 font-mono text-[10px] text-ink-3">
-        <span className="truncate">{task.repo ?? "—"}</span>
-        {task.turn > 0 && <span>turn {task.turn}</span>}
-      </div>
-      {workflow?.plan_concern && (
-        <div
-          className="mt-1 block font-mono text-[10px] text-rust truncate"
-          title={workflow.plan_concern}
-        >
-          concern: {workflow.plan_concern}
-        </div>
-      )}
-=======
-function TaskCard({ task, onOpenTask }: { task: Task; onOpenTask: (taskId: string) => void }) {
+function TaskCard({
+  task,
+  workflow,
+  onOpenTask,
+}: {
+  task: Task;
+  workflow?: WorkflowSummary | null;
+  onOpenTask: (taskId: string) => void;
+}) {
   const title = task.description?.trim() || task.repo || task.id.slice(0, 8);
   return (
     <div className="mb-2 border border-line bg-bg transition-colors last:mb-0 hover:border-line-3">
@@ -166,12 +138,34 @@ function TaskCard({ task, onOpenTask }: { task: Task; onOpenTask: (taskId: strin
         <div className="text-[12.5px] leading-snug text-ink line-clamp-2" title={title}>
           {title}
         </div>
+        {workflow && (
+          <div className="mt-1 flex flex-wrap items-center gap-1">
+            <span className="border border-line bg-bg-1 px-1.5 py-[1px] font-mono text-[10px] text-ink-2">
+              wf {workflowLabel(workflow.state)}
+            </span>
+            {workflow.pr_number ? (
+              <span className="font-mono text-[10px] text-ink-3">PR #{workflow.pr_number}</span>
+            ) : null}
+            {workflow.force_execute ? (
+              <span className="border border-rust/40 bg-rust/10 px-1.5 py-[1px] font-mono text-[10px] text-rust">
+                force-execute
+              </span>
+            ) : null}
+          </div>
+        )}
         <div className="mt-1.5 flex items-center justify-between gap-2 font-mono text-[10px] text-ink-3">
           <span className="truncate">{task.repo ?? "—"}</span>
           {task.turn > 0 && <span>turn {task.turn}</span>}
         </div>
+        {workflow?.plan_concern && (
+          <div
+            className="mt-1 block font-mono text-[10px] text-rust truncate"
+            title={workflow.plan_concern}
+          >
+            concern: {workflow.plan_concern}
+          </div>
+        )}
       </button>
->>>>>>> 996596d (Expose persisted task prompts from dashboard cards)
       {task.pr_url && (
         <a
           href={task.pr_url}
@@ -233,11 +227,12 @@ export function Active({ projectFilter, onOpenTask }: Props) {
                 </div>
               )}
               {rows.map((t) => (
-<<<<<<< HEAD
-                <TaskCard key={t.id} task={t} workflow={t.workflow ?? null} />
-=======
-                <TaskCard key={t.id} task={t} onOpenTask={onOpenTask} />
->>>>>>> 996596d (Expose persisted task prompts from dashboard cards)
+                <TaskCard
+                  key={t.id}
+                  task={t}
+                  workflow={t.workflow ?? null}
+                  onOpenTask={onOpenTask}
+                />
               ))}
             </div>
           </div>
@@ -249,19 +244,17 @@ export function Active({ projectFilter, onOpenTask }: Props) {
             <span>Other</span>
             <span className="text-ink-2">{other.length}</span>
           </div>
-<<<<<<< HEAD
-            <div className="p-2 flex-1 overflow-auto">
-              {other.map((t) => (
-                <TaskCard key={t.id} task={t} workflow={t.workflow ?? null} />
-              ))}
-            </div>
-=======
           <div className="p-2 flex-1 overflow-auto">
             {other.map((t) => (
-              <TaskCard key={t.id} task={t} onOpenTask={onOpenTask} />
+              <TaskCard
+                key={t.id}
+                task={t}
+                workflow={t.workflow ?? null}
+                onOpenTask={onOpenTask}
+              />
             ))}
->>>>>>> 996596d (Expose persisted task prompts from dashboard cards)
           </div>
+        </div>
       )}
     </div>
   );

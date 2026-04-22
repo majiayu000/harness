@@ -39,7 +39,6 @@ export interface TaskRound {
 }
 
 export interface TaskDetail extends Task {
-  external_id?: string | null;
   rounds: TaskRound[];
   priority?: number;
 }

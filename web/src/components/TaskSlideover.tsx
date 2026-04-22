@@ -146,8 +146,11 @@ export function TaskSlideover({ taskId, open, onClose }: Props) {
                       <div className="mt-2 font-mono text-[11px] text-ink-3">No rounds yet.</div>
                     ) : (
                       <div className="mt-3 space-y-2">
-                        {detailQuery.data.rounds.map((round) => (
-                          <div key={`${round.turn}-${round.action}`} className="border border-line px-3 py-2">
+                        {detailQuery.data.rounds.map((round, index) => (
+                          <div
+                            key={`${round.turn}-${round.action}-${index}`}
+                            className="border border-line px-3 py-2"
+                          >
                             <div className="font-mono text-[11px] text-ink-2">
                               turn {round.turn} · {round.action}
                             </div>
