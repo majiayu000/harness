@@ -242,7 +242,15 @@ fn is_quota_failure_message(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("quota exhausted")
         || lower.contains("hit your limit")
-        || lower.contains("rate limit")
+        || lower.contains("rate limit exceeded")
+        || lower.contains("rate_limit_exceeded")
+        || lower.contains("too many requests")
+        || lower.contains("api returned 429")
+        || lower.contains("status 429")
+        || lower.contains("status: 429")
+        || lower.contains("error 429")
+        || lower.contains("code 429")
+        || lower.contains("http 429")
         || lower.contains("quota resets")
         || lower.contains("quota reset")
 }
@@ -318,6 +326,19 @@ mod tests {
         .expect("turn failure");
 
         assert_eq!(failure.kind, TurnFailureKind::Billing);
+        assert_eq!(failure.provider.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn do_not_treat_generic_rate_limit_mentions_as_quota_failures() {
+        let failure = HarnessError::AgentExecution(
+            "codex exited with exit status: 1: stdout_tail=[please add rate limit backoff before retrying this request]"
+                .to_string(),
+        )
+        .turn_failure()
+        .expect("turn failure");
+
+        assert_eq!(failure.kind, TurnFailureKind::LocalProcess);
         assert_eq!(failure.provider.as_deref(), Some("codex"));
     }
 }
