@@ -87,6 +87,9 @@ mod tests {
     #[tokio::test]
     async fn health_check_returns_internal_error_when_scan_fails() -> anyhow::Result<()> {
         let _lock = HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let project_root = tempdir_in_home("health-scan-fail-root-")?;
         let data_dir = tempfile::tempdir()?;
         let state = make_test_state(project_root.path(), data_dir.path()).await?;
@@ -128,6 +131,9 @@ mod tests {
     #[tokio::test]
     async fn health_check_emits_rule_scan_anchor_event() -> anyhow::Result<()> {
         let _lock = HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         // Regression test for issue #82: the handler path must write a
         // `rule_scan` anchor event so that session-scoped violation counting
         // in metrics_query works correctly.

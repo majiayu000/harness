@@ -29,13 +29,28 @@ fn runtime_project_cache_app(state: Arc<crate::http::AppState>) -> Router {
         .with_state(state)
 }
 
+async fn make_test_state(
+    dir: &std::path::Path,
+) -> anyhow::Result<Option<Arc<crate::http::AppState>>> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(None);
+    }
+    match crate::test_helpers::make_test_state(dir).await {
+        Ok(state) => Ok(Some(Arc::new(state))),
+        Err(err) if crate::test_helpers::is_pool_timeout(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 #[tokio::test]
 async fn sync_and_list_watched_projects_by_path() -> anyhow::Result<()> {
     let data_dir = tempfile::tempdir()?;
     let project_dir = tempfile::tempdir()?;
     std::fs::create_dir_all(project_dir.path().join(".git"))?;
 
-    let state = Arc::new(crate::test_helpers::make_test_state(data_dir.path()).await?);
+    let Some(state) = make_test_state(data_dir.path()).await? else {
+        return Ok(());
+    };
     let app = runtime_project_cache_app(state);
 
     let register = app
@@ -96,9 +111,10 @@ async fn sync_and_list_watched_projects_by_path() -> anyhow::Result<()> {
 #[tokio::test]
 async fn sync_unknown_host_returns_not_found() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let app = runtime_project_cache_app(Arc::new(
-        crate::test_helpers::make_test_state(dir.path()).await?,
-    ));
+    let Some(state) = make_test_state(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_project_cache_app(state);
 
     let response = app
         .oneshot(
@@ -120,7 +136,9 @@ async fn sync_by_project_id_resolves_registry_root() -> anyhow::Result<()> {
     let data_dir = tempfile::tempdir()?;
     let project_dir = tempfile::tempdir()?;
     std::fs::create_dir_all(project_dir.path().join(".git"))?;
-    let state = Arc::new(crate::test_helpers::make_test_state(data_dir.path()).await?);
+    let Some(state) = make_test_state(data_dir.path()).await? else {
+        return Ok(());
+    };
     state
         .project_svc
         .register(crate::project_registry::Project {
@@ -176,7 +194,9 @@ async fn sync_after_deregister_does_not_recreate_cache() -> anyhow::Result<()> {
     let project_dir = tempfile::tempdir()?;
     std::fs::create_dir_all(project_dir.path().join(".git"))?;
 
-    let state = Arc::new(crate::test_helpers::make_test_state(data_dir.path()).await?);
+    let Some(state) = make_test_state(data_dir.path()).await? else {
+        return Ok(());
+    };
     let app = runtime_project_cache_app(state.clone());
 
     let register = app

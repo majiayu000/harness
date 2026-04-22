@@ -4,12 +4,26 @@ use std::str::FromStr as _;
 
 use crate::db::Migration;
 
+const DEFAULT_PG_MAX_CONNECTIONS: u32 = 3;
+const SUPABASE_POOLER_MAX_CONNECTIONS: u32 = 1;
+
+fn pg_max_connections(database_url: &str) -> u32 {
+    // Supabase's session pooler has a tight session cap relative to the
+    // number of independent Postgres-backed stores the workspace tests create.
+    // Budget one session per store there to avoid test-time pool starvation.
+    if database_url.contains(".pooler.supabase.com") {
+        SUPABASE_POOLER_MAX_CONNECTIONS
+    } else {
+        DEFAULT_PG_MAX_CONNECTIONS
+    }
+}
+
 /// Create a Postgres connection pool for the given DATABASE_URL.
 ///
 /// Uses 3 max connections with a 10-second acquire timeout.
 pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
     let pool = PgPoolOptions::new()
-        .max_connections(3)
+        .max_connections(pg_max_connections(database_url))
         .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(database_url)
         .await?;
@@ -82,7 +96,7 @@ pub async fn pg_open_pool_schematized(database_url: &str, schema: &str) -> anyho
     let opts = PgConnectOptions::from_str(database_url)?;
     let schema_for_hook = schema.to_string();
     let pool = PgPoolOptions::new()
-        .max_connections(3)
+        .max_connections(pg_max_connections(database_url))
         .acquire_timeout(std::time::Duration::from_secs(10))
         .after_connect(move |conn, _meta| {
             let schema = schema_for_hook.clone();
@@ -186,7 +200,7 @@ impl<'a> PgMigrator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_schema_name;
+    use super::{pg_max_connections, validate_schema_name};
 
     #[test]
     fn valid_schema_names() {
@@ -239,5 +253,17 @@ mod tests {
             validate_schema_name(&name).is_err(),
             "64-byte name should be rejected"
         );
+    }
+
+    #[test]
+    fn supabase_pooler_urls_use_single_connection() {
+        let url = "postgresql://user:pass@aws-1-ap-northeast-1.pooler.supabase.com:5432/postgres";
+        assert_eq!(pg_max_connections(url), 1);
+    }
+
+    #[test]
+    fn direct_postgres_urls_keep_default_connection_budget() {
+        let url = "postgresql://user:pass@db.example.internal:5432/postgres";
+        assert_eq!(pg_max_connections(url), 3);
     }
 }

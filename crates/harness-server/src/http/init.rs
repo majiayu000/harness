@@ -196,6 +196,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             task_queue: intake.task_queue,
             workspace_mgr: registry.workspace_mgr,
         },
+        #[cfg(test)]
+        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
         runtime_hosts: services.runtime_hosts,
         runtime_project_cache: services.runtime_project_cache,
         runtime_state_persist_lock: Mutex::new(()),

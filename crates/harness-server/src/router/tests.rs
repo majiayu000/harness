@@ -97,6 +97,8 @@ async fn make_test_state_with_config_and_registry(
             task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             workspace_mgr: None,
         },
+        #[cfg(test)]
+        _db_state_guard: None,
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
@@ -1419,6 +1421,8 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             workspace_mgr: None,
         },
+        #[cfg(test)]
+        _db_state_guard: None,
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),

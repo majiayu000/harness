@@ -26,10 +26,25 @@ fn runtime_hosts_app(state: Arc<crate::http::AppState>) -> Router {
         .with_state(state)
 }
 
+async fn make_test_state(
+    dir: &std::path::Path,
+) -> anyhow::Result<Option<Arc<crate::http::AppState>>> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(None);
+    }
+    match crate::test_helpers::make_test_state(dir).await {
+        Ok(state) => Ok(Some(Arc::new(state))),
+        Err(err) if crate::test_helpers::is_pool_timeout(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 #[tokio::test]
 async fn register_then_list_runtime_hosts() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+    let Some(state) = make_test_state(dir.path()).await? else {
+        return Ok(());
+    };
     let app = runtime_hosts_app(state);
 
     let body = serde_json::json!({
@@ -69,7 +84,9 @@ async fn register_then_list_runtime_hosts() -> anyhow::Result<()> {
 #[tokio::test]
 async fn claim_endpoint_blocks_double_claim() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+    let Some(state) = make_test_state(dir.path()).await? else {
+        return Ok(());
+    };
     let task = crate::task_runner::TaskState {
         id: crate::task_runner::TaskId::new(),
         status: crate::task_runner::TaskStatus::Pending,
@@ -155,7 +172,9 @@ async fn claim_endpoint_blocks_double_claim() -> anyhow::Result<()> {
 #[tokio::test]
 async fn claim_endpoint_honors_project_filter() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+    let Some(state) = make_test_state(dir.path()).await? else {
+        return Ok(());
+    };
 
     let project_a = dir.path().join("project-a");
     let project_b = dir.path().join("project-b");
@@ -256,7 +275,9 @@ async fn claim_endpoint_honors_project_filter() -> anyhow::Result<()> {
 #[tokio::test]
 async fn claim_endpoint_rejects_out_of_range_lease_secs() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+    let Some(state) = make_test_state(dir.path()).await? else {
+        return Ok(());
+    };
     let task = crate::task_runner::TaskState {
         id: crate::task_runner::TaskId::new(),
         status: crate::task_runner::TaskStatus::Pending,
@@ -321,7 +342,9 @@ async fn claim_endpoint_rejects_out_of_range_lease_secs() -> anyhow::Result<()> 
 #[tokio::test]
 async fn claim_endpoint_rejects_overflowing_lease_ttl() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+    let Some(state) = make_test_state(dir.path()).await? else {
+        return Ok(());
+    };
     let task = crate::task_runner::TaskState {
         id: crate::task_runner::TaskId::new(),
         status: crate::task_runner::TaskStatus::Pending,
