@@ -481,6 +481,64 @@ impl TaskStore {
         }))
     }
 
+    /// Clear a pending runtime-host lease from the authoritative scheduler state.
+    ///
+    /// Returns `true` only when the task still belonged to `host_id` and was
+    /// rewritten back to the queued state.
+    pub(crate) async fn release_runtime_host_claim(
+        &self,
+        id: &TaskId,
+        host_id: &str,
+    ) -> anyhow::Result<bool> {
+        let lock = self
+            .persist_locks
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        let Some(mut entry) = self.cache.get_mut(id) else {
+            return Ok(false);
+        };
+        if !matches!(entry.status, TaskStatus::Pending) {
+            return Ok(false);
+        }
+        if entry.scheduler.runtime_host_id() != Some(host_id) {
+            return Ok(false);
+        }
+
+        entry.scheduler.clear_to_queued();
+        let snapshot = entry.value().clone();
+        drop(entry);
+        self.db.update(&snapshot).await?;
+        Ok(true)
+    }
+
+    /// Release every pending task lease owned by `host_id`.
+    pub(crate) async fn release_runtime_host_claims(
+        &self,
+        host_id: &str,
+    ) -> anyhow::Result<Vec<TaskId>> {
+        let candidate_ids: Vec<TaskId> = self
+            .cache
+            .iter()
+            .filter_map(|entry| {
+                let task = entry.value();
+                (matches!(task.status, TaskStatus::Pending)
+                    && task.scheduler.runtime_host_id() == Some(host_id))
+                .then(|| task.id.clone())
+            })
+            .collect();
+
+        let mut released = Vec::new();
+        for task_id in candidate_ids {
+            if self.release_runtime_host_claim(&task_id, host_id).await? {
+                released.push(task_id);
+            }
+        }
+        Ok(released)
+    }
+
     /// Return the `pr_url` of the most recently created Done task, ordered by `created_at DESC`
     /// from the database (stable ordering, unlike the in-memory DashMap cache).
     pub async fn latest_done_pr_url(&self) -> Option<String> {
@@ -1275,6 +1333,12 @@ mod tests {
         );
     }
 
+    fn pending_task(id: &str) -> TaskState {
+        let mut task = TaskState::new(harness_core::types::TaskId(id.to_string()));
+        task.status = TaskStatus::Pending;
+        task
+    }
+
     #[tokio::test]
     async fn task_stream_subscribe_and_publish() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1694,6 +1758,55 @@ mod tests {
         let key = root.to_string_lossy().into_owned();
         assert_eq!(counts.by_project[&key].done, 1);
         assert_eq!(counts.by_project[&key].failed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn release_runtime_host_claims_clears_pending_scheduler_owner() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let mut leased = pending_task("leased");
+        leased.scheduler.claim_runtime_host("host-a", Utc::now());
+        let leased_id = leased.id.clone();
+        store.insert(&leased).await;
+
+        let mut other_host = pending_task("other-host");
+        other_host
+            .scheduler
+            .claim_runtime_host("host-b", Utc::now());
+        let other_host_id = other_host.id.clone();
+        store.insert(&other_host).await;
+
+        let mut non_pending = pending_task("non-pending");
+        non_pending.status = TaskStatus::Implementing;
+        non_pending
+            .scheduler
+            .claim_runtime_host("host-a", Utc::now());
+        let non_pending_id = non_pending.id.clone();
+        store.insert(&non_pending).await;
+
+        let released = store.release_runtime_host_claims("host-a").await?;
+        assert_eq!(released, vec![leased_id.clone()]);
+
+        let released_task = store
+            .get(&leased_id)
+            .expect("released task should remain cached");
+        assert_eq!(released_task.scheduler.runtime_host_id(), None);
+        assert!(matches!(
+            released_task.scheduler.authority_state,
+            crate::task_runner::SchedulerAuthorityState::Queued
+        ));
+
+        let other_task = store
+            .get(&other_host_id)
+            .expect("other-host task should remain cached");
+        assert_eq!(other_task.scheduler.runtime_host_id(), Some("host-b"));
+
+        let non_pending_task = store
+            .get(&non_pending_id)
+            .expect("non-pending task should remain cached");
+        assert_eq!(non_pending_task.scheduler.runtime_host_id(), Some("host-a"));
         Ok(())
     }
 

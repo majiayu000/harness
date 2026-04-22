@@ -83,6 +83,30 @@ pub async fn deregister_runtime_host(
     Path(host_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if state.runtime_hosts.deregister(&host_id) {
+        match state.core.tasks.release_runtime_host_claims(&host_id).await {
+            Ok(released) => {
+                if !released.is_empty() {
+                    tracing::info!(
+                        host_id = %host_id,
+                        released_tasks = released.len(),
+                        "runtime host deregistration released pending scheduler leases"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    host_id = %host_id,
+                    error = %e,
+                    "failed to release runtime-host-owned task leases during deregistration"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": format!("failed to release task leases for runtime host: {e}")
+                    })),
+                );
+            }
+        }
         state.runtime_project_cache.clear_host(&host_id);
         if let Err(response) = persist_runtime_state(&state).await {
             return response;
