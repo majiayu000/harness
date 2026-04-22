@@ -389,26 +389,19 @@ fn parse_issue_external_id(external_id: &str) -> Option<u64> {
         .ok()
 }
 
+const DEPENDENCY_UNBLOCKING_TASK_STATUSES: &[&str] = &["done", "failed"];
+
 async fn completed_issue_numbers_for_project(
     tasks: &crate::task_runner::TaskStore,
     project_id: &str,
 ) -> std::collections::HashSet<u64> {
-    match tasks.list_all_with_terminal().await {
-        Ok(all_tasks) => all_tasks
+    match tasks
+        .list_external_ids_by_project_and_statuses(project_id, DEPENDENCY_UNBLOCKING_TASK_STATUSES)
+        .await
+    {
+        Ok(external_ids) => external_ids
             .into_iter()
-            .filter(|task| {
-                matches!(task.status, TaskStatus::Done)
-                    && task
-                        .project_root
-                        .as_ref()
-                        .map(|path| path.to_string_lossy() == project_id)
-                        .unwrap_or(false)
-            })
-            .filter_map(|task| {
-                task.external_id
-                    .as_deref()
-                    .and_then(parse_issue_external_id)
-            })
+            .filter_map(|external_id| parse_issue_external_id(&external_id))
             .collect(),
         Err(e) => {
             tracing::warn!(
@@ -1320,6 +1313,40 @@ mod tests {
     fn done_and_failed_tasks_still_count_as_completed_dependencies() {
         assert!(status_unblocks_dependents(&TaskStatus::Done));
         assert!(status_unblocks_dependents(&TaskStatus::Failed));
+    }
+
+    #[tokio::test]
+    async fn completed_issue_numbers_for_project_includes_failed_tasks() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::task_runner::TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let project_root = std::path::PathBuf::from("/projects/alpha");
+        let other_project_root = std::path::PathBuf::from("/projects/beta");
+
+        for (id, issue, status, root) in [
+            ("done", 41_u64, TaskStatus::Done, &project_root),
+            ("failed", 42_u64, TaskStatus::Failed, &project_root),
+            ("cancelled", 43_u64, TaskStatus::Cancelled, &project_root),
+            (
+                "other-project",
+                44_u64,
+                TaskStatus::Done,
+                &other_project_root,
+            ),
+        ] {
+            let mut task =
+                crate::task_runner::TaskState::new(harness_core::types::TaskId(id.to_string()));
+            task.status = status;
+            task.project_root = Some(root.clone());
+            task.external_id = Some(format!("issue:{issue}"));
+            store.insert(&task).await;
+        }
+
+        let completed =
+            completed_issue_numbers_for_project(store.as_ref(), &project_root.to_string_lossy())
+                .await;
+
+        assert_eq!(completed, make_issues(&[41, 42]));
+        Ok(())
     }
 
     #[test]

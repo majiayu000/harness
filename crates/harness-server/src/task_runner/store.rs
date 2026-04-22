@@ -350,6 +350,46 @@ impl TaskStore {
         Ok(by_id)
     }
 
+    /// Return external IDs for tasks in `project_id` whose status matches `statuses`.
+    ///
+    /// Queries the database with project/status filters applied so callers do not
+    /// need to deserialize every historical task row just to inspect a narrow slice.
+    /// Matching cache entries override DB rows for the same task ID.
+    pub async fn list_external_ids_by_project_and_statuses(
+        &self,
+        project_id: &str,
+        statuses: &[&str],
+    ) -> anyhow::Result<Vec<String>> {
+        let mut by_id: HashMap<TaskId, String> = self
+            .db
+            .list_external_ids_by_project_and_statuses(project_id, statuses)
+            .await?
+            .into_iter()
+            .map(|(id, external_id)| (harness_core::types::TaskId(id), external_id))
+            .collect();
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let status_set: std::collections::HashSet<&str> = statuses.iter().copied().collect();
+        for entry in self.cache.iter() {
+            let task = entry.value();
+            let same_project = task
+                .project_root
+                .as_ref()
+                .map(|path| path.to_string_lossy() == project_id)
+                .unwrap_or(false);
+            if !same_project || !status_set.contains(task.status.as_ref()) {
+                continue;
+            }
+            if let Some(external_id) = task.external_id.clone() {
+                by_id.insert(entry.key().clone(), external_id);
+            }
+        }
+
+        Ok(by_id.into_values().collect())
+    }
+
     /// Run `f` only if the task still exists and is live-`pending`.
     ///
     /// Holding the mutable cache guard across `f` prevents a concurrent status

@@ -132,6 +132,28 @@ impl TaskDb {
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 
+    /// Return `(task_id, external_id)` pairs for tasks in `project` whose `status`
+    /// column matches any value in `statuses`.
+    pub async fn list_external_ids_by_project_and_statuses(
+        &self,
+        project: &str,
+        statuses: &[&str],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = Self::numbered_placeholders(2, statuses.len());
+        let sql = format!(
+            "SELECT id, external_id FROM tasks \
+             WHERE project = $1 AND external_id IS NOT NULL AND status IN ({placeholders})"
+        );
+        let mut q = sqlx::query_as::<_, (String, String)>(&sql).bind(project);
+        for status in statuses {
+            q = q.bind(*status);
+        }
+        q.fetch_all(&self.pool).await.map_err(Into::into)
+    }
+
     /// Find an active (non-terminal) task for the same project + external_id.
     pub async fn find_active_duplicate(
         &self,
