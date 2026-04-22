@@ -221,7 +221,8 @@ impl TaskDb {
     pub async fn list_summaries(&self) -> anyhow::Result<Vec<crate::task_runner::TaskSummary>> {
         let rows = sqlx::query_as::<_, TaskSummaryRow>(
             "SELECT id, status, turn, pr_url, error, source, external_id, parent_id, \
-             created_at, repo, depends_on, project, phase, description \
+             created_at, repo, depends_on::text AS depends_on, project, \
+             phase::text AS phase, description \
              FROM tasks ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)

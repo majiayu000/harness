@@ -792,6 +792,9 @@ impl TaskStore {
         let snapshot = self.cache.get(id).map(|state| state.value().clone());
         if let Some(state) = snapshot {
             self.db.update(&state).await?;
+            if let Some(mut entry) = self.cache.get_mut(id) {
+                entry.version += 1;
+            }
 
             // Persist a checkpoint to the DB so that recover_in_progress() can
             // restore the task if the server is killed mid-flight. Only written
@@ -1357,6 +1360,62 @@ mod tests {
         let key = root.to_string_lossy().into_owned();
         assert_eq!(counts.by_project[&key].done, 1);
         assert_eq!(counts.by_project[&key].failed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_advances_cached_version_after_successful_update() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let id = harness_core::types::TaskId("version-sync".to_string());
+
+        store.insert(&TaskState::new(id.clone())).await;
+
+        mutate_and_persist(&store, &id, |state| {
+            state.turn = 1;
+        })
+        .await?;
+        assert_eq!(
+            store.get(&id).as_ref().map(|state| state.version),
+            Some(1),
+            "cache must track the version increment after the first successful persist"
+        );
+
+        mutate_and_persist(&store, &id, |state| {
+            state.turn = 2;
+        })
+        .await?;
+        assert_eq!(
+            store.get(&id).as_ref().map(|state| state.version),
+            Some(2),
+            "sequential persists should continue from the updated cache version"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_all_summaries_handles_jsonb_backed_fields() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let id = harness_core::types::TaskId("summary-jsonb".to_string());
+        let dep = harness_core::types::TaskId("dep-1".to_string());
+
+        let mut task = TaskState::new(id.clone());
+        task.depends_on = vec![dep.clone()];
+        task.description = Some("summary row".to_string());
+        store.insert(&task).await;
+
+        let summary = store
+            .list_all_summaries_with_terminal()
+            .await?
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .expect("inserted task should appear in summaries");
+
+        assert_eq!(summary.depends_on, vec![dep]);
+        assert_eq!(summary.phase, crate::task_runner::TaskPhase::default());
+        assert_eq!(summary.description.as_deref(), Some("summary row"));
         Ok(())
     }
 
