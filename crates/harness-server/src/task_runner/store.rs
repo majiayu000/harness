@@ -1080,7 +1080,7 @@ mod tests {
         inflight.pr_url = Some("https://github.com/acme/myrepo/pull/7".to_string());
 
         let pending_without_pr = TaskState::new(harness_core::types::TaskId("no-pr".to_string()));
-        let tasks = vec![valid, invalid, inflight, pending_without_pr];
+        let tasks = [valid, invalid, inflight, pending_without_pr];
         let candidates: Vec<_> = tasks.iter().filter_map(recovered_pr_candidate).collect();
         assert_eq!(
             candidates,
