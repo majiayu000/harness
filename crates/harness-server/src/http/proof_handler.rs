@@ -12,41 +12,43 @@ use serde_json::json;
 use std::sync::Arc;
 
 use super::state::AppState;
-use crate::task_runner::{RoundResult, TaskState, TaskStatus};
+use crate::task_runner::{TaskState, TaskStatus};
 
 /// Derive a `ProofOfWork` from a `TaskState`.
 ///
 /// Scans `rounds` in reverse to find the final review detail, counts review
 /// rounds, and infers outcomes from known result label constants.
 fn proof_from_state(state: &TaskState) -> ProofOfWork {
-    // Accept both "review" (external bot) and "agent_review" (agent gate when
-    // review_bot_auto_trigger is disabled) so neither path is silently dropped.
-    let review_rounds_vec: Vec<&RoundResult> = state
-        .rounds
-        .iter()
-        .filter(|r| r.action == ACTION_REVIEW || r.action == ACTION_AGENT_REVIEW)
-        .collect();
+    let mut review_rounds = 0u32;
+    let mut has_lgtm = false;
+    let mut saw_executed_review = false;
+    let mut review_only = true;
+    let mut final_review_detail = None;
 
-    let review_rounds = review_rounds_vec.len() as u32;
+    for round in &state.rounds {
+        if round.action != ACTION_REVIEW && round.action != ACTION_AGENT_REVIEW {
+            continue;
+        }
 
-    // LGTM: external bot writes "lgtm"; agent reviewer writes "approved".
-    let has_lgtm = review_rounds_vec.iter().any(|r| {
-        r.result == RESULT_LGTM || (r.action == ACTION_AGENT_REVIEW && r.result == RESULT_APPROVED)
-    });
-    // Non-PR review tasks (periodic_review, sprint_planner) write result="completed";
-    // treat them as not applicable rather than falsely reporting changes_requested.
-    let is_review_only = review_rounds > 0
-        && review_rounds_vec
-            .iter()
-            .all(|r| r.result == RESULT_COMPLETED);
+        final_review_detail = round.detail.clone();
 
-    // Quota-heuristic graduation: external reviewer quota was exhausted on every
-    // round and the test gate passed as a proxy — task is Done, tests passed.
-    let quota_heuristic_done = review_rounds > 0
-        && review_rounds_vec
-            .iter()
-            .all(|r| r.result == RESULT_QUOTA_EXHAUSTED)
-        && state.status == TaskStatus::Done;
+        if round.result == RESULT_QUOTA_EXHAUSTED {
+            continue;
+        }
+
+        review_rounds += 1;
+        saw_executed_review = true;
+        review_only &= round.result == RESULT_COMPLETED;
+        has_lgtm |= round.result == RESULT_LGTM
+            || (round.action == ACTION_AGENT_REVIEW && round.result == RESULT_APPROVED);
+    }
+
+    let is_review_only = saw_executed_review && review_only;
+    let quota_heuristic_done = state.status == TaskStatus::Done
+        && state
+            .error
+            .as_deref()
+            .is_some_and(|note| note.starts_with("LGTM via quota-heuristic:"));
 
     let review_outcome = if is_review_only {
         ReviewOutcome::NotApplicable
@@ -65,32 +67,7 @@ fn proof_from_state(state: &TaskState) -> ProofOfWork {
         TaskStatus::Failed => CiStatus::Failed,
         _ => CiStatus::Unknown,
     };
-
-    // Detail from the last review round (either action type) that has a detail field.
-    let final_review_detail = state
-        .rounds
-        .iter()
-        .rev()
-        .find(|r| {
-            (r.action == ACTION_REVIEW || r.action == ACTION_AGENT_REVIEW) && r.detail.is_some()
-        })
-        .and_then(|r| r.detail.clone());
-
-    // Basic quality signals derived from the task.
-    let mut signals: Vec<QualitySignal> = vec![
-        QualitySignal {
-            label: "review_rounds".to_string(),
-            value: review_rounds.to_string(),
-        },
-        QualitySignal {
-            label: "pr_url".to_string(),
-            value: if state.pr_url.is_some() {
-                "present".to_string()
-            } else {
-                "absent".to_string()
-            },
-        },
-    ];
+    let mut signals: Vec<QualitySignal> = Vec::new();
     if let Some(note) = &state.error {
         signals.push(QualitySignal {
             label: "completion_note".to_string(),
@@ -102,7 +79,9 @@ fn proof_from_state(state: &TaskState) -> ProofOfWork {
         task_id: state.id.0.clone(),
         pr_url: state.pr_url.clone(),
         repo: state.repo.clone(),
-        issue: state.issue,
+        issue: state
+            .issue
+            .or_else(|| infer_issue_from_external_id(state.external_id.as_deref())),
         ci_status,
         review_outcome,
         review_rounds,
@@ -111,10 +90,20 @@ fn proof_from_state(state: &TaskState) -> ProofOfWork {
     }
 }
 
+fn infer_issue_from_external_id(external_id: Option<&str>) -> Option<u64> {
+    let raw = match external_id {
+        Some(raw) if raw.starts_with("issue:") => raw.strip_prefix("issue:")?,
+        Some(raw) if raw.chars().all(|ch| ch.is_ascii_digit()) => raw,
+        _ => return None,
+    };
+
+    raw.parse().ok()
+}
+
 /// GET /tasks/{id}/proof — machine-readable proof-of-work for a completed task.
 ///
 /// Returns 404 when the task does not exist, 422 when the task has not yet
-/// reached the `Done` state.
+/// reached a terminal state.
 pub(crate) async fn get_task_proof(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
@@ -140,7 +129,7 @@ pub(crate) async fn get_task_proof(
         }
     };
 
-    if task.status != TaskStatus::Done {
+    if !matches!(task.status, TaskStatus::Done | TaskStatus::Failed) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({

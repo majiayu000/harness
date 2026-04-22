@@ -96,6 +96,7 @@ fn from_task_done_with_approved_review() {
     assert_eq!(proof.ci_status, CiStatus::Passed);
     assert_eq!(proof.review_rounds, 2);
     assert_eq!(proof.final_review_detail.as_deref(), Some("all good"));
+    assert!(proof.quality_signals.is_empty());
 }
 
 #[test]
@@ -159,12 +160,62 @@ fn from_task_quota_heuristic_graduation() {
         review_round(RESULT_QUOTA_EXHAUSTED, None),
         review_round(RESULT_QUOTA_EXHAUSTED, None),
     ];
-    let state = make_state_with_rounds(TaskStatus::Done, rounds);
+    let mut state = make_state_with_rounds(TaskStatus::Done, rounds);
+    state.error = Some(
+        "LGTM via quota-heuristic: external reviewer quota exhausted after 3 rounds, tests passed"
+            .to_string(),
+    );
     let proof = proof_from_state(&state);
 
     assert_eq!(proof.review_outcome, ReviewOutcome::Approved);
     assert_eq!(proof.ci_status, CiStatus::Passed);
-    assert_eq!(proof.review_rounds, 3);
+    assert_eq!(proof.review_rounds, 0);
+    assert_eq!(proof.final_review_detail, None);
+}
+
+#[test]
+fn from_task_mixed_quota_heuristic_graduation() {
+    let rounds = vec![
+        review_round("fixed", Some("addressed initial feedback")),
+        review_round(RESULT_QUOTA_EXHAUSTED, None),
+        review_round(RESULT_QUOTA_EXHAUSTED, None),
+        review_round(RESULT_QUOTA_EXHAUSTED, None),
+    ];
+    let mut state = make_state_with_rounds(TaskStatus::Done, rounds);
+    state.error = Some(
+        "LGTM via quota-heuristic: external reviewer quota exhausted after 3 rounds, tests passed"
+            .to_string(),
+    );
+
+    let proof = proof_from_state(&state);
+
+    assert_eq!(proof.review_outcome, ReviewOutcome::Approved);
+    assert_eq!(proof.ci_status, CiStatus::Passed);
+    assert_eq!(proof.review_rounds, 1);
+    assert!(proof.final_review_detail.is_none());
+}
+
+#[test]
+fn from_task_uses_actual_final_review_round_detail() {
+    let rounds = vec![
+        review_round("fixed", Some("older feedback")),
+        review_round(RESULT_QUOTA_EXHAUSTED, None),
+    ];
+    let state = make_state_with_rounds(TaskStatus::Done, rounds);
+    let proof = proof_from_state(&state);
+
+    assert_eq!(proof.review_rounds, 1);
+    assert!(proof.final_review_detail.is_none());
+}
+
+#[test]
+fn from_task_falls_back_to_external_issue_id() {
+    let mut state = make_state_with_rounds(TaskStatus::Done, vec![]);
+    state.external_id = Some("issue:123".to_string());
+
+    let proof = proof_from_state(&state);
+
+    assert_eq!(proof.issue, Some(123));
 }
 
 // ---------------------------------------------------------------------------
@@ -365,7 +416,7 @@ async fn proof_endpoint_route_coverage() -> anyhow::Result<()> {
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "404 case");
     }
 
-    // --- 422: task exists but is not Done ---
+    // --- 422: task exists but is not terminal ---
     {
         let id = harness_core::types::TaskId("pending-task".to_string());
         state.core.tasks.insert(&TaskState::new(id)).await;
@@ -382,6 +433,28 @@ async fn proof_endpoint_route_coverage() -> anyhow::Result<()> {
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             "422 case"
         );
+    }
+
+    // --- 200: Failed task is terminal and should return proof ---
+    {
+        let id = harness_core::types::TaskId("failed-task".to_string());
+        let mut task = TaskState::new(id);
+        task.status = TaskStatus::Failed;
+        task.rounds = vec![review_round("fixed", Some("needs more work"))];
+        state.core.tasks.insert(&task).await;
+
+        let resp = proof_route(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/failed-task/proof")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK, "failed 200");
+        let body = resp.into_body().collect().await?.to_bytes();
+        let proof: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(proof["ci_status"], "failed");
+        assert_eq!(proof["review_outcome"], "changes_requested");
     }
 
     // --- 200: Done task with LGTM rounds, issue preserved from cache ---
@@ -447,6 +520,35 @@ async fn proof_endpoint_route_coverage() -> anyhow::Result<()> {
         let body = resp.into_body().collect().await?.to_bytes();
         let proof: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(proof["issue"], 99, "issue must survive DB roundtrip");
+    }
+
+    // --- 200: DB-fallback path — legacy external_id restores issue when column is null ---
+    {
+        let id = harness_core::types::TaskId("legacy-db-task".to_string());
+        let mut task = TaskState::new(id.clone());
+        task.status = TaskStatus::Done;
+        task.external_id = Some("issue:314".to_string());
+        state.core.tasks.insert(&task).await;
+        state.core.tasks.cache.remove(&id); // evict to force DB path
+
+        let resp = proof_route(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/legacy-db-task/proof")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "legacy DB-fallback 200"
+        );
+        let body = resp.into_body().collect().await?.to_bytes();
+        let proof: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(
+            proof["issue"], 314,
+            "legacy external_id should restore issue"
+        );
     }
 
     // --- 200: periodic_review task → review_outcome = not_applicable ---
