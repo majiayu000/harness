@@ -919,6 +919,8 @@ async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
     let get_body = get_resp.into_body().collect().await?.to_bytes();
     let task_json: serde_json::Value = serde_json::from_slice(&get_body)?;
     assert_eq!(task_json["id"], task_id);
+    assert!(task_json["scheduler"]["authority_state"].is_string());
+    assert!(task_json["scheduler"]["run_generation"].is_number());
     Ok(())
 }
 
@@ -1955,7 +1957,7 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -2103,7 +2105,7 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;

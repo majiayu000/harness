@@ -1,4 +1,4 @@
-use crate::task_runner::{SystemTaskInput, TaskKind, TaskState, TaskStatus};
+use crate::task_runner::{TaskKind, TaskState, TaskStatus};
 use chrono::{DateTime, Utc};
 use harness_core::error::TaskDbDecodeError;
 use serde::{Deserialize, Serialize};
@@ -63,14 +63,10 @@ pub struct RecoveryResult {
 #[derive(sqlx::FromRow)]
 pub(super) struct RecoveryRow {
     pub(super) id: String,
-    pub(super) task_kind: String,
-    pub(super) source: Option<String>,
-    pub(super) external_id: Option<String>,
-    pub(super) description: Option<String>,
     pub(super) status: String,
     pub(super) turn: i64,
     pub(super) task_pr_url: Option<String>,
-    pub(super) system_input: Option<String>,
+    pub(super) scheduler_state: String,
     pub(super) triage_output: Option<String>,
     pub(super) plan_output: Option<String>,
     pub(super) ck_pr_url: Option<String>,
@@ -82,7 +78,7 @@ pub(super) struct RecoveryRow {
 /// When adding a field to `TaskRow`, add the column here once and all queries
 /// pick it up automatically.  The `task_row_columns_match_struct` test below
 /// will fail if this list drifts from the struct definition.
-pub(super) const TASK_ROW_COLUMNS: &str = "id, task_kind, status, failure_kind, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, updated_at, repo, depends_on, project, workspace_path, workspace_owner, run_generation, priority, phase, description, request_settings, system_input";
+pub(super) const TASK_ROW_COLUMNS: &str = "id, task_kind, status, failure_kind, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, updated_at, repo, depends_on, project, workspace_path, workspace_owner, run_generation, priority, phase, description, request_settings, scheduler_state";
 
 #[derive(sqlx::FromRow)]
 pub(super) struct TaskRow {
@@ -109,7 +105,7 @@ pub(super) struct TaskRow {
     pub(super) phase: String,
     pub(super) description: Option<String>,
     pub(super) request_settings: Option<String>,
-    pub(super) system_input: Option<String>,
+    pub(super) scheduler_state: String,
 }
 
 /// Combined row for the pending-tasks-with-checkpoint JOIN query.
@@ -138,7 +134,7 @@ pub(super) struct PendingCheckpointRow {
     pub(super) phase: String,
     pub(super) description: Option<String>,
     pub(super) request_settings: Option<String>,
-    pub(super) system_input: Option<String>,
+    pub(super) scheduler_state: String,
     // Checkpoint columns (aliased)
     pub(super) triage_output: Option<String>,
     pub(super) plan_output: Option<String>,
@@ -169,6 +165,7 @@ pub(super) struct TaskSummaryRow {
     pub(super) run_generation: i64,
     pub(super) phase: String,
     pub(super) description: Option<String>,
+    pub(super) scheduler_state: String,
 }
 
 /// Lightweight row for operator snapshot recent-failure queries.
@@ -218,16 +215,13 @@ impl TaskRow {
             phase,
             description,
             request_settings,
-            system_input,
+            scheduler_state,
         } = self;
 
         let decoded_request_settings: Option<crate::task_runner::PersistedRequestSettings> =
             request_settings
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
-        let decoded_system_input: Option<SystemTaskInput> = system_input
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok());
         let decoded_task_kind = TaskKind::from_persisted(
             Some(&task_kind),
             source.as_deref(),
@@ -254,6 +248,9 @@ impl TaskRow {
                     source,
                 }
             })?;
+        let decoded_scheduler =
+            serde_json::from_str::<crate::task_runner::TaskSchedulerState>(&scheduler_state)
+                .unwrap_or_default();
 
         Ok(TaskState {
             id: harness_core::types::TaskId(id),
@@ -287,7 +284,7 @@ impl TaskRow {
             plan_output: None,
             repo,
             request_settings: decoded_request_settings,
-            system_input: decoded_system_input,
+            scheduler: decoded_scheduler,
         })
     }
 }
@@ -314,6 +311,9 @@ impl TaskSummaryRow {
             self.external_id.as_deref(),
             self.description.as_deref(),
         )?;
+        let scheduler =
+            serde_json::from_str::<crate::task_runner::TaskSchedulerState>(&self.scheduler_state)
+                .unwrap_or_default();
         Ok(crate::task_runner::TaskSummary {
             id: TaskId(self.id),
             task_kind: decoded_task_kind,
@@ -340,6 +340,7 @@ impl TaskSummaryRow {
             workspace_owner: self.workspace_owner,
             run_generation: self.run_generation.max(0) as u32,
             workflow: None,
+            scheduler,
         })
     }
 }

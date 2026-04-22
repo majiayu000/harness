@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use super::request::{PersistedRequestSettings, SystemTaskInput};
+use chrono::{DateTime, Utc};
+use super::request::PersistedRequestSettings;
 use super::types::{TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +16,162 @@ pub struct RoundResult {
     /// Time from agent launch to first output token (milliseconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_token_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerOwnerKind {
+    Scheduler,
+    RuntimeHost,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchedulerOwner {
+    pub kind: SchedulerOwnerKind,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerAuthorityState {
+    #[default]
+    Queued,
+    AwaitingDependencies,
+    Running,
+    RetryBackoff,
+    Leased,
+    Recovering,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskSchedulerState {
+    #[serde(default)]
+    pub authority_state: SchedulerAuthorityState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<SchedulerOwner>,
+    #[serde(default)]
+    pub run_generation: u32,
+    #[serde(default)]
+    pub recovery_generation: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<String>,
+}
+
+impl Default for TaskSchedulerState {
+    fn default() -> Self {
+        Self::queued()
+    }
+}
+
+impl TaskSchedulerState {
+    pub fn queued() -> Self {
+        Self {
+            authority_state: SchedulerAuthorityState::Queued,
+            owner: None,
+            run_generation: 0,
+            recovery_generation: 0,
+            lease_expires_at: None,
+        }
+    }
+
+    pub fn awaiting_dependencies() -> Self {
+        Self {
+            authority_state: SchedulerAuthorityState::AwaitingDependencies,
+            ..Self::queued()
+        }
+    }
+
+    pub fn claim_scheduler(&mut self, owner_id: impl Into<String>) {
+        self.authority_state = SchedulerAuthorityState::Running;
+        self.owner = Some(SchedulerOwner {
+            kind: SchedulerOwnerKind::Scheduler,
+            id: owner_id.into(),
+        });
+        self.run_generation = self.run_generation.saturating_add(1);
+        self.lease_expires_at = None;
+    }
+
+    pub fn mark_retry_backoff(&mut self) {
+        self.authority_state = SchedulerAuthorityState::RetryBackoff;
+        self.lease_expires_at = None;
+    }
+
+    pub fn mark_recovering(&mut self, owner_id: impl Into<String>) {
+        self.authority_state = SchedulerAuthorityState::Recovering;
+        self.owner = Some(SchedulerOwner {
+            kind: SchedulerOwnerKind::Scheduler,
+            id: owner_id.into(),
+        });
+        self.recovery_generation = self.recovery_generation.saturating_add(1);
+        self.lease_expires_at = None;
+    }
+
+    pub fn claim_runtime_host(
+        &mut self,
+        host_id: impl Into<String>,
+        lease_expires_at: DateTime<Utc>,
+    ) {
+        self.authority_state = SchedulerAuthorityState::Leased;
+        self.owner = Some(SchedulerOwner {
+            kind: SchedulerOwnerKind::RuntimeHost,
+            id: host_id.into(),
+        });
+        self.run_generation = self.run_generation.saturating_add(1);
+        self.lease_expires_at = Some(lease_expires_at.to_rfc3339());
+    }
+
+    pub fn clear_to_queued(&mut self) {
+        self.authority_state = SchedulerAuthorityState::Queued;
+        self.owner = None;
+        self.lease_expires_at = None;
+    }
+
+    pub fn mark_terminal(&mut self, status: &TaskStatus) {
+        self.owner = None;
+        self.lease_expires_at = None;
+        self.authority_state = match status {
+            TaskStatus::Done => SchedulerAuthorityState::Done,
+            TaskStatus::Failed => SchedulerAuthorityState::Failed,
+            TaskStatus::Cancelled => SchedulerAuthorityState::Cancelled,
+            TaskStatus::AwaitingDeps => SchedulerAuthorityState::AwaitingDependencies,
+            TaskStatus::Pending => SchedulerAuthorityState::Queued,
+            _ => SchedulerAuthorityState::Running,
+        };
+    }
+
+    pub fn has_live_runtime_host_lease(&self, now: DateTime<Utc>) -> bool {
+        self.owner.as_ref().is_some_and(|owner| {
+            owner.kind == SchedulerOwnerKind::RuntimeHost
+                && self
+                    .lease_expires_at
+                    .as_deref()
+                    .and_then(parse_rfc3339_utc)
+                    .is_some_and(|expires_at| expires_at > now)
+        })
+    }
+
+    pub fn runtime_host_id(&self) -> Option<&str> {
+        self.owner.as_ref().and_then(|owner| {
+            if owner.kind == SchedulerOwnerKind::RuntimeHost {
+                Some(owner.id.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn lease_expiry(&self) -> Option<DateTime<Utc>> {
+        self.lease_expires_at.as_deref().and_then(parse_rfc3339_utc)
+    }
+}
+
+fn parse_rfc3339_utc(value: &str) -> Option<DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,10 +249,9 @@ pub struct TaskState {
     /// requested rather than silently falling back to server defaults.
     #[serde(skip)]
     pub request_settings: Option<PersistedRequestSettings>,
-    /// Restart-safe prompt snapshot for trusted system-generated prompt tasks.
-    /// Persisted internally for recovery only; never expose it via the public task API.
-    #[serde(skip)]
-    pub system_input: Option<SystemTaskInput>,
+    /// Canonical scheduler authority for ownership, recovery, and retry state.
+    #[serde(default)]
+    pub scheduler: TaskSchedulerState,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -149,6 +305,9 @@ pub struct TaskSummary {
     /// Issue workflow state summary, when this task belongs to an issue workflow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow: Option<harness_workflow::issue_lifecycle::IssueWorkflowInstance>,
+    /// Canonical scheduler authority for ownership, recovery, and retry state.
+    #[serde(default)]
+    pub scheduler: TaskSchedulerState,
 }
 
 /// Lightweight recent-failure row used by the operator snapshot.
@@ -212,7 +371,7 @@ impl TaskState {
             plan_output: None,
             repo: None,
             request_settings: None,
-            system_input: None,
+            scheduler: TaskSchedulerState::queued(),
         }
     }
 
@@ -245,6 +404,39 @@ impl TaskState {
             workspace_owner: self.workspace_owner.clone(),
             run_generation: self.run_generation,
             workflow: None,
+            scheduler: self.scheduler.clone(),
+        }
+    }
+
+    pub(crate) fn reconcile_scheduler_with_status(&mut self) {
+        match self.status {
+            TaskStatus::Pending => {
+                if self.scheduler.owner.is_none()
+                    && !matches!(
+                        self.scheduler.authority_state,
+                        SchedulerAuthorityState::Recovering | SchedulerAuthorityState::RetryBackoff
+                    )
+                {
+                    self.scheduler.clear_to_queued();
+                }
+            }
+            TaskStatus::AwaitingDeps => {
+                self.scheduler = TaskSchedulerState::awaiting_dependencies();
+            }
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled => {
+                self.scheduler.mark_terminal(&self.status);
+            }
+            _ => {
+                if matches!(
+                    self.scheduler.authority_state,
+                    SchedulerAuthorityState::Queued
+                        | SchedulerAuthorityState::Recovering
+                        | SchedulerAuthorityState::RetryBackoff
+                        | SchedulerAuthorityState::AwaitingDependencies
+                ) {
+                    self.scheduler.claim_scheduler("local-scheduler");
+                }
+            }
         }
     }
 }

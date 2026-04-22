@@ -1,4 +1,5 @@
 use crate::task_db::TaskDb;
+use chrono::Utc;
 use dashmap::DashMap;
 use futures::StreamExt;
 use harness_core::agent::StreamItem;
@@ -411,17 +412,73 @@ impl TaskStore {
         Ok(by_external_id)
     }
 
-    /// Run `f` only if the task still exists and is live-`pending`.
-    ///
-    /// Holding the mutable cache guard across `f` prevents a concurrent status
-    /// transition from changing this task out of `pending` between the check
-    /// and a follow-up side effect such as runtime-host lease insertion.
-    pub(crate) fn with_task_if_pending<R>(&self, id: &TaskId, f: impl FnOnce() -> R) -> Option<R> {
-        let entry = self.cache.get_mut(id)?;
+    /// Count live runtime-host leases from the authoritative scheduler state
+    /// carried on active task rows.
+    pub(crate) fn active_runtime_host_lease_count(&self, host_id: &str) -> usize {
+        let now = Utc::now();
+        self.cache
+            .iter()
+            .filter(|entry| {
+                let scheduler = &entry.value().scheduler;
+                scheduler.runtime_host_id() == Some(host_id)
+                    && scheduler.has_live_runtime_host_lease(now)
+            })
+            .count()
+    }
+
+    /// Attempt to claim a pending task for a runtime host by updating the
+    /// authoritative scheduler state on the task row itself.
+    pub(crate) async fn claim_for_runtime_host(
+        &self,
+        id: &TaskId,
+        host_id: &str,
+        lease_secs: Option<i64>,
+    ) -> anyhow::Result<Option<crate::runtime_hosts::TaskClaimResult>> {
+        let ttl = lease_secs
+            .unwrap_or(crate::runtime_hosts::DEFAULT_LEASE_SECS)
+            .max(0);
+        let lease_duration = chrono::TimeDelta::try_seconds(ttl).ok_or_else(|| {
+            anyhow::anyhow!(
+                "lease_secs value {ttl} is too large to compute a valid expiration timestamp"
+            )
+        })?;
+        let now = Utc::now();
+        let expires_at = now.checked_add_signed(lease_duration).ok_or_else(|| {
+            anyhow::anyhow!(
+                "lease_secs value {ttl} is too large to compute a valid expiration timestamp"
+            )
+        })?;
+        let lock = self
+            .persist_locks
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        let Some(mut entry) = self.cache.get_mut(id) else {
+            return Ok(None);
+        };
         if !matches!(entry.status, TaskStatus::Pending) {
-            return None;
+            return Ok(None);
         }
-        Some(f())
+        if entry.scheduler.owner.is_some() && entry.scheduler.has_live_runtime_host_lease(now) {
+            return Ok(None);
+        }
+        if entry.scheduler.owner.is_some() && !entry.scheduler.has_live_runtime_host_lease(now) {
+            entry.scheduler.clear_to_queued();
+        }
+        if entry.scheduler.owner.is_some() {
+            return Ok(None);
+        }
+
+        entry.scheduler.claim_runtime_host(host_id, expires_at);
+        let snapshot = entry.value().clone();
+        drop(entry);
+        self.db.update(&snapshot).await?;
+        Ok(Some(crate::runtime_hosts::TaskClaimResult {
+            task_id: id.clone(),
+            lease_expires_at: expires_at.to_rfc3339(),
+        }))
     }
 
     /// Return the `pr_url` of the most recently created Done task, ordered by `created_at DESC`
@@ -806,11 +863,13 @@ impl TaskStore {
     }
 
     pub(crate) async fn insert(&self, state: &TaskState) {
+        let mut state = state.clone();
+        state.reconcile_scheduler_with_status();
         self.persist_locks
             .entry(state.id.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())));
         self.cache.insert(state.id.clone(), state.clone());
-        if let Err(e) = self.db.insert(state).await {
+        if let Err(e) = self.db.insert(&state).await {
             tracing::error!("task_db insert failed: {e}");
         }
         self.log_event(crate::event_replay::TaskEvent::Created {
@@ -887,7 +946,12 @@ impl TaskStore {
             .clone();
         let _guard = lock.lock().await;
 
-        let snapshot = self.cache.get(id).map(|state| state.value().clone());
+        let snapshot = if let Some(mut state) = self.cache.get_mut(id) {
+            state.value_mut().reconcile_scheduler_with_status();
+            Some(state.value().clone())
+        } else {
+            None
+        };
         if let Some(state) = snapshot {
             self.db.update(&state).await?;
 
@@ -921,11 +985,22 @@ impl TaskStore {
         id: &TaskId,
         status: TaskStatus,
     ) -> anyhow::Result<()> {
+        let mut scheduler_json = None;
         if let Some(mut entry) = self.cache.get_mut(id) {
             entry.value_mut().status = status.clone();
+            entry.value_mut().reconcile_scheduler_with_status();
+            scheduler_json = Some(serde_json::to_string(&entry.value().scheduler)?);
         }
+        let default_scheduler_json =
+            serde_json::to_string(&crate::task_runner::TaskSchedulerState::queued())?;
         self.db
-            .update_status_only(id.0.as_str(), status.as_ref())
+            .update_status_only(
+                id.0.as_str(),
+                status.as_ref(),
+                scheduler_json
+                    .as_deref()
+                    .unwrap_or(default_scheduler_json.as_str()),
+            )
             .await
     }
 
@@ -1117,8 +1192,28 @@ pub async fn update_status(
 ) -> anyhow::Result<()> {
     let status_str = status.as_ref().to_string();
     mutate_and_persist(store, task_id, |s| {
-        s.status = status;
+        s.status = status.clone();
         s.turn = turn;
+        match status {
+            TaskStatus::Pending => s.scheduler.clear_to_queued(),
+            TaskStatus::AwaitingDeps => {
+                s.scheduler = crate::task_runner::TaskSchedulerState::awaiting_dependencies()
+            }
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled => {
+                s.scheduler.mark_terminal(&status)
+            }
+            _ => {
+                if matches!(
+                    s.scheduler.authority_state,
+                    crate::task_runner::SchedulerAuthorityState::Queued
+                        | crate::task_runner::SchedulerAuthorityState::Recovering
+                        | crate::task_runner::SchedulerAuthorityState::RetryBackoff
+                        | crate::task_runner::SchedulerAuthorityState::AwaitingDependencies
+                ) {
+                    s.scheduler.claim_scheduler("local-scheduler");
+                }
+            }
+        }
     })
     .await?;
     store.log_event(crate::event_replay::TaskEvent::StatusChanged {

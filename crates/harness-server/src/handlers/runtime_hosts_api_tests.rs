@@ -115,11 +115,11 @@ async fn claim_endpoint_blocks_double_claim() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: None,
+        scheduler: crate::task_runner::TaskSchedulerState::queued(),
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
-    let app = runtime_hosts_app(state);
+    let app = runtime_hosts_app(state.clone());
 
     for host in ["host-a", "host-b"] {
         let body = serde_json::json!({ "host_id": host });
@@ -155,6 +155,14 @@ async fn claim_endpoint_blocks_double_claim() -> anyhow::Result<()> {
     )?;
     assert_eq!(first_json["claimed"], true);
     assert_eq!(first_json["task_id"], task_id.to_string());
+    let claimed_state = state
+        .core
+        .tasks
+        .get(&task_id)
+        .expect("claimed task should remain cached");
+    assert_eq!(claimed_state.scheduler.runtime_host_id(), Some("host-a"));
+    assert_eq!(claimed_state.scheduler.run_generation, 1);
+    assert!(claimed_state.scheduler.lease_expires_at.is_some());
 
     let second = app
         .oneshot(
@@ -214,7 +222,7 @@ async fn claim_endpoint_honors_project_filter() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: None,
+        scheduler: crate::task_runner::TaskSchedulerState::queued(),
     };
     let task_b = crate::task_runner::TaskState {
         id: crate::task_runner::TaskId::new(),
@@ -244,7 +252,7 @@ async fn claim_endpoint_honors_project_filter() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: None,
+        scheduler: crate::task_runner::TaskSchedulerState::queued(),
     };
     let task_b_id = task_b.id.clone();
 
@@ -327,7 +335,7 @@ async fn claim_endpoint_rejects_out_of_range_lease_secs() -> anyhow::Result<()> 
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: None,
+        scheduler: crate::task_runner::TaskSchedulerState::queued(),
     };
     state.core.tasks.insert(&task).await;
     let app = runtime_hosts_app(state);
@@ -401,7 +409,7 @@ async fn claim_endpoint_rejects_overflowing_lease_ttl() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: None,
+        scheduler: crate::task_runner::TaskSchedulerState::queued(),
     };
     state.core.tasks.insert(&task).await;
     let app = runtime_hosts_app(state);

@@ -147,9 +147,9 @@ impl AppState {
         let Some(store) = self.core.runtime_state_store.as_ref() else {
             return Ok(());
         };
-        let (hosts, leases) = self.runtime_hosts.snapshot_state();
+        let hosts = self.runtime_hosts.snapshot_state();
         let project_caches = self.runtime_project_cache.snapshot_state();
-        match store.persist_snapshot(hosts, leases, project_caches).await {
+        match store.persist_snapshot(hosts, project_caches).await {
             Ok(()) => {
                 self.runtime_state_dirty.store(false, Ordering::Release);
                 Ok(())

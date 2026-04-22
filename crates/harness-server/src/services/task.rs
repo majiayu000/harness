@@ -166,7 +166,7 @@ mod tests {
             plan_output: None,
             repo: None,
             request_settings: None,
-            system_input: None,
+            scheduler: crate::task_runner::TaskSchedulerState::queued(),
         };
         state.source = Some("github".to_string());
         store.insert(&state).await;
@@ -214,7 +214,7 @@ mod tests {
             plan_output: None,
             repo: None,
             request_settings: None,
-            system_input: None,
+            scheduler: crate::task_runner::TaskSchedulerState::queued(),
         };
         store.insert(&parent_state).await;
 
@@ -246,7 +246,7 @@ mod tests {
             plan_output: None,
             repo: None,
             request_settings: None,
-            system_input: None,
+            scheduler: crate::task_runner::TaskSchedulerState::queued(),
         };
         store.insert(&child_state).await;
 

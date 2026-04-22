@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use super::request::{
     detect_main_worktree, summarize_request_description, CreateTaskRequest,
-    PersistedRequestSettings, SystemTaskInput,
+    PersistedRequestSettings,
 };
 use super::state::{RoundResult, TaskState};
 use super::store::{mutate_and_persist, TaskStore};
@@ -85,10 +85,6 @@ fn classify_task_kind(req: &CreateTaskRequest) -> TaskKind {
     req.task_kind()
 }
 
-fn system_input_for_request(req: &CreateTaskRequest) -> Option<SystemTaskInput> {
-    req.system_input.clone()
-}
-
 fn refresh_preregistered_task_metadata(
     entry: &mut TaskState,
     req: &CreateTaskRequest,
@@ -104,7 +100,6 @@ fn refresh_preregistered_task_metadata(
     entry.project_root = Some(project_root);
     entry.issue = req.issue;
     entry.description = description;
-    entry.system_input = system_input_for_request(req);
 }
 
 #[cfg(test)]
@@ -228,6 +223,7 @@ async fn record_task_failure(
         s.status = TaskStatus::Failed;
         s.failure_kind = Some(TaskFailureKind::Task);
         s.error = Some(reason);
+        s.scheduler.mark_terminal(&TaskStatus::Failed);
     })
     .await
     {
@@ -308,7 +304,6 @@ pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskReques
     state.phase = state.task_kind.default_phase();
     state.description = summarize_request_description(req);
     state.request_settings = Some(PersistedRequestSettings::from_req(req));
-    state.system_input = system_input_for_request(req);
     store.insert(&state).await;
     // Register stream channel now so SSE clients can subscribe before execution begins.
     store.register_task_stream(&task_id);
@@ -389,7 +384,6 @@ where
         state.priority = req.priority;
         state.phase = state.task_kind.default_phase();
         state.request_settings = Some(PersistedRequestSettings::from_req(&req));
-        state.system_input = system_input_for_request(&req);
         store.insert(&state).await;
         // Register stream channel before spawning so SSE clients can subscribe immediately.
         store.register_task_stream(&task_id);
@@ -482,6 +476,7 @@ where
                         tracing::warn!(task_id = %id.0, "parallel_dispatch rejected: {}", msg);
                         mutate_and_persist(&store, &id, |s| {
                             s.status = TaskStatus::Failed;
+                            s.scheduler.mark_terminal(&TaskStatus::Failed);
                             s.error = Some(msg);
                         })
                         .await?;
@@ -588,6 +583,7 @@ where
                         }
                         if succeeded {
                             s.status = TaskStatus::Done;
+                            s.scheduler.mark_terminal(&TaskStatus::Done);
                         } else {
                             let failed_count = run_result
                                 .results
@@ -596,6 +592,7 @@ where
                                 .count();
                             let total_count = run_result.results.len();
                             s.status = TaskStatus::Failed;
+                            s.scheduler.mark_terminal(&TaskStatus::Failed);
                             s.error = Some(if run_result.is_sequential {
                                 format!(
                                     "{}/{} sequential subtasks failed; remaining steps were skipped",
@@ -768,6 +765,7 @@ where
                         });
                         s.status = TaskStatus::Pending;
                         s.failure_kind = None;
+                        s.scheduler.mark_retry_backoff();
                         s.error = Some(format!(
                             "retrying after transient failure (attempt {transient_attempts}): {reason}"
                         ));
@@ -878,7 +876,6 @@ pub async fn spawn_task_awaiting_deps(
     state.phase = state.task_kind.default_phase();
     state.description = summarize_request_description(&req);
     state.request_settings = Some(PersistedRequestSettings::from_req(&req));
-    state.system_input = system_input_for_request(&req);
     // Persist the caller's resolved project root so that duplicate detection
     // (which keys on project_root + external_id) and the dep-watcher's project
     // path resolution both work correctly for waiting tasks.
@@ -889,6 +886,7 @@ pub async fn spawn_task_awaiting_deps(
 
     if !all_done && !state.depends_on.is_empty() {
         state.status = TaskStatus::AwaitingDeps;
+        state.scheduler = crate::task_runner::TaskSchedulerState::awaiting_dependencies();
     }
 
     store.insert(&state).await;
@@ -968,6 +966,7 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
             // cancel or status transition must not be clobbered.
             if matches!(entry.status, TaskStatus::AwaitingDeps) {
                 entry.status = TaskStatus::Failed;
+                entry.scheduler.mark_terminal(&TaskStatus::Failed);
                 entry.error = Some(format!("dependency {} {}", failed_dep_id.0, label));
                 newly_failed.push(task_id.clone());
             }
@@ -982,6 +981,7 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
         if let Some(mut entry) = store.cache.get_mut(task_id) {
             if matches!(entry.status, TaskStatus::AwaitingDeps) {
                 entry.status = TaskStatus::Pending;
+                entry.scheduler.clear_to_queued();
                 actually_ready.push(task_id.clone());
             }
         }

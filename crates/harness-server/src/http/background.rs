@@ -34,7 +34,6 @@ fn build_recovered_request(
         external_id: task.external_id.clone(),
         parent_task_id: task.parent_id.clone(),
         priority: task.priority,
-        system_input: task.system_input.clone(),
         ..Default::default()
     };
     if let Some(ref settings) = task.request_settings {
@@ -134,6 +133,7 @@ pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
                                 &task.id,
                                 move |s| {
                                     s.status = task_runner::TaskStatus::Failed;
+                                    s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
                                     s.error = Some(reason);
                                 },
                             )
@@ -167,6 +167,7 @@ pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
                         if let Err(pe) =
                             task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
                                 s.status = task_runner::TaskStatus::Failed;
+                                s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
                                 s.error = Some(reason);
                             })
                             .await
@@ -204,6 +205,7 @@ pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
                                 &task.id,
                                 move |s| {
                                     s.status = task_runner::TaskStatus::Failed;
+                                    s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
                                     s.error = Some(reason);
                                 },
                             )
@@ -232,6 +234,7 @@ pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
                                 &task.id,
                                 move |s| {
                                     s.status = task_runner::TaskStatus::Failed;
+                                    s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
                                     s.error = Some(reason);
                                 },
                             )
@@ -485,6 +488,7 @@ pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
                         if let Err(e) =
                             task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
                                 s.status = task_runner::TaskStatus::Failed;
+                                s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
                                 s.error = Some(format!(
                                     "startup recovery: unparseable pr_url: {bad_url}"
                                 ));
@@ -930,25 +934,33 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
         for (task, _checkpoint) in checkpoint_tasks {
             let state = state.clone();
             tokio::spawn(async move {
-                // Reconstruct request type using the persisted task kind.
-                let issue_num = match task.task_kind {
-                    task_runner::TaskKind::Issue => task
-                        .external_id
-                        .as_deref()
-                        .and_then(|eid| eid.strip_prefix("issue:"))
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .or_else(|| {
-                            task.description
-                                .as_deref()
-                                .and_then(|d| d.strip_prefix("issue #"))
-                                .and_then(|s| s.split_whitespace().next())
-                                .and_then(|s| s.parse::<u64>().ok())
-                        }),
-                    task_runner::TaskKind::Prompt => None,
-                    task_runner::TaskKind::Pr
-                    | task_runner::TaskKind::Review
-                    | task_runner::TaskKind::Planner => None,
-                };
+                if task
+                    .scheduler
+                    .has_live_runtime_host_lease(chrono::Utc::now())
+                {
+                    tracing::info!(
+                        task_id = ?task.id,
+                        owner = ?task.scheduler.runtime_host_id(),
+                        "startup recovery: skipping checkpoint redispatch because task is still leased to a runtime host"
+                    );
+                    return;
+                }
+                // Reconstruct request type: parse issue number from the
+                // authoritative external_id ("issue:<n>") first, then fall
+                // back to the human-readable description for older rows.
+                // PR tasks are handled by Source A and never appear here.
+                let issue_num = task
+                    .external_id
+                    .as_deref()
+                    .and_then(|eid| eid.strip_prefix("issue:"))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .or_else(|| {
+                        task.description
+                            .as_deref()
+                            .and_then(|d| d.strip_prefix("issue #"))
+                            .and_then(|s| s.split_whitespace().next())
+                            .and_then(|s| s.parse::<u64>().ok())
+                    });
 
                 if issue_num.is_none() {
                     let reason = if matches!(task.task_kind, task_runner::TaskKind::Prompt) {
@@ -959,6 +971,9 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                     tracing::warn!(task_id = ?task.id, "{reason}");
                     let mut failed = task.clone();
                     failed.status = task_runner::TaskStatus::Failed;
+                    failed
+                        .scheduler
+                        .mark_terminal(&task_runner::TaskStatus::Failed);
                     failed.error = Some(reason.to_string());
                     state.core.tasks.cache.insert(failed.id.clone(), failed);
                     if let Err(e) = state.core.tasks.persist(&task.id).await {
@@ -1011,6 +1026,7 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                         if let Err(pe) =
                             task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
                                 s.status = task_runner::TaskStatus::Failed;
+                                s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
                                 s.error = Some(reason);
                             })
                             .await
@@ -1046,6 +1062,7 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                         if let Err(pe) =
                             task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
                                 s.status = task_runner::TaskStatus::Failed;
+                                s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
                                 s.error = Some(reason);
                             })
                             .await
@@ -1085,6 +1102,7 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                         if let Err(pe) =
                             task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
                                 s.status = task_runner::TaskStatus::Failed;
+                                s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
                                 s.error = Some(reason);
                             })
                             .await

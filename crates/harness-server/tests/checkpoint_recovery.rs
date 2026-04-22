@@ -39,7 +39,7 @@ fn make_task(id: &str, status: TaskStatus) -> TaskState {
         plan_output: None,
         repo: None,
         request_settings: None,
-        system_input: None,
+        scheduler: harness_server::task_runner::TaskSchedulerState::queued(),
     }
 }
 
@@ -447,6 +447,38 @@ async fn restart_mixed_recovery_counts() -> anyhow::Result<()> {
         }
     }
     assert_eq!(failed_count, 2, "two tasks should have been failed");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_marks_resumed_task_as_recovering_in_scheduler_state() -> anyhow::Result<()> {
+    let store = setup_store(|db| async move {
+        db.insert(&make_task("t-recovering", TaskStatus::Implementing))
+            .await?;
+        db.write_checkpoint("t-recovering", None, Some("plan text"), None, "plan_done")
+            .await?;
+        Ok(())
+    })
+    .await?;
+
+    let recovered = store
+        .get(&CoreTaskId("t-recovering".into()))
+        .expect("recovered task should remain active");
+    assert!(matches!(recovered.status, TaskStatus::Pending));
+    assert!(matches!(
+        recovered.scheduler.authority_state,
+        harness_server::task_runner::SchedulerAuthorityState::Recovering
+    ));
+    assert_eq!(recovered.scheduler.recovery_generation, 1);
+    assert_eq!(
+        recovered
+            .scheduler
+            .owner
+            .as_ref()
+            .map(|owner| owner.id.as_str()),
+        Some("startup-recovery")
+    );
 
     Ok(())
 }

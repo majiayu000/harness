@@ -749,6 +749,7 @@ pub(crate) async fn enqueue_task_background_in_domain(
                     if let Err(persist_err) =
                         task_runner::mutate_and_persist(&state.core.tasks, &task_id2, |s| {
                             s.status = task_runner::TaskStatus::Failed;
+                            s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
                             s.error = Some(queue_error.clone());
                         })
                         .await
@@ -997,6 +998,7 @@ pub(super) async fn cancel_task(
     // it and skips the record_task_failure path.
     if let Err(e) = task_runner::mutate_and_persist(&state.core.tasks, &task_id, |s| {
         s.status = TaskStatus::Cancelled;
+        s.scheduler.mark_terminal(&TaskStatus::Cancelled);
     })
     .await
     {

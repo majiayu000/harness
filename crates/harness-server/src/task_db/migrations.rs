@@ -14,8 +14,9 @@ use harness_core::db::Migration;
 /// v15 – add (status, updated_at DESC) index for project-agnostic terminal queries.
 /// v18 – add version column for optimistic locking.
 /// v19 – add task_kind column for first-class task lifecycle dispatch.
-/// v20 – add system_input column for restart-safe trusted system prompt bundles.
+/// v20 – add system_input column for restart-safe system prompt bundles.
 /// v21 – add workspace lifecycle ownership and failure classification columns.
+/// v22 – add scheduler_state column as the single authoritative ownership/recovery contract.
 pub(super) static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -154,5 +155,11 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
               ADD COLUMN workspace_path TEXT, \
               ADD COLUMN workspace_owner TEXT, \
               ADD COLUMN run_generation BIGINT NOT NULL DEFAULT 0",
+    },
+    Migration {
+        version: 22,
+        description: "add scheduler_state column for unified task ownership and recovery",
+        sql: "ALTER TABLE tasks ADD COLUMN scheduler_state TEXT NOT NULL DEFAULT \
+              '{\"authority_state\":\"queued\",\"run_generation\":0,\"recovery_generation\":0}'",
     },
 ];

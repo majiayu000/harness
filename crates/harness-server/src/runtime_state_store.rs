@@ -1,4 +1,4 @@
-use crate::runtime_hosts_state::{PersistedRuntimeHost, PersistedTaskLease};
+use crate::runtime_hosts_state::PersistedRuntimeHost;
 use crate::runtime_project_cache_state::PersistedHostProjectCache;
 use chrono::{DateTime, Utc};
 use harness_core::db::{
@@ -10,7 +10,7 @@ use sqlx::postgres::PgPool;
 use std::path::Path;
 
 const SNAPSHOT_ID: &str = "runtime-state";
-const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStateSnapshot {
@@ -18,14 +18,12 @@ pub struct RuntimeStateSnapshot {
     pub schema_version: u32,
     pub updated_at: DateTime<Utc>,
     pub hosts: Vec<PersistedRuntimeHost>,
-    pub leases: Vec<PersistedTaskLease>,
     pub project_caches: Vec<PersistedHostProjectCache>,
 }
 
 impl RuntimeStateSnapshot {
     fn new(
         hosts: Vec<PersistedRuntimeHost>,
-        leases: Vec<PersistedTaskLease>,
         project_caches: Vec<PersistedHostProjectCache>,
     ) -> Self {
         Self {
@@ -33,7 +31,6 @@ impl RuntimeStateSnapshot {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             updated_at: Utc::now(),
             hosts,
-            leases,
             project_caches,
         }
     }
@@ -136,10 +133,9 @@ impl RuntimeStateStore {
     pub async fn persist_snapshot(
         &self,
         hosts: Vec<PersistedRuntimeHost>,
-        leases: Vec<PersistedTaskLease>,
         project_caches: Vec<PersistedHostProjectCache>,
     ) -> anyhow::Result<()> {
-        let snapshot = RuntimeStateSnapshot::new(hosts, leases, project_caches);
+        let snapshot = RuntimeStateSnapshot::new(hosts, project_caches);
         let data = serde_json::to_string(&snapshot)?;
         sqlx::query(
             "INSERT INTO runtime_state (id, data) VALUES ($1, $2)
@@ -178,13 +174,12 @@ mod tests {
         let Some(store) = open_test_store().await? else {
             return Ok(());
         };
-        store.persist_snapshot(vec![], vec![], vec![]).await?;
+        store.persist_snapshot(vec![], vec![]).await?;
 
         let snapshot = store.load_snapshot().await?.expect("snapshot should exist");
         assert_eq!(snapshot.id, SNAPSHOT_ID);
         assert_eq!(snapshot.schema_version, SNAPSHOT_SCHEMA_VERSION);
         assert!(snapshot.hosts.is_empty());
-        assert!(snapshot.leases.is_empty());
         assert!(snapshot.project_caches.is_empty());
         Ok(())
     }
@@ -194,7 +189,7 @@ mod tests {
         let Some(store) = open_test_store().await? else {
             return Ok(());
         };
-        store.persist_snapshot(vec![], vec![], vec![]).await?;
+        store.persist_snapshot(vec![], vec![]).await?;
 
         overwrite_schema_version(&store, SNAPSHOT_SCHEMA_VERSION - 1).await?;
 
@@ -214,7 +209,7 @@ mod tests {
 
         {
             let store = RuntimeStateStore::open(&db_path).await?;
-            store.persist_snapshot(vec![], vec![], vec![]).await?;
+            store.persist_snapshot(vec![], vec![]).await?;
             overwrite_schema_version(&store, SNAPSHOT_SCHEMA_VERSION + 1).await?;
         }
 
@@ -234,7 +229,7 @@ mod tests {
 
         {
             let store = RuntimeStateStore::open(&db_path).await?;
-            store.persist_snapshot(vec![], vec![], vec![]).await?;
+            store.persist_snapshot(vec![], vec![]).await?;
         }
 
         let reopened = RuntimeStateStore::open(&db_path).await?;
