@@ -1,13 +1,59 @@
-use super::helpers::run_agent_streaming;
+use super::helpers::{build_task_event, run_agent_streaming, telemetry_for_timeout};
 use crate::task_runner::{
-    mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskPhase, TaskStore,
+    mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskPhase, TaskStatus, TaskStore,
 };
+use chrono::Utc;
 use harness_core::agent::{AgentRequest, CodeAgent};
 use harness_core::prompts;
-use harness_core::types::ExecutionPhase;
+use harness_core::types::{Decision, ExecutionPhase, TurnFailure, TurnTelemetry};
+use harness_observe::event_store::EventStore;
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::time::Duration;
+
+async fn record_phase_observability(
+    store: &TaskStore,
+    events: &EventStore,
+    task_id: &TaskId,
+    turn: u32,
+    action: &str,
+    result: &str,
+    detail: Option<String>,
+    telemetry: Option<TurnTelemetry>,
+    failure: Option<TurnFailure>,
+    decision: Decision,
+    reason: Option<String>,
+) -> anyhow::Result<()> {
+    mutate_and_persist(store, task_id, |state| {
+        state.rounds.push(RoundResult::new(
+            turn,
+            action,
+            result,
+            detail.clone(),
+            telemetry.clone(),
+            failure.clone(),
+        ));
+    })
+    .await?;
+
+    let event = build_task_event(
+        task_id,
+        turn,
+        action,
+        &format!("task_{action}"),
+        decision,
+        reason,
+        None,
+        telemetry,
+        failure,
+        detail,
+    );
+    if let Err(error) = events.log(&event).await {
+        tracing::warn!(task_id = %task_id, action, "failed to log {action} event: {error}");
+    }
+
+    Ok(())
+}
 
 /// Run a plan step for a complex prompt-only task when the planning gate has
 /// forced `TaskPhase::Plan`.
@@ -19,6 +65,7 @@ pub(crate) async fn run_plan_for_prompt(
     agent: &dyn CodeAgent,
     store: &TaskStore,
     task_id: &TaskId,
+    events: &EventStore,
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
@@ -32,6 +79,8 @@ pub(crate) async fn run_plan_for_prompt(
     .await?;
 
     let plan_prompt = prompts::plan_for_prompt_task(prompt_text);
+    let prompt_built_at = Utc::now();
+    let agent_started_at = Utc::now();
 
     let plan_req = AgentRequest {
         prompt: plan_prompt,
@@ -43,15 +92,87 @@ pub(crate) async fn run_plan_for_prompt(
 
     let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
 
-    // Use agent.execute() directly — NOT run_agent_streaming — to avoid the
-    // state side-effects that run_agent_streaming performs: PR_URL extraction,
-    // turn counter mutations, and status updates.  Those side-effects would
-    // corrupt the subsequent implement phase (e.g. consuming call #0 from a
-    // mock/real agent that sets pr_url before the real implementation turn).
-    let plan_resp = tokio::time::timeout(turn_timeout, agent.execute(plan_req))
-        .await
-        .map_err(|_| anyhow::anyhow!("plan phase timed out after {}s", req.turn_timeout_secs))?
-        .map_err(|e| anyhow::anyhow!("plan phase agent error: {e}"))?;
+    let plan_resp = match tokio::time::timeout(
+        turn_timeout,
+        run_agent_streaming(
+            agent,
+            plan_req,
+            task_id,
+            store,
+            0,
+            prompt_built_at,
+            agent_started_at,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(success)) => {
+            record_phase_observability(
+                store,
+                events,
+                task_id,
+                0,
+                "plan",
+                "completed",
+                Some(success.response.output.clone()),
+                Some(success.telemetry.clone()),
+                None,
+                Decision::Complete,
+                Some("prompt task plan completed".to_string()),
+            )
+            .await?;
+            success.response
+        }
+        Ok(Err(failure)) => {
+            record_phase_observability(
+                store,
+                events,
+                task_id,
+                0,
+                "plan",
+                "failed",
+                None,
+                Some(failure.telemetry),
+                Some(failure.failure),
+                Decision::Block,
+                Some("prompt task plan failed".to_string()),
+            )
+            .await?;
+            return Err(anyhow::anyhow!("plan phase agent error: {}", failure.error));
+        }
+        Err(_) => {
+            let telemetry =
+                telemetry_for_timeout(prompt_built_at, agent_started_at, Utc::now(), None);
+            let failure = harness_core::types::TurnFailure {
+                kind: harness_core::types::TurnFailureKind::Timeout,
+                provider: None,
+                upstream_status: None,
+                message: Some(format!(
+                    "plan phase timed out after {}s",
+                    req.turn_timeout_secs
+                )),
+                body_excerpt: None,
+            };
+            record_phase_observability(
+                store,
+                events,
+                task_id,
+                0,
+                "plan",
+                "timeout",
+                None,
+                Some(telemetry),
+                Some(failure),
+                Decision::Block,
+                Some("prompt task plan timed out".to_string()),
+            )
+            .await?;
+            return Err(anyhow::anyhow!(
+                "plan phase timed out after {}s",
+                req.turn_timeout_secs
+            ));
+        }
+    };
 
     let plan_text = plan_resp.output.clone();
     mutate_and_persist(store, task_id, |state| {
@@ -81,6 +202,7 @@ pub(crate) async fn run_triage_plan_pipeline(
     store: &TaskStore,
     task_id: &TaskId,
     issue: u64,
+    events: &EventStore,
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
@@ -93,6 +215,8 @@ pub(crate) async fn run_triage_plan_pipeline(
     .await?;
 
     let triage_prompt = prompts::triage_prompt(issue).to_prompt_string();
+    let triage_prompt_built_at = Utc::now();
+    let triage_started_at = Utc::now();
     let triage_req = AgentRequest {
         prompt: triage_prompt,
         project_root: project.to_path_buf(),
@@ -102,13 +226,90 @@ pub(crate) async fn run_triage_plan_pipeline(
     };
 
     let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
-    let (triage_resp, _) = tokio::time::timeout(
+    let triage_resp = match tokio::time::timeout(
         turn_timeout,
-        run_agent_streaming(agent, triage_req, task_id, store, 0),
+        run_agent_streaming(
+            agent,
+            triage_req,
+            task_id,
+            store,
+            0,
+            triage_prompt_built_at,
+            triage_started_at,
+        ),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("triage phase timed out after {}s", req.turn_timeout_secs))?
-    .map_err(|e| anyhow::anyhow!("triage phase agent error: {e}"))?;
+    {
+        Ok(Ok(success)) => {
+            record_phase_observability(
+                store,
+                events,
+                task_id,
+                0,
+                "triage",
+                "completed",
+                Some(success.response.output.clone()),
+                Some(success.telemetry.clone()),
+                None,
+                Decision::Complete,
+                Some(format!("issue #{issue} triage completed")),
+            )
+            .await?;
+            success.response
+        }
+        Ok(Err(failure)) => {
+            record_phase_observability(
+                store,
+                events,
+                task_id,
+                0,
+                "triage",
+                "failed",
+                None,
+                Some(failure.telemetry),
+                Some(failure.failure),
+                Decision::Block,
+                Some(format!("issue #{issue} triage failed")),
+            )
+            .await?;
+            return Err(anyhow::anyhow!(
+                "triage phase agent error: {}",
+                failure.error
+            ));
+        }
+        Err(_) => {
+            let telemetry =
+                telemetry_for_timeout(triage_prompt_built_at, triage_started_at, Utc::now(), None);
+            let failure = harness_core::types::TurnFailure {
+                kind: harness_core::types::TurnFailureKind::Timeout,
+                provider: None,
+                upstream_status: None,
+                message: Some(format!(
+                    "triage phase timed out after {}s",
+                    req.turn_timeout_secs
+                )),
+                body_excerpt: None,
+            };
+            record_phase_observability(
+                store,
+                events,
+                task_id,
+                0,
+                "triage",
+                "timeout",
+                None,
+                Some(telemetry),
+                Some(failure),
+                Decision::Block,
+                Some(format!("issue #{issue} triage timed out")),
+            )
+            .await?;
+            return Err(anyhow::anyhow!(
+                "triage phase timed out after {}s",
+                req.turn_timeout_secs
+            ));
+        }
+    };
 
     let triage_text = triage_resp.output.clone();
     mutate_and_persist(store, task_id, |state| {
@@ -131,7 +332,7 @@ pub(crate) async fn run_triage_plan_pipeline(
     match decision {
         prompts::TriageDecision::Skip => {
             mutate_and_persist(store, task_id, |state| {
-                state.status = crate::task_runner::TaskStatus::Done;
+                state.status = TaskStatus::Done;
                 state.phase = TaskPhase::Terminal;
                 state.error = Some("Triage: skipped — not worth implementing".to_string());
             })
@@ -160,6 +361,8 @@ pub(crate) async fn run_triage_plan_pipeline(
     .await?;
 
     let plan_prompt = prompts::plan_prompt(issue, &triage_resp.output).to_prompt_string();
+    let plan_prompt_built_at = Utc::now();
+    let plan_started_at = Utc::now();
     let plan_req = AgentRequest {
         prompt: plan_prompt,
         project_root: project.to_path_buf(),
@@ -168,13 +371,87 @@ pub(crate) async fn run_triage_plan_pipeline(
         ..Default::default()
     };
 
-    let (plan_resp, _) = tokio::time::timeout(
+    let plan_resp = match tokio::time::timeout(
         turn_timeout,
-        run_agent_streaming(agent, plan_req, task_id, store, 0),
+        run_agent_streaming(
+            agent,
+            plan_req,
+            task_id,
+            store,
+            0,
+            plan_prompt_built_at,
+            plan_started_at,
+        ),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("plan phase timed out after {}s", req.turn_timeout_secs))?
-    .map_err(|e| anyhow::anyhow!("plan phase agent error: {e}"))?;
+    {
+        Ok(Ok(success)) => {
+            record_phase_observability(
+                store,
+                events,
+                task_id,
+                0,
+                "plan",
+                "completed",
+                Some(success.response.output.clone()),
+                Some(success.telemetry.clone()),
+                None,
+                Decision::Complete,
+                Some(format!("issue #{issue} plan completed")),
+            )
+            .await?;
+            success.response
+        }
+        Ok(Err(failure)) => {
+            record_phase_observability(
+                store,
+                events,
+                task_id,
+                0,
+                "plan",
+                "failed",
+                None,
+                Some(failure.telemetry),
+                Some(failure.failure),
+                Decision::Block,
+                Some(format!("issue #{issue} plan failed")),
+            )
+            .await?;
+            return Err(anyhow::anyhow!("plan phase agent error: {}", failure.error));
+        }
+        Err(_) => {
+            let telemetry =
+                telemetry_for_timeout(plan_prompt_built_at, plan_started_at, Utc::now(), None);
+            let failure = harness_core::types::TurnFailure {
+                kind: harness_core::types::TurnFailureKind::Timeout,
+                provider: None,
+                upstream_status: None,
+                message: Some(format!(
+                    "plan phase timed out after {}s",
+                    req.turn_timeout_secs
+                )),
+                body_excerpt: None,
+            };
+            record_phase_observability(
+                store,
+                events,
+                task_id,
+                0,
+                "plan",
+                "timeout",
+                None,
+                Some(telemetry),
+                Some(failure),
+                Decision::Block,
+                Some(format!("issue #{issue} plan timed out")),
+            )
+            .await?;
+            return Err(anyhow::anyhow!(
+                "plan phase timed out after {}s",
+                req.turn_timeout_secs
+            ));
+        }
+    };
 
     let plan_text = plan_resp.output.clone();
     mutate_and_persist(store, task_id, |state| {
@@ -233,13 +510,14 @@ pub(crate) async fn run_replan_for_issue(
     mutate_and_persist(store, task_id, |state| {
         state.plan_output = Some(plan_text.clone());
         state.phase = TaskPhase::Implement;
-        state.rounds.push(RoundResult {
-            turn: state.turn,
-            action: "replan".into(),
-            result: "plan_ready".into(),
-            detail: Some(plan_text.clone()),
-            first_token_latency_ms: None,
-        });
+        state.rounds.push(RoundResult::new(
+            state.turn,
+            "replan",
+            "plan_ready",
+            Some(plan_text.clone()),
+            None,
+            None,
+        ));
     })
     .await?;
     if let Err(e) = store

@@ -2,7 +2,9 @@ use super::*;
 use harness_core::{
     config::misc::OtelExporter,
     db::pg_open_pool,
-    types::{AutoFixAttempt, RuleId},
+    types::{
+        AutoFixAttempt, EventMetadata, RuleId, TaskId, TurnFailure, TurnFailureKind, TurnTelemetry,
+    },
 };
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -110,6 +112,119 @@ async fn log_and_query_roundtrip() -> anyhow::Result<()> {
     let results = store.query(&EventFilters::default()).await?;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, event.id);
+    store.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn event_metadata_roundtrips() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some(store) = open_test_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let mut event = make_event("task_implement", Decision::Complete);
+    event.metadata = Some(EventMetadata {
+        task_id: Some(TaskId::from_str("task-123")),
+        turn: Some(1),
+        phase: Some("implement".to_string()),
+        telemetry: Some(TurnTelemetry {
+            first_token_latency_ms: Some(42),
+            completed_latency_ms: Some(84),
+            ..Default::default()
+        }),
+        failure: None,
+    });
+    store.log(&event).await?;
+
+    let results = store.query(&EventFilters::default()).await?;
+    assert_eq!(results.len(), 1);
+    let metadata = results[0]
+        .metadata
+        .as_ref()
+        .expect("metadata should round-trip");
+    assert_eq!(
+        metadata.task_id.as_ref().map(|id| id.as_str()),
+        Some("task-123")
+    );
+    assert_eq!(
+        metadata
+            .telemetry
+            .as_ref()
+            .and_then(|t| t.first_token_latency_ms),
+        Some(42)
+    );
+    store.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_deserializes_rows_without_metadata() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some(store) = open_test_store(dir.path()).await? else {
+        return Ok(());
+    };
+
+    sqlx::query(
+        "INSERT INTO events
+            (id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, content, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind("legacy-event")
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(SessionId::new().as_str())
+    .bind("legacy_hook")
+    .bind("legacy_tool")
+    .bind("pass")
+    .bind(Option::<String>::None)
+    .bind(Option::<String>::None)
+    .bind(Option::<i64>::None)
+    .bind(Option::<String>::None)
+    .bind(Option::<String>::None)
+    .execute(&store.pool)
+    .await?;
+
+    let results = store.query(&EventFilters::default()).await?;
+    assert_eq!(results.len(), 1);
+    assert!(results[0].metadata.is_none());
+    store.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failure_metadata_roundtrips() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some(store) = open_test_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let mut event = make_event("agent_review", Decision::Block);
+    event.metadata = Some(EventMetadata {
+        task_id: Some(TaskId::from_str("task-456")),
+        turn: Some(2),
+        phase: Some("agent_review".to_string()),
+        telemetry: None,
+        failure: Some(TurnFailure {
+            kind: TurnFailureKind::Upstream,
+            provider: Some("anthropic-api".to_string()),
+            upstream_status: Some(500),
+            message: Some("API returned 500".to_string()),
+            body_excerpt: Some("{\"type\":\"error\"}".to_string()),
+        }),
+    });
+    store.log(&event).await?;
+
+    let results = store
+        .query(&EventFilters {
+            hook: Some("agent_review".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let failure = results[0]
+        .metadata
+        .as_ref()
+        .and_then(|m| m.failure.as_ref())
+        .expect("failure metadata should exist");
+    assert_eq!(failure.kind, TurnFailureKind::Upstream);
+    assert_eq!(failure.upstream_status, Some(500));
     store.close().await;
     Ok(())
 }

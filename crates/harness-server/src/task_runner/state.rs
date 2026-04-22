@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use super::request::PersistedRequestSettings;
 use super::types::{TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus};
 use chrono::{DateTime, Utc};
+use harness_core::types::{TurnFailure, TurnTelemetry};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoundResult {
@@ -16,6 +17,32 @@ pub struct RoundResult {
     /// Time from agent launch to first output token (milliseconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_token_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<TurnTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<TurnFailure>,
+}
+
+impl RoundResult {
+    pub fn new(
+        turn: u32,
+        action: impl Into<String>,
+        result: impl Into<String>,
+        detail: Option<String>,
+        telemetry: Option<TurnTelemetry>,
+        failure: Option<TurnFailure>,
+    ) -> Self {
+        let first_token_latency_ms = telemetry.as_ref().and_then(|t| t.first_token_latency_ms);
+        Self {
+            turn,
+            action: action.into(),
+            result: result.into(),
+            detail,
+            first_token_latency_ms,
+            telemetry,
+            failure,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

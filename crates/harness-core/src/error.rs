@@ -1,4 +1,5 @@
 use crate::config::agents::SandboxMode;
+use crate::types::{TurnFailure, TurnFailureKind};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -115,3 +116,140 @@ pub enum TaskDbDecodeError {
 
 pub type Error = HarnessError;
 pub type Result<T> = std::result::Result<T, HarnessError>;
+
+const MAX_FAILURE_BODY_EXCERPT_CHARS: usize = 240;
+
+impl HarnessError {
+    pub fn turn_failure(&self) -> Option<TurnFailure> {
+        match self {
+            HarnessError::Timeout(duration) => Some(TurnFailure {
+                kind: TurnFailureKind::Timeout,
+                provider: None,
+                upstream_status: None,
+                message: Some(format!("timeout after {duration:?}")),
+                body_excerpt: None,
+            }),
+            HarnessError::QuotaExhausted(message) => Some(TurnFailure {
+                kind: TurnFailureKind::Quota,
+                provider: provider_from_message(message),
+                upstream_status: parse_upstream_status(message),
+                message: Some(message.clone()),
+                body_excerpt: excerpt_after_colon(message),
+            }),
+            HarnessError::BillingFailed(message) => Some(TurnFailure {
+                kind: TurnFailureKind::Billing,
+                provider: provider_from_message(message),
+                upstream_status: parse_upstream_status(message),
+                message: Some(message.clone()),
+                body_excerpt: excerpt_after_colon(message),
+            }),
+            HarnessError::AgentExecution(message) => {
+                Some(classify_agent_execution_failure(message))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn classify_agent_execution_failure(message: &str) -> TurnFailure {
+    if message.starts_with("API returned ") {
+        return TurnFailure {
+            kind: TurnFailureKind::Upstream,
+            provider: Some("anthropic-api".to_string()),
+            upstream_status: parse_upstream_status(message),
+            message: Some(message.to_string()),
+            body_excerpt: excerpt_after_colon(message),
+        };
+    }
+
+    if message.starts_with("API request failed:") {
+        return TurnFailure {
+            kind: TurnFailureKind::Upstream,
+            provider: Some("anthropic-api".to_string()),
+            upstream_status: None,
+            message: Some(message.to_string()),
+            body_excerpt: excerpt_after_colon(message),
+        };
+    }
+
+    if message.contains("stdout unavailable")
+        || message.contains("stream send failed")
+        || message.contains("failed reading ")
+        || message.contains("failed to serialize")
+    {
+        return TurnFailure {
+            kind: TurnFailureKind::Protocol,
+            provider: provider_from_message(message),
+            upstream_status: None,
+            message: Some(message.to_string()),
+            body_excerpt: excerpt_after_colon(message),
+        };
+    }
+
+    if message.starts_with("failed to run ")
+        || message.starts_with("failed to wait for ")
+        || message.contains(" exited with ")
+        || message.contains(" stream idle timeout ")
+        || message.contains("capability token for subtask ")
+    {
+        return TurnFailure {
+            kind: TurnFailureKind::LocalProcess,
+            provider: provider_from_message(message),
+            upstream_status: parse_upstream_status(message),
+            message: Some(message.to_string()),
+            body_excerpt: excerpt_after_colon(message),
+        };
+    }
+
+    TurnFailure {
+        kind: TurnFailureKind::Unknown,
+        provider: provider_from_message(message),
+        upstream_status: parse_upstream_status(message),
+        message: Some(message.to_string()),
+        body_excerpt: excerpt_after_colon(message),
+    }
+}
+
+fn provider_from_message(message: &str) -> Option<String> {
+    if let Some(rest) = message.strip_prefix("failed to run ") {
+        return rest
+            .split_once(':')
+            .map(|(provider, _)| provider.to_string());
+    }
+    if let Some(rest) = message.strip_prefix("failed to wait for ") {
+        return rest
+            .split_once(':')
+            .map(|(provider, _)| provider.to_string());
+    }
+
+    for provider in ["codex", "claude", "anthropic-api"] {
+        if message.contains(provider) {
+            return Some(provider.to_string());
+        }
+    }
+
+    None
+}
+
+fn parse_upstream_status(message: &str) -> Option<u16> {
+    if let Some(rest) = message.strip_prefix("API returned ") {
+        let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        return digits.parse().ok();
+    }
+
+    None
+}
+
+fn excerpt_after_colon(message: &str) -> Option<String> {
+    let (_, tail) = message.split_once(':')?;
+    let excerpt = tail.trim();
+    if excerpt.is_empty() {
+        return None;
+    }
+
+    let mut end = excerpt.len().min(MAX_FAILURE_BODY_EXCERPT_CHARS);
+    while end > 0 && !excerpt.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(excerpt[..end].to_string())
+}

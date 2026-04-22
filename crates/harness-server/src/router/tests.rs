@@ -765,7 +765,7 @@ async fn event_log_then_query_roundtrip() -> anyhow::Result<()> {
         jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(1)),
         method: Method::EventLog {
-            event: event.clone(),
+            event: Box::new(event.clone()),
         },
     };
     let log_resp = handle_request(&state, log_req)
@@ -946,7 +946,9 @@ async fn event_log_records_event() -> anyhow::Result<()> {
     let req = RpcRequest {
         jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(1)),
-        method: Method::EventLog { event },
+        method: Method::EventLog {
+            event: Box::new(event),
+        },
     };
     let resp = handle_request(&state, req)
         .await

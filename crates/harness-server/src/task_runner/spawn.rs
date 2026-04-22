@@ -569,17 +569,18 @@ where
                             } else {
                                 r.error.clone()
                             };
-                            s.rounds.push(RoundResult {
-                                turn: (r.index as u32).saturating_add(1),
-                                action: format!("parallel_subtask_{}", r.index),
-                                result: if r.response.is_some() {
-                                    "success".into()
+                            s.rounds.push(RoundResult::new(
+                                (r.index as u32).saturating_add(1),
+                                format!("parallel_subtask_{}", r.index),
+                                if r.response.is_some() {
+                                    "success"
                                 } else {
-                                    "failed".into()
+                                    "failed"
                                 },
                                 detail,
-                                first_token_latency_ms: None,
-                            });
+                                None,
+                                None,
+                            ));
                         }
                         if succeeded {
                             s.status = TaskStatus::Done;
@@ -663,13 +664,14 @@ where
                         s.error = Some(error_message.clone());
                         s.workspace_path = Some(workspace_path.clone());
                         s.workspace_owner = workspace_owner.clone();
-                        s.rounds.push(RoundResult {
-                            turn: s.turn.saturating_add(1),
-                            action: "workspace_admission".into(),
-                            result: "workspace_lifecycle_failure".into(),
-                            detail: Some(error_message.clone()),
-                            first_token_latency_ms: None,
-                        });
+                        s.rounds.push(RoundResult::new(
+                            s.turn.saturating_add(1),
+                            "workspace_admission",
+                            "workspace_lifecycle_failure",
+                            Some(error_message.clone()),
+                            None,
+                            None,
+                        ));
                     })
                     .await?;
                     tracing::warn!(task_id = %id.0, error = %error_message, "workspace admission failed");
@@ -754,15 +756,14 @@ where
                     )
                     .await;
                     if let Err(pe) = mutate_and_persist(&store, &id, |s| {
-                        s.rounds.push(RoundResult {
-                            turn: s.turn,
-                            action: "transient_retry".into(),
-                            result: format!(
-                                "attempt {transient_attempts}/{MAX_TRANSIENT_RETRIES}"
-                            ),
-                            detail: Some(reason.clone()),
-                            first_token_latency_ms: None,
-                        });
+                        s.rounds.push(RoundResult::new(
+                            s.turn,
+                            "transient_retry",
+                            format!("attempt {transient_attempts}/{MAX_TRANSIENT_RETRIES}"),
+                            Some(reason.clone()),
+                            None,
+                            None,
+                        ));
                         s.status = TaskStatus::Pending;
                         s.failure_kind = None;
                         s.scheduler.mark_retry_backoff();

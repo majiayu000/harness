@@ -1,10 +1,11 @@
 use super::*;
 use async_trait::async_trait;
-use harness_core::agent::{AgentRequest, AgentResponse};
+use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+use harness_core::error::HarnessError;
 use harness_core::interceptor::{
     InterceptResult, PostExecuteResult, PostToolUseResult, ToolUseEvent, TurnInterceptor,
 };
-use harness_core::types::{Decision, TokenUsage};
+use harness_core::types::{Decision, TokenUsage, TurnFailureKind};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
@@ -184,6 +185,67 @@ impl TurnInterceptor for NamedFailingPostInterceptor {
 
 fn wrap<T: TurnInterceptor + 'static>(t: T) -> Arc<dyn TurnInterceptor> {
     Arc::new(t)
+}
+
+enum StreamScenario {
+    StreamingSuccess,
+    NonStreamingSuccess,
+    UpstreamFailure,
+}
+
+struct TestStreamingAgent {
+    scenario: StreamScenario,
+}
+
+#[async_trait]
+impl CodeAgent for TestStreamingAgent {
+    fn name(&self) -> &str {
+        "test-agent"
+    }
+
+    fn capabilities(&self) -> Vec<harness_core::types::Capability> {
+        vec![]
+    }
+
+    async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        Ok(make_resp())
+    }
+
+    async fn execute_stream(
+        &self,
+        _req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        match self.scenario {
+            StreamScenario::StreamingSuccess => {
+                tx.send(StreamItem::MessageDelta {
+                    text: "hello".to_string(),
+                })
+                .await
+                .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+                tx.send(StreamItem::Done)
+                    .await
+                    .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+                Ok(())
+            }
+            StreamScenario::NonStreamingSuccess => {
+                tx.send(StreamItem::ItemCompleted {
+                    item: harness_core::types::Item::AgentReasoning {
+                        content: "final response".to_string(),
+                    },
+                })
+                .await
+                .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+                tx.send(StreamItem::Done)
+                    .await
+                    .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+                Ok(())
+            }
+            StreamScenario::UpstreamFailure => Err(HarnessError::AgentExecution(
+                "API returned 500: upstream exploded".to_string(),
+            )),
+        }
+    }
 }
 
 // ── run_pre_execute ───────────────────────────────────────────────────────────
@@ -481,6 +543,106 @@ async fn inject_skills_empty_store_returns_empty_string() {
         result.is_empty(),
         "empty skill store must produce empty string"
     );
+}
+
+// ── run_agent_streaming ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn run_agent_streaming_records_first_token_latency_for_streaming_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = crate::task_runner::TaskStore::open(&dir.path().join("tasks.db"))
+        .await
+        .expect("task store");
+    let task_id = crate::task_runner::TaskId::new();
+    let task = crate::task_runner::TaskState::new(task_id.clone());
+    store.insert(&task).await;
+
+    let result = run_agent_streaming(
+        &TestStreamingAgent {
+            scenario: StreamScenario::StreamingSuccess,
+        },
+        make_req(),
+        &task_id,
+        &store,
+        1,
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("streaming success");
+
+    assert_eq!(result.response.output, "hello");
+    assert!(
+        result.telemetry.first_token_latency_ms.is_some(),
+        "streaming output should record first token latency"
+    );
+    assert!(result.telemetry.first_output_at.is_some());
+}
+
+#[tokio::test]
+async fn run_agent_streaming_leaves_first_token_latency_empty_for_non_streaming_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = crate::task_runner::TaskStore::open(&dir.path().join("tasks.db"))
+        .await
+        .expect("task store");
+    let task_id = crate::task_runner::TaskId::new();
+    let task = crate::task_runner::TaskState::new(task_id.clone());
+    store.insert(&task).await;
+
+    let result = run_agent_streaming(
+        &TestStreamingAgent {
+            scenario: StreamScenario::NonStreamingSuccess,
+        },
+        make_req(),
+        &task_id,
+        &store,
+        1,
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("non-streaming success");
+
+    assert_eq!(result.response.output, "final response");
+    assert_eq!(result.telemetry.first_token_latency_ms, None);
+    assert!(result.telemetry.first_output_at.is_some());
+}
+
+#[test]
+fn telemetry_for_timeout_omits_first_output() {
+    let now = chrono::Utc::now();
+    let telemetry = telemetry_for_timeout(now, now, now, Some(2));
+    assert_eq!(telemetry.first_output_at, None);
+    assert_eq!(telemetry.first_token_latency_ms, None);
+    assert_eq!(telemetry.retry_count, Some(2));
+}
+
+#[tokio::test]
+async fn run_agent_streaming_classifies_upstream_failure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = crate::task_runner::TaskStore::open(&dir.path().join("tasks.db"))
+        .await
+        .expect("task store");
+    let task_id = crate::task_runner::TaskId::new();
+    let task = crate::task_runner::TaskState::new(task_id.clone());
+    store.insert(&task).await;
+
+    let failure = run_agent_streaming(
+        &TestStreamingAgent {
+            scenario: StreamScenario::UpstreamFailure,
+        },
+        make_req(),
+        &task_id,
+        &store,
+        1,
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect_err("upstream failure expected");
+
+    assert_eq!(failure.failure.kind, TurnFailureKind::Upstream);
+    assert_eq!(failure.failure.upstream_status, Some(500));
 }
 
 // ── truncate_validation_error ─────────────────────────────────────────────────

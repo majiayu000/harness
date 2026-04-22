@@ -4,7 +4,8 @@ use axum::body::Body;
 use axum::http::Request;
 use harness_core::{
     agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, agent::StreamItem,
-    types::Capability, types::TokenUsage,
+    types::Capability, types::TokenUsage, types::TurnFailure, types::TurnFailureKind,
+    types::TurnTelemetry,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -968,6 +969,101 @@ async fn get_task_hides_internal_system_input_metadata() -> anyhow::Result<()> {
     let task_json: serde_json::Value = serde_json::from_slice(&body)?;
     assert_eq!(task_json["id"], task_id);
     assert!(task_json.get("system_input").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_task_includes_round_telemetry_and_failure() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let task_id = task_runner::TaskId::new();
+    let mut task = task_runner::TaskState::new(task_id.clone());
+    task.rounds.push(task_runner::RoundResult::new(
+        1,
+        "implement",
+        "upstream_failure",
+        Some("provider error".to_string()),
+        Some(TurnTelemetry {
+            first_token_latency_ms: Some(123),
+            completed_latency_ms: Some(456),
+            ..Default::default()
+        }),
+        Some(TurnFailure {
+            kind: TurnFailureKind::Upstream,
+            provider: Some("anthropic-api".to_string()),
+            upstream_status: Some(500),
+            message: Some("API returned 500".to_string()),
+            body_excerpt: Some("{"type":"error"}".to_string()),
+        }),
+    ));
+    state.core.tasks.insert(&task).await;
+
+    let response = task_app(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/tasks/{}", task_id.0))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    use http_body_util::BodyExt;
+    let body = response.into_body().collect().await?.to_bytes();
+    let task_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        task_json["rounds"][0]["telemetry"]["first_token_latency_ms"],
+        123
+    );
+    assert_eq!(task_json["rounds"][0]["failure"]["kind"], "upstream");
+    assert_eq!(task_json["rounds"][0]["failure"]["upstream_status"], 500);
+    Ok(())
+}
+
+#[tokio::test]
+async fn closed_task_sse_replay_includes_observability_fields() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let task_id = task_runner::TaskId::new();
+    let mut task = task_runner::TaskState::new(task_id.clone());
+    task.rounds.push(task_runner::RoundResult::new(
+        1,
+        "review",
+        "timeout",
+        Some("reviewer stalled".to_string()),
+        Some(TurnTelemetry {
+            completed_latency_ms: Some(900),
+            ..Default::default()
+        }),
+        Some(TurnFailure {
+            kind: TurnFailureKind::Timeout,
+            provider: Some("claude".to_string()),
+            upstream_status: None,
+            message: Some("timeout".to_string()),
+            body_excerpt: None,
+        }),
+    ));
+    state.core.tasks.insert(&task).await;
+
+    let app = Router::new()
+        .route("/tasks/{id}/stream", get(stream_task_sse))
+        .with_state(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/tasks/{}/stream", task_id.0))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    use http_body_util::BodyExt;
+    let body = response.into_body().collect().await?.to_bytes();
+    let body_text = String::from_utf8(body.to_vec())?;
+    assert!(body_text.contains("telemetry="));
+    assert!(body_text.contains("failure="));
+    assert!(body_text.contains(""kind":"timeout""));
     Ok(())
 }
 

@@ -1,10 +1,12 @@
 use crate::task_runner::{TaskId, TaskStatus, TaskStore};
+use chrono::{DateTime, Utc};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::error::HarnessError;
 use harness_core::interceptor::{ToolUseEvent, TurnInterceptor};
 use harness_core::prompts;
 use harness_core::types::{
-    ContextItem, Decision, Item, SkillId, ThreadId, TokenUsage, TurnId, TurnStatus,
+    ContextItem, Decision, Event, EventMetadata, Item, SessionId, SkillId, ThreadId, TokenUsage,
+    TurnFailure, TurnId, TurnStatus, TurnTelemetry,
 };
 use harness_protocol::{notifications::Notification, notifications::RpcNotification};
 use std::path::Path;
@@ -28,6 +30,67 @@ pub(crate) fn truncate_validation_error(error: &str, max_chars: usize) -> String
         "{truncated}\n\n... (output truncated, {total} chars total)",
         total = error.len()
     )
+}
+
+#[derive(Debug)]
+pub(crate) struct TurnExecutionSuccess {
+    pub response: AgentResponse,
+    pub telemetry: TurnTelemetry,
+}
+
+#[derive(Debug)]
+pub(crate) struct TurnExecutionFailure {
+    pub error: HarnessError,
+    pub telemetry: TurnTelemetry,
+    pub failure: TurnFailure,
+}
+
+pub(crate) fn telemetry_for_timeout(
+    prompt_built_at: DateTime<Utc>,
+    agent_started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    retry_count: Option<u32>,
+) -> TurnTelemetry {
+    let completed_latency_ms = completed_at
+        .signed_duration_since(agent_started_at)
+        .num_milliseconds()
+        .max(0) as u64;
+    TurnTelemetry {
+        prompt_built_at: Some(prompt_built_at),
+        agent_started_at: Some(agent_started_at),
+        first_output_at: None,
+        completed_at: Some(completed_at),
+        first_token_latency_ms: None,
+        completed_latency_ms: Some(completed_latency_ms),
+        retry_count,
+        exit_code: None,
+    }
+}
+
+pub(crate) fn build_task_event(
+    task_id: &TaskId,
+    turn: u32,
+    phase: &str,
+    hook: &str,
+    decision: Decision,
+    reason: Option<String>,
+    detail: Option<String>,
+    telemetry: Option<TurnTelemetry>,
+    failure: Option<TurnFailure>,
+    content: Option<String>,
+) -> Event {
+    let mut event = Event::new(SessionId::new(), hook, "task_runner", decision);
+    event.reason = reason;
+    event.detail = detail;
+    event.content = content;
+    event.metadata = Some(EventMetadata {
+        task_id: Some(task_id.clone()),
+        turn: Some(turn),
+        phase: Some(phase.to_string()),
+        telemetry,
+        failure,
+    });
+    event
 }
 
 /// Run all pre_execute interceptors in order. Returns the (possibly modified) request,
@@ -551,7 +614,9 @@ pub(crate) async fn run_agent_streaming(
     task_id: &TaskId,
     store: &TaskStore,
     turn: u32,
-) -> harness_core::error::Result<(AgentResponse, Option<u64>)> {
+    prompt_built_at: DateTime<Utc>,
+    agent_started_at: DateTime<Utc>,
+) -> Result<TurnExecutionSuccess, TurnExecutionFailure> {
     let turn_start = Instant::now();
 
     // Persist redacted prompt before req is consumed by execute_stream.
@@ -582,6 +647,7 @@ pub(crate) async fn run_agent_streaming(
     let mut output = String::new();
     let mut token_usage = TokenUsage::default();
     let mut first_token_latency_ms: Option<u64> = None;
+    let mut first_output_at: Option<DateTime<Utc>> = None;
     // Tracks the last CREATED_ISSUE= number we successfully wrote to the DB so
     // we can (a) skip redundant writes and (b) detect agent self-corrections
     // that replace an earlier sentinel with a later one ("last sentinel wins").
@@ -607,8 +673,8 @@ pub(crate) async fn run_agent_streaming(
                         match &item {
                             StreamItem::MessageDelta { text } => {
                                 if first_token_latency_ms.is_none() {
-                                    first_token_latency_ms =
-                                        Some(turn_start.elapsed().as_millis() as u64);
+                                    first_output_at = Some(Utc::now());
+                                    first_token_latency_ms = Some(turn_start.elapsed().as_millis() as u64);
                                 }
                                 output.push_str(text);
 
@@ -657,6 +723,9 @@ pub(crate) async fn run_agent_streaming(
                                 // streaming events) sets first_token_latency_ms.
                                 // Prefer the full content over accumulated deltas.
                                 output = content.clone();
+                                if first_output_at.is_none() && !content.is_empty() {
+                                    first_output_at = Some(Utc::now());
+                                }
                                 // For non-streaming adapters the full output arrives
                                 // here; apply the same sentinel scan so backfill
                                 // happens before the post-execution path runs (closes
@@ -694,13 +763,30 @@ pub(crate) async fn run_agent_streaming(
         }
     }
 
+    let completed_at = Utc::now();
+    let completed_latency_ms = completed_at
+        .signed_duration_since(agent_started_at)
+        .num_milliseconds()
+        .max(0) as u64;
+
+    let base_telemetry = TurnTelemetry {
+        prompt_built_at: Some(prompt_built_at),
+        agent_started_at: Some(agent_started_at),
+        first_output_at,
+        completed_at: Some(completed_at),
+        first_token_latency_ms,
+        completed_latency_ms: Some(completed_latency_ms),
+        retry_count: None,
+        exit_code: None,
+    };
+
     match exec_result.unwrap_or_else(|| {
         Err(HarnessError::AgentExecution(
             "agent execution completed without result".into(),
         ))
     }) {
-        Ok(()) => Ok((
-            AgentResponse {
+        Ok(()) => Ok(TurnExecutionSuccess {
+            response: AgentResponse {
                 output,
                 stderr: String::new(),
                 items: Vec::new(),
@@ -708,9 +794,25 @@ pub(crate) async fn run_agent_streaming(
                 model: String::new(),
                 exit_code: Some(0),
             },
-            first_token_latency_ms,
-        )),
-        Err(e) => Err(e),
+            telemetry: TurnTelemetry {
+                exit_code: Some(0),
+                ..base_telemetry
+            },
+        }),
+        Err(error) => {
+            let failure = error.turn_failure().unwrap_or(TurnFailure {
+                kind: harness_core::types::TurnFailureKind::Unknown,
+                provider: None,
+                upstream_status: None,
+                message: Some(error.to_string()),
+                body_excerpt: None,
+            });
+            Err(TurnExecutionFailure {
+                error,
+                telemetry: base_telemetry,
+                failure,
+            })
+        }
     }
 }
 

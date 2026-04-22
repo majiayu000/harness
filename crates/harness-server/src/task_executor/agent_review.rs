@@ -1,10 +1,14 @@
-use super::helpers::{run_on_error, run_post_execute, run_pre_execute, update_status};
+use super::helpers::{
+    build_task_event, run_agent_streaming, run_on_error, run_post_execute, run_pre_execute,
+    telemetry_for_timeout, update_status,
+};
 use crate::task_runner::{mutate_and_persist, RoundResult, TaskId, TaskStatus, TaskStore};
+use chrono::Utc;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::error::HarnessError;
 use harness_core::prompts;
 use harness_core::tool_isolation::validate_tool_usage;
-use harness_core::types::{ContextItem, Event, ExecutionPhase, SessionId};
+use harness_core::types::{ContextItem, Decision, ExecutionPhase, TurnFailure, TurnFailureKind};
 use harness_observe::event_store::EventStore;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -74,6 +78,7 @@ pub(crate) async fn run_agent_review(
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
 
         // Reviewer evaluates the PR diff — read-only except Bash for `gh pr diff`.
+        let review_prompt_built_at = Utc::now();
         let review_req = AgentRequest {
             prompt: {
                 let base = prompts::agent_review_prompt(pr_url, agent_round, project_type);
@@ -104,10 +109,24 @@ pub(crate) async fn run_agent_review(
                 ));
             }
         }
-        let resp = tokio::time::timeout(turn_timeout, reviewer.execute(review_req.clone())).await;
+        let review_started_at = Utc::now();
+        let resp = tokio::time::timeout(
+            turn_timeout,
+            run_agent_streaming(
+                reviewer,
+                review_req.clone(),
+                task_id,
+                store,
+                0,
+                review_prompt_built_at,
+                review_started_at,
+            ),
+        )
+        .await;
         *turns_used += 1;
         let resp = match resp {
-            Ok(Ok(r)) => {
+            Ok(Ok(success)) => {
+                let r = success.response;
                 let tool_violations = validate_tool_usage(
                     &r.output,
                     review_req.allowed_tools.as_deref().unwrap_or(&[]),
@@ -132,28 +151,82 @@ pub(crate) async fn run_agent_review(
                         "post-execute validation failed in agent review; continuing"
                     );
                 }
-                r
+                (r, success.telemetry)
             }
-            Ok(Err(e)) => {
+            Ok(Err(failure)) => {
                 // Quota/billing failures are not retryable — break immediately.
                 // Do NOT activate the global rate-limit circuit breaker: the reviewer
                 // agent is configured independently from the implementation agent and a
                 // depleted reviewer account must not stall unrelated implementation tasks.
                 if matches!(
-                    e,
+                    failure.error,
                     HarnessError::QuotaExhausted(_) | HarnessError::BillingFailed(_)
                 ) {
-                    tracing::error!(agent_round, error = %e, "quota/billing failure during agent review — aborting");
-                    run_on_error(interceptors, &review_req, &e.to_string()).await;
+                    tracing::error!(agent_round, error = %failure.error, "quota/billing failure during agent review — aborting");
+                    run_on_error(interceptors, &review_req, &failure.error.to_string()).await;
                     mutate_and_persist(store, task_id, |s| {
                         s.status = TaskStatus::Failed;
-                        s.error = Some(e.to_string());
+                        s.error = Some(failure.error.to_string());
+                        s.rounds.push(RoundResult::new(
+                            0,
+                            "agent_review",
+                            match failure.failure.kind {
+                                TurnFailureKind::Quota => "quota_exhausted",
+                                TurnFailureKind::Billing => "billing_failed",
+                                TurnFailureKind::Upstream => "upstream_failure",
+                                _ => "failed",
+                            },
+                            None,
+                            Some(failure.telemetry.clone()),
+                            Some(failure.failure.clone()),
+                        ));
                     })
                     .await?;
+                    let event = build_task_event(
+                        task_id,
+                        0,
+                        "agent_review",
+                        "agent_review",
+                        Decision::Block,
+                        Some("agent reviewer failed".to_string()),
+                        Some(format!("pr={pr_url}")),
+                        Some(failure.telemetry),
+                        Some(failure.failure),
+                        None,
+                    );
+                    if let Err(error) = events.log(&event).await {
+                        tracing::warn!("failed to log agent_review event: {error}");
+                    }
                     return Ok((false, false));
                 }
-                run_on_error(interceptors, &review_req, &e.to_string()).await;
-                return Err(e.into());
+                run_on_error(interceptors, &review_req, &failure.error.to_string()).await;
+                mutate_and_persist(store, task_id, |s| {
+                    s.rounds.push(RoundResult::new(
+                        0,
+                        "agent_review",
+                        "failed",
+                        None,
+                        Some(failure.telemetry.clone()),
+                        Some(failure.failure.clone()),
+                    ));
+                })
+                .await?;
+                let event = build_task_event(
+                    task_id,
+                    0,
+                    "agent_review",
+                    "agent_review",
+                    Decision::Block,
+                    Some("agent reviewer failed".to_string()),
+                    Some(format!("pr={pr_url}")),
+                    Some(failure.telemetry),
+                    Some(failure.failure),
+                    None,
+                );
+                if let Err(error) = events.log(&event).await {
+                    tracing::warn!("failed to log agent_review event: {error}");
+                }
+                return Err(failure.error.into());
             }
             Err(_) => {
                 let msg = format!(
@@ -161,11 +234,50 @@ pub(crate) async fn run_agent_review(
                     turn_timeout.as_secs()
                 );
                 run_on_error(interceptors, &review_req, &msg).await;
+                let telemetry = telemetry_for_timeout(
+                    review_prompt_built_at,
+                    review_started_at,
+                    Utc::now(),
+                    None,
+                );
+                let failure = TurnFailure {
+                    kind: TurnFailureKind::Timeout,
+                    provider: Some(reviewer.name().to_string()),
+                    upstream_status: None,
+                    message: Some(msg.clone()),
+                    body_excerpt: None,
+                };
+                mutate_and_persist(store, task_id, |s| {
+                    s.rounds.push(RoundResult::new(
+                        0,
+                        "agent_review",
+                        "timeout",
+                        None,
+                        Some(telemetry.clone()),
+                        Some(failure.clone()),
+                    ));
+                })
+                .await?;
+                let event = build_task_event(
+                    task_id,
+                    0,
+                    "agent_review",
+                    "agent_review",
+                    Decision::Block,
+                    Some("agent reviewer timed out".to_string()),
+                    Some(format!("pr={pr_url}")),
+                    Some(telemetry),
+                    Some(failure),
+                    None,
+                );
+                if let Err(error) = events.log(&event).await {
+                    tracing::warn!("failed to log agent_review event: {error}");
+                }
                 return Err(anyhow::anyhow!("{msg}"));
             }
         };
 
-        let AgentResponse { output, stderr, .. } = resp;
+        let (AgentResponse { output, stderr, .. }, review_telemetry) = resp;
 
         if !stderr.is_empty() {
             tracing::warn!(agent_round, stderr = %stderr, "agent reviewer stderr");
@@ -176,38 +288,42 @@ pub(crate) async fn run_agent_review(
         let review_detail = output;
 
         mutate_and_persist(store, task_id, |s| {
-            s.rounds.push(RoundResult {
-                turn: 0, // agent review rounds use turn 0
-                action: "agent_review".into(),
-                result: if approved {
-                    "approved".into()
+            s.rounds.push(RoundResult::new(
+                0,
+                "agent_review",
+                if approved {
+                    "approved".to_string()
                 } else {
                     format!("{} issues", issues.len())
                 },
-                detail: Some(review_detail),
-                first_token_latency_ms: None,
-            });
+                Some(review_detail.clone()),
+                Some(review_telemetry.clone()),
+                None,
+            ));
         })
         .await?;
 
-        // Log agent_review event
-        let mut ev = Event::new(
-            SessionId::new(),
+        let event = build_task_event(
+            task_id,
+            0,
             "agent_review",
-            "task_runner",
+            "agent_review",
             if approved {
-                harness_core::types::Decision::Complete
+                Decision::Complete
             } else {
-                harness_core::types::Decision::Warn
+                Decision::Warn
             },
+            Some(if approved {
+                format!("round {agent_round}: approved")
+            } else {
+                format!("round {agent_round}: {} issues", issues.len())
+            }),
+            Some(format!("pr={pr_url}")),
+            Some(review_telemetry.clone()),
+            None,
+            Some(review_detail.clone()),
         );
-        ev.detail = Some(format!("pr={pr_url}"));
-        ev.reason = Some(if approved {
-            format!("round {agent_round}: approved")
-        } else {
-            format!("round {agent_round}: {} issues", issues.len())
-        });
-        if let Err(e) = events.log(&ev).await {
+        if let Err(e) = events.log(&event).await {
             tracing::warn!("failed to log agent_review event: {e}");
         }
 
@@ -280,6 +396,7 @@ pub(crate) async fn run_agent_review(
         }
 
         // Implementor fixes the issues
+        let fix_prompt_built_at = Utc::now();
         let fix_req = AgentRequest {
             prompt: {
                 let prompt_fn = if is_impasse {
@@ -305,10 +422,24 @@ pub(crate) async fn run_agent_review(
                 ));
             }
         }
-        let fix_resp = tokio::time::timeout(turn_timeout, agent.execute(fix_req.clone())).await;
+        let fix_started_at = Utc::now();
+        let fix_resp = tokio::time::timeout(
+            turn_timeout,
+            run_agent_streaming(
+                agent,
+                fix_req.clone(),
+                task_id,
+                store,
+                0,
+                fix_prompt_built_at,
+                fix_started_at,
+            ),
+        )
+        .await;
         *turns_used += 1;
         match fix_resp {
-            Ok(Ok(r)) => {
+            Ok(Ok(success)) => {
+                let r = success.response;
                 if let Some(val_err) = run_post_execute(interceptors, &fix_req, &r).await {
                     tracing::warn!(
                         agent_round,
@@ -316,10 +447,32 @@ pub(crate) async fn run_agent_review(
                         "post-execute validation failed in agent review fix; continuing"
                     );
                 }
+                mutate_and_persist(store, task_id, |s| {
+                    s.rounds.push(RoundResult::new(
+                        0,
+                        "agent_review_fix",
+                        "fixed",
+                        None,
+                        Some(success.telemetry.clone()),
+                        None,
+                    ));
+                })
+                .await?;
             }
-            Ok(Err(e)) => {
-                run_on_error(interceptors, &fix_req, &e.to_string()).await;
-                return Err(e.into());
+            Ok(Err(failure)) => {
+                run_on_error(interceptors, &fix_req, &failure.error.to_string()).await;
+                mutate_and_persist(store, task_id, |s| {
+                    s.rounds.push(RoundResult::new(
+                        0,
+                        "agent_review_fix",
+                        "failed",
+                        None,
+                        Some(failure.telemetry.clone()),
+                        Some(failure.failure.clone()),
+                    ));
+                })
+                .await?;
+                return Err(failure.error.into());
             }
             Err(_) => {
                 let msg = format!(
@@ -327,20 +480,29 @@ pub(crate) async fn run_agent_review(
                     turn_timeout.as_secs()
                 );
                 run_on_error(interceptors, &fix_req, &msg).await;
+                let telemetry =
+                    telemetry_for_timeout(fix_prompt_built_at, fix_started_at, Utc::now(), None);
+                let failure = TurnFailure {
+                    kind: TurnFailureKind::Timeout,
+                    provider: Some(agent.name().to_string()),
+                    upstream_status: None,
+                    message: Some(msg.clone()),
+                    body_excerpt: None,
+                };
+                mutate_and_persist(store, task_id, |s| {
+                    s.rounds.push(RoundResult::new(
+                        0,
+                        "agent_review_fix",
+                        "timeout",
+                        None,
+                        Some(telemetry.clone()),
+                        Some(failure.clone()),
+                    ));
+                })
+                .await?;
                 return Err(anyhow::anyhow!("{msg}"));
             }
         }
-
-        mutate_and_persist(store, task_id, |s| {
-            s.rounds.push(RoundResult {
-                turn: 0,
-                action: "agent_review_fix".into(),
-                result: "fixed".into(),
-                detail: None,
-                first_token_latency_ms: None,
-            });
-        })
-        .await?;
         pushed_commit = true;
     }
 
