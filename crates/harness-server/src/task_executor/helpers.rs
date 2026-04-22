@@ -58,6 +58,12 @@ impl Default for RunAgentStreamingOptions {
     }
 }
 
+pub(crate) fn is_prompt_only_task(store: &TaskStore, task_id: &TaskId) -> bool {
+    store
+        .get(task_id)
+        .is_some_and(|state| state.description.as_deref() == Some("prompt task"))
+}
+
 pub(crate) fn telemetry_for_timeout(
     prompt_built_at: DateTime<Utc>,
     agent_started_at: DateTime<Utc>,
@@ -658,10 +664,7 @@ pub(crate) async fn run_agent_streaming_with_options(
     // Persist redacted prompt before req is consumed by execute_stream.
     // Skip prompt-only tasks: their prompts may contain user-supplied credentials
     // and must not be written at rest (per the privacy contract in task_runner.rs).
-    let is_prompt_only = store
-        .get(task_id)
-        .map(|s| matches!(s.task_kind, crate::task_runner::TaskKind::Prompt))
-        .unwrap_or(false);
+    let is_prompt_only = is_prompt_only_task(store, task_id);
     let phase_str = req
         .execution_phase
         .map(|p| format!("{p:?}").to_lowercase())

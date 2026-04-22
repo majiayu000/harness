@@ -152,6 +152,26 @@ impl HarnessError {
 }
 
 fn classify_agent_execution_failure(message: &str) -> TurnFailure {
+    if is_billing_failure_message(message) {
+        return TurnFailure {
+            kind: TurnFailureKind::Billing,
+            provider: provider_from_message(message),
+            upstream_status: parse_upstream_status(message),
+            message: Some(message.to_string()),
+            body_excerpt: excerpt_after_colon(message),
+        };
+    }
+
+    if is_quota_failure_message(message) {
+        return TurnFailure {
+            kind: TurnFailureKind::Quota,
+            provider: provider_from_message(message),
+            upstream_status: parse_upstream_status(message),
+            message: Some(message.to_string()),
+            body_excerpt: excerpt_after_colon(message),
+        };
+    }
+
     if message.starts_with("API returned ") {
         return TurnFailure {
             kind: TurnFailureKind::Upstream,
@@ -210,6 +230,23 @@ fn classify_agent_execution_failure(message: &str) -> TurnFailure {
     }
 }
 
+fn is_billing_failure_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("payment required")
+        || lower.contains("billing failure")
+        || lower.contains("insufficient available balance")
+        || lower.contains("insufficient balance")
+}
+
+fn is_quota_failure_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("quota exhausted")
+        || lower.contains("hit your limit")
+        || lower.contains("rate limit")
+        || lower.contains("quota resets")
+        || lower.contains("quota reset")
+}
+
 fn provider_from_message(message: &str) -> Option<String> {
     if let Some(rest) = message.strip_prefix("failed to run ") {
         return rest
@@ -252,4 +289,35 @@ fn excerpt_after_colon(message: &str) -> Option<String> {
         end -= 1;
     }
     Some(excerpt[..end].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_streamed_quota_exit_as_quota_failure() {
+        let failure = HarnessError::AgentExecution(
+            "claude exited with exit status: 1: stderr=[] stdout_tail=[You've hit your limit · resets 3pm (Asia/Shanghai)\n]"
+                .to_string(),
+        )
+        .turn_failure()
+        .expect("turn failure");
+
+        assert_eq!(failure.kind, TurnFailureKind::Quota);
+        assert_eq!(failure.provider.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn classify_streamed_billing_exit_as_billing_failure() {
+        let failure = HarnessError::AgentExecution(
+            "codex exited with exit status: 1: payment required: insufficient available balance"
+                .to_string(),
+        )
+        .turn_failure()
+        .expect("turn failure");
+
+        assert_eq!(failure.kind, TurnFailureKind::Billing);
+        assert_eq!(failure.provider.as_deref(), Some("codex"));
+    }
 }

@@ -5,7 +5,6 @@ use super::helpers::{
 use crate::task_runner::{mutate_and_persist, RoundResult, TaskId, TaskStatus, TaskStore};
 use chrono::Utc;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
-use harness_core::error::HarnessError;
 use harness_core::prompts;
 use harness_core::tool_isolation::validate_tool_usage;
 use harness_core::types::{ContextItem, Decision, ExecutionPhase, TurnFailure, TurnFailureKind};
@@ -159,8 +158,8 @@ pub(crate) async fn run_agent_review(
                 // agent is configured independently from the implementation agent and a
                 // depleted reviewer account must not stall unrelated implementation tasks.
                 if matches!(
-                    failure.error,
-                    HarnessError::QuotaExhausted(_) | HarnessError::BillingFailed(_)
+                    failure.failure.kind,
+                    TurnFailureKind::Quota | TurnFailureKind::Billing
                 ) {
                     tracing::error!(agent_round, error = %failure.error, "quota/billing failure during agent review — aborting");
                     run_on_error(interceptors, &review_req, &failure.error.to_string()).await;
