@@ -17,6 +17,35 @@ fn apply_recovered_request_settings(
     Ok(())
 }
 
+fn checkpoint_recovery_failure_reason(
+    task: &task_runner::TaskState,
+    req: &task_runner::CreateTaskRequest,
+    recovered_issue_num: Option<u64>,
+) -> Option<&'static str> {
+    if recovered_issue_num.is_none()
+        && task
+            .request_settings
+            .as_ref()
+            .is_some_and(|settings| settings.additional_prompt.is_some())
+    {
+        Some("checkpoint task lost parseable issue number during restart recovery — skipping")
+    } else if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
+        if task
+            .request_settings
+            .as_ref()
+            .is_some_and(|settings| settings.is_manual_prompt_only())
+        {
+            Some(
+                "manual prompt-only task cannot be recovered after restart: original prompt text is not persisted",
+            )
+        } else {
+            Some("checkpoint task has no parseable issue number or restart bundle — skipping")
+        }
+    } else {
+        None
+    }
+}
+
 /// Spawn background watcher for AwaitingDeps tasks.
 /// Uses Weak<AppState> to avoid a reference cycle; the loop exits when AppState is dropped.
 pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
@@ -1165,17 +1194,7 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                     }
                 }
 
-                if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
-                    let reason = if task
-                        .request_settings
-                        .as_ref()
-                        .is_some_and(|settings| settings.is_manual_prompt_only())
-                    {
-                        "manual prompt-only task cannot be recovered after restart: \
-                         original prompt text is not persisted"
-                    } else {
-                        "checkpoint task has no parseable issue number or restart bundle — skipping"
-                    };
+                if let Some(reason) = checkpoint_recovery_failure_reason(&task, &req, issue_num) {
                     tracing::warn!(task_id = ?task.id, "{reason}");
                     let mut failed = task.clone();
                     failed.status = task_runner::TaskStatus::Failed;
@@ -1306,5 +1325,92 @@ mod tests {
         let mut pending_without_pr = pending_with_pr;
         pending_without_pr.pr_url = None;
         assert!(!task_is_pr_recovery_candidate(&pending_without_pr));
+    }
+
+    fn issue_task_settings(additional_prompt: &str) -> task_runner::PersistedRequestSettings {
+        task_runner::PersistedRequestSettings {
+            additional_prompt: Some(additional_prompt.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn manual_prompt_only_settings() -> task_runner::PersistedRequestSettings {
+        task_runner::PersistedRequestSettings {
+            prompt_task_origin: Some(task_runner::PromptTaskOrigin::Manual),
+            ..Default::default()
+        }
+    }
+
+    fn task_with_settings(
+        settings: task_runner::PersistedRequestSettings,
+    ) -> task_runner::TaskState {
+        task_runner::TaskState {
+            id: task_runner::TaskId::new(),
+            status: task_runner::TaskStatus::Pending,
+            turn: 0,
+            pr_url: None,
+            rounds: vec![],
+            error: None,
+            source: None,
+            external_id: None,
+            parent_id: None,
+            depends_on: vec![],
+            subtask_ids: vec![],
+            project_root: None,
+            issue: None,
+            repo: None,
+            description: None,
+            created_at: None,
+            updated_at: None,
+            priority: 0,
+            phase: task_runner::TaskPhase::default(),
+            triage_output: None,
+            plan_output: None,
+            request_settings: Some(settings),
+        }
+    }
+
+    #[test]
+    fn checkpoint_recovery_fails_closed_when_issue_identity_is_lost() {
+        let task = task_with_settings(issue_task_settings("extra context"));
+        let req = task_runner::CreateTaskRequest {
+            prompt: Some("extra context".to_string()),
+            ..Default::default()
+        };
+
+        let reason = checkpoint_recovery_failure_reason(&task, &req, None);
+
+        assert_eq!(
+            reason,
+            Some("checkpoint task lost parseable issue number during restart recovery — skipping")
+        );
+    }
+
+    #[test]
+    fn checkpoint_recovery_allows_system_prompt_only_recovery() {
+        let task = task_with_settings(task_runner::PersistedRequestSettings::default());
+        let req = task_runner::CreateTaskRequest {
+            prompt: Some("rebuilt system prompt".to_string()),
+            ..Default::default()
+        };
+
+        let reason = checkpoint_recovery_failure_reason(&task, &req, None);
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn checkpoint_recovery_rejects_manual_prompt_only_tasks_without_prompt() {
+        let task = task_with_settings(manual_prompt_only_settings());
+        let req = task_runner::CreateTaskRequest::default();
+
+        let reason = checkpoint_recovery_failure_reason(&task, &req, None);
+
+        assert_eq!(
+            reason,
+            Some(
+                "manual prompt-only task cannot be recovered after restart: original prompt text is not persisted",
+            )
+        );
     }
 }
