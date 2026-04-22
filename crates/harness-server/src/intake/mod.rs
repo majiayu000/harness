@@ -389,24 +389,25 @@ fn parse_issue_external_id(external_id: &str) -> Option<u64> {
         .ok()
 }
 
-const DEPENDENCY_UNBLOCKING_TASK_STATUSES: &[&str] = &["done", "failed"];
-
 async fn completed_issue_numbers_for_project(
     tasks: &crate::task_runner::TaskStore,
     project_id: &str,
+    repo: Option<&str>,
 ) -> std::collections::HashSet<u64> {
     match tasks
-        .list_external_ids_by_project_and_statuses(project_id, DEPENDENCY_UNBLOCKING_TASK_STATUSES)
+        .list_latest_external_statuses_by_project_and_repo(project_id, repo)
         .await
     {
-        Ok(external_ids) => external_ids
+        Ok(external_statuses) => external_statuses
             .into_iter()
-            .filter_map(|external_id| parse_issue_external_id(&external_id))
+            .filter(|(_, status)| status_unblocks_dependents(status))
+            .filter_map(|(external_id, _)| parse_issue_external_id(&external_id))
             .collect(),
         Err(e) => {
             tracing::warn!(
                 project = project_id,
-                "intake: failed to inspect terminal tasks during sprint normalization: {e}"
+                repo,
+                "intake: failed to inspect latest task statuses during sprint normalization: {e}"
             );
             std::collections::HashSet::new()
         }
@@ -592,7 +593,8 @@ async fn run_repo_sprint(
     };
 
     let completed_issues =
-        completed_issue_numbers_for_project(state.core.tasks.as_ref(), &project_id).await;
+        completed_issue_numbers_for_project(state.core.tasks.as_ref(), &project_id, Some(repo))
+            .await;
     let planner_skip_set: std::collections::HashSet<u64> =
         plan.skip.iter().map(|skip| skip.issue).collect();
     let normalized =
@@ -1316,34 +1318,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_issue_numbers_for_project_includes_failed_tasks() -> anyhow::Result<()> {
+    async fn completed_issue_numbers_for_project_uses_repo_and_latest_status() -> anyhow::Result<()>
+    {
         let dir = tempfile::tempdir()?;
         let store = crate::task_runner::TaskStore::open(&dir.path().join("tasks.db")).await?;
         let project_root = std::path::PathBuf::from("/projects/alpha");
         let other_project_root = std::path::PathBuf::from("/projects/beta");
+        let repo = "owner/current";
 
-        for (id, issue, status, root) in [
-            ("done", 41_u64, TaskStatus::Done, &project_root),
-            ("failed", 42_u64, TaskStatus::Failed, &project_root),
-            ("cancelled", 43_u64, TaskStatus::Cancelled, &project_root),
+        for (id, issue, status, root, task_repo, created_at) in [
+            (
+                "done",
+                41_u64,
+                TaskStatus::Done,
+                &project_root,
+                repo,
+                Some("2026-04-22T09:00:00Z"),
+            ),
+            (
+                "failed",
+                42_u64,
+                TaskStatus::Failed,
+                &project_root,
+                repo,
+                Some("2026-04-22T09:05:00Z"),
+            ),
+            (
+                "cancelled",
+                43_u64,
+                TaskStatus::Cancelled,
+                &project_root,
+                repo,
+                Some("2026-04-22T09:10:00Z"),
+            ),
             (
                 "other-project",
                 44_u64,
                 TaskStatus::Done,
                 &other_project_root,
+                repo,
+                Some("2026-04-22T09:15:00Z"),
+            ),
+            (
+                "other-repo",
+                45_u64,
+                TaskStatus::Done,
+                &project_root,
+                "owner/other",
+                Some("2026-04-22T09:20:00Z"),
+            ),
+            (
+                "done-old-attempt",
+                46_u64,
+                TaskStatus::Done,
+                &project_root,
+                repo,
+                Some("2026-04-22T09:25:00Z"),
+            ),
+            (
+                "retry-latest",
+                46_u64,
+                TaskStatus::Implementing,
+                &project_root,
+                repo,
+                Some("2026-04-22T09:30:00Z"),
             ),
         ] {
             let mut task =
                 crate::task_runner::TaskState::new(harness_core::types::TaskId(id.to_string()));
             task.status = status;
             task.project_root = Some(root.clone());
+            task.repo = Some(task_repo.to_string());
             task.external_id = Some(format!("issue:{issue}"));
+            task.created_at = created_at.map(str::to_string);
             store.insert(&task).await;
         }
 
-        let completed =
-            completed_issue_numbers_for_project(store.as_ref(), &project_root.to_string_lossy())
-                .await;
+        let completed = completed_issue_numbers_for_project(
+            store.as_ref(),
+            &project_root.to_string_lossy(),
+            Some(repo),
+        )
+        .await;
 
         assert_eq!(completed, make_issues(&[41, 42]));
         Ok(())

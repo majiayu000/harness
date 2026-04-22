@@ -350,28 +350,28 @@ impl TaskStore {
         Ok(by_id)
     }
 
-    /// Return external IDs for tasks in `project_id` whose status matches `statuses`.
+    /// Return the latest status for each `external_id` in a single project/repo namespace.
     ///
-    /// Queries the database with project/status filters applied so callers do not
-    /// need to deserialize every historical task row just to inspect a narrow slice.
-    /// Matching cache entries override DB rows for the same task ID.
-    pub async fn list_external_ids_by_project_and_statuses(
+    /// The database query collapses historical attempts down to the newest row per
+    /// issue. In-memory cache entries then override the DB result when the server
+    /// is holding a newer status transition that has not been re-read from storage.
+    pub async fn list_latest_external_statuses_by_project_and_repo(
         &self,
         project_id: &str,
-        statuses: &[&str],
-    ) -> anyhow::Result<Vec<String>> {
-        let mut by_id: HashMap<TaskId, String> = self
+        repo: Option<&str>,
+    ) -> anyhow::Result<HashMap<String, TaskStatus>> {
+        let mut by_external_id: HashMap<String, (Option<String>, TaskStatus)> = self
             .db
-            .list_external_ids_by_project_and_statuses(project_id, statuses)
+            .list_latest_external_statuses_by_project_and_repo(project_id, repo)
             .await?
             .into_iter()
-            .map(|(id, external_id)| (harness_core::types::TaskId(id), external_id))
+            .filter_map(|(external_id, status, created_at)| {
+                status
+                    .parse::<TaskStatus>()
+                    .ok()
+                    .map(|parsed| (external_id, (created_at, parsed)))
+            })
             .collect();
-        if statuses.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let status_set: std::collections::HashSet<&str> = statuses.iter().copied().collect();
         for entry in self.cache.iter() {
             let task = entry.value();
             let same_project = task
@@ -379,15 +379,35 @@ impl TaskStore {
                 .as_ref()
                 .map(|path| path.to_string_lossy() == project_id)
                 .unwrap_or(false);
-            if !same_project || !status_set.contains(task.status.as_ref()) {
+            let same_repo = match (repo, task.repo.as_deref()) {
+                (Some(expected), Some(actual)) => expected == actual,
+                (None, None) => true,
+                _ => false,
+            };
+            if !same_project || !same_repo {
                 continue;
             }
-            if let Some(external_id) = task.external_id.clone() {
-                by_id.insert(entry.key().clone(), external_id);
+            let Some(external_id) = task.external_id.clone() else {
+                continue;
+            };
+            let should_replace = by_external_id
+                .get(&external_id)
+                .map(|(existing_created_at, _)| {
+                    latest_timestamp_at_least(
+                        task.created_at.as_deref(),
+                        existing_created_at.as_deref(),
+                    )
+                })
+                .unwrap_or(true);
+            if should_replace {
+                by_external_id.insert(external_id, (task.created_at.clone(), task.status.clone()));
             }
         }
 
-        Ok(by_id.into_values().collect())
+        Ok(by_external_id
+            .into_iter()
+            .map(|(external_id, (_, status))| (external_id, status))
+            .collect())
     }
 
     /// Run `f` only if the task still exists and is live-`pending`.
@@ -1119,6 +1139,15 @@ pub async fn mutate_and_persist(
         f(entry.value_mut());
     }
     store.persist(id).await
+}
+
+fn latest_timestamp_at_least(candidate: Option<&str>, existing: Option<&str>) -> bool {
+    match (candidate, existing) {
+        (Some(candidate), Some(existing)) => candidate >= existing,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => true,
+    }
 }
 
 #[cfg(test)]

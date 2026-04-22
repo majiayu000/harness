@@ -163,6 +163,13 @@ pub(super) struct RecentFailureRow {
     pub(super) updated_at: Option<DateTime<Utc>>,
 }
 
+#[derive(sqlx::FromRow)]
+pub(super) struct ExternalStatusRow {
+    pub(super) external_id: String,
+    pub(super) status: String,
+    pub(super) created_at: Option<DateTime<Utc>>,
+}
+
 impl TaskRow {
     pub(super) fn try_into_task_state(self) -> anyhow::Result<TaskState> {
         let Self {
