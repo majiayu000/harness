@@ -3,11 +3,6 @@
 #
 # REQUIRED ENVIRONMENT VARIABLES (set in shell before starting the server):
 #
-#   DATABASE_URL=postgres://harness:harness@localhost:5432/harness
-#       Postgres 14+ connection string. TOML cannot read env vars — this MUST
-#       be exported in your shell (or a .env loader). See .env.example and
-#       scripts/dev-db.sh for a one-command local dev setup.
-#
 #   GITHUB_TOKEN=ghp_...
 #       Personal access token with repo + read:org scope. Required for
 #       GitHub integration (webhooks, auto-review, issue/PR tasks).
@@ -19,6 +14,7 @@
 [server]
 transport = "http"
 http_addr = "127.0.0.1:9800"
+database_url = "postgres://harness:harness@localhost:5432/harness"
 # Absolute path required — the server does not expand `~`.
 # Default on Linux:  ~/.local/share/harness
 # Default on macOS:  ~/Library/Application Support/harness
@@ -84,7 +80,16 @@ enabled = false
 # interval_hours = 24
 # agent = "codex"
 # strategy = "single" # or "cross" for dual-review + synthesis
-# timeout_secs = 900
+# timeout_secs = 10800
+# max_concurrent_tasks = 2
+
+# [intake.github]
+# enabled = true
+# poll_interval_secs = 300
+# planner_agent = "claude"
+# sprint_timeout_secs = 10800
+# retry_backoff_base_secs = 15
+# retry_backoff_max_secs = 120
 
 # Register projects below (can also pass --project-root / --project on CLI).
 # [[projects]]

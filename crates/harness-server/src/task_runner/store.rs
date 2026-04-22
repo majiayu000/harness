@@ -32,7 +32,14 @@ pub struct TaskStore {
 
 impl TaskStore {
     pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
-        let db = TaskDb::open(db_path).await?;
+        Self::open_with_database_url(db_path, None).await
+    }
+
+    pub async fn open_with_database_url(
+        db_path: &std::path::Path,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let db = TaskDb::open_with_database_url(db_path, configured_database_url).await?;
 
         // 1. Event replay: runs BEFORE recover_in_progress so event-sourced
         //    data (pr_url, terminal status) wins over checkpoint data.
@@ -116,6 +123,18 @@ impl TaskStore {
             return Ok(Some(task.value().clone()));
         }
         self.db.get(id.0.as_str()).await
+    }
+
+    /// Return `true` when the task exists in either the in-memory cache or the
+    /// backing database.
+    ///
+    /// Used by intake reconciliation to detect stale persisted dispatch markers
+    /// after a task-storage backend change (for example SQLite -> Postgres).
+    pub async fn exists_with_db_fallback(&self, id: &TaskId) -> anyhow::Result<bool> {
+        if self.cache.contains_key(id) {
+            return Ok(true);
+        }
+        self.db.exists_by_id(id.0.as_str()).await
     }
 
     /// Return the status of a dependency task with a single DB lookup.

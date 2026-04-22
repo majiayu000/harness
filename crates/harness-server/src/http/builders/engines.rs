@@ -87,8 +87,9 @@ pub(crate) async fn build_engines(
 
     // ── Event store ──────────────────────────────────────────────────────────
     let events = Arc::new(
-        harness_observe::event_store::EventStore::with_policies_and_otel(
+        harness_observe::event_store::EventStore::with_policies_and_otel_with_database_url(
             data_dir,
+            server.config.server.database_url.as_deref(),
             server.config.observe.session_renewal_secs,
             server.config.observe.log_retention_days,
             &server.config.otel,

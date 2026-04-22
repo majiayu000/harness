@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use harness_core::config::misc::OtelConfig;
 use harness_core::db::{
-    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, Migration, PgMigrator,
+    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, resolve_database_url,
+    Migration, PgMigrator,
 };
 use harness_core::types::{
     AutoFixReport, Decision, Event, EventFilters, EventId, ExternalSignal, ExternalSignalId, Grade,
@@ -62,11 +63,17 @@ pub struct EventStore {
 
 impl EventStore {
     pub async fn new(data_dir: &Path) -> anyhow::Result<Self> {
+        Self::new_with_database_url(data_dir, None).await
+    }
+
+    pub async fn new_with_database_url(
+        data_dir: &Path,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let data_dir = data_dir.to_path_buf();
 
-        let database_url = std::env::var("DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable is not set"))?;
+        let database_url = resolve_database_url(configured_database_url)?;
         use sha2::{Digest, Sha256};
         let events_path = data_dir.join("events.db");
         let path_utf8 = events_path
@@ -177,7 +184,24 @@ impl EventStore {
         log_retention_days: u32,
         otel_config: &OtelConfig,
     ) -> anyhow::Result<Self> {
-        let mut store = Self::new(data_dir).await?;
+        Self::with_policies_and_otel_with_database_url(
+            data_dir,
+            None,
+            session_renewal_secs,
+            log_retention_days,
+            otel_config,
+        )
+        .await
+    }
+
+    pub async fn with_policies_and_otel_with_database_url(
+        data_dir: &Path,
+        configured_database_url: Option<&str>,
+        session_renewal_secs: u64,
+        log_retention_days: u32,
+        otel_config: &OtelConfig,
+    ) -> anyhow::Result<Self> {
+        let mut store = Self::new_with_database_url(data_dir, configured_database_url).await?;
         store.session_renewal_secs = session_renewal_secs;
         tracing::debug!(
             session_renewal_secs,

@@ -4,7 +4,7 @@ use std::str::FromStr as _;
 
 use crate::db::Migration;
 
-const DEFAULT_PG_MAX_CONNECTIONS: u32 = 3;
+const DEFAULT_PG_MAX_CONNECTIONS: u32 = 8;
 const SUPABASE_POOLER_MAX_CONNECTIONS: u32 = 1;
 
 fn pg_max_connections(database_url: &str) -> u32 {
@@ -18,9 +18,33 @@ fn pg_max_connections(database_url: &str) -> u32 {
     }
 }
 
+/// Resolve the effective Postgres connection string.
+///
+/// Precedence:
+/// 1. Explicit configured URL (for example `server.database_url` from TOML)
+/// 2. Legacy `DATABASE_URL` environment variable fallback
+pub fn resolve_database_url(configured_database_url: Option<&str>) -> anyhow::Result<String> {
+    if let Some(url) = configured_database_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        return Ok(url.to_string());
+    }
+    if let Ok(url) = std::env::var("DATABASE_URL") {
+        let url = url.trim();
+        if !url.is_empty() {
+            return Ok(url.to_string());
+        }
+    }
+    anyhow::bail!(
+        "database URL is not configured; set server.database_url in TOML or DATABASE_URL in the environment"
+    )
+}
+
 /// Create a Postgres connection pool for the given DATABASE_URL.
 ///
-/// Uses 3 max connections with a 10-second acquire timeout.
+/// Uses 8 max connections by default, or 1 for Supabase pooler URLs, with a
+/// 10-second acquire timeout.
 pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
     let pool = PgPoolOptions::new()
         .max_connections(pg_max_connections(database_url))
@@ -200,7 +224,9 @@ impl<'a> PgMigrator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pg_max_connections, validate_schema_name};
+    use super::{
+        pg_max_connections, resolve_database_url, validate_schema_name, DEFAULT_PG_MAX_CONNECTIONS,
+    };
 
     #[test]
     fn valid_schema_names() {
@@ -264,6 +290,48 @@ mod tests {
     #[test]
     fn direct_postgres_urls_keep_default_connection_budget() {
         let url = "postgresql://user:pass@db.example.internal:5432/postgres";
-        assert_eq!(pg_max_connections(url), 3);
+        assert_eq!(pg_max_connections(url), DEFAULT_PG_MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn configured_database_url_wins_over_environment() {
+        temp_env::with_vars(
+            [(
+                "DATABASE_URL",
+                Some("postgres://env-user:env-pass@env-host:5432/envdb"),
+            )],
+            || {
+                let resolved =
+                    resolve_database_url(Some("postgres://cfg-user:cfg-pass@cfg-host:5432/cfgdb"))
+                        .expect("configured database URL should resolve");
+                assert_eq!(resolved, "postgres://cfg-user:cfg-pass@cfg-host:5432/cfgdb");
+            },
+        );
+    }
+
+    #[test]
+    fn environment_database_url_used_as_fallback() {
+        temp_env::with_vars(
+            [(
+                "DATABASE_URL",
+                Some("postgres://env-user:env-pass@env-host:5432/envdb"),
+            )],
+            || {
+                let resolved =
+                    resolve_database_url(None).expect("environment database URL should resolve");
+                assert_eq!(resolved, "postgres://env-user:env-pass@env-host:5432/envdb");
+            },
+        );
+    }
+
+    #[test]
+    fn missing_database_url_returns_error() {
+        temp_env::with_vars([("DATABASE_URL", None::<&str>)], || {
+            let err = resolve_database_url(None).expect_err("missing database URL should fail");
+            assert!(
+                err.to_string().contains("server.database_url"),
+                "error should mention the TOML config path, got: {err}"
+            );
+        });
     }
 }

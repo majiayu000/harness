@@ -12,6 +12,12 @@ pub struct ServerConfig {
     pub data_dir: PathBuf,
     #[serde(default = "default_project_root")]
     pub project_root: PathBuf,
+    /// Postgres connection string for all persistent server stores.
+    ///
+    /// When set, this wins over the legacy `DATABASE_URL` environment variable
+    /// fallback used by lower-level store initializers.
+    #[serde(default)]
+    pub database_url: Option<String>,
     #[serde(default)]
     pub github_webhook_secret: Option<String>,
     #[serde(default = "default_notification_broadcast_capacity")]
@@ -75,6 +81,7 @@ impl ServerConfig {
     /// - `HARNESS_HTTP_ADDR`       — `http_addr` (parsed as `SocketAddr`)
     /// - `HARNESS_DATA_DIR`        — `data_dir`
     /// - `HARNESS_PROJECT_ROOT`    — `project_root`
+    /// - `HARNESS_DATABASE_URL`    — `database_url`
     /// - `HARNESS_API_TOKEN`       — `api_token`
     /// - `GITHUB_TOKEN`            — `github_token`
     /// - `GITHUB_WEBHOOK_SECRET`   — `github_webhook_secret`
@@ -87,6 +94,11 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("HARNESS_PROJECT_ROOT") {
             if !v.is_empty() {
                 self.project_root = std::path::PathBuf::from(v);
+            }
+        }
+        if let Ok(v) = std::env::var("HARNESS_DATABASE_URL") {
+            if !v.is_empty() {
+                self.database_url = Some(v);
             }
         }
         if let Ok(v) = std::env::var("HARNESS_API_TOKEN") {
@@ -135,6 +147,7 @@ impl fmt::Debug for ServerConfig {
             http_addr,
             data_dir,
             project_root,
+            database_url,
             github_webhook_secret,
             notification_broadcast_capacity,
             notification_lag_log_every,
@@ -153,6 +166,7 @@ impl fmt::Debug for ServerConfig {
             .field("http_addr", http_addr)
             .field("data_dir", data_dir)
             .field("project_root", project_root)
+            .field("database_url", &database_url.as_ref().map(|_| "[REDACTED]"))
             .field(
                 "github_webhook_secret",
                 &github_webhook_secret.as_ref().map(|_| "[REDACTED]"),
@@ -185,6 +199,7 @@ impl Default for ServerConfig {
             http_addr: SocketAddr::from(([127, 0, 0, 1], 9800)),
             data_dir: dirs_data_dir().join("harness"),
             project_root: default_project_root(),
+            database_url: None,
             github_webhook_secret: None,
             notification_broadcast_capacity: default_notification_broadcast_capacity(),
             notification_lag_log_every: default_notification_lag_log_every(),
@@ -295,6 +310,39 @@ mod tests {
     }
 
     #[test]
+    fn env_override_database_url() {
+        temp_env::with_vars(
+            [(
+                "HARNESS_DATABASE_URL",
+                Some("postgres://env-user:env-pass@env-host:5432/envdb"),
+            )],
+            || {
+                let mut cfg = ServerConfig::default();
+                cfg.apply_env_overrides().unwrap();
+                assert_eq!(
+                    cfg.database_url,
+                    Some("postgres://env-user:env-pass@env-host:5432/envdb".to_string())
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn env_override_empty_database_url_does_not_override_toml_url() {
+        temp_env::with_vars([("HARNESS_DATABASE_URL", Some(""))], || {
+            let mut cfg = ServerConfig {
+                database_url: Some("postgres://cfg-user:cfg-pass@cfg-host:5432/cfgdb".to_string()),
+                ..ServerConfig::default()
+            };
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(
+                cfg.database_url,
+                Some("postgres://cfg-user:cfg-pass@cfg-host:5432/cfgdb".to_string())
+            );
+        });
+    }
+
+    #[test]
     fn env_override_api_token() {
         temp_env::with_vars([("HARNESS_API_TOKEN", Some("tok-test"))], || {
             let mut cfg = ServerConfig::default();
@@ -374,6 +422,7 @@ mod tests {
                 ("HARNESS_HTTP_ADDR", None::<&str>),
                 ("HARNESS_DATA_DIR", None::<&str>),
                 ("HARNESS_PROJECT_ROOT", None::<&str>),
+                ("HARNESS_DATABASE_URL", None::<&str>),
                 ("HARNESS_API_TOKEN", None::<&str>),
                 ("GITHUB_TOKEN", None::<&str>),
             ],
@@ -386,9 +435,26 @@ mod tests {
                 cfg.apply_env_overrides().unwrap();
                 assert_eq!(cfg.http_addr, http_addr_before);
                 assert_eq!(cfg.data_dir, data_dir_before);
+                assert_eq!(cfg.database_url, None);
                 assert_eq!(cfg.api_token, None);
                 assert_eq!(cfg.github_token, None);
             },
+        );
+    }
+
+    #[test]
+    fn server_config_deserializes_database_url_from_toml() {
+        let toml_str = r#"
+            transport = "http"
+            http_addr = "127.0.0.1:9800"
+            data_dir = "/tmp/harness"
+            project_root = "/tmp/project"
+            database_url = "postgres://harness:harness@localhost:5432/harness"
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.database_url.as_deref(),
+            Some("postgres://harness:harness@localhost:5432/harness")
         );
     }
 
@@ -397,12 +463,17 @@ mod tests {
     #[test]
     fn server_config_debug_redacts_secrets() {
         let config = ServerConfig {
+            database_url: Some("postgres://harness:harness@localhost:5432/harness".to_string()),
             github_webhook_secret: Some("wh-secret-abc".to_string()),
             api_token: Some("tok-xyz".to_string()),
             github_token: Some("gh-token-123".to_string()),
             ..ServerConfig::default()
         };
         let debug_output = format!("{config:?}");
+        assert!(
+            !debug_output.contains("postgres://harness:harness@localhost:5432/harness"),
+            "database_url must not appear in Debug output"
+        );
         assert!(
             !debug_output.contains("wh-secret-abc"),
             "github_webhook_secret must not appear in Debug output"
@@ -425,6 +496,10 @@ mod tests {
     fn server_config_debug_shows_none_for_absent_secrets() {
         let config = ServerConfig::default();
         let debug_output = format!("{config:?}");
+        assert!(
+            debug_output.contains("database_url: None"),
+            "absent database_url should show as None"
+        );
         assert!(
             debug_output.contains("github_webhook_secret: None"),
             "absent github_webhook_secret should show as None"

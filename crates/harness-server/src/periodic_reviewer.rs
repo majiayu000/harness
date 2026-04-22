@@ -79,6 +79,63 @@ pub fn start(state: Arc<AppState>, config: ReviewConfig) {
     });
 }
 
+fn startup_project_delay(
+    run_on_startup: bool,
+    interval: Duration,
+    last_review_ts: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Duration {
+    let interval_chrono =
+        chrono::Duration::from_std(interval).unwrap_or_else(|_| chrono::Duration::hours(24));
+    match last_review_ts {
+        Some(last_ts) => {
+            let elapsed = now.signed_duration_since(last_ts);
+            if elapsed >= interval_chrono {
+                if run_on_startup {
+                    Duration::ZERO
+                } else {
+                    interval
+                }
+            } else {
+                (interval_chrono - elapsed).to_std().unwrap_or(interval)
+            }
+        }
+        None => {
+            if run_on_startup {
+                Duration::ZERO
+            } else {
+                interval
+            }
+        }
+    }
+}
+
+struct StartupDelayOutcome {
+    delay: Duration,
+    last_review_ts: Option<DateTime<Utc>>,
+    overdue: bool,
+    elapsed: Option<chrono::Duration>,
+}
+
+fn startup_delay_outcome(
+    run_on_startup: bool,
+    interval: Duration,
+    last_review_ts: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> StartupDelayOutcome {
+    let interval_chrono =
+        chrono::Duration::from_std(interval).unwrap_or_else(|_| chrono::Duration::hours(24));
+    let elapsed = last_review_ts.map(|ts| now.signed_duration_since(ts));
+    let overdue = elapsed.is_some_and(|elapsed| elapsed >= interval_chrono);
+    let delay = startup_project_delay(run_on_startup, interval, last_review_ts, now);
+    StartupDelayOutcome {
+        delay,
+        last_review_ts,
+        overdue,
+        elapsed,
+    }
+}
+
 async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     let interval = config.effective_interval();
 
@@ -101,45 +158,63 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // On startup, compute the per-project remaining time and the global minimum.
     // Only projects whose individual delay falls within the minimum sleep window
     // are run on the first tick; others wait for the regular interval loop.
-    let interval_chrono =
-        chrono::Duration::from_std(interval).unwrap_or_else(|_| chrono::Duration::hours(24));
+    let default_startup_delay = if config.run_on_startup {
+        Duration::ZERO
+    } else {
+        interval
+    };
     let mut min_delay = interval;
     let mut project_delays: Vec<Duration> = Vec::with_capacity(projects.len());
     for project in &projects {
         let hook_key = project_hook_key(&project.name, &project.root);
-        let delay = match last_review_timestamp(&state, &hook_key).await {
+        let last_review_ts = last_review_timestamp(&state, &hook_key).await;
+        let outcome =
+            startup_delay_outcome(config.run_on_startup, interval, last_review_ts, Utc::now());
+        match outcome.last_review_ts {
             Some(last_ts) => {
-                let elapsed = Utc::now().signed_duration_since(last_ts);
-                if elapsed >= interval_chrono {
-                    tracing::info!(
-                        project = %project.name,
-                        last_review = %last_ts,
-                        elapsed_hours = elapsed.num_hours(),
-                        "scheduler: periodic review overdue, triggering now"
-                    );
-                    Duration::from_secs(0)
+                if outcome.overdue {
+                    if config.run_on_startup {
+                        tracing::info!(
+                            project = %project.name,
+                            last_review = %last_ts,
+                            elapsed_hours = outcome.elapsed.map(|e| e.num_hours()).unwrap_or_default(),
+                            "scheduler: periodic review overdue, triggering now"
+                        );
+                    } else {
+                        tracing::info!(
+                            project = %project.name,
+                            last_review = %last_ts,
+                            next_in_secs = outcome.delay.as_secs(),
+                            "scheduler: startup review suppressed for overdue project; deferring until next interval"
+                        );
+                    }
                 } else {
-                    let remaining = (interval_chrono - elapsed).to_std().unwrap_or(interval);
                     tracing::info!(
                         project = %project.name,
                         last_review = %last_ts,
-                        next_in_secs = remaining.as_secs(),
+                        next_in_secs = outcome.delay.as_secs(),
                         "scheduler: periodic review not yet due, sleeping"
                     );
-                    remaining
                 }
             }
             None => {
-                tracing::info!(
-                    project = %project.name,
-                    "scheduler: no prior periodic review found, triggering now"
-                );
-                Duration::from_secs(0)
+                if config.run_on_startup {
+                    tracing::info!(
+                        project = %project.name,
+                        "scheduler: no prior periodic review found, triggering now"
+                    );
+                } else {
+                    tracing::info!(
+                        project = %project.name,
+                        next_in_secs = outcome.delay.as_secs(),
+                        "scheduler: startup review suppressed for first run; deferring until next interval"
+                    );
+                }
             }
-        };
-        project_delays.push(delay);
-        if delay < min_delay {
-            min_delay = delay;
+        }
+        project_delays.push(outcome.delay);
+        if outcome.delay < min_delay {
+            min_delay = outcome.delay;
         }
     }
 
@@ -150,7 +225,8 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // Re-collect after the startup sleep to pick up projects registered via
     // `POST /projects` during the sleep window (5 s init + min_delay).
     // Build a delay-by-name lookup first so newly registered projects (absent
-    // from the original snapshot) default to delay=0 and run on the first tick.
+    // from the original snapshot) inherit the startup policy: immediate when
+    // run_on_startup is enabled, otherwise deferred until the next interval.
     let startup_delay_by_name: HashMap<String, Duration> = projects
         .iter()
         .zip(project_delays.iter())
@@ -177,7 +253,7 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     for project in &projects {
         let project_delay = *startup_delay_by_name
             .get(&project.name)
-            .unwrap_or(&Duration::ZERO);
+            .unwrap_or(&default_startup_delay);
         if project_delay > min_delay {
             tracing::debug!(
                 project = %project.name,
@@ -576,6 +652,18 @@ async fn last_review_timestamp(state: &Arc<AppState>, hook_key: &str) -> Option<
     events.iter().map(|e| e.ts).max()
 }
 
+fn ensure_review_queue_limit(state: &Arc<AppState>, project_root: &std::path::Path) {
+    let canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    state
+        .concurrency
+        .review_task_queue
+        .set_project_limit(&canonical, 1);
+}
+
 async fn run_review_tick(
     state: &Arc<AppState>,
     config: &ReviewConfig,
@@ -695,6 +783,8 @@ async fn run_review_tick(
         );
     }
 
+    ensure_review_queue_limit(state, project_root);
+
     let review_req = CreateTaskRequest {
         prompt: Some(base_prompt.clone()),
         agent: Some(review_agent.clone()),
@@ -704,9 +794,10 @@ async fn run_review_tick(
         ..CreateTaskRequest::default()
     };
 
-    let primary_review_id = task_routes::enqueue_task(state, review_req)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to enqueue periodic review: {e}"))?;
+    let primary_review_id =
+        task_routes::enqueue_task_in_domain(state, review_req, task_routes::QueueDomain::Review)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to enqueue periodic review: {e}"))?;
     tracing::info!(
         task_id = %primary_review_id,
         agent = %review_agent,
@@ -803,7 +894,13 @@ async fn run_review_tick(
                 project: Some(project_root_for_poll.clone()),
                 ..CreateTaskRequest::default()
             };
-            match task_routes::enqueue_task(&state_for_synthesis, req).await {
+            match task_routes::enqueue_task_in_domain(
+                &state_for_synthesis,
+                req,
+                task_routes::QueueDomain::Review,
+            )
+            .await
+            {
                 Ok(task_id) => {
                     tracing::info!(
                         task_id = %task_id,
@@ -879,7 +976,13 @@ async fn run_review_tick(
                     project: Some(project_root_for_poll.clone()),
                     ..CreateTaskRequest::default()
                 };
-                match task_routes::enqueue_task(&state_for_synthesis, synth_req).await {
+                match task_routes::enqueue_task_in_domain(
+                    &state_for_synthesis,
+                    synth_req,
+                    task_routes::QueueDomain::Review,
+                )
+                .await
+                {
                     Ok(synth_id) => {
                         tracing::info!(
                             task_id = %synth_id,
@@ -1544,6 +1647,7 @@ mod tests {
         assert_eq!(config.interval_hours, 24);
         assert!(config.interval_secs.is_none());
         assert_eq!(config.timeout_secs, 900);
+        assert_eq!(config.max_concurrent_tasks, 2);
         assert!(config.agent.is_none());
         assert_eq!(config.strategy, ReviewStrategy::Single);
     }
@@ -1558,6 +1662,7 @@ mod tests {
             agent: Some("codex".to_string()),
             strategy: ReviewStrategy::Cross,
             timeout_secs: 600,
+            max_concurrent_tasks: 3,
         };
         assert!(config.enabled);
         assert!(config.run_on_startup);
@@ -1565,6 +1670,7 @@ mod tests {
         assert_eq!(config.agent.as_deref(), Some("codex"));
         assert_eq!(config.strategy, ReviewStrategy::Cross);
         assert_eq!(config.timeout_secs, 600);
+        assert_eq!(config.max_concurrent_tasks, 3);
     }
 
     #[test]
@@ -1615,6 +1721,60 @@ mod tests {
             ..ReviewConfig::default()
         };
         assert_eq!(config.effective_interval(), Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn startup_project_delay_runs_immediately_when_enabled_and_no_watermark() {
+        let now = Utc::now();
+        let interval = Duration::from_secs(3600);
+        assert_eq!(
+            startup_project_delay(true, interval, None, now),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn startup_project_delay_runs_immediately_when_enabled_and_overdue() {
+        let now = Utc::now();
+        let interval = Duration::from_secs(3600);
+        let last_review = now - chrono::Duration::hours(2);
+        assert_eq!(
+            startup_project_delay(true, interval, Some(last_review), now),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn startup_project_delay_waits_full_interval_when_disabled_and_no_watermark() {
+        let now = Utc::now();
+        let interval = Duration::from_secs(3600);
+        assert_eq!(startup_project_delay(false, interval, None, now), interval);
+    }
+
+    #[test]
+    fn startup_project_delay_waits_full_interval_when_disabled_and_overdue() {
+        let now = Utc::now();
+        let interval = Duration::from_secs(3600);
+        let last_review = now - chrono::Duration::hours(2);
+        assert_eq!(
+            startup_project_delay(false, interval, Some(last_review), now),
+            interval
+        );
+    }
+
+    #[test]
+    fn startup_project_delay_preserves_remaining_time_when_not_yet_due() {
+        let now = Utc::now();
+        let interval = Duration::from_secs(3600);
+        let last_review = now - chrono::Duration::minutes(15);
+        assert_eq!(
+            startup_project_delay(false, interval, Some(last_review), now),
+            Duration::from_secs(2700)
+        );
+        assert_eq!(
+            startup_project_delay(true, interval, Some(last_review), now),
+            Duration::from_secs(2700)
+        );
     }
 
     #[test]

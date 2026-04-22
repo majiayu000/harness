@@ -95,10 +95,11 @@ async fn make_test_state_with_config_and_registry(
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            review_task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             workspace_mgr: None,
         },
         #[cfg(test)]
-        _db_state_guard: None,
+        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
@@ -1419,10 +1420,11 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            review_task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             workspace_mgr: None,
         },
         #[cfg(test)]
-        _db_state_guard: None,
+        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),

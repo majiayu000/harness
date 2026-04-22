@@ -444,6 +444,10 @@ pub struct ReviewConfig {
     /// Per-turn timeout in seconds for the review agent. Default: 900.
     #[serde(default = "default_review_timeout_secs")]
     pub timeout_secs: u64,
+    /// Maximum number of periodic review tasks executing concurrently.
+    /// Uses a dedicated review capacity domain and does not consume issue/planner slots.
+    #[serde(default = "default_review_max_concurrent_tasks")]
+    pub max_concurrent_tasks: usize,
 }
 
 impl ReviewConfig {
@@ -465,6 +469,10 @@ fn default_review_timeout_secs() -> u64 {
     900
 }
 
+fn default_review_max_concurrent_tasks() -> usize {
+    2
+}
+
 impl Default for ReviewConfig {
     fn default() -> Self {
         Self {
@@ -475,6 +483,7 @@ impl Default for ReviewConfig {
             agent: None,
             strategy: ReviewStrategy::Single,
             timeout_secs: default_review_timeout_secs(),
+            max_concurrent_tasks: default_review_max_concurrent_tasks(),
         }
     }
 }
