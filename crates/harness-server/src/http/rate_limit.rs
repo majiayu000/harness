@@ -14,6 +14,12 @@ pub struct PasswordResetLimiterSnapshot {
     pub limit_per_hour: usize,
 }
 
+struct PasswordResetState {
+    timestamps: HashMap<String, VecDeque<Instant>>,
+    expirations: VecDeque<(Instant, String)>,
+    active_identifiers: usize,
+}
+
 /// Per-identifier rate limiter for `POST /auth/reset-password`.
 ///
 /// Uses a 1-hour rolling window per email address to prevent brute-force
@@ -22,7 +28,7 @@ pub struct PasswordResetLimiterSnapshot {
 /// Memory is bounded: at most `max_tracked_keys` identifiers are tracked at
 /// once; expired timestamps are evicted lazily on each access.
 pub struct PasswordResetRateLimiter {
-    timestamps: Mutex<HashMap<String, VecDeque<Instant>>>,
+    state: Mutex<PasswordResetState>,
     max_per_hour: usize,
     max_tracked_keys: usize,
 }
@@ -30,52 +36,54 @@ pub struct PasswordResetRateLimiter {
 impl PasswordResetRateLimiter {
     const WINDOW: Duration = Duration::from_secs(3600);
 
-    fn prune_expired_timestamps(map: &mut HashMap<String, VecDeque<Instant>>, now: Instant) {
-        map.retain(|_, timestamps| {
-            while let Some(&front) = timestamps.front() {
-                if now.duration_since(front) >= Self::WINDOW {
-                    timestamps.pop_front();
-                } else {
-                    break;
-                }
-            }
-            !timestamps.is_empty()
-        });
-    }
-
-    fn prune_identifier_entry(
-        map: &mut HashMap<String, VecDeque<Instant>>,
-        identifier: &str,
-        now: Instant,
-    ) {
-        if let Some(timestamps) = map.get_mut(identifier) {
-            while let Some(&front) = timestamps.front() {
-                if now.duration_since(front) >= Self::WINDOW {
-                    timestamps.pop_front();
-                } else {
-                    break;
-                }
-            }
-            if timestamps.is_empty() {
-                map.remove(identifier);
+    fn prune_identifier_timestamps(timestamps: &mut VecDeque<Instant>, now: Instant) {
+        while let Some(&front) = timestamps.front() {
+            if now.duration_since(front) >= Self::WINDOW {
+                timestamps.pop_front();
+            } else {
+                break;
             }
         }
     }
 
-    fn active_identifier_count(map: &HashMap<String, VecDeque<Instant>>, now: Instant) -> usize {
-        map.values()
-            .filter(|timestamps| {
-                timestamps
-                    .back()
-                    .is_some_and(|last| now.duration_since(*last) < Self::WINDOW)
-            })
-            .count()
+    fn prune_expired_timestamps(state: &mut PasswordResetState, now: Instant) {
+        while state
+            .expirations
+            .front()
+            .is_some_and(|(expires_at, _)| *expires_at <= now)
+        {
+            let (_, identifier) = state.expirations.pop_front().expect("front checked above");
+            let should_remove = match state.timestamps.get_mut(&identifier) {
+                Some(timestamps) => {
+                    Self::prune_identifier_timestamps(timestamps, now);
+                    timestamps.is_empty()
+                }
+                None => false,
+            };
+            if should_remove {
+                state.timestamps.remove(&identifier);
+                state.active_identifiers = state.active_identifiers.saturating_sub(1);
+            }
+        }
     }
 
     #[cfg(test)]
     fn insert_for_test(&self, identifier: &str, timestamps: VecDeque<Instant>) {
-        let mut map = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
-        map.insert(identifier.to_string(), timestamps);
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !timestamps.is_empty() {
+            state.active_identifiers += 1;
+        }
+        state.expirations.extend(
+            timestamps
+                .iter()
+                .copied()
+                .map(|timestamp| (timestamp + Self::WINDOW, identifier.to_string())),
+        );
+        state
+            .expirations
+            .make_contiguous()
+            .sort_by_key(|(expires_at, _)| *expires_at);
+        state.timestamps.insert(identifier.to_string(), timestamps);
     }
 
     #[cfg(test)]
@@ -85,23 +93,29 @@ impl PasswordResetRateLimiter {
 
     #[cfg(test)]
     fn len_for_test(&self) -> usize {
-        self.timestamps
+        self.state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .timestamps
             .len()
     }
 
     #[cfg(test)]
     fn contains_for_test(&self, identifier: &str) -> bool {
-        self.timestamps
+        self.state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .timestamps
             .contains_key(identifier)
     }
 
     pub fn new(max_per_hour: u32) -> Self {
         Self {
-            timestamps: Mutex::new(HashMap::new()),
+            state: Mutex::new(PasswordResetState {
+                timestamps: HashMap::new(),
+                expirations: VecDeque::new(),
+                active_identifiers: 0,
+            }),
             max_per_hour: max_per_hour as usize,
             max_tracked_keys: 100_000,
         }
@@ -110,7 +124,11 @@ impl PasswordResetRateLimiter {
     #[cfg(test)]
     fn new_with_cap(max_per_hour: u32, max_tracked_keys: usize) -> Self {
         Self {
-            timestamps: Mutex::new(HashMap::new()),
+            state: Mutex::new(PasswordResetState {
+                timestamps: HashMap::new(),
+                expirations: VecDeque::new(),
+                active_identifiers: 0,
+            }),
             max_per_hour: max_per_hour as usize,
             max_tracked_keys,
         }
@@ -118,115 +136,153 @@ impl PasswordResetRateLimiter {
 
     /// Return a read-only snapshot of the current limiter state.
     pub fn snapshot(&self) -> PasswordResetLimiterSnapshot {
-        let map = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        Self::prune_expired_timestamps(&mut state, Instant::now());
         PasswordResetLimiterSnapshot {
-            tracked_identifiers: Self::active_identifier_count(&map, Instant::now()),
+            tracked_identifiers: state.active_identifiers,
             limit_per_hour: self.max_per_hour,
         }
     }
 
     /// Returns `true` if the request is within the rate limit and increments the counter.
     pub fn check_and_increment(&self, identifier: &str) -> bool {
-        let mut map = self.timestamps.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
 
-        Self::prune_identifier_entry(&mut map, identifier, now);
+        Self::prune_expired_timestamps(&mut state, now);
 
-        // Reject new identifiers when map is at capacity (memory-DoS guard).
-        if !map.contains_key(identifier) && map.len() >= self.max_tracked_keys {
-            Self::prune_expired_timestamps(&mut map, now);
-        }
-
-        if !map.contains_key(identifier) && map.len() >= self.max_tracked_keys {
+        let key = identifier.to_string();
+        let is_new_identifier = !state.timestamps.contains_key(&key);
+        if is_new_identifier && state.timestamps.len() >= self.max_tracked_keys {
             return false;
         }
 
-        let entry = map.entry(identifier.to_string()).or_default();
-        if entry.len() < self.max_per_hour {
-            entry.push_back(now);
-            true
-        } else {
-            false
+        if is_new_identifier {
+            state.timestamps.insert(key.clone(), VecDeque::new());
+            state.active_identifiers += 1;
         }
+
+        let entry = state
+            .timestamps
+            .get_mut(&key)
+            .expect("identifier inserted above");
+        if entry.len() >= self.max_per_hour {
+            return false;
+        }
+
+        entry.push_back(now);
+        state.expirations.push_back((now + Self::WINDOW, key));
+        true
     }
 }
 
 /// Per-source rate limiter for `POST /signals` ingestion.
 pub struct SignalRateLimiter {
-    counts: Mutex<HashMap<String, (u32, Instant)>>,
+    state: Mutex<SignalRateLimiterState>,
     max_per_minute: u32,
+}
+
+struct SignalRateLimiterState {
+    counts: HashMap<String, (u32, Instant)>,
+    expirations: VecDeque<(Instant, String)>,
+    active_sources: usize,
 }
 
 impl SignalRateLimiter {
     const WINDOW: Duration = Duration::from_secs(60);
-    const FULL_PRUNE_INTERVAL: usize = 256;
 
-    fn prune_expired_counts(counts: &mut HashMap<String, (u32, Instant)>, now: Instant) {
-        counts.retain(|_, (_, window_start)| now.duration_since(*window_start) < Self::WINDOW);
-    }
-
-    fn prune_source_entry(
-        counts: &mut HashMap<String, (u32, Instant)>,
-        source: &str,
-        now: Instant,
-    ) {
-        if counts
-            .get(source)
-            .is_some_and(|(_, window_start)| now.duration_since(*window_start) >= Self::WINDOW)
+    fn prune_expired_counts(state: &mut SignalRateLimiterState, now: Instant) {
+        while state
+            .expirations
+            .front()
+            .is_some_and(|(expires_at, _)| *expires_at <= now)
         {
-            counts.remove(source);
+            let (_, source) = state.expirations.pop_front().expect("front checked above");
+            let should_remove = state
+                .counts
+                .get(&source)
+                .is_some_and(|(_, window_start)| *window_start + Self::WINDOW <= now);
+            if should_remove {
+                state.counts.remove(&source);
+                state.active_sources = state.active_sources.saturating_sub(1);
+            }
         }
-    }
-
-    fn active_source_count(counts: &HashMap<String, (u32, Instant)>, now: Instant) -> usize {
-        counts
-            .values()
-            .filter(|(_, window_start)| now.duration_since(*window_start) < Self::WINDOW)
-            .count()
     }
 
     #[cfg(test)]
     fn insert_for_test(&self, source: &str, count: u32, window_start: Instant) {
-        let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        counts.insert(source.to_string(), (count, window_start));
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.active_sources += 1;
+        state
+            .expirations
+            .push_back((window_start + Self::WINDOW, source.to_string()));
+        state
+            .expirations
+            .make_contiguous()
+            .sort_by_key(|(expires_at, _)| *expires_at);
+        state
+            .counts
+            .insert(source.to_string(), (count, window_start));
+    }
+
+    #[cfg(test)]
+    fn contains_for_test(&self, source: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .counts
+            .contains_key(source)
     }
 
     pub fn new(max_per_minute: u32) -> Self {
         Self {
-            counts: Mutex::new(HashMap::new()),
+            state: Mutex::new(SignalRateLimiterState {
+                counts: HashMap::new(),
+                expirations: VecDeque::new(),
+                active_sources: 0,
+            }),
             max_per_minute,
         }
     }
 
     /// Return a read-only snapshot of the current limiter state.
     pub fn snapshot(&self) -> SignalLimiterSnapshot {
-        let counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        Self::prune_expired_counts(&mut state, Instant::now());
         SignalLimiterSnapshot {
-            tracked_sources: Self::active_source_count(&counts, Instant::now()),
+            tracked_sources: state.active_sources,
             limit_per_minute: self.max_per_minute,
         }
     }
 
     /// Returns `true` if the request is within the rate limit and increments the counter.
     pub fn check_and_increment(&self, source: &str) -> bool {
-        let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
 
-        Self::prune_source_entry(&mut counts, source, now);
+        Self::prune_expired_counts(&mut state, now);
 
-        if !counts.contains_key(source) && counts.len().is_multiple_of(Self::FULL_PRUNE_INTERVAL) {
-            Self::prune_expired_counts(&mut counts, now);
-        }
-
-        let entry = counts.entry(source.to_string()).or_insert((0, now));
-        if now.duration_since(entry.1) >= Self::WINDOW {
-            *entry = (1, now);
-            true
-        } else if entry.0 < self.max_per_minute {
-            entry.0 += 1;
-            true
+        if let Some((count, window_start)) = state.counts.get_mut(source) {
+            if now.duration_since(*window_start) >= Self::WINDOW {
+                *count = 1;
+                *window_start = now;
+                state
+                    .expirations
+                    .push_back((now + Self::WINDOW, source.to_string()));
+                true
+            } else if *count < self.max_per_minute {
+                *count += 1;
+                true
+            } else {
+                false
+            }
         } else {
-            false
+            state.counts.insert(source.to_string(), (1, now));
+            state.active_sources += 1;
+            state
+                .expirations
+                .push_back((now + Self::WINDOW, source.to_string()));
+            true
         }
     }
 }
@@ -316,9 +372,8 @@ mod tests {
 
         assert!(limiter.check_and_increment("active"));
 
-        let counts = limiter.counts.lock().unwrap_or_else(|p| p.into_inner());
-        assert!(counts.contains_key("expired"));
-        assert!(counts.contains_key("active"));
+        assert!(!limiter.contains_for_test("expired"));
+        assert!(limiter.contains_for_test("active"));
     }
 
     #[test]
@@ -364,7 +419,7 @@ mod tests {
         limiter.insert_for_test("expired@example.com", VecDeque::from([expired]));
 
         assert!(limiter.check_and_increment("active@example.com"));
-        assert_eq!(limiter.len_for_test(), 2);
-        assert!(limiter.contains_for_test("expired@example.com"));
+        assert_eq!(limiter.len_for_test(), 1);
+        assert!(!limiter.contains_for_test("expired@example.com"));
     }
 }

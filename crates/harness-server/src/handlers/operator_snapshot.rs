@@ -65,21 +65,37 @@ fn recent_failure_json(t: &crate::task_runner::RecentFailureTask) -> Value {
     })
 }
 
-pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
-    let generated_at = Utc::now();
-
-    let recent_retry_filter = EventFilters {
+async fn query_retry_summary_events(
+    state: &Arc<AppState>,
+    generated_at: chrono::DateTime<Utc>,
+) -> anyhow::Result<Vec<harness_core::types::Event>> {
+    let recent_window = EventFilters {
         hook: Some("periodic_retry:summary".to_string()),
         since: Some(generated_at - chrono::Duration::hours(2)),
         ..Default::default()
     };
-    let all_retry_filter = EventFilters {
-        hook: Some("periodic_retry:summary".to_string()),
-        ..Default::default()
-    };
+    let recent_events = state.observability.events.query(&recent_window).await?;
+    if !recent_events.is_empty() {
+        return Ok(recent_events);
+    }
+
+    // If the scheduler has been quiet for longer than the recent window, fall
+    // back to the full history so operators still see the last recorded tick.
+    state
+        .observability
+        .events
+        .query(&EventFilters {
+            hook: Some("periodic_retry:summary".to_string()),
+            ..Default::default()
+        })
+        .await
+}
+
+pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+    let generated_at = Utc::now();
     // Collect all subsections concurrently — they are independent.
     let (retry_events_res, stalled_res, failed_res) = tokio::join!(
-        state.observability.events.query(&recent_retry_filter),
+        query_retry_summary_events(&state, generated_at),
         state
             .core
             .tasks
@@ -87,7 +103,7 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
         state.core.tasks.list_recent_failed(MAX_TASKS as i64),
     );
 
-    let mut retry_events = match retry_events_res {
+    let retry_events = match retry_events_res {
         Ok(events) => events,
         Err(e) => return error_response(format!("failed to query retry events: {e}")),
     };
@@ -99,13 +115,6 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
         Ok(tasks) => tasks,
         Err(e) => return error_response(format!("failed to query recent failures: {e}")),
     };
-    if retry_events.is_empty() {
-        retry_events = match state.observability.events.query(&all_retry_filter).await {
-            Ok(events) => events,
-            Err(e) => return error_response(format!("failed to query retry events: {e}")),
-        };
-    }
-
     // ---- retry section ----
     // query returns ASC order; the last element is the most recent tick.
     let last_tick: Value = retry_events
