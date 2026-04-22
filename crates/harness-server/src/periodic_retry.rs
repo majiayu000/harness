@@ -401,6 +401,7 @@ mod tests {
             repo: None,
             description: None,
             created_at: None,
+            updated_at: None,
             priority: 0,
             phase: crate::task_runner::TaskPhase::Implement,
             triage_output: None,

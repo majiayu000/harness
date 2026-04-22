@@ -3,7 +3,7 @@ use crate::task_runner::{TaskState, TaskStatus};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-use super::types::{RecoveryRow, TaskRow, TaskSummaryRow, TASK_ROW_COLUMNS};
+use super::types::{RecentFailureRow, RecoveryRow, TaskRow, TaskSummaryRow, TASK_ROW_COLUMNS};
 use super::{RecoveryResult, TaskDb};
 
 impl TaskDb {
@@ -628,6 +628,25 @@ impl TaskDb {
         }
         let rows = q.fetch_all(&self.pool).await?;
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
+    }
+
+    /// Return the most recent `limit` failed tasks, newest first.
+    pub async fn list_recent_failed(
+        &self,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::task_runner::RecentFailureTask>> {
+        let rows = sqlx::query_as::<_, RecentFailureRow>(
+            "SELECT id, external_id, project, error, updated_at FROM tasks \
+             WHERE status = 'failed' \
+             ORDER BY updated_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(RecentFailureRow::into_recent_failure)
+            .collect())
     }
 
     /// Expose the raw pool for test-only SQL setup (e.g. back-dating `updated_at`).

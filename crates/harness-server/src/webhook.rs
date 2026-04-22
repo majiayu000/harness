@@ -389,7 +389,7 @@ mod tests {
                 "number": 77,
                 "body": "@harness please implement this feature"
             },
-            "repository": { "full_name": "majiayu000/harness" }
+            "repository": { "full_name": "org/repo" }
         });
 
         let (request, reason) =
@@ -399,7 +399,7 @@ mod tests {
         assert_eq!(request.issue, Some(77));
         assert_eq!(request.pr, None);
         assert_eq!(request.prompt, None);
-        assert_eq!(request.repo.as_deref(), Some("majiayu000/harness"));
+        assert_eq!(request.repo.as_deref(), Some("org/repo"));
     }
 
     #[test]
@@ -410,7 +410,7 @@ mod tests {
                 "number": 88,
                 "body": "This is still broken, @harness fix it"
             },
-            "repository": { "full_name": "majiayu000/harness" }
+            "repository": { "full_name": "org/repo" }
         });
 
         let (request, reason) =
@@ -418,7 +418,7 @@ mod tests {
         let request = request.expect("request should exist");
         assert_eq!(reason, "issue mention");
         assert_eq!(request.issue, Some(88));
-        assert_eq!(request.repo.as_deref(), Some("majiayu000/harness"));
+        assert_eq!(request.repo.as_deref(), Some("org/repo"));
     }
 
     #[test]
@@ -429,7 +429,7 @@ mod tests {
                 "number": 99,
                 "body": "This issue has no harness mention"
             },
-            "repository": { "full_name": "majiayu000/harness" }
+            "repository": { "full_name": "org/repo" }
         });
 
         let (request, reason) =
@@ -443,7 +443,7 @@ mod tests {
         let payload = serde_json::json!({
             "action": "opened",
             "issue": { "number": 100 },
-            "repository": { "full_name": "majiayu000/harness" }
+            "repository": { "full_name": "org/repo" }
         });
 
         let (request, reason) =
@@ -460,7 +460,7 @@ mod tests {
                 "number": 106,
                 "body": "@harness please handle this issue"
             },
-            "repository": { "full_name": "majiayu000/harness" }
+            "repository": { "full_name": "org/repo" }
         });
 
         let (request, reason) =

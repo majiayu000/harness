@@ -164,6 +164,8 @@ async fn make_test_state_with_project_root(
             review_task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             workspace_mgr: None,
         },
+        #[cfg(test)]
+        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
@@ -230,21 +232,35 @@ async fn make_test_state_with_agent(
     dir: &std::path::Path,
     webhook_secret: Option<&str>,
 ) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
-    make_test_state_with_agent_and_config(
-        dir,
-        dir,
-        harness_core::config::HarnessConfig {
-            server: harness_core::config::server::ServerConfig {
-                github_webhook_secret: webhook_secret.map(ToString::to_string),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )
-    .await
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = webhook_secret.map(ToString::to_string);
+    build_test_state_with_agent(dir, dir, config).await
+}
+
+async fn make_test_state_with_agent_and_repo(
+    dir: &std::path::Path,
+    webhook_secret: Option<&str>,
+    repo: &str,
+) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = webhook_secret.map(ToString::to_string);
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        repo: repo.to_string(),
+        ..Default::default()
+    });
+    build_test_state_with_agent(dir, dir, config).await
 }
 
 async fn make_test_state_with_agent_and_config(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    config: harness_core::config::HarnessConfig,
+) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
+    build_test_state_with_agent(dir, project_root, config).await
+}
+
+async fn build_test_state_with_agent(
     dir: &std::path::Path,
     project_root: &std::path::Path,
     config: harness_core::config::HarnessConfig,
@@ -255,6 +271,11 @@ async fn make_test_state_with_agent_and_config(
 
     let state = make_test_state_with_project_root(dir, project_root, config, registry).await?;
     Ok((state, capturing))
+}
+
+fn init_fake_git_repo(root: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(root.join(".git"))?;
+    Ok(())
 }
 
 fn task_app(state: Arc<AppState>) -> Router {
@@ -509,7 +530,8 @@ async fn token_usage_route_is_registered() -> anyhow::Result<()> {
 async fn webhook_issue_mention_creates_issue_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "majiayu000/harness").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -543,7 +565,8 @@ async fn webhook_issue_mention_creates_issue_task() -> anyhow::Result<()> {
 async fn webhook_review_on_pr_creates_pr_review_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "majiayu000/harness").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -577,7 +600,8 @@ async fn webhook_review_on_pr_creates_pr_review_task() -> anyhow::Result<()> {
 async fn webhook_fix_ci_on_pr_creates_fix_ci_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "majiayu000/harness").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -1220,8 +1244,10 @@ async fn feishu_webhook_rejects_invalid_token() -> anyhow::Result<()> {
 #[tokio::test]
 async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
+    init_fake_git_repo(dir.path())?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "org/repo").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -1369,7 +1395,7 @@ async fn webhook_routes_prompt_tasks_to_repo_specific_project_root() -> anyhow::
 }
 
 #[tokio::test]
-async fn webhook_uses_default_project_root_when_repo_is_unmapped() -> anyhow::Result<()> {
+async fn webhook_ignores_issue_tasks_when_repo_is_unmapped() -> anyhow::Result<()> {
     let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-fallback-a-")?;
     let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-fallback-b-")?;
     let secret = "secret";
@@ -1412,14 +1438,17 @@ async fn webhook_uses_default_project_root_when_repo_is_unmapped() -> anyhow::Re
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::OK);
     let json = response_json(response).await?;
-    let task_root = wait_for_task_project_root(
-        &state,
-        json["task_id"].as_str().expect("task id should be present"),
-    )
-    .await?;
-    assert_eq!(task_root.canonicalize()?, repo_a_dir.path().canonicalize()?);
+    assert_eq!(json["status"], "ignored");
+    assert!(
+        json["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not configured"),
+        "reason should explain why the repo was ignored"
+    );
+    assert_eq!(state.core.tasks.count(), 0);
     Ok(())
 }
 
@@ -1427,7 +1456,8 @@ async fn webhook_uses_default_project_root_when_repo_is_unmapped() -> anyhow::Re
 async fn webhook_pull_request_review_changes_requested_creates_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "org/repo").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -1771,6 +1801,7 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
         repo: None,
         description: None,
         created_at: None,
+        updated_at: None,
         priority: 0,
         phase: task_runner::TaskPhase::default(),
         triage_output: None,
@@ -1838,6 +1869,7 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
         repo: None,
         description: Some("prompt task".to_string()),
         created_at: None,
+        updated_at: None,
         priority: 0,
         phase: task_runner::TaskPhase::default(),
         triage_output: None,

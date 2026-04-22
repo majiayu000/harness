@@ -201,6 +201,9 @@ mod tests {
     #[tokio::test]
     async fn list_projects_includes_task_count_and_project_identity() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let project_root = crate::test_helpers::tempdir_in_home("projects-handler-root-")?;
         let data_dir = tempfile::tempdir()?;
         let state = make_test_state(project_root.path(), data_dir.path()).await?;

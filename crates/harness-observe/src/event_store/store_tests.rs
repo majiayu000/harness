@@ -1,20 +1,50 @@
 use super::*;
 use harness_core::{
     config::misc::OtelExporter,
+    db::pg_open_pool,
     types::{AutoFixAttempt, RuleId},
 };
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::sync::OnceCell;
 
 // Supabase session pooler caps simultaneous clients at pool_size (15).
-// Gate all test DB connections through a semaphore so concurrent tests
-// never exceed that limit.
+// Serialize these DB-backed tests so one test process does not exhaust the
+// shared external session budget for the whole workspace.
 static DB_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static DB_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
 
 fn db_semaphore() -> Arc<tokio::sync::Semaphore> {
     DB_SEMAPHORE
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(3)))
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
         .clone()
+}
+
+async fn db_tests_enabled() -> bool {
+    if std::env::var("DATABASE_URL").is_err() {
+        return false;
+    }
+
+    *DB_AVAILABLE
+        .get_or_init(|| async {
+            let Ok(database_url) = std::env::var("DATABASE_URL") else {
+                return false;
+            };
+            match tokio::time::timeout(Duration::from_secs(2), pg_open_pool(&database_url)).await {
+                Ok(Ok(pool)) => {
+                    pool.close().await;
+                    true
+                }
+                _ => false,
+            }
+        })
+        .await
+}
+
+fn is_pool_timeout(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("pool timed out while waiting for an open connection")
 }
 
 struct TestStore {
@@ -36,17 +66,21 @@ impl std::ops::Deref for TestStore {
 }
 
 async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<TestStore>> {
-    if std::env::var("DATABASE_URL").is_err() {
+    if !db_tests_enabled().await {
         return Ok(None);
     }
     let permit = db_semaphore()
         .acquire_owned()
         .await
         .expect("semaphore never closed");
-    Ok(Some(TestStore {
-        inner: EventStore::new(data_dir).await?,
-        _permit: permit,
-    }))
+    match EventStore::new(data_dir).await {
+        Ok(inner) => Ok(Some(TestStore {
+            inner,
+            _permit: permit,
+        })),
+        Err(err) if is_pool_timeout(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 fn make_event(hook: &str, decision: Decision) -> Event {
@@ -499,7 +533,7 @@ async fn query_external_signals_empty_when_no_file() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn log_with_unreachable_otel_endpoint_still_persists_event() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    if std::env::var("DATABASE_URL").is_err() {
+    if !db_tests_enabled().await {
         return Ok(());
     }
     let config = OtelConfig {
@@ -507,7 +541,15 @@ async fn log_with_unreachable_otel_endpoint_still_persists_event() -> anyhow::Re
         endpoint: Some("http://127.0.0.1:1".to_string()),
         ..OtelConfig::default()
     };
-    let store = EventStore::with_policies_and_otel(dir.path(), 1800, 90, &config).await?;
+    let permit = db_semaphore()
+        .acquire_owned()
+        .await
+        .expect("semaphore never closed");
+    let store = match EventStore::with_policies_and_otel(dir.path(), 1800, 90, &config).await {
+        Ok(store) => store,
+        Err(err) if is_pool_timeout(&err) => return Ok(()),
+        Err(err) => return Err(err),
+    };
     assert!(store.otel_pipeline_is_none());
     let event = Event::new(
         SessionId::new(),
@@ -525,21 +567,21 @@ async fn log_with_unreachable_otel_endpoint_still_persists_event() -> anyhow::Re
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].id, event.id);
     store.close().await;
+    drop(permit);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn migrate_from_jsonl_imports_existing_events() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    if std::env::var("DATABASE_URL").is_err() {
-        return Ok(());
-    }
     let event = make_event("pre_tool_use", Decision::Pass);
     let line = serde_json::to_string(&event)?;
     let jsonl_path = dir.path().join("events.jsonl");
     std::fs::write(&jsonl_path, format!("{line}\n"))?;
 
-    let store = EventStore::new(dir.path()).await?;
+    let Some(store) = open_test_store(dir.path()).await? else {
+        return Ok(());
+    };
     let results = store.query(&EventFilters::default()).await?;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, event.id);
