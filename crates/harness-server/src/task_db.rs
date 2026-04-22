@@ -6,7 +6,8 @@ mod types;
 pub use types::{RecoveryResult, TaskArtifact, TaskCheckpoint, TaskPrompt};
 
 use harness_core::db::{
-    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, PgMigrator,
+    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, resolve_database_url,
+    PgMigrator,
 };
 use migrations::TASK_MIGRATIONS;
 use sqlx::postgres::PgPool;
@@ -24,8 +25,14 @@ impl TaskDb {
     /// fully isolated. The schema is created if it does not exist and migrations
     /// are applied before any queries run.
     pub async fn open(db_path: &Path) -> anyhow::Result<Self> {
-        let database_url = std::env::var("DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable is not set"))?;
+        Self::open_with_database_url(db_path, None).await
+    }
+
+    pub async fn open_with_database_url(
+        db_path: &Path,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let database_url = resolve_database_url(configured_database_url)?;
         use sha2::{Digest, Sha256};
         let path_utf8 = db_path
             .to_str()
