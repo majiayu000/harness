@@ -136,6 +136,24 @@ fn startup_delay_outcome(
     }
 }
 
+fn recollected_project_startup_delay(
+    initial_delay: Option<Duration>,
+    min_delay: Duration,
+    run_on_startup: bool,
+    interval: Duration,
+    last_review_ts: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Duration {
+    match initial_delay {
+        Some(delay) => delay.saturating_sub(min_delay),
+        None => startup_project_delay(run_on_startup, interval, last_review_ts, now),
+    }
+}
+
+fn deferred_startup_deadline(anchor: Instant, delay: Duration) -> Instant {
+    anchor + delay
+}
+
 async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     let interval = config.effective_interval();
 
@@ -158,11 +176,6 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // On startup, compute the per-project remaining time and the global minimum.
     // Only projects whose individual delay falls within the minimum sleep window
     // are run on the first tick; others wait for the regular interval loop.
-    let default_startup_delay = if config.run_on_startup {
-        Duration::ZERO
-    } else {
-        interval
-    };
     let mut min_delay = interval;
     let mut project_delays: Vec<Duration> = Vec::with_capacity(projects.len());
     for project in &projects {
@@ -224,9 +237,9 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
 
     // Re-collect after the startup sleep to pick up projects registered via
     // `POST /projects` during the sleep window (5 s init + min_delay).
-    // Build a delay-by-name lookup first so newly registered projects (absent
-    // from the original snapshot) inherit the startup policy: immediate when
-    // run_on_startup is enabled, otherwise deferred until the next interval.
+    // Keep the original snapshot delays for existing projects, but recompute
+    // from the live watermark for any newly registered project so it preserves
+    // the remaining time instead of silently waiting a full interval.
     let startup_delay_by_name: HashMap<String, Duration> = projects
         .iter()
         .zip(project_delays.iter())
@@ -246,24 +259,42 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // slow guard scans / queue waits, triggering an immediate re-review and
     // avoidable quota spikes when the main loop starts.
     let mut next_run_map: HashMap<String, Instant> = HashMap::new();
+    let deferred_anchor = Instant::now();
 
     // First tick: only run projects that became due within the startup sleep window.
     // Projects whose remaining time exceeds min_delay are deferred to the regular
     // interval loop, avoiding unnecessary task/quota spikes on restart.
     for project in &projects {
-        let project_delay = *startup_delay_by_name
-            .get(&project.name)
-            .unwrap_or(&default_startup_delay);
-        if project_delay > min_delay {
+        let project_delay = if let Some(initial_delay) = startup_delay_by_name.get(&project.name) {
+            recollected_project_startup_delay(
+                Some(*initial_delay),
+                min_delay,
+                config.run_on_startup,
+                interval,
+                None,
+                Utc::now(),
+            )
+        } else {
+            let hook_key = project_hook_key(&project.name, &project.root);
+            let last_review_ts = last_review_timestamp(&state, &hook_key).await;
+            recollected_project_startup_delay(
+                None,
+                min_delay,
+                config.run_on_startup,
+                interval,
+                last_review_ts,
+                Utc::now(),
+            )
+        };
+        if !project_delay.is_zero() {
             tracing::debug!(
                 project = %project.name,
-                remaining_secs = (project_delay - min_delay).as_secs(),
+                remaining_secs = project_delay.as_secs(),
                 "scheduler: project not yet due at startup, deferring to next scheduled tick"
             );
-            // Anchor deferred schedule relative to now (after sleep elapsed).
             next_run_map.insert(
                 project.name.clone(),
-                Instant::now() + project_delay.saturating_sub(min_delay),
+                deferred_startup_deadline(deferred_anchor, project_delay),
             );
             continue;
         }
@@ -1745,6 +1776,55 @@ mod tests {
             startup_project_delay(true, interval, Some(last_review), now),
             Duration::from_secs(2700)
         );
+    }
+
+    #[test]
+    fn recollected_project_delay_preserves_remaining_time_for_runtime_registered_project() {
+        let now = Utc::now();
+        let interval = Duration::from_secs(3600);
+        let min_delay = Duration::from_secs(300);
+        let last_review = now - chrono::Duration::minutes(55);
+
+        assert_eq!(
+            recollected_project_startup_delay(
+                None,
+                min_delay,
+                false,
+                interval,
+                Some(last_review),
+                now,
+            ),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn recollected_project_delay_subtracts_elapsed_startup_sleep_for_existing_project() {
+        let now = Utc::now();
+        let interval = Duration::from_secs(3600);
+        let min_delay = Duration::from_secs(300);
+
+        assert_eq!(
+            recollected_project_startup_delay(
+                Some(interval),
+                min_delay,
+                false,
+                interval,
+                None,
+                now,
+            ),
+            Duration::from_secs(3300)
+        );
+    }
+
+    #[test]
+    fn deferred_startup_deadline_uses_shared_anchor() {
+        let anchor = Instant::now();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let deadline = deferred_startup_deadline(anchor, Duration::from_secs(60));
+
+        assert_eq!(deadline.duration_since(anchor), Duration::from_secs(60));
     }
 
     #[test]
