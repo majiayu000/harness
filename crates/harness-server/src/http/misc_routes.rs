@@ -12,6 +12,44 @@ use std::sync::Arc;
 use super::{state::AppState, task_routes};
 use crate::{router, task_runner};
 
+fn resolve_webhook_project_root(
+    state: &AppState,
+    req: &task_runner::CreateTaskRequest,
+) -> std::path::PathBuf {
+    if let Some(repo) = req.repo.as_deref() {
+        if let Some(project_root) = state
+            .core
+            .server
+            .config
+            .intake
+            .github
+            .as_ref()
+            .and_then(|config| config.find_repo_config(repo))
+            .and_then(|repo_config| repo_config.project_root.map(std::path::PathBuf::from))
+        {
+            tracing::info!(
+                repo,
+                project_root = %project_root.display(),
+                "webhook: resolved repo-specific project root"
+            );
+            return project_root;
+        }
+
+        tracing::debug!(
+            repo,
+            default_project_root = %state.core.project_root.display(),
+            "webhook: using default project root"
+        );
+    } else {
+        tracing::debug!(
+            default_project_root = %state.core.project_root.display(),
+            "webhook: request missing repo slug; using default project root"
+        );
+    }
+
+    state.core.project_root.clone()
+}
+
 pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let count = state.core.tasks.count();
     let dirty = state.is_runtime_state_dirty();
@@ -152,7 +190,7 @@ pub(crate) async fn github_webhook(
     };
 
     if req.project.is_none() {
-        req.project = Some(state.core.project_root.clone());
+        req.project = Some(resolve_webhook_project_root(&state, &req));
     }
 
     match task_routes::enqueue_task(&state, req).await {
