@@ -7,6 +7,7 @@ use axum::{
 };
 use harness_protocol::methods::RpcRequest;
 use serde_json::json;
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 
 use super::{state::AppState, task_routes};
@@ -67,6 +68,128 @@ pub(crate) async fn handle_rpc(
     match router::handle_request(&state, req).await {
         Some(resp) => (StatusCode::OK, Json(resp)).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+fn configured_github_webhook_project_root(
+    github: Option<&harness_core::config::intake::GitHubIntakeConfig>,
+    default_root: &StdPath,
+    repo: &str,
+) -> Option<PathBuf> {
+    github?
+        .effective_repos()
+        .into_iter()
+        .find(|repo_cfg| repo_cfg.repo == repo)
+        .map(|repo_cfg| {
+            repo_cfg
+                .project_root
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_root.to_path_buf())
+        })
+}
+
+async fn resolve_github_webhook_project_root(
+    state: &Arc<AppState>,
+    repo: &str,
+) -> Result<PathBuf, String> {
+    if let Some(project_root) = configured_github_webhook_project_root(
+        state.core.server.config.intake.github.as_ref(),
+        &state.core.project_root,
+        repo,
+    ) {
+        return Ok(project_root);
+    }
+
+    if let Some(registry) = state.core.project_registry.as_deref() {
+        if let Some(project) = registry
+            .get(repo)
+            .await
+            .map_err(|error| format!("project registry lookup failed: {error}"))?
+        {
+            return Ok(project.root);
+        }
+        if let Some(project) = registry
+            .get_by_name(repo)
+            .await
+            .map_err(|error| format!("project registry lookup failed: {error}"))?
+        {
+            return Ok(project.root);
+        }
+    }
+
+    Err(format!(
+        "webhook repository '{repo}' is not configured in intake.github and was not found in the project registry"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configured_github_webhook_project_root;
+    use harness_core::config::intake::{GitHubIntakeConfig, GitHubRepoConfig};
+    use std::path::PathBuf;
+
+    #[test]
+    fn multi_repo_github_webhook_uses_repo_specific_project_root_override() {
+        let default_root = PathBuf::from("/srv/repo-a");
+        let github = GitHubIntakeConfig {
+            enabled: true,
+            repos: vec![
+                GitHubRepoConfig {
+                    repo: "org/repo-a".to_string(),
+                    label: "harness".to_string(),
+                    project_root: None,
+                },
+                GitHubRepoConfig {
+                    repo: "org/repo-b".to_string(),
+                    label: "harness".to_string(),
+                    project_root: Some("/srv/repo-b".to_string()),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let resolved =
+            configured_github_webhook_project_root(Some(&github), &default_root, "org/repo-b");
+
+        assert_eq!(resolved, Some(PathBuf::from("/srv/repo-b")));
+    }
+
+    #[test]
+    fn configured_github_repo_without_override_falls_back_to_default_project_root() {
+        let default_root = PathBuf::from("/srv/repo-a");
+        let github = GitHubIntakeConfig {
+            enabled: true,
+            repos: vec![GitHubRepoConfig {
+                repo: "org/repo-a".to_string(),
+                label: "harness".to_string(),
+                project_root: None,
+            }],
+            ..Default::default()
+        };
+
+        let resolved =
+            configured_github_webhook_project_root(Some(&github), &default_root, "org/repo-a");
+
+        assert_eq!(resolved, Some(default_root));
+    }
+
+    #[test]
+    fn unconfigured_github_repo_has_no_configured_project_root() {
+        let default_root = PathBuf::from("/srv/repo-a");
+        let github = GitHubIntakeConfig {
+            enabled: true,
+            repos: vec![GitHubRepoConfig {
+                repo: "org/repo-a".to_string(),
+                label: "harness".to_string(),
+                project_root: None,
+            }],
+            ..Default::default()
+        };
+
+        let resolved =
+            configured_github_webhook_project_root(Some(&github), &default_root, "org/repo-b");
+
+        assert_eq!(resolved, None);
     }
 }
 
@@ -152,7 +275,13 @@ pub(crate) async fn github_webhook(
     };
 
     if req.project.is_none() {
-        req.project = Some(state.core.project_root.clone());
+        req.project = Some(match req.repo.as_deref() {
+            Some(repo) => match resolve_github_webhook_project_root(&state, repo).await {
+                Ok(project_root) => project_root,
+                Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+            },
+            None => state.core.project_root.clone(),
+        });
     }
 
     match task_routes::enqueue_task(&state, req).await {

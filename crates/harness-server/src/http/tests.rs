@@ -230,6 +230,11 @@ async fn make_test_state_with_agent(
     Ok((state, capturing))
 }
 
+fn init_fake_git_repo(root: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(root.join(".git"))?;
+    Ok(())
+}
+
 fn task_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_check))
@@ -1176,6 +1181,7 @@ async fn feishu_webhook_rejects_invalid_token() -> anyhow::Result<()> {
 #[tokio::test]
 async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
+    init_fake_git_repo(dir.path())?;
     let secret = "secret";
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
     let before_count = state.core.tasks.count();
@@ -1186,7 +1192,8 @@ async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Resu
         "issue": {
             "number": 77,
             "body": "@harness please implement this feature"
-        }
+        },
+        "repository": { "full_name": "org/repo" }
     });
     let payload_body = payload.to_string();
     let signature = webhook_signature(secret, payload_body.as_bytes());
