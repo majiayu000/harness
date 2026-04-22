@@ -46,6 +46,35 @@ fn checkpoint_recovery_failure_reason(
     }
 }
 
+fn awaiting_deps_recovery_failure_reason(
+    task: &task_runner::TaskState,
+    req: &task_runner::CreateTaskRequest,
+    recovered_issue_num: Option<u64>,
+) -> Option<&'static str> {
+    if recovered_issue_num.is_none()
+        && task
+            .request_settings
+            .as_ref()
+            .is_some_and(|settings| settings.additional_prompt.is_some())
+    {
+        Some("dep-watcher: issue-backed task lost parseable issue number after restart; skipping")
+    } else if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
+        if task
+            .request_settings
+            .as_ref()
+            .is_some_and(|settings| settings.is_manual_prompt_only())
+        {
+            Some(
+                "dep-watcher: manual prompt-only task has no persisted prompt after server restart; please re-submit the task",
+            )
+        } else {
+            Some("dep-watcher: task has no recoverable issue, PR, or prompt after server restart")
+        }
+    } else {
+        None
+    }
+}
+
 /// Spawn background watcher for AwaitingDeps tasks.
 /// Uses Weak<AppState> to avoid a reference cycle; the loop exits when AppState is dropped.
 pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
@@ -188,24 +217,9 @@ pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
                         }
                     }
 
-                    // Guard: manual prompt-only tasks keep their prompt in
-                    // memory only. If restart recovery cannot rebuild a
-                    // system-generated prompt either, fail explicitly instead
-                    // of silently executing with an empty prompt.
-                    if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
-                        let reason = if task
-                            .request_settings
-                            .as_ref()
-                            .is_some_and(|settings| settings.is_manual_prompt_only())
-                        {
-                            "dep-watcher: manual prompt-only task has no persisted \
-                             prompt after server restart; please re-submit the task"
-                                .to_string()
-                        } else {
-                            "dep-watcher: task has no recoverable issue, PR, or prompt \
-                             after server restart"
-                                .to_string()
-                        };
+                    if let Some(reason) = awaiting_deps_recovery_failure_reason(&task, &req, issue)
+                    {
+                        let reason = reason.to_string();
                         tracing::error!(task_id = ?task.id, "{reason}");
                         if let Err(pe) =
                             task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
@@ -1120,40 +1134,6 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                 };
                 let project_id = canonical.to_string_lossy().into_owned();
 
-                let permit = match state
-                    .concurrency
-                    .task_queue
-                    .acquire(&project_id, task.priority)
-                    .await
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let reason =
-                            format!("startup recovery: failed to acquire concurrency permit: {e}");
-                        tracing::error!(task_id = ?task.id, "{reason}");
-                        if let Err(pe) =
-                            task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
-                                s.status = task_runner::TaskStatus::Failed;
-                                s.error = Some(reason);
-                            })
-                            .await
-                        {
-                            tracing::error!(
-                                task_id = ?task.id,
-                                "startup recovery: failed to persist failed status: {pe}; \
-                                 skipping completion callback to avoid state split"
-                            );
-                            return;
-                        }
-                        if let Some(cb) = &state.intake.completion_callback {
-                            if let Some(final_state) = state.core.tasks.get(&task.id) {
-                                cb(final_state).await;
-                            }
-                        }
-                        return;
-                    }
-                };
-
                 let mut req = task_runner::CreateTaskRequest {
                     issue: issue_num,
                     project: Some(canonical),
@@ -1213,6 +1193,43 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                     }
                     return;
                 }
+
+                // Only wait for a permit once recovery has proven the task can
+                // actually be re-dispatched. Otherwise guaranteed-failure
+                // tasks sit behind unrelated work and delay intake cleanup.
+                let permit = match state
+                    .concurrency
+                    .task_queue
+                    .acquire(&project_id, task.priority)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let reason =
+                            format!("startup recovery: failed to acquire concurrency permit: {e}");
+                        tracing::error!(task_id = ?task.id, "{reason}");
+                        if let Err(pe) =
+                            task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
+                                s.status = task_runner::TaskStatus::Failed;
+                                s.error = Some(reason);
+                            })
+                            .await
+                        {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to persist failed status: {pe}; \
+                                 skipping completion callback to avoid state split"
+                            );
+                            return;
+                        }
+                        if let Some(cb) = &state.intake.completion_callback {
+                            if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                cb(final_state).await;
+                            }
+                        }
+                        return;
+                    }
+                };
 
                 // Use the three-tier select_agent() so that an explicit agent
                 // pin stored in request_settings (Tier 1) and project-level
