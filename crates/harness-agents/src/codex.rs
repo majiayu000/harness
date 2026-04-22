@@ -1,6 +1,7 @@
 use crate::cloud_setup;
 use crate::streaming::{
-    filter_agent_stderr, log_captured_stderr, send_stream_item, stream_child_output,
+    captured_stderr_tail, enrich_stream_exit_error, filter_agent_stderr_with_capture,
+    log_captured_stderr, send_stream_item, stream_child_output,
 };
 use async_trait::async_trait;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
@@ -11,6 +12,7 @@ use harness_sandbox::{wrap_command, SandboxSpec};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 
 pub struct CodexAgent {
@@ -243,10 +245,12 @@ impl CodeAgent for CodexAgent {
             ))
         })?;
 
+        let stderr_capture = Arc::new(Mutex::new(String::new()));
         if let Some(stderr) = child.stderr.take() {
             let agent = self.name().to_string();
+            let captured = Arc::clone(&stderr_capture);
             tokio::spawn(async move {
-                filter_agent_stderr(stderr, &agent).await;
+                filter_agent_stderr_with_capture(stderr, &agent, Some(captured)).await;
             });
         }
 
@@ -254,7 +258,25 @@ impl CodeAgent for CodexAgent {
             .stream_timeout_secs
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
-        stream_child_output(&mut child, &tx, self.name(), idle_timeout).await?;
+        if let Err(error) = stream_child_output(&mut child, &tx, self.name(), idle_timeout).await {
+            let stderr = captured_stderr_tail(&stderr_capture);
+            let stderr_lower = stderr.to_lowercase();
+            if !stderr.is_empty() {
+                if stderr_lower.contains("payment required")
+                    || stderr_lower.contains("insufficient available balance")
+                {
+                    return Err(harness_core::error::HarnessError::BillingFailed(format!(
+                        "codex billing failure (streamed exit): {stderr}"
+                    )));
+                }
+                if stderr_lower.contains("402") || stderr_lower.contains("quota") {
+                    return Err(harness_core::error::HarnessError::QuotaExhausted(format!(
+                        "codex quota exhausted (streamed exit): {stderr}"
+                    )));
+                }
+            }
+            return Err(enrich_stream_exit_error(error, &stderr));
+        }
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
     }
@@ -505,6 +527,37 @@ printf 'world\n'
             }
             other => panic!("unexpected completed event payload: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_stream_classifies_quota_failure_from_stderr() {
+        let (dir, script) = write_executable_script(
+            r#"
+echo 'quota exhausted: retry later' >&2
+exit 1
+"#,
+        );
+        let agent = CodexAgent::new(script, SandboxMode::DangerFullAccess);
+        let request = AgentRequest {
+            prompt: "ignored".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..AgentRequest::default()
+        };
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let err = agent
+            .execute_stream(request, tx)
+            .await
+            .expect_err("stream execution should fail");
+
+        assert!(
+            matches!(err, harness_core::error::HarnessError::QuotaExhausted(_)),
+            "expected streamed codex stderr to preserve quota classification, got: {err}"
+        );
+        assert_eq!(
+            err.turn_failure().expect("turn failure").kind,
+            harness_core::types::TurnFailureKind::Quota
+        );
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 use harness_core::{agent::StreamItem, error::HarnessError, types::Item};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::Sender;
@@ -13,6 +14,8 @@ const STDERR_ERROR_KEYWORDS: &[&str] = &[
     "exception",
 ];
 const MAX_STDERR_LINE_LEN: usize = 1000;
+const MAX_CAPTURED_STDERR_CHARS: usize = 4000;
+const MAX_STREAM_FAILURE_OUTPUT_CHARS: usize = 500;
 
 /// Truncate a string to at most `max_bytes`, snapping to a char boundary.
 fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
@@ -190,9 +193,57 @@ fn is_agent_internal(line: &str) -> bool {
         .any(|prefix| lower.starts_with(prefix))
 }
 
-/// Read agent stderr line-by-line. Lines matching error keywords are logged
-/// at warn level; agent-internal progress lines are always debug.
-pub(crate) async fn filter_agent_stderr(stderr: tokio::process::ChildStderr, agent_name: &str) {
+fn tail_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+
+    s.chars()
+        .rev()
+        .take(max_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn append_stderr_capture(captured: &Arc<Mutex<String>>, line: &str) {
+    let mut guard = captured
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.push_str(line);
+    guard.push('\n');
+    if guard.chars().count() > MAX_CAPTURED_STDERR_CHARS {
+        *guard = tail_chars(&guard, MAX_CAPTURED_STDERR_CHARS);
+    }
+}
+
+pub(crate) fn captured_stderr_tail(captured: &Arc<Mutex<String>>) -> String {
+    captured
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .trim()
+        .to_string()
+}
+
+pub(crate) fn enrich_stream_exit_error(error: HarnessError, stderr_tail: &str) -> HarnessError {
+    match error {
+        HarnessError::AgentExecution(message)
+            if message.contains(" exited with ")
+                && !message.contains("stderr=[")
+                && !stderr_tail.trim().is_empty() =>
+        {
+            HarnessError::AgentExecution(format!("{message}: stderr=[{stderr_tail}]"))
+        }
+        other => other,
+    }
+}
+
+pub(crate) async fn filter_agent_stderr_with_capture(
+    stderr: tokio::process::ChildStderr,
+    agent_name: &str,
+    captured: Option<Arc<Mutex<String>>>,
+) {
     let reader = BufReader::new(stderr);
     let mut lines = reader.lines();
 
@@ -200,6 +251,9 @@ pub(crate) async fn filter_agent_stderr(stderr: tokio::process::ChildStderr, age
         let trimmed = truncate_to_char_boundary(&line, MAX_STDERR_LINE_LEN);
         if trimmed.is_empty() {
             continue;
+        }
+        if let Some(captured) = captured.as_ref() {
+            append_stderr_capture(captured, trimmed);
         }
         if is_agent_internal(trimmed) {
             tracing::debug!(agent = agent_name, "{trimmed}");
@@ -212,6 +266,13 @@ pub(crate) async fn filter_agent_stderr(stderr: tokio::process::ChildStderr, age
             tracing::debug!(agent = agent_name, "{trimmed}");
         }
     }
+}
+
+/// Read agent stderr line-by-line. Lines matching error keywords are logged
+/// at warn level; agent-internal progress lines are always debug.
+#[cfg(test)]
+pub(crate) async fn filter_agent_stderr(stderr: tokio::process::ChildStderr, agent_name: &str) {
+    filter_agent_stderr_with_capture(stderr, agent_name, None).await;
 }
 
 /// Log stderr captured from a non-streaming `output()` call.
@@ -316,9 +377,12 @@ pub(crate) async fn stream_child_output(
         HarnessError::AgentExecution(format!("failed waiting for {agent_name} process: {error}"))
     })?;
     if !status.success() {
-        return Err(HarnessError::AgentExecution(format!(
-            "{agent_name} exited with {status}"
-        )));
+        let stdout_tail = tail_chars(&output, MAX_STREAM_FAILURE_OUTPUT_CHARS);
+        return Err(HarnessError::AgentExecution(if stdout_tail.is_empty() {
+            format!("{agent_name} exited with {status}")
+        } else {
+            format!("{agent_name} exited with {status}: stdout_tail=[{stdout_tail}]")
+        }));
     }
 
     send_stream_item(
@@ -467,7 +531,7 @@ mod tests {
     async fn stream_child_output_fails_on_nonzero_exit() {
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg("exit 1")
+            .arg("printf \"You've hit your limit\\n\"; exit 1")
             .stdout(std::process::Stdio::piped())
             .stdin(std::process::Stdio::null())
             .spawn()
@@ -480,6 +544,10 @@ mod tests {
         assert!(
             msg.contains("test-agent"),
             "error message must identify the agent, got: {msg}"
+        );
+        assert!(
+            msg.contains("stdout_tail=[You've hit your limit"),
+            "error message must preserve stdout tail for failure classification, got: {msg}"
         );
     }
 
