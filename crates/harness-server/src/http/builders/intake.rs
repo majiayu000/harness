@@ -250,7 +250,7 @@ fn runtime_issue_concurrency_config(
             continue;
         };
         let canonical = project.root.to_string_lossy().into_owned();
-        config.per_project.entry(canonical).or_insert(limit);
+        config.per_project.insert(canonical, limit);
         derived_total = derived_total.saturating_add(limit);
     }
 
@@ -342,6 +342,11 @@ mod tests {
             AgentRegistry::new("test"),
         );
         server.config.concurrency.max_concurrent_tasks = 6;
+        server
+            .config
+            .concurrency
+            .per_project
+            .insert("/tmp/a".to_string(), 2);
         server.startup_projects = vec![
             harness_core::config::ProjectEntry {
                 name: "a".to_string(),
@@ -363,8 +368,8 @@ mod tests {
 
         assert_eq!(cfg.max_concurrent_tasks, 12);
         assert_eq!(cfg.per_project.len(), 2);
-        assert!(cfg.per_project.values().any(|v| *v == 4));
-        assert!(cfg.per_project.values().any(|v| *v == 8));
+        assert_eq!(cfg.per_project.get("/tmp/a"), Some(&4));
+        assert_eq!(cfg.per_project.get("/tmp/b"), Some(&8));
     }
 
     #[test]
