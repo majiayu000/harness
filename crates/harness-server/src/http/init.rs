@@ -54,6 +54,8 @@ pub(super) fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
 pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppState> {
     let dir = expand_tilde(&server.config.server.data_dir);
     let project_root = resolve_project_root(&server.config.server.project_root)?;
+    #[cfg(test)]
+    let db_state_guard = Some(crate::test_helpers::acquire_db_state_guard().await);
 
     tracing::debug!(
         data_dir = %dir.display(),
@@ -207,7 +209,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             workspace_mgr: registry.workspace_mgr,
         },
         #[cfg(test)]
-        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
+        _db_state_guard: db_state_guard,
         runtime_hosts: services.runtime_hosts,
         runtime_project_cache: services.runtime_project_cache,
         runtime_state_persist_lock: Mutex::new(()),

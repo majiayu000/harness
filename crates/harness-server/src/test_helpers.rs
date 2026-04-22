@@ -132,6 +132,8 @@ async fn make_state_inner(
     project_root: &std::path::Path,
     agent_registry: AgentRegistry,
 ) -> anyhow::Result<AppState> {
+    #[cfg(test)]
+    let db_state_guard = Some(acquire_db_state_guard().await);
     let server = Arc::new(HarnessServer::new(
         HarnessConfig::default(),
         ThreadManager::new(),
@@ -219,7 +221,7 @@ async fn make_state_inner(
             workspace_mgr: None,
         },
         #[cfg(test)]
-        _db_state_guard: Some(acquire_db_state_guard().await),
+        _db_state_guard: db_state_guard,
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
