@@ -159,9 +159,23 @@ pub struct SignalRateLimiter {
 
 impl SignalRateLimiter {
     const WINDOW: Duration = Duration::from_secs(60);
+    const FULL_PRUNE_INTERVAL: usize = 256;
 
     fn prune_expired_counts(counts: &mut HashMap<String, (u32, Instant)>, now: Instant) {
         counts.retain(|_, (_, window_start)| now.duration_since(*window_start) < Self::WINDOW);
+    }
+
+    fn prune_source_entry(
+        counts: &mut HashMap<String, (u32, Instant)>,
+        source: &str,
+        now: Instant,
+    ) {
+        if counts
+            .get(source)
+            .is_some_and(|(_, window_start)| now.duration_since(*window_start) >= Self::WINDOW)
+        {
+            counts.remove(source);
+        }
     }
 
     fn active_source_count(counts: &HashMap<String, (u32, Instant)>, now: Instant) -> usize {
@@ -198,7 +212,11 @@ impl SignalRateLimiter {
         let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
 
-        Self::prune_expired_counts(&mut counts, now);
+        Self::prune_source_entry(&mut counts, source, now);
+
+        if !counts.contains_key(source) && counts.len().is_multiple_of(Self::FULL_PRUNE_INTERVAL) {
+            Self::prune_expired_counts(&mut counts, now);
+        }
 
         let entry = counts.entry(source.to_string()).or_insert((0, now));
         if now.duration_since(entry.1) >= Self::WINDOW {
@@ -287,6 +305,20 @@ mod tests {
         let snap = limiter.snapshot();
 
         assert_eq!(snap.tracked_sources, 1);
+    }
+
+    #[test]
+    fn signal_hot_path_only_prunes_requested_source() {
+        let limiter = SignalRateLimiter::new(60);
+        let now = Instant::now();
+        limiter.insert_for_test("active", 1, now - Duration::from_secs(5));
+        limiter.insert_for_test("expired", 1, now - Duration::from_secs(61));
+
+        assert!(limiter.check_and_increment("active"));
+
+        let counts = limiter.counts.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(counts.contains_key("expired"));
+        assert!(counts.contains_key("active"));
     }
 
     #[test]

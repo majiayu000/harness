@@ -24,17 +24,18 @@ const MAX_ERROR_LEN: usize = 200;
 pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
     let generated_at = Utc::now();
 
-    // Bound the retry-event query to the last 2 hours so the endpoint does not
-    // scan unbounded history on long-lived instances.  We only need `.last()`,
-    // so any window that comfortably covers one retry interval is sufficient.
-    let retry_filter = EventFilters {
+    let recent_retry_filter = EventFilters {
         hook: Some("periodic_retry:summary".to_string()),
         since: Some(generated_at - chrono::Duration::hours(2)),
         ..Default::default()
     };
+    let all_retry_filter = EventFilters {
+        hook: Some("periodic_retry:summary".to_string()),
+        ..Default::default()
+    };
     // Collect all subsections concurrently — they are independent.
     let (retry_events_res, stalled_res, failed_res) = tokio::join!(
-        state.observability.events.query(&retry_filter),
+        state.observability.events.query(&recent_retry_filter),
         state
             .core
             .tasks
@@ -42,7 +43,7 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
         state.core.tasks.list_recent_failed(MAX_TASKS as i64),
     );
 
-    let retry_events = match retry_events_res {
+    let mut retry_events = match retry_events_res {
         Ok(events) => events,
         Err(e) => return error_response(format!("failed to query retry events: {e}")),
     };
@@ -54,6 +55,12 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
         Ok(tasks) => tasks,
         Err(e) => return error_response(format!("failed to query recent failures: {e}")),
     };
+    if retry_events.is_empty() {
+        retry_events = match state.observability.events.query(&all_retry_filter).await {
+            Ok(events) => events,
+            Err(e) => return error_response(format!("failed to query retry events: {e}")),
+        };
+    }
 
     // ---- retry section ----
     // query returns ASC order; the last element is the most recent tick.
@@ -385,6 +392,39 @@ mod tests {
         assert_eq!(tick["retried"], 7);
         assert_eq!(tick["stuck"], 0);
         assert_eq!(tick["skipped"], 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn last_tick_falls_back_to_older_summary_event() -> anyhow::Result<()> {
+        let _lock = test_helpers::HOME_LOCK.lock().await;
+        let dir = test_helpers::tempdir_in_home("harness-test-op-snap-old-tick-")?;
+        let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+
+        let mut event = harness_core::types::Event::new(
+            harness_core::types::SessionId::new(),
+            "periodic_retry:summary",
+            "retry_scheduler",
+            harness_core::types::Decision::Warn,
+        );
+        event.ts = Utc::now() - chrono::Duration::hours(3);
+        event.detail = Some(r#"{"checked":1,"retried":0,"stuck":1,"skipped":0}"#.to_string());
+        state.observability.events.log(&event).await?;
+
+        let app = Router::new()
+            .route("/api/operator-snapshot", get(operator_snapshot))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/api/operator-snapshot")
+            .body(axum::body::Body::empty())?;
+        let resp = tower::ServiceExt::oneshot(app, req).await?;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+        let tick = &body["retry"]["last_tick"];
+        assert_eq!(tick["checked"], 1);
+        assert_eq!(tick["stuck"], 1);
         Ok(())
     }
 
