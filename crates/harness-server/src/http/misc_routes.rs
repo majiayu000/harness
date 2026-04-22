@@ -516,45 +516,64 @@ pub(crate) struct PasswordResetRequest {
     pub(crate) email: String,
 }
 
-/// POST /auth/reset-password — initiate a password reset.
+pub(crate) fn prepare_password_reset_request(
+    rate_limiter: &crate::http::rate_limit::PasswordResetRateLimiter,
+    limit: u32,
+    email: &str,
+) -> Result<String, (StatusCode, serde_json::Value)> {
+    let email = email.trim().to_lowercase();
+    if email.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            json!({"error": "email is required"}),
+        ));
+    }
+
+    if !rate_limiter.check_and_increment(&email) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({
+                "error": format!(
+                    "rate limit exceeded: max {} password reset requests per hour",
+                    limit
+                )
+            }),
+        ));
+    }
+
+    Ok(email)
+}
+
+pub(crate) fn disabled_password_reset_response() -> (StatusCode, serde_json::Value) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        json!({"error": "password reset is not yet implemented"}),
+    )
+}
+
+/// POST /auth/reset-password — temporarily disabled until email delivery exists.
 ///
-/// Rate-limited per email address to prevent enumeration and brute-force.
-/// Always returns a generic success response regardless of whether the email
-/// exists, to avoid leaking account information.
+/// Requests are still validated, rate-limited, and logged so the auth-exempt
+/// endpoint retains its abuse protections while the actual reset flow is
+/// unavailable.
 pub(crate) async fn password_reset(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PasswordResetRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let email = req.email.trim().to_lowercase();
-    if email.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "email is required"})),
-        );
-    }
-
     let limit = state
         .core
         .server
         .config
         .server
         .password_reset_rate_limit_per_hour;
-
-    if !state
-        .observability
-        .password_reset_rate_limiter
-        .check_and_increment(&email)
-    {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({
-                "error": format!(
-                    "rate limit exceeded: max {} password reset requests per hour",
-                    limit
-                )
-            })),
-        );
-    }
+    let email = match prepare_password_reset_request(
+        &state.observability.password_reset_rate_limiter,
+        limit,
+        &req.email,
+    ) {
+        Ok(email) => email,
+        Err((status, body)) => return (status, Json(body)),
+    };
 
     tracing::info!(
         email_hash = %format!("{:x}", {
@@ -563,13 +582,10 @@ pub(crate) async fn password_reset(
             email.hash(&mut h);
             h.finish()
         }),
-        "password reset requested"
+        "password reset requested while endpoint disabled"
     );
 
-    (
-        StatusCode::OK,
-        Json(
-            json!({"status": "ok", "message": "If that email is registered, a reset link has been sent."}),
-        ),
-    )
+    // TODO: wire up SMTP/transactional email before enabling this endpoint.
+    let (status, body) = disabled_password_reset_response();
+    (status, Json(body))
 }

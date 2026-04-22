@@ -28,6 +28,8 @@ pub(crate) mod task_routes;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_password_reset;
 
 // Re-export all public symbols so callers using `crate::http::*` paths continue to work.
 pub use init::build_app_state;

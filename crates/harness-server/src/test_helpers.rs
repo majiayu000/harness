@@ -62,14 +62,20 @@ pub fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
 }
 
 pub async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
-    make_state_inner(dir, dir, AgentRegistry::new("test")).await
+    make_state_inner(
+        dir,
+        dir,
+        AgentRegistry::new("test"),
+        HarnessConfig::default(),
+    )
+    .await
 }
 
 pub async fn make_test_state_with_registry(
     dir: &std::path::Path,
     agent_registry: AgentRegistry,
 ) -> anyhow::Result<AppState> {
-    make_state_inner(dir, dir, agent_registry).await
+    make_state_inner(dir, dir, agent_registry, HarnessConfig::default()).await
 }
 
 /// Build a test `AppState` wrapped in `Arc`, using separate data and project-root directories.
@@ -81,7 +87,13 @@ pub async fn make_test_state_with_project_root(
     project_root: &std::path::Path,
 ) -> anyhow::Result<Arc<AppState>> {
     Ok(Arc::new(
-        make_state_inner(dir, project_root, AgentRegistry::new("test")).await?,
+        make_state_inner(
+            dir,
+            project_root,
+            AgentRegistry::new("test"),
+            HarnessConfig::default(),
+        )
+        .await?,
     ))
 }
 
@@ -89,12 +101,14 @@ async fn make_state_inner(
     dir: &std::path::Path,
     project_root: &std::path::Path,
     agent_registry: AgentRegistry,
+    config: HarnessConfig,
 ) -> anyhow::Result<AppState> {
     let server = Arc::new(HarnessServer::new(
-        HarnessConfig::default(),
+        config,
         ThreadManager::new(),
         agent_registry,
     ));
+    let password_reset_rate_limit = server.config.server.password_reset_rate_limit_per_hour;
     let tasks = crate::task_runner::TaskStore::open(&harness_core::config::dirs::default_db_path(
         dir, "tasks",
     ))
@@ -167,7 +181,7 @@ async fn make_state_inner(
             events,
             signal_rate_limiter: Arc::new(crate::http::rate_limit::SignalRateLimiter::new(100)),
             password_reset_rate_limiter: Arc::new(
-                crate::http::rate_limit::PasswordResetRateLimiter::new(5),
+                crate::http::rate_limit::PasswordResetRateLimiter::new(password_reset_rate_limit),
             ),
             review_store: None,
         },
