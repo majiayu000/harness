@@ -18,6 +18,10 @@ pub struct CreateTaskRequest {
     /// straight to implementation using the legacy direct-implement path.
     #[serde(default)]
     pub skip_triage: bool,
+    /// When true, agent-raised plan concerns must not block implementation.
+    /// The concern is recorded, but the issue contract remains authoritative.
+    #[serde(default)]
+    pub force_execute: bool,
     /// GitHub PR number to review/fix.
     pub pr: Option<u64>,
     /// Explicit agent name; if omitted, uses the default agent.
@@ -61,6 +65,9 @@ pub struct CreateTaskRequest {
     /// Repository slug (e.g. "owner/repo"). Stored in TaskState for traceability.
     #[serde(default)]
     pub repo: Option<String>,
+    /// Snapshot of source labels for workflow policy decisions.
+    #[serde(default)]
+    pub labels: Vec<String>,
     /// Explicit parent task ID.
     #[serde(default)]
     pub parent_task_id: Option<TaskId>,
@@ -88,6 +95,10 @@ pub struct PersistedRequestSettings {
     pub max_turns: Option<u32>,
     #[serde(default)]
     pub skip_triage: bool,
+    #[serde(default)]
+    pub force_execute: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_budget_usd: Option<f64>,
     pub wait_secs: u64,
@@ -124,6 +135,8 @@ impl PersistedRequestSettings {
             max_rounds: req.max_rounds,
             max_turns: req.max_turns,
             skip_triage: req.skip_triage,
+            force_execute: req.force_execute,
+            labels: req.labels.clone(),
             max_budget_usd: req.max_budget_usd,
             wait_secs: req.wait_secs,
             retry_base_backoff_ms: req.retry_base_backoff_ms,
@@ -154,6 +167,8 @@ impl PersistedRequestSettings {
         req.max_rounds = self.max_rounds;
         req.max_turns = self.max_turns;
         req.skip_triage = self.skip_triage;
+        req.force_execute = self.force_execute;
+        req.labels = self.labels.clone();
         req.max_budget_usd = self.max_budget_usd;
         req.wait_secs = self.wait_secs;
         req.retry_base_backoff_ms = self.retry_base_backoff_ms;
@@ -177,6 +192,7 @@ impl Default for CreateTaskRequest {
             prompt: None,
             issue: None,
             skip_triage: false,
+            force_execute: false,
             pr: None,
             agent: None,
             project: None,
@@ -191,6 +207,7 @@ impl Default for CreateTaskRequest {
             source: None,
             external_id: None,
             repo: None,
+            labels: Vec::new(),
             parent_task_id: None,
             depends_on: Vec::new(),
             priority: 0,
@@ -288,6 +305,7 @@ mod tests {
     fn create_task_request_default_skip_triage_is_false() {
         let req = CreateTaskRequest::default();
         assert!(!req.skip_triage);
+        assert!(!req.force_execute);
     }
 
     #[test]
@@ -295,13 +313,16 @@ mod tests {
         let req = CreateTaskRequest {
             issue: Some(42),
             skip_triage: true,
+            force_execute: true,
             ..CreateTaskRequest::default()
         };
         let settings = PersistedRequestSettings::from_req(&req);
         assert!(settings.skip_triage);
+        assert!(settings.force_execute);
 
         let mut restored = CreateTaskRequest::default();
         settings.apply_to_req(&mut restored);
         assert!(restored.skip_triage);
+        assert!(restored.force_execute);
     }
 }

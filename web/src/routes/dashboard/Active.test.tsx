@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Active } from "./Active";
 import type { Task } from "@/types";
@@ -24,6 +24,7 @@ function makeTask(id: string, project: string | null, status = "running"): Task 
     error: null,
     source: null,
     parent_id: null,
+    external_id: null,
     repo: null,
     description: id,
     created_at: null,
@@ -31,7 +32,14 @@ function makeTask(id: string, project: string | null, status = "running"): Task 
     depends_on: [],
     subtask_ids: [],
     project,
+    workflow: null,
   };
+}
+
+function columnCount(label: string): string {
+  const header = screen.getByText(label).parentElement;
+  if (!header) throw new Error(`missing ${label} column header`);
+  return within(header).getAllByText(/\d+/)[0].textContent ?? "";
 }
 
 function wrap(ui: React.ReactElement) {
@@ -80,5 +88,25 @@ describe("<Active>", () => {
     expect(screen.queryByText("t2")).not.toBeInTheDocument();
     const dashes = screen.getAllByText("—");
     expect(dashes.length).toBeGreaterThan(0);
+  });
+
+  it("groups tasks by workflow state before falling back to task status", () => {
+    const ready = {
+      ...makeTask("ready-task", "harness", "implementing"),
+      workflow: { state: "ready_to_merge", pr_number: 123 },
+    };
+    const feedback = {
+      ...makeTask("feedback-task", "harness", "pending"),
+      workflow: { state: "addressing_feedback", pr_number: 124 },
+    };
+    mockUseTasks.mockReturnValue({ data: [ready, feedback], isLoading: false, isError: false });
+    wrap(<Active projectFilter="harness" />);
+
+    expect(screen.getByText("wf Ready To Merge")).toBeInTheDocument();
+    expect(screen.getByText("wf Addressing Feedback")).toBeInTheDocument();
+    expect(columnCount("Ready")).toBe("1");
+    expect(columnCount("Feedback")).toBe("1");
+    expect(columnCount("Implementing")).toBe("0");
+    expect(columnCount("Pending")).toBe("0");
   });
 });

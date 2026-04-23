@@ -80,6 +80,7 @@ pub struct DefaultExecutionService {
     workspace_mgr: Option<Arc<WorkspaceManager>>,
     task_queue: Arc<TaskQueue>,
     completion_callback: Option<CompletionCallback>,
+    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     project_registry: Option<Arc<ProjectRegistry>>,
     allowed_project_roots: Vec<PathBuf>,
 }
@@ -96,6 +97,7 @@ impl DefaultExecutionService {
         workspace_mgr: Option<Arc<WorkspaceManager>>,
         task_queue: Arc<TaskQueue>,
         completion_callback: Option<CompletionCallback>,
+        issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
         project_registry: Option<Arc<ProjectRegistry>>,
         allowed_project_roots: Vec<PathBuf>,
     ) -> Arc<Self> {
@@ -109,6 +111,7 @@ impl DefaultExecutionService {
             workspace_mgr,
             task_queue,
             completion_callback,
+            issue_workflow_store,
             project_registry,
             allowed_project_roots,
         })
@@ -185,6 +188,49 @@ impl DefaultExecutionService {
                 .map_err(|e| EnqueueTaskError::Internal(e.to_string()))
         }
     }
+
+    async fn track_issue_workflow(
+        &self,
+        project_id: &str,
+        req: &CreateTaskRequest,
+        task_id: &TaskId,
+    ) {
+        let Some(workflows) = self.issue_workflow_store.as_ref() else {
+            return;
+        };
+        if let Some(issue_number) = req.issue {
+            if let Err(e) = workflows
+                .record_issue_scheduled(
+                    project_id,
+                    req.repo.as_deref(),
+                    issue_number,
+                    &task_id.0,
+                    &req.labels,
+                    req.force_execute,
+                )
+                .await
+            {
+                tracing::warn!(
+                    issue = issue_number,
+                    task_id = %task_id.0,
+                    "issue workflow enqueue tracking failed: {e}"
+                );
+            }
+            return;
+        }
+        if let Some(pr_number) = req.pr {
+            if let Err(e) = workflows
+                .record_feedback_task_scheduled(project_id, pr_number, &task_id.0)
+                .await
+            {
+                tracing::warn!(
+                    pr = pr_number,
+                    task_id = %task_id.0,
+                    "issue workflow PR enqueue tracking failed: {e}"
+                );
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -215,6 +261,7 @@ impl ExecutionService for DefaultExecutionService {
             agent.name(),
         );
 
+        let workflow_req = req.clone();
         let task_id = task_runner::spawn_task(
             self.tasks.clone(),
             agent,
@@ -227,8 +274,12 @@ impl ExecutionService for DefaultExecutionService {
             self.workspace_mgr.clone(),
             permit,
             self.completion_callback.clone(),
+            self.issue_workflow_store.clone(),
         )
         .await;
+
+        self.track_issue_workflow(&project_id, &workflow_req, &task_id)
+            .await;
 
         Ok(task_id)
     }
@@ -271,7 +322,9 @@ impl ExecutionService for DefaultExecutionService {
         let workspace_mgr = self.workspace_mgr.clone();
         let task_queue = self.task_queue.clone();
         let completion_callback = self.completion_callback.clone();
+        let issue_workflow_store = self.issue_workflow_store.clone();
         let task_id2 = task_id.clone();
+        self.track_issue_workflow(&project_id, &req, &task_id).await;
         tokio::spawn(async move {
             match task_queue.acquire(&project_id, req.priority).await {
                 Ok(permit) => {
@@ -288,6 +341,7 @@ impl ExecutionService for DefaultExecutionService {
                         workspace_mgr,
                         permit,
                         completion_callback,
+                        issue_workflow_store,
                         None,
                     )
                     .await;
@@ -511,6 +565,7 @@ mod tests {
             None,
             make_task_queue(),
             None,
+            None,
             registry,
             vec![],
         )
@@ -531,6 +586,7 @@ mod tests {
             vec![],
             None,
             make_task_queue(),
+            None,
             None,
             None,
             allowed,

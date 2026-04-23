@@ -20,6 +20,9 @@ pub struct CoreServices {
     /// In-memory plan cache hydrated from `plan_db` on startup.
     /// Write-through: every mutation must also persist via `plan_db`.
     pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
+    pub issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
+    pub project_workflow_store:
+        Option<Arc<harness_workflow::project_lifecycle::ProjectWorkflowStore>>,
     pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
     pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
     /// Q-value store for MemRL rule utility tracking. None when unavailable.

@@ -170,6 +170,7 @@ pub(crate) async fn build_intake(
         server.config.agents.review.clone(),
         Some(quality_trigger),
         server.config.server.github_token.clone(),
+        registry.issue_workflow_store.clone(),
     );
 
     // Wrap completion callback to record Q-value pipeline events and apply

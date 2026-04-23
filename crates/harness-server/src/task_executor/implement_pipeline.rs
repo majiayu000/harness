@@ -76,6 +76,13 @@ pub(crate) fn task_needs_pr_url(req: &CreateTaskRequest) -> bool {
 pub(crate) enum ImplementOutcome {
     /// Task is fully complete (success or failure already persisted) — caller returns Ok(()).
     Done,
+    /// Implementation reported that the current plan is incomplete and the
+    /// caller should choose between replan or force-execute retry.
+    Replan {
+        issue: u64,
+        plan_issue: String,
+        prior_plan: Option<String>,
+    },
     /// Implementation succeeded — proceed to conflict resolution and review.
     Proceed {
         pr_url: Option<String>,
@@ -112,6 +119,7 @@ pub(crate) async fn run_implement_phase(
     project: &Path,
     plan_output: Option<String>,
     resumed_pr_url: Option<String>,
+    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     turn_timeout: Duration,
     effective_max_turns: Option<u32>,
     turns_used: &mut u32,
@@ -600,6 +608,34 @@ pub(crate) async fn run_implement_phase(
 
         let (pr_url, pr_num, created_issue_num) = match parse_implementation_outcome(&output) {
             ImplementationOutcome::PlanIssue(plan_issue) => {
+                if let (Some(workflows), Some(issue_number)) =
+                    (issue_workflow_store.as_ref(), req.issue)
+                {
+                    let project_id = project.to_string_lossy().into_owned();
+                    if let Err(e) = workflows
+                        .record_plan_issue_detected(
+                            &project_id,
+                            req.repo.as_deref(),
+                            issue_number,
+                            &task_id.0,
+                            &plan_issue,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            issue = issue_number,
+                            task_id = %task_id.0,
+                            "issue workflow PLAN_ISSUE tracking failed: {e}"
+                        );
+                    }
+                }
+                if let Some(issue_number) = req.issue {
+                    return Ok(ImplementOutcome::Replan {
+                        issue: issue_number,
+                        plan_issue,
+                        prior_plan: plan_output.clone(),
+                    });
+                }
                 tracing::error!(
                     task_id = %task_id,
                     plan_issue = %plan_issue,
@@ -688,6 +724,29 @@ pub(crate) async fn run_implement_phase(
 
         // Emit PrDetected event so crash recovery can reconstruct pr_url.
         if let Some(pr_url_str) = pr_url.as_deref() {
+            if let (Some(workflows), Some(issue_number), Some(pr_number)) =
+                (issue_workflow_store.as_ref(), req.issue, pr_num)
+            {
+                let project_id = project.to_string_lossy().into_owned();
+                if let Err(e) = workflows
+                    .record_pr_detected(
+                        &project_id,
+                        req.repo.as_deref(),
+                        issue_number,
+                        &task_id.0,
+                        pr_number,
+                        pr_url_str,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        issue = issue_number,
+                        pr = pr_number,
+                        task_id = %task_id.0,
+                        "issue workflow PR binding failed: {e}"
+                    );
+                }
+            }
             store.log_event(crate::event_replay::TaskEvent::PrDetected {
                 task_id: task_id.0.clone(),
                 ts: crate::event_replay::now_ts(),

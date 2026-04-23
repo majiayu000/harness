@@ -241,6 +241,7 @@ pub async fn spawn_task(
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
+    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
 ) -> TaskId {
     spawn_task_with_worktree_detector(
         store,
@@ -255,6 +256,7 @@ pub async fn spawn_task(
         workspace_mgr,
         permit,
         completion_callback,
+        issue_workflow_store,
         None,
         None,
     )
@@ -299,6 +301,7 @@ pub async fn spawn_preregistered_task(
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
+    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     group_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) {
     spawn_task_with_worktree_detector(
@@ -314,6 +317,7 @@ pub async fn spawn_preregistered_task(
         workspace_mgr,
         permit,
         completion_callback,
+        issue_workflow_store,
         Some(task_id),
         group_permit,
     )
@@ -333,6 +337,7 @@ pub(super) async fn spawn_task_with_worktree_detector<F>(
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
+    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     preregistered_id: Option<TaskId>,
     group_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> TaskId
@@ -618,6 +623,7 @@ where
                 &req,
                 run_project.clone(),
                 server_config.as_ref(),
+                issue_workflow_store.clone(),
                 &mut total_turns_used,
             )
             .await;
@@ -997,6 +1003,7 @@ mod tests {
             None,
             permit,
             None,
+            None,
         )
         .await;
 
@@ -1070,6 +1077,7 @@ mod tests {
             req,
             None,
             permit,
+            None,
             None,
         )
         .await;
@@ -1162,6 +1170,7 @@ mod tests {
             },
             None,
             permit,
+            None,
             None,
             None,
             None,
@@ -1341,6 +1350,7 @@ mod tests {
             None,
             permit,
             None,
+            None,
         )
         .await;
 
@@ -1397,6 +1407,7 @@ mod tests {
             req,
             None,
             permit,
+            None,
             None,
         )
         .await;

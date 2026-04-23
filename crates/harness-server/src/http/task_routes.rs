@@ -153,6 +153,49 @@ async fn check_pr_duplicate(
     Some(existing_id)
 }
 
+async fn track_issue_workflow_enqueue(
+    state: &Arc<AppState>,
+    project_id: &str,
+    req: &task_runner::CreateTaskRequest,
+    task_id: &task_runner::TaskId,
+) {
+    let Some(workflows) = state.core.issue_workflow_store.as_ref() else {
+        return;
+    };
+    if let Some(issue_number) = req.issue {
+        if let Err(e) = workflows
+            .record_issue_scheduled(
+                project_id,
+                req.repo.as_deref(),
+                issue_number,
+                &task_id.0,
+                &req.labels,
+                req.force_execute,
+            )
+            .await
+        {
+            tracing::warn!(
+                issue = issue_number,
+                task_id = %task_id.0,
+                "issue workflow enqueue tracking failed: {e}"
+            );
+        }
+        return;
+    }
+    if let Some(pr_number) = req.pr {
+        if let Err(e) = workflows
+            .record_feedback_task_scheduled(project_id, pr_number, &task_id.0)
+            .await
+        {
+            tracing::warn!(
+                pr = pr_number,
+                task_id = %task_id.0,
+                "issue workflow PR enqueue tracking failed: {e}"
+            );
+        }
+    }
+}
+
 /// Three-tier agent selection: request override > project default > complexity dispatch.
 ///
 /// Tier 1: `req.agent` is `Some` — use the named agent directly (unchanged behaviour).
@@ -315,9 +358,11 @@ pub(crate) async fn enqueue_task_in_domain(
             }
         }
         if !all_deps_done {
+            let workflow_req = req.clone();
             let task_id = task_runner::spawn_task_awaiting_deps(state.core.tasks.clone(), req)
                 .await
                 .map_err(|e| EnqueueTaskError::BadRequest(e.to_string()))?;
+            track_issue_workflow_enqueue(state, &project_id, &workflow_req, &task_id).await;
             return Ok(task_id);
         }
         // All deps satisfied — clear the list so the normal spawn path
@@ -352,6 +397,7 @@ pub(crate) async fn enqueue_task_in_domain(
         agent.name(),
     );
 
+    let workflow_req = req.clone();
     let task_id = task_runner::spawn_task(
         state.core.tasks.clone(),
         agent,
@@ -364,8 +410,11 @@ pub(crate) async fn enqueue_task_in_domain(
         state.concurrency.workspace_mgr.clone(),
         permit,
         state.intake.completion_callback.clone(),
+        state.core.issue_workflow_store.clone(),
     )
     .await;
+
+    track_issue_workflow_enqueue(state, &project_id, &workflow_req, &task_id).await;
 
     Ok(task_id)
 }
@@ -556,6 +605,7 @@ pub(crate) async fn enqueue_task_background_in_domain(
 
     // Register the task immediately so the caller gets an ID without blocking.
     let task_id = task_runner::register_pending_task(state.core.tasks.clone(), &req).await;
+    track_issue_workflow_enqueue(&state, &project_id, &req, &task_id).await;
 
     // Spawn a background tokio task that waits for a concurrency slot then executes.
     // The HTTP handler returns the task_id before this future completes.
@@ -589,6 +639,7 @@ pub(crate) async fn enqueue_task_background_in_domain(
                         state.concurrency.workspace_mgr.clone(),
                         permit,
                         state.intake.completion_callback.clone(),
+                        state.core.issue_workflow_store.clone(),
                         group_permit,
                     )
                     .await;

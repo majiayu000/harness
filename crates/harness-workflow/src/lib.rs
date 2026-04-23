@@ -5,5 +5,7 @@
 
 pub mod checkpoint;
 pub mod circuit_breaker;
+pub mod issue_lifecycle;
 pub mod plan_db;
+pub mod project_lifecycle;
 pub mod task_queue;

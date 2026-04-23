@@ -9,6 +9,9 @@ pub(crate) struct RegistryBundle {
     pub thread_db: crate::thread_db::ThreadDb,
     pub plan_db: crate::plan_db::PlanDb,
     pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
+    pub issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
+    pub project_workflow_store:
+        Option<Arc<harness_workflow::project_lifecycle::ProjectWorkflowStore>>,
     pub project_registry: Arc<crate::project_registry::ProjectRegistry>,
     pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
     pub workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
@@ -73,6 +76,48 @@ pub(crate) async fn build_registry(
         }
         Err(e) => tracing::warn!("plan cache: failed to load plans on startup: {e}"),
     }
+
+    // ── Issue workflow store ──────────────────────────────────────────────────
+    let issue_workflow_store = {
+        let issue_workflows_db_path =
+            harness_core::config::dirs::default_db_path(data_dir, "issue_workflows");
+        match harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url(
+            &issue_workflows_db_path,
+            configured_database_url,
+        )
+        .await
+        {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!(
+                    path = %issue_workflows_db_path.display(),
+                    "issue workflow store init failed, issue lifecycle state will not persist: {e}"
+                );
+                None
+            }
+        }
+    };
+
+    // ── Project workflow store ────────────────────────────────────────────────
+    let project_workflow_store = {
+        let project_workflows_db_path =
+            harness_core::config::dirs::default_db_path(data_dir, "project_workflows");
+        match harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url(
+            &project_workflows_db_path,
+            configured_database_url,
+        )
+        .await
+        {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!(
+                    path = %project_workflows_db_path.display(),
+                    "project workflow store init failed, project lifecycle state will not persist: {e}"
+                );
+                None
+            }
+        }
+    };
 
     // ── Project registry ──────────────────────────────────────────────────────
     let project_registry = crate::project_registry::ProjectRegistry::open_with_database_url(
@@ -206,6 +251,8 @@ pub(crate) async fn build_registry(
         thread_db,
         plan_db,
         plan_cache,
+        issue_workflow_store,
+        project_workflow_store,
         project_registry,
         runtime_state_store,
         workspace_mgr,

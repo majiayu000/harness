@@ -10,6 +10,7 @@ export interface Task {
   error: string | null;
   source: string | null;
   parent_id: string | null;
+  external_id: string | null;
   repo: string | null;
   description: string | null;
   created_at: string | null;
@@ -17,4 +18,13 @@ export interface Task {
   depends_on: string[];
   subtask_ids: string[];
   project: string | null;
+  workflow?: WorkflowSummary | null;
+}
+
+export interface WorkflowSummary {
+  state: string;
+  issue_number?: number | null;
+  pr_number?: number | null;
+  force_execute?: boolean;
+  plan_concern?: string | null;
 }

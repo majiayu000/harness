@@ -270,6 +270,7 @@ impl TaskSummaryRow {
             depends_on,
             subtask_ids: Vec::new(),
             project: self.project,
+            workflow: None,
         })
     }
 }

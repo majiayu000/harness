@@ -330,6 +330,7 @@ pub async fn gc_adopt(
                                 state.concurrency.workspace_mgr.clone(),
                                 permit,
                                 None,
+                                state.core.issue_workflow_store.clone(),
                             )
                             .await;
                             Ok(Some(tid.0))

@@ -316,6 +316,7 @@ mod tests {
             Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             None,
             None,
+            None,
             vec![],
         );
         Ok(AppState {
@@ -329,6 +330,8 @@ mod tests {
                 thread_db: Some(thread_db),
                 plan_db: None,
                 plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+                issue_workflow_store: None,
+                project_workflow_store: None,
                 project_registry: None,
                 runtime_state_store: None,
                 q_values: None,

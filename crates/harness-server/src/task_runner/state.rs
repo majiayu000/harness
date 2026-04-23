@@ -116,6 +116,9 @@ pub struct TaskSummary {
     /// Resolved project root path. Persisted to the database for observability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Issue workflow state summary, when this task belongs to an issue workflow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<harness_workflow::issue_lifecycle::IssueWorkflowInstance>,
 }
 
 /// Lightweight recent-failure row used by the operator snapshot.
@@ -179,6 +182,7 @@ impl TaskState {
                 .project_root
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            workflow: None,
         }
     }
 }
