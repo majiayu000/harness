@@ -666,7 +666,7 @@ impl TaskDb {
                  WHERE status IN ('implementing', 'review_generating', 'review_waiting', \
                                   'planner_generating', 'planner_waiting', 'agent_review', \
                                   'waiting', 'reviewing') \
-                 AND (external_id IS NOT NULL OR task_kind IN ('review', 'planner')) \
+                 AND external_id IS NOT NULL \
                  AND updated_at < $1 AND project = $2 \
                  ORDER BY updated_at ASC LIMIT 100"
             )
@@ -676,7 +676,7 @@ impl TaskDb {
                  WHERE status IN ('implementing', 'review_generating', 'review_waiting', \
                                   'planner_generating', 'planner_waiting', 'agent_review', \
                                   'waiting', 'reviewing') \
-                 AND (external_id IS NOT NULL OR task_kind IN ('review', 'planner')) \
+                 AND external_id IS NOT NULL \
                  AND updated_at < $1 \
                  ORDER BY updated_at ASC LIMIT 100"
             )

@@ -491,6 +491,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn system_review_tasks_are_excluded_from_stalled_scan() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
+        let mut task = stalled_task("t1", "issue:1", "/proj");
+        task.task_kind = crate::task_runner::TaskKind::Review;
+        task.status = TaskStatus::ReviewWaiting;
+        task.external_id = None;
+        db.insert(&task).await?;
+        sqlx::query("UPDATE tasks SET updated_at = NOW() - INTERVAL '120 minutes' WHERE id = 't1'")
+            .execute(db.pool_for_test())
+            .await?;
+
+        let results = db
+            .list_stalled_tasks(Duration::from_secs(60 * 60), None)
+            .await?;
+        assert!(results.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn project_filter_scopes_results() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let db = TaskDb::open(&tmp.path().join("tasks.db")).await?;
