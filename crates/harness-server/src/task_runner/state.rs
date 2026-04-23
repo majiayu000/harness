@@ -80,7 +80,8 @@ pub struct TaskState {
     #[serde(skip)]
     pub request_settings: Option<PersistedRequestSettings>,
     /// Restart-safe prompt snapshot for trusted system-generated prompt tasks.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Persisted internally for recovery only; never expose it via the public task API.
+    #[serde(skip)]
     pub system_input: Option<SystemTaskInput>,
 }
 

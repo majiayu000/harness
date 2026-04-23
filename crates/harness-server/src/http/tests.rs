@@ -923,6 +923,51 @@ async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn get_task_hides_internal_system_input_metadata() -> anyhow::Result<()> {
+    use axum::response::IntoResponse;
+
+    let dir = tempfile::tempdir()?;
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Review,
+        status: task_runner::TaskStatus::ReviewWaiting,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("periodic_review".to_string()),
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: None,
+        repo: Some("owner/repo".to_string()),
+        description: Some("periodic review".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Review,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        system_input: Some(task_runner::SystemTaskInput::PeriodicReview {
+            prompt: "review prompt".to_string(),
+        }),
+    };
+    let task_id = task.id.to_string();
+
+    let response = axum::Json(task).into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let task_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(task_json["id"], task_id);
+    assert!(task_json.get("system_input").is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn intake_status_returns_three_channels() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
