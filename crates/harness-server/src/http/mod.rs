@@ -143,6 +143,9 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // These had PRs when the server crashed and need their review loop re-started.
     background::spawn_pr_recovery(&state);
 
+    // Re-dispatch recovered review/planner tasks that have restart-safe input bundles.
+    background::spawn_system_task_recovery(&state);
+
     // Re-dispatch tasks recovered from plan/triage checkpoints but without a PR.
     background::spawn_checkpoint_recovery(&state).await;
 

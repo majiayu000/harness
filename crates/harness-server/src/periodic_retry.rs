@@ -386,6 +386,7 @@ mod tests {
     fn stalled_task(id: &str, external_id: &str, project: &str) -> TaskState {
         TaskState {
             id: TaskId(id.to_string()),
+            task_kind: crate::task_runner::TaskKind::Issue,
             status: TaskStatus::Implementing,
             turn: 1,
             pr_url: None,
@@ -407,6 +408,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             request_settings: None,
+            system_input: None,
         }
     }
 

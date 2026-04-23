@@ -107,6 +107,10 @@ impl TaskStore {
             "pending",
             "awaiting_deps",
             "implementing",
+            "review_generating",
+            "review_waiting",
+            "planner_generating",
+            "planner_waiting",
             "agent_review",
             "waiting",
             "reviewing",
@@ -1344,6 +1348,42 @@ mod tests {
                 false,
             ),
             (
+                TaskStatus::ReviewGenerating,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                TaskStatus::ReviewWaiting,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                TaskStatus::PlannerGenerating,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                TaskStatus::PlannerWaiting,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
                 TaskStatus::AgentReview,
                 false,
                 true,
@@ -1394,7 +1434,16 @@ mod tests {
         );
         assert_eq!(
             TaskStatus::resumable_statuses(),
-            &["implementing", "agent_review", "waiting", "reviewing"]
+            &[
+                "implementing",
+                "review_generating",
+                "review_waiting",
+                "planner_generating",
+                "planner_waiting",
+                "agent_review",
+                "waiting",
+                "reviewing",
+            ]
         );
     }
 

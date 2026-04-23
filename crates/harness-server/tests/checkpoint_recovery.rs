@@ -8,11 +8,12 @@
 
 use harness_core::types::TaskId as CoreTaskId;
 use harness_server::task_db::TaskDb;
-use harness_server::task_runner::{TaskPhase, TaskState, TaskStatus, TaskStore};
+use harness_server::task_runner::{TaskKind, TaskPhase, TaskState, TaskStatus, TaskStore};
 
 fn make_task(id: &str, status: TaskStatus) -> TaskState {
     TaskState {
         id: CoreTaskId(id.to_string()),
+        task_kind: TaskKind::Prompt,
         status,
         turn: 0,
         pr_url: None,
@@ -34,6 +35,7 @@ fn make_task(id: &str, status: TaskStatus) -> TaskState {
         plan_output: None,
         repo: None,
         request_settings: None,
+        system_input: None,
     }
 }
 
@@ -259,6 +261,85 @@ async fn restart_with_triage_checkpoint_resumes_task() -> anyhow::Result<()> {
         task.error
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_with_review_system_input_resumes_task() -> anyhow::Result<()> {
+    let store = setup_store(|db| async move {
+        let mut task = make_task("t-review-system", TaskStatus::ReviewGenerating);
+        task.task_kind = TaskKind::Review;
+        task.system_input = Some(
+            harness_server::task_runner::SystemTaskInput::PeriodicReview {
+                prompt: "review prompt".to_string(),
+            },
+        );
+        db.insert(&task).await?;
+        Ok(())
+    })
+    .await?;
+
+    let task = store
+        .get(&CoreTaskId("t-review-system".into()))
+        .expect("task must exist");
+    assert!(
+        matches!(task.status, TaskStatus::ReviewWaiting),
+        "review task with persisted input should resume to review_waiting, got {:?}",
+        task.status
+    );
+    assert_eq!(task.task_kind, TaskKind::Review);
+    assert!(task.system_input.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_with_planner_system_input_resumes_task() -> anyhow::Result<()> {
+    let store = setup_store(|db| async move {
+        let mut task = make_task("t-planner-system", TaskStatus::PlannerGenerating);
+        task.task_kind = TaskKind::Planner;
+        task.system_input = Some(
+            harness_server::task_runner::SystemTaskInput::SprintPlanner {
+                prompt: "planner prompt".to_string(),
+            },
+        );
+        db.insert(&task).await?;
+        Ok(())
+    })
+    .await?;
+
+    let task = store
+        .get(&CoreTaskId("t-planner-system".into()))
+        .expect("task must exist");
+    assert!(
+        matches!(task.status, TaskStatus::PlannerWaiting),
+        "planner task with persisted input should resume to planner_waiting, got {:?}",
+        task.status
+    );
+    assert_eq!(task.task_kind, TaskKind::Planner);
+    assert!(task.system_input.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_review_task_without_system_input_fails() -> anyhow::Result<()> {
+    let store = setup_store(|db| async move {
+        let mut task = make_task("t-review-missing-input", TaskStatus::ReviewGenerating);
+        task.task_kind = TaskKind::Review;
+        db.insert(&task).await?;
+        Ok(())
+    })
+    .await?;
+
+    let task = store
+        .get_with_db_fallback(&CoreTaskId("t-review-missing-input".into()))
+        .await?
+        .expect("task should be fetchable from DB");
+    assert!(
+        matches!(task.status, TaskStatus::Failed),
+        "review task without persisted input should fail on restart, got {:?}",
+        task.status
+    );
+    assert!(task.error.is_some());
     Ok(())
 }
 

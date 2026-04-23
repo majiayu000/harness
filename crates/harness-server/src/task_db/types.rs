@@ -1,4 +1,4 @@
-use crate::task_runner::{TaskState, TaskStatus};
+use crate::task_runner::{SystemTaskInput, TaskKind, TaskState, TaskStatus};
 use chrono::{DateTime, Utc};
 use harness_core::error::TaskDbDecodeError;
 use serde::{Deserialize, Serialize};
@@ -63,9 +63,14 @@ pub struct RecoveryResult {
 #[derive(sqlx::FromRow)]
 pub(super) struct RecoveryRow {
     pub(super) id: String,
+    pub(super) task_kind: String,
+    pub(super) source: Option<String>,
+    pub(super) external_id: Option<String>,
+    pub(super) description: Option<String>,
     pub(super) status: String,
     pub(super) turn: i64,
     pub(super) task_pr_url: Option<String>,
+    pub(super) system_input: Option<String>,
     pub(super) triage_output: Option<String>,
     pub(super) plan_output: Option<String>,
     pub(super) ck_pr_url: Option<String>,
@@ -77,11 +82,12 @@ pub(super) struct RecoveryRow {
 /// When adding a field to `TaskRow`, add the column here once and all queries
 /// pick it up automatically.  The `task_row_columns_match_struct` test below
 /// will fail if this list drifts from the struct definition.
-pub(super) const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, updated_at, repo, depends_on, project, priority, phase, description, request_settings";
+pub(super) const TASK_ROW_COLUMNS: &str = "id, task_kind, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, updated_at, repo, depends_on, project, priority, phase, description, request_settings, system_input";
 
 #[derive(sqlx::FromRow)]
 pub(super) struct TaskRow {
     pub(super) id: String,
+    pub(super) task_kind: String,
     pub(super) status: String,
     pub(super) turn: i64,
     pub(super) pr_url: Option<String>,
@@ -99,6 +105,7 @@ pub(super) struct TaskRow {
     pub(super) phase: String,
     pub(super) description: Option<String>,
     pub(super) request_settings: Option<String>,
+    pub(super) system_input: Option<String>,
 }
 
 /// Combined row for the pending-tasks-with-checkpoint JOIN query.
@@ -109,6 +116,7 @@ pub(super) struct TaskRow {
 pub(super) struct PendingCheckpointRow {
     // Task columns
     pub(super) id: String,
+    pub(super) task_kind: String,
     pub(super) status: String,
     pub(super) turn: i64,
     pub(super) pr_url: Option<String>,
@@ -126,6 +134,7 @@ pub(super) struct PendingCheckpointRow {
     pub(super) phase: String,
     pub(super) description: Option<String>,
     pub(super) request_settings: Option<String>,
+    pub(super) system_input: Option<String>,
     // Checkpoint columns (aliased)
     pub(super) triage_output: Option<String>,
     pub(super) plan_output: Option<String>,
@@ -138,6 +147,7 @@ pub(super) struct PendingCheckpointRow {
 #[derive(sqlx::FromRow)]
 pub(super) struct TaskSummaryRow {
     pub(super) id: String,
+    pub(super) task_kind: String,
     pub(super) status: String,
     pub(super) turn: i64,
     pub(super) pr_url: Option<String>,
@@ -167,6 +177,7 @@ impl TaskRow {
     pub(super) fn try_into_task_state(self) -> anyhow::Result<TaskState> {
         let Self {
             id,
+            task_kind,
             status,
             turn,
             pr_url,
@@ -184,12 +195,22 @@ impl TaskRow {
             phase,
             description,
             request_settings,
+            system_input,
         } = self;
 
         let decoded_request_settings: Option<crate::task_runner::PersistedRequestSettings> =
             request_settings
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
+        let decoded_system_input: Option<SystemTaskInput> = system_input
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        let decoded_task_kind = TaskKind::from_persisted(
+            Some(&task_kind),
+            source.as_deref(),
+            external_id.as_deref(),
+            description.as_deref(),
+        )?;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
             TaskDbDecodeError::RoundsDeserialize {
@@ -213,6 +234,7 @@ impl TaskRow {
 
         Ok(TaskState {
             id: harness_core::types::TaskId(id),
+            task_kind: decoded_task_kind,
             status: status.parse::<TaskStatus>()?,
             turn: turn as u32,
             pr_url,
@@ -234,6 +256,7 @@ impl TaskRow {
             plan_output: None,
             repo,
             request_settings: decoded_request_settings,
+            system_input: decoded_system_input,
         })
     }
 }
@@ -254,8 +277,15 @@ impl TaskSummaryRow {
                     source,
                 },
             )?;
+        let decoded_task_kind = TaskKind::from_persisted(
+            Some(&self.task_kind),
+            self.source.as_deref(),
+            self.external_id.as_deref(),
+            self.description.as_deref(),
+        )?;
         Ok(crate::task_runner::TaskSummary {
             id: TaskId(self.id),
+            task_kind: decoded_task_kind,
             status: self.status.parse::<crate::task_runner::TaskStatus>()?,
             turn: self.turn as u32,
             pr_url: self.pr_url,

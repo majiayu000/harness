@@ -13,6 +13,8 @@ use harness_core::db::Migration;
 /// v14 – add description column for task observability after restart.
 /// v15 – add (status, updated_at DESC) index for project-agnostic terminal queries.
 /// v18 – add version column for optimistic locking.
+/// v19 – add task_kind column for first-class task lifecycle dispatch.
+/// v20 – add system_input column for restart-safe trusted system prompt bundles.
 pub(super) static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -132,5 +134,15 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
         version: 18,
         description: "add version column for optimistic locking",
         sql: "ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
+    },
+    Migration {
+        version: 19,
+        description: "add task_kind column for explicit task lifecycle dispatch",
+        sql: "ALTER TABLE tasks ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'legacy'",
+    },
+    Migration {
+        version: 20,
+        description: "add system_input column for restart-safe system prompt bundles",
+        sql: "ALTER TABLE tasks ADD COLUMN system_input TEXT",
     },
 ];

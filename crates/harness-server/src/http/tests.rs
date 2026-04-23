@@ -1153,6 +1153,89 @@ async fn dashboard_no_auth_configured_remains_public() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = Router::new()
+        .route("/tasks", get(list_tasks))
+        .with_state(state.clone());
+
+    let review_task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Review,
+        status: task_runner::TaskStatus::ReviewWaiting,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("periodic_review".to_string()),
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: None,
+        repo: Some("owner/repo".to_string()),
+        description: Some("periodic review".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Review,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        system_input: Some(task_runner::SystemTaskInput::PeriodicReview {
+            prompt: "review prompt".to_string(),
+        }),
+    };
+    let planner_task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Planner,
+        status: task_runner::TaskStatus::PlannerGenerating,
+        turn: 1,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("sprint_planner".to_string()),
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: None,
+        repo: Some("owner/repo".to_string()),
+        description: Some("sprint planner".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Plan,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        system_input: Some(task_runner::SystemTaskInput::SprintPlanner {
+            prompt: "planner prompt".to_string(),
+        }),
+    };
+    state.core.tasks.insert(&review_task).await;
+    state.core.tasks.insert(&planner_task).await;
+
+    let response = app
+        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let tasks: serde_json::Value = serde_json::from_slice(&body)?;
+    let tasks = tasks.as_array().expect("tasks array");
+    assert!(tasks
+        .iter()
+        .any(|task| { task["task_kind"] == "review" && task["status"] == "review_waiting" }));
+    assert!(tasks
+        .iter()
+        .any(|task| { task["task_kind"] == "planner" && task["status"] == "planner_generating" }));
+    Ok(())
+}
+
+#[tokio::test]
 async fn feishu_webhook_returns_service_unavailable_when_token_missing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state_with_feishu(dir.path(), None).await?;
@@ -1789,6 +1872,7 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
 
     let task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Pr,
         status: task_runner::TaskStatus::Pending,
         turn: 0,
         pr_url: Some("not-a-valid-pr-url".to_string()),
@@ -1810,6 +1894,7 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        system_input: None,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -1857,6 +1942,7 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
 
     let task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Prompt,
         status: task_runner::TaskStatus::Pending,
         turn: 0,
         pr_url: None,
@@ -1878,6 +1964,7 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        system_input: None,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;

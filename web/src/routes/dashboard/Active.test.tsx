@@ -15,9 +15,10 @@ import { useTasks, useDashboard } from "@/lib/queries";
 const mockUseTasks = useTasks as ReturnType<typeof vi.fn>;
 const mockUseDashboard = useDashboard as ReturnType<typeof vi.fn>;
 
-function makeTask(id: string, project: string | null, status = "running"): Task {
+function makeTask(id: string, project: string | null, status = "running", task_kind = "issue"): Task {
   return {
     id,
+    task_kind,
     status,
     turn: 1,
     pr_url: null,
@@ -108,5 +109,23 @@ describe("<Active>", () => {
     expect(columnCount("Feedback")).toBe("1");
     expect(columnCount("Implementing")).toBe("0");
     expect(columnCount("Pending")).toBe("0");
+  });
+
+  it("groups planner and review lifecycle statuses outside implementing", () => {
+    mockUseTasks.mockReturnValue({
+      data: [
+        makeTask("planner-task", "harness", "planner_waiting", "planner"),
+        makeTask("review-task", "harness", "review_generating", "review"),
+        makeTask("impl-task", "harness", "implementing", "issue"),
+      ],
+      isLoading: false,
+      isError: false,
+    });
+    wrap(<Active />);
+    expect(screen.getByText("Planning")).toBeInTheDocument();
+    expect(screen.getByText("Review")).toBeInTheDocument();
+    expect(screen.getByText("planner-task")).toBeInTheDocument();
+    expect(screen.getByText("review-task")).toBeInTheDocument();
+    expect(screen.getByText("impl-task")).toBeInTheDocument();
   });
 });

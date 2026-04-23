@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use super::types::TaskId;
+use super::types::{TaskId, TaskKind};
 
 /// Maximum allowed scheduling priority. Values above this are rejected at the
 /// API boundary to prevent scheduler-level starvation of normal-priority tasks.
@@ -78,6 +78,34 @@ pub struct CreateTaskRequest {
     /// Higher values are served first when multiple tasks are waiting for a slot.
     #[serde(default)]
     pub priority: u8,
+    /// Restart-safe metadata for trusted system-generated prompt tasks.
+    /// Never accepted from or exposed to external HTTP callers.
+    #[serde(skip)]
+    pub system_input: Option<SystemTaskInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SystemTaskInput {
+    PeriodicReview { prompt: String },
+    SprintPlanner { prompt: String },
+}
+
+impl SystemTaskInput {
+    pub fn from_request(task_kind: TaskKind, req: &CreateTaskRequest) -> Option<Self> {
+        let prompt = req.prompt.as_ref()?.clone();
+        match task_kind {
+            TaskKind::Review => Some(Self::PeriodicReview { prompt }),
+            TaskKind::Planner => Some(Self::SprintPlanner { prompt }),
+            TaskKind::Issue | TaskKind::Pr | TaskKind::Prompt => None,
+        }
+    }
+
+    pub fn prompt(&self) -> &str {
+        match self {
+            Self::PeriodicReview { prompt } | Self::SprintPlanner { prompt } => prompt,
+        }
+    }
 }
 
 /// Execution limits that survive a server restart.
@@ -211,11 +239,13 @@ impl Default for CreateTaskRequest {
             parent_task_id: None,
             depends_on: Vec::new(),
             priority: 0,
+            system_input: None,
         }
     }
 }
 
 pub(super) fn summarize_request_description(req: &CreateTaskRequest) -> Option<String> {
+    let task_kind = TaskKind::classify(req.source.as_deref(), req.issue, req.pr);
     // Only persist structured safe labels — never raw prompt text, which may contain
     // credentials or customer data.
     if let Some(n) = req.issue {
@@ -224,12 +254,12 @@ pub(super) fn summarize_request_description(req: &CreateTaskRequest) -> Option<S
     if let Some(n) = req.pr {
         return Some(format!("PR #{n}"));
     }
-    // Prompt-only tasks: store a generic label so that:
-    //   (a) sibling-awareness can include them (prevents parallel agents stomping the same files),
-    //   (b) operators can identify crashed tasks in the DB/dashboard after a restart.
-    // The prompt itself is deliberately not stored.
     if req.prompt.is_some() {
-        return Some("prompt task".to_string());
+        return Some(match task_kind {
+            TaskKind::Review => "periodic review".to_string(),
+            TaskKind::Planner => "sprint planner".to_string(),
+            TaskKind::Issue | TaskKind::Pr | TaskKind::Prompt => "prompt task".to_string(),
+        });
     }
     None
 }

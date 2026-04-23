@@ -3,6 +3,50 @@ use std::sync::Arc;
 use super::{state::AppState, task_routes};
 use crate::task_runner;
 
+fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
+    task.external_id
+        .as_deref()
+        .map(|eid| {
+            if let Some(n) = eid.strip_prefix("issue:") {
+                (n.parse::<u64>().ok(), None)
+            } else if let Some(n) = eid.strip_prefix("pr:") {
+                (None, n.parse::<u64>().ok())
+            } else {
+                (None, None)
+            }
+        })
+        .unwrap_or((None, None))
+}
+
+fn build_recovered_request(
+    task: &task_runner::TaskState,
+    canonical: std::path::PathBuf,
+    issue: Option<u64>,
+    pr: Option<u64>,
+) -> task_runner::CreateTaskRequest {
+    let mut req = task_runner::CreateTaskRequest {
+        issue,
+        pr,
+        project: Some(canonical),
+        repo: task.repo.clone(),
+        source: task.source.clone(),
+        external_id: task.external_id.clone(),
+        parent_task_id: task.parent_id.clone(),
+        priority: task.priority,
+        system_input: task.system_input.clone(),
+        ..Default::default()
+    };
+    if let Some(ref settings) = task.request_settings {
+        settings.apply_to_req(&mut req);
+    }
+    if req.prompt.is_none() {
+        if let Some(system_input) = req.system_input.as_ref() {
+            req.prompt = Some(system_input.prompt().to_string());
+        }
+    }
+    req
+}
+
 /// Spawn background watcher for AwaitingDeps tasks.
 /// Uses Weak<AppState> to avoid a reference cycle; the loop exits when AppState is dropped.
 pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
@@ -94,36 +138,8 @@ pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
                     };
                     let project_id = canonical.to_string_lossy().into_owned();
 
-                    // Reconstruct the CreateTaskRequest from persisted task fields.
-                    // Parse issue/pr numbers from the canonical external_id (e.g. "issue:42").
-                    let (issue, pr) = task
-                        .external_id
-                        .as_deref()
-                        .map(|eid| {
-                            if let Some(n) = eid.strip_prefix("issue:") {
-                                (n.parse::<u64>().ok(), None)
-                            } else if let Some(n) = eid.strip_prefix("pr:") {
-                                (None, n.parse::<u64>().ok())
-                            } else {
-                                (None, None)
-                            }
-                        })
-                        .unwrap_or((None, None));
-                    let mut req = task_runner::CreateTaskRequest {
-                        issue,
-                        pr,
-                        project: Some(canonical),
-                        repo: task.repo.clone(),
-                        source: task.source.clone(),
-                        external_id: task.external_id.clone(),
-                        parent_task_id: task.parent_id.clone(),
-                        priority: task.priority,
-                        ..Default::default()
-                    };
-                    // Restore execution limits and prompt from persisted settings.
-                    if let Some(ref settings) = task.request_settings {
-                        settings.apply_to_req(&mut req);
-                    }
+                    let (issue, pr) = parse_issue_pr(&task);
+                    let req = build_recovered_request(&task, canonical, issue, pr);
 
                     // Guard: prompt-only tasks store their prompt in memory only
                     // (#[serde(skip)]). After a server restart the prompt field is
@@ -131,9 +147,11 @@ pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
                     // call implement_from_prompt("") — a silent mis-execution.
                     // Fail the task explicitly so the caller can re-submit.
                     if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
-                        let reason = "dep-watcher: prompt-only task has no persisted \
-                            prompt after server restart; please re-submit the task"
-                            .to_string();
+                        let reason = format!(
+                            "dep-watcher: {} task has no restart-safe input after server restart; \
+                             please re-submit the task",
+                            task.task_kind.as_ref()
+                        );
                         tracing::error!(task_id = ?task.id, "{reason}");
                         if let Err(pe) =
                             task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
@@ -408,7 +426,11 @@ pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
         .tasks
         .list_all()
         .into_iter()
-        .filter(|t| matches!(t.status, task_runner::TaskStatus::Pending) && t.pr_url.is_some())
+        .filter(|t| {
+            matches!(t.status, task_runner::TaskStatus::Pending)
+                && t.task_kind.requires_pr_url()
+                && t.pr_url.is_some()
+        })
         .collect();
     if !recovered.is_empty() {
         tracing::info!(
@@ -555,19 +577,7 @@ pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
                     }
                 };
 
-                let mut req = task_runner::CreateTaskRequest {
-                    pr: Some(pr_num),
-                    project: Some(canonical),
-                    repo: task.repo.clone(),
-                    source: task.source.clone(),
-                    external_id: task.external_id.clone(),
-                    ..Default::default()
-                };
-                // Restore persisted execution limits so the recovered task resumes
-                // with the same budget / timeout guardrails as originally requested.
-                if let Some(ref settings) = task.request_settings {
-                    settings.apply_to_req(&mut req);
-                }
+                let req = build_recovered_request(&task, canonical, None, Some(pr_num));
                 // Use the three-tier select_agent() so that an explicit agent
                 // pin stored in request_settings (Tier 1) and project-level
                 // defaults (Tier 2a) are honoured, not bypassed by a raw
@@ -631,6 +641,184 @@ pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
     }
 }
 
+/// Re-dispatch review/planner tasks that were recovered into their kind-specific
+/// waiting states after a restart.
+pub(super) fn spawn_system_task_recovery(state: &Arc<AppState>) {
+    let recovered: Vec<_> = state
+        .core
+        .tasks
+        .list_all()
+        .into_iter()
+        .filter(|task| {
+            matches!(
+                task.status,
+                task_runner::TaskStatus::ReviewWaiting | task_runner::TaskStatus::PlannerWaiting
+            )
+        })
+        .collect();
+    if !recovered.is_empty() {
+        tracing::info!(
+            count = recovered.len(),
+            "startup: re-dispatching recovered review/planner task(s)"
+        );
+        for task in recovered {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let project_path = task
+                    .project_root
+                    .clone()
+                    .or_else(|| task.repo.as_deref().map(std::path::PathBuf::from));
+                let canonical = match task_runner::resolve_canonical_project(project_path).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let reason =
+                            format!("startup recovery: failed to resolve project path: {e}");
+                        tracing::error!(task_id = ?task.id, "{reason}");
+                        if let Err(pe) =
+                            task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
+                                s.status = task_runner::TaskStatus::Failed;
+                                s.error = Some(reason);
+                            })
+                            .await
+                        {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to persist failed status: {pe}; \
+                                 skipping completion callback to avoid state split"
+                            );
+                            return;
+                        }
+                        if let Some(cb) = &state.intake.completion_callback {
+                            if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                cb(final_state).await;
+                            }
+                        }
+                        return;
+                    }
+                };
+                let project_id = canonical.to_string_lossy().into_owned();
+
+                let permit = match state
+                    .concurrency
+                    .task_queue
+                    .acquire(&project_id, task.priority)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let reason =
+                            format!("startup recovery: failed to acquire concurrency permit: {e}");
+                        tracing::error!(task_id = ?task.id, "{reason}");
+                        if let Err(pe) =
+                            task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
+                                s.status = task_runner::TaskStatus::Failed;
+                                s.error = Some(reason);
+                            })
+                            .await
+                        {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to persist failed status: {pe}; \
+                                 skipping completion callback to avoid state split"
+                            );
+                            return;
+                        }
+                        if let Some(cb) = &state.intake.completion_callback {
+                            if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                cb(final_state).await;
+                            }
+                        }
+                        return;
+                    }
+                };
+
+                let req = build_recovered_request(&task, canonical, None, None);
+                if req.prompt.is_none() {
+                    let reason = format!(
+                        "startup recovery: {} task has no restart-safe input metadata",
+                        task.task_kind.as_ref()
+                    );
+                    tracing::error!(task_id = ?task.id, "{reason}");
+                    if let Err(pe) =
+                        task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
+                            s.status = task_runner::TaskStatus::Failed;
+                            s.error = Some(reason);
+                        })
+                        .await
+                    {
+                        tracing::error!(
+                            task_id = ?task.id,
+                            "startup recovery: failed to persist failed status: {pe}; \
+                             skipping completion callback to avoid state split"
+                        );
+                        return;
+                    }
+                    if let Some(cb) = &state.intake.completion_callback {
+                        if let Some(final_state) = state.core.tasks.get(&task.id) {
+                            cb(final_state).await;
+                        }
+                    }
+                    return;
+                }
+
+                let agent = match task_routes::select_agent(
+                    &req,
+                    &state.core.server.agent_registry,
+                    None,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let reason = format!("startup recovery: failed to select agent: {e}");
+                        tracing::error!(task_id = ?task.id, "{reason}");
+                        if let Err(pe) =
+                            task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
+                                s.status = task_runner::TaskStatus::Failed;
+                                s.error = Some(reason);
+                            })
+                            .await
+                        {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to persist failed status: {pe}; \
+                                 skipping completion callback to avoid state split"
+                            );
+                            return;
+                        }
+                        if let Some(cb) = &state.intake.completion_callback {
+                            if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                cb(final_state).await;
+                            }
+                        }
+                        return;
+                    }
+                };
+                let (reviewer, _) = super::resolve_reviewer(
+                    &state.core.server.agent_registry,
+                    &state.core.server.config.agents.review,
+                    agent.name(),
+                );
+                state.core.tasks.register_task_stream(&task.id);
+                task_runner::spawn_preregistered_task(
+                    task.id,
+                    state.core.tasks.clone(),
+                    agent,
+                    reviewer,
+                    Arc::new(state.core.server.config.clone()),
+                    state.engines.skills.clone(),
+                    state.observability.events.clone(),
+                    state.interceptors.clone(),
+                    req,
+                    state.concurrency.workspace_mgr.clone(),
+                    permit,
+                    state.intake.completion_callback.clone(),
+                    None,
+                )
+                .await;
+            });
+        }
+    }
+}
+
 /// Re-dispatch tasks recovered from plan/triage checkpoints but without a PR.
 /// Source A (spawn_pr_recovery) handles tasks with `pr_url` set. Source B (this
 /// function) picks up remaining pending tasks that have a plan or triage
@@ -656,32 +844,29 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
         for (task, _checkpoint) in checkpoint_tasks {
             let state = state.clone();
             tokio::spawn(async move {
-                // Reconstruct request type: parse issue number from the
-                // authoritative external_id ("issue:<n>") first, then fall
-                // back to the human-readable description for older rows.
-                // PR tasks are handled by Source A and never appear here.
-                let issue_num = task
-                    .external_id
-                    .as_deref()
-                    .and_then(|eid| eid.strip_prefix("issue:"))
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .or_else(|| {
-                        task.description
-                            .as_deref()
-                            .and_then(|d| d.strip_prefix("issue #"))
-                            .and_then(|s| s.split_whitespace().next())
-                            .and_then(|s| s.parse::<u64>().ok())
-                    });
+                // Reconstruct request type using the persisted task kind.
+                let issue_num = match task.task_kind {
+                    task_runner::TaskKind::Issue => task
+                        .external_id
+                        .as_deref()
+                        .and_then(|eid| eid.strip_prefix("issue:"))
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .or_else(|| {
+                            task.description
+                                .as_deref()
+                                .and_then(|d| d.strip_prefix("issue #"))
+                                .and_then(|s| s.split_whitespace().next())
+                                .and_then(|s| s.parse::<u64>().ok())
+                        }),
+                    task_runner::TaskKind::Prompt => None,
+                    task_runner::TaskKind::Pr
+                    | task_runner::TaskKind::Review
+                    | task_runner::TaskKind::Planner => None,
+                };
 
                 if issue_num.is_none() {
-                    // Prompt tasks store the placeholder "prompt task" in description
-                    // by design — the original prompt text is never persisted for
-                    // privacy.  Re-dispatching with that placeholder would execute
-                    // against the wrong prompt, so mark the task failed instead to
-                    // prevent the same broken recovery on every subsequent restart.
-                    let reason = if task.description.as_deref() == Some("prompt task") {
-                        "prompt task cannot be recovered after restart: \
-                         original prompt text is not persisted"
+                    let reason = if matches!(task.task_kind, task_runner::TaskKind::Prompt) {
+                        "prompt task cannot be recovered after restart: original prompt text is not persisted"
                     } else {
                         "checkpoint task has no parseable issue number — skipping"
                     };
@@ -795,23 +980,8 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                     }
                 };
 
-                // issue_num is always Some here — the None branch returned above.
                 let Some(issue) = issue_num else { return };
-                let mut req = task_runner::CreateTaskRequest {
-                    issue: Some(issue),
-                    project: Some(canonical),
-                    repo: task.repo.clone(),
-                    source: task.source.clone(),
-                    external_id: task.external_id.clone(),
-                    priority: task.priority,
-                    ..Default::default()
-                };
-                // Restore persisted execution limits and any additional prompt
-                // context so the recovered task resumes with the same settings
-                // and caller-supplied context as originally requested.
-                if let Some(ref settings) = task.request_settings {
-                    settings.apply_to_req(&mut req);
-                }
+                let req = build_recovered_request(&task, canonical, Some(issue), None);
 
                 // Use the three-tier select_agent() so that an explicit agent
                 // pin stored in request_settings (Tier 1) and project-level

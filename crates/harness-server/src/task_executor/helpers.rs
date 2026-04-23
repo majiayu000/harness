@@ -559,7 +559,7 @@ pub(crate) async fn run_agent_streaming(
     // and must not be written at rest (per the privacy contract in task_runner.rs).
     let is_prompt_only = store
         .get(task_id)
-        .map(|s| s.description.as_deref() == Some("prompt task"))
+        .map(|s| matches!(s.task_kind, crate::task_runner::TaskKind::Prompt))
         .unwrap_or(false);
     let phase_str = req
         .execution_phase

@@ -11,24 +11,30 @@ impl TaskDb {
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let status = state.status.as_ref();
+        let task_kind = state.task_kind.as_ref();
         let phase_json = serde_json::to_string(&state.phase)?;
         let settings_json = state
             .request_settings
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok());
+        let system_input_json = state
+            .system_input
+            .as_ref()
+            .and_then(|input| serde_json::to_string(input).ok());
         let created_at_dt: Option<DateTime<Utc>> = state
             .created_at
             .as_deref()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
         sqlx::query(
-            "INSERT INTO tasks (id, status, turn, pr_url, rounds, error, source, external_id, \
-             parent_id, created_at, repo, depends_on, project, priority, phase, description, \
-             request_settings) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                     COALESCE($10, CURRENT_TIMESTAMP), $11, $12, $13, $14, $15, $16, $17)",
+            "INSERT INTO tasks (id, task_kind, status, turn, pr_url, rounds, error, source, \
+             external_id, parent_id, created_at, repo, depends_on, project, priority, phase, \
+             description, request_settings, system_input) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                     COALESCE($11, CURRENT_TIMESTAMP), $12, $13, $14, $15, $16, $17, $18, $19)",
         )
         .bind(&state.id.0)
+        .bind(task_kind)
         .bind(status)
         .bind(state.turn as i64)
         .bind(&state.pr_url)
@@ -50,6 +56,7 @@ impl TaskDb {
         .bind(&phase_json)
         .bind(state.description.as_deref())
         .bind(settings_json.as_deref())
+        .bind(system_input_json.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -60,17 +67,23 @@ impl TaskDb {
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let phase_json = serde_json::to_string(&state.phase)?;
         let status = state.status.as_ref();
+        let task_kind = state.task_kind.as_ref();
         let settings_json = state
             .request_settings
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok());
+        let system_input_json = state
+            .system_input
+            .as_ref()
+            .and_then(|input| serde_json::to_string(input).ok());
         sqlx::query(
-            "UPDATE tasks SET status = $1, turn = $2, pr_url = $3, rounds = $4, error = $5, \
-                    source = $6, external_id = $7, repo = $8, depends_on = $9, project = $10, \
-                    priority = $11, phase = $12, description = $13, request_settings = $14, \
-                    updated_at = CURRENT_TIMESTAMP, version = version + 1 \
-             WHERE id = $15",
+            "UPDATE tasks SET task_kind = $1, status = $2, turn = $3, pr_url = $4, rounds = $5, \
+                    error = $6, source = $7, external_id = $8, repo = $9, depends_on = $10, \
+                    project = $11, priority = $12, phase = $13, description = $14, \
+                    request_settings = $15, system_input = $16, updated_at = CURRENT_TIMESTAMP, \
+                    version = version + 1 WHERE id = $17",
         )
+        .bind(task_kind)
         .bind(status)
         .bind(state.turn as i64)
         .bind(&state.pr_url)
@@ -90,6 +103,7 @@ impl TaskDb {
         .bind(&phase_json)
         .bind(state.description.as_deref())
         .bind(settings_json.as_deref())
+        .bind(system_input_json.as_deref())
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -138,16 +152,22 @@ impl TaskDb {
         project: &str,
         external_id: &str,
     ) -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as(
+        let active_statuses: Vec<&str> = std::iter::once(TaskStatus::Pending.as_ref())
+            .chain(std::iter::once(TaskStatus::AwaitingDeps.as_ref()))
+            .chain(TaskStatus::resumable_statuses().iter().copied())
+            .collect();
+        let placeholders = Self::numbered_placeholders(3, active_statuses.len());
+        let sql = format!(
             "SELECT id FROM tasks WHERE project = $1 AND external_id = $2 \
-             AND status IN ('pending', 'awaiting_deps', 'implementing', \
-                           'agent_review', 'waiting', 'reviewing') \
-             LIMIT 1",
-        )
-        .bind(project)
-        .bind(external_id)
-        .fetch_optional(&self.pool)
-        .await?;
+             AND status IN ({placeholders}) LIMIT 1"
+        );
+        let mut query = sqlx::query_as::<_, (String,)>(&sql)
+            .bind(project)
+            .bind(external_id);
+        for status in active_statuses {
+            query = query.bind(status);
+        }
+        let row = query.fetch_optional(&self.pool).await?;
         Ok(row.map(|r| r.0))
     }
 
@@ -213,7 +233,7 @@ impl TaskDb {
     /// Return all tasks as lightweight summaries, skipping the heavy `rounds` column.
     pub async fn list_summaries(&self) -> anyhow::Result<Vec<crate::task_runner::TaskSummary>> {
         let rows = sqlx::query_as::<_, TaskSummaryRow>(
-            "SELECT id, status, turn, pr_url, error, source, external_id, parent_id, \
+            "SELECT id, task_kind, status, turn, pr_url, error, source, external_id, parent_id, \
              created_at, repo, depends_on, project, phase, description \
              FROM tasks ORDER BY created_at DESC",
         )
@@ -345,7 +365,9 @@ impl TaskDb {
             let resumable = TaskStatus::resumable_statuses();
             let placeholders = Self::numbered_placeholders(1, resumable.len());
             let sql = format!(
-                "SELECT t.id, t.status, t.turn, t.pr_url AS task_pr_url, \
+                "SELECT t.id, t.task_kind, t.source, t.external_id, t.description, \
+                        t.status, t.turn, t.pr_url AS task_pr_url, \
+                        t.system_input, \
                         c.triage_output, c.plan_output, c.pr_url AS ck_pr_url \
                  FROM tasks t \
                  LEFT JOIN task_checkpoints c ON t.id = c.task_id \
@@ -363,6 +385,16 @@ impl TaskDb {
         let mut result = RecoveryResult::default();
 
         for row in rows {
+            let task_kind = crate::task_runner::TaskKind::from_persisted(
+                Some(&row.task_kind),
+                row.source.as_deref(),
+                row.external_id.as_deref(),
+                row.description.as_deref(),
+            )?;
+            let system_input: Option<crate::task_runner::SystemTaskInput> = row
+                .system_input
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok());
             let effective_pr_url = row
                 .task_pr_url
                 .as_deref()
@@ -375,6 +407,29 @@ impl TaskDb {
             let has_pr = effective_pr_url.is_some();
             let has_plan = row.plan_output.is_some();
             let has_triage = row.triage_output.is_some();
+
+            if task_kind.recovery_status().is_some() {
+                if let Some(recovery_status) = task_kind.recovery_status() {
+                    if system_input.is_some() {
+                        sqlx::query(
+                            "UPDATE tasks SET status = $1, error = NULL, \
+                             updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+                        )
+                        .bind(recovery_status.as_ref())
+                        .bind(&row.id)
+                        .execute(&self.pool)
+                        .await?;
+                        result.resumed += 1;
+                        tracing::info!(
+                            task_id = %row.id,
+                            task_kind = task_kind.as_ref(),
+                            was = %row.status,
+                            "startup recovery: resumed system task"
+                        );
+                        continue;
+                    }
+                }
+            }
 
             if has_pr || has_plan || has_triage {
                 let reason = if has_pr {
@@ -608,16 +663,20 @@ impl TaskDb {
         let sql = if project.is_some() {
             format!(
                 "SELECT {TASK_ROW_COLUMNS} FROM tasks \
-                 WHERE status IN ('implementing', 'agent_review', 'waiting', 'reviewing') \
-                 AND external_id IS NOT NULL \
+                 WHERE status IN ('implementing', 'review_generating', 'review_waiting', \
+                                  'planner_generating', 'planner_waiting', 'agent_review', \
+                                  'waiting', 'reviewing') \
+                 AND (external_id IS NOT NULL OR task_kind IN ('review', 'planner')) \
                  AND updated_at < $1 AND project = $2 \
                  ORDER BY updated_at ASC LIMIT 100"
             )
         } else {
             format!(
                 "SELECT {TASK_ROW_COLUMNS} FROM tasks \
-                 WHERE status IN ('implementing', 'agent_review', 'waiting', 'reviewing') \
-                 AND external_id IS NOT NULL \
+                 WHERE status IN ('implementing', 'review_generating', 'review_waiting', \
+                                  'planner_generating', 'planner_waiting', 'agent_review', \
+                                  'waiting', 'reviewing') \
+                 AND (external_id IS NOT NULL OR task_kind IN ('review', 'planner')) \
                  AND updated_at < $1 \
                  ORDER BY updated_at ASC LIMIT 100"
             )

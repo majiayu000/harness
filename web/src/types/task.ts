@@ -4,6 +4,7 @@
  */
 export interface Task {
   id: string;
+  task_kind: string;
   status: string;
   turn: number;
   pr_url: string | null;

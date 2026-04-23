@@ -363,10 +363,13 @@ async fn run_repo_sprint(
     let planner_prompt = harness_core::prompts::sprint_plan_prompt(&issue_summary);
 
     let planner_req = crate::task_runner::CreateTaskRequest {
-        prompt: Some(planner_prompt),
+        prompt: Some(planner_prompt.clone()),
         agent: planner_agent.map(String::from),
         project: Some(project_root.clone()),
         source: Some("sprint_planner".to_string()),
+        system_input: Some(crate::task_runner::SystemTaskInput::SprintPlanner {
+            prompt: planner_prompt,
+        }),
         ..Default::default()
     };
 

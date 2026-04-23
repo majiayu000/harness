@@ -18,7 +18,12 @@ function fmtBytes(v: number | null): string {
 function statusColor(status: string): string {
   switch (status) {
     case "implementing":
+    case "planner_generating":
       return "text-ok border-ok/40";
+    case "review_generating":
+      return "text-rust border-rust/40";
+    case "review_waiting":
+    case "planner_waiting":
     case "pending":
     case "awaiting_deps":
     case "waiting":

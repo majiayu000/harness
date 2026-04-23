@@ -852,6 +852,9 @@ async fn run_review_tick(
         turn_timeout_secs: config.timeout_secs,
         source: Some("periodic_review".to_string()),
         project: Some(project_root.clone()),
+        system_input: Some(crate::task_runner::SystemTaskInput::PeriodicReview {
+            prompt: base_prompt.clone(),
+        }),
         ..CreateTaskRequest::default()
     };
 
@@ -953,6 +956,9 @@ async fn run_review_tick(
                 turn_timeout_secs: timeout_secs,
                 source: Some("periodic_review".to_string()),
                 project: Some(project_root_for_poll.clone()),
+                system_input: Some(crate::task_runner::SystemTaskInput::PeriodicReview {
+                    prompt: base_prompt.clone(),
+                }),
                 ..CreateTaskRequest::default()
             };
             match task_routes::enqueue_task_in_domain(
@@ -1030,11 +1036,14 @@ async fn run_review_tick(
                     secondary_text,
                 );
                 let synth_req = CreateTaskRequest {
-                    prompt: Some(synthesis_prompt),
+                    prompt: Some(synthesis_prompt.clone()),
                     agent: Some(primary_agent_for_synthesis.clone()),
                     turn_timeout_secs: timeout_secs,
                     source: Some("periodic_review".to_string()),
                     project: Some(project_root_for_poll.clone()),
+                    system_input: Some(crate::task_runner::SystemTaskInput::PeriodicReview {
+                        prompt: synthesis_prompt,
+                    }),
                     ..CreateTaskRequest::default()
                 };
                 match task_routes::enqueue_task_in_domain(

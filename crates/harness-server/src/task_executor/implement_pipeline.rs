@@ -3,7 +3,9 @@ use super::helpers::{
     matched_skills_for_prompt, run_agent_streaming, run_on_error, run_post_execute,
     run_post_tool_use, run_pre_execute, update_status,
 };
-use crate::task_runner::{mutate_and_persist, CreateTaskRequest, TaskId, TaskStatus, TaskStore};
+use crate::task_runner::{
+    mutate_and_persist, CreateTaskRequest, TaskId, TaskKind, TaskStatus, TaskStore,
+};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::interceptor::ToolUseEvent;
 use harness_core::tool_isolation::validate_tool_usage;
@@ -65,10 +67,10 @@ pub(crate) fn prepend_constitution(prompt: String, enabled: bool) -> String {
 }
 
 /// Returns true when the task type requires the agent to emit a `PR_URL=…` line.
-/// Issue-backed tasks and `pr:N` review tasks must produce a PR URL; prompt-only
-/// tasks (periodic_review, etc.) may produce output without creating a PR.
+/// Issue-backed tasks and `pr:N` review tasks must produce a PR URL; generic
+/// prompt-only implementation tasks may complete without creating one.
 pub(crate) fn task_needs_pr_url(req: &CreateTaskRequest) -> bool {
-    req.issue.is_some() || req.pr.is_some()
+    TaskKind::classify(req.source.as_deref(), req.issue, req.pr).requires_pr_url()
 }
 
 /// Outcome of the implement phase.
@@ -127,16 +129,6 @@ pub(crate) async fn run_implement_phase(
     task_start: Instant,
 ) -> anyhow::Result<ImplementOutcome> {
     use crate::task_runner::RoundResult;
-    use harness_core::config::agents::CapabilityProfile;
-
-    fn restricted_tools(profile: CapabilityProfile) -> anyhow::Result<Vec<String>> {
-        profile.tools().ok_or_else(|| {
-            anyhow::anyhow!(
-                "capability profile {:?} returned None from tools() — misconfiguration",
-                profile
-            )
-        })
-    }
 
     // Resume normal flow — update status to Implementing for the main turn.
     update_status(store, task_id, TaskStatus::Implementing, 1).await?;
@@ -177,12 +169,6 @@ pub(crate) async fn run_implement_phase(
             &review_config.reviewer_name,
             false,
         )
-    } else if matches!(
-        req.source.as_deref(),
-        Some("periodic_review") | Some("sprint_planner")
-    ) {
-        // Review/planner tasks use their prompt as-is — no "create PR" wrapper.
-        req.prompt.clone().unwrap_or_default()
     } else {
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default(), git)
     };
@@ -275,23 +261,8 @@ pub(crate) async fn run_implement_phase(
 
     let context_items = collect_context_items(skills, project, &first_prompt).await;
 
-    // Periodic review tasks need Bash to run guard check commands but should
-    // not have unrestricted write access — use Standard profile. All other
-    // tasks (implementation) keep Full (None → --dangerously-skip-permissions).
-    //
-    // Some(tools) causes claude.rs to pass --allowedTools to the CLI (hard
-    // enforcement). None → --dangerously-skip-permissions (full access).
-    let (initial_allowed_tools, capability_prompt_note): (Option<Vec<String>>, _) = if matches!(
-        req.source.as_deref(),
-        Some("periodic_review") | Some("sprint_planner")
-    ) {
-        (
-            Some(restricted_tools(CapabilityProfile::Standard)?),
-            CapabilityProfile::Standard.prompt_note(),
-        )
-    } else {
-        (None, None)
-    };
+    let initial_allowed_tools: Option<Vec<String>> = None;
+    let capability_prompt_note: Option<&'static str> = None;
 
     // Prepend capability restriction note so the agent knows which tools are
     // permitted. This is the primary enforcement path now that --allowedTools
@@ -565,47 +536,6 @@ pub(crate) async fn run_implement_phase(
             return Ok(ImplementOutcome::Done);
         }
 
-        // Review-only tasks produce a report, not a PR.
-        // Persist the output and return immediately — no PR parsing or review loop.
-        let is_review_task = store.get(task_id).is_some_and(|s| {
-            matches!(
-                s.source.as_deref(),
-                Some("periodic_review") | Some("sprint_planner")
-            )
-        });
-
-        if is_review_task {
-            mutate_and_persist(store, task_id, |s| {
-                s.status = TaskStatus::Done;
-                s.turn = 1;
-                s.rounds.push(RoundResult {
-                    turn: 1,
-                    action: "review".into(),
-                    result: "completed".into(),
-                    detail: if output.is_empty() {
-                        None
-                    } else {
-                        Some(output.clone())
-                    },
-                    first_token_latency_ms: impl_first_token_ms,
-                });
-            })
-            .await?;
-            store.log_event(crate::event_replay::TaskEvent::Completed {
-                task_id: task_id.0.clone(),
-                ts: crate::event_replay::now_ts(),
-            });
-            tracing::info!(
-                task_id = %task_id,
-                status = "done",
-                turns = 1,
-                pr_url = tracing::field::Empty,
-                total_elapsed_secs = task_start.elapsed().as_secs(),
-                "task_completed"
-            );
-            return Ok(ImplementOutcome::Done);
-        }
-
         let (pr_url, pr_num, created_issue_num) = match parse_implementation_outcome(&output) {
             ImplementationOutcome::PlanIssue(plan_issue) => {
                 if let (Some(workflows), Some(issue_number)) =
@@ -805,8 +735,7 @@ pub(crate) async fn run_implement_phase(
             }
             // Issue tasks and pr:N tasks must produce a PR URL. Mark Failed so the issue
             // is removed from the dispatched set by on_task_complete and can be re-queued.
-            // Prompt-only tasks (periodic_review, etc.) may legitimately produce output
-            // without a PR — Done is correct there.
+            // Generic prompt-only implementation tasks may legitimately finish without a PR.
             if task_needs_pr_url(req) {
                 tracing::warn!(
                     task_id = %task_id,
