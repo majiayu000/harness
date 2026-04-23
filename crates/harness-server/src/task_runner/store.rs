@@ -359,7 +359,7 @@ impl TaskStore {
         &self,
         project_id: &str,
         repo: Option<&str>,
-    ) -> anyhow::Result<HashMap<String, TaskStatus>> {
+    ) -> anyhow::Result<HashMap<String, (Option<String>, TaskStatus)>> {
         let mut by_external_id: HashMap<String, (Option<String>, TaskStatus)> = self
             .db
             .list_latest_external_statuses_by_project_and_repo(project_id, repo)
@@ -404,10 +404,7 @@ impl TaskStore {
             }
         }
 
-        Ok(by_external_id
-            .into_iter()
-            .map(|(external_id, (_, status))| (external_id, status))
-            .collect())
+        Ok(by_external_id)
     }
 
     /// Run `f` only if the task still exists and is live-`pending`.

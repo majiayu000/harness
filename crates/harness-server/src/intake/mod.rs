@@ -389,6 +389,47 @@ fn parse_issue_external_id(external_id: &str) -> Option<u64> {
         .ok()
 }
 
+fn latest_timestamp_at_least(candidate: Option<&str>, existing: Option<&str>) -> bool {
+    match (candidate, existing) {
+        (Some(candidate), Some(existing)) => candidate >= existing,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => true,
+    }
+}
+
+fn latest_unblocking_issue_numbers(
+    external_statuses: std::collections::HashMap<
+        String,
+        (Option<String>, crate::task_runner::TaskStatus),
+    >,
+) -> std::collections::HashSet<u64> {
+    let mut latest_by_issue: std::collections::HashMap<
+        u64,
+        (Option<String>, crate::task_runner::TaskStatus),
+    > = std::collections::HashMap::new();
+
+    for (external_id, (created_at, status)) in external_statuses {
+        let Some(issue) = parse_issue_external_id(&external_id) else {
+            continue;
+        };
+        let should_replace = latest_by_issue
+            .get(&issue)
+            .map(|(existing_created_at, _)| {
+                latest_timestamp_at_least(created_at.as_deref(), existing_created_at.as_deref())
+            })
+            .unwrap_or(true);
+        if should_replace {
+            latest_by_issue.insert(issue, (created_at, status));
+        }
+    }
+
+    latest_by_issue
+        .into_iter()
+        .filter_map(|(issue, (_, status))| status_unblocks_dependents(&status).then_some(issue))
+        .collect()
+}
+
 async fn completed_issue_numbers_for_project(
     tasks: &crate::task_runner::TaskStore,
     project_id: &str,
@@ -398,11 +439,7 @@ async fn completed_issue_numbers_for_project(
         .list_latest_external_statuses_by_project_and_repo(project_id, repo)
         .await
     {
-        Ok(external_statuses) => external_statuses
-            .into_iter()
-            .filter(|(_, status)| status_unblocks_dependents(status))
-            .filter_map(|(external_id, _)| parse_issue_external_id(&external_id))
-            .collect(),
+        Ok(external_statuses) => latest_unblocking_issue_numbers(external_statuses),
         Err(e) => {
             tracing::warn!(
                 project = project_id,
@@ -1403,6 +1440,29 @@ mod tests {
 
         assert_eq!(completed, make_issues(&[41, 42]));
         Ok(())
+    }
+
+    #[test]
+    fn latest_unblocking_issue_numbers_prefers_latest_issue_id_format() {
+        let completed = latest_unblocking_issue_numbers(std::collections::HashMap::from([
+            (
+                "42".to_string(),
+                (Some("2026-04-22T09:00:00Z".to_string()), TaskStatus::Done),
+            ),
+            (
+                "issue:42".to_string(),
+                (
+                    Some("2026-04-22T09:05:00Z".to_string()),
+                    TaskStatus::Implementing,
+                ),
+            ),
+            (
+                "issue:43".to_string(),
+                (Some("2026-04-22T09:10:00Z".to_string()), TaskStatus::Done),
+            ),
+        ]));
+
+        assert_eq!(completed, make_issues(&[43]));
     }
 
     #[test]
