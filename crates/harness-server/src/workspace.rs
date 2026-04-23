@@ -820,6 +820,8 @@ async fn infer_workspace_source_repo(workspace_path: &Path) -> Option<PathBuf> {
 }
 
 async fn is_registered_worktree(source_repo: &Path, workspace_path: &Path) -> bool {
+    // `git worktree list --porcelain` emits absolute paths even when `workspace.root`
+    // was configured relatively, so normalize both sides before matching.
     let expected_path =
         std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf());
     git_command()
