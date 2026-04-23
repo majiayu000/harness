@@ -1,7 +1,11 @@
-use crate::{http::AppState, task_runner::DashboardCounts};
+use crate::{
+    http::AppState,
+    task_runner::{DashboardCounts, TaskStatus, TaskSummary},
+};
 use axum::{extract::State, http::StatusCode, Json};
-use harness_core::types::EventFilters;
+use harness_core::types::{Event, EventFilters};
 use harness_observe::{quality::QualityGrader, stats};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -14,6 +18,136 @@ const DASHBOARD_EVENT_WINDOW_DAYS: i64 = 30;
 /// so `uptime_secs` reflects true server uptime rather than time since first dashboard hit.
 pub(crate) static SERVER_START: std::sync::OnceLock<std::time::Instant> =
     std::sync::OnceLock::new();
+
+#[derive(Debug, Default, Serialize)]
+struct DashboardFunnel {
+    project_registered_at: Option<String>,
+    task_submitted_at: Option<String>,
+    live_output_at: Option<String>,
+    completion_evidence_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardOnboarding {
+    phase: &'static str,
+    has_registered_project: bool,
+    has_submitted_task: bool,
+    has_live_output: bool,
+    has_completion_evidence: bool,
+}
+
+fn record_first_timestamp(slot: &mut Option<String>, ts: &chrono::DateTime<chrono::Utc>) {
+    let ts = ts.to_rfc3339();
+    if slot.as_ref().is_none_or(|existing| ts < *existing) {
+        *slot = Some(ts);
+    }
+}
+
+fn parse_operator_funnel_milestone(event: &Event) -> Option<String> {
+    if event.hook != "operator_funnel" {
+        return None;
+    }
+    event.content.as_deref().and_then(|content| {
+        serde_json::from_str::<serde_json::Value>(content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("milestone")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string)
+            })
+    })
+}
+
+fn task_has_started(summary: &TaskSummary) -> bool {
+    matches!(
+        summary.status,
+        TaskStatus::Implementing
+            | TaskStatus::AgentReview
+            | TaskStatus::Waiting
+            | TaskStatus::Reviewing
+            | TaskStatus::Done
+            | TaskStatus::Failed
+    ) || summary.turn > 0
+}
+
+async fn build_onboarding_summary(
+    state: &AppState,
+    dashboard_events: &[Event],
+) -> (bool, DashboardOnboarding, DashboardFunnel) {
+    let mut funnel = DashboardFunnel::default();
+    for event in dashboard_events {
+        match parse_operator_funnel_milestone(event).as_deref() {
+            Some("project_registered") => {
+                record_first_timestamp(&mut funnel.project_registered_at, &event.ts)
+            }
+            Some("task_submitted") => {
+                record_first_timestamp(&mut funnel.task_submitted_at, &event.ts)
+            }
+            Some("live_output_available") => {
+                record_first_timestamp(&mut funnel.live_output_at, &event.ts)
+            }
+            Some("completion_evidence_available") => {
+                record_first_timestamp(&mut funnel.completion_evidence_at, &event.ts)
+            }
+            _ => {}
+        }
+    }
+
+    let task_summaries = match state.core.tasks.list_all_summaries_with_terminal().await {
+        Ok(summaries) => summaries,
+        Err(e) => {
+            tracing::warn!("dashboard: failed to list task summaries for onboarding: {e}");
+            Vec::new()
+        }
+    };
+
+    if funnel.live_output_at.is_none() {
+        for summary in task_summaries
+            .iter()
+            .filter(|summary| task_has_started(summary))
+        {
+            if let Some(created_at) = &summary.created_at {
+                if funnel
+                    .live_output_at
+                    .as_ref()
+                    .is_none_or(|existing| created_at < existing)
+                {
+                    funnel.live_output_at = Some(created_at.clone());
+                }
+            }
+        }
+    }
+
+    let has_registered_project = funnel.project_registered_at.is_some();
+    let has_submitted_task = funnel.task_submitted_at.is_some();
+    let has_live_output = funnel.live_output_at.is_some();
+    let has_completion_evidence = funnel.completion_evidence_at.is_some();
+
+    let phase = if !has_registered_project {
+        "register_project"
+    } else if !has_submitted_task {
+        "submit_task"
+    } else if !has_live_output {
+        "watch_live_output"
+    } else if !has_completion_evidence {
+        "inspect_completion"
+    } else {
+        "complete"
+    };
+
+    (
+        phase != "complete",
+        DashboardOnboarding {
+            phase,
+            has_registered_project,
+            has_submitted_task,
+            has_live_output,
+            has_completion_evidence,
+        },
+        funnel,
+    )
+}
 
 /// GET /api/dashboard — JSON summary of all registered projects and global concurrency.
 ///
@@ -44,7 +178,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     // Derive violation_count from the most recent rule_scan session so we don't
     // permanently depress the grade with historical violations from old scans.
     let events_since = chrono::Utc::now() - chrono::Duration::days(DASHBOARD_EVENT_WINDOW_DAYS);
-    let grade: Option<Value> = match state
+    let dashboard_events = match state
         .observability
         .events
         .query(&EventFilters {
@@ -53,7 +187,18 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         })
         .await
     {
-        Ok(events) => {
+        Ok(events) => events,
+        Err(e) => {
+            tracing::warn!("dashboard: failed to query events: {e}");
+            Vec::new()
+        }
+    };
+
+    let grade: Option<Value> = {
+        let events = &dashboard_events;
+        if events.is_empty() {
+            None
+        } else {
             // Return None when the rolling window contains no events rather than
             // computing a false perfect grade from an empty set.  Operators should
             // see null (unknown) instead of an inflated A when the project has been
@@ -72,13 +217,9 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                             .count()
                     })
                     .unwrap_or(0);
-                let report = QualityGrader::grade(&events, violation_count);
+                let report = QualityGrader::grade(events, violation_count);
                 serde_json::to_value(report.grade).ok()
             }
-        }
-        Err(e) => {
-            tracing::warn!("dashboard: failed to query events for grade: {e}");
-            None
         }
     };
 
@@ -203,11 +344,15 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         .iter()
         .filter(|host| host["online"].as_bool().unwrap_or(false))
         .count() as u64;
+    let (first_run, onboarding, funnel) = build_onboarding_summary(&state, &dashboard_events).await;
 
     let body = json!({
         "projects": projects,
         "runtime_hosts": runtime_hosts,
         "llm_metrics": llm_metrics,
+        "first_run": first_run,
+        "onboarding": onboarding,
+        "funnel": funnel,
         "global": {
             "running": tq.running_count(),
             "queued": tq.queued_count(),
@@ -272,6 +417,9 @@ mod tests {
 
         // Must have top-level "projects" array and "global" object.
         assert!(body.get("projects").and_then(|v| v.as_array()).is_some());
+        assert!(body.get("first_run").is_some());
+        assert!(body.get("onboarding").is_some());
+        assert!(body.get("funnel").is_some());
         let global = body.get("global").expect("missing global key");
         assert!(global.get("running").is_some());
         assert!(global.get("queued").is_some());
@@ -367,6 +515,56 @@ mod tests {
             host["assignment_pressure"], 0.0,
             "idle host must have 0.0 assignment_pressure"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dashboard_aggregates_operator_funnel_milestones() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-dashboard-")?;
+        let state = Arc::new(make_test_state(dir.path()).await?);
+
+        for milestone in [
+            "project_registered",
+            "task_submitted",
+            "live_output_available",
+            "completion_evidence_available",
+        ] {
+            let mut event = harness_core::types::Event::new(
+                harness_core::types::SessionId::new(),
+                "operator_funnel",
+                "test",
+                harness_core::types::Decision::Complete,
+            );
+            event.content = Some(serde_json::json!({ "milestone": milestone }).to_string());
+            state.observability.events.log(&event).await?;
+        }
+
+        let app = Router::new()
+            .route("/api/dashboard", get(dashboard))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/api/dashboard")
+            .body(axum::body::Body::empty())?;
+
+        let resp = tower::ServiceExt::oneshot(app, req).await?;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+        assert_eq!(body["first_run"], false);
+        assert_eq!(body["onboarding"]["phase"], "complete");
+        assert_eq!(body["onboarding"]["has_registered_project"], true);
+        assert_eq!(body["onboarding"]["has_submitted_task"], true);
+        assert_eq!(body["onboarding"]["has_live_output"], true);
+        assert_eq!(body["onboarding"]["has_completion_evidence"], true);
+        assert!(body["funnel"]["project_registered_at"].is_string());
+        assert!(body["funnel"]["task_submitted_at"].is_string());
+        assert!(body["funnel"]["live_output_at"].is_string());
+        assert!(body["funnel"]["completion_evidence_at"].is_string());
         Ok(())
     }
 }

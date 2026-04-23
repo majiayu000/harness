@@ -44,9 +44,27 @@ export interface DashboardGlobal {
   runtime_hosts_online: number;
 }
 
+export interface DashboardOnboarding {
+  phase: "register_project" | "submit_task" | "watch_live_output" | "inspect_completion" | "complete";
+  has_registered_project: boolean;
+  has_submitted_task: boolean;
+  has_live_output: boolean;
+  has_completion_evidence: boolean;
+}
+
+export interface DashboardFunnel {
+  project_registered_at: string | null;
+  task_submitted_at: string | null;
+  live_output_at: string | null;
+  completion_evidence_at: string | null;
+}
+
 export interface DashboardPayload {
   projects: DashboardProject[];
   runtime_hosts: DashboardRuntimeHost[];
   llm_metrics: DashboardLlmMetrics;
+  first_run: boolean;
+  onboarding: DashboardOnboarding;
+  funnel: DashboardFunnel;
   global: DashboardGlobal;
 }

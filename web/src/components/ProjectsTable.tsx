@@ -28,8 +28,27 @@ export function ProjectsTable({ projects }: Props) {
 
   if (!projects.length) {
     return (
-      <div className="px-5 py-5 text-ink-4 font-mono text-[11px]">
-        no projects registered yet — register one via POST /projects
+      <div className="px-5 py-5">
+        <div className="text-[13px] text-ink">No projects registered yet.</div>
+        <div className="mt-2 text-ink-3 text-[12px] max-w-[560px]">
+          Start with the guided setup flow, validate the repository root, then launch a sample operator task from the dashboard.
+        </div>
+        <div className="mt-4 flex gap-2">
+          <button
+            type="button"
+            onClick={() => nav("/")}
+            className="px-3 py-1.5 bg-rust text-white font-mono text-[12px]"
+          >
+            Register a project
+          </button>
+          <button
+            type="button"
+            onClick={() => nav("/")}
+            className="px-3 py-1.5 border border-line-2 bg-bg text-ink font-mono text-[12px]"
+          >
+            Try a sample task
+          </button>
+        </div>
       </div>
     );
   }

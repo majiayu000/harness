@@ -1,6 +1,18 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiJson } from "./api";
-import type { DashboardPayload, OperatorSnapshotPayload, OverviewPayload, Task } from "@/types";
+import type {
+  CreateTaskResponse,
+  DashboardPayload,
+  OperatorSnapshotPayload,
+  OverviewPayload,
+  ProjectValidationResult,
+  RegisterProjectResponse,
+  RegisteredProject,
+  Task,
+  TaskArtifactRecord,
+  TaskDetail,
+  TaskPromptRecord,
+} from "@/types";
 
 export function useDashboard() {
   return useQuery<DashboardPayload, Error>({
@@ -28,6 +40,85 @@ export function useTasks() {
   return useQuery<Task[], Error>({
     queryKey: ["tasks"],
     queryFn: ({ signal }) => apiJson<Task[]>("/tasks", { signal }),
+  });
+}
+
+export function useProjects() {
+  return useQuery<RegisteredProject[], Error>({
+    queryKey: ["projects"],
+    queryFn: ({ signal }) => apiJson<RegisteredProject[]>("/projects", { signal }),
+  });
+}
+
+export function useTaskDetail(taskId: string | null) {
+  return useQuery<TaskDetail, Error>({
+    queryKey: ["task-detail", taskId],
+    queryFn: ({ signal }) => apiJson<TaskDetail>(`/tasks/${taskId}`, { signal }),
+    enabled: Boolean(taskId),
+  });
+}
+
+export function useTaskArtifacts(taskId: string | null) {
+  return useQuery<TaskArtifactRecord[], Error>({
+    queryKey: ["task-artifacts", taskId],
+    queryFn: ({ signal }) => apiJson<TaskArtifactRecord[]>(`/tasks/${taskId}/artifacts`, { signal }),
+    enabled: Boolean(taskId),
+  });
+}
+
+export function useTaskPrompts(taskId: string | null) {
+  return useQuery<TaskPromptRecord[], Error>({
+    queryKey: ["task-prompts", taskId],
+    queryFn: ({ signal }) => apiJson<TaskPromptRecord[]>(`/tasks/${taskId}/prompts`, { signal }),
+    enabled: Boolean(taskId),
+  });
+}
+
+export function useValidateProject() {
+  return useMutation<ProjectValidationResult, Error, { root: string }>({
+    mutationFn: async ({ root }) =>
+      apiJson<ProjectValidationResult>("/projects/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root }),
+      }),
+  });
+}
+
+export function useRegisterProject() {
+  const queryClient = useQueryClient();
+  return useMutation<RegisterProjectResponse, Error, { root: string }>({
+    mutationFn: async ({ root }) =>
+      apiJson<RegisterProjectResponse>("/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root }),
+      }),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["projects"] }),
+        queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+        queryClient.invalidateQueries({ queryKey: ["overview"] }),
+      ]);
+    },
+  });
+}
+
+export function useCreateTask() {
+  const queryClient = useQueryClient();
+  return useMutation<CreateTaskResponse, Error, { prompt: string; project?: string }>({
+    mutationFn: async ({ prompt, project }) =>
+      apiJson<CreateTaskResponse>("/tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, project }),
+      }),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+        queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+      ]);
+    },
   });
 }
 

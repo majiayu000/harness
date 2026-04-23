@@ -80,6 +80,7 @@ pub(crate) async fn run_triage_plan_pipeline(
     agent: &dyn CodeAgent,
     store: &TaskStore,
     task_id: &TaskId,
+    events: &harness_observe::event_store::EventStore,
     issue: u64,
     cargo_env: &HashMap<String, String>,
     project: &Path,
@@ -104,7 +105,7 @@ pub(crate) async fn run_triage_plan_pipeline(
     let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
     let (triage_resp, _) = tokio::time::timeout(
         turn_timeout,
-        run_agent_streaming(agent, triage_req, task_id, store, 0),
+        run_agent_streaming(agent, triage_req, task_id, store, events, 0),
     )
     .await
     .map_err(|_| anyhow::anyhow!("triage phase timed out after {}s", req.turn_timeout_secs))?
@@ -170,7 +171,7 @@ pub(crate) async fn run_triage_plan_pipeline(
 
     let (plan_resp, _) = tokio::time::timeout(
         turn_timeout,
-        run_agent_streaming(agent, plan_req, task_id, store, 0),
+        run_agent_streaming(agent, plan_req, task_id, store, events, 0),
     )
     .await
     .map_err(|_| anyhow::anyhow!("plan phase timed out after {}s", req.turn_timeout_secs))?

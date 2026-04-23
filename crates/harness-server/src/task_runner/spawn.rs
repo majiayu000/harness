@@ -766,7 +766,59 @@ where
         store_watcher.close_task_stream(&id_watcher);
         if let Some(cb) = completion_callback {
             match store_watcher.get(&id_watcher) {
-                Some(final_state) => cb(final_state).await,
+                Some(final_state) => {
+                    let artifact_count = store_watcher
+                        .list_artifacts(&id_watcher)
+                        .await
+                        .map(|artifacts| artifacts.len())
+                        .unwrap_or(0);
+                    let prompt_count = store_watcher
+                        .get_prompts(&id_watcher)
+                        .await
+                        .map(|prompts| prompts.len())
+                        .unwrap_or(0);
+                    let checkpoint = store_watcher
+                        .load_checkpoint(&id_watcher)
+                        .await
+                        .ok()
+                        .flatten();
+                    let has_completion_evidence = final_state.pr_url.is_some()
+                        || artifact_count > 0
+                        || prompt_count > 0
+                        || checkpoint.as_ref().is_some_and(|checkpoint| {
+                            checkpoint.pr_url.is_some()
+                                || checkpoint.plan_output.is_some()
+                                || checkpoint.triage_output.is_some()
+                        });
+                    if has_completion_evidence {
+                        let task_id_value = id_watcher.0.clone();
+                        let mut event = Event::new(
+                            SessionId::new(),
+                            "operator_funnel",
+                            "task_runner",
+                            Decision::Complete,
+                        );
+                        event.detail = Some("completion_evidence_available".to_string());
+                        event.content = Some(
+                            serde_json::json!({
+                                "milestone": "completion_evidence_available",
+                                "task_id": task_id_value,
+                                "status": final_state.status.as_ref(),
+                                "pr_url": final_state.pr_url.clone(),
+                                "artifact_count": artifact_count,
+                                "prompt_count": prompt_count,
+                            })
+                            .to_string(),
+                        );
+                        if let Err(e) = events_watcher.log(&event).await {
+                            tracing::warn!(
+                                task_id = %id_watcher.0,
+                                "failed to log operator_funnel completion_evidence_available event: {e}"
+                            );
+                        }
+                    }
+                    cb(final_state).await
+                }
                 None => tracing::warn!(
                     "completion_callback: task {:?} not found in store after completion",
                     id_watcher

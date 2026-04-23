@@ -4,6 +4,7 @@ use crate::{
 };
 use axum::{extract::State, http::StatusCode, response::IntoResponse, response::Response, Json};
 use harness_core::agent::CodeAgent;
+use harness_core::types::{Decision, Event, SessionId};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -21,6 +22,12 @@ impl QueueDomain {
             Self::Review => "review",
         }
     }
+}
+
+#[derive(Clone)]
+struct EnqueueTaskResult {
+    task_id: task_runner::TaskId,
+    deduped: bool,
 }
 
 fn queue_timeout_message(
@@ -264,14 +271,33 @@ pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
     req: task_runner::CreateTaskRequest,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
-    enqueue_task_in_domain(state, req, QueueDomain::Primary).await
+    enqueue_task_with_result(state, req)
+        .await
+        .map(|result| result.task_id)
 }
 
 pub(crate) async fn enqueue_task_in_domain(
     state: &Arc<AppState>,
-    mut req: task_runner::CreateTaskRequest,
+    req: task_runner::CreateTaskRequest,
     queue_domain: QueueDomain,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
+    enqueue_task_in_domain_with_result(state, req, queue_domain)
+        .await
+        .map(|result| result.task_id)
+}
+
+async fn enqueue_task_with_result(
+    state: &Arc<AppState>,
+    req: task_runner::CreateTaskRequest,
+) -> Result<EnqueueTaskResult, EnqueueTaskError> {
+    enqueue_task_in_domain_with_result(state, req, QueueDomain::Primary).await
+}
+
+async fn enqueue_task_in_domain_with_result(
+    state: &Arc<AppState>,
+    mut req: task_runner::CreateTaskRequest,
+    queue_domain: QueueDomain,
+) -> Result<EnqueueTaskResult, EnqueueTaskError> {
     let now = chrono::Utc::now();
     if state
         .core
@@ -336,10 +362,16 @@ pub(crate) async fn enqueue_task_in_domain(
     // a concurrency permit (same dedup as enqueue_task_background).
     populate_external_id(&mut req);
     if let Some(existing_id) = check_duplicate(&state.core.tasks, &project_id, &req).await {
-        return Ok(existing_id);
+        return Ok(EnqueueTaskResult {
+            task_id: existing_id,
+            deduped: true,
+        });
     }
     if let Some(existing_id) = check_pr_duplicate(&state.core.tasks, &project_id, &req).await {
-        return Ok(existing_id);
+        return Ok(EnqueueTaskResult {
+            task_id: existing_id,
+            deduped: true,
+        });
     }
 
     // Tasks with unresolved dependencies are registered as AwaitingDeps without
@@ -363,7 +395,10 @@ pub(crate) async fn enqueue_task_in_domain(
                 .await
                 .map_err(|e| EnqueueTaskError::BadRequest(e.to_string()))?;
             track_issue_workflow_enqueue(state, &project_id, &workflow_req, &task_id).await;
-            return Ok(task_id);
+            return Ok(EnqueueTaskResult {
+                task_id,
+                deduped: false,
+            });
         }
         // All deps satisfied — clear the list so the normal spawn path
         // does not re-enter the AwaitingDeps branch.
@@ -416,7 +451,10 @@ pub(crate) async fn enqueue_task_in_domain(
 
     track_issue_workflow_enqueue(state, &project_id, &workflow_req, &task_id).await;
 
-    Ok(task_id)
+    Ok(EnqueueTaskResult {
+        task_id,
+        deduped: false,
+    })
 }
 
 /// A single task entry in the detailed batch format.
@@ -835,15 +873,60 @@ pub(super) async fn create_task(
     State(state): State<Arc<AppState>>,
     Json(req): Json<task_runner::CreateTaskRequest>,
 ) -> Response {
-    match enqueue_task(&state, req).await {
-        Ok(task_id) => (
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "task_id": task_id.0,
-                "status": "running"
-            })),
-        )
-            .into_response(),
+    match enqueue_task_with_result(&state, req).await {
+        Ok(result) => {
+            let task_id = result.task_id.0.clone();
+            let task_state = match state.core.tasks.get_with_db_fallback(&result.task_id).await {
+                Ok(task) => task,
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        "failed to load task after enqueue for operator_funnel logging: {e}"
+                    );
+                    None
+                }
+            };
+            let task_status = task_state
+                .as_ref()
+                .map(|task| task.status.as_ref().to_string())
+                .unwrap_or_else(|| "running".to_string());
+            let project_id = task_state
+                .as_ref()
+                .and_then(|task| task.project_root.as_ref())
+                .map(|root| root.to_string_lossy().into_owned());
+
+            let mut event = Event::new(
+                SessionId::new(),
+                "operator_funnel",
+                "tasks",
+                Decision::Complete,
+            );
+            event.detail = Some("task_submitted".to_string());
+            event.content = Some(
+                json!({
+                    "milestone": "task_submitted",
+                    "task_id": task_id,
+                    "project_id": project_id,
+                    "deduped": result.deduped,
+                    "status": task_status.clone(),
+                })
+                .to_string(),
+            );
+            if let Err(e) = state.observability.events.log(&event).await {
+                tracing::warn!("failed to log operator_funnel task_submitted event: {e}");
+            }
+
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "task_id": task_id,
+                    "status": task_status.clone(),
+                    "deduped": result.deduped,
+                    "task_url": format!("/?task={}", result.task_id.0),
+                })),
+            )
+                .into_response()
+        }
         Err(EnqueueTaskError::BadRequest(error)) => {
             (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
         }

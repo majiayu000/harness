@@ -4,7 +4,8 @@ use harness_core::error::HarnessError;
 use harness_core::interceptor::{ToolUseEvent, TurnInterceptor};
 use harness_core::prompts;
 use harness_core::types::{
-    ContextItem, Decision, Item, SkillId, ThreadId, TokenUsage, TurnId, TurnStatus,
+    ContextItem, Decision, Event, Item, SessionId, SkillId, ThreadId, TokenUsage, TurnId,
+    TurnStatus,
 };
 use harness_protocol::{notifications::Notification, notifications::RpcNotification};
 use std::path::Path;
@@ -550,6 +551,7 @@ pub(crate) async fn run_agent_streaming(
     req: AgentRequest,
     task_id: &TaskId,
     store: &TaskStore,
+    events: &harness_observe::event_store::EventStore,
     turn: u32,
 ) -> harness_core::error::Result<(AgentResponse, Option<u64>)> {
     let turn_start = Instant::now();
@@ -594,6 +596,7 @@ pub(crate) async fn run_agent_streaming(
     let is_auto_fix_task = store
         .get(task_id)
         .is_some_and(|s| s.source.as_deref() == Some("auto-fix"));
+    let mut live_output_logged = false;
 
     loop {
         tokio::select! {
@@ -609,6 +612,31 @@ pub(crate) async fn run_agent_streaming(
                                 if first_token_latency_ms.is_none() {
                                     first_token_latency_ms =
                                         Some(turn_start.elapsed().as_millis() as u64);
+                                }
+                                if !live_output_logged && !text.trim().is_empty() {
+                                    let mut event = Event::new(
+                                        SessionId::new(),
+                                        "operator_funnel",
+                                        "task_runner",
+                                        Decision::Complete,
+                                    );
+                                    event.detail = Some("live_output_available".to_string());
+                                    event.content = Some(
+                                        serde_json::json!({
+                                            "milestone": "live_output_available",
+                                            "task_id": task_id.0,
+                                            "turn": turn,
+                                        })
+                                        .to_string(),
+                                    );
+                                    if let Err(e) = events.log(&event).await {
+                                        tracing::warn!(
+                                            task_id = %task_id,
+                                            turn,
+                                            "failed to log operator_funnel live_output_available event: {e}"
+                                        );
+                                    }
+                                    live_output_logged = true;
                                 }
                                 output.push_str(text);
 
@@ -669,6 +697,31 @@ pub(crate) async fn run_agent_streaming(
                                         task_id,
                                     )
                                     .await;
+                                }
+                                if !live_output_logged && !content.trim().is_empty() {
+                                    let mut event = Event::new(
+                                        SessionId::new(),
+                                        "operator_funnel",
+                                        "task_runner",
+                                        Decision::Complete,
+                                    );
+                                    event.detail = Some("live_output_available".to_string());
+                                    event.content = Some(
+                                        serde_json::json!({
+                                            "milestone": "live_output_available",
+                                            "task_id": task_id.0,
+                                            "turn": turn,
+                                        })
+                                        .to_string(),
+                                    );
+                                    if let Err(e) = events.log(&event).await {
+                                        tracing::warn!(
+                                            task_id = %task_id,
+                                            turn,
+                                            "failed to log operator_funnel live_output_available event: {e}"
+                                        );
+                                    }
+                                    live_output_logged = true;
                                 }
                             }
                             StreamItem::ItemCompleted { item: completed_item } => {

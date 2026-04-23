@@ -358,7 +358,7 @@ pub(crate) async fn run_implement_phase(
             }
             let raw = tokio::time::timeout(
                 turn_timeout,
-                run_agent_streaming(agent, impl_req.clone(), task_id, store, 1),
+                run_agent_streaming(agent, impl_req.clone(), task_id, store, events, 1),
             )
             .await;
             *turns_used += 1;

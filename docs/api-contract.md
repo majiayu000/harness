@@ -22,6 +22,7 @@ observes results. The following capabilities are **only available over HTTP**:
 | `POST /tasks/batch` | batch create | Enqueue multiple tasks at once |
 | `GET  /tasks/{id}` | get | Fetch task details |
 | `GET  /tasks/{id}/stream` | stream | Server-Sent Events live output |
+| `POST /projects/validate` | validate | Validate a project root and preview canonical metadata |
 | `POST /projects` | register | Register a project root |
 | `GET  /projects` | list | List registered projects |
 | `GET  /projects/{id}` | get | Get project details |
@@ -43,6 +44,46 @@ clients that cannot set `Authorization` headers on WebSocket upgrades or
 top-level navigation requests, `/ws` and `/` additionally accept a
 `?token=<value>` query parameter as a fallback; all other routes only accept
 `Authorization: Bearer <token>`.
+
+### Operator first-run flow
+
+The web product uses the HTTP control plane for a single guided loop:
+
+1. `POST /projects/validate` previews the canonical root, detected project id,
+   inferred display name, and detected repo slug before registration.
+2. `POST /projects` reuses the same validation path and persists the project
+   record. Re-registering the same root is idempotent and returns the existing
+   canonical project id.
+3. `POST /tasks` returns a UI-friendly payload with `task_id`, `deduped`, and
+   `task_url`, so the operator can navigate straight into `/?task=<id>`.
+4. `GET /tasks/{id}` returns one joined payload for the task state, workflow
+   state, prompts, artifacts, and completion summary.
+5. `GET /tasks/{id}/stream` remains the live SSE channel for in-flight output.
+6. `GET /api/dashboard` now includes `first_run`, `onboarding`, and `funnel`
+   so the client does not infer onboarding state on its own.
+
+Example validation response:
+
+```json
+{
+  "canonical_root": "/srv/repos/harness",
+  "project_id": "/srv/repos/harness",
+  "display_name": "harness",
+  "repo": "majiayu000/harness",
+  "errors": []
+}
+```
+
+Example task-create response:
+
+```json
+{
+  "task_id": "7d4f0f4f-5e94-4df2-a8d2-6d3374cce936",
+  "status": "pending",
+  "deduped": false,
+  "task_url": "/?task=7d4f0f4f-5e94-4df2-a8d2-6d3374cce936"
+}
+```
 
 ### JSON-RPC 2.0 — agent-facing (data plane)
 
@@ -132,6 +173,7 @@ The design is intentional:
 |---|---|
 | Submit a task from a CI script | `POST /tasks` (HTTP) |
 | Stream live output from a running task | `GET /tasks/{id}/stream` (HTTP SSE) |
+| Validate a repository root before registration | `POST /projects/validate` (HTTP) |
 | Register a new project | `POST /projects` (HTTP) |
 | Run an agent thread interactively | `turn/start` (JSON-RPC) |
 | Inspect or cancel a running turn | `turn/status` / `turn/cancel` (JSON-RPC) |

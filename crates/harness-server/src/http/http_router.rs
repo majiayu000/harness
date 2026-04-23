@@ -40,6 +40,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
                 .get(crate::handlers::projects::list_projects),
         )
         .route(
+            "/projects/validate",
+            post(crate::handlers::projects::validate_project),
+        )
+        .route(
             "/projects/{id}",
             get(crate::handlers::projects::get_project)
                 .delete(crate::handlers::projects::delete_project),

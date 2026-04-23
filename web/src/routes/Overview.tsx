@@ -10,7 +10,7 @@ import { Feed } from "@/components/Feed";
 import { AlertList } from "@/components/AlertList";
 import { StatusBadge } from "@/components/StatusBadge";
 import { PaletteFab } from "@/components/PaletteFab";
-import { useOperatorSnapshot, useOverview } from "@/lib/queries";
+import { useDashboard, useOperatorSnapshot, useOverview } from "@/lib/queries";
 import { OperatorPanel } from "./overview/OperatorPanel";
 import { fmtInt, fmtPct, fmtScore } from "@/lib/format";
 
@@ -25,6 +25,7 @@ const SERIES_COLORS = [
 
 export function Overview() {
   const { data, isError } = useOverview();
+  const { data: dashboard } = useDashboard();
   const { isError: isOperatorSnapshotError } = useOperatorSnapshot();
   const isSystemHealthy = !isError && !isOperatorSnapshotError;
 
@@ -79,6 +80,19 @@ export function Overview() {
           </div>
 
           <div className="grid grid-cols-6 border-b border-line">
+            {dashboard?.first_run ? (
+              <div className="col-span-6 border-b border-line bg-rust/8 px-6 py-5">
+                <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-rust">
+                  First run
+                </div>
+                <div className="mt-2 text-[18px] text-ink">
+                  Register a project, submit one focused task, then inspect the proof of work.
+                </div>
+                <div className="mt-2 text-[13px] text-ink-2 max-w-[760px]">
+                  The control-plane metrics below are most useful after you complete the first operator loop. Use the dashboard setup flow first if you have not seen a live run yet.
+                </div>
+              </div>
+            ) : null}
             <KpiCard label="Active tasks" value={fmtInt(data?.kpi.active_tasks)} delta={`window ${data?.window.hours ?? 24}h`} />
             <KpiCard label="Merged · 24h" value={fmtInt(data?.kpi.merged_24h)} delta="in window" />
             <KpiCard

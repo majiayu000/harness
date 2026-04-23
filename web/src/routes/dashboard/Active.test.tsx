@@ -10,6 +10,10 @@ vi.mock("@/lib/queries", () => ({
   useDashboard: vi.fn(),
 }));
 
+vi.mock("./TaskDetailPanel", () => ({
+  TaskDetailPanel: () => <div>task detail</div>,
+}));
+
 import { useTasks, useDashboard } from "@/lib/queries";
 
 const mockUseTasks = useTasks as ReturnType<typeof vi.fn>;
@@ -66,7 +70,7 @@ describe("<Active>", () => {
 
   it("filters to matching project when projectFilter is set", () => {
     mockUseTasks.mockReturnValue({ data: tasks, isLoading: false, isError: false });
-    wrap(<Active projectFilter="harness" />);
+    wrap(<Active projectFilter="harness" selectedTaskId={null} onSelectTask={vi.fn()} />);
     expect(screen.getByText("t1")).toBeInTheDocument();
     expect(screen.getByText("t3")).toBeInTheDocument();
     expect(screen.queryByText("t2")).not.toBeInTheDocument();
@@ -75,7 +79,7 @@ describe("<Active>", () => {
 
   it("shows all non-terminal tasks when no projectFilter", () => {
     mockUseTasks.mockReturnValue({ data: tasks, isLoading: false, isError: false });
-    wrap(<Active />);
+    wrap(<Active selectedTaskId={null} onSelectTask={vi.fn()} />);
     expect(screen.getByText("t1")).toBeInTheDocument();
     expect(screen.getByText("t2")).toBeInTheDocument();
     expect(screen.getByText("t3")).toBeInTheDocument();
@@ -84,7 +88,7 @@ describe("<Active>", () => {
 
   it("shows empty columns when projectFilter matches no tasks", () => {
     mockUseTasks.mockReturnValue({ data: tasks, isLoading: false, isError: false });
-    wrap(<Active projectFilter="nonexistent" />);
+    wrap(<Active projectFilter="nonexistent" selectedTaskId={null} onSelectTask={vi.fn()} />);
     expect(screen.queryByText("t1")).not.toBeInTheDocument();
     expect(screen.queryByText("t2")).not.toBeInTheDocument();
     const dashes = screen.getAllByText("—");
@@ -101,7 +105,7 @@ describe("<Active>", () => {
       workflow: { state: "addressing_feedback", pr_number: 124 },
     };
     mockUseTasks.mockReturnValue({ data: [ready, feedback], isLoading: false, isError: false });
-    wrap(<Active projectFilter="harness" />);
+    wrap(<Active projectFilter="harness" selectedTaskId={null} onSelectTask={vi.fn()} />);
 
     expect(screen.getByText("wf Ready To Merge")).toBeInTheDocument();
     expect(screen.getByText("wf Addressing Feedback")).toBeInTheDocument();

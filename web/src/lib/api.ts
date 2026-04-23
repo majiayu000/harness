@@ -14,6 +14,7 @@ export class ApiError extends Error {
   constructor(
     public readonly status: number,
     message: string,
+    public readonly details?: unknown,
   ) {
     super(message);
     this.name = "ApiError";
@@ -43,7 +44,23 @@ export async function apiFetch(
     throw new ApiError(401, `${path} → 401`);
   }
   if (!resp.ok) {
-    throw new ApiError(resp.status, `${path} → HTTP ${resp.status}`);
+    let body: unknown = null;
+    let message = `${path} → HTTP ${resp.status}`;
+    try {
+      body = await resp.clone().json();
+      if (body && typeof body === "object") {
+        const error = "error" in body ? body.error : undefined;
+        const errors = "errors" in body ? body.errors : undefined;
+        if (typeof error === "string" && error.trim()) {
+          message = error;
+        } else if (Array.isArray(errors) && typeof errors[0] === "string") {
+          message = errors[0];
+        }
+      }
+    } catch {
+      // Non-JSON error bodies fall back to the HTTP status message above.
+    }
+    throw new ApiError(resp.status, message, body);
   }
   return resp;
 }

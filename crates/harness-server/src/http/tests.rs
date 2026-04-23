@@ -968,6 +968,114 @@ async fn get_task_hides_internal_system_input_metadata() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn create_task_records_operator_funnel_submission_event() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+
+    let create_body = serde_json::json!({ "prompt": "add tests" });
+    let response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let events = state
+        .observability
+        .events
+        .query(&harness_core::types::EventFilters {
+            hook: Some("operator_funnel".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+    assert!(events.iter().any(|event| {
+        event
+            .content
+            .as_deref()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+            .and_then(|value| {
+                value
+                    .get("milestone")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string)
+            })
+            .as_deref()
+            == Some("task_submitted")
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_task_returns_joined_detail_payload() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+
+    let create_body = serde_json::json!({ "prompt": "add tests" });
+    let create_resp = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(create_resp.status(), StatusCode::ACCEPTED);
+
+    use http_body_util::BodyExt;
+    let create_body = create_resp.into_body().collect().await?.to_bytes();
+    let create_json: serde_json::Value = serde_json::from_slice(&create_body)?;
+    let task_id = harness_core::types::TaskId(
+        create_json["task_id"]
+            .as_str()
+            .expect("task_id should be string")
+            .to_string(),
+    );
+
+    state
+        .core
+        .tasks
+        .save_prompt(&task_id, 1, "implement", "redacted prompt")
+        .await?;
+    state
+        .core
+        .tasks
+        .insert_artifact(&task_id, 1, "stdout", "artifact content")
+        .await;
+    state
+        .core
+        .tasks
+        .write_checkpoint(&task_id, Some("triage"), Some("plan"), None, "plan_done")
+        .await?;
+
+    let get_resp = task_app(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/tasks/{}", task_id.0))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get_resp.status(), StatusCode::OK);
+
+    let get_body = get_resp.into_body().collect().await?.to_bytes();
+    let task_json: serde_json::Value = serde_json::from_slice(&get_body)?;
+    assert_eq!(task_json["id"], task_id.0);
+    assert_eq!(task_json["prompts"][0]["prompt"], "redacted prompt");
+    assert_eq!(task_json["artifacts"][0]["content"], "artifact content");
+    assert_eq!(task_json["completion"]["has_artifacts"], true);
+    assert_eq!(task_json["completion"]["has_prompts"], true);
+    assert_eq!(
+        task_json["completion"]["checkpoint"]["last_phase"],
+        "plan_done"
+    );    Ok(())
+}
+
+#[tokio::test]
 async fn intake_status_returns_three_channels() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;

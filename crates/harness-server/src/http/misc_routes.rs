@@ -6,12 +6,82 @@ use axum::{
     Json,
 };
 use harness_protocol::methods::RpcRequest;
+use serde::Serialize;
 use serde_json::json;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 
 use super::{state::AppState, task_routes};
 use crate::{router, task_runner};
+
+#[derive(Debug, Serialize)]
+struct TaskDetailCheckpoint {
+    triage_output: Option<String>,
+    plan_output: Option<String>,
+    pr_url: Option<String>,
+    last_phase: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskCompletionSummary {
+    is_terminal: bool,
+    status: String,
+    has_pr: bool,
+    has_artifacts: bool,
+    has_prompts: bool,
+    pr_url: Option<String>,
+    latest_artifact_at: Option<String>,
+    latest_prompt_at: Option<String>,
+    checkpoint: Option<TaskDetailCheckpoint>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskDetailResponse {
+    #[serde(flatten)]
+    task: task_runner::TaskState,
+    workflow: Option<harness_workflow::issue_lifecycle::IssueWorkflowInstance>,
+    prompts: Vec<crate::task_db::TaskPrompt>,
+    artifacts: Vec<crate::task_db::TaskArtifact>,
+    completion: TaskCompletionSummary,
+}
+
+async fn load_issue_workflow_for_summary(
+    state: &AppState,
+    summary: &task_runner::TaskSummary,
+) -> Option<harness_workflow::issue_lifecycle::IssueWorkflowInstance> {
+    let workflow_store = state.core.issue_workflow_store.as_ref()?;
+    let project_id = summary.project.as_deref()?;
+    let by_issue = summary
+        .external_id
+        .as_deref()
+        .and_then(|id| id.strip_prefix("issue:"))
+        .and_then(|n| n.parse::<u64>().ok());
+    let by_pr = summary
+        .external_id
+        .as_deref()
+        .and_then(|id| id.strip_prefix("pr:"))
+        .and_then(|n| n.parse::<u64>().ok())
+        .or_else(|| {
+            summary
+                .pr_url
+                .as_deref()
+                .and_then(crate::http::parse_pr_num_from_url)
+        });
+    match (by_issue, by_pr) {
+        (Some(issue), _) => workflow_store
+            .get_by_issue(project_id, summary.repo.as_deref(), issue)
+            .await
+            .ok()
+            .flatten(),
+        (None, Some(pr)) => workflow_store
+            .get_by_pr(project_id, summary.repo.as_deref(), pr)
+            .await
+            .ok()
+            .flatten(),
+        (None, None) => None,
+    }
+}
 
 pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let count = state.core.tasks.count();
@@ -474,41 +544,8 @@ pub(crate) async fn github_webhook(
 pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
     match state.core.tasks.list_all_summaries_with_terminal().await {
         Ok(mut summaries) => {
-            if let Some(workflow_store) = state.core.issue_workflow_store.as_ref() {
-                for summary in &mut summaries {
-                    let Some(project_id) = summary.project.as_deref() else {
-                        continue;
-                    };
-                    let by_issue = summary
-                        .external_id
-                        .as_deref()
-                        .and_then(|id| id.strip_prefix("issue:"))
-                        .and_then(|n| n.parse::<u64>().ok());
-                    let by_pr = summary
-                        .external_id
-                        .as_deref()
-                        .and_then(|id| id.strip_prefix("pr:"))
-                        .and_then(|n| n.parse::<u64>().ok())
-                        .or_else(|| {
-                            summary
-                                .pr_url
-                                .as_deref()
-                                .and_then(crate::http::parse_pr_num_from_url)
-                        });
-                    summary.workflow = match (by_issue, by_pr) {
-                        (Some(issue), _) => workflow_store
-                            .get_by_issue(project_id, summary.repo.as_deref(), issue)
-                            .await
-                            .ok()
-                            .flatten(),
-                        (None, Some(pr)) => workflow_store
-                            .get_by_pr(project_id, summary.repo.as_deref(), pr)
-                            .await
-                            .ok()
-                            .flatten(),
-                        (None, None) => None,
-                    };
-                }
+            for summary in &mut summaries {
+                summary.workflow = load_issue_workflow_for_summary(&state, summary).await;
             }
             Json(summaries).into_response()
         }
@@ -533,7 +570,77 @@ pub(crate) async fn get_task(
         .get_with_db_fallback(&harness_core::types::TaskId(id))
         .await
     {
-        Ok(Some(task)) => Json(task).into_response(),
+        Ok(Some(task)) => {
+            let summary = task.summary();
+            let workflow = load_issue_workflow_for_summary(&state, &summary).await;
+            let task_id = task.id.clone();
+            let prompts = match state.core.tasks.get_prompts(&task_id).await {
+                Ok(prompts) => prompts,
+                Err(e) => {
+                    tracing::error!("get_task: prompt query failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "internal server error"})),
+                    )
+                        .into_response();
+                }
+            };
+            let artifacts = match state.core.tasks.list_artifacts(&task_id).await {
+                Ok(artifacts) => artifacts,
+                Err(e) => {
+                    tracing::error!("get_task: artifact query failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "internal server error"})),
+                    )
+                        .into_response();
+                }
+            };
+            let checkpoint = match state.core.tasks.load_checkpoint(&task_id).await {
+                Ok(checkpoint) => checkpoint.map(|checkpoint| TaskDetailCheckpoint {
+                    triage_output: checkpoint.triage_output,
+                    plan_output: checkpoint.plan_output,
+                    pr_url: checkpoint.pr_url,
+                    last_phase: checkpoint.last_phase,
+                    updated_at: checkpoint.updated_at,
+                }),
+                Err(e) => {
+                    tracing::error!("get_task: checkpoint query failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "internal server error"})),
+                    )
+                        .into_response();
+                }
+            };
+            let completion = TaskCompletionSummary {
+                is_terminal: task.status.is_terminal(),
+                status: task.status.as_ref().to_string(),
+                has_pr: task.pr_url.is_some()
+                    || checkpoint
+                        .as_ref()
+                        .is_some_and(|checkpoint| checkpoint.pr_url.is_some()),
+                has_artifacts: !artifacts.is_empty(),
+                has_prompts: !prompts.is_empty(),
+                pr_url: task.pr_url.clone().or_else(|| {
+                    checkpoint
+                        .as_ref()
+                        .and_then(|checkpoint| checkpoint.pr_url.clone())
+                }),
+                latest_artifact_at: artifacts.last().map(|artifact| artifact.created_at.clone()),
+                latest_prompt_at: prompts.last().map(|prompt| prompt.created_at.clone()),
+                checkpoint,
+            };
+
+            Json(TaskDetailResponse {
+                task,
+                workflow,
+                prompts,
+                artifacts,
+                completion,
+            })
+            .into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "task not found"})),

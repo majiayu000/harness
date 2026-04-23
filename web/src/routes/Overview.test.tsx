@@ -7,12 +7,14 @@ import { PaletteProvider } from "@/lib/palette";
 import type { OperatorSnapshotPayload, OverviewPayload } from "@/types";
 
 vi.mock("@/lib/queries", () => ({
+  useDashboard: vi.fn(),
   useOverview: vi.fn(),
   useOperatorSnapshot: vi.fn(),
 }));
 
-import { useOperatorSnapshot, useOverview } from "@/lib/queries";
+import { useDashboard, useOperatorSnapshot, useOverview } from "@/lib/queries";
 
+const mockUseDashboard = useDashboard as ReturnType<typeof vi.fn>;
 const mockUseOverview = useOverview as ReturnType<typeof vi.fn>;
 const mockUseOperatorSnapshot = useOperatorSnapshot as ReturnType<typeof vi.fn>;
 
@@ -99,6 +101,7 @@ function makeSnapshot(): OperatorSnapshotPayload {
 
 describe("<Overview>", () => {
   it("shows a degraded status badge when operator snapshot fails even if overview succeeds", () => {
+    mockUseDashboard.mockReturnValue({ data: { first_run: false } });
     mockUseOverview.mockReturnValue({
       data: makeOverview(),
       isError: false,
@@ -115,6 +118,7 @@ describe("<Overview>", () => {
   });
 
   it("shows a healthy status badge only when both overview and operator snapshot succeed", () => {
+    mockUseDashboard.mockReturnValue({ data: { first_run: false } });
     mockUseOverview.mockReturnValue({
       data: makeOverview(),
       isError: false,

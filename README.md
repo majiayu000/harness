@@ -63,6 +63,7 @@ Harness is a Rust-native platform that wraps AI coding agents (Claude Code, Code
 ### Prerequisites
 
 - Rust 1.88+
+- Postgres 14+
 - At least one agent runtime:
   - [`codex`](https://github.com/openai/codex) CLI
   - [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI
@@ -74,6 +75,36 @@ Harness is a Rust-native platform that wraps AI coding agents (Claude Code, Code
 git clone https://github.com/majiayu000/harness.git
 cd harness
 cargo build
+```
+
+### First Successful Run
+
+1. Start Postgres and set `server.database_url` in your config.
+2. Start the HTTP server:
+
+```bash
+cargo run -p harness-cli -- serve --transport http --port 9800
+```
+
+3. Open the web UI at `http://127.0.0.1:9800/`.
+4. In the dashboard, register a repository root with the guided setup flow.
+5. Submit one focused task, let the UI redirect into `/?task=<id>`, and watch the live stream.
+6. Reopen the completed task from History to inspect the PR, prompts, artifacts, and checkpoint summary.
+
+If you prefer the raw HTTP control plane, the same loop is:
+
+```bash
+curl -X POST http://127.0.0.1:9800/projects/validate \
+  -H "Content-Type: application/json" \
+  -d '{"root": "/absolute/path/to/repo"}'
+
+curl -X POST http://127.0.0.1:9800/projects \
+  -H "Content-Type: application/json" \
+  -d '{"root": "/absolute/path/to/repo"}'
+
+curl -X POST http://127.0.0.1:9800/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"project": "/absolute/path/to/repo", "prompt": "Add a focused regression test for the latest failing behavior"}'
 ```
 
 ### Rust API Facade
@@ -150,6 +181,10 @@ cargo run -p harness-cli -- serve --transport http --port 9800
 curl http://127.0.0.1:9800/health
 ```
 
+Open `http://127.0.0.1:9800/` for the operator dashboard. The first-run flow
+validates a repository root, registers it, submits a task, and redirects into
+the live task detail view.
+
 **Stdio (for MCP integration):**
 
 ```bash
@@ -165,10 +200,19 @@ cargo run -p harness-cli -- exec "Fix the failing test in src/lib.rs"
 ### Common Workflows
 
 ```bash
-# Task management
+# Validate + register a project for the operator control plane
+curl -X POST http://127.0.0.1:9800/projects/validate \
+  -H "Content-Type: application/json" \
+  -d '{"root": "/absolute/path/to/repo"}'
+
+curl -X POST http://127.0.0.1:9800/projects \
+  -H "Content-Type: application/json" \
+  -d '{"root": "/absolute/path/to/repo"}'
+
+# Submit a task
 curl -X POST http://127.0.0.1:9800/tasks \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Add input validation to the API handler"}'
+  -d '{"project": "/absolute/path/to/repo", "prompt": "Add input validation to the API handler"}'
 
 # Rule engine
 cargo run -p harness-cli -- rule load .

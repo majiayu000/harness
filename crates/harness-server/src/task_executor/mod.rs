@@ -534,7 +534,7 @@ pub(crate) async fn run_task(
             (None, prompts::TriageComplexity::Medium, 0u32)
         } else {
             triage_pipeline::run_triage_plan_pipeline(
-                agent, store, task_id, issue, &cargo_env, &project, req,
+                agent, store, task_id, &events, issue, &cargo_env, &project, req,
             )
             .await?
         }
