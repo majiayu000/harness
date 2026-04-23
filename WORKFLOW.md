@@ -5,6 +5,7 @@ issue_workflow:
 pr_feedback:
   enabled: true
   sweep_interval_secs: 60
+  claim_stale_after_secs: 300
 storage:
   schema_namespace: workflow
 ---
@@ -26,6 +27,10 @@ Current externally configurable rules:
 
 - `pr_feedback.enabled`
   - Enables or disables automatic background PR feedback sweeping.
+
+- `pr_feedback.claim_stale_after_secs`
+  - Maximum age for a claimed feedback workflow before the sweeper reclaims it
+    after an interrupted enqueue path.
 
 - `storage.schema_namespace`
   - Stable namespace used for workflow persistence in Postgres so multiple instances do not split by local `data_dir` path.

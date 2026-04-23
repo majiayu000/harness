@@ -34,6 +34,13 @@ static ISSUE_WORKFLOW_MIGRATIONS: &[Migration] = &[
         sql: "CREATE INDEX IF NOT EXISTS idx_issue_workflows_pr
               ON issue_workflows ((data::jsonb->>'project_id'), ((data::jsonb->>'pr_number')::bigint))",
     },
+    Migration {
+        version: 4,
+        description: "index issue workflow feedback sweep candidates",
+        sql: "CREATE INDEX IF NOT EXISTS idx_issue_workflows_feedback_candidates
+              ON issue_workflows (((data::jsonb->>'state')), updated_at DESC)
+              WHERE data::jsonb->>'pr_number' IS NOT NULL",
+    },
 ];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -238,6 +245,16 @@ pub fn workflow_id(project_id: &str, repo: Option<&str>, issue_number: u64) -> S
     )
 }
 
+pub fn legacy_schema_for_path(path: &Path) -> anyhow::Result<String> {
+    let path_utf8 = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
+    let digest = Sha256::digest(path_utf8.as_bytes());
+    let mut schema_bytes = [0u8; 8];
+    schema_bytes.copy_from_slice(&digest[..8]);
+    Ok(format!("h{:016x}", u64::from_le_bytes(schema_bytes)))
+}
+
 pub struct IssueWorkflowStore {
     pool: PgPool,
 }
@@ -252,13 +269,7 @@ impl IssueWorkflowStore {
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
         let database_url = resolve_database_url(configured_database_url)?;
-        let path_utf8 = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
-        let digest = Sha256::digest(path_utf8.as_bytes());
-        let mut schema_bytes = [0u8; 8];
-        schema_bytes.copy_from_slice(&digest[..8]);
-        let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
+        let schema = legacy_schema_for_path(path)?;
 
         let setup = pg_open_pool(&database_url).await?;
         pg_create_schema_if_not_exists(&setup, &schema).await?;
@@ -387,6 +398,13 @@ impl IssueWorkflowStore {
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
             .collect()
+    }
+
+    pub async fn row_count(&self) -> anyhow::Result<i64> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM issue_workflows")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
     }
 
     pub async fn record_issue_scheduled(
@@ -545,23 +563,40 @@ impl IssueWorkflowStore {
     pub async fn claim_feedback_candidates(
         &self,
         limit: i64,
+        stale_before: DateTime<Utc>,
     ) -> anyhow::Result<Vec<IssueWorkflowInstance>> {
         let mut tx = self.pool.begin().await?;
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT id, data FROM issue_workflows
-             WHERE data::jsonb->>'state' IN ('pr_open', 'awaiting_feedback')
-               AND data::jsonb->>'pr_number' IS NOT NULL
+             WHERE data::jsonb->>'pr_number' IS NOT NULL
+               AND (
+                    data::jsonb->>'state' IN ('pr_open', 'awaiting_feedback')
+                    OR (
+                        data::jsonb->>'state' = 'addressing_feedback'
+                        AND updated_at <= $2
+                    )
+               )
              ORDER BY updated_at DESC
              LIMIT $1
              FOR UPDATE SKIP LOCKED",
         )
         .bind(limit)
+        .bind(stale_before)
         .fetch_all(&mut *tx)
         .await?;
 
         let mut claimed = Vec::with_capacity(rows.len());
         for (workflow_id, data) in rows {
-            let mut workflow: IssueWorkflowInstance = serde_json::from_str(&data)?;
+            let mut workflow: IssueWorkflowInstance = match serde_json::from_str(&data) {
+                Ok(workflow) => workflow,
+                Err(e) => {
+                    tracing::warn!(
+                        workflow_id = %workflow_id,
+                        "workflow feedback sweep: skipping malformed workflow row while claiming candidates: {e}"
+                    );
+                    continue;
+                }
+            };
             let claim_id = format!("claim:{}", workflow.id);
             if let Some(pr_number) = workflow.pr_number {
                 let pr_url = workflow.pr_url.clone().unwrap_or_default();
@@ -913,6 +948,89 @@ mod tests {
             .await?
             .expect("workflow");
         assert_eq!(workflow.state, IssueLifecycleState::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_feedback_candidates_reclaims_stale_claims() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let project_id = "/tmp/project-stale-claim";
+        store
+            .record_issue_scheduled(project_id, Some("owner/repo"), 9, "task-1", &[], false)
+            .await?;
+        store
+            .record_pr_detected(
+                project_id,
+                Some("owner/repo"),
+                9,
+                "task-1",
+                77,
+                "https://github.com/owner/repo/pull/77",
+            )
+            .await?;
+        store
+            .record_feedback_task_scheduled(project_id, Some("owner/repo"), 77, "task-2")
+            .await?;
+
+        let mut workflow = store
+            .get_by_pr(project_id, Some("owner/repo"), 77)
+            .await?
+            .expect("workflow");
+        workflow.feedback_claimed_at = Some(Utc::now() - chrono::Duration::minutes(10));
+        store.upsert(&workflow).await?;
+        sqlx::query(
+            "UPDATE issue_workflows
+             SET updated_at = CURRENT_TIMESTAMP - INTERVAL '10 minutes'
+             WHERE id = $1",
+        )
+        .bind(&workflow.id)
+        .execute(&store.pool)
+        .await?;
+
+        let claimed = store
+            .claim_feedback_candidates(16, Utc::now() - chrono::Duration::minutes(5))
+            .await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].pr_number, Some(77));
+        assert_eq!(claimed[0].state, IssueLifecycleState::AddressingFeedback);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_feedback_candidates_skips_malformed_rows() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let project_id = "/tmp/project-malformed";
+        store
+            .record_issue_scheduled(project_id, Some("owner/repo"), 10, "task-1", &[], false)
+            .await?;
+        store
+            .record_pr_detected(
+                project_id,
+                Some("owner/repo"),
+                10,
+                "task-1",
+                88,
+                "https://github.com/owner/repo/pull/88",
+            )
+            .await?;
+        sqlx::query(
+            "INSERT INTO issue_workflows (id, data) VALUES ($1, $2)
+             ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+        )
+        .bind("malformed-workflow")
+        .bind(r#"{"project_id":"/tmp/project-malformed","repo":"owner/repo","state":"pr_open","pr_number":999}"#)
+        .execute(&store.pool)
+        .await?;
+
+        let claimed = store
+            .claim_feedback_candidates(16, Utc::now() - chrono::Duration::minutes(5))
+            .await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].pr_number, Some(88));
         Ok(())
     }
 }

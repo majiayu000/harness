@@ -15,6 +15,8 @@ pub struct PrFeedbackPolicy {
     pub enabled: bool,
     #[serde(default = "default_feedback_sweep_interval_secs")]
     pub sweep_interval_secs: u64,
+    #[serde(default = "default_feedback_claim_stale_after_secs")]
+    pub claim_stale_after_secs: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -47,6 +49,7 @@ impl Default for PrFeedbackPolicy {
         Self {
             enabled: default_true(),
             sweep_interval_secs: default_feedback_sweep_interval_secs(),
+            claim_stale_after_secs: default_feedback_claim_stale_after_secs(),
         }
     }
 }
@@ -65,6 +68,10 @@ fn default_force_execute_label() -> String {
 
 fn default_feedback_sweep_interval_secs() -> u64 {
     60
+}
+
+fn default_feedback_claim_stale_after_secs() -> u64 {
+    300
 }
 
 fn default_workflow_schema_namespace() -> String {
@@ -119,6 +126,7 @@ mod tests {
         assert_eq!(cfg.issue_workflow.force_execute_label, "force-execute");
         assert!(cfg.pr_feedback.enabled);
         assert_eq!(cfg.pr_feedback.sweep_interval_secs, 60);
+        assert_eq!(cfg.pr_feedback.claim_stale_after_secs, 300);
         assert!(cfg.issue_workflow.auto_replan_on_plan_issue);
         assert_eq!(cfg.storage.schema_namespace, "workflow");
         Ok(())
@@ -136,6 +144,7 @@ issue_workflow:
 pr_feedback:
   enabled: false
   sweep_interval_secs: 15
+  claim_stale_after_secs: 45
 storage:
   schema_namespace: orchestration
 ---
@@ -152,6 +161,7 @@ Body
         assert!(!cfg.issue_workflow.auto_replan_on_plan_issue);
         assert!(!cfg.pr_feedback.enabled);
         assert_eq!(cfg.pr_feedback.sweep_interval_secs, 15);
+        assert_eq!(cfg.pr_feedback.claim_stale_after_secs, 45);
         assert_eq!(cfg.storage.schema_namespace, "orchestration");
         Ok(())
     }

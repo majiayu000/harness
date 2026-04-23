@@ -285,7 +285,12 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                 continue;
             };
 
-            let candidates = match issue_workflows.claim_feedback_candidates(128).await {
+            let stale_before = chrono::Utc::now()
+                - chrono::Duration::seconds(workflow_cfg.pr_feedback.claim_stale_after_secs as i64);
+            let candidates = match issue_workflows
+                .claim_feedback_candidates(128, stale_before)
+                .await
+            {
                 Ok(candidates) => candidates,
                 Err(e) => {
                     tracing::warn!("workflow feedback sweep: failed to claim candidates: {e}");
