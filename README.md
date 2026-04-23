@@ -302,7 +302,16 @@ curl -X POST http://127.0.0.1:9800/tasks \
   -d '{
     "project": "/path/to/project",
     "issue": 42,
-    "description": "fix: handle edge case in parser"
+    "prompt": "fix: handle edge case in parser"
+  }'
+
+# Submit an issue task but bypass triage/plan and go straight to implementation
+curl -X POST http://127.0.0.1:9800/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project": "/path/to/project",
+    "issue": 42,
+    "skip_triage": true
   }'
 
 # Submit a task by PR number (for review/fix)

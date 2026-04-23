@@ -41,6 +41,7 @@ pub use state::{
 
 // Handler re-exports — moved to focused submodules, kept accessible via `crate::http::`.
 pub(crate) use misc_routes::{
+    get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
     get_task, get_task_artifacts, get_task_prompts, github_webhook, handle_rpc, health_check,
     ingest_signal, intake_status, list_tasks, password_reset, project_queue_stats,
 };
@@ -144,6 +145,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
     // Re-dispatch tasks recovered from plan/triage checkpoints but without a PR.
     background::spawn_checkpoint_recovery(&state).await;
+
+    // Periodically sweep issue workflows with attached PRs and automatically
+    // enqueue `pr:N` tasks so PR feedback is handled without manual resubmission.
+    background::spawn_issue_workflow_feedback_sweeper(&state);
 
     let initial_grade = {
         let events = state

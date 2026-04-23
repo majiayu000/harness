@@ -17,8 +17,8 @@ pub use contract::{
     test_gate_failure_prompt, validation_retry_prompt,
 };
 pub use issue::{
-    gc_adopt_prompt, implement_from_issue, implement_from_prompt, plan_prompt, triage_prompt,
-    wrap_external_data,
+    gc_adopt_prompt, implement_from_issue, implement_from_prompt, plan_prompt, replan_prompt,
+    triage_prompt, wrap_external_data,
 };
 pub use parsing::{
     extract_pr_number, extract_review_issues, is_lgtm, is_quota_exhausted, is_waiting,

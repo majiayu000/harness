@@ -197,6 +197,7 @@ async fn make_state_inner(
         task_queue.clone(),
         None,
         None,
+        None,
         vec![],
     );
 
@@ -211,6 +212,8 @@ async fn make_state_inner(
             thread_db: Some(thread_db),
             plan_db: None,
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+            issue_workflow_store: None,
+            project_workflow_store: None,
             project_registry: None,
             runtime_state_store: None,
             q_values: None,

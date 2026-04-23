@@ -5,6 +5,7 @@ pub mod misc;
 pub mod project;
 pub mod resolve;
 pub mod server;
+pub mod workflow;
 
 use self::agents::*;
 use self::intake::*;

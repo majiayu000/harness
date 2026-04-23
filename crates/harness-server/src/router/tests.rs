@@ -60,6 +60,7 @@ async fn make_test_state_with_config_and_registry(
         Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         None,
         None,
+        None,
         vec![],
     );
     Ok(AppState {
@@ -73,6 +74,8 @@ async fn make_test_state_with_config_and_registry(
             thread_db: Some(thread_db),
             plan_db: None,
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+            issue_workflow_store: None,
+            project_workflow_store: None,
             project_registry: None,
             runtime_state_store: None,
             q_values: None,
@@ -1385,6 +1388,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         None,
         None,
+        None,
         vec![],
     );
     Ok(AppState {
@@ -1398,6 +1402,8 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             thread_db: Some(thread_db),
             plan_db: Some(plan_db),
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+            issue_workflow_store: None,
+            project_workflow_store: None,
             project_registry: None,
             runtime_state_store: None,
             q_values: None,

@@ -73,6 +73,10 @@ pub(crate) struct TaskContext {
     pub project: std::path::PathBuf,
 }
 
+fn should_run_issue_triage(skip_triage: bool, has_existing_pr: bool) -> bool {
+    !skip_triage && !has_existing_pr
+}
+
 /// Run the project's test commands as a hard gate before accepting LGTM.
 ///
 /// When `custom_cmds` is non-empty (from `validation.pre_push` in project config),
@@ -167,6 +171,7 @@ pub(crate) async fn run_task(
     req: &CreateTaskRequest,
     project: PathBuf,
     server_config: &harness_core::config::HarnessConfig,
+    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     // Accumulated turn count from previous transient-retry attempts.
     // Ensures the max_turns budget is global across the full task lifecycle,
     // not reset on each retry (fix for budget-reset-on-retry bug).
@@ -265,15 +270,22 @@ pub(crate) async fn run_task(
             .ok()
             .flatten()
             .is_some();
-        if !has_existing_pr {
+        if has_existing_pr {
+            // Fresh issue task reusing an existing PR — treat as resumed for conflict gating.
+            was_resumed_pr = true;
+            (None, prompts::TriageComplexity::Medium, 0u32)
+        } else if !should_run_issue_triage(req.skip_triage, has_existing_pr) {
+            tracing::info!(
+                task_id = %task_id,
+                issue,
+                "issue request opted to skip triage/plan pipeline"
+            );
+            (None, prompts::TriageComplexity::Medium, 0u32)
+        } else {
             triage_pipeline::run_triage_plan_pipeline(
                 agent, store, task_id, issue, &cargo_env, &project, req,
             )
             .await?
-        } else {
-            // Fresh issue task reusing an existing PR — treat as resumed for conflict gating.
-            was_resumed_pr = true;
-            (None, prompts::TriageComplexity::Medium, 0u32)
         }
     } else {
         // Planning gate (task_runner) may have forced TaskPhase::Plan for a
@@ -324,40 +336,126 @@ pub(crate) async fn run_task(
 
     let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
 
-    // Run the implement phase (prompt construction + agent execution + PR detection).
-    let outcome = implement_pipeline::run_implement_phase(
-        store,
-        task_id,
-        agent,
-        req,
-        server_config,
-        &project_config,
-        review_config,
-        &interceptors,
-        &events,
-        &skills,
-        &cargo_env,
-        git,
-        &repo_slug,
-        &project,
-        plan_output,
-        resumed_pr_url,
-        turn_timeout,
-        effective_max_turns,
-        &mut turns_used,
-        turns_used_acc,
-        task_start,
-    )
-    .await?;
+    if let (Some(workflows), Some(issue_number)) = (issue_workflow_store.as_ref(), req.issue) {
+        let project_id = project.to_string_lossy().into_owned();
+        if let Err(e) = workflows
+            .record_implement_started(&project_id, req.repo.as_deref(), issue_number, &task_id.0)
+            .await
+        {
+            tracing::warn!(
+                issue = issue_number,
+                task_id = %task_id.0,
+                "issue workflow implement-start tracking failed: {e}"
+            );
+        }
+    }
 
-    let (pr_url, pr_num, context_items) = match outcome {
-        implement_pipeline::ImplementOutcome::Done => return Ok(()),
-        implement_pipeline::ImplementOutcome::Proceed {
-            pr_url,
-            pr_num,
-            context_items,
-            ..
-        } => (pr_url, pr_num, context_items),
+    let mut current_plan_output = plan_output;
+    let mut replan_attempted = false;
+    let (pr_url, pr_num, context_items) = loop {
+        let outcome = implement_pipeline::run_implement_phase(
+            store,
+            task_id,
+            agent,
+            req,
+            server_config,
+            &project_config,
+            review_config,
+            &interceptors,
+            &events,
+            &skills,
+            &cargo_env,
+            git,
+            &repo_slug,
+            &project,
+            current_plan_output.clone(),
+            resumed_pr_url.clone(),
+            issue_workflow_store.clone(),
+            turn_timeout,
+            effective_max_turns,
+            &mut turns_used,
+            turns_used_acc,
+            task_start,
+        )
+        .await?;
+
+        match outcome {
+            implement_pipeline::ImplementOutcome::Done => return Ok(()),
+            implement_pipeline::ImplementOutcome::Proceed {
+                pr_url,
+                pr_num,
+                context_items,
+                ..
+            } => break (pr_url, pr_num, context_items),
+            implement_pipeline::ImplementOutcome::Replan {
+                issue,
+                plan_issue,
+                prior_plan,
+            } => {
+                if replan_attempted {
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.error = Some(format!("PLAN_ISSUE persisted after replan: {plan_issue}"));
+                    })
+                    .await?;
+                    return Ok(());
+                }
+
+                let workflow_cfg = harness_core::config::workflow::load_workflow_config(&project)
+                    .unwrap_or_default();
+
+                if req.force_execute {
+                    let forced_plan = match prior_plan.or(current_plan_output.clone()) {
+                        Some(plan) => format!(
+                            "{plan}\n\nExecution override: this issue is force_execute.\n\
+                             Previous plan concern:\n{}",
+                            prompts::wrap_external_data(&plan_issue)
+                        ),
+                        None => format!(
+                            "Execution override: this issue is force_execute.\n\
+                             Previous plan concern:\n{}",
+                            prompts::wrap_external_data(&plan_issue)
+                        ),
+                    };
+                    current_plan_output = Some(forced_plan);
+                } else if workflow_cfg.issue_workflow.auto_replan_on_plan_issue {
+                    if let Some(max) = effective_max_turns {
+                        if turns_used >= max {
+                            return Err(anyhow::anyhow!(
+                                "Turn budget exhausted before replan: used {} of {} allowed turns",
+                                turns_used,
+                                max
+                            ));
+                        }
+                    }
+                    let new_plan = triage_pipeline::run_replan_for_issue(
+                        agent,
+                        store,
+                        task_id,
+                        issue,
+                        prior_plan.as_deref().or(current_plan_output.as_deref()),
+                        &plan_issue,
+                        &cargo_env,
+                        &project,
+                        req,
+                    )
+                    .await?;
+                    turns_used += 1;
+                    *turns_used_acc = turns_used;
+                    current_plan_output = Some(new_plan);
+                } else {
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.error = Some(format!(
+                            "PLAN_ISSUE encountered and auto_replan_on_plan_issue=false: {plan_issue}"
+                        ));
+                    })
+                    .await?;
+                    return Ok(());
+                }
+                replan_attempted = true;
+            }
+        }
     };
 
     // Gate A: require pr_url when the implement phase extracted a pr_num.
@@ -720,6 +818,13 @@ mod tests {
             implement_pipeline::task_needs_pr_url(&req),
             "issue task must require PR_URL"
         );
+    }
+
+    #[test]
+    fn issue_triage_runs_only_when_not_skipped_and_no_existing_pr() {
+        assert!(should_run_issue_triage(false, false));
+        assert!(!should_run_issue_triage(true, false));
+        assert!(!should_run_issue_triage(false, true));
     }
 
     #[test]

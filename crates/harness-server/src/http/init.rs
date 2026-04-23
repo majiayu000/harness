@@ -44,6 +44,11 @@ pub(super) fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
     path.to_path_buf()
 }
 
+fn parse_external_id_number(prefix: &str, external_id: Option<&str>) -> Option<u64> {
+    let value = external_id?;
+    value.strip_prefix(prefix)?.parse::<u64>().ok()
+}
+
 /// Build an AppState with all stores. Used by both HTTP and stdio transports.
 ///
 /// Initialization is split into five ordered phases — each phase's outputs
@@ -185,6 +190,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             thread_db: Some(registry.thread_db),
             plan_db: Some(registry.plan_db),
             plan_cache: registry.plan_cache,
+            issue_workflow_store: registry.issue_workflow_store,
+            project_workflow_store: registry.project_workflow_store,
             project_registry: Some(registry.project_registry),
             runtime_state_store: registry.runtime_state_store,
             q_values: storage.q_values,
@@ -242,6 +249,7 @@ pub(crate) fn build_completion_callback(
     review_config: harness_core::config::agents::AgentReviewConfig,
     quality_trigger: Option<Arc<crate::quality_trigger::QualityTrigger>>,
     config_github_token: Option<String>,
+    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
 ) -> Option<task_runner::CompletionCallback> {
     let mut sources: std::collections::HashMap<String, Arc<dyn crate::intake::IntakeSource>> =
         std::collections::HashMap::new();
@@ -268,6 +276,7 @@ pub(crate) fn build_completion_callback(
         let review_config = review_config.clone();
         let quality_trigger = quality_trigger.clone();
         let github_token = config_github_token.clone();
+        let issue_workflow_store = issue_workflow_store.clone();
         Box::pin(async move {
             // Grade recent events and auto-trigger GC if quality is poor.
             if let Some(qt) = quality_trigger {
@@ -346,6 +355,83 @@ pub(crate) fn build_completion_callback(
                                     );
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            if let (Some(workflows), Some(project_root)) =
+                (issue_workflow_store.as_ref(), task.project_root.as_ref())
+            {
+                let project_id = project_root.to_string_lossy().into_owned();
+                let task_error = task.error.as_deref();
+                if let Some(issue_number) = task
+                    .issue
+                    .or_else(|| parse_external_id_number("issue:", task.external_id.as_deref()))
+                {
+                    let final_state = match task.status {
+                        task_runner::TaskStatus::Done => {
+                            if task.pr_url.is_none() {
+                                Some(harness_workflow::issue_lifecycle::IssueLifecycleState::Done)
+                            } else {
+                                None
+                            }
+                        }
+                        task_runner::TaskStatus::Failed => {
+                            Some(harness_workflow::issue_lifecycle::IssueLifecycleState::Failed)
+                        }
+                        task_runner::TaskStatus::Cancelled => {
+                            Some(harness_workflow::issue_lifecycle::IssueLifecycleState::Cancelled)
+                        }
+                        _ => None,
+                    };
+                    if let Some(final_state) = final_state {
+                        if let Err(e) = workflows
+                            .record_terminal_for_issue(
+                                &project_id,
+                                task.repo.as_deref(),
+                                issue_number,
+                                final_state,
+                                task_error,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                issue = issue_number,
+                                task_id = ?task.id,
+                                "issue workflow terminal update failed: {e}"
+                            );
+                        }
+                    }
+                } else if let Some(pr_number) = task
+                    .pr_url
+                    .as_deref()
+                    .and_then(crate::http::parse_pr_num_from_url)
+                    .or_else(|| parse_external_id_number("pr:", task.external_id.as_deref()))
+                {
+                    let success = matches!(task.status, task_runner::TaskStatus::Done);
+                    if matches!(
+                        task.status,
+                        task_runner::TaskStatus::Done
+                            | task_runner::TaskStatus::Failed
+                            | task_runner::TaskStatus::Cancelled
+                    ) {
+                        if let Err(e) = workflows
+                            .record_terminal_for_pr(
+                                &project_id,
+                                task.repo.as_deref(),
+                                pr_number,
+                                success,
+                                matches!(task.status, task_runner::TaskStatus::Cancelled),
+                                task_error,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                pr = pr_number,
+                                task_id = ?task.id,
+                                "issue workflow PR terminal update failed: {e}"
+                            );
                         }
                     }
                 }

@@ -113,6 +113,7 @@ async fn make_test_state_with(
         Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         None,
         None,
+        None,
         vec![],
     );
     Ok(Arc::new(AppState {
@@ -126,6 +127,8 @@ async fn make_test_state_with(
             thread_db: Some(thread_db),
             plan_db: None,
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+            issue_workflow_store: None,
+            project_workflow_store: None,
             project_registry: None,
             runtime_state_store: None,
             q_values: None,

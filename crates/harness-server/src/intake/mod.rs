@@ -165,6 +165,26 @@ impl IntakeOrchestrator {
         // 2. Run a separate sprint planner per repo, all in parallel.
         let mut handles = Vec::new();
         for (repo, issues) in by_repo {
+            let project_root = issues
+                .first()
+                .and_then(|(_, i)| i.project_root.clone())
+                .unwrap_or_else(|| state.core.project_root.clone());
+            let project_id =
+                match crate::task_runner::resolve_canonical_project(Some(project_root)).await {
+                    Ok(path) => path.to_string_lossy().into_owned(),
+                    Err(_) => state.core.project_root.to_string_lossy().into_owned(),
+                };
+            if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+                if let Err(e) = workflows
+                    .record_poll_started(&project_id, Some(&repo))
+                    .await
+                {
+                    tracing::warn!(
+                        repo,
+                        "intake: failed to mark project workflow poll state: {e}"
+                    );
+                }
+            }
             let state = Arc::clone(state);
             let planner_agent = self.planner_agent.clone();
             let sprint_timeout = self.sprint_timeout;
@@ -303,16 +323,40 @@ async fn run_repo_sprint(
     retry_backoff_base: Duration,
     retry_backoff_max: Duration,
 ) {
+    let project_root = issues
+        .first()
+        .and_then(|(_, i)| i.project_root.clone())
+        .unwrap_or_else(|| state.core.project_root.clone());
+    let project_id = match crate::task_runner::resolve_canonical_project(Some(project_root.clone()))
+        .await
+    {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(e) => {
+            tracing::warn!(
+                repo,
+                "intake: failed to canonicalize project root for workflow lookup, using raw path: {e}"
+            );
+            project_root.to_string_lossy().into_owned()
+        }
+    };
+
+    if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+        if let Err(e) = workflows
+            .record_planning_started(&project_id, Some(repo))
+            .await
+        {
+            tracing::warn!(
+                repo,
+                "intake: failed to mark project workflow planning state: {e}"
+            );
+        }
+    }
+
     tracing::info!(
         repo,
         count = issues.len(),
         "intake: planning sprint for repo"
     );
-
-    let project_root = issues
-        .first()
-        .and_then(|(_, i)| i.project_root.clone())
-        .unwrap_or_else(|| state.core.project_root.clone());
 
     // 1. Run sprint planner.
     let issue_summary = build_issue_summary(&issues);
@@ -328,10 +372,37 @@ async fn run_repo_sprint(
 
     let planner_task_id = match crate::http::task_routes::enqueue_task(state, planner_req).await {
         Ok(id) => {
+            if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+                if let Err(e) = workflows
+                    .record_planner_enqueued(&project_id, Some(repo), &id.0)
+                    .await
+                {
+                    tracing::warn!(
+                        repo,
+                        task_id = %id,
+                        "intake: failed to record planner enqueue on project workflow: {e}"
+                    );
+                }
+            }
             tracing::info!(repo, task_id = %id, "intake: sprint planner enqueued");
             id
         }
         Err(e) => {
+            if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+                if let Err(track_err) = workflows
+                    .record_degraded(
+                        &project_id,
+                        Some(repo),
+                        &format!("failed to enqueue sprint planner: {e:?}"),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        repo,
+                        "intake: failed to record degraded project workflow state: {track_err}"
+                    );
+                }
+            }
             tracing::error!(repo, "intake: failed to enqueue sprint planner: {e:?}");
             return;
         }
@@ -340,11 +411,33 @@ async fn run_repo_sprint(
     let Some(planner_output) =
         poll_task_output(&state.core.tasks, &planner_task_id, sprint_timeout).await
     else {
+        if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+            if let Err(e) = workflows
+                .record_degraded(&project_id, Some(repo), "sprint planner failed")
+                .await
+            {
+                tracing::warn!(
+                    repo,
+                    "intake: failed to record degraded project workflow state: {e}"
+                );
+            }
+        }
         tracing::error!(repo, task_id = %planner_task_id, "intake: sprint planner failed");
         return;
     };
 
     let Some(plan) = harness_core::prompts::parse_sprint_plan(&planner_output) else {
+        if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+            if let Err(e) = workflows
+                .record_degraded(&project_id, Some(repo), "failed to parse sprint plan")
+                .await
+            {
+                tracing::warn!(
+                    repo,
+                    "intake: failed to record degraded project workflow state: {e}"
+                );
+            }
+        }
         tracing::error!(repo, task_id = %planner_task_id, "intake: failed to parse sprint plan");
         return;
     };
@@ -407,20 +500,9 @@ async fn run_repo_sprint(
         return;
     }
 
-    let project_id = match crate::task_runner::resolve_canonical_project(Some(project_root.clone()))
-        .await
-    {
-        Ok(path) => path.to_string_lossy().into_owned(),
-        Err(e) => {
-            tracing::warn!(
-                repo,
-                "intake: failed to canonicalize project root for slot limit lookup, using raw path: {e}"
-            );
-            project_root.to_string_lossy().into_owned()
-        }
-    };
     let start = tokio::time::Instant::now();
     let mut transient_retry_count = 0u32;
+    let mut project_workflow_monitoring_started = false;
 
     'sprint: loop {
         // All done?
@@ -447,6 +529,19 @@ async fn run_repo_sprint(
         // Fill available slots.
         let available =
             sprint_available_slots(&state.concurrency.task_queue.diagnostics(&project_id));
+        if available > 0 {
+            if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+                if let Err(e) = workflows
+                    .record_dispatch_started(&project_id, Some(repo))
+                    .await
+                {
+                    tracing::warn!(
+                        repo,
+                        "intake: failed to mark project workflow dispatching state: {e}"
+                    );
+                }
+            }
+        }
         for &issue_num in ready.iter().take(available) {
             let ext_id = issue_num.to_string();
             let Some((source, issue)) = issue_map.get(&ext_id) else {
@@ -463,6 +558,15 @@ async fn run_repo_sprint(
             }
 
             let req = crate::task_runner::CreateTaskRequest {
+                force_execute: {
+                    let workflow_cfg =
+                        harness_core::config::workflow::load_workflow_config(&project_root)
+                            .unwrap_or_default();
+                    issue
+                        .labels
+                        .iter()
+                        .any(|label| label == &workflow_cfg.issue_workflow.force_execute_label)
+                },
                 issue: issue.external_id.parse().ok(),
                 project: issue
                     .project_root
@@ -471,6 +575,7 @@ async fn run_repo_sprint(
                 source: Some(source.name().to_string()),
                 external_id: Some(issue.external_id.clone()),
                 repo: Some(repo.to_string()),
+                labels: issue.labels.clone(),
                 ..Default::default()
             };
 
@@ -556,6 +661,20 @@ async fn run_repo_sprint(
         }
 
         // Wait for any running task to complete.
+        if !running.is_empty() && !project_workflow_monitoring_started {
+            if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+                if let Err(e) = workflows
+                    .record_monitoring_started(&project_id, Some(repo))
+                    .await
+                {
+                    tracing::warn!(
+                        repo,
+                        "intake: failed to mark project workflow monitoring state: {e}"
+                    );
+                }
+            }
+            project_workflow_monitoring_started = true;
+        }
         tokio::time::sleep(TASK_POLL_INTERVAL).await;
         let mut newly_done = Vec::new();
         let mut cancelled = Vec::new();
@@ -612,6 +731,29 @@ async fn run_repo_sprint(
         elapsed_secs = start.elapsed().as_secs(),
         "intake: repo sprint complete"
     );
+
+    if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+        let result = if stranded.is_empty() {
+            workflows.record_idle(&project_id, Some(repo)).await
+        } else {
+            workflows
+                .record_degraded(
+                    &project_id,
+                    Some(repo),
+                    &format!(
+                        "repo sprint ended with unresolved tasks: {}",
+                        stranded.len()
+                    ),
+                )
+                .await
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                repo,
+                "intake: failed to finalize project workflow state: {e}"
+            );
+        }
+    }
 
     if !stranded.is_empty() {
         tracing::error!(

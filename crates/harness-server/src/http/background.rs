@@ -235,10 +235,161 @@ pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
                         state.concurrency.workspace_mgr.clone(),
                         permit,
                         state.intake.completion_callback.clone(),
+                        state.core.issue_workflow_store.clone(),
                         None,
                     )
                     .await;
                 });
+            }
+        }
+    });
+}
+
+/// Spawn a background sweeper that turns `pr_open` / `awaiting_feedback`
+/// issue workflows into `pr:N` review tasks.
+///
+/// This reuses the existing PR review loop instead of adding another GitHub API
+/// interpretation layer in the server. The workflow store decides *which* PRs
+/// need attention; the existing `pr:N` task path decides *what* to do.
+pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
+    if state.core.issue_workflow_store.is_none() {
+        tracing::debug!("workflow feedback sweeper disabled: issue workflow store unavailable");
+        return;
+    }
+
+    let weak_state = Arc::downgrade(state);
+    tokio::spawn(async move {
+        loop {
+            let state = match weak_state.upgrade() {
+                Some(s) => s,
+                None => break,
+            };
+            let workflow_cfg =
+                harness_core::config::workflow::load_workflow_config(&state.core.project_root)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "workflow feedback sweeper: failed to load WORKFLOW.md, using default config: {e}"
+                        );
+                        harness_core::config::workflow::WorkflowConfig::default()
+                    });
+            let interval =
+                std::time::Duration::from_secs(workflow_cfg.pr_feedback.sweep_interval_secs);
+            tokio::time::sleep(interval).await;
+
+            if !workflow_cfg.pr_feedback.enabled {
+                tracing::debug!("workflow feedback sweeper: disabled by WORKFLOW.md");
+                continue;
+            }
+
+            let Some(issue_workflows) = state.core.issue_workflow_store.as_ref() else {
+                continue;
+            };
+
+            let candidates = match issue_workflows.list_feedback_candidates().await {
+                Ok(candidates) => candidates,
+                Err(e) => {
+                    tracing::warn!("workflow feedback sweep: failed to list candidates: {e}");
+                    continue;
+                }
+            };
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let mut touched_projects = std::collections::HashSet::new();
+            let mut incomplete_projects = std::collections::HashSet::new();
+            for workflow in candidates {
+                let Some(pr_number) = workflow.pr_number else {
+                    continue;
+                };
+                let project_key = (workflow.project_id.clone(), workflow.repo.clone());
+                if touched_projects.insert(project_key.clone()) {
+                    if let Some(project_store) = state.core.project_workflow_store.as_ref() {
+                        if let Err(e) = project_store
+                            .record_feedback_sweep_started(
+                                &workflow.project_id,
+                                workflow.repo.as_deref(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                project_id = %workflow.project_id,
+                                "workflow feedback sweep: failed to mark project sweep start: {e}"
+                            );
+                        }
+                    }
+                }
+
+                let req = crate::task_runner::CreateTaskRequest {
+                    pr: Some(pr_number),
+                    project: Some(std::path::PathBuf::from(&workflow.project_id)),
+                    repo: workflow.repo.clone(),
+                    source: Some("workflow_feedback".to_string()),
+                    ..Default::default()
+                };
+
+                match task_routes::enqueue_task_background(state.clone(), req, None).await {
+                    Ok(task_id) => {
+                        tracing::info!(
+                            project_id = %workflow.project_id,
+                            pr = pr_number,
+                            task_id = %task_id.0,
+                            "workflow feedback sweep: PR task enqueued"
+                        );
+                    }
+                    Err(crate::services::execution::EnqueueTaskError::MaintenanceWindow {
+                        retry_after_secs,
+                    }) => {
+                        incomplete_projects.insert(project_key.clone());
+                        if let Some(project_store) = state.core.project_workflow_store.as_ref() {
+                            let _ = project_store
+                                .record_paused(
+                                    &workflow.project_id,
+                                    workflow.repo.as_deref(),
+                                    &format!(
+                                        "feedback sweep paused by maintenance window; retry after {retry_after_secs}s"
+                                    ),
+                                )
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        incomplete_projects.insert(project_key.clone());
+                        tracing::warn!(
+                            project_id = %workflow.project_id,
+                            pr = pr_number,
+                            "workflow feedback sweep: failed to enqueue PR task: {e}"
+                        );
+                        if let Some(project_store) = state.core.project_workflow_store.as_ref() {
+                            let _ = project_store
+                                .record_degraded(
+                                    &workflow.project_id,
+                                    workflow.repo.as_deref(),
+                                    &format!(
+                                        "feedback sweep enqueue failed for pr:{pr_number}: {e}"
+                                    ),
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
+
+            if let Some(project_store) = state.core.project_workflow_store.as_ref() {
+                for (project_id, repo) in touched_projects {
+                    if incomplete_projects.contains(&(project_id.clone(), repo.clone())) {
+                        continue;
+                    }
+                    if let Err(e) = project_store
+                        .record_feedback_sweep_completed(&project_id, repo.as_deref())
+                        .await
+                    {
+                        tracing::warn!(
+                            project_id = %project_id,
+                            "workflow feedback sweep: failed to mark project sweep completion: {e}"
+                        );
+                    }
+                }
             }
         }
     });
@@ -471,6 +622,7 @@ pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
                     state.concurrency.workspace_mgr.clone(),
                     permit,
                     state.intake.completion_callback.clone(),
+                    state.core.issue_workflow_store.clone(),
                     None,
                 )
                 .await;
@@ -715,6 +867,7 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                     state.concurrency.workspace_mgr.clone(),
                     permit,
                     state.intake.completion_callback.clone(),
+                    state.core.issue_workflow_store.clone(),
                     None,
                 )
                 .await;

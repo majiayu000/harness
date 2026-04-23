@@ -1,5 +1,7 @@
 use super::helpers::run_agent_streaming;
-use crate::task_runner::{mutate_and_persist, CreateTaskRequest, TaskId, TaskPhase, TaskStore};
+use crate::task_runner::{
+    mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskPhase, TaskStore,
+};
 use harness_core::agent::{AgentRequest, CodeAgent};
 use harness_core::prompts;
 use harness_core::types::ExecutionPhase;
@@ -189,6 +191,66 @@ pub(crate) async fn run_triage_plan_pipeline(
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete");
     Ok((Some(plan_text), complexity, 2))
+}
+
+/// Run a repair-plan step after an implementation attempt emitted `PLAN_ISSUE=...`.
+///
+/// Returns the corrected plan text and advances the task phase back to
+/// `Implement`. The caller decides whether to retry implementation or fail.
+pub(crate) async fn run_replan_for_issue(
+    agent: &dyn CodeAgent,
+    store: &TaskStore,
+    task_id: &TaskId,
+    issue: u64,
+    prior_plan: Option<&str>,
+    plan_issue: &str,
+    cargo_env: &HashMap<String, String>,
+    project: &Path,
+    req: &CreateTaskRequest,
+) -> anyhow::Result<String> {
+    tracing::info!(task_id = %task_id, issue, "pipeline: starting replan phase");
+    mutate_and_persist(store, task_id, |state| {
+        state.phase = TaskPhase::Plan;
+    })
+    .await?;
+
+    let prompt = prompts::replan_prompt(issue, prior_plan, plan_issue).to_prompt_string();
+    let plan_req = AgentRequest {
+        prompt,
+        project_root: project.to_path_buf(),
+        env_vars: cargo_env.clone(),
+        execution_phase: Some(ExecutionPhase::Planning),
+        ..Default::default()
+    };
+
+    let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
+    let plan_resp = tokio::time::timeout(turn_timeout, agent.execute(plan_req))
+        .await
+        .map_err(|_| anyhow::anyhow!("replan phase timed out after {}s", req.turn_timeout_secs))?
+        .map_err(|e| anyhow::anyhow!("replan phase agent error: {e}"))?;
+
+    let plan_text = plan_resp.output.clone();
+    mutate_and_persist(store, task_id, |state| {
+        state.plan_output = Some(plan_text.clone());
+        state.phase = TaskPhase::Implement;
+        state.rounds.push(RoundResult {
+            turn: state.turn,
+            action: "replan".into(),
+            result: "plan_ready".into(),
+            detail: Some(plan_text.clone()),
+            first_token_latency_ms: None,
+        });
+    })
+    .await?;
+    if let Err(e) = store
+        .write_checkpoint(task_id, None, Some(&plan_text), None, "replan_done")
+        .await
+    {
+        tracing::warn!(task_id = %task_id, "failed to write replan checkpoint: {e}");
+    }
+
+    tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "replan phase complete");
+    Ok(plan_text)
 }
 
 /// Fire a single agent turn to rebase a conflicting PR onto `origin/main`.

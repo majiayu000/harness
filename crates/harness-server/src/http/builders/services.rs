@@ -71,6 +71,7 @@ pub(crate) async fn build_services(
         registry.workspace_mgr.clone(),
         intake.task_queue.clone(),
         intake.completion_callback.clone(),
+        registry.issue_workflow_store.clone(),
         Some(registry.project_registry.clone()),
         server.config.server.allowed_project_roots.clone(),
     );

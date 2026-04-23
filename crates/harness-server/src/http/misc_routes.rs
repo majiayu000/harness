@@ -1,6 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -59,6 +59,113 @@ pub(crate) async fn project_queue_stats(
         },
         "projects": projects,
     }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct IssueWorkflowByIssueQuery {
+    pub project_id: String,
+    pub repo: Option<String>,
+    pub issue: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct IssueWorkflowByPrQuery {
+    pub project_id: String,
+    pub repo: Option<String>,
+    pub pr: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct ProjectWorkflowByProjectQuery {
+    pub project_id: String,
+    pub repo: Option<String>,
+}
+
+pub(crate) async fn get_issue_workflow_by_issue(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<IssueWorkflowByIssueQuery>,
+) -> Response {
+    let Some(store) = state.core.issue_workflow_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "issue workflow store unavailable" })),
+        )
+            .into_response();
+    };
+    match store
+        .get_by_issue(&query.project_id, query.repo.as_deref(), query.issue)
+        .await
+    {
+        Ok(Some(workflow)) => (StatusCode::OK, Json(json!(workflow))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "issue workflow not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) async fn get_issue_workflow_by_pr(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<IssueWorkflowByPrQuery>,
+) -> Response {
+    let Some(store) = state.core.issue_workflow_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "issue workflow store unavailable" })),
+        )
+            .into_response();
+    };
+    match store
+        .get_by_pr(&query.project_id, query.repo.as_deref(), query.pr)
+        .await
+    {
+        Ok(Some(workflow)) => (StatusCode::OK, Json(json!(workflow))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "issue workflow not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) async fn get_project_workflow_by_project(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ProjectWorkflowByProjectQuery>,
+) -> Response {
+    let Some(store) = state.core.project_workflow_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "project workflow store unavailable" })),
+        )
+            .into_response();
+    };
+    match store
+        .get_by_project(&query.project_id, query.repo.as_deref())
+        .await
+    {
+        Ok(Some(workflow)) => (StatusCode::OK, Json(json!(workflow))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "project workflow not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 pub(crate) async fn handle_rpc(
@@ -366,7 +473,45 @@ pub(crate) async fn github_webhook(
 
 pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
     match state.core.tasks.list_all_summaries_with_terminal().await {
-        Ok(summaries) => Json(summaries).into_response(),
+        Ok(mut summaries) => {
+            if let Some(workflow_store) = state.core.issue_workflow_store.as_ref() {
+                for summary in &mut summaries {
+                    let Some(project_id) = summary.project.as_deref() else {
+                        continue;
+                    };
+                    let by_issue = summary
+                        .external_id
+                        .as_deref()
+                        .and_then(|id| id.strip_prefix("issue:"))
+                        .and_then(|n| n.parse::<u64>().ok());
+                    let by_pr = summary
+                        .external_id
+                        .as_deref()
+                        .and_then(|id| id.strip_prefix("pr:"))
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .or_else(|| {
+                            summary
+                                .pr_url
+                                .as_deref()
+                                .and_then(crate::http::parse_pr_num_from_url)
+                        });
+                    summary.workflow = match (by_issue, by_pr) {
+                        (Some(issue), _) => workflow_store
+                            .get_by_issue(project_id, summary.repo.as_deref(), issue)
+                            .await
+                            .ok()
+                            .flatten(),
+                        (None, Some(pr)) => workflow_store
+                            .get_by_pr(project_id, summary.repo.as_deref(), pr)
+                            .await
+                            .ok()
+                            .flatten(),
+                        (None, None) => None,
+                    };
+                }
+            }
+            Json(summaries).into_response()
+        }
         Err(e) => {
             tracing::error!("list_tasks: database error: {e}");
             (
