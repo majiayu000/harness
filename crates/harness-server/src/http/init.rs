@@ -389,6 +389,7 @@ pub(crate) fn build_completion_callback(
                         if let Err(e) = workflows
                             .record_terminal_for_issue(
                                 &project_id,
+                                task.repo.as_deref(),
                                 issue_number,
                                 final_state,
                                 task_error,
@@ -416,7 +417,14 @@ pub(crate) fn build_completion_callback(
                             | task_runner::TaskStatus::Cancelled
                     ) {
                         if let Err(e) = workflows
-                            .record_terminal_for_pr(&project_id, pr_number, success, task_error)
+                            .record_terminal_for_pr(
+                                &project_id,
+                                task.repo.as_deref(),
+                                pr_number,
+                                success,
+                                matches!(task.status, task_runner::TaskStatus::Cancelled),
+                                task_error,
+                            )
                             .await
                         {
                             tracing::warn!(

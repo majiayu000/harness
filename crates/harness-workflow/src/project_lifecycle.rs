@@ -113,7 +113,7 @@ impl ProjectWorkflowInstance {
         let project_id = project_id.into();
         let now = Utc::now();
         Self {
-            id: workflow_id(&project_id),
+            id: workflow_id(&project_id, repo.as_deref()),
             schema_version: PROJECT_WORKFLOW_SCHEMA_VERSION,
             project_id,
             repo,
@@ -169,8 +169,12 @@ impl ProjectWorkflowInstance {
     }
 }
 
-pub fn workflow_id(project_id: &str) -> String {
-    format!("{project_id}::project")
+fn repo_key(repo: Option<&str>) -> &str {
+    repo.unwrap_or("<none>")
+}
+
+pub fn workflow_id(project_id: &str, repo: Option<&str>) -> String {
+    format!("{project_id}::repo:{}::project", repo_key(repo))
 }
 
 pub struct ProjectWorkflowStore {
@@ -227,16 +231,32 @@ impl ProjectWorkflowStore {
     pub async fn get_by_project(
         &self,
         project_id: &str,
+        repo: Option<&str>,
     ) -> anyhow::Result<Option<ProjectWorkflowInstance>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT data FROM project_workflows
-             WHERE data::jsonb->>'project_id' = $1
-             ORDER BY updated_at DESC
-             LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(String,)> = if let Some(repo) = repo {
+            sqlx::query_as(
+                "SELECT data FROM project_workflows
+                 WHERE data::jsonb->>'project_id' = $1
+                   AND data::jsonb->>'repo' = $2
+                 ORDER BY updated_at DESC
+                 LIMIT 1",
+            )
+            .bind(project_id)
+            .bind(repo)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT data FROM project_workflows
+                 WHERE data::jsonb->>'project_id' = $1
+                   AND data::jsonb->>'repo' IS NULL
+                 ORDER BY updated_at DESC
+                 LIMIT 1",
+            )
+            .bind(project_id)
+            .fetch_optional(&self.pool)
+            .await?
+        };
         row.map(|(data,)| serde_json::from_str(&data))
             .transpose()
             .map_err(Into::into)
@@ -388,7 +408,10 @@ impl ProjectWorkflowStore {
         F: FnOnce(&mut ProjectWorkflowInstance),
     {
         let _guard = self.update_lock.lock().await;
-        let mut workflow = self.get_by_project(project_id).await?.unwrap_or_else(|| {
+        let mut workflow = self
+            .get_by_project(project_id, repo)
+            .await?
+            .unwrap_or_else(|| {
             ProjectWorkflowInstance::new(project_id.to_string(), repo.map(str::to_string))
         });
         if workflow.repo.is_none() {
@@ -438,7 +461,7 @@ mod tests {
             .await?;
 
         let workflow = store
-            .get_by_project(project_id)
+            .get_by_project(project_id, Some("owner/repo"))
             .await?
             .expect("project workflow");
         assert_eq!(workflow.state, ProjectWorkflowState::Monitoring);
@@ -446,6 +469,28 @@ mod tests {
             workflow.active_planner_task_id.as_deref(),
             Some("planner-1")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_workflow_store_scopes_rows_by_repo() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let project_id = "/tmp/shared-project";
+        store.record_poll_started(project_id, Some("owner/repo-a")).await?;
+        store.record_poll_started(project_id, Some("owner/repo-b")).await?;
+
+        let a = store
+            .get_by_project(project_id, Some("owner/repo-a"))
+            .await?
+            .expect("repo-a workflow");
+        let b = store
+            .get_by_project(project_id, Some("owner/repo-b"))
+            .await?
+            .expect("repo-b workflow");
+
+        assert_ne!(a.id, b.id);
         Ok(())
     }
 }

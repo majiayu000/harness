@@ -64,18 +64,21 @@ pub(crate) async fn project_queue_stats(
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct IssueWorkflowByIssueQuery {
     pub project_id: String,
+    pub repo: Option<String>,
     pub issue: u64,
 }
 
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct IssueWorkflowByPrQuery {
     pub project_id: String,
+    pub repo: Option<String>,
     pub pr: u64,
 }
 
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct ProjectWorkflowByProjectQuery {
     pub project_id: String,
+    pub repo: Option<String>,
 }
 
 pub(crate) async fn get_issue_workflow_by_issue(
@@ -89,7 +92,10 @@ pub(crate) async fn get_issue_workflow_by_issue(
         )
             .into_response();
     };
-    match store.get_by_issue(&query.project_id, query.issue).await {
+    match store
+        .get_by_issue(&query.project_id, query.repo.as_deref(), query.issue)
+        .await
+    {
         Ok(Some(workflow)) => (StatusCode::OK, Json(json!(workflow))).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -115,7 +121,10 @@ pub(crate) async fn get_issue_workflow_by_pr(
         )
             .into_response();
     };
-    match store.get_by_pr(&query.project_id, query.pr).await {
+    match store
+        .get_by_pr(&query.project_id, query.repo.as_deref(), query.pr)
+        .await
+    {
         Ok(Some(workflow)) => (StatusCode::OK, Json(json!(workflow))).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -141,7 +150,10 @@ pub(crate) async fn get_project_workflow_by_project(
         )
             .into_response();
     };
-    match store.get_by_project(&query.project_id).await {
+    match store
+        .get_by_project(&query.project_id, query.repo.as_deref())
+        .await
+    {
         Ok(Some(workflow)) => (StatusCode::OK, Json(json!(workflow))).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -485,12 +497,12 @@ pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
                         });
                     summary.workflow = match (by_issue, by_pr) {
                         (Some(issue), _) => workflow_store
-                            .get_by_issue(project_id, issue)
+                            .get_by_issue(project_id, summary.repo.as_deref(), issue)
                             .await
                             .ok()
                             .flatten(),
                         (None, Some(pr)) => workflow_store
-                            .get_by_pr(project_id, pr)
+                            .get_by_pr(project_id, summary.repo.as_deref(), pr)
                             .await
                             .ok()
                             .flatten(),

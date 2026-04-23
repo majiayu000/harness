@@ -141,7 +141,7 @@ pub struct IssueWorkflowInstance {
 impl IssueWorkflowInstance {
     pub fn new(project_id: impl Into<String>, repo: Option<String>, issue_number: u64) -> Self {
         let project_id = project_id.into();
-        let id = workflow_id(&project_id, issue_number);
+        let id = workflow_id(&project_id, repo.as_deref(), issue_number);
         let now = Utc::now();
         Self {
             id,
@@ -216,8 +216,12 @@ impl IssueWorkflowInstance {
     }
 }
 
-pub fn workflow_id(project_id: &str, issue_number: u64) -> String {
-    format!("{project_id}::issue:{issue_number}")
+fn repo_key(repo: Option<&str>) -> &str {
+    repo.unwrap_or("<none>")
+}
+
+pub fn workflow_id(project_id: &str, repo: Option<&str>, issue_number: u64) -> String {
+    format!("{project_id}::repo:{}::issue:{issue_number}", repo_key(repo))
 }
 
 pub struct IssueWorkflowStore {
@@ -274,19 +278,37 @@ impl IssueWorkflowStore {
     pub async fn get_by_issue(
         &self,
         project_id: &str,
+        repo: Option<&str>,
         issue_number: u64,
     ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT data FROM issue_workflows
-             WHERE data::jsonb->>'project_id' = $1
-               AND (data::jsonb->>'issue_number')::bigint = $2
-             ORDER BY updated_at DESC
-             LIMIT 1",
-        )
-        .bind(project_id)
-        .bind(issue_number as i64)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(String,)> = if let Some(repo) = repo {
+            sqlx::query_as(
+                "SELECT data FROM issue_workflows
+                 WHERE data::jsonb->>'project_id' = $1
+                   AND data::jsonb->>'repo' = $2
+                   AND (data::jsonb->>'issue_number')::bigint = $3
+                 ORDER BY updated_at DESC
+                 LIMIT 1",
+            )
+            .bind(project_id)
+            .bind(repo)
+            .bind(issue_number as i64)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT data FROM issue_workflows
+                 WHERE data::jsonb->>'project_id' = $1
+                   AND data::jsonb->>'repo' IS NULL
+                   AND (data::jsonb->>'issue_number')::bigint = $2
+                 ORDER BY updated_at DESC
+                 LIMIT 1",
+            )
+            .bind(project_id)
+            .bind(issue_number as i64)
+            .fetch_optional(&self.pool)
+            .await?
+        };
         row.map(|(data,)| serde_json::from_str(&data))
             .transpose()
             .map_err(Into::into)
@@ -295,19 +317,37 @@ impl IssueWorkflowStore {
     pub async fn get_by_pr(
         &self,
         project_id: &str,
+        repo: Option<&str>,
         pr_number: u64,
     ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT data FROM issue_workflows
-             WHERE data::jsonb->>'project_id' = $1
-               AND (data::jsonb->>'pr_number')::bigint = $2
-             ORDER BY updated_at DESC
-             LIMIT 1",
-        )
-        .bind(project_id)
-        .bind(pr_number as i64)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(String,)> = if let Some(repo) = repo {
+            sqlx::query_as(
+                "SELECT data FROM issue_workflows
+                 WHERE data::jsonb->>'project_id' = $1
+                   AND data::jsonb->>'repo' = $2
+                   AND (data::jsonb->>'pr_number')::bigint = $3
+                 ORDER BY updated_at DESC
+                 LIMIT 1",
+            )
+            .bind(project_id)
+            .bind(repo)
+            .bind(pr_number as i64)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT data FROM issue_workflows
+                 WHERE data::jsonb->>'project_id' = $1
+                   AND data::jsonb->>'repo' IS NULL
+                   AND (data::jsonb->>'pr_number')::bigint = $2
+                 ORDER BY updated_at DESC
+                 LIMIT 1",
+            )
+            .bind(project_id)
+            .bind(pr_number as i64)
+            .fetch_optional(&self.pool)
+            .await?
+        };
         row.map(|(data,)| serde_json::from_str(&data))
             .transpose()
             .map_err(Into::into)
@@ -389,10 +429,11 @@ impl IssueWorkflowStore {
     pub async fn record_feedback_task_scheduled(
         &self,
         project_id: &str,
+        repo: Option<&str>,
         pr_number: u64,
         task_id: &str,
     ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
-        self.update_by_pr(project_id, pr_number, |workflow| {
+        self.update_by_pr(project_id, repo, pr_number, |workflow| {
             let mut event =
                 IssueLifecycleEvent::new(IssueLifecycleEventKind::FeedbackTaskScheduled)
                     .with_task_id(task_id.to_string());
@@ -407,11 +448,12 @@ impl IssueWorkflowStore {
     pub async fn record_terminal_for_issue(
         &self,
         project_id: &str,
+        repo: Option<&str>,
         issue_number: u64,
         final_state: IssueLifecycleState,
         detail: Option<&str>,
     ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
-        self.update_existing_issue(project_id, issue_number, |workflow| {
+        self.update_existing_issue(project_id, repo, issue_number, |workflow| {
             let mut event = IssueLifecycleEvent::new(match final_state {
                 IssueLifecycleState::Done => IssueLifecycleEventKind::WorkflowDone,
                 IssueLifecycleState::Cancelled => IssueLifecycleEventKind::WorkflowCancelled,
@@ -428,12 +470,16 @@ impl IssueWorkflowStore {
     pub async fn record_terminal_for_pr(
         &self,
         project_id: &str,
+        repo: Option<&str>,
         pr_number: u64,
         success: bool,
+        cancelled: bool,
         detail: Option<&str>,
     ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
-        self.update_by_pr(project_id, pr_number, |workflow| {
-            let mut event = IssueLifecycleEvent::new(if success {
+        self.update_by_pr(project_id, repo, pr_number, |workflow| {
+            let mut event = IssueLifecycleEvent::new(if cancelled {
+                IssueLifecycleEventKind::WorkflowCancelled
+            } else if success {
                 IssueLifecycleEventKind::Mergeable
             } else {
                 IssueLifecycleEventKind::WorkflowFailed
@@ -472,7 +518,7 @@ impl IssueWorkflowStore {
     {
         let _guard = self.update_lock.lock().await;
         let mut workflow = self
-            .get_by_issue(project_id, issue_number)
+            .get_by_issue(project_id, repo, issue_number)
             .await?
             .unwrap_or_else(|| {
                 IssueWorkflowInstance::new(
@@ -492,6 +538,7 @@ impl IssueWorkflowStore {
     async fn update_existing_issue<F>(
         &self,
         project_id: &str,
+        repo: Option<&str>,
         issue_number: u64,
         f: F,
     ) -> anyhow::Result<Option<IssueWorkflowInstance>>
@@ -499,7 +546,7 @@ impl IssueWorkflowStore {
         F: FnOnce(&mut IssueWorkflowInstance),
     {
         let _guard = self.update_lock.lock().await;
-        let Some(mut workflow) = self.get_by_issue(project_id, issue_number).await? else {
+        let Some(mut workflow) = self.get_by_issue(project_id, repo, issue_number).await? else {
             return Ok(None);
         };
         f(&mut workflow);
@@ -510,6 +557,7 @@ impl IssueWorkflowStore {
     async fn update_by_pr<F>(
         &self,
         project_id: &str,
+        repo: Option<&str>,
         pr_number: u64,
         f: F,
     ) -> anyhow::Result<Option<IssueWorkflowInstance>>
@@ -517,7 +565,7 @@ impl IssueWorkflowStore {
         F: FnOnce(&mut IssueWorkflowInstance),
     {
         let _guard = self.update_lock.lock().await;
-        let Some(mut workflow) = self.get_by_pr(project_id, pr_number).await? else {
+        let Some(mut workflow) = self.get_by_pr(project_id, repo, pr_number).await? else {
             return Ok(None);
         };
         f(&mut workflow);
@@ -572,11 +620,11 @@ mod tests {
             .await?;
 
         let by_issue = store
-            .get_by_issue(project_id, 882)
+            .get_by_issue(project_id, Some("owner/repo"), 882)
             .await?
             .expect("workflow by issue");
         let by_pr = store
-            .get_by_pr(project_id, 909)
+            .get_by_pr(project_id, Some("owner/repo"), 909)
             .await?
             .expect("workflow by pr");
 
@@ -616,6 +664,59 @@ mod tests {
             workflow.last_event.as_ref().map(|e| &e.kind),
             Some(&IssueLifecycleEventKind::PlanIssueDetected)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_workflow_store_scopes_identity_by_repo() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let project_id = "/tmp/shared-project";
+        store
+            .record_issue_scheduled(project_id, Some("owner/repo-a"), 42, "task-a", &[], false)
+            .await?;
+        store
+            .record_issue_scheduled(project_id, Some("owner/repo-b"), 42, "task-b", &[], false)
+            .await?;
+
+        let a = store
+            .get_by_issue(project_id, Some("owner/repo-a"), 42)
+            .await?
+            .expect("repo-a workflow");
+        let b = store
+            .get_by_issue(project_id, Some("owner/repo-b"), 42)
+            .await?
+            .expect("repo-b workflow");
+
+        assert_ne!(a.id, b.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_workflow_store_records_cancelled_pr_tasks_as_cancelled() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let project_id = "/tmp/project-cancel";
+        store
+            .record_issue_scheduled(project_id, Some("owner/repo"), 7, "task-1", &[], false)
+            .await?;
+        store
+            .record_pr_detected(
+                project_id,
+                Some("owner/repo"),
+                7,
+                "task-1",
+                55,
+                "https://github.com/owner/repo/pull/55",
+            )
+            .await?;
+        let workflow = store
+            .record_terminal_for_pr(project_id, Some("owner/repo"), 55, false, true, None)
+            .await?
+            .expect("workflow");
+        assert_eq!(workflow.state, IssueLifecycleState::Cancelled);
         Ok(())
     }
 }
