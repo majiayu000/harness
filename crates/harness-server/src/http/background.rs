@@ -816,6 +816,7 @@ pub(super) fn spawn_system_task_recovery(state: &Arc<AppState>) {
                     state.concurrency.workspace_mgr.clone(),
                     permit,
                     state.intake.completion_callback.clone(),
+                    state.core.issue_workflow_store.clone(),
                     None,
                 )
                 .await;
