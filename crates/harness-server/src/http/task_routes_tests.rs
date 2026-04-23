@@ -1,4 +1,5 @@
 use super::*;
+use harness_workflow::issue_lifecycle::{IssueLifecycleState, IssueWorkflowInstance};
 
 #[test]
 fn batch_request_deserializes_issues_format() {
@@ -223,6 +224,52 @@ fn conflict_groups_single_task() {
     let groups = build_conflict_groups(&refs);
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0], vec![0]);
+}
+
+#[test]
+fn workflow_reuse_strategy_prefers_active_task() {
+    let mut workflow =
+        IssueWorkflowInstance::new("/tmp/project".to_string(), Some("owner/repo".to_string()), 42);
+    workflow.state = IssueLifecycleState::Implementing;
+    workflow.active_task_id = Some("task-123".to_string());
+    workflow.pr_number = Some(7);
+    match workflow_reuse_strategy(&workflow) {
+        WorkflowReuseStrategy::ActiveTask(task_id) => assert_eq!(task_id.0, "task-123"),
+        _ => panic!("expected active-task reuse strategy"),
+    }
+}
+
+#[test]
+fn workflow_reuse_strategy_falls_back_to_pr_when_active_task_missing() {
+    let mut workflow =
+        IssueWorkflowInstance::new("/tmp/project".to_string(), Some("owner/repo".to_string()), 42);
+    workflow.state = IssueLifecycleState::AwaitingFeedback;
+    workflow.pr_number = Some(99);
+    match workflow_reuse_strategy(&workflow) {
+        WorkflowReuseStrategy::PrExternalId(ext_id) => assert_eq!(ext_id, "pr:99"),
+        _ => panic!("expected pr-external-id reuse strategy"),
+    }
+}
+
+#[test]
+fn workflow_reuse_strategy_rejects_failed_and_cancelled_workflows() {
+    let mut failed =
+        IssueWorkflowInstance::new("/tmp/project".to_string(), Some("owner/repo".to_string()), 1);
+    failed.state = IssueLifecycleState::Failed;
+    failed.active_task_id = Some("task-failed".to_string());
+    assert!(matches!(
+        workflow_reuse_strategy(&failed),
+        WorkflowReuseStrategy::None
+    ));
+
+    let mut cancelled =
+        IssueWorkflowInstance::new("/tmp/project".to_string(), Some("owner/repo".to_string()), 2);
+    cancelled.state = IssueLifecycleState::Cancelled;
+    cancelled.pr_number = Some(88);
+    assert!(matches!(
+        workflow_reuse_strategy(&cancelled),
+        WorkflowReuseStrategy::None
+    ));
 }
 
 // ── select_agent three-tier precedence tests ─────────────────────────────

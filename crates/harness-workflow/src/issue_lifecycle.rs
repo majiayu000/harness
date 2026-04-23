@@ -379,6 +379,16 @@ impl IssueWorkflowStore {
             .map_err(Into::into)
     }
 
+    pub async fn list(&self) -> anyhow::Result<Vec<IssueWorkflowInstance>> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT data FROM issue_workflows ORDER BY updated_at DESC")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
+    }
+
     pub async fn record_issue_scheduled(
         &self,
         project_id: &str,
