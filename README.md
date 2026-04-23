@@ -5,7 +5,7 @@
 **An orchestration layer for AI coding agents — govern, observe, and improve agent workflows at scale.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.88+-orange.svg)](https://www.rust-lang.org)
 [![CI](https://img.shields.io/github/actions/workflow/status/majiayu000/harness/ci.yml?branch=main&label=CI)](https://github.com/majiayu000/harness/actions/workflows/ci.yml)
 
 [Documentation](docs/) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
@@ -62,7 +62,7 @@ Harness is a Rust-native platform that wraps AI coding agents (Claude Code, Code
 
 ### Prerequisites
 
-- Rust 1.75+
+- Rust 1.88+
 - At least one agent runtime:
   - [`codex`](https://github.com/openai/codex) CLI
   - [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI

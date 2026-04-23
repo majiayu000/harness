@@ -4,7 +4,7 @@ Thanks for contributing.
 
 ## Development Setup
 
-1. Install Rust `1.75+`.
+1. Install Rust `1.88+`.
 2. Clone the repository.
 3. Build the workspace:
 
