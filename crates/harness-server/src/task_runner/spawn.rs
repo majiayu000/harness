@@ -896,7 +896,7 @@ mod tests {
     use async_trait::async_trait;
     use harness_core::agent::{AgentRequest, AgentResponse, StreamItem};
     use harness_core::types::{Capability, ContextItem, EventFilters, ExecutionPhase, TokenUsage};
-    use tokio::time::Duration;
+    use tokio::time::{sleep, Duration, Instant};
 
     fn tid(s: &str) -> harness_core::types::TaskId {
         harness_core::types::TaskId(s.to_string())
@@ -911,6 +911,22 @@ mod tests {
             Arc::new(Self {
                 captured: tokio::sync::Mutex::new(Vec::new()),
             })
+        }
+    }
+
+    async fn wait_until(
+        timeout: Duration,
+        mut predicate: impl FnMut() -> bool,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if predicate() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("condition not met within {:?}", timeout);
+            }
+            sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -1007,7 +1023,14 @@ mod tests {
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_until(Duration::from_secs(3), || {
+            agent
+                .captured
+                .try_lock()
+                .map(|captured| !captured.is_empty())
+                .unwrap_or(false)
+        })
+        .await?;
 
         let captured = agent.captured.lock().await;
         assert!(
@@ -1082,8 +1105,12 @@ mod tests {
         )
         .await;
 
-        // Allow async task to complete.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_until(Duration::from_secs(3), || {
+            store
+                .get(&task_id)
+                .is_some_and(|state| matches!(state.status, TaskStatus::Failed))
+        })
+        .await?;
 
         let state = store.get(&task_id).ok_or_else(|| {
             anyhow::anyhow!("task not found in store — possible concurrent deletion")
@@ -1177,7 +1204,12 @@ mod tests {
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_until(Duration::from_secs(3), || {
+            store
+                .get(&task_id)
+                .is_some_and(|state| matches!(state.status, TaskStatus::Failed))
+        })
+        .await?;
 
         let state = store.get(&task_id).ok_or_else(|| {
             anyhow::anyhow!("task not found in store — possible concurrent deletion")

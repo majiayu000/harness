@@ -115,6 +115,7 @@ struct StartupDelayOutcome {
     last_review_ts: Option<DateTime<Utc>>,
     overdue: bool,
     elapsed: Option<chrono::Duration>,
+    reused_startup_delay: bool,
 }
 
 fn startup_delay_outcome(
@@ -133,7 +134,68 @@ fn startup_delay_outcome(
         last_review_ts,
         overdue,
         elapsed,
+        reused_startup_delay: false,
     }
+}
+
+async fn startup_delay_for_project(
+    state: &Arc<AppState>,
+    project: &ProjectInfo,
+    run_on_startup: bool,
+    interval: Duration,
+    now: DateTime<Utc>,
+) -> StartupDelayOutcome {
+    let hook_key = project_hook_key(&project.name, &project.root);
+    let last_review_ts = last_review_timestamp(state, &hook_key).await;
+    startup_delay_outcome(run_on_startup, interval, last_review_ts, now)
+}
+
+fn startup_delay_for_rescanned_project_outcome(
+    startup_delay_by_name: &HashMap<String, Duration>,
+    project_name: &str,
+    run_on_startup: bool,
+    interval: Duration,
+    last_review_ts: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> StartupDelayOutcome {
+    match startup_delay_by_name.get(project_name).copied() {
+        Some(delay) => StartupDelayOutcome {
+            delay,
+            last_review_ts,
+            overdue: false,
+            elapsed: last_review_ts.map(|ts| now.signed_duration_since(ts)),
+            reused_startup_delay: true,
+        },
+        None => startup_delay_outcome(run_on_startup, interval, last_review_ts, now),
+    }
+}
+
+fn startup_rescan_remaining_delay(outcome: &StartupDelayOutcome, min_delay: Duration) -> Duration {
+    if outcome.reused_startup_delay {
+        outcome.delay.saturating_sub(min_delay)
+    } else {
+        outcome.delay
+    }
+}
+
+async fn startup_delay_for_rescanned_project(
+    state: &Arc<AppState>,
+    startup_delay_by_name: &HashMap<String, Duration>,
+    project: &ProjectInfo,
+    run_on_startup: bool,
+    interval: Duration,
+    now: DateTime<Utc>,
+) -> StartupDelayOutcome {
+    let hook_key = project_hook_key(&project.name, &project.root);
+    let last_review_ts = last_review_timestamp(state, &hook_key).await;
+    startup_delay_for_rescanned_project_outcome(
+        startup_delay_by_name,
+        &project.name,
+        run_on_startup,
+        interval,
+        last_review_ts,
+        now,
+    )
 }
 
 async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
@@ -158,18 +220,12 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // On startup, compute the per-project remaining time and the global minimum.
     // Only projects whose individual delay falls within the minimum sleep window
     // are run on the first tick; others wait for the regular interval loop.
-    let default_startup_delay = if config.run_on_startup {
-        Duration::ZERO
-    } else {
-        interval
-    };
     let mut min_delay = interval;
     let mut project_delays: Vec<Duration> = Vec::with_capacity(projects.len());
     for project in &projects {
-        let hook_key = project_hook_key(&project.name, &project.root);
-        let last_review_ts = last_review_timestamp(&state, &hook_key).await;
         let outcome =
-            startup_delay_outcome(config.run_on_startup, interval, last_review_ts, Utc::now());
+            startup_delay_for_project(&state, project, config.run_on_startup, interval, Utc::now())
+                .await;
         match outcome.last_review_ts {
             Some(last_ts) => {
                 if outcome.overdue {
@@ -224,9 +280,10 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
 
     // Re-collect after the startup sleep to pick up projects registered via
     // `POST /projects` during the sleep window (5 s init + min_delay).
-    // Build a delay-by-name lookup first so newly registered projects (absent
-    // from the original snapshot) inherit the startup policy: immediate when
-    // run_on_startup is enabled, otherwise deferred until the next interval.
+    // Build a delay-by-name lookup first so projects from the original
+    // snapshot keep their already-computed startup delay. Projects newly
+    // discovered during the sleep window recompute their delay from the
+    // current watermark on demand.
     let startup_delay_by_name: HashMap<String, Duration> = projects
         .iter()
         .zip(project_delays.iter())
@@ -251,20 +308,24 @@ async fn review_loop(state: Arc<AppState>, config: ReviewConfig) {
     // Projects whose remaining time exceeds min_delay are deferred to the regular
     // interval loop, avoiding unnecessary task/quota spikes on restart.
     for project in &projects {
-        let project_delay = *startup_delay_by_name
-            .get(&project.name)
-            .unwrap_or(&default_startup_delay);
-        if project_delay > min_delay {
+        let outcome = startup_delay_for_rescanned_project(
+            &state,
+            &startup_delay_by_name,
+            project,
+            config.run_on_startup,
+            interval,
+            Utc::now(),
+        )
+        .await;
+        let remaining_delay = startup_rescan_remaining_delay(&outcome, min_delay);
+        if !remaining_delay.is_zero() {
             tracing::debug!(
                 project = %project.name,
-                remaining_secs = (project_delay - min_delay).as_secs(),
+                remaining_secs = remaining_delay.as_secs(),
                 "scheduler: project not yet due at startup, deferring to next scheduled tick"
             );
             // Anchor deferred schedule relative to now (after sleep elapsed).
-            next_run_map.insert(
-                project.name.clone(),
-                Instant::now() + project_delay.saturating_sub(min_delay),
-            );
+            next_run_map.insert(project.name.clone(), Instant::now() + remaining_delay);
             continue;
         }
         let review_state = state_map[&project.name].clone();
@@ -1774,6 +1835,59 @@ mod tests {
         assert_eq!(
             startup_project_delay(true, interval, Some(last_review), now),
             Duration::from_secs(2700)
+        );
+    }
+
+    #[test]
+    fn startup_rescan_recomputes_missing_project_delay_from_watermark() {
+        let now = Utc::now();
+        let outcome = startup_delay_for_rescanned_project_outcome(
+            &HashMap::new(),
+            "runtime-project",
+            false,
+            Duration::from_secs(3600),
+            Some(now - chrono::Duration::minutes(15)),
+            now,
+        );
+        assert_eq!(outcome.delay, Duration::from_secs(2700));
+        assert_eq!(
+            outcome.last_review_ts,
+            Some(now - chrono::Duration::minutes(15))
+        );
+        assert!(!outcome.reused_startup_delay);
+    }
+
+    #[test]
+    fn startup_rescan_preserves_missing_project_remaining_delay_after_sleep() {
+        let min_delay = Duration::from_secs(300);
+        let outcome = StartupDelayOutcome {
+            delay: Duration::from_secs(2700),
+            last_review_ts: None,
+            overdue: false,
+            elapsed: None,
+            reused_startup_delay: false,
+        };
+
+        assert_eq!(
+            startup_rescan_remaining_delay(&outcome, min_delay),
+            Duration::from_secs(2700)
+        );
+    }
+
+    #[test]
+    fn startup_rescan_subtracts_elapsed_sleep_for_original_project_delay() {
+        let min_delay = Duration::from_secs(300);
+        let outcome = StartupDelayOutcome {
+            delay: Duration::from_secs(2700),
+            last_review_ts: None,
+            overdue: false,
+            elapsed: None,
+            reused_startup_delay: true,
+        };
+
+        assert_eq!(
+            startup_rescan_remaining_delay(&outcome, min_delay),
+            Duration::from_secs(2400)
         );
     }
 
