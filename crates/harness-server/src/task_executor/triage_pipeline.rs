@@ -8,7 +8,7 @@ use crate::task_runner::{
 use chrono::Utc;
 use harness_core::agent::{AgentRequest, CodeAgent};
 use harness_core::prompts;
-use harness_core::types::{Decision, ExecutionPhase, TurnFailure, TurnTelemetry};
+use harness_core::types::{Decision, ExecutionPhase, TurnFailure, TurnFailureKind, TurnTelemetry};
 use harness_observe::event_store::EventStore;
 use std::collections::HashMap;
 use std::path::Path;
@@ -64,6 +64,33 @@ fn redact_prompt_plan_failure(failure: TurnFailure) -> TurnFailure {
         body_excerpt: None,
         ..failure
     }
+}
+
+fn turn_failure_kind_label(kind: TurnFailureKind) -> &'static str {
+    match kind {
+        TurnFailureKind::Timeout => "timeout",
+        TurnFailureKind::Quota => "quota",
+        TurnFailureKind::Billing => "billing",
+        TurnFailureKind::LocalProcess => "local_process",
+        TurnFailureKind::Upstream => "upstream",
+        TurnFailureKind::Protocol => "protocol",
+        TurnFailureKind::Unknown => "unknown",
+    }
+}
+
+fn redact_prompt_plan_error_message(failure: &TurnFailure) -> String {
+    let mut message = format!(
+        "plan phase agent error (details redacted for prompt-only task privacy; kind={}",
+        turn_failure_kind_label(failure.kind)
+    );
+    if let Some(provider) = &failure.provider {
+        message.push_str(&format!(", provider={provider}"));
+    }
+    if let Some(status) = failure.upstream_status {
+        message.push_str(&format!(", upstream_status={status}"));
+    }
+    message.push(')');
+    message
 }
 
 /// Run a plan step for a complex prompt-only task when the planning gate has
@@ -139,6 +166,7 @@ pub(crate) async fn run_plan_for_prompt(
         }
         Ok(Err(failure)) => {
             let persisted_failure = redact_prompt_plan_failure(failure.failure.clone());
+            let redacted_error = redact_prompt_plan_error_message(&persisted_failure);
             record_phase_observability(
                 store,
                 events,
@@ -153,7 +181,7 @@ pub(crate) async fn run_plan_for_prompt(
                 Some("prompt task plan failed".to_string()),
             )
             .await?;
-            return Err(anyhow::anyhow!("plan phase agent error: {}", failure.error));
+            return Err(anyhow::anyhow!("{redacted_error}"));
         }
         Err(_) => {
             let telemetry =
@@ -808,6 +836,14 @@ mod tests {
             err.to_string().contains("plan phase agent error"),
             "unexpected error: {err}"
         );
+        assert!(
+            !err.to_string().contains("secret prompt"),
+            "returned error must not leak prompt-derived content: {err}"
+        );
+        assert!(
+            err.to_string().contains("kind=local_process"),
+            "returned error should preserve failure classification: {err}"
+        );
 
         let task = store.get(&task_id).expect("task state");
         assert_eq!(task.rounds.len(), 1);
@@ -859,5 +895,23 @@ mod tests {
         assert_eq!(redacted.upstream_status, Some(1));
         assert!(redacted.message.is_none());
         assert!(redacted.body_excerpt.is_none());
+    }
+
+    #[test]
+    fn redact_prompt_plan_error_message_preserves_only_safe_fields() {
+        let message = redact_prompt_plan_error_message(&TurnFailure {
+            kind: TurnFailureKind::Upstream,
+            provider: Some("anthropic-api".to_string()),
+            upstream_status: Some(500),
+            message: Some("secret prompt".to_string()),
+            body_excerpt: Some("still secret".to_string()),
+        });
+
+        assert_eq!(
+            message,
+            "plan phase agent error (details redacted for prompt-only task privacy; kind=upstream, provider=anthropic-api, upstream_status=500)"
+        );
+        assert!(!message.contains("secret prompt"));
+        assert!(!message.contains("still secret"));
     }
 }
