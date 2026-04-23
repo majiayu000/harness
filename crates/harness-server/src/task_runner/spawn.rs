@@ -768,15 +768,10 @@ where
             match store_watcher.get(&id_watcher) {
                 Some(final_state) => {
                     let artifact_count = store_watcher
-                        .list_artifacts(&id_watcher)
+                        .count_artifacts(&id_watcher)
                         .await
-                        .map(|artifacts| artifacts.len())
                         .unwrap_or(0);
-                    let prompt_count = store_watcher
-                        .get_prompts(&id_watcher)
-                        .await
-                        .map(|prompts| prompts.len())
-                        .unwrap_or(0);
+                    let prompt_count = store_watcher.count_prompts(&id_watcher).await.unwrap_or(0);
                     let checkpoint = store_watcher
                         .load_checkpoint(&id_watcher)
                         .await
@@ -817,6 +812,7 @@ where
                             );
                         }
                     }
+
                     cb(final_state).await
                 }
                 None => tracing::warn!(

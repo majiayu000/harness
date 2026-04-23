@@ -93,6 +93,15 @@ impl TaskDb {
         Ok(rows)
     }
 
+    pub async fn count_artifacts(&self, task_id: &str) -> anyhow::Result<u64> {
+        let count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_artifacts WHERE task_id = $1")
+                .bind(task_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count as u64)
+    }
+
     pub async fn save_task_prompt(
         &self,
         task_id: &str,
@@ -133,6 +142,15 @@ impl TaskDb {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    pub async fn count_task_prompts(&self, task_id: &str) -> anyhow::Result<u64> {
+        let count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_prompts WHERE task_id = $1")
+                .bind(task_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count as u64)
     }
 
     pub async fn pending_tasks_with_checkpoint(

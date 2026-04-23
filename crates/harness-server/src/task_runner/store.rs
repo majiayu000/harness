@@ -777,6 +777,11 @@ impl TaskStore {
         self.db.list_artifacts(&task_id.0).await
     }
 
+    /// Return the number of persisted artifacts for a task without loading them.
+    pub async fn count_artifacts(&self, task_id: &TaskId) -> anyhow::Result<u64> {
+        self.db.count_artifacts(&task_id.0).await
+    }
+
     /// Persist a redacted agent prompt for a task turn (fire-and-forget wrapper).
     pub(crate) async fn save_prompt(
         &self,
@@ -796,6 +801,11 @@ impl TaskStore {
         task_id: &TaskId,
     ) -> anyhow::Result<Vec<crate::task_db::TaskPrompt>> {
         self.db.get_task_prompts(&task_id.0).await
+    }
+
+    /// Return the number of persisted prompts for a task without loading them.
+    pub async fn count_prompts(&self, task_id: &TaskId) -> anyhow::Result<u64> {
+        self.db.count_task_prompts(&task_id.0).await
     }
 
     /// Append a [`TaskEvent`] to the event log. No-op when the log is not open.
@@ -1599,6 +1609,26 @@ mod tests {
         let key = root.to_string_lossy().into_owned();
         assert_eq!(counts.by_project[&key].done, 1);
         assert_eq!(counts.by_project[&key].failed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prompt_and_artifact_counts_use_persisted_rows() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = harness_core::types::TaskId("counted".to_string());
+
+        store
+            .insert_artifact(&task_id, 1, "log", "artifact-one")
+            .await;
+        store
+            .insert_artifact(&task_id, 2, "log", "artifact-two")
+            .await;
+        store.save_prompt(&task_id, 1, "plan", "prompt-one").await?;
+        store.save_prompt(&task_id, 2, "impl", "prompt-two").await?;
+
+        assert_eq!(store.count_artifacts(&task_id).await?, 2);
+        assert_eq!(store.count_prompts(&task_id).await?, 2);
         Ok(())
     }
 

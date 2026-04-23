@@ -23,6 +23,7 @@ export function TaskDetailPanel({ taskId }: Props) {
   const [streamText, setStreamText] = useState("");
 
   const task = detail.data;
+  const isTerminal = task?.completion.is_terminal ?? false;
   const prompts = promptsQuery.data ?? task?.prompts ?? [];
   const artifacts = artifactsQuery.data ?? task?.artifacts ?? [];
 
@@ -31,7 +32,7 @@ export function TaskDetailPanel({ taskId }: Props) {
   }, [taskId]);
 
   useEffect(() => {
-    if (!taskId || !task || task.completion.is_terminal || typeof EventSource !== "function") {
+    if (!taskId || isTerminal || typeof EventSource !== "function") {
       return;
     }
     const source = new EventSource(buildStreamUrl(taskId));
@@ -48,7 +49,7 @@ export function TaskDetailPanel({ taskId }: Props) {
       }
     };
     return () => source.close();
-  }, [task, taskId]);
+  }, [isTerminal, taskId]);
 
   if (!taskId) {
     return (

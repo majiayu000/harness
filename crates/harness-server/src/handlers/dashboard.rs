@@ -94,15 +94,15 @@ async fn build_onboarding_summary(
         }
     }
 
-    let task_summaries = match state.core.tasks.list_all_summaries_with_terminal().await {
-        Ok(summaries) => summaries,
-        Err(e) => {
-            tracing::warn!("dashboard: failed to list task summaries for onboarding: {e}");
-            Vec::new()
-        }
-    };
-
     if funnel.live_output_at.is_none() {
+        let task_summaries = match state.core.tasks.list_all_summaries_with_terminal().await {
+            Ok(summaries) => summaries,
+            Err(e) => {
+                tracing::warn!("dashboard: failed to list task summaries for onboarding: {e}");
+                Vec::new()
+            }
+        };
+
         for summary in task_summaries
             .iter()
             .filter(|summary| task_has_started(summary))
