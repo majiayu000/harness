@@ -221,7 +221,10 @@ fn repo_key(repo: Option<&str>) -> &str {
 }
 
 pub fn workflow_id(project_id: &str, repo: Option<&str>, issue_number: u64) -> String {
-    format!("{project_id}::repo:{}::issue:{issue_number}", repo_key(repo))
+    format!(
+        "{project_id}::repo:{}::issue:{issue_number}",
+        repo_key(repo)
+    )
 }
 
 pub struct IssueWorkflowStore {

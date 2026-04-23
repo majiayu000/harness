@@ -164,10 +164,10 @@ async fn track_issue_workflow_enqueue(
     };
     if let Some(issue_number) = req.issue {
         if let Err(e) = workflows
-                .record_issue_scheduled(
-                    project_id,
-                    req.repo.as_deref(),
-                    issue_number,
+            .record_issue_scheduled(
+                project_id,
+                req.repo.as_deref(),
+                issue_number,
                 &task_id.0,
                 &req.labels,
                 req.force_execute,
@@ -182,11 +182,11 @@ async fn track_issue_workflow_enqueue(
         }
         return;
     }
-        if let Some(pr_number) = req.pr {
-            if let Err(e) = workflows
-                .record_feedback_task_scheduled(project_id, req.repo.as_deref(), pr_number, &task_id.0)
-                .await
-            {
+    if let Some(pr_number) = req.pr {
+        if let Err(e) = workflows
+            .record_feedback_task_scheduled(project_id, req.repo.as_deref(), pr_number, &task_id.0)
+            .await
+        {
             tracing::warn!(
                 pr = pr_number,
                 task_id = %task_id.0,

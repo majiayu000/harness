@@ -412,8 +412,8 @@ impl ProjectWorkflowStore {
             .get_by_project(project_id, repo)
             .await?
             .unwrap_or_else(|| {
-            ProjectWorkflowInstance::new(project_id.to_string(), repo.map(str::to_string))
-        });
+                ProjectWorkflowInstance::new(project_id.to_string(), repo.map(str::to_string))
+            });
         if workflow.repo.is_none() {
             workflow.repo = repo.map(str::to_string);
         }
@@ -478,8 +478,12 @@ mod tests {
             return Ok(());
         };
         let project_id = "/tmp/shared-project";
-        store.record_poll_started(project_id, Some("owner/repo-a")).await?;
-        store.record_poll_started(project_id, Some("owner/repo-b")).await?;
+        store
+            .record_poll_started(project_id, Some("owner/repo-a"))
+            .await?;
+        store
+            .record_poll_started(project_id, Some("owner/repo-b"))
+            .await?;
 
         let a = store
             .get_by_project(project_id, Some("owner/repo-a"))

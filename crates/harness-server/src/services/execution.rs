@@ -220,7 +220,12 @@ impl DefaultExecutionService {
         }
         if let Some(pr_number) = req.pr {
             if let Err(e) = workflows
-                .record_feedback_task_scheduled(project_id, req.repo.as_deref(), pr_number, &task_id.0)
+                .record_feedback_task_scheduled(
+                    project_id,
+                    req.repo.as_deref(),
+                    pr_number,
+                    &task_id.0,
+                )
                 .await
             {
                 tracing::warn!(
