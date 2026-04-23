@@ -23,6 +23,14 @@ pub struct WorkflowConfig {
     pub issue_workflow: IssueWorkflowPolicy,
     #[serde(default)]
     pub pr_feedback: PrFeedbackPolicy,
+    #[serde(default)]
+    pub storage: WorkflowStoragePolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStoragePolicy {
+    #[serde(default = "default_workflow_schema_namespace")]
+    pub schema_namespace: String,
 }
 
 impl Default for IssueWorkflowPolicy {
@@ -43,12 +51,24 @@ impl Default for PrFeedbackPolicy {
     }
 }
 
+impl Default for WorkflowStoragePolicy {
+    fn default() -> Self {
+        Self {
+            schema_namespace: default_workflow_schema_namespace(),
+        }
+    }
+}
+
 fn default_force_execute_label() -> String {
     "force-execute".to_string()
 }
 
 fn default_feedback_sweep_interval_secs() -> u64 {
     60
+}
+
+fn default_workflow_schema_namespace() -> String {
+    "workflow".to_string()
 }
 
 fn default_true() -> bool {
@@ -100,6 +120,7 @@ mod tests {
         assert!(cfg.pr_feedback.enabled);
         assert_eq!(cfg.pr_feedback.sweep_interval_secs, 60);
         assert!(cfg.issue_workflow.auto_replan_on_plan_issue);
+        assert_eq!(cfg.storage.schema_namespace, "workflow");
         Ok(())
     }
 
@@ -115,6 +136,8 @@ issue_workflow:
 pr_feedback:
   enabled: false
   sweep_interval_secs: 15
+storage:
+  schema_namespace: orchestration
 ---
 
 Body
@@ -129,6 +152,7 @@ Body
         assert!(!cfg.issue_workflow.auto_replan_on_plan_issue);
         assert!(!cfg.pr_feedback.enabled);
         assert_eq!(cfg.pr_feedback.sweep_interval_secs, 15);
+        assert_eq!(cfg.storage.schema_namespace, "orchestration");
         Ok(())
     }
 }

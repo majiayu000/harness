@@ -5,6 +5,8 @@ issue_workflow:
 pr_feedback:
   enabled: true
   sweep_interval_secs: 60
+storage:
+  schema_namespace: workflow
 ---
 
 # Harness Workflow
@@ -24,3 +26,6 @@ Current externally configurable rules:
 
 - `pr_feedback.enabled`
   - Enables or disables automatic background PR feedback sweeping.
+
+- `storage.schema_namespace`
+  - Stable namespace used for workflow persistence in Postgres so multiple instances do not split by local `data_dir` path.

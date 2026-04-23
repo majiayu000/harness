@@ -29,6 +29,9 @@ pub(crate) async fn build_registry(
     tasks: &Arc<crate::task_runner::TaskStore>,
 ) -> anyhow::Result<RegistryBundle> {
     let configured_database_url = server.config.server.database_url.as_deref();
+    let workflow_config =
+        harness_core::config::workflow::load_workflow_config(project_root).unwrap_or_default();
+    let workflow_ns = workflow_config.storage.schema_namespace;
     // ── Thread DB ─────────────────────────────────────────────────────────────
     let thread_db_path = harness_core::config::dirs::default_db_path(data_dir, "threads");
     let thread_db = crate::thread_db::ThreadDb::open_with_database_url(
@@ -79,18 +82,17 @@ pub(crate) async fn build_registry(
 
     // ── Issue workflow store ──────────────────────────────────────────────────
     let issue_workflow_store = {
-        let issue_workflows_db_path =
-            harness_core::config::dirs::default_db_path(data_dir, "issue_workflows");
-        match harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url(
-            &issue_workflows_db_path,
+        let schema = format!("{workflow_ns}_issue");
+        match harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url_and_schema(
             configured_database_url,
+            &schema,
         )
         .await
         {
             Ok(store) => Some(Arc::new(store)),
             Err(e) => {
                 tracing::warn!(
-                    path = %issue_workflows_db_path.display(),
+                    schema = %schema,
                     "issue workflow store init failed, issue lifecycle state will not persist: {e}"
                 );
                 None
@@ -100,18 +102,17 @@ pub(crate) async fn build_registry(
 
     // ── Project workflow store ────────────────────────────────────────────────
     let project_workflow_store = {
-        let project_workflows_db_path =
-            harness_core::config::dirs::default_db_path(data_dir, "project_workflows");
-        match harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url(
-            &project_workflows_db_path,
+        let schema = format!("{workflow_ns}_project");
+        match harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url_and_schema(
             configured_database_url,
+            &schema,
         )
         .await
         {
             Ok(store) => Some(Arc::new(store)),
             Err(e) => {
                 tracing::warn!(
-                    path = %project_workflows_db_path.display(),
+                    schema = %schema,
                     "project workflow store init failed, project lifecycle state will not persist: {e}"
                 );
                 None

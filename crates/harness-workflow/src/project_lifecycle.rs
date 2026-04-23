@@ -6,6 +6,7 @@ use harness_core::db::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPool;
+use sqlx::Postgres;
 use std::path::Path;
 
 const PROJECT_WORKFLOW_SCHEMA_VERSION: u32 = 1;
@@ -179,7 +180,6 @@ pub fn workflow_id(project_id: &str, repo: Option<&str>) -> String {
 
 pub struct ProjectWorkflowStore {
     pool: PgPool,
-    update_lock: tokio::sync::Mutex<()>,
 }
 
 impl ProjectWorkflowStore {
@@ -208,10 +208,23 @@ impl ProjectWorkflowStore {
         PgMigrator::new(&pool, PROJECT_WORKFLOW_MIGRATIONS)
             .run()
             .await?;
-        Ok(Self {
-            pool,
-            update_lock: tokio::sync::Mutex::new(()),
-        })
+        Ok(Self { pool })
+    }
+
+    pub async fn open_with_database_url_and_schema(
+        configured_database_url: Option<&str>,
+        schema: &str,
+    ) -> anyhow::Result<Self> {
+        let database_url = resolve_database_url(configured_database_url)?;
+        let setup = pg_open_pool(&database_url).await?;
+        pg_create_schema_if_not_exists(&setup, schema).await?;
+        setup.close().await;
+
+        let pool = pg_open_pool_schematized(&database_url, schema).await?;
+        PgMigrator::new(&pool, PROJECT_WORKFLOW_MIGRATIONS)
+            .run()
+            .await?;
+        Ok(Self { pool })
     }
 
     pub async fn upsert(&self, workflow: &ProjectWorkflowInstance) -> anyhow::Result<()> {
@@ -407,19 +420,73 @@ impl ProjectWorkflowStore {
     where
         F: FnOnce(&mut ProjectWorkflowInstance),
     {
-        let _guard = self.update_lock.lock().await;
+        let workflow_id = workflow_id(project_id, repo);
+        let placeholder = ProjectWorkflowInstance::new(project_id.to_string(), repo.map(str::to_string));
+        let mut tx = self.pool.begin().await?;
+        self.insert_placeholder(&mut tx, &workflow_id, &placeholder)
+            .await?;
         let mut workflow = self
-            .get_by_project(project_id, repo)
+            .load_for_update_by_id(&mut tx, &workflow_id)
             .await?
-            .unwrap_or_else(|| {
-                ProjectWorkflowInstance::new(project_id.to_string(), repo.map(str::to_string))
-            });
+            .ok_or_else(|| anyhow::anyhow!("project workflow row disappeared after placeholder insert"))?;
         if workflow.repo.is_none() {
             workflow.repo = repo.map(str::to_string);
         }
         f(&mut workflow);
-        self.upsert(&workflow).await?;
+        self.upsert_in_tx(&mut tx, &workflow).await?;
+        tx.commit().await?;
         Ok(workflow)
+    }
+
+    async fn insert_placeholder(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        workflow_id: &str,
+        workflow: &ProjectWorkflowInstance,
+    ) -> anyhow::Result<()> {
+        let data = serde_json::to_string(workflow)?;
+        sqlx::query(
+            "INSERT INTO project_workflows (id, data) VALUES ($1, $2)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(workflow_id)
+        .bind(&data)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn load_for_update_by_id(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        workflow_id: &str,
+    ) -> anyhow::Result<Option<ProjectWorkflowInstance>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data FROM project_workflows WHERE id = $1 FOR UPDATE")
+                .bind(workflow_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        row.map(|(data,)| serde_json::from_str(&data))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    async fn upsert_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        workflow: &ProjectWorkflowInstance,
+    ) -> anyhow::Result<()> {
+        let data = serde_json::to_string(workflow)?;
+        sqlx::query(
+            "UPDATE project_workflows
+             SET data = $1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $2",
+        )
+        .bind(&data)
+        .bind(&workflow.id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 }
 

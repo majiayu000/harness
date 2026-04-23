@@ -285,10 +285,10 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                 continue;
             };
 
-            let candidates = match issue_workflows.list_feedback_candidates().await {
+            let candidates = match issue_workflows.claim_feedback_candidates(128).await {
                 Ok(candidates) => candidates,
                 Err(e) => {
-                    tracing::warn!("workflow feedback sweep: failed to list candidates: {e}");
+                    tracing::warn!("workflow feedback sweep: failed to claim candidates: {e}");
                     continue;
                 }
             };
@@ -341,6 +341,16 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                         retry_after_secs,
                     }) => {
                         incomplete_projects.insert(project_key.clone());
+                        let _ = issue_workflows
+                            .release_feedback_claim(
+                                &workflow.project_id,
+                                workflow.repo.as_deref(),
+                                pr_number,
+                                &format!(
+                                    "feedback sweep deferred by maintenance window; retry after {retry_after_secs}s"
+                                ),
+                            )
+                            .await;
                         if let Some(project_store) = state.core.project_workflow_store.as_ref() {
                             let _ = project_store
                                 .record_paused(
@@ -355,6 +365,14 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                     }
                     Err(e) => {
                         incomplete_projects.insert(project_key.clone());
+                        let _ = issue_workflows
+                            .release_feedback_claim(
+                                &workflow.project_id,
+                                workflow.repo.as_deref(),
+                                pr_number,
+                                &format!("feedback sweep enqueue failed: {e}"),
+                            )
+                            .await;
                         tracing::warn!(
                             project_id = %workflow.project_id,
                             pr = pr_number,
