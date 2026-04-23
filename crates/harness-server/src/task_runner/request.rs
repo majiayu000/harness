@@ -84,6 +84,21 @@ pub struct CreateTaskRequest {
     pub system_input: Option<SystemTaskInput>,
 }
 
+impl CreateTaskRequest {
+    /// Classify task kind using only trusted internal metadata for system tasks.
+    ///
+    /// External callers may set `source`, but they cannot populate `system_input`
+    /// because the field is `#[serde(skip)]`. That makes `system_input` the trust
+    /// boundary for review/planner lifecycle selection.
+    pub fn task_kind(&self) -> TaskKind {
+        match self.system_input.as_ref() {
+            Some(SystemTaskInput::PeriodicReview { .. }) => TaskKind::Review,
+            Some(SystemTaskInput::SprintPlanner { .. }) => TaskKind::Planner,
+            None => TaskKind::classify(None, self.issue, self.pr),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SystemTaskInput {
@@ -92,15 +107,6 @@ pub enum SystemTaskInput {
 }
 
 impl SystemTaskInput {
-    pub fn from_request(task_kind: TaskKind, req: &CreateTaskRequest) -> Option<Self> {
-        let prompt = req.prompt.as_ref()?.clone();
-        match task_kind {
-            TaskKind::Review => Some(Self::PeriodicReview { prompt }),
-            TaskKind::Planner => Some(Self::SprintPlanner { prompt }),
-            TaskKind::Issue | TaskKind::Pr | TaskKind::Prompt => None,
-        }
-    }
-
     pub fn prompt(&self) -> &str {
         match self {
             Self::PeriodicReview { prompt } | Self::SprintPlanner { prompt } => prompt,
@@ -245,7 +251,7 @@ impl Default for CreateTaskRequest {
 }
 
 pub(super) fn summarize_request_description(req: &CreateTaskRequest) -> Option<String> {
-    let task_kind = TaskKind::classify(req.source.as_deref(), req.issue, req.pr);
+    let task_kind = req.task_kind();
     // Only persist structured safe labels — never raw prompt text, which may contain
     // credentials or customer data.
     if let Some(n) = req.issue {

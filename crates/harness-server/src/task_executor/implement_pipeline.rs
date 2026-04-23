@@ -3,9 +3,7 @@ use super::helpers::{
     matched_skills_for_prompt, run_agent_streaming, run_on_error, run_post_execute,
     run_post_tool_use, run_pre_execute, update_status,
 };
-use crate::task_runner::{
-    mutate_and_persist, CreateTaskRequest, TaskId, TaskKind, TaskStatus, TaskStore,
-};
+use crate::task_runner::{mutate_and_persist, CreateTaskRequest, TaskId, TaskStatus, TaskStore};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::interceptor::ToolUseEvent;
 use harness_core::tool_isolation::validate_tool_usage;
@@ -70,7 +68,7 @@ pub(crate) fn prepend_constitution(prompt: String, enabled: bool) -> String {
 /// Issue-backed tasks and `pr:N` review tasks must produce a PR URL; generic
 /// prompt-only implementation tasks may complete without creating one.
 pub(crate) fn task_needs_pr_url(req: &CreateTaskRequest) -> bool {
-    TaskKind::classify(req.source.as_deref(), req.issue, req.pr).requires_pr_url()
+    req.task_kind().requires_pr_url()
 }
 
 /// Outcome of the implement phase.

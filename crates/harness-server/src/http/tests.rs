@@ -2011,3 +2011,15 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn recovery_queue_domain_routes_review_tasks_to_review_capacity() {
+    assert_eq!(
+        super::background::recovery_queue_domain(task_runner::TaskKind::Review),
+        super::task_routes::QueueDomain::Review
+    );
+    assert_eq!(
+        super::background::recovery_queue_domain(task_runner::TaskKind::Planner),
+        super::task_routes::QueueDomain::Primary
+    );
+}

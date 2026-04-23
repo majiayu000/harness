@@ -47,6 +47,16 @@ fn build_recovered_request(
     req
 }
 
+pub(super) fn recovery_queue_domain(task_kind: task_runner::TaskKind) -> task_routes::QueueDomain {
+    match task_kind {
+        task_runner::TaskKind::Review => task_routes::QueueDomain::Review,
+        task_runner::TaskKind::Issue
+        | task_runner::TaskKind::Pr
+        | task_runner::TaskKind::Prompt
+        | task_runner::TaskKind::Planner => task_routes::QueueDomain::Primary,
+    }
+}
+
 /// Spawn background watcher for AwaitingDeps tasks.
 /// Uses Weak<AppState> to avoid a reference cycle; the loop exits when AppState is dropped.
 pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
@@ -698,12 +708,11 @@ pub(super) fn spawn_system_task_recovery(state: &Arc<AppState>) {
                 };
                 let project_id = canonical.to_string_lossy().into_owned();
 
-                let permit = match state
-                    .concurrency
-                    .task_queue
-                    .acquire(&project_id, task.priority)
-                    .await
-                {
+                let queue = match recovery_queue_domain(task.task_kind) {
+                    task_routes::QueueDomain::Primary => state.concurrency.task_queue.clone(),
+                    task_routes::QueueDomain::Review => state.concurrency.review_task_queue.clone(),
+                };
+                let permit = match queue.acquire(&project_id, task.priority).await {
                     Ok(p) => p,
                     Err(e) => {
                         let reason =

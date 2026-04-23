@@ -436,7 +436,7 @@ pub(crate) async fn run_task(
     let task_kind = store
         .get(task_id)
         .map(|state| state.task_kind)
-        .unwrap_or_else(|| TaskKind::classify(req.source.as_deref(), req.issue, req.pr));
+        .unwrap_or_else(|| req.task_kind());
     let effective_max_turns: Option<u32> = req.max_turns.or(server_config.concurrency.max_turns);
     let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
 

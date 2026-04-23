@@ -82,11 +82,11 @@ pub fn prompt_requires_plan(prompt: &str) -> bool {
 }
 
 fn classify_task_kind(req: &CreateTaskRequest) -> TaskKind {
-    TaskKind::classify(req.source.as_deref(), req.issue, req.pr)
+    req.task_kind()
 }
 
 fn system_input_for_request(req: &CreateTaskRequest) -> Option<SystemTaskInput> {
-    SystemTaskInput::from_request(classify_task_kind(req), req)
+    req.system_input.clone()
 }
 
 #[cfg(test)]
@@ -1610,6 +1610,51 @@ mod tests {
         assert!(is_non_decomposable_prompt_source(Some("sprint_planner")));
         assert!(!is_non_decomposable_prompt_source(Some("github")));
         assert!(!is_non_decomposable_prompt_source(None));
+    }
+
+    #[test]
+    fn request_task_kind_trusts_only_internal_system_input() {
+        let spoofed = CreateTaskRequest {
+            prompt: Some("review this".to_string()),
+            source: Some("periodic_review".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(spoofed.task_kind(), TaskKind::Prompt);
+
+        let trusted = CreateTaskRequest {
+            prompt: Some("review this".to_string()),
+            source: Some("periodic_review".to_string()),
+            system_input: Some(SystemTaskInput::PeriodicReview {
+                prompt: "review this".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(trusted.task_kind(), TaskKind::Review);
+    }
+
+    #[test]
+    fn system_input_for_request_clones_only_explicit_internal_metadata() {
+        let spoofed = CreateTaskRequest {
+            prompt: Some("review this".to_string()),
+            source: Some("periodic_review".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(system_input_for_request(&spoofed), None);
+
+        let trusted = CreateTaskRequest {
+            prompt: Some("review this".to_string()),
+            source: Some("periodic_review".to_string()),
+            system_input: Some(SystemTaskInput::PeriodicReview {
+                prompt: "review this".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            system_input_for_request(&trusted),
+            Some(SystemTaskInput::PeriodicReview {
+                prompt: "review this".to_string(),
+            })
+        );
     }
 
     // --- dependency scheduling tests ---
