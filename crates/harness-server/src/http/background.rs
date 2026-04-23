@@ -436,11 +436,7 @@ pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
         .tasks
         .list_all()
         .into_iter()
-        .filter(|t| {
-            matches!(t.status, task_runner::TaskStatus::Pending)
-                && t.task_kind.requires_pr_url()
-                && t.pr_url.is_some()
-        })
+        .filter(|t| matches!(t.status, task_runner::TaskStatus::Pending) && t.pr_url.is_some())
         .collect();
     if !recovered.is_empty() {
         tracing::info!(
