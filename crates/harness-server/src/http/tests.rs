@@ -66,6 +66,15 @@ async fn make_test_state_with(
     config: harness_core::config::HarnessConfig,
     agent_registry: harness_agents::registry::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
+    make_test_state_with_project_root(dir, dir, config, agent_registry).await
+}
+
+async fn make_test_state_with_project_root(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    config: harness_core::config::HarnessConfig,
+    agent_registry: harness_agents::registry::AgentRegistry,
+) -> anyhow::Result<Arc<AppState>> {
     let feishu_intake = config.intake.feishu.as_ref().and_then(|cfg| {
         (cfg.enabled && crate::intake::feishu::has_verification_token(cfg))
             .then(|| Arc::new(crate::intake::feishu::FeishuIntake::new(cfg.clone())))
@@ -89,7 +98,7 @@ async fn make_test_state_with(
         server.config.gc.clone(),
         signal_detector,
         draft_store,
-        dir.to_path_buf(),
+        project_root.to_path_buf(),
     ));
     let thread_db = crate::thread_db::ThreadDb::open(&harness_core::config::dirs::default_db_path(
         dir, "threads",
@@ -99,8 +108,10 @@ async fn make_test_state_with(
         &harness_core::config::dirs::default_db_path(dir, "projects"),
     )
     .await?;
-    let project_svc =
-        crate::services::project::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
+    let project_svc = crate::services::project::DefaultProjectService::new(
+        _project_svc_tmp,
+        project_root.to_path_buf(),
+    );
     let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
     let execution_svc = crate::services::execution::DefaultExecutionService::new(
         tasks.clone(),
@@ -119,10 +130,10 @@ async fn make_test_state_with(
     Ok(Arc::new(AppState {
         core: crate::http::CoreServices {
             server,
-            project_root: dir.to_path_buf(),
+            project_root: project_root.to_path_buf(),
             home_dir: std::env::var("HOME")
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| dir.to_path_buf()),
+                .unwrap_or_else(|_| project_root.to_path_buf()),
             tasks,
             thread_db: Some(thread_db),
             plan_db: None,
@@ -226,7 +237,7 @@ async fn make_test_state_with_agent(
 ) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
     let mut config = harness_core::config::HarnessConfig::default();
     config.server.github_webhook_secret = webhook_secret.map(ToString::to_string);
-    build_test_state_with_agent(dir, config).await
+    build_test_state_with_agent(dir, dir, config).await
 }
 
 async fn make_test_state_with_agent_and_repo(
@@ -241,18 +252,27 @@ async fn make_test_state_with_agent_and_repo(
         repo: repo.to_string(),
         ..Default::default()
     });
-    build_test_state_with_agent(dir, config).await
+    build_test_state_with_agent(dir, dir, config).await
+}
+
+async fn make_test_state_with_agent_and_config(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    config: harness_core::config::HarnessConfig,
+) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
+    build_test_state_with_agent(dir, project_root, config).await
 }
 
 async fn build_test_state_with_agent(
     dir: &std::path::Path,
+    project_root: &std::path::Path,
     config: harness_core::config::HarnessConfig,
 ) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
     let capturing = CapturingAgent::new();
     let mut registry = harness_agents::registry::AgentRegistry::new("test");
     registry.register("test", capturing.clone());
 
-    let state = make_test_state_with(dir, config, registry).await?;
+    let state = make_test_state_with_project_root(dir, project_root, config, registry).await?;
     Ok((state, capturing))
 }
 
@@ -365,6 +385,23 @@ async fn response_json(response: axum::response::Response) -> anyhow::Result<ser
     use http_body_util::BodyExt;
     let body = response.into_body().collect().await?.to_bytes();
     Ok(serde_json::from_slice(&body)?)
+}
+
+async fn wait_for_task_project_root(
+    state: &Arc<AppState>,
+    task_id: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let task_id = harness_core::types::TaskId(task_id.to_string());
+    for _ in 0..50 {
+        if let Some(task) = state.core.tasks.get_with_db_fallback(&task_id).await? {
+            if let Some(project_root) = task.project_root {
+                return Ok(project_root);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    anyhow::bail!("task {task_id} did not resolve a project root")
 }
 
 fn webhook_signature(secret: &str, payload: &[u8]) -> String {
@@ -1242,6 +1279,179 @@ async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Resu
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(state.core.tasks.count(), before_count + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn webhook_routes_issue_tasks_to_repo_specific_project_root() -> anyhow::Result<()> {
+    let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-repo-a-")?;
+    let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-repo-b-")?;
+    let secret = "secret";
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        repos: vec![harness_core::config::intake::GitHubRepoConfig {
+            repo: "org/repo-b".to_string(),
+            label: "harness".to_string(),
+            project_root: Some(repo_b_dir.path().display().to_string()),
+        }],
+        ..Default::default()
+    });
+
+    let (state, _agent) =
+        make_test_state_with_agent_and_config(repo_a_dir.path(), repo_a_dir.path(), config).await?;
+    let app = webhook_app(state.clone());
+
+    let payload = serde_json::json!({
+        "action": "opened",
+        "issue": {
+            "number": 77,
+            "body": "@harness please implement this feature"
+        },
+        "repository": { "full_name": "org/repo-b" }
+    });
+    let payload_body = payload.to_string();
+    let signature = webhook_signature(secret, payload_body.as_bytes());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("x-github-event", "issues")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload_body))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let json = response_json(response).await?;
+    let task_root = wait_for_task_project_root(
+        &state,
+        json["task_id"].as_str().expect("task id should be present"),
+    )
+    .await?;
+    assert_eq!(task_root.canonicalize()?, repo_b_dir.path().canonicalize()?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn webhook_routes_prompt_tasks_to_repo_specific_project_root() -> anyhow::Result<()> {
+    let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-prompt-a-")?;
+    let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-prompt-b-")?;
+    let secret = "secret";
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        repos: vec![harness_core::config::intake::GitHubRepoConfig {
+            repo: "org/repo-b".to_string(),
+            label: "harness".to_string(),
+            project_root: Some(repo_b_dir.path().display().to_string()),
+        }],
+        ..Default::default()
+    });
+
+    let (state, _agent) =
+        make_test_state_with_agent_and_config(repo_a_dir.path(), repo_a_dir.path(), config).await?;
+    let app = webhook_app(state.clone());
+
+    let payload = serde_json::json!({
+        "action": "created",
+        "issue": {
+            "number": 42,
+            "html_url": "https://github.com/org/repo-b/pull/42",
+            "pull_request": { "url": "https://api.github.com/repos/org/repo-b/pulls/42" }
+        },
+        "comment": {
+            "body": "@harness fix ci",
+            "html_url": "https://github.com/org/repo-b/issues/42#issuecomment-1"
+        },
+        "repository": { "full_name": "org/repo-b" }
+    });
+    let payload_body = payload.to_string();
+    let signature = webhook_signature(secret, payload_body.as_bytes());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("x-github-event", "issue_comment")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload_body))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let json = response_json(response).await?;
+    let task_root = wait_for_task_project_root(
+        &state,
+        json["task_id"].as_str().expect("task id should be present"),
+    )
+    .await?;
+    assert_eq!(task_root.canonicalize()?, repo_b_dir.path().canonicalize()?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn webhook_ignores_issue_tasks_when_repo_is_unmapped() -> anyhow::Result<()> {
+    let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-fallback-a-")?;
+    let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-fallback-b-")?;
+    let secret = "secret";
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        repos: vec![harness_core::config::intake::GitHubRepoConfig {
+            repo: "org/repo-b".to_string(),
+            label: "harness".to_string(),
+            project_root: Some(repo_b_dir.path().display().to_string()),
+        }],
+        ..Default::default()
+    });
+
+    let (state, _agent) =
+        make_test_state_with_agent_and_config(repo_a_dir.path(), repo_a_dir.path(), config).await?;
+    let app = webhook_app(state.clone());
+
+    let payload = serde_json::json!({
+        "action": "opened",
+        "issue": {
+            "number": 78,
+            "body": "@harness please implement this feature"
+        },
+        "repository": { "full_name": "org/unmapped" }
+    });
+    let payload_body = payload.to_string();
+    let signature = webhook_signature(secret, payload_body.as_bytes());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("x-github-event", "issues")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload_body))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await?;
+    assert_eq!(json["status"], "ignored");
+    assert!(
+        json["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not configured"),
+        "reason should explain why the repo was ignored"
+    );
+    assert_eq!(state.core.tasks.count(), 0);
     Ok(())
 }
 

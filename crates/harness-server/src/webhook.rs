@@ -329,6 +329,7 @@ mod tests {
         assert_eq!(request.issue, Some(106));
         assert_eq!(request.pr, None);
         assert_eq!(request.prompt, None);
+        assert_eq!(request.repo.as_deref(), Some("majiayu000/harness"));
     }
 
     #[test]
@@ -347,6 +348,7 @@ mod tests {
         assert_eq!(request.issue, None);
         assert_eq!(request.pr, Some(42));
         assert_eq!(request.prompt, None);
+        assert_eq!(request.repo.as_deref(), Some("majiayu000/harness"));
     }
 
     #[test]
@@ -371,6 +373,7 @@ mod tests {
         let request = request.expect("request should exist");
         assert_eq!(request.issue, None);
         assert_eq!(request.pr, None);
+        assert_eq!(request.repo.as_deref(), Some("majiayu000/harness"));
         assert!(request
             .prompt
             .as_deref()
@@ -587,6 +590,7 @@ mod tests {
         .unwrap();
         let request = request.expect("request should exist");
         assert_eq!(reason, "pr review changes_requested");
+        assert_eq!(request.repo.as_deref(), Some("org/repo"));
         let prompt = request.prompt.unwrap();
         assert!(prompt.contains("PR #10"));
         assert!(prompt.contains("org/repo"));
@@ -617,6 +621,7 @@ mod tests {
         .unwrap();
         let request = request.expect("request should exist");
         assert_eq!(reason, "pr review approved");
+        assert_eq!(request.repo.as_deref(), Some("org/repo"));
         let prompt = request.prompt.unwrap();
         assert!(prompt.contains("PR #10"));
         assert!(prompt.contains("org/repo"));
@@ -647,6 +652,7 @@ mod tests {
         .unwrap();
         let request = request.expect("request should exist");
         assert_eq!(reason, "pr review comment: actionable feedback");
+        assert_eq!(request.repo.as_deref(), Some("org/repo"));
         let prompt = request.prompt.unwrap();
         assert!(prompt.contains("Consider renaming this variable"));
     }
