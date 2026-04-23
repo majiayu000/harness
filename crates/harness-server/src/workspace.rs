@@ -556,8 +556,18 @@ impl WorkspaceManager {
 
             if should_remove {
                 let cleanup_repo = resolve_cleanup_source_repo(source_repo, &path, task).await;
-                cleanup_workspace_path(&cleanup_repo, &path).await?;
-                summary.removed += 1;
+                match cleanup_workspace_path(&cleanup_repo, &path).await {
+                    Ok(()) => {
+                        summary.removed += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = ?path,
+                            source_repo = ?cleanup_repo,
+                            "reconcile_startup: failed to cleanup workspace: {e}"
+                        );
+                    }
+                }
             } else {
                 summary.preserved += 1;
             }
@@ -765,13 +775,18 @@ async fn remove_worktree(source_repo: &Path, workspace_path: &Path) -> anyhow::R
 }
 
 async fn cleanup_workspace_path(source_repo: &Path, workspace_path: &Path) -> anyhow::Result<()> {
-    if !workspace_path.exists() {
-        return Ok(());
-    }
-
     let worktree_registered = is_registered_worktree(source_repo, workspace_path).await;
     if worktree_registered {
-        remove_worktree(source_repo, workspace_path).await?;
+        match remove_worktree(source_repo, workspace_path).await {
+            Ok(()) => {}
+            Err(e) if !workspace_path.exists() => {
+                tracing::warn!(
+                    path = ?workspace_path,
+                    "cleanup_workspace_path: git worktree remove failed for missing path; pruning stale metadata: {e}"
+                );
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     if workspace_path.exists() {
@@ -821,9 +836,10 @@ async fn infer_workspace_source_repo(workspace_path: &Path) -> Option<PathBuf> {
 
 async fn is_registered_worktree(source_repo: &Path, workspace_path: &Path) -> bool {
     // `git worktree list --porcelain` emits absolute paths even when `workspace.root`
-    // was configured relatively, so normalize both sides before matching.
-    let expected_path =
-        std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf());
+    // was configured relatively. Deleted worktrees may still be listed through a
+    // symlink-expanded parent such as `/private/var`, so normalize through the
+    // nearest existing ancestor before matching.
+    let expected_path = canonicalize_existing_or_parent(workspace_path);
     git_command()
         .args([
             "-C",
@@ -841,11 +857,36 @@ async fn is_registered_worktree(source_repo: &Path, workspace_path: &Path) -> bo
             stdout.lines().any(|line| {
                 line.strip_prefix("worktree ")
                     .map(PathBuf::from)
-                    .and_then(|listed| std::fs::canonicalize(&listed).ok().or(Some(listed)))
+                    .map(|listed| canonicalize_existing_or_parent(&listed))
                     .is_some_and(|listed| listed == expected_path)
             })
         })
         .unwrap_or(false)
+}
+
+fn canonicalize_existing_or_parent(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let mut missing_components = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        let Some(parent) = cursor.parent() else {
+            return path.to_path_buf();
+        };
+        let Some(file_name) = cursor.file_name() else {
+            return path.to_path_buf();
+        };
+        missing_components.push(file_name.to_os_string());
+        cursor = parent;
+    }
+
+    let mut normalized = std::fs::canonicalize(cursor).unwrap_or_else(|_| cursor.to_path_buf());
+    for component in missing_components.iter().rev() {
+        normalized.push(component);
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -1377,6 +1418,87 @@ mod tests {
                     .is_some_and(|entry| entry == lease.workspace_path.to_string_lossy())
             }),
             "startup cleanup must prune the owning repo entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_workspace_path_prunes_missing_registered_worktree() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let task_id = harness_core::types::TaskId("missing-registered-task".to_string());
+
+        let lease = mgr
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .await
+            .expect("create workspace");
+        std::fs::remove_dir_all(&lease.workspace_path).expect("remove checkout dir");
+
+        assert!(
+            is_registered_worktree(source.path(), &lease.workspace_path).await,
+            "git should still have a stale worktree registration"
+        );
+
+        cleanup_workspace_path(source.path(), &lease.workspace_path)
+            .await
+            .expect("cleanup missing registered worktree");
+
+        assert!(
+            !is_registered_worktree(source.path(), &lease.workspace_path).await,
+            "cleanup should prune missing worktree registration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_startup_continues_after_workspace_cleanup_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+
+        let bad_path = workspaces.path().join("bad-stale-workspace");
+        std::fs::create_dir_all(&bad_path).expect("create bad workspace");
+        std::fs::write(bad_path.join("locked"), "locked").expect("write locked child");
+        std::fs::set_permissions(&bad_path, std::fs::Permissions::from_mode(0o500))
+            .expect("lock bad workspace");
+
+        let good_path = workspaces.path().join("good-stale-workspace");
+        std::fs::create_dir_all(&good_path).expect("create good workspace");
+
+        let summary = mgr
+            .reconcile_startup(source.path(), &[])
+            .await
+            .expect("startup reconcile should continue after per-entry cleanup failure");
+
+        std::fs::set_permissions(&bad_path, std::fs::Permissions::from_mode(0o700))
+            .expect("unlock bad workspace");
+
+        assert_eq!(
+            summary.removed, 1,
+            "successful entries should still be counted after another entry fails"
+        );
+        assert!(
+            !good_path.exists(),
+            "good stale workspace should still be cleaned"
+        );
+        assert!(
+            bad_path.exists(),
+            "failed stale workspace should remain for later retry or operator cleanup"
         );
     }
 
