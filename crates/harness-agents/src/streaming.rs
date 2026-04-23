@@ -154,6 +154,7 @@ fn looks_like_search_result(line: &str) -> bool {
         return false;
     };
     !path.is_empty()
+        && !path.contains(char::is_whitespace)
         && !line_no.is_empty()
         && line_no.chars().all(|c| c.is_ascii_digit())
         && (path.starts_with("./")
@@ -638,6 +639,9 @@ mod tests {
         ));
         assert!(looks_like_search_result(
             "./crates/harness-server/src/http/background.rs:382:                            format!(\"startup recovery: failed to acquire concurrency permit: {e}\");"
+        ));
+        assert!(!looks_like_search_result(
+            "thread 'main' panicked at src/main.rs:10:5:"
         ));
     }
 

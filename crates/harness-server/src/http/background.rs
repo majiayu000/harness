@@ -297,11 +297,13 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
             }
 
             let mut touched_projects = std::collections::HashSet::new();
+            let mut incomplete_projects = std::collections::HashSet::new();
             for workflow in candidates {
                 let Some(pr_number) = workflow.pr_number else {
                     continue;
                 };
-                if touched_projects.insert((workflow.project_id.clone(), workflow.repo.clone())) {
+                let project_key = (workflow.project_id.clone(), workflow.repo.clone());
+                if touched_projects.insert(project_key.clone()) {
                     if let Some(project_store) = state.core.project_workflow_store.as_ref() {
                         if let Err(e) = project_store
                             .record_feedback_sweep_started(
@@ -338,6 +340,7 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                     Err(crate::services::execution::EnqueueTaskError::MaintenanceWindow {
                         retry_after_secs,
                     }) => {
+                        incomplete_projects.insert(project_key.clone());
                         if let Some(project_store) = state.core.project_workflow_store.as_ref() {
                             let _ = project_store
                                 .record_paused(
@@ -351,6 +354,7 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                         }
                     }
                     Err(e) => {
+                        incomplete_projects.insert(project_key.clone());
                         tracing::warn!(
                             project_id = %workflow.project_id,
                             pr = pr_number,
@@ -373,6 +377,9 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
 
             if let Some(project_store) = state.core.project_workflow_store.as_ref() {
                 for (project_id, repo) in touched_projects {
+                    if incomplete_projects.contains(&(project_id.clone(), repo.clone())) {
+                        continue;
+                    }
                     if let Err(e) = project_store
                         .record_feedback_sweep_completed(&project_id, repo.as_deref())
                         .await
