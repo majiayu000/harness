@@ -47,21 +47,19 @@ impl TaskKind {
         external_id: Option<&str>,
         description: Option<&str>,
     ) -> Self {
-        match source {
-            Some("periodic_review") => Self::Review,
-            Some("sprint_planner") => Self::Planner,
-            _ => {
-                if external_id.is_some_and(|id| id.starts_with("issue:"))
-                    || description.is_some_and(|desc| desc.starts_with("issue #"))
-                {
-                    Self::Issue
-                } else if external_id.is_some_and(|id| id.starts_with("pr:"))
-                    || description.is_some_and(|desc| desc.starts_with("PR #"))
-                {
-                    Self::Pr
-                } else {
-                    Self::Prompt
-                }
+        if external_id.is_some_and(|id| id.starts_with("issue:"))
+            || description.is_some_and(|desc| desc.starts_with("issue #"))
+        {
+            Self::Issue
+        } else if external_id.is_some_and(|id| id.starts_with("pr:"))
+            || description.is_some_and(|desc| desc.starts_with("PR #"))
+        {
+            Self::Pr
+        } else {
+            match source {
+                Some("periodic_review") => Self::Review,
+                Some("sprint_planner") => Self::Planner,
+                _ => Self::Prompt,
             }
         }
     }
@@ -245,5 +243,57 @@ impl std::str::FromStr for TaskStatus {
             "cancelled" => Ok(TaskStatus::Cancelled),
             _ => anyhow::bail!("unknown task status `{s}`"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TaskKind;
+
+    #[test]
+    fn legacy_issue_markers_override_review_source() {
+        let kind = TaskKind::from_persisted(
+            None,
+            Some("periodic_review"),
+            Some("issue:42"),
+            Some("issue #42"),
+        )
+        .expect("legacy task kind should decode");
+
+        assert_eq!(kind, TaskKind::Issue);
+    }
+
+    #[test]
+    fn legacy_pr_markers_override_planner_source() {
+        let kind = TaskKind::from_persisted(
+            Some("legacy"),
+            Some("sprint_planner"),
+            Some("pr:7"),
+            Some("PR #7"),
+        )
+        .expect("legacy task kind should decode");
+
+        assert_eq!(kind, TaskKind::Pr);
+    }
+
+    #[test]
+    fn legacy_system_sources_still_decode_when_no_issue_or_pr_markers_exist() {
+        let review = TaskKind::from_persisted(
+            Some("legacy"),
+            Some("periodic_review"),
+            Some("legacy:review"),
+            Some("periodic review"),
+        )
+        .expect("legacy review task kind should decode");
+        let planner = TaskKind::from_persisted(
+            Some("legacy"),
+            Some("sprint_planner"),
+            Some("legacy:planner"),
+            Some("sprint planner"),
+        )
+        .expect("legacy planner task kind should decode");
+
+        assert_eq!(review, TaskKind::Review);
+        assert_eq!(planner, TaskKind::Planner);
     }
 }
