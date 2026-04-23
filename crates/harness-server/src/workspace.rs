@@ -519,12 +519,14 @@ impl WorkspaceManager {
 
         let read_dir = std::fs::read_dir(&self.config.root)?;
         let mut summary = StartupReconciliation::default();
+        let mut seen_paths = std::collections::HashSet::new();
 
         for entry in read_dir.flatten() {
             let path = entry.path();
             if !path.is_dir() {
                 continue;
             }
+            seen_paths.insert(path.clone());
             if self.active.iter().any(|e| e.workspace_path == path) {
                 continue;
             }
@@ -570,6 +572,33 @@ impl WorkspaceManager {
                 }
             } else {
                 summary.preserved += 1;
+            }
+        }
+
+        for (path, task) in &path_to_task {
+            if seen_paths.contains(path)
+                || self.active.iter().any(|e| e.workspace_path == *path)
+                || path.exists()
+            {
+                continue;
+            }
+
+            let cleanup_repo = resolve_cleanup_source_repo(source_repo, path, Some(*task)).await;
+            if !is_registered_worktree(&cleanup_repo, path).await {
+                continue;
+            }
+
+            match cleanup_workspace_path(&cleanup_repo, path).await {
+                Ok(()) => {
+                    summary.removed += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = ?path,
+                        source_repo = ?cleanup_repo,
+                        "reconcile_startup: failed to cleanup missing workspace registration: {e}"
+                    );
+                }
             }
         }
 
@@ -1453,6 +1482,74 @@ mod tests {
         assert!(
             !is_registered_worktree(source.path(), &lease.workspace_path).await,
             "cleanup should prune missing worktree registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_startup_prunes_missing_registered_worktree_for_tracked_task() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr_a = WorkspaceManager::new(config.clone()).expect("mgr a");
+        let mgr_b = WorkspaceManager::new(config).expect("mgr b");
+        let task_id = harness_core::types::TaskId("startup-missing-registered-task".to_string());
+
+        let lease = mgr_a
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .await
+            .expect("create workspace");
+        std::fs::remove_dir_all(&lease.workspace_path).expect("remove checkout dir");
+
+        assert!(
+            is_registered_worktree(source.path(), &lease.workspace_path).await,
+            "git should still have a stale worktree registration"
+        );
+
+        let task_summary = crate::task_runner::TaskSummary {
+            id: task_id.clone(),
+            status: crate::task_runner::TaskStatus::Pending,
+            failure_kind: None,
+            turn: 0,
+            pr_url: None,
+            error: None,
+            source: None,
+            parent_id: None,
+            external_id: None,
+            repo: None,
+            description: None,
+            created_at: None,
+            phase: crate::task_runner::TaskPhase::Implement,
+            depends_on: vec![],
+            subtask_ids: vec![],
+            project: Some(source.path().to_string_lossy().into_owned()),
+            workspace_path: Some(lease.workspace_path.to_string_lossy().into_owned()),
+            workspace_owner: Some(mgr_a.owner_session.clone()),
+            run_generation: 1,
+        };
+
+        let summary = mgr_b
+            .reconcile_startup(source.path(), &[task_summary])
+            .await
+            .expect("startup reconcile");
+        assert_eq!(summary.removed, 1);
+        assert!(
+            !is_registered_worktree(source.path(), &lease.workspace_path).await,
+            "startup reconcile should prune missing worktree registration"
+        );
+
+        let recreated = mgr_b
+            .create_workspace(&task_id, source.path(), "origin", &branch, 2)
+            .await
+            .expect("recreate workspace after startup reconcile");
+        assert!(
+            recreated.workspace_path.exists(),
+            "startup reconcile should unblock the next worktree add"
         );
     }
 
