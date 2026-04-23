@@ -89,6 +89,24 @@ fn system_input_for_request(req: &CreateTaskRequest) -> Option<SystemTaskInput> 
     req.system_input.clone()
 }
 
+fn refresh_preregistered_task_metadata(
+    entry: &mut TaskState,
+    req: &CreateTaskRequest,
+    project_root: PathBuf,
+    description: Option<String>,
+) {
+    entry.task_kind = classify_task_kind(req);
+    entry.source = req.source.clone();
+    entry.external_id = req.external_id.clone();
+    entry.repo = req.repo.clone();
+    entry.parent_id = req.parent_task_id.clone();
+    entry.depends_on = req.depends_on.clone();
+    entry.project_root = Some(project_root);
+    entry.issue = req.issue;
+    entry.description = description;
+    entry.system_input = system_input_for_request(req);
+}
+
 #[cfg(test)]
 pub(super) fn is_non_decomposable_prompt_source(source: Option<&str>) -> bool {
     TaskKind::classify(source, None, None).is_non_decomposable_prompt()
@@ -408,17 +426,12 @@ where
         }
         let description = summarize_request_description(&req);
         if let Some(mut entry) = store.cache.get_mut(&id) {
-            entry.task_kind = classify_task_kind(&req);
-            entry.source = req.source.clone();
-            entry.external_id = req.external_id.clone();
-            entry.repo = req.repo.clone();
-            entry.parent_id = req.parent_task_id.clone();
-            entry.depends_on = req.depends_on.clone();
-            entry.project_root = Some(project_root.clone());
-            entry.issue = req.issue;
-            entry.phase = entry.task_kind.default_phase();
-            entry.description = description;
-            entry.system_input = system_input_for_request(&req);
+            refresh_preregistered_task_metadata(
+                &mut entry,
+                &req,
+                project_root.clone(),
+                description,
+            );
         }
 
         // Parallel dispatch for Complex+ prompt-only tasks when workspace isolation is active.
@@ -1485,6 +1498,30 @@ mod tests {
             "review loop turn must use Execution phase (agent needs write access to fix bot comments)"
         );
         Ok(())
+    }
+
+    #[test]
+    fn preregistered_metadata_refresh_preserves_persisted_phase() {
+        let mut state = TaskState::new(TaskId::new());
+        state.phase = TaskPhase::Plan;
+
+        let req = CreateTaskRequest {
+            prompt: Some("small prompt".into()),
+            project: Some(PathBuf::from("/tmp/recovered-project")),
+            repo: Some("owner/repo".into()),
+            ..Default::default()
+        };
+
+        refresh_preregistered_task_metadata(
+            &mut state,
+            &req,
+            PathBuf::from("/tmp/recovered-project"),
+            Some("small prompt".into()),
+        );
+
+        assert_eq!(state.phase, TaskPhase::Plan);
+        assert_eq!(state.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(state.description.as_deref(), Some("small prompt"));
     }
 
     #[test]
