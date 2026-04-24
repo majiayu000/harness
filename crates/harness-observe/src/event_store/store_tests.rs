@@ -42,9 +42,16 @@ async fn db_tests_enabled() -> bool {
         .await
 }
 
-fn is_pool_timeout(err: &anyhow::Error) -> bool {
-    err.to_string()
-        .contains("pool timed out while waiting for an open connection")
+fn is_db_unavailable(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    // SQLx pool exhausted locally
+    msg.contains("pool timed out while waiting for an open connection")
+        // Supabase session pooler cap (EMAXCONNSESSION)
+        || msg.contains("EMAXCONNSESSION")
+        // SSL handshake failure (DB unreachable or in maintenance)
+        || msg.contains("SSLRequest")
+        // Generic connection-refused at TCP level
+        || msg.contains("Connection refused")
 }
 
 struct TestStore {
@@ -78,7 +85,7 @@ async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<TestStore>> {
             inner,
             _permit: permit,
         })),
-        Err(err) if is_pool_timeout(&err) => Ok(None),
+        Err(err) if is_db_unavailable(&err) => Ok(None),
         Err(err) => Err(err),
     }
 }
@@ -547,7 +554,7 @@ async fn log_with_unreachable_otel_endpoint_still_persists_event() -> anyhow::Re
         .expect("semaphore never closed");
     let store = match EventStore::with_policies_and_otel(dir.path(), 1800, 90, &config).await {
         Ok(store) => store,
-        Err(err) if is_pool_timeout(&err) => return Ok(()),
+        Err(err) if is_db_unavailable(&err) => return Ok(()),
         Err(err) => return Err(err),
     };
     assert!(store.otel_pipeline_is_none());
