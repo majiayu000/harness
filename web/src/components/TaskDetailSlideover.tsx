@@ -17,29 +17,34 @@ interface Props {
 export function TaskDetailSlideover({ taskId, onClose }: Props) {
   const [activeTab, setActiveTab] = useState<Tab>("summary");
   const [streamText, setStreamText] = useState("");
+  const [streamError, setStreamError] = useState<string | null>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setStreamText("");
+    setStreamError(null);
     setActiveTab("summary");
   }, [taskId]);
 
-  useTaskStream(taskId, (text) =>
-    setStreamText((prev) => {
-      const next = prev + text;
-      return next.length > MAX_STREAM_CHARS ? next.slice(-MAX_STREAM_CHARS) : next;
-    }),
+  useTaskStream(
+    taskId,
+    (text) =>
+      setStreamText((prev) => {
+        const next = prev + text;
+        return next.length > MAX_STREAM_CHARS ? next.slice(-MAX_STREAM_CHARS) : next;
+      }),
+    (msg) => setStreamError(msg),
   );
 
   const { data: task, isLoading, isError } = useTaskDetail(taskId);
 
-  const { data: artifacts } = useQuery({
+  const { data: artifacts, isError: isArtifactsError } = useQuery({
     queryKey: ["task-artifacts", taskId],
     queryFn: ({ signal }) => apiJson<unknown[]>(`/tasks/${taskId}/artifacts`, { signal }),
     enabled: !!taskId && activeTab === "artifacts",
   });
 
-  const { data: prompts } = useQuery({
+  const { data: prompts, isError: isPromptsError } = useQuery({
     queryKey: ["task-prompts", taskId],
     queryFn: ({ signal }) => apiJson<unknown[]>(`/tasks/${taskId}/prompts`, { signal }),
     enabled: !!taskId && activeTab === "prompts",
@@ -120,12 +125,23 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
             <SummaryContent task={task} />
           )}
           {activeTab === "output" && (
-            <pre className="font-mono text-[11px] text-ink whitespace-pre-wrap break-words">
-              {streamText || <span className="text-ink-4">No output yet.</span>}
-            </pre>
+            <>
+              {streamError && (
+                <div className="font-mono text-[11px] text-rust mb-2" role="alert">
+                  Stream error: {streamError}
+                </div>
+              )}
+              <pre className="font-mono text-[11px] text-ink whitespace-pre-wrap break-words">
+                {streamText || <span className="text-ink-4">No output yet.</span>}
+              </pre>
+            </>
           )}
-          {activeTab === "prompts" && <RawJsonContent data={prompts} label="prompts" />}
-          {activeTab === "artifacts" && <RawJsonContent data={artifacts} label="artifacts" />}
+          {activeTab === "prompts" && (
+            <RawJsonContent data={prompts} label="prompts" isError={isPromptsError} />
+          )}
+          {activeTab === "artifacts" && (
+            <RawJsonContent data={artifacts} label="artifacts" isError={isArtifactsError} />
+          )}
         </div>
       </div>
     </>
@@ -170,7 +186,14 @@ function Field({ label, value }: { label: string; value: string }) {
   );
 }
 
-function RawJsonContent({ data, label }: { data: unknown; label: string }) {
+function RawJsonContent({ data, label, isError }: { data: unknown; label: string; isError?: boolean }) {
+  if (isError) {
+    return (
+      <div className="font-mono text-[11px] text-rust" role="alert">
+        Failed to load {label}.
+      </div>
+    );
+  }
   if (data === undefined) {
     return <div className="font-mono text-[11px] text-ink-3">Loading {label}…</div>;
   }

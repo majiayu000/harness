@@ -131,8 +131,9 @@ function TaskCard({
 }) {
   const title = task.description?.trim() || task.repo || task.id.slice(0, 8);
   return (
-    <div
-      className="border border-line bg-bg px-2.5 py-2 mb-2 last:mb-0 hover:border-line-3 transition-colors cursor-pointer"
+    <button
+      type="button"
+      className="w-full text-left border border-line bg-bg px-2.5 py-2 mb-2 last:mb-0 hover:border-line-3 transition-colors cursor-pointer"
       onClick={onClick}
     >
       <div className="text-[12.5px] text-ink leading-snug line-clamp-2" title={title}>
@@ -176,7 +177,7 @@ function TaskCard({
           {task.pr_url.replace(/^https:\/\/github\.com\//, "")}
         </a>
       )}
-    </div>
+    </button>
   );
 }
 

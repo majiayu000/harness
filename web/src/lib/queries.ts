@@ -40,10 +40,16 @@ export function useTaskDetail(id: string | null) {
   });
 }
 
-export function useTaskStream(id: string | null, onChunk: (text: string) => void): void {
+export function useTaskStream(
+  id: string | null,
+  onChunk: (text: string) => void,
+  onError?: (message: string) => void,
+): void {
   const onChunkRef = useRef(onChunk);
+  const onErrorRef = useRef(onError);
   useEffect(() => {
     onChunkRef.current = onChunk;
+    onErrorRef.current = onError;
   });
 
   useEffect(() => {
@@ -75,7 +81,11 @@ export function useTaskStream(id: string | null, onChunk: (text: string) => void
               const item = JSON.parse(dataLine.slice(6)) as StreamItem;
               if (item.type === "MessageDelta") {
                 onChunkRef.current(item.text);
-              } else if (item.type === "Done" || item.type === "Error") {
+              } else if (item.type === "Error") {
+                onErrorRef.current?.(item.message);
+                reader.cancel();
+                return;
+              } else if (item.type === "Done") {
                 reader.cancel();
                 return;
               }
@@ -84,8 +94,11 @@ export function useTaskStream(id: string | null, onChunk: (text: string) => void
             }
           }
         }
-      } catch {
-        // AbortError or network error — clean exit
+      } catch (err) {
+        if (err instanceof Error && err.name !== "AbortError") {
+          onErrorRef.current?.(err.message);
+        }
+        // AbortError — clean exit
       }
     })();
 
