@@ -350,6 +350,63 @@ impl TaskStore {
         Ok(by_id)
     }
 
+    /// Return the latest status for each `external_id` in a single project/repo namespace.
+    ///
+    /// The database query collapses historical attempts down to the newest row per
+    /// issue. In-memory cache entries then override the DB result when the server
+    /// is holding a newer status transition that has not been re-read from storage.
+    pub async fn list_latest_external_statuses_by_project_and_repo(
+        &self,
+        project_id: &str,
+        repo: Option<&str>,
+    ) -> anyhow::Result<HashMap<String, (Option<String>, TaskStatus)>> {
+        let mut by_external_id: HashMap<String, (Option<String>, TaskStatus)> = self
+            .db
+            .list_latest_external_statuses_by_project_and_repo(project_id, repo)
+            .await?
+            .into_iter()
+            .filter_map(|(external_id, status, created_at)| {
+                status
+                    .parse::<TaskStatus>()
+                    .ok()
+                    .map(|parsed| (external_id, (created_at, parsed)))
+            })
+            .collect();
+        for entry in self.cache.iter() {
+            let task = entry.value();
+            let same_project = task
+                .project_root
+                .as_ref()
+                .map(|path| path.to_string_lossy() == project_id)
+                .unwrap_or(false);
+            let same_repo = match (repo, task.repo.as_deref()) {
+                (Some(expected), Some(actual)) => expected == actual,
+                (None, None) => true,
+                _ => false,
+            };
+            if !same_project || !same_repo {
+                continue;
+            }
+            let Some(external_id) = task.external_id.clone() else {
+                continue;
+            };
+            let should_replace = by_external_id
+                .get(&external_id)
+                .map(|(existing_created_at, _)| {
+                    latest_timestamp_at_least(
+                        task.created_at.as_deref(),
+                        existing_created_at.as_deref(),
+                    )
+                })
+                .unwrap_or(true);
+            if should_replace {
+                by_external_id.insert(external_id, (task.created_at.clone(), task.status.clone()));
+            }
+        }
+
+        Ok(by_external_id)
+    }
+
     /// Run `f` only if the task still exists and is live-`pending`.
     ///
     /// Holding the mutable cache guard across `f` prevents a concurrent status
@@ -1079,6 +1136,15 @@ pub async fn mutate_and_persist(
         f(entry.value_mut());
     }
     store.persist(id).await
+}
+
+fn latest_timestamp_at_least(candidate: Option<&str>, existing: Option<&str>) -> bool {
+    match (candidate, existing) {
+        (Some(candidate), Some(existing)) => candidate >= existing,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => true,
+    }
 }
 
 #[cfg(test)]

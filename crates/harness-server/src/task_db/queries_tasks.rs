@@ -3,7 +3,9 @@ use crate::task_runner::{TaskState, TaskStatus};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-use super::types::{RecentFailureRow, RecoveryRow, TaskRow, TaskSummaryRow, TASK_ROW_COLUMNS};
+use super::types::{
+    ExternalStatusRow, RecentFailureRow, RecoveryRow, TaskRow, TaskSummaryRow, TASK_ROW_COLUMNS,
+};
 use super::{RecoveryResult, TaskDb};
 
 impl TaskDb {
@@ -130,6 +132,45 @@ impl TaskDb {
         }
         let rows = q.fetch_all(&self.pool).await?;
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
+    }
+
+    /// Return the latest `(external_id, status, created_at)` row for each issue task
+    /// in a single project/repo namespace.
+    pub async fn list_latest_external_statuses_by_project_and_repo(
+        &self,
+        project: &str,
+        repo: Option<&str>,
+    ) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+        let base_sql = "SELECT external_id, status, created_at FROM (\
+                 SELECT external_id, status, created_at, \
+                        ROW_NUMBER() OVER (PARTITION BY external_id ORDER BY created_at DESC, id DESC) AS rn \
+                 FROM tasks \
+                 WHERE project = $1 AND external_id IS NOT NULL";
+        let rows: Vec<ExternalStatusRow> = if let Some(repo) = repo {
+            let sql = format!("{base_sql} AND repo = $2) latest WHERE rn = 1");
+            sqlx::query_as::<_, ExternalStatusRow>(&sql)
+                .bind(project)
+                .bind(repo)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            let sql = format!("{base_sql} AND repo IS NULL) latest WHERE rn = 1");
+            sqlx::query_as::<_, ExternalStatusRow>(&sql)
+                .bind(project)
+                .fetch_all(&self.pool)
+                .await?
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.external_id,
+                    row.status,
+                    row.created_at.map(|dt| dt.to_rfc3339()),
+                )
+            })
+            .collect())
     }
 
     /// Find an active (non-terminal) task for the same project + external_id.
