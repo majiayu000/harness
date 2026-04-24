@@ -125,7 +125,7 @@ describe("<Active>", () => {
       isLoading: false,
       isError: false,
     });
-    wrap(<Active />);
+    wrap(<Active selectedTaskId={null} onSelectTask={vi.fn()} />);
     expect(screen.getByText("Planning")).toBeInTheDocument();
     expect(screen.getByText("Review")).toBeInTheDocument();
     expect(screen.getByText("planner-task")).toBeInTheDocument();

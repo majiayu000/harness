@@ -3,6 +3,7 @@ mod request;
 pub(super) mod spawn;
 mod state;
 mod store;
+mod store_ext;
 mod types;
 
 // CompletionCallback references TaskState (state.rs) which depends on types.rs.

@@ -48,8 +48,12 @@ export function TaskDetailPanel({ taskId }: Props) {
         setStreamText((current) => `${current}\n${event.data}`.trim());
       }
     };
+    source.onerror = () => {
+      setStreamText((current) => `${current}\n[stream disconnected]`.trim());
+      source.close();
+    };
     return () => source.close();
-  }, [isTerminal, taskId]);
+  }, [taskId, isTerminal]);
 
   if (!taskId) {
     return (

@@ -749,6 +749,20 @@ impl TaskDb {
             .collect())
     }
 
+    /// Return the `created_at` of the earliest task that has started
+    /// (status in active/terminal set, or turn > 0), as an RFC-3339 string.
+    /// Returns `None` when no such task exists.
+    pub async fn earliest_started_created_at(&self) -> anyhow::Result<Option<String>> {
+        let dt: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT MIN(created_at) FROM tasks \
+             WHERE status IN ('implementing', 'agent_review', 'waiting', 'reviewing', 'done', 'failed') \
+                OR turn > 0",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(dt.map(|t| t.to_rfc3339()))
+    }
+
     /// Expose the raw pool for test-only SQL setup (e.g. back-dating `updated_at`).
     #[cfg(test)]
     pub(crate) fn pool_for_test(&self) -> &sqlx::PgPool {

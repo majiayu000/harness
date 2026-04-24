@@ -247,11 +247,11 @@ export function Submit({ projectFilter }: Props) {
         <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_260px]">
           <div className="space-y-4">
             <div>
-              <label className="block font-mono text-[10.5px] tracking-[0.1em] uppercase text-ink-3 mb-1">
+              <label htmlFor="task-title" className="block font-mono text-[10.5px] tracking-[0.1em] uppercase text-ink-3 mb-1">
                 Title
               </label>
               <input
-                aria-label="Title"
+                id="task-title"
                 value={title}
                 onChange={(event) => setTitle(event.target.value)}
                 required
@@ -259,11 +259,11 @@ export function Submit({ projectFilter }: Props) {
               />
             </div>
             <div>
-              <label className="block font-mono text-[10.5px] tracking-[0.1em] uppercase text-ink-3 mb-1">
+              <label htmlFor="task-description" className="block font-mono text-[10.5px] tracking-[0.1em] uppercase text-ink-3 mb-1">
                 Description
               </label>
               <textarea
-                aria-label="Description"
+                id="task-description"
                 value={desc}
                 onChange={(event) => setDesc(event.target.value)}
                 required

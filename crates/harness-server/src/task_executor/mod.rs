@@ -234,7 +234,7 @@ async fn run_non_implementation_task(
         }
         let raw = tokio::time::timeout(
             turn_timeout,
-            helpers::run_agent_streaming(agent, turn_req.clone(), task_id, store, 1),
+            helpers::run_agent_streaming(agent, turn_req.clone(), task_id, store, events, 1),
         )
         .await;
         *turns_used += 1;

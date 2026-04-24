@@ -1,7 +1,4 @@
-use crate::{
-    http::AppState,
-    task_runner::{DashboardCounts, TaskStatus, TaskSummary},
-};
+use crate::{http::AppState, task_runner::DashboardCounts};
 use axum::{extract::State, http::StatusCode, Json};
 use harness_core::types::{Event, EventFilters};
 use harness_observe::{quality::QualityGrader, stats};
@@ -59,24 +56,34 @@ fn parse_operator_funnel_milestone(event: &Event) -> Option<String> {
     })
 }
 
-fn task_has_started(summary: &TaskSummary) -> bool {
-    matches!(
-        summary.status,
-        TaskStatus::Implementing
-            | TaskStatus::AgentReview
-            | TaskStatus::Waiting
-            | TaskStatus::Reviewing
-            | TaskStatus::Done
-            | TaskStatus::Failed
-    ) || summary.turn > 0
-}
-
 async fn build_onboarding_summary(
     state: &AppState,
-    dashboard_events: &[Event],
 ) -> (bool, DashboardOnboarding, DashboardFunnel) {
     let mut funnel = DashboardFunnel::default();
-    for event in dashboard_events {
+
+    // Query operator_funnel events with content so milestone values can be parsed.
+    // This is a targeted query for a small event subset rather than loading the full
+    // content column for the entire rolling-window event history.
+    let events_since = chrono::Utc::now() - chrono::Duration::days(DASHBOARD_EVENT_WINDOW_DAYS);
+    let funnel_events = match state
+        .observability
+        .events
+        .query(&EventFilters {
+            hook: Some("operator_funnel".to_string()),
+            since: Some(events_since),
+            include_content: true,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(events) => events,
+        Err(e) => {
+            tracing::warn!("dashboard: failed to query operator_funnel events: {e}");
+            Vec::new()
+        }
+    };
+
+    for event in &funnel_events {
         match parse_operator_funnel_milestone(event).as_deref() {
             Some("project_registered") => {
                 record_first_timestamp(&mut funnel.project_registered_at, &event.ts)
@@ -95,27 +102,9 @@ async fn build_onboarding_summary(
     }
 
     if funnel.live_output_at.is_none() {
-        let task_summaries = match state.core.tasks.list_all_summaries_with_terminal().await {
-            Ok(summaries) => summaries,
-            Err(e) => {
-                tracing::warn!("dashboard: failed to list task summaries for onboarding: {e}");
-                Vec::new()
-            }
-        };
-
-        for summary in task_summaries
-            .iter()
-            .filter(|summary| task_has_started(summary))
-        {
-            if let Some(created_at) = &summary.created_at {
-                if funnel
-                    .live_output_at
-                    .as_ref()
-                    .is_none_or(|existing| created_at < existing)
-                {
-                    funnel.live_output_at = Some(created_at.clone());
-                }
-            }
+        // Fallback: use a single MIN aggregate query instead of loading all summaries.
+        if let Some(ts) = state.core.tasks.earliest_started_task_created_at().await {
+            funnel.live_output_at = Some(ts);
         }
     }
 
@@ -344,7 +333,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         .iter()
         .filter(|host| host["online"].as_bool().unwrap_or(false))
         .count() as u64;
-    let (first_run, onboarding, funnel) = build_onboarding_summary(&state, &dashboard_events).await;
+    let (first_run, onboarding, funnel) = build_onboarding_summary(&state).await;
 
     let body = json!({
         "projects": projects,

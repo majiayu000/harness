@@ -990,6 +990,7 @@ async fn create_task_records_operator_funnel_submission_event() -> anyhow::Resul
             .events
             .query(&harness_core::types::EventFilters {
                 hook: Some("operator_funnel".to_string()),
+                include_content: true,
                 ..Default::default()
             })
             .await?;
@@ -1079,7 +1080,8 @@ async fn get_task_returns_joined_detail_payload() -> anyhow::Result<()> {
     assert_eq!(
         task_json["completion"]["checkpoint"]["last_phase"],
         "plan_done"
-    );    Ok(())
+    );
+    Ok(())
 }
 
 #[tokio::test]

@@ -544,8 +544,14 @@ pub(crate) async fn github_webhook(
 pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
     match state.core.tasks.list_all_summaries_with_terminal().await {
         Ok(mut summaries) => {
-            for summary in &mut summaries {
-                summary.workflow = load_issue_workflow_for_summary(&state, summary).await;
+            let workflows = futures::future::join_all(
+                summaries
+                    .iter()
+                    .map(|s| load_issue_workflow_for_summary(&state, s)),
+            )
+            .await;
+            for (summary, workflow) in summaries.iter_mut().zip(workflows) {
+                summary.workflow = workflow;
             }
             Json(summaries).into_response()
         }
@@ -572,9 +578,15 @@ pub(crate) async fn get_task(
     {
         Ok(Some(task)) => {
             let summary = task.summary();
-            let workflow = load_issue_workflow_for_summary(&state, &summary).await;
             let task_id = task.id.clone();
-            let prompts = match state.core.tasks.get_prompts(&task_id).await {
+            // Run independent DB lookups concurrently to reduce response latency.
+            let (workflow, prompts_result, artifacts_result, checkpoint_result) = tokio::join!(
+                load_issue_workflow_for_summary(&state, &summary),
+                state.core.tasks.get_prompts(&task_id),
+                state.core.tasks.list_artifacts(&task_id),
+                state.core.tasks.load_checkpoint(&task_id),
+            );
+            let prompts = match prompts_result {
                 Ok(prompts) => prompts,
                 Err(e) => {
                     tracing::error!("get_task: prompt query failed: {e}");
@@ -585,7 +597,7 @@ pub(crate) async fn get_task(
                         .into_response();
                 }
             };
-            let artifacts = match state.core.tasks.list_artifacts(&task_id).await {
+            let artifacts = match artifacts_result {
                 Ok(artifacts) => artifacts,
                 Err(e) => {
                     tracing::error!("get_task: artifact query failed: {e}");
@@ -596,7 +608,7 @@ pub(crate) async fn get_task(
                         .into_response();
                 }
             };
-            let checkpoint = match state.core.tasks.load_checkpoint(&task_id).await {
+            let checkpoint = match checkpoint_result {
                 Ok(checkpoint) => checkpoint.map(|checkpoint| TaskDetailCheckpoint {
                     triage_output: checkpoint.triage_output,
                     plan_output: checkpoint.plan_output,
