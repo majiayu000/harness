@@ -237,7 +237,15 @@ async fn run_non_implementation_task(
         let agent_started_at = Utc::now();
         let raw = tokio::time::timeout(
             turn_timeout,
-            helpers::run_agent_streaming(agent, turn_req.clone(), task_id, store, 1, prompt_built_at, agent_started_at),
+            helpers::run_agent_streaming(
+                agent,
+                turn_req.clone(),
+                task_id,
+                store,
+                1,
+                prompt_built_at,
+                agent_started_at,
+            ),
         )
         .await;
         *turns_used += 1;
@@ -269,7 +277,7 @@ async fn run_non_implementation_task(
                         helpers::run_post_tool_use(interceptors, &hook_event, project).await
                     }
                 };
-                let post_err = helpers::run_post_execute(interceptors, &turn_req, &response).await;
+                let post_err = helpers::run_post_execute(interceptors, &turn_req, response).await;
                 if let Some(err) = violation_err.or(hook_err).or(post_err) {
                     if validation_attempt < max_validation_retries {
                         validation_attempt += 1;

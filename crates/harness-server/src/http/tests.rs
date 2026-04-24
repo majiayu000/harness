@@ -994,7 +994,7 @@ async fn get_task_includes_round_telemetry_and_failure() -> anyhow::Result<()> {
             provider: Some("anthropic-api".to_string()),
             upstream_status: Some(500),
             message: Some("API returned 500".to_string()),
-            body_excerpt: Some("{"type":"error"}".to_string()),
+            body_excerpt: Some("{\"type\":\"error\"}".to_string()),
         }),
     ));
     state.core.tasks.insert(&task).await;
