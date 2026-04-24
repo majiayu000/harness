@@ -1361,6 +1361,8 @@ mod tests {
             workspace_path: Some(lease.workspace_path.to_string_lossy().into_owned()),
             workspace_owner: Some(mgr_a.owner_session.clone()),
             run_generation: 2,
+            task_kind: crate::task_runner::TaskKind::Prompt,
+            workflow: None,
         };
 
         let summary = mgr_b
@@ -1418,6 +1420,8 @@ mod tests {
             workspace_path: Some(lease.workspace_path.to_string_lossy().into_owned()),
             workspace_owner: Some(mgr_a.owner_session.clone()),
             run_generation: 2,
+            task_kind: crate::task_runner::TaskKind::Prompt,
+            workflow: None,
         };
 
         let summary = mgr_b
@@ -1531,6 +1535,8 @@ mod tests {
             workspace_path: Some(lease.workspace_path.to_string_lossy().into_owned()),
             workspace_owner: Some(mgr_a.owner_session.clone()),
             run_generation: 1,
+            task_kind: crate::task_runner::TaskKind::Prompt,
+            workflow: None,
         };
 
         let summary = mgr_b

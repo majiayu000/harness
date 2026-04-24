@@ -955,6 +955,10 @@ async fn get_task_hides_internal_system_input_metadata() -> anyhow::Result<()> {
         system_input: Some(task_runner::SystemTaskInput::PeriodicReview {
             prompt: "review prompt".to_string(),
         }),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
     };
     let task_id = task.id.to_string();
 
@@ -1232,6 +1236,10 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
         system_input: Some(task_runner::SystemTaskInput::PeriodicReview {
             prompt: "review prompt".to_string(),
         }),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
     };
     let planner_task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
@@ -1260,6 +1268,10 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
         system_input: Some(task_runner::SystemTaskInput::SprintPlanner {
             prompt: "planner prompt".to_string(),
         }),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
     };
     state.core.tasks.insert(&review_task).await;
     state.core.tasks.insert(&planner_task).await;
@@ -2014,6 +2026,10 @@ async fn pr_recovery_redispatches_prompt_tasks_with_pr_urls() -> anyhow::Result<
         plan_output: None,
         request_settings: None,
         system_input: None,
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -2183,6 +2199,8 @@ async fn get_task_exposes_workspace_lifecycle_metadata() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        task_kind: task_runner::TaskKind::Issue,
+        system_input: None,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
