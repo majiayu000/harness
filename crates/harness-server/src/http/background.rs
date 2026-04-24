@@ -57,6 +57,72 @@ pub(super) fn recovery_queue_domain(task_kind: task_runner::TaskKind) -> task_ro
     }
 }
 
+async fn await_startup_recovery_ready_task(
+    state: &Arc<AppState>,
+    task_id: &crate::task_runner::TaskId,
+    recovery_kind: &'static str,
+) -> Option<crate::task_runner::TaskState> {
+    loop {
+        let task = state.core.tasks.get(task_id)?;
+        if !matches!(task.status, task_runner::TaskStatus::Pending) {
+            return None;
+        }
+
+        let now = chrono::Utc::now();
+        if task.scheduler.has_live_runtime_host_lease(now) {
+            let expires_at = task.scheduler.lease_expiry()?;
+            let wait_for = expires_at
+                .signed_duration_since(now)
+                .to_std()
+                .unwrap_or_default()
+                .saturating_add(std::time::Duration::from_millis(50));
+            tracing::info!(
+                task_id = ?task.id,
+                recovery_kind,
+                owner = ?task.scheduler.runtime_host_id(),
+                lease_expires_at = %expires_at,
+                "startup recovery: waiting for runtime-host lease expiry before redispatch"
+            );
+            drop(task);
+            tokio::time::sleep(wait_for).await;
+            continue;
+        }
+
+        let task_id = task.id.clone();
+        let Some(host_id) = task.scheduler.runtime_host_id().map(str::to_string) else {
+            return Some(task);
+        };
+        drop(task);
+
+        match state
+            .core
+            .tasks
+            .release_runtime_host_claim(&task_id, &host_id)
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    task_id = ?task_id,
+                    host_id,
+                    recovery_kind,
+                    "startup recovery: cleared stale runtime-host lease before redispatch"
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::error!(
+                    task_id = ?task_id,
+                    host_id,
+                    recovery_kind,
+                    error = %e,
+                    "startup recovery: failed to clear stale runtime-host lease"
+                );
+                return None;
+            }
+        }
+    }
+}
+
 /// Spawn background watcher for AwaitingDeps tasks.
 /// Uses Weak<AppState> to avoid a reference cycle; the loop exits when AppState is dropped.
 pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
@@ -470,32 +536,10 @@ pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
         for task in recovered {
             let state = state.clone();
             tokio::spawn(async move {
-                if let Some(host_id) = task.scheduler.runtime_host_id().map(str::to_string) {
-                    match state
-                        .core
-                        .tasks
-                        .release_runtime_host_claim(&task.id, &host_id)
-                        .await
-                    {
-                        Ok(true) => {
-                            tracing::info!(
-                                task_id = ?task.id,
-                                host_id,
-                                "startup recovery: cleared stale runtime-host lease before PR redispatch"
-                            );
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            tracing::error!(
-                                task_id = ?task.id,
-                                host_id,
-                                error = %e,
-                                "startup recovery: failed to clear stale runtime-host lease"
-                            );
-                            return;
-                        }
-                    }
-                }
+                let Some(task) = await_startup_recovery_ready_task(&state, &task.id, "pr").await
+                else {
+                    return;
+                };
                 let pr_url = task.pr_url.as_deref().unwrap_or("");
                 // Issue 4: robust parsing handles /pull/42/files and #fragment suffixes
                 let pr_num = match super::parse_pr_num_from_url(pr_url) {
@@ -960,43 +1004,11 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
         for (task, _checkpoint) in checkpoint_tasks {
             let state = state.clone();
             tokio::spawn(async move {
-                if task
-                    .scheduler
-                    .has_live_runtime_host_lease(chrono::Utc::now())
-                {
-                    tracing::info!(
-                        task_id = ?task.id,
-                        owner = ?task.scheduler.runtime_host_id(),
-                        "startup recovery: skipping checkpoint redispatch because task is still leased to a runtime host"
-                    );
+                let Some(task) =
+                    await_startup_recovery_ready_task(&state, &task.id, "checkpoint").await
+                else {
                     return;
-                }
-                if let Some(host_id) = task.scheduler.runtime_host_id().map(str::to_string) {
-                    match state
-                        .core
-                        .tasks
-                        .release_runtime_host_claim(&task.id, &host_id)
-                        .await
-                    {
-                        Ok(true) => {
-                            tracing::info!(
-                                task_id = ?task.id,
-                                host_id,
-                                "startup recovery: cleared stale runtime-host lease before checkpoint redispatch"
-                            );
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            tracing::error!(
-                                task_id = ?task.id,
-                                host_id,
-                                error = %e,
-                                "startup recovery: failed to clear stale runtime-host lease"
-                            );
-                            return;
-                        }
-                    }
-                }
+                };
                 // Reconstruct request type: parse issue number from the
                 // authoritative external_id ("issue:<n>") first, then fall
                 // back to the human-readable description for older rows.

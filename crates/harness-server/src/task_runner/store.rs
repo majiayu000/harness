@@ -461,6 +461,7 @@ impl TaskStore {
         if !matches!(entry.status, TaskStatus::Pending) {
             return Ok(None);
         }
+        let original_scheduler = entry.scheduler.clone();
         if entry.scheduler.owner.is_some() && entry.scheduler.has_live_runtime_host_lease(now) {
             return Ok(None);
         }
@@ -474,7 +475,12 @@ impl TaskStore {
         entry.scheduler.claim_runtime_host(host_id, expires_at);
         let snapshot = entry.value().clone();
         drop(entry);
-        self.db.update(&snapshot).await?;
+        if let Err(e) = self.db.update(&snapshot).await {
+            if let Some(mut rollback) = self.cache.get_mut(id) {
+                rollback.scheduler = original_scheduler;
+            }
+            return Err(e);
+        }
         Ok(Some(crate::runtime_hosts::TaskClaimResult {
             task_id: id.clone(),
             lease_expires_at: expires_at.to_rfc3339(),
@@ -507,10 +513,16 @@ impl TaskStore {
             return Ok(false);
         }
 
+        let original_scheduler = entry.scheduler.clone();
         entry.scheduler.clear_to_queued();
         let snapshot = entry.value().clone();
         drop(entry);
-        self.db.update(&snapshot).await?;
+        if let Err(e) = self.db.update(&snapshot).await {
+            if let Some(mut rollback) = self.cache.get_mut(id) {
+                rollback.scheduler = original_scheduler;
+            }
+            return Err(e);
+        }
         Ok(true)
     }
 
@@ -1807,6 +1819,37 @@ mod tests {
             .get(&non_pending_id)
             .expect("non-pending task should remain cached");
         assert_eq!(non_pending_task.scheduler.runtime_host_id(), Some("host-a"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_for_runtime_host_rolls_back_cache_when_persist_fails() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let task = pending_task("leased");
+        let task_id = task.id.clone();
+        store.insert(&task).await;
+
+        crate::test_helpers::drop_tasks_table(dir.path()).await?;
+
+        let result = store
+            .claim_for_runtime_host(&task_id, "host-a", Some(30))
+            .await;
+        assert!(
+            result.is_err(),
+            "claim should fail once the tasks table is gone"
+        );
+
+        let task = store
+            .get(&task_id)
+            .expect("task should remain cached after failed claim");
+        assert_eq!(task.scheduler.runtime_host_id(), None);
+        assert!(matches!(
+            task.scheduler.authority_state,
+            crate::task_runner::SchedulerAuthorityState::Queued
+        ));
+        assert_eq!(task.scheduler.run_generation, 0);
         Ok(())
     }
 

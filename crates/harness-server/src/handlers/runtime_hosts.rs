@@ -82,7 +82,19 @@ pub async fn deregister_runtime_host(
     State(state): State<Arc<AppState>>,
     Path(host_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if state.runtime_hosts.deregister(&host_id) {
+    if !state.runtime_hosts.hosts.contains_key(&host_id) {
+        // Host already gone from memory (idempotent retry).  If a prior
+        // deregister mutated memory but failed to persist, converge now.
+        if state.is_runtime_state_dirty() {
+            if let Err(response) = persist_runtime_state(&state).await {
+                return response;
+            }
+        }
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "runtime host not found" })),
+        )
+    } else {
         match state.core.tasks.release_runtime_host_claims(&host_id).await {
             Ok(released) => {
                 if !released.is_empty() {
@@ -107,23 +119,18 @@ pub async fn deregister_runtime_host(
                 );
             }
         }
+
+        if !state.runtime_hosts.deregister(&host_id) {
+            tracing::warn!(
+                host_id = %host_id,
+                "runtime host disappeared during deregistration after task lease release"
+            );
+        }
         state.runtime_project_cache.clear_host(&host_id);
         if let Err(response) = persist_runtime_state(&state).await {
             return response;
         }
         (StatusCode::OK, Json(json!({ "deregistered": true })))
-    } else {
-        // Host already gone from memory (idempotent retry).  If a prior
-        // deregister mutated memory but failed to persist, converge now.
-        if state.is_runtime_state_dirty() {
-            if let Err(response) = persist_runtime_state(&state).await {
-                return response;
-            }
-        }
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "runtime host not found" })),
-        )
     }
 }
 

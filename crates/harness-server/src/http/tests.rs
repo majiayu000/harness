@@ -2202,7 +2202,7 @@ async fn get_task_exposes_workspace_lifecycle_metadata() -> anyhow::Result<()> {
         plan_output: None,
         request_settings: None,
         task_kind: task_runner::TaskKind::Issue,
-        system_input: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -2225,5 +2225,138 @@ async fn get_task_exposes_workspace_lifecycle_metadata() -> anyhow::Result<()> {
         .as_str()
         .unwrap_or("")
         .ends_with("workspaces/task-899"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn pr_recovery_waits_for_runtime_host_lease_to_expire() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let mut task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        status: task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: Some("not-a-valid-pr-url".to_string()),
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: None,
+        issue: None,
+        repo: None,
+        description: None,
+        created_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+    };
+    task.scheduler.claim_runtime_host(
+        "host-a",
+        chrono::Utc::now() + chrono::TimeDelta::milliseconds(75),
+    );
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+
+    super::background::spawn_pr_recovery(&state);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(t) = state.core.tasks.get(&task_id) {
+            if matches!(t.status, task_runner::TaskStatus::Failed) {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("task was not recovered within 5 seconds after lease expiry");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let final_state = state
+        .core
+        .tasks
+        .get(&task_id)
+        .expect("task must still exist");
+    assert_eq!(final_state.scheduler.runtime_host_id(), None);
+    assert!(matches!(
+        final_state.scheduler.authority_state,
+        task_runner::SchedulerAuthorityState::Failed
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpoint_recovery_waits_for_runtime_host_lease_to_expire() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let mut task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        status: task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: None,
+        issue: None,
+        repo: None,
+        description: Some("prompt task".to_string()),
+        created_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+    };
+    task.scheduler.claim_runtime_host(
+        "host-a",
+        chrono::Utc::now() + chrono::TimeDelta::milliseconds(75),
+    );
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+    state
+        .core
+        .tasks
+        .write_checkpoint(&task_id, None, Some("plan output"), None, "plan")
+        .await?;
+
+    super::background::spawn_checkpoint_recovery(&state).await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(t) = state.core.tasks.get(&task_id) {
+            if matches!(t.status, task_runner::TaskStatus::Failed) {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("checkpoint task was not recovered within 5 seconds after lease expiry");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let final_state = state
+        .core
+        .tasks
+        .get(&task_id)
+        .expect("task must still exist");
+    assert_eq!(final_state.scheduler.runtime_host_id(), None);
+    assert!(matches!(
+        final_state.scheduler.authority_state,
+        task_runner::SchedulerAuthorityState::Failed
+    ));
     Ok(())
 }

@@ -529,3 +529,83 @@ async fn claim_endpoint_rejects_overflowing_lease_ttl() -> anyhow::Result<()> {
         .contains("too large to compute a valid expiration timestamp"));
     Ok(())
 }
+
+#[tokio::test]
+async fn deregister_keeps_host_registered_when_claim_release_fails() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+    let mut task = crate::task_runner::TaskState {
+        id: crate::task_runner::TaskId::new(),
+        status: crate::task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: None,
+        issue: None,
+        repo: None,
+        description: Some("leased task".to_string()),
+        created_at: Some("2026-04-02T00:00:00Z".to_string()),
+        priority: 0,
+        phase: crate::task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: crate::task_runner::TaskSchedulerState::queued(),
+    };
+    task.scheduler.claim_runtime_host(
+        "host-a",
+        chrono::Utc::now() + chrono::TimeDelta::seconds(60),
+    );
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+
+    let app = runtime_hosts_app(state.clone());
+
+    let register = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "host_id": "host-a" }).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(register.status(), axum::http::StatusCode::OK);
+
+    crate::test_helpers::drop_tasks_table(dir.path()).await?;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/host-a/deregister")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(state.runtime_hosts.hosts.contains_key("host-a"));
+
+    let task = state
+        .core
+        .tasks
+        .get(&task_id)
+        .expect("task should remain cached after failed deregistration");
+    assert_eq!(task.scheduler.runtime_host_id(), Some("host-a"));
+    assert!(matches!(
+        task.scheduler.authority_state,
+        crate::task_runner::SchedulerAuthorityState::Leased
+    ));
+    Ok(())
+}
