@@ -1341,6 +1341,7 @@ mod tests {
             run_generation: 2,
             task_kind: crate::task_runner::TaskKind::Prompt,
             workflow: None,
+            scheduler: crate::task_runner::TaskSchedulerState::default(),
         };
 
         let summary = mgr_b
@@ -1400,6 +1401,7 @@ mod tests {
             run_generation: 2,
             task_kind: crate::task_runner::TaskKind::Prompt,
             workflow: None,
+            scheduler: crate::task_runner::TaskSchedulerState::default(),
         };
 
         let summary = mgr_b
@@ -1515,6 +1517,7 @@ mod tests {
             run_generation: 1,
             task_kind: crate::task_runner::TaskKind::Prompt,
             workflow: None,
+            scheduler: crate::task_runner::TaskSchedulerState::default(),
         };
 
         let summary = mgr_b

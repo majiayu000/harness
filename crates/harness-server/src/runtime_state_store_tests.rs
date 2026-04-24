@@ -1,6 +1,4 @@
-use crate::runtime_hosts::ClaimCandidate;
 use crate::runtime_project_cache::WatchedProjectInput;
-use crate::task_runner::{TaskId, TaskStatus};
 use crate::{http::build_app_state, server::HarnessServer, thread_manager::ThreadManager};
 use harness_agents::registry::AgentRegistry;
 use harness_core::config::HarnessConfig;
@@ -28,18 +26,6 @@ async fn build_app_state_restores_runtime_snapshot() -> anyhow::Result<()> {
         Some("Host A".to_string()),
         vec!["codex".to_string()],
     );
-    let task_id = TaskId::new();
-    first_state.runtime_hosts.claim_task(
-        "host-a",
-        vec![ClaimCandidate {
-            task_id: task_id.clone(),
-            status: TaskStatus::Pending,
-            created_at: Some("2026-04-02T00:00:00Z".to_string()),
-            project: None,
-        }],
-        Some(120),
-        None,
-    )?;
     first_state.runtime_project_cache.sync_host_projects(
         "host-a",
         vec![WatchedProjectInput {
@@ -64,9 +50,6 @@ async fn build_app_state_restores_runtime_snapshot() -> anyhow::Result<()> {
     let hosts = restored_state.runtime_hosts.list_hosts();
     assert_eq!(hosts.len(), 1);
     assert_eq!(hosts[0].id, "host-a");
-    let (_, leases) = restored_state.runtime_hosts.snapshot_state();
-    assert_eq!(leases.len(), 1);
-    assert_eq!(leases[0].task_id, task_id);
 
     let project_cache = restored_state
         .runtime_project_cache

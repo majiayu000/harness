@@ -144,7 +144,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
         .map_or(0, |m| m.live_count());
     let mut worktrees_used: u64 = local_worktrees;
     for host in &runtime_hosts {
-        let active_leases = state.runtime_hosts.active_lease_count(&host.id) as u64;
+        let active_leases = state.core.tasks.active_runtime_host_lease_count(&host.id) as u64;
         worktrees_used = worktrees_used.saturating_add(active_leases);
         let watched_projects = state
             .runtime_project_cache

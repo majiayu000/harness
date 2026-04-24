@@ -15,14 +15,11 @@ impl TaskDb {
         let status = state.status.as_ref();
         let task_kind = state.task_kind.as_ref();
         let phase_json = serde_json::to_string(&state.phase)?;
+        let scheduler_json = serde_json::to_string(&state.scheduler)?;
         let settings_json = state
             .request_settings
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok());
-        let system_input_json = state
-            .system_input
-            .as_ref()
-            .and_then(|input| serde_json::to_string(input).ok());
         let created_at_dt: Option<DateTime<Utc>> = state
             .created_at
             .as_deref()
@@ -31,7 +28,7 @@ impl TaskDb {
         sqlx::query(
             "INSERT INTO tasks (id, task_kind, status, failure_kind, turn, pr_url, rounds, error, source, \
              external_id, parent_id, created_at, repo, depends_on, project, workspace_path, \
-             workspace_owner, run_generation, priority, phase, description, request_settings, system_input) \
+             workspace_owner, run_generation, priority, phase, description, request_settings, scheduler_state) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
                      COALESCE($12, CURRENT_TIMESTAMP), $13, $14, $15, $16, $17, $18, \
                      $19, $20, $21, $22, $23)",
@@ -68,7 +65,7 @@ impl TaskDb {
         .bind(&phase_json)
         .bind(state.description.as_deref())
         .bind(settings_json.as_deref())
-        .bind(system_input_json.as_deref())
+        .bind(&scheduler_json)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -78,22 +75,19 @@ impl TaskDb {
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let phase_json = serde_json::to_string(&state.phase)?;
+        let scheduler_json = serde_json::to_string(&state.scheduler)?;
         let status = state.status.as_ref();
         let task_kind = state.task_kind.as_ref();
         let settings_json = state
             .request_settings
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok());
-        let system_input_json = state
-            .system_input
-            .as_ref()
-            .and_then(|input| serde_json::to_string(input).ok());
         sqlx::query(
             "UPDATE tasks SET task_kind = $1, status = $2, failure_kind = $3, turn = $4, pr_url = $5, rounds = $6, \
                     error = $7, source = $8, external_id = $9, repo = $10, depends_on = $11, \
                     project = $12, workspace_path = $13, workspace_owner = $14, \
                     run_generation = $15, priority = $16, phase = $17, description = $18, \
-                    request_settings = $19, system_input = $20, updated_at = CURRENT_TIMESTAMP, \
+                    request_settings = $19, scheduler_state = $20, updated_at = CURRENT_TIMESTAMP, \
                     version = version + 1 WHERE id = $21",
         )
         .bind(task_kind)
@@ -125,7 +119,7 @@ impl TaskDb {
         .bind(&phase_json)
         .bind(state.description.as_deref())
         .bind(settings_json.as_deref())
-        .bind(system_input_json.as_deref())
+        .bind(&scheduler_json)
         .bind(&state.id.0)
         .execute(&self.pool)
         .await?;
@@ -252,9 +246,15 @@ impl TaskDb {
     }
 
     /// Update only the `status` column without touching `updated_at`.
-    pub(crate) async fn update_status_only(&self, id: &str, status: &str) -> anyhow::Result<()> {
-        sqlx::query("UPDATE tasks SET status = $1 WHERE id = $2")
+    pub(crate) async fn update_status_only(
+        &self,
+        id: &str,
+        status: &str,
+        scheduler_state: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE tasks SET status = $1, scheduler_state = $2 WHERE id = $3")
             .bind(status)
+            .bind(scheduler_state)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -296,7 +296,7 @@ impl TaskDb {
         let rows = sqlx::query_as::<_, TaskSummaryRow>(
             "SELECT id, task_kind, status, failure_kind, turn, pr_url, error, source, external_id, parent_id, \
              created_at, repo, depends_on, project, workspace_path, workspace_owner, \
-             run_generation, phase, description \
+             run_generation, phase, description, scheduler_state \
              FROM tasks ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -398,15 +398,33 @@ impl TaskDb {
         terminal_status: Option<&str>,
     ) -> anyhow::Result<()> {
         if let Some(status) = terminal_status {
+            let scheduler_state_row: Option<(String,)> =
+                sqlx::query_as("SELECT scheduler_state FROM tasks WHERE id = $1")
+                    .bind(task_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            let mut scheduler = scheduler_state_row
+                .and_then(|(value,)| {
+                    serde_json::from_str::<crate::task_runner::TaskSchedulerState>(&value).ok()
+                })
+                .unwrap_or_default();
+            if let Ok(task_status) = status.parse::<TaskStatus>() {
+                scheduler.mark_terminal(&task_status);
+            }
+            let scheduler_json = serde_json::to_string(&scheduler)?;
             let resumable = TaskStatus::resumable_statuses();
-            let placeholders = Self::numbered_placeholders(4, resumable.len());
+            let placeholders = Self::numbered_placeholders(5, resumable.len());
             let sql = format!(
                 "UPDATE tasks SET status = $1, pr_url = COALESCE($2, pr_url), \
-                 updated_at = CURRENT_TIMESTAMP \
-                 WHERE id = $3 AND status IN ({})",
+                 scheduler_state = $3, updated_at = CURRENT_TIMESTAMP \
+                 WHERE id = $4 AND status IN ({})",
                 placeholders
             );
-            let query = sqlx::query(&sql).bind(status).bind(pr_url).bind(task_id);
+            let query = sqlx::query(&sql)
+                .bind(status)
+                .bind(pr_url)
+                .bind(&scheduler_json)
+                .bind(task_id);
             let query = resumable
                 .iter()
                 .fold(query, |q, resumable| q.bind(*resumable));
@@ -427,9 +445,7 @@ impl TaskDb {
             let resumable = TaskStatus::resumable_statuses();
             let placeholders = Self::numbered_placeholders(1, resumable.len());
             let sql = format!(
-                "SELECT t.id, t.task_kind, t.source, t.external_id, t.description, \
-                        t.status, t.turn, t.pr_url AS task_pr_url, \
-                        t.system_input, \
+                "SELECT t.id, t.status, t.turn, t.pr_url AS task_pr_url, t.scheduler_state, \
                         c.triage_output, c.plan_output, c.pr_url AS ck_pr_url \
                  FROM tasks t \
                  LEFT JOIN task_checkpoints c ON t.id = c.task_id \
@@ -447,16 +463,10 @@ impl TaskDb {
         let mut result = RecoveryResult::default();
 
         for row in rows {
-            let task_kind = crate::task_runner::TaskKind::from_persisted(
-                Some(&row.task_kind),
-                row.source.as_deref(),
-                row.external_id.as_deref(),
-                row.description.as_deref(),
-            )?;
-            let system_input: Option<crate::task_runner::SystemTaskInput> = row
-                .system_input
-                .as_deref()
-                .and_then(|value| serde_json::from_str(value).ok());
+            let mut scheduler = serde_json::from_str::<crate::task_runner::TaskSchedulerState>(
+                &row.scheduler_state,
+            )
+            .unwrap_or_default();
             let effective_pr_url = row
                 .task_pr_url
                 .as_deref()
@@ -469,29 +479,6 @@ impl TaskDb {
             let has_pr = effective_pr_url.is_some();
             let has_plan = row.plan_output.is_some();
             let has_triage = row.triage_output.is_some();
-
-            if task_kind.recovery_status().is_some() {
-                if let Some(recovery_status) = task_kind.recovery_status() {
-                    if system_input.is_some() {
-                        sqlx::query(
-                            "UPDATE tasks SET status = $1, error = NULL, \
-                             updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-                        )
-                        .bind(recovery_status.as_ref())
-                        .bind(&row.id)
-                        .execute(&self.pool)
-                        .await?;
-                        result.resumed += 1;
-                        tracing::info!(
-                            task_id = %row.id,
-                            task_kind = task_kind.as_ref(),
-                            was = %row.status,
-                            "startup recovery: resumed system task"
-                        );
-                        continue;
-                    }
-                }
-            }
 
             if has_pr || has_plan || has_triage {
                 let reason = if has_pr {
@@ -511,18 +498,21 @@ impl TaskDb {
                         row.status
                     )
                 };
+                scheduler.mark_recovering("startup-recovery");
                 let task_pr_url_valid = row
                     .task_pr_url
                     .as_deref()
                     .map(|u| parse_pr_num_from_url(u).is_some())
                     .unwrap_or(false);
                 let needs_pr_url_writeback = !task_pr_url_valid && effective_pr_url.is_some();
+                let scheduler_json = serde_json::to_string(&scheduler)?;
                 if needs_pr_url_writeback {
                     sqlx::query(
                         "UPDATE tasks SET status = 'pending', error = NULL, pr_url = $1, \
-                         updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+                         scheduler_state = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3",
                     )
                     .bind(effective_pr_url)
+                    .bind(&scheduler_json)
                     .bind(&row.id)
                     .execute(&self.pool)
                     .await?;
@@ -535,8 +525,9 @@ impl TaskDb {
                 } else {
                     sqlx::query(
                         "UPDATE tasks SET status = 'pending', error = NULL, \
-                         updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+                         scheduler_state = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
                     )
+                    .bind(&scheduler_json)
                     .bind(&row.id)
                     .execute(&self.pool)
                     .await?;
@@ -555,11 +546,14 @@ impl TaskDb {
                     row.turn,
                     row.task_pr_url.as_deref().unwrap_or("none")
                 );
+                scheduler.mark_terminal(&TaskStatus::Failed);
+                let scheduler_json = serde_json::to_string(&scheduler)?;
                 sqlx::query(
                     "UPDATE tasks SET status = 'failed', error = $1, \
-                     updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+                     scheduler_state = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3",
                 )
                 .bind(&err)
+                .bind(&scheduler_json)
                 .bind(&row.id)
                 .execute(&self.pool)
                 .await?;
@@ -567,18 +561,34 @@ impl TaskDb {
             }
         }
 
-        let transient_failed = sqlx::query(
-            "UPDATE tasks \
-             SET status = 'failed', \
-                 error = 'recovered after restart (was: pending in transient retry): ' \
-                      || COALESCE(error, ''), \
-                 updated_at = CURRENT_TIMESTAMP \
+        let transient_failed_rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT id, error, scheduler_state FROM tasks \
              WHERE status = 'pending' \
                AND error LIKE 'retrying after transient failure%'",
         )
-        .execute(&self.pool)
-        .await?
-        .rows_affected() as u32;
+        .fetch_all(&self.pool)
+        .await?;
+        for (id, error, scheduler_state) in &transient_failed_rows {
+            let mut scheduler =
+                serde_json::from_str::<crate::task_runner::TaskSchedulerState>(scheduler_state)
+                    .unwrap_or_default();
+            scheduler.mark_terminal(&TaskStatus::Failed);
+            let scheduler_json = serde_json::to_string(&scheduler)?;
+            let err = format!(
+                "recovered after restart (was: pending in transient retry): {}",
+                error.as_deref().unwrap_or_default()
+            );
+            sqlx::query(
+                "UPDATE tasks SET status = 'failed', error = $1, scheduler_state = $2, \
+                 updated_at = CURRENT_TIMESTAMP WHERE id = $3",
+            )
+            .bind(err)
+            .bind(&scheduler_json)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        }
+        let transient_failed = transient_failed_rows.len() as u32;
         if transient_failed > 0 {
             tracing::info!(
                 "startup recovery: failed {} task(s) that were pending mid-transient-retry",

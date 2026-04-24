@@ -183,7 +183,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                 .as_ref()
                 .map(|s| s.projects.iter().map(|p| p.root.as_str()).collect())
                 .unwrap_or_default();
-            let active_leases = state.runtime_hosts.active_lease_count(&host.id);
+            let active_leases = state.core.tasks.active_runtime_host_lease_count(&host.id);
             let assignment_pressure = active_leases as f64 / watched_projects.max(1) as f64;
             json!({
                 "id": host.id,

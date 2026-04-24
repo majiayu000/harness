@@ -180,7 +180,7 @@ async fn run_non_implementation_task(
     turns_used_acc: &mut u32,
     task_start: Instant,
 ) -> anyhow::Result<()> {
-    let Some(system_input) = store.get(task_id).and_then(|state| state.system_input) else {
+    let Some(system_input) = req.system_input.as_ref() else {
         anyhow::bail!(
             "{} task is missing restart-safe input metadata",
             task_kind.as_ref()

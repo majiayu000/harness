@@ -39,7 +39,7 @@ fn make_task(id: &str, status: TaskStatus) -> TaskState {
         plan_output: None,
         repo: None,
         request_settings: None,
-        system_input: None,
+        scheduler: harness_server::task_runner::TaskSchedulerState::queued(),
     }
 }
 
@@ -269,62 +269,6 @@ async fn restart_with_triage_checkpoint_resumes_task() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn restart_with_review_system_input_resumes_task() -> anyhow::Result<()> {
-    let store = setup_store(|db| async move {
-        let mut task = make_task("t-review-system", TaskStatus::ReviewGenerating);
-        task.task_kind = TaskKind::Review;
-        task.system_input = Some(
-            harness_server::task_runner::SystemTaskInput::PeriodicReview {
-                prompt: "review prompt".to_string(),
-            },
-        );
-        db.insert(&task).await?;
-        Ok(())
-    })
-    .await?;
-
-    let task = store
-        .get(&CoreTaskId("t-review-system".into()))
-        .expect("task must exist");
-    assert!(
-        matches!(task.status, TaskStatus::ReviewWaiting),
-        "review task with persisted input should resume to review_waiting, got {:?}",
-        task.status
-    );
-    assert_eq!(task.task_kind, TaskKind::Review);
-    assert!(task.system_input.is_some());
-    Ok(())
-}
-
-#[tokio::test]
-async fn restart_with_planner_system_input_resumes_task() -> anyhow::Result<()> {
-    let store = setup_store(|db| async move {
-        let mut task = make_task("t-planner-system", TaskStatus::PlannerGenerating);
-        task.task_kind = TaskKind::Planner;
-        task.system_input = Some(
-            harness_server::task_runner::SystemTaskInput::SprintPlanner {
-                prompt: "planner prompt".to_string(),
-            },
-        );
-        db.insert(&task).await?;
-        Ok(())
-    })
-    .await?;
-
-    let task = store
-        .get(&CoreTaskId("t-planner-system".into()))
-        .expect("task must exist");
-    assert!(
-        matches!(task.status, TaskStatus::PlannerWaiting),
-        "planner task with persisted input should resume to planner_waiting, got {:?}",
-        task.status
-    );
-    assert_eq!(task.task_kind, TaskKind::Planner);
-    assert!(task.system_input.is_some());
-    Ok(())
-}
-
-#[tokio::test]
 async fn restart_review_task_without_system_input_fails() -> anyhow::Result<()> {
     let store = setup_store(|db| async move {
         let mut task = make_task("t-review-missing-input", TaskStatus::ReviewGenerating);
@@ -447,6 +391,38 @@ async fn restart_mixed_recovery_counts() -> anyhow::Result<()> {
         }
     }
     assert_eq!(failed_count, 2, "two tasks should have been failed");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_marks_resumed_task_as_recovering_in_scheduler_state() -> anyhow::Result<()> {
+    let store = setup_store(|db| async move {
+        db.insert(&make_task("t-recovering", TaskStatus::Implementing))
+            .await?;
+        db.write_checkpoint("t-recovering", None, Some("plan text"), None, "plan_done")
+            .await?;
+        Ok(())
+    })
+    .await?;
+
+    let recovered = store
+        .get(&CoreTaskId("t-recovering".into()))
+        .expect("recovered task should remain active");
+    assert!(matches!(recovered.status, TaskStatus::Pending));
+    assert!(matches!(
+        recovered.scheduler.authority_state,
+        harness_server::task_runner::SchedulerAuthorityState::Recovering
+    ));
+    assert_eq!(recovered.scheduler.recovery_generation, 1);
+    assert_eq!(
+        recovered
+            .scheduler
+            .owner
+            .as_ref()
+            .map(|owner| owner.id.as_str()),
+        Some("startup-recovery")
+    );
 
     Ok(())
 }

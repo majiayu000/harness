@@ -86,12 +86,11 @@ pub(crate) async fn build_services(
     if let Some(store) = registry.runtime_state_store.as_ref() {
         match store.try_load_snapshot().await {
             Ok((Some(snapshot), crate::runtime_state_store::LoadSnapshotOutcome::Loaded)) => {
-                let restored_hosts = runtime_hosts.restore_state(snapshot.hosts, snapshot.leases);
+                let restored_hosts = runtime_hosts.restore_state(snapshot.hosts);
                 let restored_project_caches =
                     runtime_project_cache.restore_state(snapshot.project_caches);
                 tracing::info!(
-                    restored_hosts = restored_hosts.0,
-                    restored_leases = restored_hosts.1,
+                    restored_hosts,
                     restored_project_caches,
                     "runtime state restored from persistent snapshot"
                 );
