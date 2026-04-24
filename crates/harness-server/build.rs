@@ -42,8 +42,26 @@ fn main() {
     if std::env::var("HARNESS_SKIP_WEB_BUILD").ok().as_deref() != Some("1") {
         if let Some(bun) = find_bun() {
             let bun_str = bun.to_str().unwrap_or("bun");
-            run(&[bun_str, "install", "--frozen-lockfile"], &web_dir);
-            run(&[bun_str, "run", "build"], &web_dir);
+            let build_err = try_run(&[bun_str, "install", "--frozen-lockfile"], &web_dir)
+                .and_then(|_| try_run(&[bun_str, "run", "build"], &web_dir))
+                .err();
+            if let Some(e) = build_err {
+                if index_html.exists() {
+                    println!(
+                        "cargo:warning=bun invocation failed ({}); reusing existing web/dist bundle",
+                        e
+                    );
+                } else if can_fall_back_to_stub_bundle() {
+                    println!(
+                        "cargo:warning=bun invocation failed ({}); embedding stub bundle for non-release build",
+                        e
+                    );
+                    write_stub_manifest(&manifest);
+                    return;
+                } else {
+                    panic!("bun build failed in release mode: {}", e);
+                }
+            }
         } else if index_html.exists() {
             println!(
                 "cargo:warning=bun unavailable; reusing existing web/dist bundle from {}",
@@ -183,15 +201,16 @@ fn can_fall_back_to_stub_bundle() -> bool {
     std::env::var("PROFILE").ok().as_deref() != Some("release")
 }
 
-fn run(cmd: &[&str], dir: &std::path::Path) {
+fn try_run(cmd: &[&str], dir: &std::path::Path) -> Result<(), String> {
     let status = Command::new(cmd[0])
         .args(&cmd[1..])
         .current_dir(dir)
         .status()
-        .unwrap_or_else(|e| panic!("failed to invoke `{}` — install bun? ({})", cmd[0], e));
+        .map_err(|e| format!("failed to invoke `{}` — install bun? ({})", cmd[0], e))?;
     if !status.success() {
-        panic!("`{}` exited with {}", cmd.join(" "), status);
+        return Err(format!("`{}` exited with {}", cmd.join(" "), status));
     }
+    Ok(())
 }
 
 /// Extract the first asset filename from `dist/index.html` whose href/src
