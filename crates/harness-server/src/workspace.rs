@@ -222,12 +222,10 @@ impl WorkspaceManager {
             }
         }
 
-        let expected_branch = format!("harness/{}", task_id.0);
         let mut decision = WorkspaceAcquireDecision::CreatedFresh;
 
         if workspace_path.exists() {
             let owner_record = read_owner_record(&workspace_path);
-            let legacy_same_branch = is_worktree_on_branch(&workspace_path, &expected_branch).await;
             if owner_record.as_ref().is_some_and(|record| {
                 record.task_id == task_id.0
                     && record.run_generation == run_generation
@@ -274,11 +272,7 @@ impl WorkspaceManager {
                     ),
                 });
             }
-            if legacy_same_branch {
-                decision = WorkspaceAcquireDecision::ReusedRecovered;
-            } else {
-                decision = WorkspaceAcquireDecision::RecreatedStale;
-            }
+            decision = WorkspaceAcquireDecision::RecreatedStale;
         }
 
         // Fetch latest base_branch from remote so the worktree starts from upstream HEAD.
@@ -701,24 +695,6 @@ fn sanitize_task_id(id: &str) -> String {
 
 /// Returns true when the git worktree at `path` is currently on `branch`.
 /// Used to distinguish crash-recovery (same task's worktree) from a true collision.
-async fn is_worktree_on_branch(path: &Path, branch: &str) -> bool {
-    git_command()
-        .args([
-            "-C",
-            &path.to_string_lossy(),
-            "rev-parse",
-            "--abbrev-ref",
-            "HEAD",
-        ])
-        .output()
-        .await
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|b| b.trim() == branch)
-        .unwrap_or(false)
-}
-
 async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {
     crate::post_validator::validate_command_safety(script).map_err(|e| anyhow::anyhow!("{e}"))?;
     let output = tokio::process::Command::new("sh")
@@ -814,7 +790,9 @@ async fn cleanup_workspace_path(source_repo: &Path, workspace_path: &Path) -> an
                     "cleanup_workspace_path: git worktree remove failed for missing path; pruning stale metadata: {e}"
                 );
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                tracing::warn!(path = ?workspace_path, "cleanup_workspace_path: git worktree remove failed for existing path: {e}");
+            }
         }
     }
 
