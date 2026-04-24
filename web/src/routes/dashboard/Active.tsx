@@ -28,6 +28,18 @@ const COLUMNS: Column[] = [
     fallbackTaskStatuses: ["implementing", "running", "triage", "plan"],
   },
   {
+    key: "planning",
+    label: "Planning",
+    workflowStates: [],
+    fallbackTaskStatuses: ["planner_generating", "planner_waiting"],
+  },
+  {
+    key: "review",
+    label: "Review",
+    workflowStates: [],
+    fallbackTaskStatuses: ["review_generating", "review_waiting"],
+  },
+  {
     key: "feedback",
     label: "Feedback",
     workflowStates: ["pr_open", "awaiting_feedback", "addressing_feedback"],

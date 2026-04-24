@@ -140,6 +140,7 @@ mod tests {
         let id = harness_core::types::TaskId("test-task".to_string());
         let mut state = crate::task_runner::TaskState {
             id: id.clone(),
+            task_kind: crate::task_runner::TaskKind::Prompt,
             status: TaskStatus::Pending,
             turn: 0,
             pr_url: None,
@@ -161,6 +162,7 @@ mod tests {
             plan_output: None,
             repo: None,
             request_settings: None,
+            system_input: None,
         };
         state.source = Some("github".to_string());
         store.insert(&state).await;
@@ -182,6 +184,7 @@ mod tests {
 
         let parent_state = crate::task_runner::TaskState {
             id: parent_id.clone(),
+            task_kind: crate::task_runner::TaskKind::Prompt,
             status: TaskStatus::Pending,
             turn: 0,
             pr_url: None,
@@ -203,11 +206,13 @@ mod tests {
             plan_output: None,
             repo: None,
             request_settings: None,
+            system_input: None,
         };
         store.insert(&parent_state).await;
 
         let child_state = crate::task_runner::TaskState {
             id: child_id.clone(),
+            task_kind: crate::task_runner::TaskKind::Prompt,
             status: TaskStatus::Pending,
             turn: 0,
             pr_url: None,
@@ -229,6 +234,7 @@ mod tests {
             plan_output: None,
             repo: None,
             request_settings: None,
+            system_input: None,
         };
         store.insert(&child_state).await;
 

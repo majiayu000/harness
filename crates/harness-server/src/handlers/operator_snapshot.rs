@@ -274,6 +274,7 @@ mod tests {
     fn missing_timestamps_serialize_as_null() {
         let stalled_task = crate::task_runner::TaskState {
             id: harness_core::types::TaskId("stalled-task".to_string()),
+            task_kind: crate::task_runner::TaskKind::Issue,
             status: crate::task_runner::TaskStatus::Implementing,
             turn: 1,
             pr_url: None,
@@ -295,6 +296,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             request_settings: None,
+            system_input: None,
         };
         let stalled_json = stalled_task_json(&stalled_task);
 
@@ -398,6 +400,7 @@ mod tests {
         for i in 0..25u32 {
             let mut task = crate::task_runner::TaskState {
                 id: harness_core::types::TaskId(format!("fail-task-{i}")),
+                task_kind: crate::task_runner::TaskKind::Issue,
                 status: crate::task_runner::TaskStatus::Failed,
                 turn: 1,
                 pr_url: None,
@@ -419,6 +422,7 @@ mod tests {
                 triage_output: None,
                 plan_output: None,
                 request_settings: None,
+                system_input: None,
             };
             task.status = crate::task_runner::TaskStatus::Failed;
             state.core.tasks.insert(&task).await;
@@ -453,6 +457,7 @@ mod tests {
         let long_error = "x".repeat(500);
         let task = crate::task_runner::TaskState {
             id: harness_core::types::TaskId("trunc-task".to_string()),
+            task_kind: crate::task_runner::TaskKind::Issue,
             status: crate::task_runner::TaskStatus::Failed,
             turn: 1,
             pr_url: None,
@@ -474,6 +479,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             request_settings: None,
+            system_input: None,
         };
         state.core.tasks.insert(&task).await;
 
@@ -512,6 +518,7 @@ mod tests {
         let unicode_error = "€".repeat(100); // 300 bytes total
         let task = crate::task_runner::TaskState {
             id: harness_core::types::TaskId("unicode-task".to_string()),
+            task_kind: crate::task_runner::TaskKind::Issue,
             status: crate::task_runner::TaskStatus::Failed,
             turn: 1,
             pr_url: None,
@@ -533,6 +540,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             request_settings: None,
+            system_input: None,
         };
         state.core.tasks.insert(&task).await;
 

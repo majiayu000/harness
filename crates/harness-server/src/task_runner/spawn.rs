@@ -6,11 +6,11 @@ use tokio::sync::RwLock;
 
 use super::request::{
     detect_main_worktree, summarize_request_description, CreateTaskRequest,
-    PersistedRequestSettings,
+    PersistedRequestSettings, SystemTaskInput,
 };
 use super::state::{RoundResult, TaskState};
 use super::store::{mutate_and_persist, TaskStore};
-use super::types::{TaskId, TaskPhase, TaskStatus};
+use super::types::{TaskId, TaskKind, TaskPhase, TaskStatus};
 use super::CompletionCallback;
 
 /// Patterns that indicate a transient (retryable) failure rather than a permanent one.
@@ -81,8 +81,35 @@ pub fn prompt_requires_plan(prompt: &str) -> bool {
     file_path_count >= 3
 }
 
+fn classify_task_kind(req: &CreateTaskRequest) -> TaskKind {
+    req.task_kind()
+}
+
+fn system_input_for_request(req: &CreateTaskRequest) -> Option<SystemTaskInput> {
+    req.system_input.clone()
+}
+
+fn refresh_preregistered_task_metadata(
+    entry: &mut TaskState,
+    req: &CreateTaskRequest,
+    project_root: PathBuf,
+    description: Option<String>,
+) {
+    entry.task_kind = classify_task_kind(req);
+    entry.source = req.source.clone();
+    entry.external_id = req.external_id.clone();
+    entry.repo = req.repo.clone();
+    entry.parent_id = req.parent_task_id.clone();
+    entry.depends_on = req.depends_on.clone();
+    entry.project_root = Some(project_root);
+    entry.issue = req.issue;
+    entry.description = description;
+    entry.system_input = system_input_for_request(req);
+}
+
+#[cfg(test)]
 pub(super) fn is_non_decomposable_prompt_source(source: Option<&str>) -> bool {
-    matches!(source, Some("periodic_review") | Some("sprint_planner"))
+    TaskKind::classify(source, None, None).is_non_decomposable_prompt()
 }
 
 /// Check if an error message indicates a transient failure that may succeed on retry.
@@ -269,6 +296,7 @@ pub async fn spawn_task(
 pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskRequest) -> TaskId {
     let task_id = TaskId::new();
     let mut state = TaskState::new(task_id.clone());
+    state.task_kind = classify_task_kind(req);
     state.source = req.source.clone();
     state.external_id = req.external_id.clone();
     state.repo = req.repo.clone();
@@ -276,8 +304,10 @@ pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskReques
     state.depends_on = req.depends_on.clone();
     state.priority = req.priority;
     state.issue = req.issue;
+    state.phase = state.task_kind.default_phase();
     state.description = summarize_request_description(req);
     state.request_settings = Some(PersistedRequestSettings::from_req(req));
+    state.system_input = system_input_for_request(req);
     store.insert(&state).await;
     // Register stream channel now so SSE clients can subscribe before execution begins.
     store.register_task_stream(&task_id);
@@ -351,11 +381,14 @@ where
     } else {
         let task_id = TaskId::new();
         let mut state = TaskState::new(task_id.clone());
+        state.task_kind = classify_task_kind(&req);
         state.source = req.source.clone();
         state.external_id = req.external_id.clone();
         state.repo = req.repo.clone();
         state.priority = req.priority;
+        state.phase = state.task_kind.default_phase();
         state.request_settings = Some(PersistedRequestSettings::from_req(&req));
+        state.system_input = system_input_for_request(&req);
         store.insert(&state).await;
         // Register stream channel before spawning so SSE clients can subscribe immediately.
         store.register_task_stream(&task_id);
@@ -393,14 +426,12 @@ where
         }
         let description = summarize_request_description(&req);
         if let Some(mut entry) = store.cache.get_mut(&id) {
-            entry.source = req.source.clone();
-            entry.external_id = req.external_id.clone();
-            entry.repo = req.repo.clone();
-            entry.parent_id = req.parent_task_id.clone();
-            entry.depends_on = req.depends_on.clone();
-            entry.project_root = Some(project_root.clone());
-            entry.issue = req.issue;
-            entry.description = description;
+            refresh_preregistered_task_metadata(
+                &mut entry,
+                &req,
+                project_root.clone(),
+                description,
+            );
         }
 
         // Parallel dispatch for Complex+ prompt-only tasks when workspace isolation is active.
@@ -415,8 +446,12 @@ where
             harness_core::agent::TaskComplexity::Complex
                 | harness_core::agent::TaskComplexity::Critical
         );
-        let is_non_decomposable_source = is_non_decomposable_prompt_source(req.source.as_deref());
-        if req.issue.is_none() && req.pr.is_none() && is_complex && !is_non_decomposable_source {
+        let task_kind = classify_task_kind(&req);
+        if req.issue.is_none()
+            && req.pr.is_none()
+            && is_complex
+            && !task_kind.is_non_decomposable_prompt()
+        {
             if let Some(ref wmgr) = workspace_mgr {
                 let mut subtask_specs = match crate::parallel_dispatch::decompose(
                     req.prompt.as_deref().unwrap_or_default(),
@@ -562,10 +597,7 @@ where
         // Planning gate: complex prompt-only tasks must go through the Plan phase
         // before implementation to reduce drift.
         // Heuristic: prompt longer than 200 words OR containing 3+ file path tokens.
-        if req.issue.is_none()
-            && req.pr.is_none()
-            && !is_non_decomposable_prompt_source(req.source.as_deref())
-        {
+        if req.issue.is_none() && req.pr.is_none() && !task_kind.is_non_decomposable_prompt() {
             if let Some(ref prompt) = req.prompt {
                 if prompt_requires_plan(prompt) {
                     mutate_and_persist(&store, &id, |s| {
@@ -771,14 +803,17 @@ pub async fn spawn_task_awaiting_deps(
     }
 
     let mut state = TaskState::new(task_id.clone());
+    state.task_kind = classify_task_kind(&req);
     state.depends_on = depends_on;
     state.source = req.source.clone();
     state.external_id = req.external_id.clone();
     state.repo = req.repo.clone();
     state.priority = req.priority;
     state.issue = req.issue;
+    state.phase = state.task_kind.default_phase();
     state.description = summarize_request_description(&req);
     state.request_settings = Some(PersistedRequestSettings::from_req(&req));
+    state.system_input = system_input_for_request(&req);
     // Persist the caller's resolved project root so that duplicate detection
     // (which keys on project_root + external_id) and the dep-watcher's project
     // path resolution both work correctly for waiting tasks.
@@ -1466,6 +1501,30 @@ mod tests {
     }
 
     #[test]
+    fn preregistered_metadata_refresh_preserves_persisted_phase() {
+        let mut state = TaskState::new(TaskId::new());
+        state.phase = TaskPhase::Plan;
+
+        let req = CreateTaskRequest {
+            prompt: Some("small prompt".into()),
+            project: Some(PathBuf::from("/tmp/recovered-project")),
+            repo: Some("owner/repo".into()),
+            ..Default::default()
+        };
+
+        refresh_preregistered_task_metadata(
+            &mut state,
+            &req,
+            PathBuf::from("/tmp/recovered-project"),
+            Some("small prompt".into()),
+        );
+
+        assert_eq!(state.phase, TaskPhase::Plan);
+        assert_eq!(state.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(state.description.as_deref(), Some("small prompt"));
+    }
+
+    #[test]
     fn transient_error_detection() {
         // Positive cases — should match transient patterns.
         assert!(is_transient_error(
@@ -1588,6 +1647,51 @@ mod tests {
         assert!(is_non_decomposable_prompt_source(Some("sprint_planner")));
         assert!(!is_non_decomposable_prompt_source(Some("github")));
         assert!(!is_non_decomposable_prompt_source(None));
+    }
+
+    #[test]
+    fn request_task_kind_trusts_only_internal_system_input() {
+        let spoofed = CreateTaskRequest {
+            prompt: Some("review this".to_string()),
+            source: Some("periodic_review".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(spoofed.task_kind(), TaskKind::Prompt);
+
+        let trusted = CreateTaskRequest {
+            prompt: Some("review this".to_string()),
+            source: Some("periodic_review".to_string()),
+            system_input: Some(SystemTaskInput::PeriodicReview {
+                prompt: "review this".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(trusted.task_kind(), TaskKind::Review);
+    }
+
+    #[test]
+    fn system_input_for_request_clones_only_explicit_internal_metadata() {
+        let spoofed = CreateTaskRequest {
+            prompt: Some("review this".to_string()),
+            source: Some("periodic_review".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(system_input_for_request(&spoofed), None);
+
+        let trusted = CreateTaskRequest {
+            prompt: Some("review this".to_string()),
+            source: Some("periodic_review".to_string()),
+            system_input: Some(SystemTaskInput::PeriodicReview {
+                prompt: "review this".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            system_input_for_request(&trusted),
+            Some(SystemTaskInput::PeriodicReview {
+                prompt: "review this".to_string(),
+            })
+        );
     }
 
     // --- dependency scheduling tests ---

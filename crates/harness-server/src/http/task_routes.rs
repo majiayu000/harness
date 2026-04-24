@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QueueDomain {
     Primary,
     Review,

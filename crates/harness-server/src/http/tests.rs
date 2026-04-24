@@ -923,6 +923,51 @@ async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn get_task_hides_internal_system_input_metadata() -> anyhow::Result<()> {
+    use axum::response::IntoResponse;
+
+    let dir = tempfile::tempdir()?;
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Review,
+        status: task_runner::TaskStatus::ReviewWaiting,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("periodic_review".to_string()),
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: None,
+        repo: Some("owner/repo".to_string()),
+        description: Some("periodic review".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Review,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        system_input: Some(task_runner::SystemTaskInput::PeriodicReview {
+            prompt: "review prompt".to_string(),
+        }),
+    };
+    let task_id = task.id.to_string();
+
+    let response = axum::Json(task).into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let task_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(task_json["id"], task_id);
+    assert!(task_json.get("system_input").is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn intake_status_returns_three_channels() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
@@ -1149,6 +1194,89 @@ async fn dashboard_no_auth_configured_remains_public() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = Router::new()
+        .route("/tasks", get(list_tasks))
+        .with_state(state.clone());
+
+    let review_task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Review,
+        status: task_runner::TaskStatus::ReviewWaiting,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("periodic_review".to_string()),
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: None,
+        repo: Some("owner/repo".to_string()),
+        description: Some("periodic review".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Review,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        system_input: Some(task_runner::SystemTaskInput::PeriodicReview {
+            prompt: "review prompt".to_string(),
+        }),
+    };
+    let planner_task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Planner,
+        status: task_runner::TaskStatus::PlannerGenerating,
+        turn: 1,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("sprint_planner".to_string()),
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: None,
+        repo: Some("owner/repo".to_string()),
+        description: Some("sprint planner".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Plan,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        system_input: Some(task_runner::SystemTaskInput::SprintPlanner {
+            prompt: "planner prompt".to_string(),
+        }),
+    };
+    state.core.tasks.insert(&review_task).await;
+    state.core.tasks.insert(&planner_task).await;
+
+    let response = app
+        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let tasks: serde_json::Value = serde_json::from_slice(&body)?;
+    let tasks = tasks.as_array().expect("tasks array");
+    assert!(tasks
+        .iter()
+        .any(|task| { task["task_kind"] == "review" && task["status"] == "review_waiting" }));
+    assert!(tasks
+        .iter()
+        .any(|task| { task["task_kind"] == "planner" && task["status"] == "planner_generating" }));
     Ok(())
 }
 
@@ -1789,6 +1917,7 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
 
     let task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Pr,
         status: task_runner::TaskStatus::Pending,
         turn: 0,
         pr_url: Some("not-a-valid-pr-url".to_string()),
@@ -1810,6 +1939,7 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        system_input: None,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -1851,12 +1981,83 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn pr_recovery_redispatches_prompt_tasks_with_pr_urls() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Prompt,
+        status: task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: Some("not-a-valid-pr-url".to_string()),
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: None,
+        issue: None,
+        repo: None,
+        description: None,
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        system_input: None,
+    };
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+
+    super::background::spawn_pr_recovery(&state);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(t) = state.core.tasks.get(&task_id) {
+            if matches!(t.status, task_runner::TaskStatus::Failed) {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("prompt task was not re-dispatched within 5 seconds after pr_recovery");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let final_state = state
+        .core
+        .tasks
+        .get(&task_id)
+        .expect("task must still exist");
+    assert!(matches!(
+        final_state.status,
+        task_runner::TaskStatus::Failed
+    ));
+    assert!(
+        final_state
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("unparseable pr_url"),
+        "error should mention unparseable pr_url, got: {:?}",
+        final_state.error
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
 
     let task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Prompt,
         status: task_runner::TaskStatus::Pending,
         turn: 0,
         pr_url: None,
@@ -1878,6 +2079,7 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        system_input: None,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -1923,4 +2125,16 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
         final_state.error
     );
     Ok(())
+}
+
+#[test]
+fn recovery_queue_domain_routes_review_tasks_to_review_capacity() {
+    assert_eq!(
+        super::background::recovery_queue_domain(task_runner::TaskKind::Review),
+        super::task_routes::QueueDomain::Review
+    );
+    assert_eq!(
+        super::background::recovery_queue_domain(task_runner::TaskKind::Planner),
+        super::task_routes::QueueDomain::Primary
+    );
 }

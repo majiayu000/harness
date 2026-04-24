@@ -16,7 +16,8 @@ pub type CompletionCallback =
 // Re-export everything that was previously public from the flat task_runner.rs.
 pub use metrics::{DashboardCounts, LlmMetricsInputs, ProjectCounts};
 pub use request::{
-    fill_missing_repo_from_project, CreateTaskRequest, PersistedRequestSettings, MAX_TASK_PRIORITY,
+    fill_missing_repo_from_project, CreateTaskRequest, PersistedRequestSettings, SystemTaskInput,
+    MAX_TASK_PRIORITY,
 };
 pub use spawn::{
     check_awaiting_deps, effective_turn_timeout, prompt_requires_plan, register_pending_task,
@@ -24,7 +25,7 @@ pub use spawn::{
 };
 pub use state::{RecentFailureTask, RoundResult, TaskState, TaskSummary};
 pub use store::{mutate_and_persist, update_status, TaskStore};
-pub use types::{TaskId, TaskPhase, TaskStatus};
+pub use types::{TaskId, TaskKind, TaskPhase, TaskStatus};
 
 impl TaskStore {
     /// Return the most recent `limit` failed tasks, newest first.
