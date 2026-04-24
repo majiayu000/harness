@@ -1,18 +1,21 @@
 use crate::task_runner::{TaskId, TaskStatus, TaskStore};
 use chrono::{DateTime, Utc};
-use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+use harness_core::agent::{AgentRequest, AgentResponse, StreamItem};
 use harness_core::error::HarnessError;
 use harness_core::interceptor::{ToolUseEvent, TurnInterceptor};
-use harness_core::prompts;
 use harness_core::types::{
-    ContextItem, Decision, Event, EventMetadata, Item, SessionId, SkillId, ThreadId, TokenUsage,
-    TurnFailure, TurnId, TurnStatus, TurnTelemetry,
+    ContextItem, Decision, Event, EventMetadata, SessionId, SkillId, ThreadId, TurnFailure, TurnId,
+    TurnStatus, TurnTelemetry,
 };
 use harness_protocol::{notifications::Notification, notifications::RpcNotification};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::Instant;
+
+pub(crate) mod streaming;
+pub(crate) use streaming::{
+    run_agent_streaming, run_agent_streaming_with_options, RunAgentStreamingOptions,
+};
 
 /// Truncate validation error output to `max_chars` to avoid bloating agent prompts.
 /// Preserves the first portion which typically contains the most actionable info.
@@ -43,19 +46,6 @@ pub(crate) struct TurnExecutionFailure {
     pub error: HarnessError,
     pub telemetry: TurnTelemetry,
     pub failure: TurnFailure,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RunAgentStreamingOptions {
-    pub persist_artifacts: bool,
-}
-
-impl Default for RunAgentStreamingOptions {
-    fn default() -> Self {
-        Self {
-            persist_artifacts: true,
-        }
-    }
 }
 
 pub(crate) fn is_prompt_only_task(store: &TaskStore, task_id: &TaskId) -> bool {
@@ -586,275 +576,6 @@ pub(crate) async fn persist_artifact(
     store
         .insert_artifact(task_id, turn, artifact_type, &content)
         .await;
-}
-
-/// Scan `output_slice` for a `CREATED_ISSUE=` sentinel and, when a new issue
-/// number is found, write it to the database via [`TaskStore::overwrite_external_id_auto_fix`].
-///
-/// Deduplicates writes using `last_backfilled_issue` so each distinct issue
-/// number causes exactly one DB write ("last sentinel wins" semantics are
-/// preserved by the caller choosing which slice to pass).
-async fn backfill_issue_if_found(
-    output_slice: &str,
-    last_backfilled_issue: &mut Option<u64>,
-    store: &TaskStore,
-    task_id: &TaskId,
-) {
-    if let Some(issue_num) = prompts::parse_created_issue_number(output_slice) {
-        if Some(issue_num) != *last_backfilled_issue {
-            let eid = format!("issue:{issue_num}");
-            match store.overwrite_external_id_auto_fix(task_id, &eid).await {
-                Ok(()) => {
-                    tracing::info!(
-                        task_id = %task_id,
-                        external_id = %eid,
-                        "streaming: backfilled external_id for auto-fix task"
-                    );
-                    *last_backfilled_issue = Some(issue_num);
-                }
-                Err(e) => tracing::warn!(
-                    task_id = %task_id,
-                    "streaming: failed to backfill external_id: {e}"
-                ),
-            }
-        }
-    }
-}
-
-/// Execute an agent request via [`CodeAgent::execute_stream`], broadcasting
-/// each [`StreamItem`] to the per-task channel in real time, and reconstruct
-/// an [`AgentResponse`] from the collected stream events.
-///
-/// `turn` is stored with each captured artifact so callers can distinguish
-/// implementation turn (1) from later review or retry turns.
-pub(crate) async fn run_agent_streaming(
-    agent: &dyn CodeAgent,
-    req: AgentRequest,
-    task_id: &TaskId,
-    store: &TaskStore,
-    turn: u32,
-    prompt_built_at: DateTime<Utc>,
-    agent_started_at: DateTime<Utc>,
-) -> Result<TurnExecutionSuccess, TurnExecutionFailure> {
-    run_agent_streaming_with_options(
-        agent,
-        req,
-        task_id,
-        store,
-        turn,
-        prompt_built_at,
-        agent_started_at,
-        RunAgentStreamingOptions::default(),
-    )
-    .await
-}
-
-pub(crate) async fn run_agent_streaming_with_options(
-    agent: &dyn CodeAgent,
-    req: AgentRequest,
-    task_id: &TaskId,
-    store: &TaskStore,
-    turn: u32,
-    prompt_built_at: DateTime<Utc>,
-    agent_started_at: DateTime<Utc>,
-    options: RunAgentStreamingOptions,
-) -> Result<TurnExecutionSuccess, TurnExecutionFailure> {
-    let turn_start = Instant::now();
-
-    // Persist redacted prompt before req is consumed by execute_stream.
-    // Skip prompt-only tasks: their prompts may contain user-supplied credentials
-    // and must not be written at rest (per the privacy contract in task_runner.rs).
-    let is_prompt_only = is_prompt_only_task(store, task_id);
-    let phase_str = req
-        .execution_phase
-        .map(|p| format!("{p:?}").to_lowercase())
-        .unwrap_or_else(|| "unknown".into());
-    if !is_prompt_only {
-        let redacted_prompt = crate::redact::redact_secrets(&req.prompt, &req.env_vars);
-        if let Err(e) = store
-            .save_prompt(task_id, turn, &phase_str, &redacted_prompt)
-            .await
-        {
-            tracing::warn!(task_id = %task_id, turn, "failed to persist prompt: {e}");
-        }
-    }
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamItem>(128);
-    let mut exec = std::pin::pin!(agent.execute_stream(req, tx));
-    let mut exec_result: Option<harness_core::error::Result<()>> = None;
-    let mut channel_closed = false;
-    let mut output = String::new();
-    let mut token_usage = TokenUsage::default();
-    let mut first_token_latency_ms: Option<u64> = None;
-    let mut first_output_at: Option<DateTime<Utc>> = None;
-    // Tracks the last CREATED_ISSUE= number we successfully wrote to the DB so
-    // we can (a) skip redundant writes and (b) detect agent self-corrections
-    // that replace an earlier sentinel with a later one ("last sentinel wins").
-    // Using Option<u64> rather than a boolean means each distinct value causes
-    // exactly one DB write, and a second CREATED_ISSUE=20 after CREATED_ISSUE=10
-    // correctly overwrites the stored external_id.
-    let mut last_backfilled_issue: Option<u64> = None;
-    // Pre-check whether this task is auto-fix to avoid a cache lookup on every
-    // MessageDelta.  The source field is immutable after creation.
-    let is_auto_fix_task = store
-        .get(task_id)
-        .is_some_and(|s| s.source.as_deref() == Some("auto-fix"));
-
-    loop {
-        tokio::select! {
-            result = &mut exec, if exec_result.is_none() => {
-                exec_result = Some(result);
-            }
-            item = rx.recv(), if !channel_closed => {
-                match item {
-                    Some(item) => {
-                        store.publish_stream_item(task_id, item.clone());
-                        match &item {
-                            StreamItem::MessageDelta { text } => {
-                                if first_token_latency_ms.is_none() {
-                                    first_output_at = Some(Utc::now());
-                                    first_token_latency_ms = Some(turn_start.elapsed().as_millis() as u64);
-                                }
-                                output.push_str(text);
-
-                                // Early backfill: scan the full accumulated output on
-                                // every delta.  Scanning the full buffer (rather than
-                                // only the newly appended window) is required for two
-                                // correctness properties:
-                                //
-                                // 1. Chunked streaming: if the sentinel was split across
-                                //    chunk boundaries (e.g. "CREATED_ISSUE=" in one
-                                //    delta, "42\n" in the next), a window-only scan
-                                //    would miss the number.  The full-buffer scan sees
-                                //    the complete sentinel once both chunks have arrived.
-                                //
-                                // 2. "Last sentinel wins": parse_created_issue_number
-                                //    returns the LAST CREATED_ISSUE= in the output, so
-                                //    a later self-correction (CREATED_ISSUE=20 after
-                                //    CREATED_ISSUE=10) is written to the DB.
-                                //    last_backfilled_issue prevents redundant writes
-                                //    when the parsed number has not changed.
-                                if is_auto_fix_task && text.contains('\n') {
-                                    // Only scan up to the last newline so that a
-                                    // sentinel split across chunk boundaries (e.g.
-                                    // "CREATED_ISSUE=4" then "2\n" in the next delta)
-                                    // does not produce a spurious partial value.
-                                    let complete_len =
-                                        output.rfind('\n').map(|i| i + 1).unwrap_or(0);
-                                    backfill_issue_if_found(
-                                        &output[..complete_len],
-                                        &mut last_backfilled_issue,
-                                        store,
-                                        task_id,
-                                    )
-                                    .await;
-                                }
-                            }
-                            StreamItem::ItemCompleted {
-                                item: Item::AgentReasoning { content },
-                            } => {
-                                // Non-streaming adapters (e.g. AnthropicApiAgent) call
-                                // execute() to completion before emitting this item, so
-                                // elapsed time here is full-request latency, not TTFB.
-                                // Recording it as first_token_latency_ms would silently
-                                // mix whole-request durations with real streaming TTFB
-                                // values and inflate p50.  Only MessageDelta (true
-                                // streaming events) sets first_token_latency_ms.
-                                // Prefer the full content over accumulated deltas.
-                                output = content.clone();
-                                if first_output_at.is_none() && !content.is_empty() {
-                                    first_output_at = Some(Utc::now());
-                                }
-                                // For non-streaming adapters the full output arrives
-                                // here; apply the same sentinel scan so backfill
-                                // happens before the post-execution path runs (closes
-                                // the webhook race for these adapters too).
-                                if is_auto_fix_task {
-                                    backfill_issue_if_found(
-                                        &output,
-                                        &mut last_backfilled_issue,
-                                        store,
-                                        task_id,
-                                    )
-                                    .await;
-                                }
-                            }
-                            StreamItem::ItemCompleted { item: completed_item }
-                                if options.persist_artifacts =>
-                            {
-                                persist_artifact(store, task_id, turn, completed_item).await;
-                            }
-                            StreamItem::TokenUsage { usage } => {
-                                token_usage = usage.clone();
-                            }
-                            StreamItem::Done => {
-                                channel_closed = true;
-                            }
-                            _ => {}
-                        }
-                    }
-                    None => {
-                        channel_closed = true;
-                    }
-                }
-            }
-        }
-        if exec_result.is_some() && channel_closed {
-            break;
-        }
-    }
-
-    let completed_at = Utc::now();
-    let completed_latency_ms = completed_at
-        .signed_duration_since(agent_started_at)
-        .num_milliseconds()
-        .max(0) as u64;
-
-    let base_telemetry = TurnTelemetry {
-        prompt_built_at: Some(prompt_built_at),
-        agent_started_at: Some(agent_started_at),
-        first_output_at,
-        completed_at: Some(completed_at),
-        first_token_latency_ms,
-        completed_latency_ms: Some(completed_latency_ms),
-        retry_count: None,
-        exit_code: None,
-    };
-
-    match exec_result.unwrap_or_else(|| {
-        Err(HarnessError::AgentExecution(
-            "agent execution completed without result".into(),
-        ))
-    }) {
-        Ok(()) => Ok(TurnExecutionSuccess {
-            response: AgentResponse {
-                output,
-                stderr: String::new(),
-                items: Vec::new(),
-                token_usage,
-                model: String::new(),
-                exit_code: Some(0),
-            },
-            telemetry: TurnTelemetry {
-                exit_code: Some(0),
-                ..base_telemetry
-            },
-        }),
-        Err(error) => {
-            let failure = error.turn_failure().unwrap_or(TurnFailure {
-                kind: harness_core::types::TurnFailureKind::Unknown,
-                provider: None,
-                upstream_status: None,
-                message: Some(error.to_string()),
-                body_excerpt: None,
-            });
-            Err(TurnExecutionFailure {
-                error,
-                telemetry: base_telemetry,
-                failure,
-            })
-        }
-    }
 }
 
 #[cfg(test)]
