@@ -543,28 +543,25 @@ mod tests {
             state.observability.events.log(&event).await?;
         }
 
-        let app = Router::new()
-            .route("/api/dashboard", get(dashboard))
-            .with_state(state);
+        for _ in 0..50 {
+            let (_status, Json(body)) = dashboard(State(state.clone())).await;
+            if body["first_run"] == false {
+                assert_eq!(body["onboarding"]["phase"], "complete");
+                assert_eq!(body["onboarding"]["has_registered_project"], true);
+                assert_eq!(body["onboarding"]["has_submitted_task"], true);
+                assert_eq!(body["onboarding"]["has_live_output"], true);
+                assert_eq!(body["onboarding"]["has_completion_evidence"], true);
+                assert!(body["funnel"]["project_registered_at"].is_string());
+                assert!(body["funnel"]["task_submitted_at"].is_string());
+                assert!(body["funnel"]["live_output_at"].is_string());
+                assert!(body["funnel"]["completion_evidence_at"].is_string());
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
-        let req = axum::http::Request::builder()
-            .uri("/api/dashboard")
-            .body(axum::body::Body::empty())?;
-
-        let resp = tower::ServiceExt::oneshot(app, req).await?;
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
-        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
-
+        let (_status, Json(body)) = dashboard(State(state)).await;
         assert_eq!(body["first_run"], false);
-        assert_eq!(body["onboarding"]["phase"], "complete");
-        assert_eq!(body["onboarding"]["has_registered_project"], true);
-        assert_eq!(body["onboarding"]["has_submitted_task"], true);
-        assert_eq!(body["onboarding"]["has_live_output"], true);
-        assert_eq!(body["onboarding"]["has_completion_evidence"], true);
-        assert!(body["funnel"]["project_registered_at"].is_string());
-        assert!(body["funnel"]["task_submitted_at"].is_string());
-        assert!(body["funnel"]["live_output_at"].is_string());
-        assert!(body["funnel"]["completion_evidence_at"].is_string());
         Ok(())
     }
 }

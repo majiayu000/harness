@@ -462,10 +462,11 @@ mod tests {
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
         }
+        let startup_root = crate::test_helpers::tempdir_in_home("projects-startup-root-")?;
         let repo = crate::test_helpers::tempdir_in_home("projects-register-")?;
         init_git_repo(repo.path(), None)?;
         let data_dir = tempfile::tempdir()?;
-        let state = make_test_state(repo.path(), data_dir.path()).await?;
+        let state = make_test_state(startup_root.path(), data_dir.path()).await?;
         let root = repo.path().to_path_buf();
 
         let (first_status, Json(first_body)) = register_project(

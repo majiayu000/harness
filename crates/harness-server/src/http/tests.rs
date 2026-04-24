@@ -984,30 +984,37 @@ async fn create_task_records_operator_funnel_submission_event() -> anyhow::Resul
         .await?;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
 
-    let events = state
-        .observability
-        .events
-        .query(&harness_core::types::EventFilters {
-            hook: Some("operator_funnel".to_string()),
-            ..Default::default()
-        })
-        .await?;
-
-    assert!(events.iter().any(|event| {
-        event
-            .content
-            .as_deref()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
-            .and_then(|value| {
-                value
-                    .get("milestone")
-                    .and_then(|value| value.as_str())
-                    .map(ToString::to_string)
+    for _ in 0..50 {
+        let events = state
+            .observability
+            .events
+            .query(&harness_core::types::EventFilters {
+                hook: Some("operator_funnel".to_string()),
+                ..Default::default()
             })
-            .as_deref()
-            == Some("task_submitted")
-    }));
-    Ok(())
+            .await?;
+
+        if events.iter().any(|event| {
+            event
+                .content
+                .as_deref()
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+                .and_then(|value| {
+                    value
+                        .get("milestone")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string)
+                })
+                .as_deref()
+                == Some("task_submitted")
+        }) {
+            return Ok(());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    anyhow::bail!("task_submitted operator_funnel event was not persisted in time")
 }
 
 #[tokio::test]
