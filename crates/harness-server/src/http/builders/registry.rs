@@ -245,17 +245,26 @@ pub(crate) async fn build_registry(
             }
         };
 
-    // Cleanup orphan worktrees from any previous crash.
-    // Terminal tasks are no longer held in the in-memory cache, so query DB directly.
+    // Reconcile stale workspaces from any previous crash before new task admission.
     if let Some(ref wmgr) = workspace_mgr {
-        match tasks.list_terminal_ids_from_db().await {
-            Ok(terminal_ids) => {
-                wmgr.cleanup_orphan_worktrees(project_root, &terminal_ids)
-                    .await;
+        match tasks.list_all_summaries_with_terminal().await {
+            Ok(task_summaries) => {
+                match wmgr.reconcile_startup(project_root, &task_summaries).await {
+                    Ok(summary) => {
+                        tracing::info!(
+                            removed = summary.removed,
+                            preserved = summary.preserved,
+                            "workspace startup reconciliation complete"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("workspace startup reconciliation failed: {e}");
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to load terminal tasks for orphan worktree cleanup: {e}; skipping cleanup"
+                    "Failed to load task summaries for workspace reconciliation: {e}; skipping cleanup"
                 );
             }
         }

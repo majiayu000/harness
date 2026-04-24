@@ -955,6 +955,10 @@ async fn get_task_hides_internal_system_input_metadata() -> anyhow::Result<()> {
         system_input: Some(task_runner::SystemTaskInput::PeriodicReview {
             prompt: "review prompt".to_string(),
         }),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
     };
     let task_id = task.id.to_string();
 
@@ -1232,6 +1236,10 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
         system_input: Some(task_runner::SystemTaskInput::PeriodicReview {
             prompt: "review prompt".to_string(),
         }),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
     };
     let planner_task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
@@ -1260,6 +1268,10 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
         system_input: Some(task_runner::SystemTaskInput::SprintPlanner {
             prompt: "planner prompt".to_string(),
         }),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
     };
     state.core.tasks.insert(&review_task).await;
     state.core.tasks.insert(&planner_task).await;
@@ -1919,6 +1931,7 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
         id: task_runner::TaskId::new(),
         task_kind: task_runner::TaskKind::Pr,
         status: task_runner::TaskStatus::Pending,
+        failure_kind: None,
         turn: 0,
         pr_url: Some("not-a-valid-pr-url".to_string()),
         rounds: vec![],
@@ -1929,6 +1942,9 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
         depends_on: vec![],
         subtask_ids: vec![],
         project_root: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
         issue: None,
         repo: None,
         description: None,
@@ -2010,6 +2026,10 @@ async fn pr_recovery_redispatches_prompt_tasks_with_pr_urls() -> anyhow::Result<
         plan_output: None,
         request_settings: None,
         system_input: None,
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -2059,6 +2079,7 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
         id: task_runner::TaskId::new(),
         task_kind: task_runner::TaskKind::Prompt,
         status: task_runner::TaskStatus::Pending,
+        failure_kind: None,
         turn: 0,
         pr_url: None,
         rounds: vec![],
@@ -2069,6 +2090,9 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
         depends_on: vec![],
         subtask_ids: vec![],
         project_root: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
         issue: None,
         repo: None,
         description: Some("prompt task".to_string()),
@@ -2137,4 +2161,67 @@ fn recovery_queue_domain_routes_review_tasks_to_review_capacity() {
         super::background::recovery_queue_domain(task_runner::TaskKind::Planner),
         super::task_routes::QueueDomain::Primary
     );
+}
+
+#[tokio::test]
+async fn get_task_exposes_workspace_lifecycle_metadata() -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = crate::test_helpers::tempdir_in_home("harness-test-task-metadata-")?;
+    let state = make_test_state(dir.path()).await?;
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        status: task_runner::TaskStatus::Failed,
+        failure_kind: Some(task_runner::TaskFailureKind::WorkspaceLifecycle),
+        turn: 1,
+        pr_url: None,
+        rounds: vec![],
+        error: Some("workspace lifecycle reconciliation failed".to_string()),
+        source: Some("github".to_string()),
+        external_id: Some("issue:899".to_string()),
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        workspace_path: Some(dir.path().join("workspaces/task-899")),
+        workspace_owner: Some("session-899".to_string()),
+        run_generation: 3,
+        issue: Some(899),
+        repo: Some("majiayu000/harness".to_string()),
+        description: Some("workspace failure".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Implement,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        task_kind: task_runner::TaskKind::Issue,
+        system_input: None,
+    };
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+
+    let app = task_app(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/tasks/{}", task_id.0))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let json = response_json(response).await?;
+    assert_eq!(json["failure_kind"], "workspace_lifecycle");
+    assert_eq!(json["workspace_owner"], "session-899");
+    assert_eq!(json["run_generation"], 3);
+    assert!(json["workspace_path"]
+        .as_str()
+        .unwrap_or("")
+        .ends_with("workspaces/task-899"));
+    Ok(())
 }

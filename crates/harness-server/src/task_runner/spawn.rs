@@ -10,7 +10,7 @@ use super::request::{
 };
 use super::state::{RoundResult, TaskState};
 use super::store::{mutate_and_persist, TaskStore};
-use super::types::{TaskId, TaskKind, TaskPhase, TaskStatus};
+use super::types::{TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus};
 use super::CompletionCallback;
 
 /// Patterns that indicate a transient (retryable) failure rather than a permanent one.
@@ -226,6 +226,7 @@ async fn record_task_failure(
     });
     if let Err(e) = mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Failed;
+        s.failure_kind = Some(TaskFailureKind::Task);
         s.error = Some(reason);
     })
     .await
@@ -430,9 +431,29 @@ where
                 &mut entry,
                 &req,
                 project_root.clone(),
-                description,
+                description.clone(),
             );
         }
+        mutate_and_persist(&store, &id, |s| {
+            s.source = req.source.clone();
+            s.external_id = req.external_id.clone();
+            s.repo = req.repo.clone();
+            s.parent_id = req.parent_task_id.clone();
+            s.depends_on = req.depends_on.clone();
+            s.project_root = Some(project_root.clone());
+            s.issue = req.issue;
+            s.description = description.clone();
+            s.run_generation = s.run_generation.saturating_add(1);
+            s.failure_kind = None;
+            s.workspace_path = None;
+            s.workspace_owner = None;
+            s.error = None;
+        })
+        .await?;
+        let run_generation = store
+            .get(&id)
+            .map(|state| state.run_generation)
+            .unwrap_or(1);
 
         // Parallel dispatch for Complex+ prompt-only tasks when workspace isolation is active.
         // Issue and PR tasks have their own structured prompt flow and are not decomposed.
@@ -623,13 +644,56 @@ where
                         project_root.display()
                     )
                 })?;
-            wmgr.create_workspace(
-                &id,
-                &project_root,
-                &project_config.git.remote,
-                &project_config.git.base_branch,
-            )
-            .await?
+            let lease = match wmgr
+                .create_workspace(
+                    &id,
+                    &project_root,
+                    &project_config.git.remote,
+                    &project_config.git.base_branch,
+                    run_generation,
+                )
+                .await
+            {
+                Ok(lease) => lease,
+                Err(err) => {
+                    let error_message = err.to_string();
+                    let workspace_path = err.workspace_path().to_path_buf();
+                    let workspace_owner =
+                        err.workspace_owner().map(std::string::ToString::to_string);
+                    mutate_and_persist(&store, &id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.failure_kind = Some(TaskFailureKind::WorkspaceLifecycle);
+                        s.error = Some(error_message.clone());
+                        s.workspace_path = Some(workspace_path.clone());
+                        s.workspace_owner = workspace_owner.clone();
+                        s.rounds.push(RoundResult {
+                            turn: s.turn.saturating_add(1),
+                            action: "workspace_admission".into(),
+                            result: "workspace_lifecycle_failure".into(),
+                            detail: Some(error_message.clone()),
+                            first_token_latency_ms: None,
+                        });
+                    })
+                    .await?;
+                    tracing::warn!(task_id = %id.0, error = %error_message, "workspace admission failed");
+                    return Ok(());
+                }
+            };
+            tracing::info!(
+                task_id = %id.0,
+                workspace_path = %lease.workspace_path.display(),
+                workspace_owner = %lease.owner_session,
+                run_generation = lease.run_generation,
+                workspace_decision = ?lease.decision,
+                "workspace admitted"
+            );
+            mutate_and_persist(&store, &id, |s| {
+                s.workspace_path = Some(lease.workspace_path.clone());
+                s.workspace_owner = Some(lease.owner_session.clone());
+                s.run_generation = lease.run_generation;
+            })
+            .await?;
+            lease.workspace_path
         } else {
             project_root
         };
@@ -703,6 +767,7 @@ where
                             first_token_latency_ms: None,
                         });
                         s.status = TaskStatus::Pending;
+                        s.failure_kind = None;
                         s.error = Some(format!(
                             "retrying after transient failure (attempt {transient_attempts}): {reason}"
                         ));

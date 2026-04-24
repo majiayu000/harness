@@ -15,6 +15,7 @@ use harness_core::db::Migration;
 /// v18 – add version column for optimistic locking.
 /// v19 – add task_kind column for first-class task lifecycle dispatch.
 /// v20 – add system_input column for restart-safe trusted system prompt bundles.
+/// v21 – add workspace lifecycle ownership and failure classification columns.
 pub(super) static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -144,5 +145,14 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
         version: 20,
         description: "add system_input column for restart-safe system prompt bundles",
         sql: "ALTER TABLE tasks ADD COLUMN system_input TEXT",
+    },
+    Migration {
+        version: 21,
+        description: "add workspace lifecycle ownership and failure classification columns",
+        sql: "ALTER TABLE tasks \
+              ADD COLUMN failure_kind TEXT, \
+              ADD COLUMN workspace_path TEXT, \
+              ADD COLUMN workspace_owner TEXT, \
+              ADD COLUMN run_generation BIGINT NOT NULL DEFAULT 0",
     },
 ];

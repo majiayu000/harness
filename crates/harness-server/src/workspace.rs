@@ -1,6 +1,8 @@
-use crate::task_runner::TaskId;
+use crate::task_runner::{TaskId, TaskSummary};
 use dashmap::DashMap;
 use harness_core::config::misc::WorkspaceConfig;
+use harness_core::types::SessionId;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
@@ -28,6 +30,8 @@ const GIT_LOCAL_ENV_VARS: &[&str] = &[
     "GIT_COMMON_DIR",
 ];
 
+const OWNER_RECORD_FILE: &str = "harness-workspace-owner.json";
+
 fn git_command() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("git");
     for key in GIT_LOCAL_ENV_VARS {
@@ -39,19 +43,110 @@ fn git_command() -> tokio::process::Command {
 pub(crate) struct ActiveWorkspace {
     pub(crate) workspace_path: PathBuf,
     pub(crate) source_repo: PathBuf,
+    pub(crate) owner_session: String,
+    pub(crate) run_generation: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkspaceOwnerRecord {
+    task_id: String,
+    run_generation: u32,
+    owner_session: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkspaceAcquireDecision {
+    CreatedFresh,
+    ReusedTracked,
+    ReusedRecovered,
+    RecreatedStale,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceLease {
+    pub(crate) workspace_path: PathBuf,
+    pub(crate) owner_session: String,
+    pub(crate) run_generation: u32,
+    pub(crate) decision: WorkspaceAcquireDecision,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum WorkspaceLifecycleError {
+    LiveForeignOwner {
+        workspace_path: PathBuf,
+        workspace_owner: Option<String>,
+        message: String,
+    },
+    ReconcileFailed {
+        workspace_path: PathBuf,
+        workspace_owner: Option<String>,
+        message: String,
+    },
+    CreateFailed {
+        workspace_path: PathBuf,
+        workspace_owner: Option<String>,
+        message: String,
+    },
+}
+
+impl WorkspaceLifecycleError {
+    pub(crate) fn workspace_path(&self) -> &Path {
+        match self {
+            Self::LiveForeignOwner { workspace_path, .. }
+            | Self::ReconcileFailed { workspace_path, .. }
+            | Self::CreateFailed { workspace_path, .. } => workspace_path.as_path(),
+        }
+    }
+
+    pub(crate) fn workspace_owner(&self) -> Option<&str> {
+        match self {
+            Self::LiveForeignOwner {
+                workspace_owner, ..
+            }
+            | Self::ReconcileFailed {
+                workspace_owner, ..
+            }
+            | Self::CreateFailed {
+                workspace_owner, ..
+            } => workspace_owner.as_deref(),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkspaceLifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LiveForeignOwner { message, .. }
+            | Self::ReconcileFailed { message, .. }
+            | Self::CreateFailed { message, .. } => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceLifecycleError {}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StartupReconciliation {
+    pub(crate) removed: u32,
+    pub(crate) preserved: u32,
 }
 
 pub struct WorkspaceManager {
     pub(crate) config: WorkspaceConfig,
     pub(crate) active: DashMap<TaskId, ActiveWorkspace>,
+    pub(crate) owner_session: String,
 }
 
 impl WorkspaceManager {
-    pub fn new(config: WorkspaceConfig) -> anyhow::Result<Self> {
+    pub fn new(mut config: WorkspaceConfig) -> anyhow::Result<Self> {
+        if !config.root.is_absolute() {
+            config.root = std::env::current_dir()?.join(&config.root);
+        }
         std::fs::create_dir_all(&config.root)?;
         Ok(Self {
             config,
             active: DashMap::new(),
+            owner_session: SessionId::new().to_string(),
         })
     }
 
@@ -61,23 +156,33 @@ impl WorkspaceManager {
     /// upstream state. Creates branch `harness/<task_id>` based on `remote/base_branch`.
     /// Runs `after_create_hook` on new creation only. Idempotent: returns existing path
     /// if already active.
-    pub async fn create_workspace(
+    pub(crate) async fn create_workspace(
         &self,
         task_id: &TaskId,
         source_repo: &Path,
         remote: &str,
         base_branch: &str,
-    ) -> anyhow::Result<PathBuf> {
+        run_generation: u32,
+    ) -> Result<WorkspaceLease, WorkspaceLifecycleError> {
         // Validate inputs to prevent unexpected git behavior.
         if !is_valid_branch_name(base_branch) {
-            anyhow::bail!("invalid base_branch: {base_branch:?}");
+            return Err(WorkspaceLifecycleError::CreateFailed {
+                workspace_path: self.config.root.join(sanitize_task_id(&task_id.0)),
+                workspace_owner: None,
+                message: format!("invalid base_branch: {base_branch:?}"),
+            });
         }
         if !is_valid_branch_name(remote) {
-            anyhow::bail!("invalid remote: {remote:?}");
+            return Err(WorkspaceLifecycleError::CreateFailed {
+                workspace_path: self.config.root.join(sanitize_task_id(&task_id.0)),
+                workspace_owner: None,
+                message: format!("invalid remote: {remote:?}"),
+            });
         }
 
         let sanitized = sanitize_task_id(&task_id.0);
         let workspace_path = self.config.root.join(&sanitized);
+        let owner_session = self.owner_session.clone();
 
         // Atomic check-and-insert: prevents TOCTOU where two concurrent calls for the
         // same task_id would both attempt git worktree add on the same path.
@@ -85,38 +190,89 @@ impl WorkspaceManager {
         {
             use dashmap::mapref::entry::Entry;
             match self.active.entry(task_id.clone()) {
-                Entry::Occupied(occ) => return Ok(occ.get().workspace_path.clone()),
+                Entry::Occupied(occ) => {
+                    let active = occ.get();
+                    if active.run_generation == run_generation
+                        && active.owner_session == owner_session
+                    {
+                        return Ok(WorkspaceLease {
+                            workspace_path: active.workspace_path.clone(),
+                            owner_session,
+                            run_generation,
+                            decision: WorkspaceAcquireDecision::ReusedTracked,
+                        });
+                    }
+                    return Err(WorkspaceLifecycleError::LiveForeignOwner {
+                        workspace_path: active.workspace_path.clone(),
+                        workspace_owner: Some(active.owner_session.clone()),
+                        message: format!(
+                            "WorktreeCollision: workspace path {:?} already owned by another harness session; manual resolution required",
+                            active.workspace_path
+                        ),
+                    });
+                }
                 Entry::Vacant(vac) => {
                     vac.insert(ActiveWorkspace {
                         workspace_path: workspace_path.clone(),
                         source_repo: source_repo.to_path_buf(),
+                        owner_session: owner_session.clone(),
+                        run_generation,
                     });
                 }
             }
         }
 
-        // Stale-state guard: if the workspace directory already exists on disk but was
-        // not tracked as active (Occupied path above), check whether it is this task's
-        // own worktree left behind by a server crash (recovery path) or a truly foreign
-        // worktree (collision path).
+        let mut decision = WorkspaceAcquireDecision::CreatedFresh;
+
         if workspace_path.exists() {
-            let expected_branch = format!("harness/{}", task_id.0);
-            if is_worktree_on_branch(&workspace_path, &expected_branch).await {
-                // Recovery: same task's worktree survived a crash — re-register and reuse.
+            let owner_record = read_owner_record(&workspace_path);
+            if owner_record.as_ref().is_some_and(|record| {
+                record.task_id == task_id.0
+                    && record.run_generation == run_generation
+                    && record.owner_session != owner_session
+            }) {
+                self.active.remove(task_id);
+                return Err(WorkspaceLifecycleError::LiveForeignOwner {
+                    workspace_path: workspace_path.clone(),
+                    workspace_owner: owner_record.map(|record| record.owner_session),
+                    message: format!(
+                        "WorktreeCollision: workspace path {:?} is managed by another harness session for task {} generation {}; manual resolution required",
+                        workspace_path, task_id.0, run_generation
+                    ),
+                });
+            }
+
+            if owner_record.as_ref().is_some_and(|record| {
+                record.task_id == task_id.0
+                    && record.run_generation == run_generation
+                    && record.owner_session == owner_session
+            }) {
                 tracing::info!(
                     task_id = %task_id.0,
                     path = ?workspace_path,
-                    "workspace recovery: re-using existing worktree from previous run"
+                    run_generation,
+                    "workspace recovery: re-using recorded worktree from previous run"
                 );
-                return Ok(workspace_path);
+                return Ok(WorkspaceLease {
+                    workspace_path,
+                    owner_session,
+                    run_generation,
+                    decision: WorkspaceAcquireDecision::ReusedRecovered,
+                });
             }
-            self.active.remove(task_id);
-            anyhow::bail!(
-                "WorktreeCollision: workspace path {:?} already exists on disk for task {}; \
-                 a previous run did not clean up — remove the directory to retry",
-                workspace_path,
-                task_id.0
-            );
+
+            if let Err(err) = cleanup_workspace_path(source_repo, &workspace_path).await {
+                self.active.remove(task_id);
+                return Err(WorkspaceLifecycleError::ReconcileFailed {
+                    workspace_path: workspace_path.clone(),
+                    workspace_owner: owner_record.map(|record| record.owner_session),
+                    message: format!(
+                        "workspace lifecycle reconciliation failed for task {} at {:?}: {err}",
+                        task_id.0, workspace_path
+                    ),
+                });
+            }
+            decision = WorkspaceAcquireDecision::RecreatedStale;
         }
 
         // Fetch latest base_branch from remote so the worktree starts from upstream HEAD.
@@ -129,7 +285,12 @@ impl WorkspaceManager {
                 base_branch,
             ])
             .output()
-            .await?;
+            .await
+            .map_err(|e| WorkspaceLifecycleError::CreateFailed {
+                workspace_path: workspace_path.clone(),
+                workspace_owner: Some(owner_session.clone()),
+                message: format!("git fetch failed for task {}: {e}", task_id.0),
+            })?;
 
         if !fetch_output.status.success() {
             let stderr = String::from_utf8_lossy(&fetch_output.stderr);
@@ -155,7 +316,12 @@ impl WorkspaceManager {
                 &remote_ref,
             ])
             .output()
-            .await?;
+            .await
+            .map_err(|e| WorkspaceLifecycleError::CreateFailed {
+                workspace_path: workspace_path.clone(),
+                workspace_owner: Some(owner_session.clone()),
+                message: format!("git worktree add failed for task {}: {e}", task_id.0),
+            })?;
 
         if !output.status.success() {
             // Fallback: try local base_branch (useful for repos without remotes, e.g. tests).
@@ -171,17 +337,48 @@ impl WorkspaceManager {
                     base_branch,
                 ])
                 .output()
-                .await?;
+                .await
+                .map_err(|e| WorkspaceLifecycleError::CreateFailed {
+                    workspace_path: workspace_path.clone(),
+                    workspace_owner: Some(owner_session.clone()),
+                    message: format!(
+                        "git worktree add fallback failed for task {}: {e}",
+                        task_id.0
+                    ),
+                })?;
 
             if !fallback.status.success() {
                 self.active.remove(task_id);
                 let stderr = String::from_utf8_lossy(&fallback.stderr);
-                anyhow::bail!(
-                    "git worktree add failed for task {}: {}",
-                    task_id.0,
-                    stderr.trim()
+                return Err(WorkspaceLifecycleError::CreateFailed {
+                    workspace_path: workspace_path.clone(),
+                    workspace_owner: Some(owner_session.clone()),
+                    message: format!(
+                        "git worktree add failed for task {}: {}",
+                        task_id.0,
+                        stderr.trim()
+                    ),
+                });
+            }
+        }
+
+        let owner_record = WorkspaceOwnerRecord {
+            task_id: task_id.0.clone(),
+            run_generation,
+            owner_session: owner_session.clone(),
+        };
+        if let Err(err) = write_owner_record(&workspace_path, &owner_record) {
+            self.active.remove(task_id);
+            if let Err(cleanup_err) = cleanup_workspace_path(source_repo, &workspace_path).await {
+                tracing::warn!(
+                    "failed to cleanup partial worktree after owner-record failure: {cleanup_err}"
                 );
             }
+            return Err(WorkspaceLifecycleError::CreateFailed {
+                workspace_path: workspace_path.clone(),
+                workspace_owner: Some(owner_session.clone()),
+                message: format!("failed to persist workspace owner record: {err}"),
+            });
         }
 
         // Run after_create_hook if set. Fatal on failure: cleanup partial worktree.
@@ -200,16 +397,26 @@ impl WorkspaceManager {
 
             if let Some(err_msg) = hook_error {
                 self.active.remove(task_id);
-                if let Err(cleanup_err) = remove_worktree(source_repo, &workspace_path).await {
+                if let Err(cleanup_err) = cleanup_workspace_path(source_repo, &workspace_path).await
+                {
                     tracing::warn!(
                         "failed to cleanup partial worktree after hook failure: {cleanup_err}"
                     );
                 }
-                anyhow::bail!("{err_msg}");
+                return Err(WorkspaceLifecycleError::CreateFailed {
+                    workspace_path,
+                    workspace_owner: Some(owner_session),
+                    message: err_msg,
+                });
             }
         }
 
-        Ok(workspace_path)
+        Ok(WorkspaceLease {
+            workspace_path,
+            owner_session,
+            run_generation,
+            decision,
+        })
     }
 
     /// Remove the workspace for the given task. Runs `before_remove_hook` first (non-fatal).
@@ -237,13 +444,27 @@ impl WorkspaceManager {
             }
         }
 
-        if let Err(e) = remove_worktree(&entry.source_repo, &entry.workspace_path).await {
+        if let Err(e) = cleanup_workspace_path(&entry.source_repo, &entry.workspace_path).await {
             tracing::warn!(
                 "git worktree remove failed for {:?}: {e}",
                 entry.workspace_path
             );
         }
         Ok(())
+    }
+
+    pub async fn cleanup_workspace_for_retry(
+        &self,
+        task_id: &TaskId,
+        source_repo: &Path,
+        workspace_path: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        self.active.remove(task_id);
+        let fallback_path = self.config.root.join(sanitize_task_id(&task_id.0));
+        let target = workspace_path
+            .map(Path::to_path_buf)
+            .unwrap_or(fallback_path);
+        cleanup_workspace_path(source_repo, &target).await
     }
 
     /// Return the workspace path for the given task if it is active.
@@ -267,6 +488,115 @@ impl WorkspaceManager {
             }
         }
         Ok(())
+    }
+
+    pub(crate) async fn reconcile_startup(
+        &self,
+        source_repo: &Path,
+        tasks: &[TaskSummary],
+    ) -> anyhow::Result<StartupReconciliation> {
+        let task_by_id: std::collections::HashMap<&str, &TaskSummary> = tasks
+            .iter()
+            .map(|task| (task.id.0.as_str(), task))
+            .collect();
+        let path_to_task: std::collections::HashMap<PathBuf, &TaskSummary> = tasks
+            .iter()
+            .map(|task| {
+                let path = task
+                    .workspace_path
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.config.root.join(sanitize_task_id(&task.id.0)));
+                (path, task)
+            })
+            .collect();
+
+        let read_dir = std::fs::read_dir(&self.config.root)?;
+        let mut summary = StartupReconciliation::default();
+        let mut seen_paths = std::collections::HashSet::new();
+
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            seen_paths.insert(path.clone());
+            if self.active.iter().any(|e| e.workspace_path == path) {
+                continue;
+            }
+
+            let owner_record = read_owner_record(&path);
+            let task = owner_record
+                .as_ref()
+                .and_then(|record| task_by_id.get(record.task_id.as_str()).copied())
+                .or_else(|| path_to_task.get(&path).copied());
+
+            let should_remove = match task {
+                None => true,
+                Some(task) if task.status.is_terminal() => true,
+                Some(task) => {
+                    if let Some(owner_record) = owner_record.as_ref() {
+                        if owner_record.run_generation != task.run_generation {
+                            true
+                        } else if let Some(expected_owner) = task.workspace_owner.as_deref() {
+                            expected_owner == self.owner_session
+                                && owner_record.owner_session == expected_owner
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            if should_remove {
+                let cleanup_repo = resolve_cleanup_source_repo(source_repo, &path, task).await;
+                match cleanup_workspace_path(&cleanup_repo, &path).await {
+                    Ok(()) => {
+                        summary.removed += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = ?path,
+                            source_repo = ?cleanup_repo,
+                            "reconcile_startup: failed to cleanup workspace: {e}"
+                        );
+                    }
+                }
+            } else {
+                summary.preserved += 1;
+            }
+        }
+
+        for (path, task) in &path_to_task {
+            if seen_paths.contains(path)
+                || self.active.iter().any(|e| e.workspace_path == *path)
+                || path.exists()
+            {
+                continue;
+            }
+
+            let cleanup_repo = resolve_cleanup_source_repo(source_repo, path, Some(*task)).await;
+            if !is_registered_worktree(&cleanup_repo, path).await {
+                continue;
+            }
+
+            match cleanup_workspace_path(&cleanup_repo, path).await {
+                Ok(()) => {
+                    summary.removed += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = ?path,
+                        source_repo = ?cleanup_repo,
+                        "reconcile_startup: failed to cleanup missing workspace registration: {e}"
+                    );
+                }
+            }
+        }
+
+        Ok(summary)
     }
 
     /// Scan `config.root` for worktree directories and remove any that correspond to
@@ -365,24 +695,6 @@ fn sanitize_task_id(id: &str) -> String {
 
 /// Returns true when the git worktree at `path` is currently on `branch`.
 /// Used to distinguish crash-recovery (same task's worktree) from a true collision.
-async fn is_worktree_on_branch(path: &Path, branch: &str) -> bool {
-    git_command()
-        .args([
-            "-C",
-            &path.to_string_lossy(),
-            "rev-parse",
-            "--abbrev-ref",
-            "HEAD",
-        ])
-        .output()
-        .await
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|b| b.trim() == branch)
-        .unwrap_or(false)
-}
-
 async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {
     crate::post_validator::validate_command_safety(script).map_err(|e| anyhow::anyhow!("{e}"))?;
     let output = tokio::process::Command::new("sh")
@@ -399,6 +711,45 @@ async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {
             stderr.trim()
         );
     }
+    Ok(())
+}
+
+fn workspace_git_dir(workspace_path: &Path) -> anyhow::Result<PathBuf> {
+    let dot_git = workspace_path.join(".git");
+    let metadata = std::fs::metadata(&dot_git)?;
+    if metadata.is_dir() {
+        return Ok(dot_git);
+    }
+
+    let gitdir = std::fs::read_to_string(&dot_git)?;
+    let relative = gitdir
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .ok_or_else(|| anyhow::anyhow!("invalid gitdir metadata at {:?}", dot_git))?;
+    let gitdir_path = Path::new(relative);
+    Ok(if gitdir_path.is_absolute() {
+        gitdir_path.to_path_buf()
+    } else {
+        workspace_path.join(gitdir_path)
+    })
+}
+
+fn owner_record_path(workspace_path: &Path) -> anyhow::Result<PathBuf> {
+    Ok(workspace_git_dir(workspace_path)?.join(OWNER_RECORD_FILE))
+}
+
+fn read_owner_record(workspace_path: &Path) -> Option<WorkspaceOwnerRecord> {
+    let bytes = std::fs::read(owner_record_path(workspace_path).ok()?).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_owner_record(
+    workspace_path: &Path,
+    owner_record: &WorkspaceOwnerRecord,
+) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec(owner_record)?;
+    std::fs::write(owner_record_path(workspace_path)?, bytes)?;
     Ok(())
 }
 
@@ -428,6 +779,123 @@ async fn remove_worktree(source_repo: &Path, workspace_path: &Path) -> anyhow::R
     Ok(())
 }
 
+async fn cleanup_workspace_path(source_repo: &Path, workspace_path: &Path) -> anyhow::Result<()> {
+    let worktree_registered = is_registered_worktree(source_repo, workspace_path).await;
+    if worktree_registered {
+        match remove_worktree(source_repo, workspace_path).await {
+            Ok(()) => {}
+            Err(e) if !workspace_path.exists() => {
+                tracing::warn!(
+                    path = ?workspace_path,
+                    "cleanup_workspace_path: git worktree remove failed for missing path; pruning stale metadata: {e}"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(path = ?workspace_path, "cleanup_workspace_path: git worktree remove failed for existing path: {e}");
+            }
+        }
+    }
+
+    if workspace_path.exists() {
+        std::fs::remove_dir_all(workspace_path)?;
+    }
+
+    if let Err(e) = git_command()
+        .args(["-C", &source_repo.to_string_lossy(), "worktree", "prune"])
+        .output()
+        .await
+    {
+        tracing::warn!("cleanup_workspace_path: git worktree prune failed: {e}");
+    }
+
+    Ok(())
+}
+
+async fn resolve_cleanup_source_repo(
+    default_source_repo: &Path,
+    workspace_path: &Path,
+    task: Option<&TaskSummary>,
+) -> PathBuf {
+    if let Some(project_root) = task.and_then(|task| task.project.as_deref()) {
+        return PathBuf::from(project_root);
+    }
+
+    infer_workspace_source_repo(workspace_path)
+        .await
+        .unwrap_or_else(|| default_source_repo.to_path_buf())
+}
+
+async fn infer_workspace_source_repo(workspace_path: &Path) -> Option<PathBuf> {
+    git_command()
+        .args([
+            "-C",
+            &workspace_path.to_string_lossy(),
+            "rev-parse",
+            "--show-toplevel",
+        ])
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|stdout| PathBuf::from(stdout.trim()))
+}
+
+async fn is_registered_worktree(source_repo: &Path, workspace_path: &Path) -> bool {
+    // `git worktree list --porcelain` emits absolute paths even when `workspace.root`
+    // was configured relatively. Deleted worktrees may still be listed through a
+    // symlink-expanded parent such as `/private/var`, so normalize through the
+    // nearest existing ancestor before matching.
+    let expected_path = canonicalize_existing_or_parent(workspace_path);
+    git_command()
+        .args([
+            "-C",
+            &source_repo.to_string_lossy(),
+            "worktree",
+            "list",
+            "--porcelain",
+        ])
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|stdout| {
+            stdout.lines().any(|line| {
+                line.strip_prefix("worktree ")
+                    .map(PathBuf::from)
+                    .map(|listed| canonicalize_existing_or_parent(&listed))
+                    .is_some_and(|listed| listed == expected_path)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn canonicalize_existing_or_parent(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let mut missing_components = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        let Some(parent) = cursor.parent() else {
+            return path.to_path_buf();
+        };
+        let Some(file_name) = cursor.file_name() else {
+            return path.to_path_buf();
+        };
+        missing_components.push(file_name.to_os_string());
+        cursor = parent;
+    }
+
+    let mut normalized = std::fs::canonicalize(cursor).unwrap_or_else(|_| cursor.to_path_buf());
+    for component in missing_components.iter().rev() {
+        normalized.push(component);
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +913,11 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn async_env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     struct ScopedEnvVar {
@@ -588,14 +1061,50 @@ mod tests {
         let task_id = harness_core::types::TaskId("test-task-001".to_string());
 
         let ws_path = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
             .await
             .expect("create");
-        assert!(ws_path.is_dir());
+        assert!(ws_path.workspace_path.is_dir());
         assert!(mgr.get_workspace(&task_id).is_some());
 
         mgr.remove_workspace(&task_id).await.expect("remove");
         assert!(mgr.get_workspace(&task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn create_workspace_persists_owner_record_outside_checkout_root() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let task_id = harness_core::types::TaskId("test-task-owner-record".to_string());
+
+        let lease = mgr
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .await
+            .expect("create");
+
+        let metadata_path = owner_record_path(&lease.workspace_path).expect("owner record path");
+        assert!(
+            metadata_path.exists(),
+            "owner record should be written into git metadata"
+        );
+        assert!(
+            !lease
+                .workspace_path
+                .join(format!(".{OWNER_RECORD_FILE}"))
+                .exists()
+                && !lease.workspace_path.join(OWNER_RECORD_FILE).exists(),
+            "owner record must not dirty the checkout root"
+        );
+
+        mgr.remove_workspace(&task_id).await.expect("remove");
     }
 
     #[tokio::test]
@@ -628,14 +1137,14 @@ mod tests {
         let task_id = harness_core::types::TaskId("test-task-002".to_string());
 
         let path1 = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
             .await
             .expect("create first");
         let path2 = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
             .await
             .expect("create second");
-        assert_eq!(path1, path2);
+        assert_eq!(path1.workspace_path, path2.workspace_path);
 
         mgr.remove_workspace(&task_id).await.expect("remove");
     }
@@ -657,10 +1166,10 @@ mod tests {
         let task_id = harness_core::types::TaskId("test-task-git-index-file".to_string());
 
         let ws_path = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
             .await
             .expect("create");
-        assert!(ws_path.is_dir());
+        assert!(ws_path.workspace_path.is_dir());
 
         mgr.remove_workspace(&task_id).await.expect("remove");
     }
@@ -683,7 +1192,7 @@ mod tests {
         let mgr = WorkspaceManager::new(config).expect("new");
         let task_id = harness_core::types::TaskId("test-task-003".to_string());
 
-        mgr.create_workspace(&task_id, source.path(), "origin", &branch)
+        mgr.create_workspace(&task_id, source.path(), "origin", &branch, 1)
             .await
             .expect("create");
         assert!(
@@ -710,7 +1219,7 @@ mod tests {
         let task_id = harness_core::types::TaskId("test-task-004".to_string());
 
         let result = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
             .await;
         assert!(result.is_err(), "should fail when hook exits 1");
         assert!(
@@ -725,7 +1234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_workspace_rejects_stale_directory() {
+    async fn create_workspace_reconciles_stale_directory() {
         let source = tempfile::tempdir().expect("tempdir");
         init_git_repo(source.path());
         let branch = current_branch(source.path());
@@ -743,19 +1252,384 @@ mod tests {
         std::fs::create_dir_all(&stale_path).expect("create stale dir");
 
         let result = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
             .await;
-        assert!(result.is_err(), "should fail when stale directory exists");
-        let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("WorktreeCollision"),
-            "error should mention WorktreeCollision, got: {err_msg}"
+            result.is_ok(),
+            "stale directory should be reconciled automatically"
         );
-        // Task must not be left in the active map after a collision error.
         assert!(
-            mgr.get_workspace(&task_id).is_none(),
-            "task should not be in active map after collision"
+            stale_path.join(".git").exists(),
+            "workspace should be recreated as a git worktree"
         );
+        assert!(
+            mgr.get_workspace(&task_id).is_some(),
+            "task should be tracked after reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_workspace_blocks_live_foreign_owner() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr_a = WorkspaceManager::new(config.clone()).expect("mgr a");
+        let mgr_b = WorkspaceManager::new(config).expect("mgr b");
+        let task_id = harness_core::types::TaskId("foreign-owner-task".to_string());
+
+        mgr_a
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .await
+            .expect("create first owner");
+
+        let err = mgr_b
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .await
+            .expect_err("second owner should be blocked");
+        assert!(
+            err.to_string().contains("manual resolution required"),
+            "foreign live owner should remain a protected hard stop: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_startup_removes_generation_drifted_workspace() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr_a = WorkspaceManager::new(config.clone()).expect("mgr a");
+        let mgr_b = WorkspaceManager::new(config).expect("mgr b");
+        let task_id = harness_core::types::TaskId("startup-reconcile-task".to_string());
+
+        let lease = mgr_a
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .await
+            .expect("create workspace");
+        assert!(lease.workspace_path.exists());
+
+        let task_summary = crate::task_runner::TaskSummary {
+            id: task_id.clone(),
+            status: crate::task_runner::TaskStatus::Pending,
+            failure_kind: None,
+            turn: 0,
+            pr_url: None,
+            error: None,
+            source: None,
+            parent_id: None,
+            external_id: None,
+            repo: None,
+            description: None,
+            created_at: None,
+            phase: crate::task_runner::TaskPhase::Implement,
+            depends_on: vec![],
+            subtask_ids: vec![],
+            project: Some(source.path().to_string_lossy().into_owned()),
+            workspace_path: Some(lease.workspace_path.to_string_lossy().into_owned()),
+            workspace_owner: Some(mgr_a.owner_session.clone()),
+            run_generation: 2,
+            task_kind: crate::task_runner::TaskKind::Prompt,
+            workflow: None,
+        };
+
+        let summary = mgr_b
+            .reconcile_startup(source.path(), &[task_summary])
+            .await
+            .expect("startup reconcile");
+        assert_eq!(summary.removed, 1);
+        assert!(
+            !lease.workspace_path.exists(),
+            "generation drift should be cleaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_startup_cleans_up_with_workspace_owning_repo() {
+        let source_a = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source_a.path());
+        let branch_a = current_branch(source_a.path());
+
+        let source_b = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source_b.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr_a = WorkspaceManager::new(config.clone()).expect("mgr a");
+        let mgr_b = WorkspaceManager::new(config).expect("mgr b");
+        let task_id = harness_core::types::TaskId("startup-owning-repo-task".to_string());
+
+        let lease = mgr_a
+            .create_workspace(&task_id, source_a.path(), "origin", &branch_a, 1)
+            .await
+            .expect("create workspace");
+        assert!(lease.workspace_path.exists());
+
+        let task_summary = crate::task_runner::TaskSummary {
+            id: task_id,
+            status: crate::task_runner::TaskStatus::Pending,
+            failure_kind: None,
+            turn: 0,
+            pr_url: None,
+            error: None,
+            source: None,
+            parent_id: None,
+            external_id: None,
+            repo: None,
+            description: None,
+            created_at: None,
+            phase: crate::task_runner::TaskPhase::Implement,
+            depends_on: vec![],
+            subtask_ids: vec![],
+            project: Some(source_a.path().to_string_lossy().into_owned()),
+            workspace_path: Some(lease.workspace_path.to_string_lossy().into_owned()),
+            workspace_owner: Some(mgr_a.owner_session.clone()),
+            run_generation: 2,
+            task_kind: crate::task_runner::TaskKind::Prompt,
+            workflow: None,
+        };
+
+        let summary = mgr_b
+            .reconcile_startup(source_b.path(), &[task_summary])
+            .await
+            .expect("startup reconcile");
+        assert_eq!(summary.removed, 1);
+        assert!(
+            !lease.workspace_path.exists(),
+            "generation drift should be cleaned"
+        );
+
+        let listed = String::from_utf8(
+            run_git(&[
+                "-C",
+                &source_a.path().to_string_lossy(),
+                "worktree",
+                "list",
+                "--porcelain",
+            ])
+            .stdout,
+        )
+        .expect("utf8");
+        assert!(
+            !listed.lines().any(|line| {
+                line.strip_prefix("worktree ")
+                    .is_some_and(|entry| entry == lease.workspace_path.to_string_lossy())
+            }),
+            "startup cleanup must prune the owning repo entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_workspace_path_prunes_missing_registered_worktree() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let task_id = harness_core::types::TaskId("missing-registered-task".to_string());
+
+        let lease = mgr
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .await
+            .expect("create workspace");
+        std::fs::remove_dir_all(&lease.workspace_path).expect("remove checkout dir");
+
+        assert!(
+            is_registered_worktree(source.path(), &lease.workspace_path).await,
+            "git should still have a stale worktree registration"
+        );
+
+        cleanup_workspace_path(source.path(), &lease.workspace_path)
+            .await
+            .expect("cleanup missing registered worktree");
+
+        assert!(
+            !is_registered_worktree(source.path(), &lease.workspace_path).await,
+            "cleanup should prune missing worktree registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_startup_prunes_missing_registered_worktree_for_tracked_task() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr_a = WorkspaceManager::new(config.clone()).expect("mgr a");
+        let mgr_b = WorkspaceManager::new(config).expect("mgr b");
+        let task_id = harness_core::types::TaskId("startup-missing-registered-task".to_string());
+
+        let lease = mgr_a
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .await
+            .expect("create workspace");
+        std::fs::remove_dir_all(&lease.workspace_path).expect("remove checkout dir");
+
+        assert!(
+            is_registered_worktree(source.path(), &lease.workspace_path).await,
+            "git should still have a stale worktree registration"
+        );
+
+        let task_summary = crate::task_runner::TaskSummary {
+            id: task_id.clone(),
+            status: crate::task_runner::TaskStatus::Pending,
+            failure_kind: None,
+            turn: 0,
+            pr_url: None,
+            error: None,
+            source: None,
+            parent_id: None,
+            external_id: None,
+            repo: None,
+            description: None,
+            created_at: None,
+            phase: crate::task_runner::TaskPhase::Implement,
+            depends_on: vec![],
+            subtask_ids: vec![],
+            project: Some(source.path().to_string_lossy().into_owned()),
+            workspace_path: Some(lease.workspace_path.to_string_lossy().into_owned()),
+            workspace_owner: Some(mgr_a.owner_session.clone()),
+            run_generation: 1,
+            task_kind: crate::task_runner::TaskKind::Prompt,
+            workflow: None,
+        };
+
+        let summary = mgr_b
+            .reconcile_startup(source.path(), &[task_summary])
+            .await
+            .expect("startup reconcile");
+        assert_eq!(summary.removed, 1);
+        assert!(
+            !is_registered_worktree(source.path(), &lease.workspace_path).await,
+            "startup reconcile should prune missing worktree registration"
+        );
+
+        let recreated = mgr_b
+            .create_workspace(&task_id, source.path(), "origin", &branch, 2)
+            .await
+            .expect("recreate workspace after startup reconcile");
+        assert!(
+            recreated.workspace_path.exists(),
+            "startup reconcile should unblock the next worktree add"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_startup_continues_after_workspace_cleanup_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+
+        let bad_path = workspaces.path().join("bad-stale-workspace");
+        std::fs::create_dir_all(&bad_path).expect("create bad workspace");
+        std::fs::write(bad_path.join("locked"), "locked").expect("write locked child");
+        std::fs::set_permissions(&bad_path, std::fs::Permissions::from_mode(0o500))
+            .expect("lock bad workspace");
+
+        let good_path = workspaces.path().join("good-stale-workspace");
+        std::fs::create_dir_all(&good_path).expect("create good workspace");
+
+        let summary = mgr
+            .reconcile_startup(source.path(), &[])
+            .await
+            .expect("startup reconcile should continue after per-entry cleanup failure");
+
+        std::fs::set_permissions(&bad_path, std::fs::Permissions::from_mode(0o700))
+            .expect("unlock bad workspace");
+
+        assert_eq!(
+            summary.removed, 1,
+            "successful entries should still be counted after another entry fails"
+        );
+        assert!(
+            !good_path.exists(),
+            "good stale workspace should still be cleaned"
+        );
+        assert!(
+            bad_path.exists(),
+            "failed stale workspace should remain for later retry or operator cleanup"
+        );
+    }
+
+    struct CwdGuard(PathBuf);
+
+    impl CwdGuard {
+        fn switch_to(path: &Path) -> anyhow::Result<Self> {
+            let original = std::env::current_dir()?;
+            std::env::set_current_dir(path)?;
+            Ok(Self(original))
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn is_registered_worktree_matches_relative_workspace_paths() {
+        let _guard = async_env_lock().lock().await;
+
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let _cwd_guard = CwdGuard::switch_to(sandbox.path()).expect("switch cwd");
+
+        let source = sandbox.path().join("source");
+        std::fs::create_dir_all(&source).expect("create source");
+        init_git_repo(&source);
+        let branch = current_branch(&source);
+
+        let config = WorkspaceConfig {
+            root: PathBuf::from("workspaces"),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let task_id = harness_core::types::TaskId("test-task-relative-path".to_string());
+
+        mgr.create_workspace(&task_id, &source, "origin", &branch, 1)
+            .await
+            .expect("create");
+        let relative_workspace_path =
+            PathBuf::from("workspaces").join(sanitize_task_id(&task_id.0));
+
+        assert!(
+            is_registered_worktree(&source, &relative_workspace_path).await,
+            "registered worktree lookup should canonicalize relative paths"
+        );
+
+        mgr.remove_workspace(&task_id).await.expect("remove");
     }
 
     #[tokio::test]
@@ -776,7 +1650,7 @@ mod tests {
             .collect();
 
         for id in &ids {
-            mgr.create_workspace(id, source.path(), "origin", &branch)
+            mgr.create_workspace(id, source.path(), "origin", &branch, 1)
                 .await
                 .expect("create");
         }

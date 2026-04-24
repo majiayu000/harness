@@ -3,7 +3,9 @@ use super::helpers::{
     matched_skills_for_prompt, run_agent_streaming, run_on_error, run_post_execute,
     run_post_tool_use, run_pre_execute, update_status,
 };
-use crate::task_runner::{mutate_and_persist, CreateTaskRequest, TaskId, TaskStatus, TaskStore};
+use crate::task_runner::{
+    mutate_and_persist, CreateTaskRequest, TaskFailureKind, TaskId, TaskStatus, TaskStore,
+};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::interceptor::ToolUseEvent;
 use harness_core::tool_isolation::validate_tool_usage;
@@ -504,16 +506,17 @@ pub(crate) async fn run_implement_phase(
             );
             mutate_and_persist(store, task_id, |s| {
                 s.status = TaskStatus::Failed;
+                s.failure_kind = Some(TaskFailureKind::WorkspaceLifecycle);
                 s.turn = 1;
                 s.pr_url = collision_pr_url.clone();
                 s.error = Some(
-                    "WorktreeCollision: agent observed worktree managed by another harness session"
+                    "WorktreeCollision: agent observed worktree managed by another harness session; reconciliation required"
                         .into(),
                 );
                 s.rounds.push(RoundResult {
                     turn: 1,
                     action: "implement".into(),
-                    result: "worktree_collision".into(),
+                    result: "workspace_lifecycle_collision".into(),
                     detail: if output.is_empty() {
                         None
                     } else {

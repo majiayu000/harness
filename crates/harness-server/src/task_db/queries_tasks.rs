@@ -29,15 +29,17 @@ impl TaskDb {
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
         sqlx::query(
-            "INSERT INTO tasks (id, task_kind, status, turn, pr_url, rounds, error, source, \
-             external_id, parent_id, created_at, repo, depends_on, project, priority, phase, \
-             description, request_settings, system_input) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-                     COALESCE($11, CURRENT_TIMESTAMP), $12, $13, $14, $15, $16, $17, $18, $19)",
+            "INSERT INTO tasks (id, task_kind, status, failure_kind, turn, pr_url, rounds, error, source, \
+             external_id, parent_id, created_at, repo, depends_on, project, workspace_path, \
+             workspace_owner, run_generation, priority, phase, description, request_settings, system_input) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                     COALESCE($12, CURRENT_TIMESTAMP), $13, $14, $15, $16, $17, $18, \
+                     $19, $20, $21, $22, $23)",
         )
         .bind(&state.id.0)
         .bind(task_kind)
         .bind(status)
+        .bind(state.failure_kind.as_ref().map(|kind| kind.as_ref()))
         .bind(state.turn as i64)
         .bind(&state.pr_url)
         .bind(&rounds_json)
@@ -54,6 +56,14 @@ impl TaskDb {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
         )
+        .bind(
+            state
+                .workspace_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        )
+        .bind(state.workspace_owner.as_deref())
+        .bind(state.run_generation as i64)
         .bind(state.priority as i64)
         .bind(&phase_json)
         .bind(state.description.as_deref())
@@ -79,14 +89,16 @@ impl TaskDb {
             .as_ref()
             .and_then(|input| serde_json::to_string(input).ok());
         sqlx::query(
-            "UPDATE tasks SET task_kind = $1, status = $2, turn = $3, pr_url = $4, rounds = $5, \
-                    error = $6, source = $7, external_id = $8, repo = $9, depends_on = $10, \
-                    project = $11, priority = $12, phase = $13, description = $14, \
-                    request_settings = $15, system_input = $16, updated_at = CURRENT_TIMESTAMP, \
-                    version = version + 1 WHERE id = $17",
+            "UPDATE tasks SET task_kind = $1, status = $2, failure_kind = $3, turn = $4, pr_url = $5, rounds = $6, \
+                    error = $7, source = $8, external_id = $9, repo = $10, depends_on = $11, \
+                    project = $12, workspace_path = $13, workspace_owner = $14, \
+                    run_generation = $15, priority = $16, phase = $17, description = $18, \
+                    request_settings = $19, system_input = $20, updated_at = CURRENT_TIMESTAMP, \
+                    version = version + 1 WHERE id = $21",
         )
         .bind(task_kind)
         .bind(status)
+        .bind(state.failure_kind.as_ref().map(|kind| kind.as_ref()))
         .bind(state.turn as i64)
         .bind(&state.pr_url)
         .bind(&rounds_json)
@@ -101,6 +113,14 @@ impl TaskDb {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
         )
+        .bind(
+            state
+                .workspace_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        )
+        .bind(state.workspace_owner.as_deref())
+        .bind(state.run_generation as i64)
         .bind(state.priority as i64)
         .bind(&phase_json)
         .bind(state.description.as_deref())
@@ -274,8 +294,9 @@ impl TaskDb {
     /// Return all tasks as lightweight summaries, skipping the heavy `rounds` column.
     pub async fn list_summaries(&self) -> anyhow::Result<Vec<crate::task_runner::TaskSummary>> {
         let rows = sqlx::query_as::<_, TaskSummaryRow>(
-            "SELECT id, task_kind, status, turn, pr_url, error, source, external_id, parent_id, \
-             created_at, repo, depends_on, project, phase, description \
+            "SELECT id, task_kind, status, failure_kind, turn, pr_url, error, source, external_id, parent_id, \
+             created_at, repo, depends_on, project, workspace_path, workspace_owner, \
+             run_generation, phase, description \
              FROM tasks ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -736,7 +757,8 @@ impl TaskDb {
         limit: i64,
     ) -> anyhow::Result<Vec<crate::task_runner::RecentFailureTask>> {
         let rows = sqlx::query_as::<_, RecentFailureRow>(
-            "SELECT id, external_id, project, error, updated_at FROM tasks \
+            "SELECT id, failure_kind, external_id, project, workspace_path, workspace_owner, \
+             run_generation, error, updated_at FROM tasks \
              WHERE status = 'failed' \
              ORDER BY updated_at DESC LIMIT $1",
         )

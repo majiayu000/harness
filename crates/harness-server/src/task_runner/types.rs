@@ -147,6 +147,13 @@ pub enum TaskStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskFailureKind {
+    Task,
+    WorkspaceLifecycle,
+}
+
 const TERMINAL_TASK_STATUSES: &[&str] = &["done", "failed", "cancelled"];
 const RESUMABLE_TASK_STATUSES: &[&str] = &[
     "implementing",
@@ -242,6 +249,27 @@ impl std::str::FromStr for TaskStatus {
             "failed" => Ok(TaskStatus::Failed),
             "cancelled" => Ok(TaskStatus::Cancelled),
             _ => anyhow::bail!("unknown task status `{s}`"),
+        }
+    }
+}
+
+impl AsRef<str> for TaskFailureKind {
+    fn as_ref(&self) -> &str {
+        match self {
+            TaskFailureKind::Task => "task",
+            TaskFailureKind::WorkspaceLifecycle => "workspace_lifecycle",
+        }
+    }
+}
+
+impl std::str::FromStr for TaskFailureKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "task" => Ok(TaskFailureKind::Task),
+            "workspace_lifecycle" => Ok(TaskFailureKind::WorkspaceLifecycle),
+            _ => anyhow::bail!("unknown task failure kind `{s}`"),
         }
     }
 }
