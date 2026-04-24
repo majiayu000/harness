@@ -29,3 +29,24 @@ export interface WorkflowSummary {
   force_execute?: boolean;
   plan_concern?: string | null;
 }
+
+export interface RoundItem {
+  kind: string;
+  content?: string | null;
+}
+
+export interface TaskRound {
+  items: RoundItem[];
+}
+
+export interface FullTask extends Task {
+  rounds: TaskRound[];
+  system_input?: string | null;
+  request_settings?: string | null;
+}
+
+export type StreamItem =
+  | { type: "MessageDelta"; text: string }
+  | { type: "Done" }
+  | { type: "Error"; message: string }
+  | { type: "TokenUsage"; usage: { input_tokens: number; output_tokens: number } };

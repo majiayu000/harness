@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, within, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Active } from "./Active";
 import type { Task } from "@/types";
@@ -8,6 +8,24 @@ import type { Task } from "@/types";
 vi.mock("@/lib/queries", () => ({
   useTasks: vi.fn(),
   useDashboard: vi.fn(),
+}));
+
+vi.mock("@/components/TaskDetailSlideover", () => ({
+  TaskDetailSlideover: ({
+    taskId,
+    onClose,
+  }: {
+    taskId: string | null;
+    onClose: () => void;
+  }) => {
+    if (!taskId) return null;
+    return (
+      <div data-testid="task-slideover" data-task-id={taskId}>
+        <div data-testid="slideover-scrim" onClick={onClose} />
+        <button onClick={onClose}>close-slideover</button>
+      </div>
+    );
+  },
 }));
 
 import { useTasks, useDashboard } from "@/lib/queries";
@@ -127,5 +145,30 @@ describe("<Active>", () => {
     expect(screen.getByText("planner-task")).toBeInTheDocument();
     expect(screen.getByText("review-task")).toBeInTheDocument();
     expect(screen.getByText("impl-task")).toBeInTheDocument();
+  });
+
+  it("clicking a TaskCard opens the slide-over with that task's id", () => {
+    mockUseTasks.mockReturnValue({ data: [makeTask("t1", "proj")], isLoading: false, isError: false });
+    wrap(<Active />);
+    fireEvent.click(screen.getByText("t1"));
+    expect(screen.getByTestId("task-slideover")).toHaveAttribute("data-task-id", "t1");
+  });
+
+  it("calling onClose from the slide-over hides it", () => {
+    mockUseTasks.mockReturnValue({ data: [makeTask("t1", "proj")], isLoading: false, isError: false });
+    wrap(<Active />);
+    fireEvent.click(screen.getByText("t1"));
+    expect(screen.getByTestId("task-slideover")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("close-slideover"));
+    expect(screen.queryByTestId("task-slideover")).not.toBeInTheDocument();
+  });
+
+  it("clicking the scrim overlay closes the slide-over", () => {
+    mockUseTasks.mockReturnValue({ data: [makeTask("t1", "proj")], isLoading: false, isError: false });
+    wrap(<Active />);
+    fireEvent.click(screen.getByText("t1"));
+    expect(screen.getByTestId("task-slideover")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("slideover-scrim"));
+    expect(screen.queryByTestId("task-slideover")).not.toBeInTheDocument();
   });
 });

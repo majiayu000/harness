@@ -1,6 +1,7 @@
+import { useEffect, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { apiJson } from "./api";
-import type { DashboardPayload, OperatorSnapshotPayload, OverviewPayload, Task } from "@/types";
+import { apiJson, apiFetch } from "./api";
+import type { DashboardPayload, FullTask, OperatorSnapshotPayload, OverviewPayload, StreamItem, Task } from "@/types";
 
 export function useDashboard() {
   return useQuery<DashboardPayload, Error>({
@@ -29,6 +30,67 @@ export function useTasks() {
     queryKey: ["tasks"],
     queryFn: ({ signal }) => apiJson<Task[]>("/tasks", { signal }),
   });
+}
+
+export function useTaskDetail(id: string | null) {
+  return useQuery<FullTask, Error>({
+    queryKey: ["task", id],
+    queryFn: ({ signal }) => apiJson<FullTask>(`/tasks/${id}`, { signal }),
+    enabled: !!id,
+  });
+}
+
+export function useTaskStream(id: string | null, onChunk: (text: string) => void): void {
+  const onChunkRef = useRef(onChunk);
+  useEffect(() => {
+    onChunkRef.current = onChunk;
+  });
+
+  useEffect(() => {
+    if (!id) return;
+    const controller = new AbortController();
+
+    (async () => {
+      try {
+        const resp = await apiFetch(`/tasks/${id}/stream`, {
+          signal: controller.signal,
+          headers: { Accept: "text/event-stream" },
+        });
+        if (!resp.body) return;
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const parts = buf.split("\n\n");
+          buf = parts.pop() ?? "";
+          for (const part of parts) {
+            const dataLine = part.split("\n").find((l) => l.startsWith("data: "));
+            if (!dataLine) continue;
+            try {
+              const item = JSON.parse(dataLine.slice(6)) as StreamItem;
+              if (item.type === "MessageDelta") {
+                onChunkRef.current(item.text);
+              } else if (item.type === "Done" || item.type === "Error") {
+                reader.cancel();
+                return;
+              }
+            } catch {
+              // malformed SSE line — skip
+            }
+          }
+        }
+      } catch {
+        // AbortError or network error — clean exit
+      }
+    })();
+
+    return () => controller.abort();
+  }, [id]);
 }
 
 export interface WorktreeCard {

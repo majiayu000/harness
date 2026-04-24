@@ -2,7 +2,7 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
-import { useWorktrees } from "./queries";
+import { useWorktrees, useTaskDetail, useTaskStream } from "./queries";
 import { TOKEN_KEY } from "./api";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -95,5 +95,87 @@ describe("stream URL construction", () => {
 
   it("omits token param when no session token", () => {
     expect(buildStreamUrl("abc-123")).not.toContain("token=");
+  });
+});
+
+// ── useTaskDetail ─────────────────────────────────────────────────────────────
+
+describe("useTaskDetail", () => {
+  it("fetches /tasks/{id} and returns FullTask shape", async () => {
+    const task = { id: "t1", status: "implementing", task_kind: "issue", rounds: [] };
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(task), { status: 200 }),
+    ) as unknown as typeof fetch;
+
+    const { result } = renderHook(() => useTaskDetail("t1"), { wrapper: makeWrapper() });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.data).toMatchObject({ id: "t1", status: "implementing" });
+  });
+
+  it("is disabled when id is null", () => {
+    global.fetch = vi.fn() as unknown as typeof fetch;
+    const { result } = renderHook(() => useTaskDetail(null), { wrapper: makeWrapper() });
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("exposes error when the server returns 404", async () => {
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response("not found", { status: 404 }),
+    ) as unknown as typeof fetch;
+
+    const { result } = renderHook(() => useTaskDetail("missing"), { wrapper: makeWrapper() });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error).toBeTruthy();
+  });
+});
+
+// ── useTaskStream ─────────────────────────────────────────────────────────────
+
+describe("useTaskStream", () => {
+  it("calls onChunk for each MessageDelta event", async () => {
+    const chunks: string[] = [];
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"MessageDelta","text":"hello "}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"MessageDelta","text":"world"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"Done"}\n\n'));
+        controller.close();
+      },
+    });
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(stream, { status: 200 }),
+    ) as unknown as typeof fetch;
+
+    renderHook(() => useTaskStream("t1", (text) => chunks.push(text)), {
+      wrapper: makeWrapper(),
+    });
+
+    await waitFor(() => expect(chunks.length).toBe(2));
+    expect(chunks).toEqual(["hello ", "world"]);
+  });
+
+  it("aborts the fetch when the hook cleans up", async () => {
+    const abortSpy = vi.fn();
+    const realAbortController = globalThis.AbortController;
+    globalThis.AbortController = class {
+      signal = { aborted: false } as AbortSignal;
+      abort = abortSpy;
+    } as unknown as typeof AbortController;
+
+    const stream = new ReadableStream({ start() {} });
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(stream, { status: 200 }),
+    ) as unknown as typeof fetch;
+
+    const { unmount } = renderHook(() => useTaskStream("t1", vi.fn()), {
+      wrapper: makeWrapper(),
+    });
+
+    unmount();
+    expect(abortSpy).toHaveBeenCalled();
+
+    globalThis.AbortController = realAbortController;
   });
 });
