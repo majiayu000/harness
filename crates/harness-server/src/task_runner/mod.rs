@@ -23,7 +23,10 @@ pub use spawn::{
     check_awaiting_deps, effective_turn_timeout, prompt_requires_plan, register_pending_task,
     resolve_canonical_project, spawn_preregistered_task, spawn_task, spawn_task_awaiting_deps,
 };
-pub use state::{active_agent_phase, task_agent_active, RecentFailureTask, RoundResult, TaskState, TaskSummary, TaskSummaryView, TaskView};
+pub use state::{
+    active_agent_phase, task_agent_active, RecentFailureTask, RoundResult, TaskState, TaskSummary,
+    TaskSummaryView, TaskView,
+};
 pub use store::{mutate_and_persist, update_status, TaskStore};
 pub use types::{TaskId, TaskKind, TaskPhase, TaskStatus};
 

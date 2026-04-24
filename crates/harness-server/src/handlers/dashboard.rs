@@ -460,6 +460,8 @@ mod tests {
                 depends_on: Vec::new(),
                 subtask_ids: Vec::new(),
                 project: Some(project.clone()),
+                task_kind: crate::task_runner::TaskKind::default(),
+                workflow: None,
             }
             .view(Some("2026-04-22T00:00:00Z".to_string())),
             crate::task_runner::TaskSummary {
@@ -478,6 +480,8 @@ mod tests {
                 depends_on: Vec::new(),
                 subtask_ids: Vec::new(),
                 project: Some(project.clone()),
+                task_kind: crate::task_runner::TaskKind::default(),
+                workflow: None,
             }
             .view(Some("2026-04-22T00:01:00Z".to_string())),
             crate::task_runner::TaskSummary {
@@ -496,6 +500,8 @@ mod tests {
                 depends_on: Vec::new(),
                 subtask_ids: Vec::new(),
                 project: Some(project.clone()),
+                task_kind: crate::task_runner::TaskKind::default(),
+                workflow: None,
             }
             .view(Some("2026-04-22T00:02:00Z".to_string())),
             crate::task_runner::TaskSummary {
@@ -514,6 +520,8 @@ mod tests {
                 depends_on: Vec::new(),
                 subtask_ids: Vec::new(),
                 project: Some(project.clone()),
+                task_kind: crate::task_runner::TaskKind::default(),
+                workflow: None,
             }
             .view(Some("2026-04-22T00:03:00Z".to_string())),
         ];
