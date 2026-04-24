@@ -32,8 +32,8 @@ impl TaskDb {
             "INSERT INTO tasks (id, task_kind, status, failure_kind, turn, pr_url, rounds, error, source, \
              external_id, parent_id, created_at, repo, depends_on, project, workspace_path, \
              workspace_owner, run_generation, priority, phase, description, request_settings, system_input) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-                     COALESCE($11, CURRENT_TIMESTAMP), $12, $13, $14, $15, $16, $17, $18, \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                     COALESCE($12, CURRENT_TIMESTAMP), $13, $14, $15, $16, $17, $18, \
                      $19, $20, $21, $22, $23)",
         )
         .bind(&state.id.0)
