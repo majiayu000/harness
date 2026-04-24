@@ -1377,6 +1377,7 @@ mod tests {
         task_runner::TaskState {
             id: task_runner::TaskId::new(),
             status: task_runner::TaskStatus::Pending,
+            task_kind: task_runner::TaskKind::default(),
             turn: 0,
             pr_url: None,
             rounds: vec![],

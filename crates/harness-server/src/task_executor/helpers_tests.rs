@@ -193,6 +193,7 @@ fn task_with_prompt_settings(
     crate::task_runner::TaskState {
         id: crate::task_runner::TaskId::new(),
         status: crate::task_runner::TaskStatus::Pending,
+        task_kind: crate::task_runner::TaskKind::default(),
         turn: 0,
         pr_url: None,
         rounds: vec![],
