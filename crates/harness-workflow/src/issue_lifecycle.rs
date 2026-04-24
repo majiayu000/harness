@@ -6,6 +6,7 @@ use harness_core::db::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPool;
+use sqlx::Postgres;
 use std::path::Path;
 
 const ISSUE_WORKFLOW_SCHEMA_VERSION: u32 = 1;
@@ -32,6 +33,13 @@ static ISSUE_WORKFLOW_MIGRATIONS: &[Migration] = &[
         description: "index issue workflow lookups by project and pr",
         sql: "CREATE INDEX IF NOT EXISTS idx_issue_workflows_pr
               ON issue_workflows ((data::jsonb->>'project_id'), ((data::jsonb->>'pr_number')::bigint))",
+    },
+    Migration {
+        version: 4,
+        description: "index issue workflow feedback sweep candidates",
+        sql: "CREATE INDEX IF NOT EXISTS idx_issue_workflows_feedback_candidates
+              ON issue_workflows (((data::jsonb->>'state')), updated_at DESC)
+              WHERE data::jsonb->>'pr_number' IS NOT NULL",
     },
 ];
 
@@ -133,6 +141,8 @@ pub struct IssueWorkflowInstance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_concern: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback_claimed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event: Option<IssueLifecycleEvent>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -156,6 +166,7 @@ impl IssueWorkflowInstance {
             labels_snapshot: Vec::new(),
             force_execute: false,
             plan_concern: None,
+            feedback_claimed_at: None,
             last_event: None,
             created_at: now,
             updated_at: now,
@@ -187,6 +198,7 @@ impl IssueWorkflowInstance {
             | IssueLifecycleEventKind::FeedbackFound => {
                 self.state = IssueLifecycleState::AddressingFeedback;
                 self.active_task_id = event.task_id.clone();
+                self.feedback_claimed_at = Some(Utc::now());
                 if event.pr_number.is_some() {
                     self.pr_number = event.pr_number;
                 }
@@ -197,18 +209,24 @@ impl IssueWorkflowInstance {
             IssueLifecycleEventKind::FeedbackSweepCompleted
             | IssueLifecycleEventKind::NoFeedbackFound => {
                 self.state = IssueLifecycleState::AwaitingFeedback;
+                self.active_task_id = None;
+                self.feedback_claimed_at = None;
             }
             IssueLifecycleEventKind::Mergeable => {
                 self.state = IssueLifecycleState::ReadyToMerge;
+                self.feedback_claimed_at = None;
             }
             IssueLifecycleEventKind::WorkflowFailed => {
                 self.state = IssueLifecycleState::Failed;
+                self.feedback_claimed_at = None;
             }
             IssueLifecycleEventKind::WorkflowCancelled => {
                 self.state = IssueLifecycleState::Cancelled;
+                self.feedback_claimed_at = None;
             }
             IssueLifecycleEventKind::WorkflowDone => {
                 self.state = IssueLifecycleState::Done;
+                self.feedback_claimed_at = None;
             }
         }
         self.last_event = Some(event);
@@ -227,9 +245,18 @@ pub fn workflow_id(project_id: &str, repo: Option<&str>, issue_number: u64) -> S
     )
 }
 
+pub fn legacy_schema_for_path(path: &Path) -> anyhow::Result<String> {
+    let path_utf8 = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
+    let digest = Sha256::digest(path_utf8.as_bytes());
+    let mut schema_bytes = [0u8; 8];
+    schema_bytes.copy_from_slice(&digest[..8]);
+    Ok(format!("h{:016x}", u64::from_le_bytes(schema_bytes)))
+}
+
 pub struct IssueWorkflowStore {
     pool: PgPool,
-    update_lock: tokio::sync::Mutex<()>,
 }
 
 impl IssueWorkflowStore {
@@ -242,13 +269,7 @@ impl IssueWorkflowStore {
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
         let database_url = resolve_database_url(configured_database_url)?;
-        let path_utf8 = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
-        let digest = Sha256::digest(path_utf8.as_bytes());
-        let mut schema_bytes = [0u8; 8];
-        schema_bytes.copy_from_slice(&digest[..8]);
-        let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
+        let schema = legacy_schema_for_path(path)?;
 
         let setup = pg_open_pool(&database_url).await?;
         pg_create_schema_if_not_exists(&setup, &schema).await?;
@@ -258,10 +279,23 @@ impl IssueWorkflowStore {
         PgMigrator::new(&pool, ISSUE_WORKFLOW_MIGRATIONS)
             .run()
             .await?;
-        Ok(Self {
-            pool,
-            update_lock: tokio::sync::Mutex::new(()),
-        })
+        Ok(Self { pool })
+    }
+
+    pub async fn open_with_database_url_and_schema(
+        configured_database_url: Option<&str>,
+        schema: &str,
+    ) -> anyhow::Result<Self> {
+        let database_url = resolve_database_url(configured_database_url)?;
+        let setup = pg_open_pool(&database_url).await?;
+        pg_create_schema_if_not_exists(&setup, schema).await?;
+        setup.close().await;
+
+        let pool = pg_open_pool_schematized(&database_url, schema).await?;
+        PgMigrator::new(&pool, ISSUE_WORKFLOW_MIGRATIONS)
+            .run()
+            .await?;
+        Ok(Self { pool })
     }
 
     pub async fn upsert(&self, workflow: &IssueWorkflowInstance) -> anyhow::Result<()> {
@@ -354,6 +388,23 @@ impl IssueWorkflowStore {
         row.map(|(data,)| serde_json::from_str(&data))
             .transpose()
             .map_err(Into::into)
+    }
+
+    pub async fn list(&self) -> anyhow::Result<Vec<IssueWorkflowInstance>> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT data FROM issue_workflows ORDER BY updated_at DESC")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
+    }
+
+    pub async fn row_count(&self) -> anyhow::Result<i64> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM issue_workflows")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
     }
 
     pub async fn record_issue_scheduled(
@@ -509,6 +560,76 @@ impl IssueWorkflowStore {
             .collect()
     }
 
+    pub async fn claim_feedback_candidates(
+        &self,
+        limit: i64,
+        stale_before: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<IssueWorkflowInstance>> {
+        let mut tx = self.pool.begin().await?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, data FROM issue_workflows
+             WHERE data::jsonb->>'pr_number' IS NOT NULL
+               AND (
+                    data::jsonb->>'state' IN ('pr_open', 'awaiting_feedback')
+                    OR (
+                        data::jsonb->>'state' = 'addressing_feedback'
+                        AND updated_at <= $2
+                    )
+               )
+             ORDER BY updated_at DESC
+             LIMIT $1
+             FOR UPDATE SKIP LOCKED",
+        )
+        .bind(limit)
+        .bind(stale_before)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut claimed = Vec::with_capacity(rows.len());
+        for (workflow_id, data) in rows {
+            let mut workflow: IssueWorkflowInstance = match serde_json::from_str(&data) {
+                Ok(workflow) => workflow,
+                Err(e) => {
+                    tracing::warn!(
+                        workflow_id = %workflow_id,
+                        "workflow feedback sweep: skipping malformed workflow row while claiming candidates: {e}"
+                    );
+                    continue;
+                }
+            };
+            let claim_id = format!("claim:{}", workflow.id);
+            if let Some(pr_number) = workflow.pr_number {
+                let pr_url = workflow.pr_url.clone().unwrap_or_default();
+                workflow.apply_event(
+                    IssueLifecycleEvent::new(IssueLifecycleEventKind::FeedbackTaskScheduled)
+                        .with_task_id(claim_id)
+                        .with_pr(pr_number, pr_url),
+                );
+                self.upsert_in_tx(&mut tx, &workflow).await?;
+                debug_assert_eq!(workflow.id, workflow_id);
+                claimed.push(workflow);
+            }
+        }
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    pub async fn release_feedback_claim(
+        &self,
+        project_id: &str,
+        repo: Option<&str>,
+        pr_number: u64,
+        detail: &str,
+    ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
+        self.update_by_pr(project_id, repo, pr_number, |workflow| {
+            workflow.apply_event(
+                IssueLifecycleEvent::new(IssueLifecycleEventKind::NoFeedbackFound)
+                    .with_detail(detail.to_string()),
+            );
+        })
+        .await
+    }
+
     async fn update_issue<F>(
         &self,
         project_id: &str,
@@ -519,22 +640,25 @@ impl IssueWorkflowStore {
     where
         F: FnOnce(&mut IssueWorkflowInstance),
     {
-        let _guard = self.update_lock.lock().await;
+        let workflow_id = workflow_id(project_id, repo, issue_number);
+        let placeholder = IssueWorkflowInstance::new(
+            project_id.to_string(),
+            repo.map(|r| r.to_string()),
+            issue_number,
+        );
+        let mut tx = self.pool.begin().await?;
+        self.insert_placeholder(&mut tx, &workflow_id, &placeholder)
+            .await?;
         let mut workflow = self
-            .get_by_issue(project_id, repo, issue_number)
+            .load_for_update_by_id(&mut tx, &workflow_id)
             .await?
-            .unwrap_or_else(|| {
-                IssueWorkflowInstance::new(
-                    project_id.to_string(),
-                    repo.map(|r| r.to_string()),
-                    issue_number,
-                )
-            });
+            .ok_or_else(|| anyhow::anyhow!("workflow row disappeared after placeholder insert"))?;
         if workflow.repo.is_none() {
             workflow.repo = repo.map(|r| r.to_string());
         }
         f(&mut workflow);
-        self.upsert(&workflow).await?;
+        self.upsert_in_tx(&mut tx, &workflow).await?;
+        tx.commit().await?;
         Ok(workflow)
     }
 
@@ -548,12 +672,14 @@ impl IssueWorkflowStore {
     where
         F: FnOnce(&mut IssueWorkflowInstance),
     {
-        let _guard = self.update_lock.lock().await;
-        let Some(mut workflow) = self.get_by_issue(project_id, repo, issue_number).await? else {
+        let mut tx = self.pool.begin().await?;
+        let workflow_id = workflow_id(project_id, repo, issue_number);
+        let Some(mut workflow) = self.load_for_update_by_id(&mut tx, &workflow_id).await? else {
             return Ok(None);
         };
         f(&mut workflow);
-        self.upsert(&workflow).await?;
+        self.upsert_in_tx(&mut tx, &workflow).await?;
+        tx.commit().await?;
         Ok(Some(workflow))
     }
 
@@ -567,13 +693,115 @@ impl IssueWorkflowStore {
     where
         F: FnOnce(&mut IssueWorkflowInstance),
     {
-        let _guard = self.update_lock.lock().await;
-        let Some(mut workflow) = self.get_by_pr(project_id, repo, pr_number).await? else {
+        let mut tx = self.pool.begin().await?;
+        let Some((workflow_id, mut workflow)) = self
+            .load_for_update_by_pr(&mut tx, project_id, repo, pr_number)
+            .await?
+        else {
             return Ok(None);
         };
         f(&mut workflow);
-        self.upsert(&workflow).await?;
+        self.upsert_in_tx(&mut tx, &workflow).await?;
+        debug_assert_eq!(workflow.id, workflow_id);
+        tx.commit().await?;
         Ok(Some(workflow))
+    }
+
+    async fn insert_placeholder(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        workflow_id: &str,
+        workflow: &IssueWorkflowInstance,
+    ) -> anyhow::Result<()> {
+        let data = serde_json::to_string(workflow)?;
+        sqlx::query(
+            "INSERT INTO issue_workflows (id, data) VALUES ($1, $2)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(workflow_id)
+        .bind(&data)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn load_for_update_by_id(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        workflow_id: &str,
+    ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data FROM issue_workflows WHERE id = $1 FOR UPDATE")
+                .bind(workflow_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        row.map(|(data,)| serde_json::from_str(&data))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    async fn load_for_update_by_pr(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        project_id: &str,
+        repo: Option<&str>,
+        pr_number: u64,
+    ) -> anyhow::Result<Option<(String, IssueWorkflowInstance)>> {
+        let row: Option<(String, String)> = if let Some(repo) = repo {
+            sqlx::query_as(
+                "SELECT id, data FROM issue_workflows
+                 WHERE data::jsonb->>'project_id' = $1
+                   AND data::jsonb->>'repo' = $2
+                   AND (data::jsonb->>'pr_number')::bigint = $3
+                 ORDER BY updated_at DESC
+                 LIMIT 1
+                 FOR UPDATE",
+            )
+            .bind(project_id)
+            .bind(repo)
+            .bind(pr_number as i64)
+            .fetch_optional(&mut **tx)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, data FROM issue_workflows
+                 WHERE data::jsonb->>'project_id' = $1
+                   AND data::jsonb->>'repo' IS NULL
+                   AND (data::jsonb->>'pr_number')::bigint = $2
+                 ORDER BY updated_at DESC
+                 LIMIT 1
+                 FOR UPDATE",
+            )
+            .bind(project_id)
+            .bind(pr_number as i64)
+            .fetch_optional(&mut **tx)
+            .await?
+        };
+        match row {
+            Some((id, data)) => {
+                let workflow = serde_json::from_str(&data)?;
+                Ok(Some((id, workflow)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        workflow: &IssueWorkflowInstance,
+    ) -> anyhow::Result<()> {
+        let data = serde_json::to_string(workflow)?;
+        sqlx::query(
+            "UPDATE issue_workflows
+             SET data = $1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $2",
+        )
+        .bind(&data)
+        .bind(&workflow.id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 }
 
@@ -720,6 +948,89 @@ mod tests {
             .await?
             .expect("workflow");
         assert_eq!(workflow.state, IssueLifecycleState::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_feedback_candidates_reclaims_stale_claims() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let project_id = "/tmp/project-stale-claim";
+        store
+            .record_issue_scheduled(project_id, Some("owner/repo"), 9, "task-1", &[], false)
+            .await?;
+        store
+            .record_pr_detected(
+                project_id,
+                Some("owner/repo"),
+                9,
+                "task-1",
+                77,
+                "https://github.com/owner/repo/pull/77",
+            )
+            .await?;
+        store
+            .record_feedback_task_scheduled(project_id, Some("owner/repo"), 77, "task-2")
+            .await?;
+
+        let mut workflow = store
+            .get_by_pr(project_id, Some("owner/repo"), 77)
+            .await?
+            .expect("workflow");
+        workflow.feedback_claimed_at = Some(Utc::now() - chrono::Duration::minutes(10));
+        store.upsert(&workflow).await?;
+        sqlx::query(
+            "UPDATE issue_workflows
+             SET updated_at = CURRENT_TIMESTAMP - INTERVAL '10 minutes'
+             WHERE id = $1",
+        )
+        .bind(&workflow.id)
+        .execute(&store.pool)
+        .await?;
+
+        let claimed = store
+            .claim_feedback_candidates(16, Utc::now() - chrono::Duration::minutes(5))
+            .await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].pr_number, Some(77));
+        assert_eq!(claimed[0].state, IssueLifecycleState::AddressingFeedback);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_feedback_candidates_skips_malformed_rows() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let project_id = "/tmp/project-malformed";
+        store
+            .record_issue_scheduled(project_id, Some("owner/repo"), 10, "task-1", &[], false)
+            .await?;
+        store
+            .record_pr_detected(
+                project_id,
+                Some("owner/repo"),
+                10,
+                "task-1",
+                88,
+                "https://github.com/owner/repo/pull/88",
+            )
+            .await?;
+        sqlx::query(
+            "INSERT INTO issue_workflows (id, data) VALUES ($1, $2)
+             ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+        )
+        .bind("malformed-workflow")
+        .bind(r#"{"project_id":"/tmp/project-malformed","repo":"owner/repo","state":"pr_open","pr_number":999}"#)
+        .execute(&store.pool)
+        .await?;
+
+        let claimed = store
+            .claim_feedback_candidates(16, Utc::now() - chrono::Duration::minutes(5))
+            .await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].pr_number, Some(88));
         Ok(())
     }
 }

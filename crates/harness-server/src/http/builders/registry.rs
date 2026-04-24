@@ -29,6 +29,9 @@ pub(crate) async fn build_registry(
     tasks: &Arc<crate::task_runner::TaskStore>,
 ) -> anyhow::Result<RegistryBundle> {
     let configured_database_url = server.config.server.database_url.as_deref();
+    let workflow_config =
+        harness_core::config::workflow::load_workflow_config(project_root).unwrap_or_default();
+    let workflow_ns = workflow_config.storage.schema_namespace;
     // ── Thread DB ─────────────────────────────────────────────────────────────
     let thread_db_path = harness_core::config::dirs::default_db_path(data_dir, "threads");
     let thread_db = crate::thread_db::ThreadDb::open_with_database_url(
@@ -78,19 +81,35 @@ pub(crate) async fn build_registry(
     }
 
     // ── Issue workflow store ──────────────────────────────────────────────────
+    let issue_workflows_db_path =
+        harness_core::config::dirs::default_db_path(data_dir, "issue_workflows");
     let issue_workflow_store = {
-        let issue_workflows_db_path =
-            harness_core::config::dirs::default_db_path(data_dir, "issue_workflows");
-        match harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url(
-            &issue_workflows_db_path,
+        let schema = format!("{workflow_ns}_issue");
+        match harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url_and_schema(
             configured_database_url,
+            &schema,
         )
         .await
         {
-            Ok(store) => Some(Arc::new(store)),
+            Ok(store) => {
+                if let Err(e) = migrate_issue_workflows_if_needed(
+                    configured_database_url,
+                    &issue_workflows_db_path,
+                    &schema,
+                    &store,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        schema = %schema,
+                        "issue workflow migration check failed: {e}"
+                    );
+                }
+                Some(Arc::new(store))
+            }
             Err(e) => {
                 tracing::warn!(
-                    path = %issue_workflows_db_path.display(),
+                    schema = %schema,
                     "issue workflow store init failed, issue lifecycle state will not persist: {e}"
                 );
                 None
@@ -99,19 +118,35 @@ pub(crate) async fn build_registry(
     };
 
     // ── Project workflow store ────────────────────────────────────────────────
+    let project_workflows_db_path =
+        harness_core::config::dirs::default_db_path(data_dir, "project_workflows");
     let project_workflow_store = {
-        let project_workflows_db_path =
-            harness_core::config::dirs::default_db_path(data_dir, "project_workflows");
-        match harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url(
-            &project_workflows_db_path,
+        let schema = format!("{workflow_ns}_project");
+        match harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url_and_schema(
             configured_database_url,
+            &schema,
         )
         .await
         {
-            Ok(store) => Some(Arc::new(store)),
+            Ok(store) => {
+                if let Err(e) = migrate_project_workflows_if_needed(
+                    configured_database_url,
+                    &project_workflows_db_path,
+                    &schema,
+                    &store,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        schema = %schema,
+                        "project workflow migration check failed: {e}"
+                    );
+                }
+                Some(Arc::new(store))
+            }
             Err(e) => {
                 tracing::warn!(
-                    path = %project_workflows_db_path.display(),
+                    schema = %schema,
                     "project workflow store init failed, project lifecycle state will not persist: {e}"
                 );
                 None
@@ -257,6 +292,74 @@ pub(crate) async fn build_registry(
         runtime_state_store,
         workspace_mgr,
     })
+}
+
+async fn migrate_issue_workflows_if_needed(
+    configured_database_url: Option<&str>,
+    legacy_path: &Path,
+    target_schema: &str,
+    target_store: &harness_workflow::issue_lifecycle::IssueWorkflowStore,
+) -> anyhow::Result<()> {
+    let legacy_schema = harness_workflow::issue_lifecycle::legacy_schema_for_path(legacy_path)?;
+    if legacy_schema == target_schema || target_store.row_count().await? > 0 {
+        return Ok(());
+    }
+
+    let legacy_store =
+        harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url(
+            legacy_path,
+            configured_database_url,
+        )
+        .await?;
+    let legacy_rows = legacy_store.list().await?;
+    if legacy_rows.is_empty() {
+        return Ok(());
+    }
+
+    for workflow in &legacy_rows {
+        target_store.upsert(workflow).await?;
+    }
+    tracing::info!(
+        count = legacy_rows.len(),
+        legacy_schema = %legacy_schema,
+        target_schema = %target_schema,
+        "workflow migration: copied legacy issue workflow rows into namespaced schema"
+    );
+    Ok(())
+}
+
+async fn migrate_project_workflows_if_needed(
+    configured_database_url: Option<&str>,
+    legacy_path: &Path,
+    target_schema: &str,
+    target_store: &harness_workflow::project_lifecycle::ProjectWorkflowStore,
+) -> anyhow::Result<()> {
+    let legacy_schema = harness_workflow::project_lifecycle::legacy_schema_for_path(legacy_path)?;
+    if legacy_schema == target_schema || target_store.row_count().await? > 0 {
+        return Ok(());
+    }
+
+    let legacy_store =
+        harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url(
+            legacy_path,
+            configured_database_url,
+        )
+        .await?;
+    let legacy_rows = legacy_store.list().await?;
+    if legacy_rows.is_empty() {
+        return Ok(());
+    }
+
+    for workflow in &legacy_rows {
+        target_store.upsert(workflow).await?;
+    }
+    tracing::info!(
+        count = legacy_rows.len(),
+        legacy_schema = %legacy_schema,
+        target_schema = %target_schema,
+        "workflow migration: copied legacy project workflow rows into namespaced schema"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

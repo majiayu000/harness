@@ -629,16 +629,42 @@ pub(crate) async fn intake_status(State(state): State<Arc<AppState>>) -> Json<se
     let intake_config = &state.core.server.config.intake;
     let all_tasks = state.core.tasks.list_all();
 
-    let github_active: u64 = all_tasks
-        .iter()
-        .filter(|t| {
-            t.source.as_deref() == Some("github")
-                && !matches!(
-                    t.status,
-                    task_runner::TaskStatus::Done | task_runner::TaskStatus::Failed
-                )
-        })
-        .count() as u64;
+    let github_active: u64 = if let Some(store) = state.core.issue_workflow_store.as_ref() {
+        match store.list().await {
+            Ok(workflows) => workflows
+                .into_iter()
+                .filter(|workflow| {
+                    !matches!(
+                        workflow.state,
+                        harness_workflow::issue_lifecycle::IssueLifecycleState::Done
+                            | harness_workflow::issue_lifecycle::IssueLifecycleState::Failed
+                            | harness_workflow::issue_lifecycle::IssueLifecycleState::Cancelled
+                    )
+                })
+                .count() as u64,
+            Err(_) => all_tasks
+                .iter()
+                .filter(|t| {
+                    t.source.as_deref() == Some("github")
+                        && !matches!(
+                            t.status,
+                            task_runner::TaskStatus::Done | task_runner::TaskStatus::Failed
+                        )
+                })
+                .count() as u64,
+        }
+    } else {
+        all_tasks
+            .iter()
+            .filter(|t| {
+                t.source.as_deref() == Some("github")
+                    && !matches!(
+                        t.status,
+                        task_runner::TaskStatus::Done | task_runner::TaskStatus::Failed
+                    )
+            })
+            .count() as u64
+    };
 
     let feishu_active: u64 = all_tasks
         .iter()

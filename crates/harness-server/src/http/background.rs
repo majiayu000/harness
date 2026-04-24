@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use super::{state::AppState, task_routes};
 use crate::task_runner;
+use harness_workflow::issue_lifecycle::{IssueLifecycleState, IssueWorkflowInstance};
 
 fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
     task.external_id
@@ -313,10 +314,15 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                 continue;
             };
 
-            let candidates = match issue_workflows.list_feedback_candidates().await {
+            let stale_before = chrono::Utc::now()
+                - chrono::Duration::seconds(workflow_cfg.pr_feedback.claim_stale_after_secs as i64);
+            let candidates = match issue_workflows
+                .claim_feedback_candidates(128, stale_before)
+                .await
+            {
                 Ok(candidates) => candidates,
                 Err(e) => {
-                    tracing::warn!("workflow feedback sweep: failed to list candidates: {e}");
+                    tracing::warn!("workflow feedback sweep: failed to claim candidates: {e}");
                     continue;
                 }
             };
@@ -369,6 +375,16 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                         retry_after_secs,
                     }) => {
                         incomplete_projects.insert(project_key.clone());
+                        let _ = issue_workflows
+                            .release_feedback_claim(
+                                &workflow.project_id,
+                                workflow.repo.as_deref(),
+                                pr_number,
+                                &format!(
+                                    "feedback sweep deferred by maintenance window; retry after {retry_after_secs}s"
+                                ),
+                            )
+                            .await;
                         if let Some(project_store) = state.core.project_workflow_store.as_ref() {
                             let _ = project_store
                                 .record_paused(
@@ -383,6 +399,14 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                     }
                     Err(e) => {
                         incomplete_projects.insert(project_key.clone());
+                        let _ = issue_workflows
+                            .release_feedback_claim(
+                                &workflow.project_id,
+                                workflow.repo.as_deref(),
+                                pr_number,
+                                &format!("feedback sweep enqueue failed: {e}"),
+                            )
+                            .await;
                         tracing::warn!(
                             project_id = %workflow.project_id,
                             pr = pr_number,
@@ -431,18 +455,15 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
 /// acquisition never blocks serve() — if more tasks exist than available
 /// concurrency slots, the background futures will simply wait in queue.
 pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
-    let recovered: Vec<_> = state
-        .core
-        .tasks
-        .list_all()
-        .into_iter()
-        .filter(|t| matches!(t.status, task_runner::TaskStatus::Pending) && t.pr_url.is_some())
-        .collect();
-    if !recovered.is_empty() {
-        tracing::info!(
-            count = recovered.len(),
-            "startup: re-dispatching recovered pending task(s) with PRs"
-        );
+    let state = state.clone();
+    tokio::spawn(async move {
+        let recovered = collect_pr_recovery_tasks(&state).await;
+        if !recovered.is_empty() {
+            tracing::info!(
+                count = recovered.len(),
+                "startup: re-dispatching recovered pending task(s) with PRs"
+            );
+        }
         for task in recovered {
             let state = state.clone();
             tokio::spawn(async move {
@@ -644,7 +665,66 @@ pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
                 .await;
             });
         }
+    });
+}
+
+fn workflow_state_needs_pr_recovery(state: IssueLifecycleState) -> bool {
+    matches!(state, IssueLifecycleState::AddressingFeedback)
+}
+
+fn task_is_pr_recovery_candidate(task: &task_runner::TaskState) -> bool {
+    matches!(task.status, task_runner::TaskStatus::Pending) && task.pr_url.is_some()
+}
+
+fn workflow_recovery_task_ids(
+    workflows: &[IssueWorkflowInstance],
+) -> std::collections::HashSet<task_runner::TaskId> {
+    workflows
+        .iter()
+        .filter(|workflow| workflow_state_needs_pr_recovery(workflow.state))
+        .filter_map(|workflow| {
+            workflow
+                .active_task_id
+                .as_deref()
+                .map(|task_id| harness_core::types::TaskId(task_id.to_string()))
+        })
+        .collect()
+}
+
+async fn collect_pr_recovery_tasks(state: &Arc<AppState>) -> Vec<task_runner::TaskState> {
+    let tasks = state.core.tasks.list_all();
+    let mut recovered = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    if let Some(workflows) = state.core.issue_workflow_store.as_ref() {
+        match workflows.list().await {
+            Ok(workflows) => {
+                let workflow_task_ids = workflow_recovery_task_ids(&workflows);
+                for task in &tasks {
+                    if workflow_task_ids.contains(&task.id) && task_is_pr_recovery_candidate(task) {
+                        seen.insert(task.id.clone());
+                        recovered.push(task.clone());
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "startup: failed to list issue workflows for PR recovery, falling back to task-only recovery: {e}"
+                );
+            }
+        }
     }
+
+    for task in tasks {
+        if seen.contains(&task.id) {
+            continue;
+        }
+        if task_is_pr_recovery_candidate(&task) {
+            recovered.push(task);
+        }
+    }
+
+    recovered
 }
 
 /// Re-dispatch review/planner tasks that were recovered into their kind-specific
@@ -1049,5 +1129,56 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                 .await;
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workflow_recovery_task_ids_only_uses_active_addressing_feedback_rows() {
+        let mut addressing = IssueWorkflowInstance::new(
+            "/tmp/project".to_string(),
+            Some("owner/repo".to_string()),
+            1,
+        );
+        addressing.state = IssueLifecycleState::AddressingFeedback;
+        addressing.active_task_id = Some("task-1".to_string());
+
+        let mut waiting = IssueWorkflowInstance::new(
+            "/tmp/project".to_string(),
+            Some("owner/repo".to_string()),
+            2,
+        );
+        waiting.state = IssueLifecycleState::AwaitingFeedback;
+        waiting.active_task_id = Some("task-2".to_string());
+
+        let mut no_task = IssueWorkflowInstance::new(
+            "/tmp/project".to_string(),
+            Some("owner/repo".to_string()),
+            3,
+        );
+        no_task.state = IssueLifecycleState::AddressingFeedback;
+
+        let ids = workflow_recovery_task_ids(&[addressing, waiting, no_task]);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&harness_core::types::TaskId("task-1".to_string())));
+    }
+
+    #[test]
+    fn task_is_pr_recovery_candidate_requires_pending_with_pr_url() {
+        let mut pending_with_pr = task_runner::TaskState::new(task_runner::TaskId::new());
+        pending_with_pr.status = task_runner::TaskStatus::Pending;
+        pending_with_pr.pr_url = Some("https://github.com/owner/repo/pull/1".to_string());
+        assert!(task_is_pr_recovery_candidate(&pending_with_pr));
+
+        let mut waiting_with_pr = pending_with_pr.clone();
+        waiting_with_pr.status = task_runner::TaskStatus::Waiting;
+        assert!(!task_is_pr_recovery_candidate(&waiting_with_pr));
+
+        let mut pending_without_pr = pending_with_pr;
+        pending_without_pr.pr_url = None;
+        assert!(!task_is_pr_recovery_candidate(&pending_without_pr));
     }
 }

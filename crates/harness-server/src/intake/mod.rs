@@ -871,6 +871,27 @@ async fn run_repo_sprint(
         let mut newly_done = Vec::new();
         let mut cancelled = Vec::new();
         for (&issue_num, task_id) in &running {
+            if let Some(outcome) = workflow_sprint_issue_outcome(
+                state.core.issue_workflow_store.as_deref(),
+                &project_id,
+                repo,
+                issue_num,
+            )
+            .await
+            {
+                tracing::info!(
+                    repo,
+                    external_id = issue_num,
+                    task_id = %task_id,
+                    workflow_outcome = outcome.as_str(),
+                    "intake: workflow state resolved running issue outcome"
+                );
+                match outcome {
+                    SprintIssueOutcome::UnblocksDependents => newly_done.push(issue_num),
+                    SprintIssueOutcome::Cancelled => cancelled.push(issue_num),
+                }
+                continue;
+            }
             if let Some(task) = state.core.tasks.get(task_id) {
                 if task.status.is_terminal() {
                     tracing::info!(
@@ -978,6 +999,63 @@ fn build_issue_summary(issues: &[(Arc<dyn IntakeSource>, IncomingIssue)]) -> Str
 
 fn status_unblocks_dependents(status: &TaskStatus) -> bool {
     matches!(status, TaskStatus::Done | TaskStatus::Failed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SprintIssueOutcome {
+    UnblocksDependents,
+    Cancelled,
+}
+
+impl SprintIssueOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UnblocksDependents => "unblocks_dependents",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+fn workflow_state_unblocks_dependents(
+    state: harness_workflow::issue_lifecycle::IssueLifecycleState,
+) -> bool {
+    matches!(
+        state,
+        harness_workflow::issue_lifecycle::IssueLifecycleState::ReadyToMerge
+            | harness_workflow::issue_lifecycle::IssueLifecycleState::Done
+            | harness_workflow::issue_lifecycle::IssueLifecycleState::Failed
+    )
+}
+
+async fn workflow_sprint_issue_outcome(
+    store: Option<&harness_workflow::issue_lifecycle::IssueWorkflowStore>,
+    project_id: &str,
+    repo: &str,
+    issue_num: u64,
+) -> Option<SprintIssueOutcome> {
+    let store = store?;
+    let workflow = match store.get_by_issue(project_id, Some(repo), issue_num).await {
+        Ok(workflow) => workflow,
+        Err(e) => {
+            tracing::warn!(
+                repo,
+                issue = issue_num,
+                "intake: failed to load workflow state for running issue: {e}"
+            );
+            return None;
+        }
+    }?;
+
+    if workflow_state_unblocks_dependents(workflow.state) {
+        Some(SprintIssueOutcome::UnblocksDependents)
+    } else if matches!(
+        workflow.state,
+        harness_workflow::issue_lifecycle::IssueLifecycleState::Cancelled
+    ) {
+        Some(SprintIssueOutcome::Cancelled)
+    } else {
+        None
+    }
 }
 
 /// Poll a task until terminal state, return its output.
@@ -1466,6 +1544,36 @@ mod tests {
         ]));
 
         assert_eq!(completed, make_issues(&[43]));
+    }
+
+    #[test]
+    fn workflow_ready_to_merge_and_terminals_unblock_dependents() {
+        use harness_workflow::issue_lifecycle::IssueLifecycleState;
+
+        assert!(workflow_state_unblocks_dependents(
+            IssueLifecycleState::ReadyToMerge
+        ));
+        assert!(workflow_state_unblocks_dependents(
+            IssueLifecycleState::Done
+        ));
+        assert!(workflow_state_unblocks_dependents(
+            IssueLifecycleState::Failed
+        ));
+        assert!(!workflow_state_unblocks_dependents(
+            IssueLifecycleState::Cancelled
+        ));
+        assert!(!workflow_state_unblocks_dependents(
+            IssueLifecycleState::AddressingFeedback
+        ));
+    }
+
+    #[test]
+    fn sprint_issue_outcome_labels_are_stable() {
+        assert_eq!(
+            SprintIssueOutcome::UnblocksDependents.as_str(),
+            "unblocks_dependents"
+        );
+        assert_eq!(SprintIssueOutcome::Cancelled.as_str(), "cancelled");
     }
 
     #[test]

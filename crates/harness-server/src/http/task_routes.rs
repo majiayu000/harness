@@ -4,6 +4,8 @@ use crate::{
 };
 use axum::{extract::State, http::StatusCode, response::IntoResponse, response::Response, Json};
 use harness_core::agent::CodeAgent;
+use harness_workflow::issue_lifecycle::IssueLifecycleState;
+use harness_workflow::issue_lifecycle::IssueWorkflowInstance;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -116,6 +118,90 @@ fn populate_external_id(req: &mut task_runner::CreateTaskRequest) {
             }
         }
     }
+}
+
+fn workflow_state_allows_reuse(state: IssueLifecycleState) -> bool {
+    !matches!(
+        state,
+        IssueLifecycleState::Failed | IssueLifecycleState::Cancelled
+    )
+}
+
+enum WorkflowReuseStrategy {
+    ActiveTask(task_runner::TaskId),
+    PrExternalId(String),
+    None,
+}
+
+fn workflow_reuse_strategy(workflow: &IssueWorkflowInstance) -> WorkflowReuseStrategy {
+    if !workflow_state_allows_reuse(workflow.state) {
+        return WorkflowReuseStrategy::None;
+    }
+    if let Some(task_id) = workflow.active_task_id.as_ref() {
+        return WorkflowReuseStrategy::ActiveTask(harness_core::types::TaskId(task_id.clone()));
+    }
+    if let Some(pr_number) = workflow.pr_number {
+        return WorkflowReuseStrategy::PrExternalId(format!("pr:{pr_number}"));
+    }
+    WorkflowReuseStrategy::None
+}
+
+async fn check_workflow_duplicate(
+    state: &Arc<AppState>,
+    project_id: &str,
+    req: &task_runner::CreateTaskRequest,
+) -> Option<task_runner::TaskId> {
+    let workflows = state.core.issue_workflow_store.as_ref()?;
+    let workflow = if let Some(issue_number) = req.issue {
+        workflows
+            .get_by_issue(project_id, req.repo.as_deref(), issue_number)
+            .await
+            .ok()
+            .flatten()
+    } else if let Some(pr_number) = req.pr {
+        workflows
+            .get_by_pr(project_id, req.repo.as_deref(), pr_number)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    }?;
+
+    match workflow_reuse_strategy(&workflow) {
+        WorkflowReuseStrategy::ActiveTask(task_id) => {
+            if state
+                .core
+                .tasks
+                .exists_with_db_fallback(&task_id)
+                .await
+                .unwrap_or(false)
+            {
+                return Some(task_id);
+            }
+        }
+        WorkflowReuseStrategy::PrExternalId(pr_ext_id) => {
+            if let Some(task_id) = state
+                .core
+                .tasks
+                .find_active_duplicate(project_id, &pr_ext_id)
+                .await
+            {
+                return Some(task_id);
+            }
+            if let Some((task_id, _)) = state
+                .core
+                .tasks
+                .find_terminal_pr_duplicate(project_id, &pr_ext_id)
+                .await
+            {
+                return Some(task_id);
+            }
+        }
+        WorkflowReuseStrategy::None => {}
+    }
+
+    None
 }
 
 /// Return existing active TaskId if one matches project + external_id.
@@ -335,6 +421,9 @@ pub(crate) async fn enqueue_task_in_domain(
     // Auto-populate external_id and check for duplicates before acquiring
     // a concurrency permit (same dedup as enqueue_task_background).
     populate_external_id(&mut req);
+    if let Some(existing_id) = check_workflow_duplicate(state, &project_id, &req).await {
+        return Ok(existing_id);
+    }
     if let Some(existing_id) = check_duplicate(&state.core.tasks, &project_id, &req).await {
         return Ok(existing_id);
     }
@@ -589,6 +678,9 @@ pub(crate) async fn enqueue_task_background_in_domain(
 
     // Auto-populate external_id and check for duplicates.
     populate_external_id(&mut req);
+    if let Some(existing_id) = check_workflow_duplicate(&state, &project_id, &req).await {
+        return Ok(existing_id);
+    }
     if let Some(existing_id) = check_duplicate(&state.core.tasks, &project_id, &req).await {
         return Ok(existing_id);
     }
