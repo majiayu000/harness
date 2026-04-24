@@ -50,10 +50,11 @@ fn is_db_unavailable(err: &anyhow::Error) -> bool {
         || msg.contains("EMAXCONNSESSION")
         // SSL handshake failure (DB unreachable or in maintenance)
         || msg.contains("SSLRequest")
-        // Generic connection-refused at TCP level
-        || msg.contains("Connection refused")
         // Postgres admin terminated the connection (maintenance / pool reset)
         || msg.contains("terminating connection due to administrator command")
+    // Note: "Connection refused" is intentionally excluded — it is too generic
+    // and also matches OTEL endpoint failures, which would mask regressions in
+    // log_with_unreachable_otel_endpoint_still_persists_event.
 }
 
 struct TestStore {
