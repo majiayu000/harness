@@ -186,6 +186,14 @@ pub async fn claim_task_for_runtime_host(
     };
 
     for (task_id, _, _) in tasks {
+        if !state.runtime_hosts.hosts.contains_key(&host_id) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(
+                    json!({ "error": format!("runtime host '{host_id}' was deregistered during claim") }),
+                ),
+            );
+        }
         match state
             .core
             .tasks
