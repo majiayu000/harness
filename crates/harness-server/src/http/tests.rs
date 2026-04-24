@@ -954,9 +954,7 @@ async fn get_task_hides_internal_system_input_metadata() -> anyhow::Result<()> {
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: Some(task_runner::SystemTaskInput::PeriodicReview {
-            prompt: "review prompt".to_string(),
-        }),
+        scheduler: task_runner::TaskSchedulerState::queued(),
         failure_kind: None,
         workspace_path: None,
         workspace_owner: None,
@@ -1235,9 +1233,7 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: Some(task_runner::SystemTaskInput::PeriodicReview {
-            prompt: "review prompt".to_string(),
-        }),
+        scheduler: task_runner::TaskSchedulerState::queued(),
         failure_kind: None,
         workspace_path: None,
         workspace_owner: None,
@@ -1267,9 +1263,7 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: Some(task_runner::SystemTaskInput::SprintPlanner {
-            prompt: "planner prompt".to_string(),
-        }),
+        scheduler: task_runner::TaskSchedulerState::queued(),
         failure_kind: None,
         workspace_path: None,
         workspace_owner: None,
@@ -2027,7 +2021,7 @@ async fn pr_recovery_redispatches_prompt_tasks_with_pr_urls() -> anyhow::Result<
         triage_output: None,
         plan_output: None,
         request_settings: None,
-        system_input: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
         failure_kind: None,
         workspace_path: None,
         workspace_owner: None,
@@ -2235,6 +2229,7 @@ async fn pr_recovery_waits_for_runtime_host_lease_to_expire() -> anyhow::Result<
 
     let mut task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::default(),
         status: task_runner::TaskStatus::Pending,
         turn: 0,
         pr_url: Some("not-a-valid-pr-url".to_string()),
@@ -2250,6 +2245,7 @@ async fn pr_recovery_waits_for_runtime_host_lease_to_expire() -> anyhow::Result<
         repo: None,
         description: None,
         created_at: None,
+        updated_at: None,
         priority: 0,
         phase: task_runner::TaskPhase::default(),
         triage_output: None,
@@ -2299,6 +2295,7 @@ async fn checkpoint_recovery_waits_for_runtime_host_lease_to_expire() -> anyhow:
 
     let mut task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::default(),
         status: task_runner::TaskStatus::Pending,
         turn: 0,
         pr_url: None,
@@ -2314,6 +2311,7 @@ async fn checkpoint_recovery_waits_for_runtime_host_lease_to_expire() -> anyhow:
         repo: None,
         description: Some("prompt task".to_string()),
         created_at: None,
+        updated_at: None,
         priority: 0,
         phase: task_runner::TaskPhase::default(),
         triage_output: None,

@@ -992,6 +992,7 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
 
 #[cfg(test)]
 mod tests {
+    use super::super::request::SystemTaskInput;
     use super::*;
     use async_trait::async_trait;
     use harness_core::agent::{AgentRequest, AgentResponse, StreamItem};
@@ -1741,7 +1742,7 @@ mod tests {
             source: Some("periodic_review".to_string()),
             ..Default::default()
         };
-        assert_eq!(system_input_for_request(&spoofed), None);
+        assert_eq!(spoofed.system_input.clone(), None);
 
         let trusted = CreateTaskRequest {
             prompt: Some("review this".to_string()),
@@ -1752,7 +1753,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            system_input_for_request(&trusted),
+            trusted.system_input.clone(),
             Some(SystemTaskInput::PeriodicReview {
                 prompt: "review this".to_string(),
             })

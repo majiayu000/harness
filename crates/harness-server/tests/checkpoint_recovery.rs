@@ -269,62 +269,6 @@ async fn restart_with_triage_checkpoint_resumes_task() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn restart_with_review_system_input_resumes_task() -> anyhow::Result<()> {
-    let store = setup_store(|db| async move {
-        let mut task = make_task("t-review-system", TaskStatus::ReviewGenerating);
-        task.task_kind = TaskKind::Review;
-        task.system_input = Some(
-            harness_server::task_runner::SystemTaskInput::PeriodicReview {
-                prompt: "review prompt".to_string(),
-            },
-        );
-        db.insert(&task).await?;
-        Ok(())
-    })
-    .await?;
-
-    let task = store
-        .get(&CoreTaskId("t-review-system".into()))
-        .expect("task must exist");
-    assert!(
-        matches!(task.status, TaskStatus::ReviewWaiting),
-        "review task with persisted input should resume to review_waiting, got {:?}",
-        task.status
-    );
-    assert_eq!(task.task_kind, TaskKind::Review);
-    assert!(task.system_input.is_some());
-    Ok(())
-}
-
-#[tokio::test]
-async fn restart_with_planner_system_input_resumes_task() -> anyhow::Result<()> {
-    let store = setup_store(|db| async move {
-        let mut task = make_task("t-planner-system", TaskStatus::PlannerGenerating);
-        task.task_kind = TaskKind::Planner;
-        task.system_input = Some(
-            harness_server::task_runner::SystemTaskInput::SprintPlanner {
-                prompt: "planner prompt".to_string(),
-            },
-        );
-        db.insert(&task).await?;
-        Ok(())
-    })
-    .await?;
-
-    let task = store
-        .get(&CoreTaskId("t-planner-system".into()))
-        .expect("task must exist");
-    assert!(
-        matches!(task.status, TaskStatus::PlannerWaiting),
-        "planner task with persisted input should resume to planner_waiting, got {:?}",
-        task.status
-    );
-    assert_eq!(task.task_kind, TaskKind::Planner);
-    assert!(task.system_input.is_some());
-    Ok(())
-}
-
-#[tokio::test]
 async fn restart_review_task_without_system_input_fails() -> anyhow::Result<()> {
     let store = setup_store(|db| async move {
         let mut task = make_task("t-review-missing-input", TaskStatus::ReviewGenerating);

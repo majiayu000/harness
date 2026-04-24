@@ -308,7 +308,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             request_settings: None,
-            system_input: None,
+            scheduler: crate::task_runner::TaskSchedulerState::queued(),
         };
         let stalled_json = stalled_task_json(&stalled_task);
 
@@ -442,7 +442,7 @@ mod tests {
                 triage_output: None,
                 plan_output: None,
                 request_settings: None,
-                system_input: None,
+                scheduler: crate::task_runner::TaskSchedulerState::queued(),
             };
             task.status = crate::task_runner::TaskStatus::Failed;
             state.core.tasks.insert(&task).await;
@@ -503,7 +503,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             request_settings: None,
-            system_input: None,
+            scheduler: crate::task_runner::TaskSchedulerState::queued(),
         };
         state.core.tasks.insert(&task).await;
 
@@ -568,7 +568,7 @@ mod tests {
             triage_output: None,
             plan_output: None,
             request_settings: None,
-            system_input: None,
+            scheduler: crate::task_runner::TaskSchedulerState::queued(),
         };
         state.core.tasks.insert(&task).await;
 
