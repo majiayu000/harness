@@ -2102,7 +2102,7 @@ async fn checkpoint_recovery_redispatches_sprint_planner_prompt_task() -> anyhow
 
     let task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
-        task_kind: task_runner::TaskKind::Prompt,
+        task_kind: task_runner::TaskKind::Planner,
         status: task_runner::TaskStatus::Pending,
         turn: 0,
         pr_url: None,
