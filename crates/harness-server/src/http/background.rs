@@ -53,7 +53,8 @@ pub(super) fn recovery_queue_domain(task_kind: task_runner::TaskKind) -> task_ro
         task_runner::TaskKind::Issue
         | task_runner::TaskKind::Pr
         | task_runner::TaskKind::Prompt
-        | task_runner::TaskKind::Planner => task_routes::QueueDomain::Primary,
+        | task_runner::TaskKind::Planner
+        | task_runner::TaskKind::PlannerTask => task_routes::QueueDomain::Primary,
     }
 }
 
@@ -867,7 +868,8 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                     task_runner::TaskKind::Prompt => None,
                     task_runner::TaskKind::Pr
                     | task_runner::TaskKind::Review
-                    | task_runner::TaskKind::Planner => None,
+                    | task_runner::TaskKind::Planner
+                    | task_runner::TaskKind::PlannerTask => None,
                 };
 
                 if issue_num.is_none() {

@@ -1,5 +1,5 @@
 use crate::http::parse_pr_num_from_url;
-use crate::task_runner::{TaskState, TaskStatus};
+use crate::task_runner::{RecoveryStrategy, TaskState, TaskStatus};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
@@ -28,15 +28,17 @@ impl TaskDb {
             .as_deref()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
+        let recovery_strategy = state.task_kind.recovery_strategy();
         sqlx::query(
-            "INSERT INTO tasks (id, task_kind, status, turn, pr_url, rounds, error, source, \
-             external_id, parent_id, created_at, repo, depends_on, project, priority, phase, \
-             description, request_settings, system_input) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-                     COALESCE($11, CURRENT_TIMESTAMP), $12, $13, $14, $15, $16, $17, $18, $19)",
+            "INSERT INTO tasks (id, task_kind, recovery_strategy, status, turn, pr_url, rounds, \
+             error, source, external_id, parent_id, created_at, repo, depends_on, project, \
+             priority, phase, description, request_settings, system_input) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                     COALESCE($12, CURRENT_TIMESTAMP), $13, $14, $15, $16, $17, $18, $19, $20)",
         )
         .bind(&state.id.0)
         .bind(task_kind)
+        .bind(recovery_strategy.as_ref())
         .bind(status)
         .bind(state.turn as i64)
         .bind(&state.pr_url)
@@ -78,14 +80,16 @@ impl TaskDb {
             .system_input
             .as_ref()
             .and_then(|input| serde_json::to_string(input).ok());
+        let recovery_strategy = state.task_kind.recovery_strategy();
         sqlx::query(
-            "UPDATE tasks SET task_kind = $1, status = $2, turn = $3, pr_url = $4, rounds = $5, \
-                    error = $6, source = $7, external_id = $8, repo = $9, depends_on = $10, \
-                    project = $11, priority = $12, phase = $13, description = $14, \
-                    request_settings = $15, system_input = $16, updated_at = CURRENT_TIMESTAMP, \
-                    version = version + 1 WHERE id = $17",
+            "UPDATE tasks SET task_kind = $1, recovery_strategy = $2, status = $3, turn = $4, \
+                    pr_url = $5, rounds = $6, error = $7, source = $8, external_id = $9, \
+                    repo = $10, depends_on = $11, project = $12, priority = $13, phase = $14, \
+                    description = $15, request_settings = $16, system_input = $17, \
+                    updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE id = $18",
         )
         .bind(task_kind)
+        .bind(recovery_strategy.as_ref())
         .bind(status)
         .bind(state.turn as i64)
         .bind(&state.pr_url)
@@ -401,13 +405,16 @@ impl TaskDb {
     }
 
     /// Recovery on server restart: resume or fail interrupted tasks.
+    ///
+    /// Dispatches by the persisted `recovery_strategy` column instead of
+    /// inferring behaviour from description/source strings.
     pub async fn recover_in_progress(&self) -> anyhow::Result<RecoveryResult> {
         let rows = {
             let resumable = TaskStatus::resumable_statuses();
             let placeholders = Self::numbered_placeholders(1, resumable.len());
             let sql = format!(
-                "SELECT t.id, t.task_kind, t.source, t.external_id, t.description, \
-                        t.status, t.turn, t.pr_url AS task_pr_url, \
+                "SELECT t.id, t.task_kind, t.recovery_strategy, t.source, t.external_id, \
+                        t.description, t.status, t.turn, t.pr_url AS task_pr_url, \
                         t.system_input, \
                         c.triage_output, c.plan_output, c.pr_url AS ck_pr_url \
                  FROM tasks t \
@@ -417,25 +424,22 @@ impl TaskDb {
             );
             let query = resumable
                 .iter()
-                .fold(sqlx::query_as::<_, RecoveryRow>(&sql), |q, status| {
-                    q.bind(*status)
-                });
+                .fold(sqlx::query_as::<_, RecoveryRow>(&sql), |q, s| q.bind(*s));
             query.fetch_all(&self.pool).await?
         };
 
         let mut result = RecoveryResult::default();
 
         for row in rows {
+            let strategy = RecoveryStrategy::from_persisted(&row.recovery_strategy);
             let task_kind = crate::task_runner::TaskKind::from_persisted(
                 Some(&row.task_kind),
                 row.source.as_deref(),
                 row.external_id.as_deref(),
                 row.description.as_deref(),
             )?;
-            let system_input: Option<crate::task_runner::SystemTaskInput> = row
-                .system_input
-                .as_deref()
-                .and_then(|value| serde_json::from_str(value).ok());
+
+            // Resolve effective PR URL (task column takes priority over checkpoint).
             let effective_pr_url = row
                 .task_pr_url
                 .as_deref()
@@ -445,88 +449,86 @@ impl TaskDb {
                         .as_deref()
                         .filter(|u| parse_pr_num_from_url(u).is_some())
                 });
-            let has_pr = effective_pr_url.is_some();
-            let has_plan = row.plan_output.is_some();
-            let has_triage = row.triage_output.is_some();
 
-            if task_kind.recovery_status().is_some() {
-                if let Some(recovery_status) = task_kind.recovery_status() {
-                    if system_input.is_some() {
-                        sqlx::query(
-                            "UPDATE tasks SET status = $1, error = NULL, \
-                             updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-                        )
-                        .bind(recovery_status.as_ref())
-                        .bind(&row.id)
-                        .execute(&self.pool)
-                        .await?;
-                        result.resumed += 1;
-                        tracing::info!(
-                            task_id = %row.id,
-                            task_kind = task_kind.as_ref(),
-                            was = %row.status,
-                            "startup recovery: resumed system task"
-                        );
-                        continue;
+            let resume_status: Option<String> = match strategy {
+                RecoveryStrategy::RecoverByPromptSnapshot => {
+                    let has_input = row
+                        .system_input
+                        .as_deref()
+                        .and_then(|v| {
+                            serde_json::from_str::<crate::task_runner::SystemTaskInput>(v).ok()
+                        })
+                        .is_some();
+                    if has_input {
+                        let s = match task_kind {
+                            crate::task_runner::TaskKind::Review => {
+                                TaskStatus::ReviewWaiting.as_ref()
+                            }
+                            crate::task_runner::TaskKind::Planner => {
+                                TaskStatus::PlannerWaiting.as_ref()
+                            }
+                            _ => TaskStatus::Implementing.as_ref(),
+                        };
+                        Some(s.to_owned())
+                    } else {
+                        None
                     }
                 }
-            }
+                RecoveryStrategy::RecoverByIssue => {
+                    row.external_id.as_deref().map(|_| "pending".to_owned())
+                }
+                RecoveryStrategy::RecoverByPr => effective_pr_url.map(|_| "pending".to_owned()),
+                RecoveryStrategy::RecoverByDerivedMetadata => {
+                    let any = effective_pr_url.is_some()
+                        || row.plan_output.is_some()
+                        || row.triage_output.is_some();
+                    any.then(|| "pending".to_owned())
+                }
+                RecoveryStrategy::NonRecoverable => None,
+            };
 
-            if has_pr || has_plan || has_triage {
-                let reason = if has_pr {
-                    format!(
-                        "resumed after restart (was: {}, pr: {})",
-                        row.status,
-                        effective_pr_url.unwrap_or("checkpoint")
-                    )
-                } else if has_plan {
-                    format!(
-                        "resumed after restart (was: {}, plan checkpoint)",
-                        row.status
-                    )
-                } else {
-                    format!(
-                        "resumed after restart (was: {}, triage checkpoint)",
-                        row.status
-                    )
-                };
-                let task_pr_url_valid = row
+            if let Some(status) = resume_status {
+                // Write back checkpoint PR URL to task row if needed.
+                let task_pr_valid = row
                     .task_pr_url
                     .as_deref()
                     .map(|u| parse_pr_num_from_url(u).is_some())
                     .unwrap_or(false);
-                let needs_pr_url_writeback = !task_pr_url_valid && effective_pr_url.is_some();
-                if needs_pr_url_writeback {
+                let pr_writeback = matches!(
+                    strategy,
+                    RecoveryStrategy::RecoverByPr | RecoveryStrategy::RecoverByDerivedMetadata
+                ) && !task_pr_valid
+                    && effective_pr_url.is_some();
+
+                if pr_writeback {
                     sqlx::query(
-                        "UPDATE tasks SET status = 'pending', error = NULL, pr_url = $1, \
-                         updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+                        "UPDATE tasks SET status = $1, error = NULL, pr_url = $2, \
+                         updated_at = CURRENT_TIMESTAMP WHERE id = $3",
                     )
+                    .bind(&status)
                     .bind(effective_pr_url)
                     .bind(&row.id)
                     .execute(&self.pool)
                     .await?;
                     tracing::info!(
-                        task_id = %row.id,
-                        was = %row.status,
-                        pr_url = ?effective_pr_url,
-                        "startup recovery: wrote back pr_url from checkpoint"
+                        task_id = %row.id, was = %row.status,
+                        "startup recovery: resumed task (pr_url written back)"
                     );
                 } else {
                     sqlx::query(
-                        "UPDATE tasks SET status = 'pending', error = NULL, \
-                         updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+                        "UPDATE tasks SET status = $1, error = NULL, \
+                         updated_at = CURRENT_TIMESTAMP WHERE id = $2",
                     )
+                    .bind(&status)
                     .bind(&row.id)
                     .execute(&self.pool)
                     .await?;
+                    tracing::info!(
+                        task_id = %row.id, was = %row.status, strategy = strategy.as_ref(),
+                        "startup recovery: resumed task to {status}"
+                    );
                 }
                 result.resumed += 1;
-                tracing::info!(
-                    task_id = %row.id,
-                    was = %row.status,
-                    reason = %reason,
-                    "startup recovery: resumed task"
-                );
             } else {
                 let err = format!(
                     "recovered after restart (was: {}, round: {}, pr: {})",

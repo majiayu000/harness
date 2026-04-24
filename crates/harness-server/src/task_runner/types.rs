@@ -3,6 +3,51 @@ use serde::{Deserialize, Serialize};
 
 pub type TaskId = CoreTaskId;
 
+/// Explicit recovery contract for a task.
+///
+/// Each variant defines what data the recovery path needs and what outcome it
+/// produces. Persisted in the `recovery_strategy` column so that future changes
+/// to `TaskKind::recovery_strategy()` do not retroactively affect existing rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryStrategy {
+    /// Resume to `Pending` when a valid `pr_url` is present (task or checkpoint).
+    RecoverByPr,
+    /// Resume to `Pending` when `external_id` is present.
+    RecoverByIssue,
+    /// Resume to `ReviewWaiting`/`PlannerWaiting` when `system_input` is present.
+    RecoverByPromptSnapshot,
+    /// Resume to `Pending` when any checkpoint (pr, plan, triage) is present.
+    RecoverByDerivedMetadata,
+    /// Always transition to `Failed`; the task cannot be safely re-queued.
+    #[default]
+    NonRecoverable,
+}
+
+impl RecoveryStrategy {
+    pub fn from_persisted(s: &str) -> Self {
+        match s {
+            "recover_by_pr" => Self::RecoverByPr,
+            "recover_by_issue" => Self::RecoverByIssue,
+            "recover_by_prompt_snapshot" => Self::RecoverByPromptSnapshot,
+            "recover_by_derived_metadata" => Self::RecoverByDerivedMetadata,
+            _ => Self::NonRecoverable,
+        }
+    }
+}
+
+impl AsRef<str> for RecoveryStrategy {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::RecoverByPr => "recover_by_pr",
+            Self::RecoverByIssue => "recover_by_issue",
+            Self::RecoverByPromptSnapshot => "recover_by_prompt_snapshot",
+            Self::RecoverByDerivedMetadata => "recover_by_derived_metadata",
+            Self::NonRecoverable => "non_recoverable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
@@ -12,6 +57,10 @@ pub enum TaskKind {
     Prompt,
     Review,
     Planner,
+    /// A concrete implementation task spawned from a sprint-planner run.
+    /// Unlike `Planner` (which generates the plan), `PlannerTask` executes
+    /// a single item from that plan and is backed by a GitHub issue.
+    PlannerTask,
 }
 
 impl TaskKind {
@@ -38,6 +87,7 @@ impl TaskKind {
             Some("prompt") => Ok(Self::Prompt),
             Some("review") => Ok(Self::Review),
             Some("planner") => Ok(Self::Planner),
+            Some("planner_task") => Ok(Self::PlannerTask),
             Some(other) => anyhow::bail!("unknown task kind `{other}`"),
         }
     }
@@ -68,7 +118,7 @@ impl TaskKind {
         match self {
             Self::Planner => TaskPhase::Plan,
             Self::Review => TaskPhase::Review,
-            Self::Issue | Self::Pr | Self::Prompt => TaskPhase::Implement,
+            Self::Issue | Self::Pr | Self::Prompt | Self::PlannerTask => TaskPhase::Implement,
         }
     }
 
@@ -76,15 +126,23 @@ impl TaskKind {
         match self {
             Self::Review => TaskStatus::ReviewGenerating,
             Self::Planner => TaskStatus::PlannerGenerating,
-            Self::Issue | Self::Pr | Self::Prompt => TaskStatus::Implementing,
+            Self::Issue | Self::Pr | Self::Prompt | Self::PlannerTask => TaskStatus::Implementing,
         }
     }
 
-    pub fn recovery_status(&self) -> Option<TaskStatus> {
+    /// Map each task kind to its explicit recovery contract.
+    ///
+    /// This replaces the old `recovery_status()` heuristic. The returned
+    /// strategy is persisted in `tasks.recovery_strategy` so existing rows
+    /// keep their original contract even if this mapping changes later.
+    pub fn recovery_strategy(&self) -> RecoveryStrategy {
         match self {
-            Self::Review => Some(TaskStatus::ReviewWaiting),
-            Self::Planner => Some(TaskStatus::PlannerWaiting),
-            Self::Issue | Self::Pr | Self::Prompt => None,
+            Self::Issue => RecoveryStrategy::RecoverByIssue,
+            Self::Pr => RecoveryStrategy::RecoverByPr,
+            Self::Prompt => RecoveryStrategy::RecoverByDerivedMetadata,
+            Self::Review => RecoveryStrategy::RecoverByPromptSnapshot,
+            Self::Planner => RecoveryStrategy::RecoverByPromptSnapshot,
+            Self::PlannerTask => RecoveryStrategy::RecoverByIssue,
         }
     }
 
@@ -105,6 +163,7 @@ impl AsRef<str> for TaskKind {
             Self::Prompt => "prompt",
             Self::Review => "review",
             Self::Planner => "planner",
+            Self::PlannerTask => "planner_task",
         }
     }
 }
@@ -248,7 +307,7 @@ impl std::str::FromStr for TaskStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::TaskKind;
+    use super::{RecoveryStrategy, TaskKind};
 
     #[test]
     fn legacy_issue_markers_override_review_source() {
@@ -295,5 +354,71 @@ mod tests {
 
         assert_eq!(review, TaskKind::Review);
         assert_eq!(planner, TaskKind::Planner);
+    }
+
+    #[test]
+    fn task_kind_recovery_strategy_mappings() {
+        assert_eq!(
+            TaskKind::Issue.recovery_strategy(),
+            RecoveryStrategy::RecoverByIssue
+        );
+        assert_eq!(
+            TaskKind::Pr.recovery_strategy(),
+            RecoveryStrategy::RecoverByPr
+        );
+        assert_eq!(
+            TaskKind::Prompt.recovery_strategy(),
+            RecoveryStrategy::RecoverByDerivedMetadata
+        );
+        assert_eq!(
+            TaskKind::Review.recovery_strategy(),
+            RecoveryStrategy::RecoverByPromptSnapshot
+        );
+        assert_eq!(
+            TaskKind::Planner.recovery_strategy(),
+            RecoveryStrategy::RecoverByPromptSnapshot
+        );
+        assert_eq!(
+            TaskKind::PlannerTask.recovery_strategy(),
+            RecoveryStrategy::RecoverByIssue
+        );
+    }
+
+    #[test]
+    fn recovery_strategy_as_ref_roundtrips() {
+        let cases = [
+            (RecoveryStrategy::RecoverByPr, "recover_by_pr"),
+            (RecoveryStrategy::RecoverByIssue, "recover_by_issue"),
+            (
+                RecoveryStrategy::RecoverByPromptSnapshot,
+                "recover_by_prompt_snapshot",
+            ),
+            (
+                RecoveryStrategy::RecoverByDerivedMetadata,
+                "recover_by_derived_metadata",
+            ),
+            (RecoveryStrategy::NonRecoverable, "non_recoverable"),
+        ];
+        for (variant, s) in cases {
+            assert_eq!(variant.as_ref(), s);
+            assert_eq!(RecoveryStrategy::from_persisted(s), variant);
+        }
+    }
+
+    #[test]
+    fn recovery_strategy_unknown_string_defaults_to_non_recoverable() {
+        assert_eq!(
+            RecoveryStrategy::from_persisted("bogus_value"),
+            RecoveryStrategy::NonRecoverable
+        );
+    }
+
+    #[test]
+    fn recovery_strategy_serde_roundtrip() {
+        let s = RecoveryStrategy::RecoverByPromptSnapshot;
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, r#""recover_by_prompt_snapshot""#);
+        let back: RecoveryStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
     }
 }

@@ -25,7 +25,7 @@ pub use spawn::{
 };
 pub use state::{RecentFailureTask, RoundResult, TaskState, TaskSummary};
 pub use store::{mutate_and_persist, update_status, TaskStore};
-pub use types::{TaskId, TaskKind, TaskPhase, TaskStatus};
+pub use types::{RecoveryStrategy, TaskId, TaskKind, TaskPhase, TaskStatus};
 
 impl TaskStore {
     /// Return the most recent `limit` failed tasks, newest first.

@@ -264,7 +264,9 @@ pub(super) fn summarize_request_description(req: &CreateTaskRequest) -> Option<S
         return Some(match task_kind {
             TaskKind::Review => "periodic review".to_string(),
             TaskKind::Planner => "sprint planner".to_string(),
-            TaskKind::Issue | TaskKind::Pr | TaskKind::Prompt => "prompt task".to_string(),
+            TaskKind::Issue | TaskKind::Pr | TaskKind::Prompt | TaskKind::PlannerTask => {
+                "prompt task".to_string()
+            }
         });
     }
     None

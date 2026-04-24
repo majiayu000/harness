@@ -64,6 +64,7 @@ pub struct RecoveryResult {
 pub(super) struct RecoveryRow {
     pub(super) id: String,
     pub(super) task_kind: String,
+    pub(super) recovery_strategy: String,
     pub(super) source: Option<String>,
     pub(super) external_id: Option<String>,
     pub(super) description: Option<String>,
