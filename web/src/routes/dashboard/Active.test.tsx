@@ -145,7 +145,7 @@ describe("<Active>", () => {
       isLoading: false,
       isError: false,
     });
-    wrap(<Active />);
+    wrap(<Active onOpenTask={() => {}} />);
     expect(screen.getByText("Planning")).toBeInTheDocument();
     expect(screen.getByText("Review")).toBeInTheDocument();
     expect(screen.getByText("planner-task")).toBeInTheDocument();

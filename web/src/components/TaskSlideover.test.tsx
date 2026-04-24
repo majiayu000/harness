@@ -29,6 +29,7 @@ const detail: TaskDetail = {
   depends_on: [],
   subtask_ids: [],
   project: "/tmp/harness",
+  task_kind: "implementation",
   rounds: [
     { turn: 1, action: "plan", result: "created implementation plan" },
     { turn: 2, action: "implement", result: "editing files" },
