@@ -43,7 +43,7 @@ async fn db_tests_enabled() -> bool {
 }
 
 fn is_db_unavailable(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
+    let msg = format!("{:#}", err);
     // SQLx pool exhausted locally
     msg.contains("pool timed out while waiting for an open connection")
         // Supabase session pooler cap (EMAXCONNSESSION)
@@ -52,6 +52,8 @@ fn is_db_unavailable(err: &anyhow::Error) -> bool {
         || msg.contains("SSLRequest")
         // Generic connection-refused at TCP level
         || msg.contains("Connection refused")
+        // Postgres admin terminated the connection (maintenance / pool reset)
+        || msg.contains("terminating connection due to administrator command")
 }
 
 struct TestStore {
