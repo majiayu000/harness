@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
 use super::request::PersistedRequestSettings;
 use super::types::{TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus};
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoundResult {

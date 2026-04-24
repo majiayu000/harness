@@ -2252,6 +2252,10 @@ async fn pr_recovery_waits_for_runtime_host_lease_to_expire() -> anyhow::Result<
         plan_output: None,
         request_settings: None,
         scheduler: task_runner::TaskSchedulerState::queued(),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
     };
     task.scheduler.claim_runtime_host(
         "host-a",
@@ -2318,6 +2322,10 @@ async fn checkpoint_recovery_waits_for_runtime_host_lease_to_expire() -> anyhow:
         plan_output: None,
         request_settings: None,
         scheduler: task_runner::TaskSchedulerState::queued(),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
     };
     task.scheduler.claim_runtime_host(
         "host-a",

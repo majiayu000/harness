@@ -217,6 +217,10 @@ async fn deregister_releases_scheduler_owned_pending_tasks() -> anyhow::Result<(
         plan_output: None,
         request_settings: None,
         scheduler: crate::task_runner::TaskSchedulerState::queued(),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
     };
     task.scheduler.claim_runtime_host(
         "host-a",
@@ -561,6 +565,10 @@ async fn deregister_keeps_host_registered_when_claim_release_fails() -> anyhow::
         plan_output: None,
         request_settings: None,
         scheduler: crate::task_runner::TaskSchedulerState::queued(),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
     };
     task.scheduler.claim_runtime_host(
         "host-a",
