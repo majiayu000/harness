@@ -11,7 +11,81 @@ use harness_core::types::{Event, ExecutionPhase, SessionId};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::time::{sleep, Duration, Instant};
+
+/// External state of a PR as observed via `gh`. Used to short-circuit the
+/// review loop when a PR has been merged or closed outside of this task so the
+/// loop does not keep invoking the reviewer agent against stale work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrExternalState {
+    Open,
+    Merged,
+    Closed,
+    Unknown,
+}
+
+/// Query `gh pr view <pr> --json state,mergedAt` with a 10 s timeout and
+/// classify the result. Returns [`PrExternalState::Unknown`] on any transient
+/// failure so callers do not abort a healthy review loop because of a flaky
+/// network call.
+async fn fetch_pr_external_state(pr_num: u64, project: &Path) -> PrExternalState {
+    // kill_on_drop(true) so the gh subprocess is reaped if the timeout
+    // future is dropped — without it, hung gh invocations (network/auth
+    // stalls) accumulate as orphaned children across repeated review
+    // rounds and degrade the server. Mirrors the pattern used by
+    // task_runner/store.rs::validate_recovered_tasks.
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        Command::new("gh")
+            .current_dir(project)
+            .args([
+                "pr",
+                "view",
+                &pr_num.to_string(),
+                "--json",
+                "state,mergedAt",
+                "--jq",
+                ".state + \"|\" + ((.mergedAt // \"\")|tostring)",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let output = match result {
+        Ok(Ok(o)) if o.status.success() => o,
+        Ok(Ok(o)) => {
+            tracing::debug!(pr = pr_num, exit = ?o.status.code(), "gh pr state check failed");
+            return PrExternalState::Unknown;
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(pr = pr_num, error = %e, "gh pr state check invocation error");
+            return PrExternalState::Unknown;
+        }
+        Err(_) => {
+            tracing::debug!(pr = pr_num, "gh pr state check timed out after 10s");
+            return PrExternalState::Unknown;
+        }
+    };
+    let raw = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    let (state, merged_at) = raw.split_once('|').unwrap_or((raw.as_str(), ""));
+    match (state.trim(), merged_at.trim().is_empty()) {
+        ("OPEN", _) => PrExternalState::Open,
+        ("MERGED", _) => PrExternalState::Merged,
+        // GitHub occasionally reports merged PRs as CLOSED with a non-empty
+        // `mergedAt`; treat that as a merge so we do not cancel a completed
+        // task by mistake.
+        ("CLOSED", false) => PrExternalState::Merged,
+        ("CLOSED", true) => PrExternalState::Closed,
+        _ => PrExternalState::Unknown,
+    }
+}
 
 /// Returns `true` when the trailing three entries of `counts` are all `Some`
 /// and the issue count is not decreasing (`c >= a && c >= b`).
@@ -91,6 +165,69 @@ pub(crate) async fn run_review_loop(
     let mut round: u32 = 1;
     let mut waiting_count: u32 = 1;
     while round <= max_rounds {
+        // Cheap pre-flight: check the PR's external state before invoking the
+        // reviewer agent. If the PR has already been merged or closed outside
+        // of this task (operator merged manually, another agent closed it,
+        // webhook finalised it) the remaining rounds would only burn tokens
+        // against stale work — short-circuit to the appropriate terminal
+        // status. Unknown/transient failures fall through and continue the
+        // normal review flow.
+        match fetch_pr_external_state(pr_num, project).await {
+            PrExternalState::Merged => {
+                tracing::info!(
+                    task_id = %task_id,
+                    pr = pr_num,
+                    round,
+                    "review loop exit: PR merged externally"
+                );
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Done;
+                    s.turn = round;
+                    s.error = Some(
+                        "PR merged externally; review loop exited without waiting for LGTM"
+                            .to_string(),
+                    );
+                })
+                .await?;
+                store.log_event(crate::event_replay::TaskEvent::Completed {
+                    task_id: task_id.0.clone(),
+                    ts: crate::event_replay::now_ts(),
+                });
+                tracing::info!(
+                    task_id = %task_id,
+                    phase = "reviewing",
+                    elapsed_secs = review_phase_start.elapsed().as_secs(),
+                    "phase_completed"
+                );
+                tracing::info!(
+                    task_id = %task_id,
+                    status = "done",
+                    turns = round,
+                    pr_url = pr_url.as_deref().unwrap_or(""),
+                    total_elapsed_secs = task_start.elapsed().as_secs(),
+                    "task_completed"
+                );
+                return Ok(());
+            }
+            PrExternalState::Closed => {
+                tracing::info!(
+                    task_id = %task_id,
+                    pr = pr_num,
+                    round,
+                    "review loop exit: PR closed externally without merge"
+                );
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Cancelled;
+                    s.turn = round;
+                    s.error =
+                        Some("PR closed externally without merge; review loop exited".to_string());
+                })
+                .await?;
+                return Ok(());
+            }
+            PrExternalState::Open | PrExternalState::Unknown => {}
+        }
+
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let base_prompt = prompts::review_prompt(
