@@ -1,5 +1,7 @@
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useTasks, useDashboard } from "@/lib/queries";
+import { apiFetch } from "@/lib/api";
 import { TaskDetailSlideover } from "@/components/TaskDetailSlideover";
 import type { Task, WorkflowSummary } from "@/types";
 
@@ -124,10 +126,14 @@ function TaskCard({
   task,
   workflow,
   onClick,
+  onMerge,
+  merging,
 }: {
   task: Task;
   workflow?: WorkflowSummary | null;
   onClick: () => void;
+  onMerge?: (taskId: string) => void;
+  merging?: boolean;
 }) {
   const title = task.description?.trim() || task.repo || task.id.slice(0, 8);
   return (
@@ -177,6 +183,19 @@ function TaskCard({
           {task.pr_url.replace(/^https:\/\/github\.com\//, "")}
         </a>
       )}
+      {workflow?.state === "ready_to_merge" && onMerge && (
+        <button
+          type="button"
+          disabled={merging}
+          onClick={(e) => {
+            e.stopPropagation();
+            onMerge(task.id);
+          }}
+          className="mt-2 w-full border border-line bg-bg-1 px-2 py-1 font-mono text-[10px] text-ink-2 hover:border-line-3 hover:text-ink transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {merging ? "Merging…" : "Merge"}
+        </button>
+      )}
     </button>
   );
 }
@@ -187,8 +206,24 @@ interface Props {
 
 export function Active({ projectFilter }: Props) {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [merging, setMerging] = useState<Set<string>>(new Set());
   const { data, isLoading, isError } = useTasks();
   const { data: dashboard } = useDashboard();
+  const queryClient = useQueryClient();
+
+  const handleMerge = async (taskId: string) => {
+    setMerging((prev) => new Set(prev).add(taskId));
+    try {
+      await apiFetch(`/tasks/${taskId}/merge`, { method: "POST" });
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    } finally {
+      setMerging((prev) => {
+        const next = new Set(prev);
+        next.delete(taskId);
+        return next;
+      });
+    }
+  };
 
   const resolvedRoot = projectFilter
     ? (dashboard?.projects.find((p) => p.id === projectFilter)?.root ?? projectFilter)
@@ -233,6 +268,8 @@ export function Active({ projectFilter }: Props) {
                   task={t}
                   workflow={t.workflow ?? null}
                   onClick={() => setSelectedTaskId(t.id)}
+                  onMerge={handleMerge}
+                  merging={merging.has(t.id)}
                 />
               ))}
             </div>
