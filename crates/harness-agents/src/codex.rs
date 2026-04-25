@@ -169,7 +169,19 @@ impl CodeAgent for CodexAgent {
                 )));
             }
             // Transient quota exhaustion (rate-limited; may recover after backoff).
-            if stderr_lower.contains("402") || stderr_lower.contains("quota") {
+            // Use specific signals only — bare "quota" or "402" appear in normal
+            // subprocess output and cause false non-retryable failures.
+            if stderr_lower.contains("quota exhausted")
+                || stderr_lower.contains("hit your limit")
+                || stderr_lower.contains("rate limit exceeded")
+                || stderr_lower.contains("rate_limit_exceeded")
+                || stderr_lower.contains("too many requests")
+                || stderr_lower.contains("quota resets")
+                || stderr_lower.contains("quota reset")
+                || stderr_lower.contains("status: 429")
+                || stderr_lower.contains("error 429")
+                || stderr_lower.contains("http 429")
+            {
                 return Err(harness_core::error::HarnessError::QuotaExhausted(format!(
                     "codex quota exhausted (exit {}): {stderr}",
                     output.status
@@ -287,7 +299,17 @@ impl CodeAgent for CodexAgent {
                         "codex billing failure (streamed exit): {stderr}"
                     )));
                 }
-                if stderr_lower.contains("402") || stderr_lower.contains("quota") {
+                if stderr_lower.contains("quota exhausted")
+                    || stderr_lower.contains("hit your limit")
+                    || stderr_lower.contains("rate limit exceeded")
+                    || stderr_lower.contains("rate_limit_exceeded")
+                    || stderr_lower.contains("too many requests")
+                    || stderr_lower.contains("quota resets")
+                    || stderr_lower.contains("quota reset")
+                    || stderr_lower.contains("status: 429")
+                    || stderr_lower.contains("error 429")
+                    || stderr_lower.contains("http 429")
+                {
                     return Err(harness_core::error::HarnessError::QuotaExhausted(format!(
                         "codex quota exhausted (streamed exit): {stderr}"
                     )));

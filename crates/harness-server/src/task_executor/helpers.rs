@@ -1,4 +1,4 @@
-use crate::task_runner::{TaskId, TaskStatus, TaskStore};
+use crate::task_runner::{TaskId, TaskKind, TaskStatus, TaskStore};
 use chrono::{DateTime, Utc};
 use harness_core::agent::{AgentRequest, AgentResponse, StreamItem};
 use harness_core::error::HarnessError;
@@ -51,7 +51,7 @@ pub(crate) struct TurnExecutionFailure {
 pub(crate) fn is_prompt_only_task(store: &TaskStore, task_id: &TaskId) -> bool {
     store
         .get(task_id)
-        .is_some_and(|state| state.description.as_deref() == Some("prompt task"))
+        .is_some_and(|state| matches!(state.task_kind, TaskKind::Prompt))
 }
 
 pub(crate) fn telemetry_for_timeout(
