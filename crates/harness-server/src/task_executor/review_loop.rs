@@ -30,6 +30,11 @@ enum PrExternalState {
 /// failure so callers do not abort a healthy review loop because of a flaky
 /// network call.
 async fn fetch_pr_external_state(pr_num: u64, project: &Path) -> PrExternalState {
+    // kill_on_drop(true) so the gh subprocess is reaped if the timeout
+    // future is dropped — without it, hung gh invocations (network/auth
+    // stalls) accumulate as orphaned children across repeated review
+    // rounds and degrade the server. Mirrors the pattern used by
+    // task_runner/store.rs::validate_recovered_tasks.
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         Command::new("gh")
@@ -46,6 +51,7 @@ async fn fetch_pr_external_state(pr_num: u64, project: &Path) -> PrExternalState
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .output(),
     )
     .await;
