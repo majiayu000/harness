@@ -230,7 +230,7 @@ fn classify_agent_execution_failure(message: &str) -> TurnFailure {
     }
 }
 
-fn is_billing_failure_message(message: &str) -> bool {
+pub fn is_billing_failure_message(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("payment required")
         || lower.contains("billing failure")
@@ -238,7 +238,7 @@ fn is_billing_failure_message(message: &str) -> bool {
         || lower.contains("insufficient balance")
 }
 
-fn is_quota_failure_message(message: &str) -> bool {
+pub fn is_quota_failure_message(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("quota exhausted")
         || lower.contains("hit your limit")

@@ -194,17 +194,15 @@ fn is_agent_internal(line: &str) -> bool {
 }
 
 fn tail_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
+    if max_chars == 0 {
+        return String::new();
     }
-
-    s.chars()
-        .rev()
-        .take(max_chars)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
+    // char_indices().rev().nth(max_chars - 1) finds the byte offset of the
+    // (max_chars)-th char from the end in a single pass — no Vec<char> needed.
+    match s.char_indices().rev().nth(max_chars - 1) {
+        Some((idx, _)) => s[idx..].to_string(),
+        None => s.to_string(),
+    }
 }
 
 fn append_stderr_capture(captured: &Arc<Mutex<String>>, line: &str) {
@@ -213,7 +211,7 @@ fn append_stderr_capture(captured: &Arc<Mutex<String>>, line: &str) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.push_str(line);
     guard.push('\n');
-    if guard.chars().count() > MAX_CAPTURED_STDERR_CHARS {
+    if guard.chars().rev().nth(MAX_CAPTURED_STDERR_CHARS).is_some() {
         *guard = tail_chars(&guard, MAX_CAPTURED_STDERR_CHARS);
     }
 }

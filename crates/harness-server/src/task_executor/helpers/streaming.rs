@@ -111,6 +111,10 @@ pub(crate) async fn run_agent_streaming_with_options(
     let mut first_token_latency_ms: Option<u64> = None;
     let mut first_output_at: Option<DateTime<Utc>> = None;
     let mut last_backfilled_issue: Option<u64> = None;
+    // Tracks how many bytes of `output` have already been scanned for
+    // CREATED_ISSUE= so each MessageDelta only scans newly appended lines,
+    // keeping the overall scan cost O(N) instead of O(N²).
+    let mut issue_scan_pos: usize = 0;
     // Pre-check whether this task is auto-fix to avoid a cache lookup on every
     // MessageDelta.  The source field is immutable after creation.
     // Backfill is restricted to execution phase to prevent reviewer/planner
@@ -140,13 +144,16 @@ pub(crate) async fn run_agent_streaming_with_options(
                                 if is_auto_fix_execution && text.contains('\n') {
                                     let complete_len =
                                         output.rfind('\n').map(|i| i + 1).unwrap_or(0);
-                                    backfill_issue_if_found(
-                                        &output[..complete_len],
-                                        &mut last_backfilled_issue,
-                                        store,
-                                        task_id,
-                                    )
-                                    .await;
+                                    if complete_len > issue_scan_pos {
+                                        backfill_issue_if_found(
+                                            &output[issue_scan_pos..complete_len],
+                                            &mut last_backfilled_issue,
+                                            store,
+                                            task_id,
+                                        )
+                                        .await;
+                                        issue_scan_pos = complete_len;
+                                    }
                                 }
                             }
                             StreamItem::ItemCompleted {

@@ -158,30 +158,13 @@ impl CodeAgent for CodexAgent {
         log_captured_stderr(&stderr, self.name());
 
         if !output.status.success() {
-            let stderr_lower = stderr.to_lowercase();
-            // Permanent billing failures (will not recover after a wait).
-            if stderr_lower.contains("payment required")
-                || stderr_lower.contains("insufficient available balance")
-            {
+            if harness_core::error::is_billing_failure_message(&stderr) {
                 return Err(harness_core::error::HarnessError::BillingFailed(format!(
                     "codex billing failure (exit {}): {stderr}",
                     output.status
                 )));
             }
-            // Transient quota exhaustion (rate-limited; may recover after backoff).
-            // Use specific signals only — bare "quota" or "402" appear in normal
-            // subprocess output and cause false non-retryable failures.
-            if stderr_lower.contains("quota exhausted")
-                || stderr_lower.contains("hit your limit")
-                || stderr_lower.contains("rate limit exceeded")
-                || stderr_lower.contains("rate_limit_exceeded")
-                || stderr_lower.contains("too many requests")
-                || stderr_lower.contains("quota resets")
-                || stderr_lower.contains("quota reset")
-                || stderr_lower.contains("status: 429")
-                || stderr_lower.contains("error 429")
-                || stderr_lower.contains("http 429")
-            {
+            if harness_core::error::is_quota_failure_message(&stderr) {
                 return Err(harness_core::error::HarnessError::QuotaExhausted(format!(
                     "codex quota exhausted (exit {}): {stderr}",
                     output.status
@@ -290,26 +273,13 @@ impl CodeAgent for CodexAgent {
         }
         if let Err(error) = stream_result {
             let stderr = captured_stderr_tail(&stderr_capture);
-            let stderr_lower = stderr.to_lowercase();
             if !stderr.is_empty() {
-                if stderr_lower.contains("payment required")
-                    || stderr_lower.contains("insufficient available balance")
-                {
+                if harness_core::error::is_billing_failure_message(&stderr) {
                     return Err(harness_core::error::HarnessError::BillingFailed(format!(
                         "codex billing failure (streamed exit): {stderr}"
                     )));
                 }
-                if stderr_lower.contains("quota exhausted")
-                    || stderr_lower.contains("hit your limit")
-                    || stderr_lower.contains("rate limit exceeded")
-                    || stderr_lower.contains("rate_limit_exceeded")
-                    || stderr_lower.contains("too many requests")
-                    || stderr_lower.contains("quota resets")
-                    || stderr_lower.contains("quota reset")
-                    || stderr_lower.contains("status: 429")
-                    || stderr_lower.contains("error 429")
-                    || stderr_lower.contains("http 429")
-                {
+                if harness_core::error::is_quota_failure_message(&stderr) {
                     return Err(harness_core::error::HarnessError::QuotaExhausted(format!(
                         "codex quota exhausted (streamed exit): {stderr}"
                     )));
