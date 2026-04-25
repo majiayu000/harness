@@ -462,14 +462,16 @@ impl TaskStore {
             return Ok(None);
         }
         let original_scheduler = entry.scheduler.clone();
-        if entry.scheduler.owner.is_some() && entry.scheduler.has_live_runtime_host_lease(now) {
-            return Ok(None);
-        }
-        if entry.scheduler.owner.is_some() && !entry.scheduler.has_live_runtime_host_lease(now) {
-            entry.scheduler.clear_to_queued();
-        }
         if entry.scheduler.owner.is_some() {
-            return Ok(None);
+            // Scheduler owner: never allow a runtime host to steal the task.
+            // RuntimeHost with live lease: the claim is still active.
+            if entry.scheduler.runtime_host_id().is_none()
+                || entry.scheduler.has_live_runtime_host_lease(now)
+            {
+                return Ok(None);
+            }
+            // RuntimeHost with a stale lease: safe to clear and re-claim.
+            entry.scheduler.clear_to_queued();
         }
 
         entry.scheduler.claim_runtime_host(host_id, expires_at);
