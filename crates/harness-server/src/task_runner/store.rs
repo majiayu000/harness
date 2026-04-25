@@ -462,14 +462,18 @@ impl TaskStore {
             return Ok(None);
         }
         let original_scheduler = entry.scheduler.clone();
-        if entry.scheduler.owner.is_some() && entry.scheduler.has_live_runtime_host_lease(now) {
-            return Ok(None);
-        }
-        if entry.scheduler.owner.is_some() && !entry.scheduler.has_live_runtime_host_lease(now) {
-            entry.scheduler.clear_to_queued();
-        }
-        if entry.scheduler.owner.is_some() {
-            return Ok(None);
+        if let Some(owner) = &entry.scheduler.owner.clone() {
+            match owner.kind {
+                super::state::SchedulerOwnerKind::RuntimeHost => {
+                    if entry.scheduler.has_live_runtime_host_lease(now) {
+                        return Ok(None);
+                    }
+                    entry.scheduler.clear_to_queued();
+                }
+                super::state::SchedulerOwnerKind::Scheduler => {
+                    return Ok(None);
+                }
+            }
         }
 
         entry.scheduler.claim_runtime_host(host_id, expires_at);
@@ -1850,6 +1854,60 @@ mod tests {
             crate::task_runner::SchedulerAuthorityState::Queued
         ));
         assert_eq!(task.scheduler.run_generation, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_for_runtime_host_blocked_by_scheduler_owner() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let mut task = pending_task("owned");
+        task.scheduler.claim_scheduler("local-scheduler");
+        // Revert status back to Pending so claim_for_runtime_host sees it
+        task.status = TaskStatus::Pending;
+        let task_id = task.id.clone();
+        store.insert(&task).await;
+
+        let result = store
+            .claim_for_runtime_host(&task_id, "host-a", Some(30))
+            .await?;
+        assert!(
+            result.is_none(),
+            "runtime host must not steal a Scheduler-owned task"
+        );
+
+        let cached = store.get(&task_id).expect("task should remain in cache");
+        assert_eq!(
+            cached.scheduler.owner.as_ref().map(|o| o.id.as_str()),
+            Some("local-scheduler"),
+            "scheduler owner must be preserved"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_for_runtime_host_reclaims_stale_runtime_host_lease() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let mut task = pending_task("stale");
+        // Expired lease: set expiry in the past
+        let past = Utc::now() - chrono::TimeDelta::try_seconds(60).unwrap();
+        task.scheduler.claim_runtime_host("old-host", past);
+        task.status = TaskStatus::Pending;
+        let task_id = task.id.clone();
+        store.insert(&task).await;
+
+        let result = store
+            .claim_for_runtime_host(&task_id, "new-host", Some(30))
+            .await?;
+        assert!(
+            result.is_some(),
+            "stale runtime-host lease must be reclaimed"
+        );
+        let cached = store.get(&task_id).expect("task should remain in cache");
+        assert_eq!(cached.scheduler.runtime_host_id(), Some("new-host"));
         Ok(())
     }
 
