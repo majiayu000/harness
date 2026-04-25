@@ -1,4 +1,7 @@
 [advisories]
+# - RUSTSEC-2023-0071 (rsa, Marvin Attack timing side-channel): https://rustsec.org/advisories/RUSTSEC-2023-0071
+#   rsa is pulled transitively by sqlx-mysql; no fixed release exists (patched = [] in the advisory).
+#   Track upstream: https://github.com/RustCrypto/RSA/issues/19#issuecomment-1822995643
 # The following advisories are pulled via `starlark` 0.13.0 (through `harness-rules`).
 # No newer `starlark` release is currently available to resolve these transitive dependencies.
 # - RUSTSEC-2024-0388 (derivative, use-after-free): https://rustsec.org/advisories/RUSTSEC-2024-0388
@@ -8,6 +11,7 @@
 # - RUSTSEC-2024-0436 (paste, proc-macro soundness): https://rustsec.org/advisories/RUSTSEC-2024-0436
 #   paste is a build-time proc-macro; it does not affect runtime behaviour.
 ignore = [
+    "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0388",
     "RUSTSEC-2025-0057",
     "RUSTSEC-2024-0436",
