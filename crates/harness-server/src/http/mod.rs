@@ -25,6 +25,7 @@ pub(crate) mod rate_limit;
 pub(crate) mod sse_routes;
 pub(crate) mod state;
 pub(crate) mod task_routes;
+pub(crate) mod webhook_routes;
 
 #[cfg(test)]
 mod tests;
@@ -42,10 +43,11 @@ pub use state::{
 // Handler re-exports — moved to focused submodules, kept accessible via `crate::http::`.
 pub(crate) use misc_routes::{
     get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
-    get_task, get_task_artifacts, get_task_prompts, github_webhook, handle_rpc, health_check,
-    ingest_signal, intake_status, list_tasks, password_reset, project_queue_stats,
+    get_task, get_task_artifacts, get_task_prompts, handle_rpc, health_check, ingest_signal,
+    intake_status, list_tasks, password_reset, project_queue_stats,
 };
 pub(crate) use sse_routes::stream_task_sse;
+pub(crate) use webhook_routes::github_webhook;
 
 /// Resolve the reviewer agent for independent agent review.
 ///
