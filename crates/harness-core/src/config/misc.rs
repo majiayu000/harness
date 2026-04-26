@@ -542,6 +542,46 @@ impl Default for RetrySchedulerConfig {
     }
 }
 
+/// Configuration for the periodic GitHub ↔ Harness reconciliation loop.
+///
+/// The loop enumerates every non-terminal task that has a `pr_url` or an
+/// `external_id` like `issue:N` / `pr:N`, fetches the current GitHub state
+/// via `gh`, and applies the appropriate task-status transition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconciliationConfig {
+    /// Whether the reconciliation loop is enabled. Default: true.
+    #[serde(default = "default_reconciliation_enabled")]
+    pub enabled: bool,
+    /// Seconds between reconciliation ticks. Default: 300 (5 minutes).
+    #[serde(default = "default_reconciliation_interval_secs")]
+    pub interval_secs: u64,
+    /// Maximum `gh` CLI calls per minute across all candidates. Default: 20.
+    #[serde(default = "default_reconciliation_max_gh_calls_per_minute")]
+    pub max_gh_calls_per_minute: u32,
+}
+
+fn default_reconciliation_enabled() -> bool {
+    true
+}
+
+fn default_reconciliation_interval_secs() -> u64 {
+    300
+}
+
+fn default_reconciliation_max_gh_calls_per_minute() -> u32 {
+    20
+}
+
+impl Default for ReconciliationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_reconciliation_enabled(),
+            interval_secs: default_reconciliation_interval_secs(),
+            max_gh_calls_per_minute: default_reconciliation_max_gh_calls_per_minute(),
+        }
+    }
+}
+
 /// Daily maintenance window configuration for scheduled restarts and self-updates.
 ///
 /// When enabled, no new tasks are dispatched during the configured time window.
