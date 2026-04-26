@@ -1546,7 +1546,20 @@ mod tests {
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Poll up to 10 s for both the implementation and review-loop turns.
+        // A fixed 300 ms sleep is insufficient in CI: fetch_pr_external_state
+        // runs Command::new("gh") before the review agent call, and even a
+        // fast failure can push the second agent call past 300 ms.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if agent.captured_phases().await.len() >= 2 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         let phases = agent.captured_phases().await;
         assert!(
