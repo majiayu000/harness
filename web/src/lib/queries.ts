@@ -3,6 +3,18 @@ import { useQuery } from "@tanstack/react-query";
 import { apiJson, apiFetch } from "./api";
 import type { DashboardPayload, FullTask, OperatorSnapshotPayload, OverviewPayload, StreamItem, Task } from "@/types";
 
+export interface Project {
+  id: string;
+  root: string;
+}
+
+export function useProjects() {
+  return useQuery<Project[], Error>({
+    queryKey: ["projects"],
+    queryFn: ({ signal }) => apiJson<Project[]>("/projects", { signal }),
+  });
+}
+
 export function useDashboard() {
   return useQuery<DashboardPayload, Error>({
     queryKey: ["dashboard"],

@@ -68,13 +68,37 @@ Harness is a Rust-native platform that wraps AI coding agents (Claude Code, Code
   - [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI
   - Anthropic API key (for direct API adapter)
 
-### Build
+### First-Run Golden Path
+
+Get from zero to a completed agent task in one sitting:
+
+**1. Build**
 
 ```bash
 git clone https://github.com/majiayu000/harness.git
 cd harness
-cargo build
+cargo build --release
 ```
+
+**2. Start the server** (in a dedicated terminal — do not run from within Claude Code or another agent session)
+
+```bash
+./target/release/harness serve --transport http --port 9800 --project-root /path/to/your/repo
+```
+
+**3. Open the web UI**
+
+Navigate to `http://localhost:9800` in your browser.
+
+**4. Register your project**
+
+On the Overview page, click **Register your first project**, enter the path to your git repository, and confirm. You can also use the Projects panel's empty-state button.
+
+**5. Submit a task**
+
+Go to **Tasks → Submit**, pick your project from the dropdown, choose a starter template (or write your own), and click **Submit Task**. The UI navigates you directly into the live task view where you can watch the agent work and inspect the output.
+
+### Build
 
 ### Rust API Facade
 

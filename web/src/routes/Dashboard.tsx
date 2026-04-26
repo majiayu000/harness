@@ -4,6 +4,7 @@ import { Sidebar, type SidebarSection } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
 import { StatusBadge } from "@/components/StatusBadge";
 import { PaletteFab } from "@/components/PaletteFab";
+import { TaskDetailSlideover } from "@/components/TaskDetailSlideover";
 import { Active } from "./dashboard/Active";
 import { History } from "./dashboard/History";
 import { Channels } from "./dashboard/Channels";
@@ -14,6 +15,7 @@ type Tab = "board" | "history" | "channels" | "submit";
 
 export function Dashboard() {
   const [tab, setTab] = useState<Tab>("board");
+  const [liveTaskId, setLiveTaskId] = useState<string | null>(null);
   const { isError } = useDashboard();
   const [searchParams] = useSearchParams();
   const projectFilter = searchParams.get("project");
@@ -55,10 +57,19 @@ export function Dashboard() {
           {tab === "board" && <Active projectFilter={projectFilter} />}
           {tab === "history" && <History projectFilter={projectFilter} />}
           {tab === "channels" && <Channels projectFilter={projectFilter} />}
-          {tab === "submit" && <Submit projectFilter={projectFilter} />}
+          {tab === "submit" && (
+            <Submit
+              projectFilter={projectFilter}
+              onTaskCreated={(id) => {
+                setLiveTaskId(id);
+                setTab("board");
+              }}
+            />
+          )}
         </div>
       </main>
       <PaletteFab />
+      <TaskDetailSlideover taskId={liveTaskId} onClose={() => setLiveTaskId(null)} />
     </div>
   );
 }

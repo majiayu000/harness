@@ -1,6 +1,8 @@
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { OverviewProject } from "@/types";
 import { fmtInt, fmtScore } from "@/lib/format";
+import { RegisterProjectDialog } from "./RegisterProjectDialog";
 
 interface Props {
   projects: OverviewProject[];
@@ -25,12 +27,25 @@ function trendSvg(arr: number[]): string {
 
 export function ProjectsTable({ projects }: Props) {
   const nav = useNavigate();
+  const [showRegister, setShowRegister] = useState(false);
 
   if (!projects.length) {
     return (
-      <div className="px-5 py-5 text-ink-4 font-mono text-[11px]">
-        no projects registered yet — register one via POST /projects
-      </div>
+      <>
+        <div className="px-5 py-8 text-center">
+          <p className="font-mono text-[12px] text-ink-3 mb-3">No projects registered yet</p>
+          <button
+            onClick={() => setShowRegister(true)}
+            className="px-3 py-1.5 bg-rust text-white font-mono text-[12px] border-0"
+          >
+            Register a project
+          </button>
+        </div>
+        <RegisterProjectDialog
+          open={showRegister}
+          onClose={() => setShowRegister(false)}
+        />
+      </>
     );
   }
 
