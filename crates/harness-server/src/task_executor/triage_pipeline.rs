@@ -1,6 +1,6 @@
-use super::helpers::run_agent_streaming;
+use super::helpers::{run_agent_streaming, update_status};
 use crate::task_runner::{
-    mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskPhase, TaskStore,
+    mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskPhase, TaskStatus, TaskStore,
 };
 use harness_core::agent::{AgentRequest, CodeAgent};
 use harness_core::prompts;
@@ -91,6 +91,7 @@ pub(crate) async fn run_triage_plan_pipeline(
         state.phase = TaskPhase::Triage;
     })
     .await?;
+    update_status(store, task_id, TaskStatus::Triaging, 0).await?;
 
     let triage_prompt = prompts::triage_prompt(issue).to_prompt_string();
     let triage_req = AgentRequest {
@@ -158,6 +159,7 @@ pub(crate) async fn run_triage_plan_pipeline(
         state.phase = TaskPhase::Plan;
     })
     .await?;
+    update_status(store, task_id, TaskStatus::Planning, 0).await?;
 
     let plan_prompt = prompts::plan_prompt(issue, &triage_resp.output).to_prompt_string();
     let plan_req = AgentRequest {
