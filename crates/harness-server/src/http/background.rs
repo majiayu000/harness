@@ -426,7 +426,8 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                 }
 
                 // Short-circuit if path is healthy (avoids a registry DB query on every tick).
-                let project_path = if std::path::Path::new(&workflow.project_id).exists() {
+                let project_path = if tokio::fs::metadata(&workflow.project_id).await.is_ok() {
+                    warned_unresolvable.remove(&project_key);
                     std::path::PathBuf::from(&workflow.project_id)
                 } else if let Some(registry) = state.core.project_registry.as_deref() {
                     match registry.resolve_path(&workflow.project_id).await {
@@ -451,12 +452,16 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                         Ok(Some(resolved))
                             if resolved.as_path() != std::path::Path::new(&workflow.project_id) =>
                         {
-                            let _ = issue_workflows
-                                .update_project_path(
-                                    &workflow.id,
-                                    resolved.to_str().unwrap_or_default(),
-                                )
-                                .await;
+                            if let Err(e) = issue_workflows
+                                .update_project_path(&workflow.id, &resolved.to_string_lossy())
+                                .await
+                            {
+                                tracing::error!(
+                                    workflow_id = %workflow.id,
+                                    error = %e,
+                                    "sweeper: failed to update project path"
+                                );
+                            }
                             warned_unresolvable.remove(&project_key);
                             resolved
                         }
