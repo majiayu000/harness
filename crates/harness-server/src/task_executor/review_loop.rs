@@ -1,13 +1,16 @@
 use super::agent_review::jaccard_word_similarity;
-use super::helpers::{run_on_error, run_post_execute, run_pre_execute, update_status};
+use super::helpers::{
+    build_task_event, run_agent_streaming, run_on_error, run_post_execute, run_pre_execute,
+    telemetry_for_timeout, update_status,
+};
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
+use chrono::Utc;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
-use harness_core::error::HarnessError;
 use harness_core::prompts;
 use harness_core::tool_isolation::validate_tool_usage;
-use harness_core::types::{Event, ExecutionPhase, SessionId};
+use harness_core::types::{Decision, ExecutionPhase, TurnFailure, TurnFailureKind};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -248,6 +251,7 @@ pub(crate) async fn run_review_loop(
             base_prompt
         };
 
+        let prompt_built_at = Utc::now();
         let check_req = AgentRequest {
             prompt: round_prompt,
             project_root: project.to_path_buf(),
@@ -273,11 +277,25 @@ pub(crate) async fn run_review_loop(
                 return Ok(());
             }
         }
-        let resp = tokio::time::timeout(turn_timeout, agent.execute(check_req.clone())).await;
+        let review_started_at = Utc::now();
+        let resp = tokio::time::timeout(
+            turn_timeout,
+            run_agent_streaming(
+                agent,
+                check_req.clone(),
+                task_id,
+                store,
+                round,
+                prompt_built_at,
+                review_started_at,
+            ),
+        )
+        .await;
         *turns_used += 1;
         *turns_used_acc = *turns_used;
         let resp = match resp {
-            Ok(Ok(r)) => {
+            Ok(Ok(success)) => {
+                let r = success.response;
                 let tool_violations = validate_tool_usage(
                     &r.output,
                     check_req.allowed_tools.as_deref().unwrap_or(&[]),
@@ -304,29 +322,83 @@ pub(crate) async fn run_review_loop(
                     pending_test_failure =
                         Some(format!("Post-execution validation failed:\n{val_err}"));
                 }
-                r
+                (r, success.telemetry)
             }
-            Ok(Err(e)) => {
+            Ok(Err(failure)) => {
                 // Quota/billing failures are not retryable — break immediately instead of
                 // burning remaining review rounds on repeated errors.
                 // Do NOT activate the global rate-limit circuit breaker: the reviewer
                 // agent is configured independently from the implementation agent and a
                 // depleted reviewer account must not stall unrelated implementation tasks.
                 if matches!(
-                    e,
-                    HarnessError::QuotaExhausted(_) | HarnessError::BillingFailed(_)
+                    failure.failure.kind,
+                    TurnFailureKind::Quota | TurnFailureKind::Billing
                 ) {
-                    tracing::error!(round, error = %e, "quota/billing failure during review — aborting review loop");
-                    run_on_error(interceptors, &check_req, &e.to_string()).await;
+                    tracing::error!(round, error = %failure.error, "quota/billing failure during review — aborting review loop");
+                    run_on_error(interceptors, &check_req, &failure.error.to_string()).await;
                     mutate_and_persist(store, task_id, |s| {
                         s.status = TaskStatus::Failed;
-                        s.error = Some(e.to_string());
+                        s.error = Some(failure.error.to_string());
+                        s.rounds.push(RoundResult::new(
+                            round,
+                            "review",
+                            match failure.failure.kind {
+                                TurnFailureKind::Quota => "quota_exhausted",
+                                TurnFailureKind::Billing => "billing_failed",
+                                TurnFailureKind::Upstream => "upstream_failure",
+                                _ => "failed",
+                            },
+                            None,
+                            Some(failure.telemetry.clone()),
+                            Some(failure.failure.clone()),
+                        ));
                     })
                     .await?;
+                    let event = build_task_event(
+                        task_id,
+                        round,
+                        "review",
+                        "pr_review",
+                        Decision::Block,
+                        Some("review round failed".to_string()),
+                        Some(format!("pr={pr_num}")),
+                        Some(failure.telemetry),
+                        Some(failure.failure),
+                        None,
+                    );
+                    if let Err(error) = events.log(&event).await {
+                        tracing::warn!("failed to log pr_review event: {error}");
+                    }
                     return Ok(());
                 }
-                run_on_error(interceptors, &check_req, &e.to_string()).await;
-                return Err(e.into());
+                run_on_error(interceptors, &check_req, &failure.error.to_string()).await;
+                mutate_and_persist(store, task_id, |s| {
+                    s.rounds.push(RoundResult::new(
+                        round,
+                        "review",
+                        "failed",
+                        None,
+                        Some(failure.telemetry.clone()),
+                        Some(failure.failure.clone()),
+                    ));
+                })
+                .await?;
+                let event = build_task_event(
+                    task_id,
+                    round,
+                    "review",
+                    "pr_review",
+                    Decision::Block,
+                    Some("review round failed".to_string()),
+                    Some(format!("pr={pr_num}")),
+                    Some(failure.telemetry),
+                    Some(failure.failure),
+                    None,
+                );
+                if let Err(error) = events.log(&event).await {
+                    tracing::warn!("failed to log pr_review event: {error}");
+                }
+                return Err(failure.error.into());
             }
             Err(_) => {
                 let msg = format!(
@@ -334,11 +406,46 @@ pub(crate) async fn run_review_loop(
                     turn_timeout.as_secs()
                 );
                 run_on_error(interceptors, &check_req, &msg).await;
+                let telemetry =
+                    telemetry_for_timeout(prompt_built_at, review_started_at, Utc::now(), None);
+                let failure = TurnFailure {
+                    kind: TurnFailureKind::Timeout,
+                    provider: Some(agent.name().to_string()),
+                    upstream_status: None,
+                    message: Some(msg.clone()),
+                    body_excerpt: None,
+                };
+                mutate_and_persist(store, task_id, |s| {
+                    s.rounds.push(RoundResult::new(
+                        round,
+                        "review",
+                        "timeout",
+                        None,
+                        Some(telemetry.clone()),
+                        Some(failure.clone()),
+                    ));
+                })
+                .await?;
+                let event = build_task_event(
+                    task_id,
+                    round,
+                    "review",
+                    "pr_review",
+                    Decision::Block,
+                    Some("review round timed out".to_string()),
+                    Some(format!("pr={pr_num}")),
+                    Some(telemetry),
+                    Some(failure),
+                    None,
+                );
+                if let Err(error) = events.log(&event).await {
+                    tracing::warn!("failed to log pr_review event: {error}");
+                }
                 return Err(anyhow::anyhow!("{msg}"));
             }
         };
 
-        let AgentResponse { output, stderr, .. } = resp;
+        let (AgentResponse { output, stderr, .. }, review_telemetry) = resp;
 
         if !stderr.is_empty() {
             tracing::warn!(round, stderr = %stderr, "agent stderr during review check");
@@ -453,15 +560,31 @@ pub(crate) async fn run_review_loop(
                 "PR #{pr_num} reviewer quota exhausted; not consuming a review round"
             );
             mutate_and_persist(store, task_id, |s| {
-                s.rounds.push(RoundResult {
-                    turn: round,
-                    action: "review".into(),
-                    result: "quota_exhausted".into(),
-                    detail: None,
-                    first_token_latency_ms: None,
-                });
+                s.rounds.push(RoundResult::new(
+                    round,
+                    "review",
+                    "quota_exhausted",
+                    None,
+                    Some(review_telemetry.clone()),
+                    None,
+                ));
             })
             .await?;
+            let event = build_task_event(
+                task_id,
+                round,
+                "review",
+                "pr_review",
+                Decision::Warn,
+                Some(format!("round {round}: quota exhausted")),
+                Some(format!("pr={pr_num}")),
+                Some(review_telemetry.clone()),
+                None,
+                Some(output.clone()),
+            );
+            if let Err(error) = events.log(&event).await {
+                tracing::warn!("failed to log pr_review event: {error}");
+            }
 
             if quota_exhausted_rounds >= QUOTA_EXHAUSTED_THRESHOLD && !lgtm_test_gate_rejected {
                 tracing::info!(
@@ -522,13 +645,14 @@ pub(crate) async fn run_review_loop(
 
         let result_label = if lgtm { "lgtm" } else { "fixed" };
         mutate_and_persist(store, task_id, |s| {
-            s.rounds.push(RoundResult {
-                turn: round,
-                action: "review".into(),
-                result: result_label.into(),
-                detail: None,
-                first_token_latency_ms: None,
-            });
+            s.rounds.push(RoundResult::new(
+                round,
+                "review",
+                result_label,
+                None,
+                Some(review_telemetry.clone()),
+                None,
+            ));
         })
         .await?;
 
@@ -541,20 +665,23 @@ pub(crate) async fn run_review_loop(
         });
 
         // Log pr_review event for observability and GC signal detection.
-        let mut ev = Event::new(
-            SessionId::new(),
+        let event = build_task_event(
+            task_id,
+            round,
+            "review",
             "pr_review",
-            "task_runner",
             if lgtm {
-                harness_core::types::Decision::Complete
+                Decision::Complete
             } else {
-                harness_core::types::Decision::Warn
+                Decision::Warn
             },
+            Some(format!("round {round}: {result_label}")),
+            Some(format!("pr={pr_num}")),
+            Some(review_telemetry.clone()),
+            None,
+            Some(output.clone()),
         );
-        ev.detail = Some(format!("pr={pr_num}"));
-        let result_label = if lgtm { "lgtm" } else { "fixed" };
-        ev.reason = Some(format!("round {round}: {result_label}"));
-        if let Err(e) = events.log(&ev).await {
+        if let Err(e) = events.log(&event).await {
             tracing::warn!("failed to log pr_review event: {e}");
         }
 

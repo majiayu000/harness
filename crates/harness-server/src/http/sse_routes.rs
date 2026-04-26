@@ -55,7 +55,19 @@ pub(crate) async fn stream_task_sse(
                         .rounds
                         .iter()
                         .filter_map(|r| {
-                            let text = format!("[turn {}] {}\n{}", r.turn, r.action, r.result);
+                            let mut text = format!("[turn {}] {}\n{}", r.turn, r.action, r.result);
+                            if let Some(detail) = &r.detail {
+                                text.push_str("\n\n");
+                                text.push_str(detail);
+                            }
+                            if let Some(telemetry) = &r.telemetry {
+                                text.push_str("\n\ntelemetry=");
+                                text.push_str(&serde_json::to_string(telemetry).ok()?);
+                            }
+                            if let Some(failure) = &r.failure {
+                                text.push_str("\nfailure=");
+                                text.push_str(&serde_json::to_string(failure).ok()?);
+                            }
                             let item = StreamItem::MessageDelta { text };
                             serde_json::to_string(&item)
                                 .ok()

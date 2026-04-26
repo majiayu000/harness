@@ -1,15 +1,18 @@
 use super::helpers::{
-    collect_context_items, detect_modified_files, inject_skills_into_prompt,
+    build_task_event, collect_context_items, detect_modified_files, inject_skills_into_prompt,
     matched_skills_for_prompt, run_agent_streaming, run_on_error, run_post_execute,
-    run_post_tool_use, run_pre_execute, update_status,
+    run_post_tool_use, run_pre_execute, telemetry_for_timeout, update_status,
 };
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, TaskFailureKind, TaskId, TaskStatus, TaskStore,
 };
+use chrono::Utc;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::interceptor::ToolUseEvent;
 use harness_core::tool_isolation::validate_tool_usage;
-use harness_core::types::{ContextItem, Decision, Event, ExecutionPhase, SessionId};
+use harness_core::types::{
+    ContextItem, Decision, Event, ExecutionPhase, SessionId, TurnFailure, TurnFailureKind,
+};
 use harness_core::{lang_detect, prompts};
 use std::collections::HashMap;
 use std::path::Path;
@@ -71,6 +74,18 @@ pub(crate) fn prepend_constitution(prompt: String, enabled: bool) -> String {
 /// prompt-only implementation tasks may complete without creating one.
 pub(crate) fn task_needs_pr_url(req: &CreateTaskRequest) -> bool {
     req.task_kind().requires_pr_url()
+}
+
+fn implementation_failure_result(failure: &TurnFailure) -> &'static str {
+    match failure.kind {
+        TurnFailureKind::Timeout => "timeout",
+        TurnFailureKind::Quota => "quota_exhausted",
+        TurnFailureKind::Billing => "billing_failed",
+        TurnFailureKind::Upstream => "upstream_failure",
+        TurnFailureKind::LocalProcess => "local_process_failure",
+        TurnFailureKind::Protocol => "protocol_failure",
+        TurnFailureKind::Unknown => "failed",
+    }
 }
 
 /// Outcome of the implement phase.
@@ -309,13 +324,14 @@ pub(crate) async fn run_implement_phase(
             };
             mutate_and_persist(store, task_id, |s| {
                 s.pr_url = Some(pr_str.clone());
-                s.rounds.push(RoundResult {
-                    turn: 1,
-                    action: "implement".into(),
-                    result: "resumed_checkpoint".into(),
-                    detail: None,
-                    first_token_latency_ms: None,
-                });
+                s.rounds.push(RoundResult::new(
+                    1,
+                    "implement",
+                    "resumed_checkpoint",
+                    None,
+                    None,
+                    None,
+                ));
             })
             .await?;
             break 'implement (Some(pr_str), n);
@@ -358,15 +374,28 @@ pub(crate) async fn run_implement_phase(
                     ));
                 }
             }
+            let prompt_built_at = Utc::now();
+            let agent_started_at = Utc::now();
             let raw = tokio::time::timeout(
                 turn_timeout,
-                run_agent_streaming(agent, impl_req.clone(), task_id, store, 1),
+                run_agent_streaming(
+                    agent,
+                    impl_req.clone(),
+                    task_id,
+                    store,
+                    1,
+                    prompt_built_at,
+                    agent_started_at,
+                ),
             )
             .await;
             *turns_used += 1;
             *turns_used_acc = *turns_used;
             match raw {
-                Ok(Ok((r, impl_first_token_ms))) => {
+                Ok(Ok(success)) => {
+                    let mut impl_telemetry = success.telemetry.clone();
+                    impl_telemetry.retry_count = Some(validation_attempt);
+                    let r = success.response;
                     // Post-execution tool isolation check (defense-in-depth alongside
                     // --allowedTools CLI enforcement). Violations feed into the retry loop
                     // so the agent gets a chance to self-correct (fail-closed, not fail-open).
@@ -434,6 +463,39 @@ pub(crate) async fn run_implement_phase(
                                 "post-execution validation failed after max retries; aborting task"
                             );
                             run_on_error(interceptors, &impl_req, &err).await;
+                            let failure = TurnFailure {
+                                kind: TurnFailureKind::Protocol,
+                                provider: Some(agent.name().to_string()),
+                                upstream_status: None,
+                                message: Some(err.clone()),
+                                body_excerpt: None,
+                            };
+                            mutate_and_persist(store, task_id, |s| {
+                                s.rounds.push(RoundResult::new(
+                                    1,
+                                    "implement",
+                                    implementation_failure_result(&failure),
+                                    Some(r.output.clone()),
+                                    Some(impl_telemetry.clone()),
+                                    Some(failure.clone()),
+                                ));
+                            })
+                            .await?;
+                            let event = build_task_event(
+                                task_id,
+                                1,
+                                "implement",
+                                "task_implement",
+                                Decision::Block,
+                                Some("implementation validation failed".to_string()),
+                                None,
+                                Some(impl_telemetry.clone()),
+                                Some(failure),
+                                Some(r.output.clone()),
+                            );
+                            if let Err(log_err) = events.log(&event).await {
+                                tracing::warn!("failed to log task_implement event: {log_err}");
+                            }
                             return Err(anyhow::anyhow!(
                                 "Post-execution validation failed after {} attempts: {}",
                                 max_validation_retries,
@@ -441,11 +503,39 @@ pub(crate) async fn run_implement_phase(
                             ));
                         }
                     }
-                    break (r, impl_first_token_ms);
+                    break (r, impl_telemetry);
                 }
-                Ok(Err(e)) => {
-                    run_on_error(interceptors, &impl_req, &e.to_string()).await;
-                    return Err(e.into());
+                Ok(Err(failure)) => {
+                    let mut telemetry = failure.telemetry.clone();
+                    telemetry.retry_count = Some(validation_attempt);
+                    run_on_error(interceptors, &impl_req, &failure.error.to_string()).await;
+                    mutate_and_persist(store, task_id, |s| {
+                        s.rounds.push(RoundResult::new(
+                            1,
+                            "implement",
+                            implementation_failure_result(&failure.failure),
+                            None,
+                            Some(telemetry.clone()),
+                            Some(failure.failure.clone()),
+                        ));
+                    })
+                    .await?;
+                    let event = build_task_event(
+                        task_id,
+                        1,
+                        "implement",
+                        "task_implement",
+                        Decision::Block,
+                        Some("implementation failed".to_string()),
+                        None,
+                        Some(telemetry),
+                        Some(failure.failure.clone()),
+                        None,
+                    );
+                    if let Err(log_err) = events.log(&event).await {
+                        tracing::warn!("failed to log task_implement event: {log_err}");
+                    }
+                    return Err(failure.error.into());
                 }
                 Err(_) => {
                     let msg = format!(
@@ -453,6 +543,45 @@ pub(crate) async fn run_implement_phase(
                         turn_timeout.as_secs()
                     );
                     run_on_error(interceptors, &impl_req, &msg).await;
+                    let telemetry = telemetry_for_timeout(
+                        prompt_built_at,
+                        agent_started_at,
+                        Utc::now(),
+                        Some(validation_attempt),
+                    );
+                    let failure = TurnFailure {
+                        kind: TurnFailureKind::Timeout,
+                        provider: Some(agent.name().to_string()),
+                        upstream_status: None,
+                        message: Some(msg.clone()),
+                        body_excerpt: None,
+                    };
+                    mutate_and_persist(store, task_id, |s| {
+                        s.rounds.push(RoundResult::new(
+                            1,
+                            "implement",
+                            "timeout",
+                            None,
+                            Some(telemetry.clone()),
+                            Some(failure.clone()),
+                        ));
+                    })
+                    .await?;
+                    let event = build_task_event(
+                        task_id,
+                        1,
+                        "implement",
+                        "task_implement",
+                        Decision::Block,
+                        Some("implementation timed out".to_string()),
+                        None,
+                        Some(telemetry),
+                        Some(failure),
+                        None,
+                    );
+                    if let Err(log_err) = events.log(&event).await {
+                        tracing::warn!("failed to log task_implement event: {log_err}");
+                    }
                     return Err(anyhow::anyhow!("{msg}"));
                 }
             }
@@ -465,7 +594,7 @@ pub(crate) async fn run_implement_phase(
                 token_usage: impl_token_usage,
                 ..
             },
-            impl_first_token_ms,
+            impl_telemetry,
         ) = resp;
 
         tracing::info!(
@@ -513,24 +642,105 @@ pub(crate) async fn run_implement_phase(
                     "WorktreeCollision: agent observed worktree managed by another harness session; reconciliation required"
                         .into(),
                 );
-                s.rounds.push(RoundResult {
-                    turn: 1,
-                    action: "implement".into(),
-                    result: "workspace_lifecycle_collision".into(),
-                    detail: if output.is_empty() {
+                s.rounds.push(RoundResult::new(
+                    1,
+                    "implement",
+                    "worktree_collision",
+                    if output.is_empty() {
                         None
                     } else {
                         Some(output.clone())
                     },
-                    first_token_latency_ms: impl_first_token_ms,
-                });
+                    Some(impl_telemetry.clone()),
+                    None,
+                ));
             })
             .await?;
+            let event = build_task_event(
+                task_id,
+                1,
+                "implement",
+                "task_implement",
+                Decision::Block,
+                Some("worktree collision detected".to_string()),
+                collision_pr_url.clone().map(|url| format!("pr_url={url}")),
+                Some(impl_telemetry.clone()),
+                None,
+                if output.is_empty() {
+                    None
+                } else {
+                    Some(output.clone())
+                },
+            );
+            if let Err(error) = events.log(&event).await {
+                tracing::warn!("failed to log task_implement event: {error}");
+            }
             tracing::info!(
                 task_id = %task_id,
                 status = "failed",
                 turns = 1,
                 pr_url = ?collision_pr_url,
+                total_elapsed_secs = task_start.elapsed().as_secs(),
+                "task_completed"
+            );
+            return Ok(ImplementOutcome::Done);
+        }
+
+        // Review-only tasks produce a report, not a PR.
+        // Persist the output and return immediately — no PR parsing or review loop.
+        let is_review_task = store.get(task_id).is_some_and(|s| {
+            matches!(
+                s.source.as_deref(),
+                Some("periodic_review") | Some("sprint_planner")
+            )
+        });
+
+        if is_review_task {
+            mutate_and_persist(store, task_id, |s| {
+                s.status = TaskStatus::Done;
+                s.turn = 1;
+                s.rounds.push(RoundResult::new(
+                    1,
+                    "review",
+                    "completed",
+                    if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.clone())
+                    },
+                    Some(impl_telemetry.clone()),
+                    None,
+                ));
+            })
+            .await?;
+            let event = build_task_event(
+                task_id,
+                1,
+                "review",
+                "task_review",
+                Decision::Complete,
+                Some("review-only task completed".to_string()),
+                None,
+                Some(impl_telemetry.clone()),
+                None,
+                if output.is_empty() {
+                    None
+                } else {
+                    Some(output.clone())
+                },
+            );
+            if let Err(error) = events.log(&event).await {
+                tracing::warn!("failed to log task_review event: {error}");
+            }
+            store.log_event(crate::event_replay::TaskEvent::Completed {
+                task_id: task_id.0.clone(),
+                ts: crate::event_replay::now_ts(),
+            });
+            tracing::info!(
+                task_id = %task_id,
+                status = "done",
+                turns = 1,
+                pr_url = tracing::field::Empty,
                 total_elapsed_secs = task_start.elapsed().as_secs(),
                 "task_completed"
             );
@@ -576,19 +786,39 @@ pub(crate) async fn run_implement_phase(
                     s.status = TaskStatus::Failed;
                     s.turn = 2;
                     s.error = Some(plan_issue.clone());
-                    s.rounds.push(RoundResult {
-                        turn: 1,
-                        action: "implement".into(),
-                        result: "plan_issue".into(),
-                        detail: if output.is_empty() {
+                    s.rounds.push(RoundResult::new(
+                        1,
+                        "implement",
+                        "plan_issue",
+                        if output.is_empty() {
                             None
                         } else {
                             Some(output.clone())
                         },
-                        first_token_latency_ms: impl_first_token_ms,
-                    });
+                        Some(impl_telemetry.clone()),
+                        None,
+                    ));
                 })
                 .await?;
+                let event = build_task_event(
+                    task_id,
+                    1,
+                    "implement",
+                    "task_implement",
+                    Decision::Block,
+                    Some(plan_issue.clone()),
+                    None,
+                    Some(impl_telemetry.clone()),
+                    None,
+                    if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.clone())
+                    },
+                );
+                if let Err(error) = events.log(&event).await {
+                    tracing::warn!("failed to log task_implement event: {error}");
+                }
                 tracing::info!(
                     task_id = %task_id,
                     status = "failed",
@@ -608,21 +838,22 @@ pub(crate) async fn run_implement_phase(
 
         mutate_and_persist(store, task_id, |s| {
             s.pr_url = pr_url.clone();
-            s.rounds.push(RoundResult {
-                turn: 1,
-                action: "implement".into(),
-                result: if pr_num.is_some() {
-                    "pr_created".into()
+            s.rounds.push(RoundResult::new(
+                1,
+                "implement",
+                if pr_num.is_some() {
+                    "pr_created"
                 } else {
-                    "no_pr".into()
+                    "no_pr"
                 },
-                detail: if output.is_empty() {
+                if output.is_empty() {
                     None
                 } else {
                     Some(output.clone())
                 },
-                first_token_latency_ms: impl_first_token_ms,
-            });
+                Some(impl_telemetry.clone()),
+                None,
+            ));
         })
         .await?;
 
@@ -696,18 +927,6 @@ pub(crate) async fn run_implement_phase(
             }
         }
 
-        // Log implementation event
-        let mut ev = Event::new(
-            SessionId::new(),
-            "task_implement",
-            "task_runner",
-            harness_core::types::Decision::Complete,
-        );
-        ev.detail = pr_num.map(|n| format!("pr={n}"));
-        if let Err(e) = events.log(&ev).await {
-            tracing::warn!("failed to log task_implement event: {e}");
-        }
-
         let Some(pr_num) = pr_num else {
             if output.trim().is_empty() {
                 tracing::warn!(
@@ -720,6 +939,21 @@ pub(crate) async fn run_implement_phase(
                     s.error = Some("empty agent output: no PR created and no output".to_string());
                 })
                 .await?;
+                let event = build_task_event(
+                    task_id,
+                    1,
+                    "implement",
+                    "task_implement",
+                    Decision::Block,
+                    Some("implementation produced no output".to_string()),
+                    None,
+                    Some(impl_telemetry.clone()),
+                    None,
+                    None,
+                );
+                if let Err(error) = events.log(&event).await {
+                    tracing::warn!("failed to log task_implement event: {error}");
+                }
                 store.log_event(crate::event_replay::TaskEvent::Completed {
                     task_id: task_id.0.clone(),
                     ts: crate::event_replay::now_ts(),
@@ -752,6 +986,21 @@ pub(crate) async fn run_implement_phase(
                     );
                 })
                 .await?;
+                let event = build_task_event(
+                    task_id,
+                    1,
+                    "implement",
+                    "task_implement",
+                    Decision::Block,
+                    Some("task required PR_URL but none was produced".to_string()),
+                    None,
+                    Some(impl_telemetry.clone()),
+                    None,
+                    Some(output.clone()),
+                );
+                if let Err(error) = events.log(&event).await {
+                    tracing::warn!("failed to log task_implement event: {error}");
+                }
             } else {
                 tracing::warn!("no PR number found in agent output; skipping review");
                 mutate_and_persist(store, task_id, |s| {
@@ -759,6 +1008,21 @@ pub(crate) async fn run_implement_phase(
                     s.turn = 2;
                 })
                 .await?;
+                let event = build_task_event(
+                    task_id,
+                    1,
+                    "implement",
+                    "task_implement",
+                    Decision::Complete,
+                    Some("implementation completed without PR".to_string()),
+                    None,
+                    Some(impl_telemetry.clone()),
+                    None,
+                    Some(output.clone()),
+                );
+                if let Err(error) = events.log(&event).await {
+                    tracing::warn!("failed to log task_implement event: {error}");
+                }
             }
             store.log_event(crate::event_replay::TaskEvent::Completed {
                 task_id: task_id.0.clone(),
@@ -774,6 +1038,26 @@ pub(crate) async fn run_implement_phase(
             );
             return Ok(ImplementOutcome::Done);
         };
+
+        let event = build_task_event(
+            task_id,
+            1,
+            "implement",
+            "task_implement",
+            Decision::Complete,
+            Some("implementation completed".to_string()),
+            Some(format!("pr={pr_num}")),
+            Some(impl_telemetry.clone()),
+            None,
+            if output.is_empty() {
+                None
+            } else {
+                Some(output.clone())
+            },
+        );
+        if let Err(error) = events.log(&event).await {
+            tracing::warn!("failed to log task_implement event: {error}");
+        }
 
         (pr_url, pr_num)
     }; // end 'implement

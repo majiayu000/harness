@@ -128,7 +128,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         Method::SkillStale => Some(handlers::skills::skill_stale(state, id).await),
 
         // === Events / Metrics ===
-        Method::EventLog { event } => Some(handlers::observe::event_log(state, id, event).await),
+        Method::EventLog { event } => Some(handlers::observe::event_log(state, id, *event).await),
         Method::EventQuery { filters } => {
             Some(handlers::observe::event_query(state, id, filters).await)
         }

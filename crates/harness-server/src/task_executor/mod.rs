@@ -17,6 +17,7 @@ use harness_core::tool_isolation::validate_tool_usage;
 use harness_core::{config::project::load_project_config, lang_detect, prompts};
 use std::collections::HashMap;
 
+use chrono::Utc;
 use helpers::update_status;
 
 /// Extract tool list from a capability profile, returning an error if the
@@ -203,6 +204,7 @@ async fn run_non_implementation_task(
         prompt = format!("{note}\n\n{prompt}");
     }
 
+    let prompt_built_at = Utc::now();
     let initial_req = AgentRequest {
         prompt,
         project_root: project.to_path_buf(),
@@ -222,7 +224,7 @@ async fn run_non_implementation_task(
     let mut validation_attempt = 0u32;
     let mut turn_req = first_req.clone();
 
-    let (resp, first_token_latency_ms) = loop {
+    let resp = loop {
         if let Some(max) = effective_max_turns {
             if *turns_used >= max {
                 anyhow::bail!(
@@ -232,15 +234,25 @@ async fn run_non_implementation_task(
                 );
             }
         }
+        let agent_started_at = Utc::now();
         let raw = tokio::time::timeout(
             turn_timeout,
-            helpers::run_agent_streaming(agent, turn_req.clone(), task_id, store, 1),
+            helpers::run_agent_streaming(
+                agent,
+                turn_req.clone(),
+                task_id,
+                store,
+                1,
+                prompt_built_at,
+                agent_started_at,
+            ),
         )
         .await;
         *turns_used += 1;
         *turns_used_acc = *turns_used;
         match raw {
-            Ok(Ok((response, latency_ms))) => {
+            Ok(Ok(success)) => {
+                let response = &success.response;
                 let turn_tools = turn_req.allowed_tools.as_deref().unwrap_or(&[]);
                 let tool_violations = validate_tool_usage(&response.output, turn_tools);
                 let violation_err: Option<String> = if tool_violations.is_empty() {
@@ -265,7 +277,7 @@ async fn run_non_implementation_task(
                         helpers::run_post_tool_use(interceptors, &hook_event, project).await
                     }
                 };
-                let post_err = helpers::run_post_execute(interceptors, &turn_req, &response).await;
+                let post_err = helpers::run_post_execute(interceptors, &turn_req, response).await;
                 if let Some(err) = violation_err.or(hook_err).or(post_err) {
                     if validation_attempt < max_validation_retries {
                         validation_attempt += 1;
@@ -291,11 +303,11 @@ async fn run_non_implementation_task(
                         err
                     );
                 }
-                break (response, latency_ms);
+                break success;
             }
             Ok(Err(err)) => {
-                helpers::run_on_error(interceptors, &turn_req, &err.to_string()).await;
-                return Err(err.into());
+                helpers::run_on_error(interceptors, &turn_req, &err.error.to_string()).await;
+                return Err(err.error.into());
             }
             Err(_) => {
                 let msg = format!(
@@ -309,7 +321,8 @@ async fn run_non_implementation_task(
         }
     };
 
-    if implement_pipeline::contains_worktree_collision_sentinel(&resp.output) {
+    if implement_pipeline::contains_worktree_collision_sentinel(&resp.response.output) {
+        let collision_telemetry = resp.telemetry.clone();
         mutate_and_persist(store, task_id, |s| {
             s.status = TaskStatus::Failed;
             s.turn = 1;
@@ -317,17 +330,18 @@ async fn run_non_implementation_task(
                 "WorktreeCollision: agent observed worktree managed by another harness session"
                     .into(),
             );
-            s.rounds.push(crate::task_runner::RoundResult {
-                turn: 1,
-                action: task_kind.as_ref().to_string(),
-                result: "worktree_collision".into(),
-                detail: if resp.output.is_empty() {
+            s.rounds.push(crate::task_runner::RoundResult::new(
+                1,
+                task_kind.as_ref().to_string(),
+                "worktree_collision",
+                if resp.response.output.is_empty() {
                     None
                 } else {
-                    Some(resp.output.clone())
+                    Some(resp.response.output.clone())
                 },
-                first_token_latency_ms,
-            });
+                Some(collision_telemetry),
+                None,
+            ));
         })
         .await?;
         tracing::info!(
@@ -340,20 +354,22 @@ async fn run_non_implementation_task(
         return Ok(());
     }
 
+    let done_telemetry = resp.telemetry.clone();
     mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Done;
         s.turn = 1;
-        s.rounds.push(crate::task_runner::RoundResult {
-            turn: 1,
-            action: task_kind.as_ref().to_string(),
-            result: "completed".into(),
-            detail: if resp.output.is_empty() {
+        s.rounds.push(crate::task_runner::RoundResult::new(
+            1,
+            task_kind.as_ref().to_string(),
+            "completed",
+            if resp.response.output.is_empty() {
                 None
             } else {
-                Some(resp.output.clone())
+                Some(resp.response.output.clone())
             },
-            first_token_latency_ms,
-        });
+            Some(done_telemetry),
+            None,
+        ));
     })
     .await?;
     store.log_event(crate::event_replay::TaskEvent::Completed {
@@ -534,7 +550,7 @@ pub(crate) async fn run_task(
             (None, prompts::TriageComplexity::Medium, 0u32)
         } else {
             triage_pipeline::run_triage_plan_pipeline(
-                agent, store, task_id, issue, &cargo_env, &project, req,
+                agent, store, task_id, issue, &events, &cargo_env, &project, req,
             )
             .await?
         }
@@ -552,8 +568,10 @@ pub(crate) async fn run_task(
             // it and fail-close it (no pr_url → mark failed), rather than leaving it stuck
             // as a plain 'pending' that is never re-dispatched.
             update_status(store, task_id, TaskStatus::Implementing, 1).await?;
-            triage_pipeline::run_plan_for_prompt(agent, store, task_id, &cargo_env, &project, req)
-                .await?
+            triage_pipeline::run_plan_for_prompt(
+                agent, store, task_id, &events, &cargo_env, &project, req,
+            )
+            .await?
         } else {
             (None, prompts::TriageComplexity::Medium, 0u32)
         }

@@ -139,7 +139,7 @@ pub enum Method {
 
     // === Observability ===
     EventLog {
-        event: Event,
+        event: Box<Event>,
     },
     EventQuery {
         filters: EventFilters,

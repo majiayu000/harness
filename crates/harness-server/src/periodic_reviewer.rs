@@ -2101,13 +2101,14 @@ mod tests {
         let task_id = harness_core::types::TaskId("cancelled-review".to_string());
         let mut task = crate::task_runner::TaskState::new(task_id.clone());
         task.status = crate::task_runner::TaskStatus::Cancelled;
-        task.rounds.push(crate::task_runner::RoundResult {
-            turn: 1,
-            action: "review".to_string(),
-            result: "cancelled".to_string(),
-            detail: Some("cancelled output should be ignored".to_string()),
-            first_token_latency_ms: None,
-        });
+        task.rounds.push(crate::task_runner::RoundResult::new(
+            1,
+            "review",
+            "cancelled",
+            Some("cancelled output should be ignored".to_string()),
+            None,
+            None,
+        ));
         store.insert(&task).await;
 
         let output = poll_task_output(&store, &task_id, 0).await;

@@ -1,6 +1,7 @@
 use crate::cloud_setup;
 use crate::streaming::{
-    filter_agent_stderr, log_captured_stderr, send_stream_item, stream_child_output,
+    captured_stderr_tail, enrich_stream_exit_error, filter_agent_stderr_with_capture,
+    log_captured_stderr, send_stream_item, stream_child_output,
 };
 use async_trait::async_trait;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
@@ -11,6 +12,7 @@ use harness_sandbox::{wrap_command, SandboxSpec};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 
 pub struct CodexAgent {
@@ -156,18 +158,13 @@ impl CodeAgent for CodexAgent {
         log_captured_stderr(&stderr, self.name());
 
         if !output.status.success() {
-            let stderr_lower = stderr.to_lowercase();
-            // Permanent billing failures (will not recover after a wait).
-            if stderr_lower.contains("payment required")
-                || stderr_lower.contains("insufficient available balance")
-            {
+            if harness_core::error::is_billing_failure_message(&stderr) {
                 return Err(harness_core::error::HarnessError::BillingFailed(format!(
                     "codex billing failure (exit {}): {stderr}",
                     output.status
                 )));
             }
-            // Transient quota exhaustion (rate-limited; may recover after backoff).
-            if stderr_lower.contains("402") || stderr_lower.contains("quota") {
+            if harness_core::error::is_quota_failure_message(&stderr) {
                 return Err(harness_core::error::HarnessError::QuotaExhausted(format!(
                     "codex quota exhausted (exit {}): {stderr}",
                     output.status
@@ -243,18 +240,53 @@ impl CodeAgent for CodexAgent {
             ))
         })?;
 
+        let stderr_capture = Arc::new(Mutex::new(String::new()));
+        let mut stderr_task = None;
         if let Some(stderr) = child.stderr.take() {
             let agent = self.name().to_string();
-            tokio::spawn(async move {
-                filter_agent_stderr(stderr, &agent).await;
-            });
+            let captured = Arc::clone(&stderr_capture);
+            stderr_task = Some(tokio::spawn(async move {
+                filter_agent_stderr_with_capture(stderr, &agent, Some(captured)).await;
+            }));
         }
 
         let idle_timeout = self
             .stream_timeout_secs
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
-        stream_child_output(&mut child, &tx, self.name(), idle_timeout).await?;
+        let stream_result = stream_child_output(&mut child, &tx, self.name(), idle_timeout).await;
+        let stream_send_failed = matches!(
+            &stream_result,
+            Err(harness_core::error::HarnessError::AgentExecution(message))
+                if message.contains("stream send failed")
+        );
+        if stream_result.is_err() {
+            #[cfg(unix)]
+            crate::kill_process_group(&child);
+            let _ = child.start_kill();
+        }
+        if stream_send_failed {
+            return Err(stream_result.expect_err("stream send failures return an error"));
+        }
+        if let Some(stderr_task) = stderr_task {
+            let _ = stderr_task.await;
+        }
+        if let Err(error) = stream_result {
+            let stderr = captured_stderr_tail(&stderr_capture);
+            if !stderr.is_empty() {
+                if harness_core::error::is_billing_failure_message(&stderr) {
+                    return Err(harness_core::error::HarnessError::BillingFailed(format!(
+                        "codex billing failure (streamed exit): {stderr}"
+                    )));
+                }
+                if harness_core::error::is_quota_failure_message(&stderr) {
+                    return Err(harness_core::error::HarnessError::QuotaExhausted(format!(
+                        "codex quota exhausted (streamed exit): {stderr}"
+                    )));
+                }
+            }
+            return Err(enrich_stream_exit_error(error, &stderr));
+        }
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
     }
@@ -508,14 +540,71 @@ printf 'world\n'
     }
 
     #[tokio::test]
+    async fn execute_stream_classifies_quota_failure_from_stderr() {
+        let (dir, script) = write_executable_script(
+            r#"
+echo 'quota exhausted: retry later' >&2
+exit 1
+"#,
+        );
+        let agent = CodexAgent::new(script, SandboxMode::DangerFullAccess);
+        let request = AgentRequest {
+            prompt: "ignored".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..AgentRequest::default()
+        };
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let err = agent
+            .execute_stream(request, tx)
+            .await
+            .expect_err("stream execution should fail");
+
+        assert!(
+            matches!(err, harness_core::error::HarnessError::QuotaExhausted(_)),
+            "expected streamed codex stderr to preserve quota classification, got: {err}"
+        );
+        assert_eq!(
+            err.turn_failure().expect("turn failure").kind,
+            harness_core::types::TurnFailureKind::Quota
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_waits_for_late_stderr_before_classifying_exit() {
+        let (dir, script) = write_executable_script(
+            r#"
+(sleep 0.2; echo 'quota exhausted: retry later' >&2) >/dev/null &
+exit 1
+"#,
+        );
+        let agent = CodexAgent::new(script, SandboxMode::DangerFullAccess);
+        let request = AgentRequest {
+            prompt: "ignored".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..AgentRequest::default()
+        };
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let err = agent
+            .execute_stream(request, tx)
+            .await
+            .expect_err("stream execution should fail");
+
+        assert!(
+            matches!(err, harness_core::error::HarnessError::QuotaExhausted(_)),
+            "expected late stderr to influence streamed exit classification, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_stream_cancel_path_converges_when_receiver_dropped_mid_stream() {
         let (dir, script) = write_executable_script(
             r#"
 printf 'first\n'
-sleep 0.5
+sleep 0.1
 printf 'second\n'
-sleep 0.5
-printf 'third\n'
+sleep 30
 "#,
         );
         let agent = CodexAgent::new(script, SandboxMode::DangerFullAccess);
