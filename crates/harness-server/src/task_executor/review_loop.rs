@@ -256,7 +256,7 @@ pub(crate) async fn run_review_loop(
             prompt: round_prompt,
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
-            execution_phase: Some(ExecutionPhase::SimpleReview),
+            execution_phase: Some(ExecutionPhase::Execution),
             env_vars: cargo_env.clone(),
             ..Default::default()
         };
