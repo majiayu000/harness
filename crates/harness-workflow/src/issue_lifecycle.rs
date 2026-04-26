@@ -809,6 +809,97 @@ impl IssueWorkflowStore {
         }
     }
 
+    /// List all workflow rows whose `project_id` contains `/workspaces/`,
+    /// indicating a corrupt worktree path was stored instead of the canonical root.
+    pub async fn list_with_worktree_project_ids(
+        &self,
+    ) -> anyhow::Result<Vec<IssueWorkflowInstance>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data FROM issue_workflows
+             WHERE data::jsonb->>'project_id' LIKE '%/workspaces/%'
+             ORDER BY updated_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
+    }
+
+    /// Replace a workflow row's `project_id` with `new_project_id`, rekeying the
+    /// primary key (which embeds the project_id). Old row is deleted; new row is inserted.
+    pub async fn repair_project_id(
+        &self,
+        old_row_id: &str,
+        new_project_id: &str,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let old_workflow = self
+            .load_for_update_by_id(&mut tx, old_row_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("workflow row '{old_row_id}' not found"))?;
+
+        let mut new_workflow = old_workflow.clone();
+        new_workflow.project_id = new_project_id.to_string();
+        new_workflow.id = workflow_id(
+            &new_workflow.project_id,
+            new_workflow.repo.as_deref(),
+            new_workflow.issue_number,
+        );
+
+        if new_workflow.id == old_row_id {
+            return Ok(());
+        }
+
+        new_workflow.updated_at = chrono::Utc::now();
+
+        let new_data = serde_json::to_string(&new_workflow)?;
+        sqlx::query(
+            "INSERT INTO issue_workflows (id, data, created_at) VALUES ($1, $2, $3)
+             ON CONFLICT(id) DO UPDATE SET data = EXCLUDED.data,
+                 updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(&new_workflow.id)
+        .bind(&new_data)
+        .bind(old_workflow.created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM issue_workflows WHERE id = $1")
+            .bind(old_row_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        tracing::info!(
+            old_row_id,
+            old_project_id = %old_workflow.project_id,
+            new_project_id,
+            new_row_id = %new_workflow.id,
+            "repaired corrupt workflow project_id"
+        );
+        Ok(())
+    }
+
+    /// Mark a workflow row as `Failed` with the given reason detail.
+    pub async fn mark_workflow_failed_with_reason(
+        &self,
+        row_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let Some(mut workflow) = self.load_for_update_by_id(&mut tx, row_id).await? else {
+            return Ok(());
+        };
+        workflow.apply_event(
+            IssueLifecycleEvent::new(IssueLifecycleEventKind::WorkflowFailed)
+                .with_detail(reason.to_string()),
+        );
+        self.upsert_in_tx(&mut tx, &workflow).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn upsert_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -1101,6 +1192,101 @@ mod tests {
         store
             .update_project_path("nonexistent-workflow-id", "/tmp/any-path")
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repair_project_id_rekeyes_row() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let corrupt_id = "/data/workspaces/abc-uuid-repair-test";
+        store
+            .record_issue_scheduled(corrupt_id, Some("owner/repo"), 9001, "task-r1", &[], false)
+            .await?;
+
+        let workflow = store
+            .get_by_issue(corrupt_id, Some("owner/repo"), 9001)
+            .await?
+            .expect("row should exist");
+        let old_row_id = workflow.id.clone();
+
+        let canonical = "/real/canonical/root";
+        store.repair_project_id(&old_row_id, canonical).await?;
+
+        // Old row gone, new row present with correct project_id
+        let old = store
+            .get_by_issue(corrupt_id, Some("owner/repo"), 9001)
+            .await?;
+        assert!(old.is_none(), "old row should be removed");
+
+        let new = store
+            .get_by_issue(canonical, Some("owner/repo"), 9001)
+            .await?
+            .expect("new row should exist");
+        assert_eq!(new.project_id, canonical);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mark_workflow_failed_with_reason_sets_state() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let project_id = "/tmp/project-mark-failed-test";
+        store
+            .record_issue_scheduled(project_id, Some("owner/repo"), 9002, "task-mf1", &[], false)
+            .await?;
+
+        let workflow = store
+            .get_by_issue(project_id, Some("owner/repo"), 9002)
+            .await?
+            .expect("row should exist");
+
+        store
+            .mark_workflow_failed_with_reason(&workflow.id, "project root not found")
+            .await?;
+
+        let updated = store
+            .get_by_issue(project_id, Some("owner/repo"), 9002)
+            .await?
+            .expect("row should still exist");
+        assert_eq!(updated.state, IssueLifecycleState::Failed);
+        assert!(
+            updated
+                .last_event
+                .as_ref()
+                .and_then(|e| e.detail.as_deref())
+                == Some("project root not found"),
+            "detail should be recorded"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_with_worktree_project_ids_filters_correctly() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let corrupt = "/data/workspaces/xyz-uuid-list-test";
+        let canonical = "/tmp/canonical-list-test";
+
+        store
+            .record_issue_scheduled(corrupt, Some("owner/repo"), 9003, "task-l1", &[], false)
+            .await?;
+        store
+            .record_issue_scheduled(canonical, Some("owner/repo"), 9004, "task-l2", &[], false)
+            .await?;
+
+        let corrupt_rows = store.list_with_worktree_project_ids().await?;
+        assert!(
+            corrupt_rows.iter().any(|w| w.project_id == corrupt),
+            "worktree row should appear"
+        );
+        assert!(
+            !corrupt_rows.iter().any(|w| w.project_id == canonical),
+            "canonical row should not appear"
+        );
         Ok(())
     }
 }

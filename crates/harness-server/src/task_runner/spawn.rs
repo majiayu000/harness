@@ -633,6 +633,8 @@ where
         }
 
         // If workspace isolation is configured, create a per-task git worktree.
+        // Save the canonical root before it may be moved into run_project.
+        let canonical_project_root = project_root.clone();
         let run_project = if let Some(ref wmgr) = workspace_mgr {
             let project_config = harness_core::config::project::load_project_config(&project_root)
                 .map_err(|e| {
@@ -715,6 +717,7 @@ where
                 interceptors.clone(),
                 &req,
                 run_project.clone(),
+                canonical_project_root.clone(),
                 server_config.as_ref(),
                 issue_workflow_store.clone(),
                 &mut total_turns_used,

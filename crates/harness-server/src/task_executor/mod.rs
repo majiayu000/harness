@@ -391,6 +391,9 @@ pub(crate) async fn run_task(
     interceptors: Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
     req: &CreateTaskRequest,
     project: PathBuf,
+    // Canonical project root used for project_id derivation in issue workflow records.
+    // Distinct from `project` when workspace isolation is active (worktree != canonical root).
+    project_root: PathBuf,
     server_config: &harness_core::config::HarnessConfig,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     // Accumulated turn count from previous transient-retry attempts.
@@ -586,7 +589,7 @@ pub(crate) async fn run_task(
     let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
 
     if let (Some(workflows), Some(issue_number)) = (issue_workflow_store.as_ref(), req.issue) {
-        let project_id = project.to_string_lossy().into_owned();
+        let project_id = project_root.to_string_lossy().into_owned();
         if let Err(e) = workflows
             .record_implement_started(&project_id, req.repo.as_deref(), issue_number, &task_id.0)
             .await
@@ -617,6 +620,7 @@ pub(crate) async fn run_task(
             git,
             &repo_slug,
             &project,
+            &project_root,
             current_plan_output.clone(),
             resumed_pr_url.clone(),
             issue_workflow_store.clone(),
