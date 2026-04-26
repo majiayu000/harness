@@ -846,16 +846,22 @@ impl IssueWorkflowStore {
             new_workflow.repo.as_deref(),
             new_workflow.issue_number,
         );
+
+        if new_workflow.id == old_row_id {
+            return Ok(());
+        }
+
         new_workflow.updated_at = chrono::Utc::now();
 
         let new_data = serde_json::to_string(&new_workflow)?;
         sqlx::query(
-            "INSERT INTO issue_workflows (id, data) VALUES ($1, $2)
+            "INSERT INTO issue_workflows (id, data, created_at) VALUES ($1, $2, $3)
              ON CONFLICT(id) DO UPDATE SET data = EXCLUDED.data,
                  updated_at = CURRENT_TIMESTAMP",
         )
         .bind(&new_workflow.id)
         .bind(&new_data)
+        .bind(old_workflow.created_at)
         .execute(&mut *tx)
         .await?;
 

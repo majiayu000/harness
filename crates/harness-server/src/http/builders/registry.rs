@@ -318,22 +318,20 @@ async fn repair_corrupt_project_ids(
     store: &harness_workflow::issue_lifecycle::IssueWorkflowStore,
     canonical_root: &std::path::Path,
 ) -> (u32, u32, u32) {
-    let all_rows = match store.list().await {
+    let corrupt_rows = match store.list_with_worktree_project_ids().await {
         Ok(rows) => rows,
         Err(e) => {
-            tracing::error!("startup repair: failed to list issue workflows: {e}");
+            tracing::error!("startup repair: failed to list corrupt issue workflows: {e}");
             return (0, 0, 0);
         }
     };
+    let total_count = store.row_count().await.unwrap_or(0);
 
     let new_project_id = canonical_root.to_string_lossy().into_owned();
-    let (mut rewritten, mut failed, mut skipped) = (0u32, 0u32, 0u32);
+    let (mut rewritten, mut failed) = (0u32, 0u32);
+    let skipped = (total_count as u32).saturating_sub(corrupt_rows.len() as u32);
 
-    for workflow in all_rows {
-        if !workflow.project_id.contains("/workspaces/") {
-            skipped += 1;
-            continue;
-        }
+    for workflow in corrupt_rows {
         tracing::info!(
             row_id = %workflow.id,
             old_project_id = %workflow.project_id,
