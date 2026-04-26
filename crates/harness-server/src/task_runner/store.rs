@@ -107,6 +107,8 @@ impl TaskStore {
         let active_statuses = &[
             "pending",
             "awaiting_deps",
+            "triaging",
+            "planning",
             "implementing",
             "review_generating",
             "review_waiting",
@@ -1577,6 +1579,8 @@ mod tests {
                 false,
                 false,
             ),
+            (TaskStatus::Triaging, false, true, true, false, false, false),
+            (TaskStatus::Planning, false, true, true, false, false, false),
             (
                 TaskStatus::Implementing,
                 false,
@@ -1674,6 +1678,8 @@ mod tests {
         assert_eq!(
             TaskStatus::resumable_statuses(),
             &[
+                "triaging",
+                "planning",
                 "implementing",
                 "review_generating",
                 "review_waiting",
