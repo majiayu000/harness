@@ -33,6 +33,7 @@ export function Submit({ projectFilter, onTaskCreated }: Props) {
   const [desc, setDesc] = useState("");
   const [project, setProject] = useState(projectFilter ?? "");
   const [msg, setMsg] = useState<string | null>(null);
+  const [msgIsError, setMsgIsError] = useState(false);
   const [busy, setBusy] = useState(false);
   const { data: projects = [] } = useProjects();
 
@@ -57,12 +58,14 @@ export function Submit({ projectFilter, onTaskCreated }: Props) {
       setTitle("");
       setDesc("");
       setProject(projectFilter ?? "");
-      if (onTaskCreated) {
-        onTaskCreated(json.id ?? "");
+      if (onTaskCreated && json.task_id) {
+        onTaskCreated(json.task_id);
       } else {
-        setMsg(`created task ${json.id ?? "?"}`);
+        setMsgIsError(false);
+        setMsg(`created task ${json.task_id ?? "?"}`);
       }
     } catch (e) {
+      setMsgIsError(true);
       setMsg((e as Error).message);
     } finally {
       setBusy(false);
@@ -142,7 +145,7 @@ export function Submit({ projectFilter, onTaskCreated }: Props) {
         >
           {busy ? "Submitting…" : "Submit Task"}
         </button>
-        {msg && <div className="font-mono text-[11px] text-ink-2">{msg}</div>}
+        {msg && <div className={`font-mono text-[11px] ${msgIsError ? "text-rust" : "text-ok"}`}>{msg}</div>}
       </form>
     </div>
   );

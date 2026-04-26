@@ -25,6 +25,13 @@ export function RegisterProjectDialog({ open, onClose, onSuccess }: Props) {
     setId(deriveId(val));
   }
 
+  function handleClose() {
+    setRoot("");
+    setId("");
+    setError(null);
+    onClose();
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!root.trim() || !id.trim()) return;
@@ -40,9 +47,7 @@ export function RegisterProjectDialog({ open, onClose, onSuccess }: Props) {
       await qc.invalidateQueries({ queryKey: ["projects"] });
       await qc.invalidateQueries({ queryKey: ["overview"] });
       onSuccess?.(json?.id ?? id.trim());
-      onClose();
-      setRoot("");
-      setId("");
+      handleClose();
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -56,7 +61,7 @@ export function RegisterProjectDialog({ open, onClose, onSuccess }: Props) {
     <>
       <div
         className="fixed inset-0 z-[99] bg-black/40"
-        onClick={onClose}
+        onClick={handleClose}
         aria-hidden="true"
         data-testid="dialog-scrim"
       />
@@ -108,7 +113,7 @@ export function RegisterProjectDialog({ open, onClose, onSuccess }: Props) {
               </button>
               <button
                 type="button"
-                onClick={onClose}
+                onClick={handleClose}
                 className="px-3 py-1.5 bg-bg border border-line-2 text-ink font-mono text-[12px]"
               >
                 Cancel
