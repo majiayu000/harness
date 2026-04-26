@@ -317,7 +317,7 @@ pub(crate) async fn build_registry(
 async fn repair_corrupt_project_ids(
     store: &harness_workflow::issue_lifecycle::IssueWorkflowStore,
     canonical_root: &std::path::Path,
-) -> (u32, u32, u32) {
+) -> (u64, u64, u64) {
     let corrupt_rows = match store.list_with_worktree_project_ids().await {
         Ok(rows) => rows,
         Err(e) => {
@@ -328,8 +328,8 @@ async fn repair_corrupt_project_ids(
     let total_count = store.row_count().await.unwrap_or(0);
 
     let new_project_id = canonical_root.to_string_lossy().into_owned();
-    let (mut rewritten, mut failed) = (0u32, 0u32);
-    let skipped = (total_count as u32).saturating_sub(corrupt_rows.len() as u32);
+    let (mut rewritten, mut failed) = (0u64, 0u64);
+    let skipped = (total_count as u64).saturating_sub(corrupt_rows.len() as u64);
 
     for workflow in corrupt_rows {
         tracing::info!(
@@ -348,7 +348,7 @@ async fn repair_corrupt_project_ids(
                 if let Err(e2) = store
                     .mark_workflow_failed_with_reason(
                         &workflow.id,
-                        "project root not found during startup repair",
+                        "failed to repair project_id during startup",
                     )
                     .await
                 {
