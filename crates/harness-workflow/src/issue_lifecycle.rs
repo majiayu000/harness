@@ -630,6 +630,29 @@ impl IssueWorkflowStore {
         .await
     }
 
+    /// Patches only the `project_id` field inside the JSONB blob without replacing the whole row.
+    /// Note: the embedded `id` field inside the JSON may diverge from the stored `project_id` after
+    /// this patch. This is harmless because all sweep/claim queries select by
+    /// `data::jsonb->>'project_id'`, not the embedded `id`.
+    /// Returns `Ok(())` even when no row matches `workflow_id` (zero rows affected is not an error).
+    pub async fn update_project_path(
+        &self,
+        workflow_id: &str,
+        new_path: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE issue_workflows
+             SET    data = jsonb_set(data::jsonb, '{project_id}', to_jsonb($2::text), false)::text,
+                    updated_at = CURRENT_TIMESTAMP
+             WHERE  id = $1",
+        )
+        .bind(workflow_id)
+        .bind(new_path)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn update_issue<F>(
         &self,
         project_id: &str,
@@ -1031,6 +1054,53 @@ mod tests {
             .await?;
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].pr_number, Some(88));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_project_path_patches_project_id_field() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let old_project_id = "/tmp/old-project-path-test";
+        store
+            .record_issue_scheduled(
+                old_project_id,
+                Some("owner/repo"),
+                101,
+                "task-path-1",
+                &[],
+                false,
+            )
+            .await?;
+        let before = store
+            .get_by_issue(old_project_id, Some("owner/repo"), 101)
+            .await?
+            .expect("workflow before update");
+        let before_state = before.state;
+
+        store
+            .update_project_path(&before.id, "/tmp/new-project-path-test")
+            .await?;
+
+        let after = store
+            .get_by_issue("/tmp/new-project-path-test", Some("owner/repo"), 101)
+            .await?
+            .expect("workflow after update");
+        assert_eq!(after.project_id, "/tmp/new-project-path-test");
+        assert_eq!(after.state, before_state);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_project_path_noop_on_missing_id() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        // Must not return an error when no row matches
+        store
+            .update_project_path("nonexistent-workflow-id", "/tmp/any-path")
+            .await?;
         Ok(())
     }
 }
