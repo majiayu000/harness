@@ -98,8 +98,6 @@ On the Overview page, click **Register your first project**, enter the path to y
 
 Go to **Tasks → Submit**, pick your project from the dropdown, choose a starter template (or write your own), and click **Submit Task**. The UI navigates you directly into the live task view where you can watch the agent work and inspect the output.
 
-### Build
-
 ### Rust API Facade
 
 For Rust consumers inside the repository or embedded integrations, `harness-api`

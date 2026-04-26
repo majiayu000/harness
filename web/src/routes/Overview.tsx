@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { Sidebar, type SidebarSection } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
 import { Panel } from "@/components/Panel";
@@ -6,7 +5,6 @@ import { KpiCard } from "@/components/KpiCard";
 import { StackedArea, type StackedAreaSeries } from "@/components/StackedArea";
 import { HeatmapRow } from "@/components/HeatmapRow";
 import { ProjectsTable } from "@/components/ProjectsTable";
-import { RegisterProjectDialog } from "@/components/RegisterProjectDialog";
 import { RuntimeCard } from "@/components/RuntimeCard";
 import { Feed } from "@/components/Feed";
 import { AlertList } from "@/components/AlertList";
@@ -29,7 +27,6 @@ export function Overview() {
   const { data, isError } = useOverview();
   const { isError: isOperatorSnapshotError } = useOperatorSnapshot();
   const isSystemHealthy = !isError && !isOperatorSnapshotError;
-  const [showRegister, setShowRegister] = useState(false);
 
   const sections: SidebarSection[] = [
     {
@@ -128,27 +125,9 @@ export function Overview() {
             </Panel>
           </div>
 
-          {data && data.projects.length === 0 && (
-            <div className="px-6 py-8 text-center border-b border-line bg-bg">
-              <p className="font-mono text-[13px] text-ink-2 mb-3">No projects registered yet</p>
-              <p className="font-mono text-[11px] text-ink-3 mb-4">
-                Register your first project to start running agent tasks.
-              </p>
-              <button
-                onClick={() => setShowRegister(true)}
-                className="px-3 py-1.5 bg-rust text-white font-mono text-[12px] border-0"
-              >
-                Register your first project
-              </button>
-            </div>
-          )}
           <Panel title="Projects" sub="click a row to open the dashboard" id="projects">
             <ProjectsTable projects={data?.projects ?? []} />
           </Panel>
-          <RegisterProjectDialog
-            open={showRegister}
-            onClose={() => setShowRegister(false)}
-          />
 
           <Panel title="Fleet runtimes" sub="connected machines and cloud endpoints" id="runtimes">
             <div className="px-5 py-3.5 grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-3">

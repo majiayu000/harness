@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { TOKEN_KEY } from "@/lib/api";
+import { apiFetch } from "@/lib/api";
 
 interface Props {
   open: boolean;
@@ -31,21 +31,12 @@ export function RegisterProjectDialog({ open, onClose, onSuccess }: Props) {
     setBusy(true);
     setError(null);
     try {
-      const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
-      const resp = await fetch("/projects", {
+      const resp = await apiFetch("/projects", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          ...(tok ? { Authorization: `Bearer ${tok}` } : {}),
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: id.trim(), root: root.trim() }),
       });
       const json = await resp.json().catch(() => null);
-      if (!resp.ok) {
-        setError(json?.error ?? `HTTP ${resp.status}`);
-        return;
-      }
       await qc.invalidateQueries({ queryKey: ["projects"] });
       await qc.invalidateQueries({ queryKey: ["overview"] });
       onSuccess?.(json?.id ?? id.trim());
