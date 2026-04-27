@@ -788,4 +788,23 @@ impl TaskDb {
     pub(crate) fn pool_for_test(&self) -> &sqlx::PgPool {
         &self.pool
     }
+
+    /// Overwrite the `rounds` column with arbitrary raw text.
+    ///
+    /// Used by integration tests to simulate a corrupted DB payload without going
+    /// through the normal serialization path. The name suffix `_for_test` signals
+    /// that production code must never call this.
+    #[doc(hidden)]
+    pub async fn overwrite_rounds_for_test(
+        &self,
+        task_id: &str,
+        raw_rounds: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE tasks SET rounds = $1 WHERE id = $2")
+            .bind(raw_rounds)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
