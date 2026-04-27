@@ -24,6 +24,7 @@ impl DispatchedTaskChecker for crate::task_runner::TaskStore {
 pub struct GitHubIssuesPoller {
     repo: String,
     label: String,
+    client: reqwest::Client,
     project_root: Option<PathBuf>,
     dispatched: DashMap<String, TaskId>,
     persist_path: Option<PathBuf>,
@@ -41,6 +42,7 @@ impl GitHubIssuesPoller {
         Self {
             repo: repo_config.repo.clone(),
             label: repo_config.label.clone(),
+            client: reqwest::Client::new(),
             project_root: repo_config.project_root.as_ref().map(PathBuf::from),
             dispatched,
             persist_path,
@@ -250,8 +252,8 @@ impl IntakeSource for GitHubIssuesPoller {
 
     async fn poll(&self) -> anyhow::Result<Vec<IncomingIssue>> {
         let url = format!("https://api.github.com/repos/{}/issues", self.repo);
-        let client = reqwest::Client::new();
-        let mut request = client
+        let mut request = self
+            .client
             .get(url)
             .query(&[("state", "open"), ("per_page", "100")])
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")

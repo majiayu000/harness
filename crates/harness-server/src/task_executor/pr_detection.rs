@@ -650,21 +650,61 @@ fn parse_remote_urls_from_git_config(config: &str) -> Vec<(String, String)> {
     let mut remotes = Vec::new();
     for line in config.lines() {
         let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            current_remote = trimmed
-                .strip_prefix("[remote \"")
-                .and_then(|value| value.strip_suffix("\"]"))
-                .map(str::to_string);
+            let section = &trimmed[1..trimmed.len() - 1];
+            current_remote = parse_remote_section_name(section);
             continue;
         }
         let Some(name) = current_remote.as_deref() else {
             continue;
         };
-        if let Some(url) = trimmed.strip_prefix("url =") {
-            remotes.push((name.to_string(), url.trim().to_string()));
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("url") {
+            let url = trim_git_config_value(value);
+            if !url.is_empty() {
+                remotes.push((name.to_string(), url.to_string()));
+            }
         }
     }
     remotes
+}
+
+fn parse_remote_section_name(section: &str) -> Option<String> {
+    let section = section.trim();
+    if let Some(name) = section.strip_prefix("remote.") {
+        let name = name.trim();
+        return (!name.is_empty()).then(|| name.to_string());
+    }
+
+    let rest = section.strip_prefix("remote")?;
+    if rest.chars().next().is_some_and(|ch| !ch.is_whitespace()) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let quoted = rest.strip_prefix('"')?;
+    let end = quoted.find('"')?;
+    let name = quoted[..end].trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn trim_git_config_value(value: &str) -> &str {
+    let value = value.trim();
+    for (idx, ch) in value.char_indices() {
+        if (ch == '#' || ch == ';')
+            && value[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            return value[..idx].trim_end();
+        }
+    }
+    value
 }
 
 #[cfg(test)]
@@ -1006,6 +1046,40 @@ mod tests {
         assert_eq!(
             parse_repo_slug_from_remote_url("https://gitlab.com/owner/repo.git"),
             None
+        );
+    }
+
+    #[test]
+    fn parse_git_config_accepts_dotted_remote_section() {
+        let config = r#"
+            [remote.origin]
+                url = https://github.com/owner/repo.git
+        "#;
+        assert_eq!(
+            parse_remote_urls_from_git_config(config),
+            vec![(
+                "origin".to_string(),
+                "https://github.com/owner/repo.git".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_git_config_accepts_quoted_remote_with_spacing_and_comments() {
+        let config = r#"
+            # ignored
+            [remote "upstream"]
+                fetch = +refs/heads/*:refs/remotes/upstream/*
+                url=git@github.com:owner/repo.git ; mirror used by tests
+            [branch "main"]
+                remote = upstream
+        "#;
+        assert_eq!(
+            parse_remote_urls_from_git_config(config),
+            vec![(
+                "upstream".to_string(),
+                "git@github.com:owner/repo.git".to_string()
+            )]
         );
     }
 }

@@ -164,7 +164,11 @@ pub(crate) async fn resolve_project_from_registry(
         return Ok((project, None));
     };
 
-    if project_path.is_dir() {
+    if tokio::fs::metadata(&project_path)
+        .await
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
         return Ok((Some(project_path), None));
     }
 
