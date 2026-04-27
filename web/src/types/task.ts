@@ -15,11 +15,32 @@ export interface Task {
   repo: string | null;
   description: string | null;
   created_at: string | null;
+  updated_at?: string | null;
   phase: string | null;
   depends_on: string[];
   subtask_ids: string[];
   project: string | null;
   workflow?: WorkflowSummary | null;
+}
+
+export interface TaskArtifact {
+  task_id: string;
+  turn: number;
+  artifact_type: string;
+  content: string;
+  created_at: string;
+}
+
+export interface TaskPrompt {
+  task_id: string;
+  turn: number;
+  phase: string;
+  prompt: string;
+  created_at: string;
+}
+
+export function isTerminal(status: string): boolean {
+  return status === "done" || status === "cancelled" || status === "failed";
 }
 
 export interface WorkflowSummary {

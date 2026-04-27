@@ -4,11 +4,22 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::state::AppState;
+
+/// Response type for `GET /tasks/{id}` — `TaskState` fields plus the optional workflow summary
+/// that requires a separate workflow-store lookup (not persisted on `TaskState` itself).
+#[derive(Serialize)]
+struct FullTaskResponse {
+    #[serde(flatten)]
+    inner: crate::task_runner::TaskState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow: Option<harness_workflow::issue_lifecycle::IssueWorkflowInstance>,
+}
 
 pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
     match state.core.tasks.list_all_summaries_with_terminal().await {
@@ -87,7 +98,14 @@ pub(crate) async fn get_task(
         .get_with_db_fallback(&harness_core::types::TaskId(id))
         .await
     {
-        Ok(Some(task)) => Json(task).into_response(),
+        Ok(Some(task)) => {
+            let workflow = enrich_task_workflow(&state, &task).await;
+            Json(FullTaskResponse {
+                inner: task,
+                workflow,
+            })
+            .into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "task not found"})),
@@ -101,6 +119,50 @@ pub(crate) async fn get_task(
             )
                 .into_response()
         }
+    }
+}
+
+/// Look up the issue-workflow instance for a task using targeted store queries.
+/// Returns `None` when the workflow store is unavailable or the task has no workflow association.
+async fn enrich_task_workflow(
+    state: &AppState,
+    task: &crate::task_runner::TaskState,
+) -> Option<harness_workflow::issue_lifecycle::IssueWorkflowInstance> {
+    let workflow_store = state.core.issue_workflow_store.as_ref()?;
+    let project_id = task.project_root.as_ref()?.to_string_lossy().into_owned();
+
+    let by_issue = task
+        .external_id
+        .as_deref()
+        .and_then(|id| id.strip_prefix("issue:"))
+        .and_then(|n| n.parse::<u64>().ok());
+    let by_pr = task
+        .external_id
+        .as_deref()
+        .and_then(|id| id.strip_prefix("pr:"))
+        .and_then(|n| n.parse::<u64>().ok())
+        .or_else(|| {
+            task.pr_url
+                .as_deref()
+                .and_then(super::parse_pr_num_from_url)
+        });
+
+    match (by_issue, by_pr) {
+        (Some(issue), _) => workflow_store
+            .get_by_issue(&project_id, task.repo.as_deref(), issue)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("get_task: workflow lookup by issue failed: {e}");
+                None
+            }),
+        (None, Some(pr)) => workflow_store
+            .get_by_pr(&project_id, task.repo.as_deref(), pr)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("get_task: workflow lookup by PR failed: {e}");
+                None
+            }),
+        (None, None) => None,
     }
 }
 

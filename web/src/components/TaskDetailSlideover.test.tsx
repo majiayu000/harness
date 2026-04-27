@@ -10,10 +10,16 @@ vi.mock("@/lib/queries", () => ({
   useTaskStream: vi.fn(),
 }));
 
+vi.mock("@/lib/api", () => ({
+  apiJson: vi.fn().mockResolvedValue([]),
+}));
+
 import { useTaskDetail, useTaskStream } from "@/lib/queries";
+import { apiJson } from "@/lib/api";
 
 const mockUseTaskDetail = useTaskDetail as ReturnType<typeof vi.fn>;
 const mockUseTaskStream = useTaskStream as ReturnType<typeof vi.fn>;
+const mockApiJson = apiJson as ReturnType<typeof vi.fn>;
 
 function makeFullTask(overrides: Partial<FullTask> = {}): FullTask {
   return {
@@ -49,6 +55,7 @@ function wrap(ui: React.ReactElement) {
 beforeEach(() => {
   mockUseTaskStream.mockImplementation(() => undefined);
   mockUseTaskDetail.mockReturnValue({ data: undefined, isLoading: false, isError: false });
+  mockApiJson.mockResolvedValue([]);
 });
 
 // ── visibility ────────────────────────────────────────────────────────────────
@@ -136,6 +143,59 @@ describe("TaskDetailSlideover", () => {
   });
 
   // ── tab switching ─────────────────────────────────────────────────────────
+
+  // ── proof-of-work card ────────────────────────────────────────────────────
+
+  it("renders proof-of-work card for terminal task", async () => {
+    const task = makeFullTask({
+      status: "done",
+      pr_url: "https://github.com/owner/repo/pull/42",
+      workflow: { state: "ready_to_merge", pr_number: 42 },
+      updated_at: "2024-01-01T01:00:00Z",
+    });
+    mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
+    mockApiJson.mockImplementation((url: string) => {
+      if (url.includes("/artifacts")) {
+        return Promise.resolve([
+          { task_id: task.id, turn: 1, artifact_type: "patch", content: "diff --git a/x", created_at: "2024-01-01T00:30:00Z" },
+        ]);
+      }
+      if (url.includes("/prompts")) {
+        return Promise.resolve([
+          { task_id: task.id, turn: 1, phase: "implement", prompt: "Write the fix", created_at: "2024-01-01T00:10:00Z" },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+    wrap(<TaskDetailSlideover taskId={task.id} onClose={vi.fn()} />);
+    const card = await screen.findByTestId("proof-of-work-card");
+    expect(card).toBeInTheDocument();
+    expect(card).toHaveTextContent("https://github.com/owner/repo/pull/42");
+    expect(card).toHaveTextContent("Rounds: 2");
+    expect(card).toHaveTextContent("Approved");
+    expect(await screen.findByText("patch")).toBeInTheDocument();
+    expect(await screen.findByText(/implement/)).toBeInTheDocument();
+  });
+
+  it("does not render proof-of-work card for non-terminal task", () => {
+    const task = makeFullTask({ status: "implementing" });
+    mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
+    wrap(<TaskDetailSlideover taskId={task.id} onClose={vi.fn()} />);
+    expect(screen.queryByTestId("proof-of-work-card")).not.toBeInTheDocument();
+  });
+
+  it("proof-of-work card degrades gracefully with missing data", async () => {
+    const task = makeFullTask({ status: "done", pr_url: null, workflow: null });
+    mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
+    wrap(<TaskDetailSlideover taskId={task.id} onClose={vi.fn()} />);
+    const card = await screen.findByTestId("proof-of-work-card");
+    expect(card).toHaveTextContent("No PR");
+    expect(card).toHaveTextContent("No reviewer data");
+    await waitFor(() => {
+      expect(card).toHaveTextContent("No prompts recorded");
+      expect(card).toHaveTextContent("No artifacts");
+    });
+  });
 
   it("switches tabs without remounting (Summary → Output → Summary)", () => {
     const task = makeFullTask();
