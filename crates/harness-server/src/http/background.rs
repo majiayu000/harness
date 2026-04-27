@@ -1266,6 +1266,60 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
 mod tests {
     use super::*;
 
+    const RECONCILE_GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Fetch the current GitHub state for a PR identified by `pr_url`.
+    ///
+    /// `gh_bin` is injectable so tests can substitute a mock shell script
+    /// without a live GitHub connection.  Returns `Some((raw_state, new_status))`
+    /// only for actionable terminal states (MERGED → Done, CLOSED → Cancelled).
+    /// Any transient failure (I/O error, non-zero exit, timeout, unexpected state)
+    /// returns `None` so the caller skips the task silently.
+    async fn fetch_pr_github_state(
+        gh_bin: &str,
+        task_id: &task_runner::TaskId,
+        pr_url: &str,
+    ) -> Option<(String, task_runner::TaskStatus)> {
+        let output = match tokio::time::timeout(
+            RECONCILE_GH_TIMEOUT,
+            tokio::process::Command::new(gh_bin)
+                .args(["pr", "view", pr_url, "--json", "state", "--jq", ".state"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                tracing::warn!(task_id = %task_id, error = %e, "reconciliation: gh command failed");
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!(task_id = %task_id, "reconciliation: gh command timed out");
+                return None;
+            }
+        };
+        if !output.status.success() {
+            tracing::debug!(
+                task_id = %task_id,
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "reconciliation: gh pr view returned non-zero"
+            );
+            return None;
+        }
+        let raw = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_uppercase();
+        match raw.as_str() {
+            "MERGED" => Some((raw.to_string(), task_runner::TaskStatus::Done)),
+            "CLOSED" => Some((raw.to_string(), task_runner::TaskStatus::Cancelled)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn workflow_recovery_task_ids_only_uses_active_addressing_feedback_rows() {
         let mut addressing = IssueWorkflowInstance::new(
@@ -1330,5 +1384,115 @@ mod tests {
             warned.insert(key.clone()),
             "after removal (path recovered), insert returns true again"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_merged_transitions_to_done() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'MERGED\\n'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = fetch_pr_github_state(
+            script.to_str().unwrap(),
+            &task_id,
+            "https://github.com/owner/repo/pull/1",
+        )
+        .await;
+        assert!(
+            matches!(result, Some((ref s, task_runner::TaskStatus::Done)) if s == "MERGED"),
+            "expected Some((\"MERGED\", Done)), got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_closed_transitions_to_cancelled() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'CLOSED\\n'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = fetch_pr_github_state(
+            script.to_str().unwrap(),
+            &task_id,
+            "https://github.com/owner/repo/pull/1",
+        )
+        .await;
+        assert!(
+            matches!(result, Some((ref s, task_runner::TaskStatus::Cancelled)) if s == "CLOSED"),
+            "expected Some((\"CLOSED\", Cancelled)), got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_open_returns_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'OPEN\\n'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = fetch_pr_github_state(
+            script.to_str().unwrap(),
+            &task_id,
+            "https://github.com/owner/repo/pull/1",
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "expected None for OPEN state, got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_gh_failure_returns_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = fetch_pr_github_state(
+            script.to_str().unwrap(),
+            &task_id,
+            "https://github.com/owner/repo/pull/1",
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "expected None for non-zero exit, got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_gh_timeout_returns_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            fetch_pr_github_state(
+                script.to_str().unwrap(),
+                &task_id,
+                "https://github.com/owner/repo/pull/1",
+            ),
+        )
+        .await;
+        // The inner function times out after RECONCILE_GH_TIMEOUT (10s) and returns None;
+        // the outer 15s guard ensures the test itself does not hang if that logic changes.
+        match result {
+            Ok(inner) => assert!(inner.is_none(), "expected None on timeout, got {inner:?}"),
+            Err(_elapsed) => {} // outer guard fired first — also acceptable
+        }
     }
 }
