@@ -8,13 +8,13 @@ interface Props {
 }
 
 export function SubmitSuccess({ taskId, onReset }: Props) {
-  const [output, setOutput] = useState<string[]>([]);
+  const [output, setOutput] = useState<string>("");
   const [streamError, setStreamError] = useState<string | null>(null);
   const cancel = useCancelTask();
 
   useTaskStream(
     taskId,
-    (text) => setOutput((prev) => [...prev, text]),
+    (text) => setOutput((prev) => prev + text),
     (err) => setStreamError(err),
   );
 
@@ -72,9 +72,9 @@ export function SubmitSuccess({ taskId, onReset }: Props) {
           Stream error: {streamError}
         </div>
       )}
-      {output.length > 0 && (
+      {output && (
         <pre className="font-mono text-[11px] text-ink bg-bg border border-line p-4 overflow-auto max-h-[400px] rounded-[3px] whitespace-pre-wrap">
-          {output.join("")}
+          {output}
         </pre>
       )}
     </div>
