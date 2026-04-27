@@ -1,12 +1,14 @@
-use super::helpers::{run_agent_streaming, update_status};
+use super::helpers::{augment_prompt_with_skills, run_agent_streaming, update_status};
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskPhase, TaskStatus, TaskStore,
 };
 use harness_core::agent::{AgentRequest, CodeAgent};
 use harness_core::prompts;
 use harness_core::types::ExecutionPhase;
+use harness_observe::event_store::EventStore;
 use std::collections::HashMap;
 use std::path::Path;
+use tokio::sync::RwLock;
 use tokio::time::Duration;
 
 /// Run a plan step for a complex prompt-only task when the planning gate has
@@ -22,6 +24,8 @@ pub(crate) async fn run_plan_for_prompt(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
 ) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
     let prompt_text = req.prompt.as_deref().unwrap_or_default();
     tracing::info!(task_id = %task_id, "pipeline: starting plan phase for prompt-only task");
@@ -32,6 +36,7 @@ pub(crate) async fn run_plan_for_prompt(
     .await?;
 
     let plan_prompt = prompts::plan_for_prompt_task(prompt_text);
+    let plan_prompt = augment_prompt_with_skills(skills, events, task_id, plan_prompt).await;
 
     let plan_req = AgentRequest {
         prompt: plan_prompt,
@@ -84,6 +89,8 @@ pub(crate) async fn run_triage_plan_pipeline(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
 ) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
     // --- Phase 1: Triage ---
     tracing::info!(task_id = %task_id, issue, "pipeline: starting triage phase");
@@ -94,6 +101,7 @@ pub(crate) async fn run_triage_plan_pipeline(
     update_status(store, task_id, TaskStatus::Triaging, 0).await?;
 
     let triage_prompt = prompts::triage_prompt(issue).to_prompt_string();
+    let triage_prompt = augment_prompt_with_skills(skills, events, task_id, triage_prompt).await;
     let triage_req = AgentRequest {
         prompt: triage_prompt,
         project_root: project.to_path_buf(),
@@ -162,6 +170,7 @@ pub(crate) async fn run_triage_plan_pipeline(
     update_status(store, task_id, TaskStatus::Planning, 0).await?;
 
     let plan_prompt = prompts::plan_prompt(issue, &triage_resp.output).to_prompt_string();
+    let plan_prompt = augment_prompt_with_skills(skills, events, task_id, plan_prompt).await;
     let plan_req = AgentRequest {
         prompt: plan_prompt,
         project_root: project.to_path_buf(),
@@ -209,6 +218,8 @@ pub(crate) async fn run_replan_for_issue(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
 ) -> anyhow::Result<String> {
     tracing::info!(task_id = %task_id, issue, "pipeline: starting replan phase");
     mutate_and_persist(store, task_id, |state| {
@@ -217,6 +228,7 @@ pub(crate) async fn run_replan_for_issue(
     .await?;
 
     let prompt = prompts::replan_prompt(issue, prior_plan, plan_issue).to_prompt_string();
+    let prompt = augment_prompt_with_skills(skills, events, task_id, prompt).await;
     let plan_req = AgentRequest {
         prompt,
         project_root: project.to_path_buf(),
