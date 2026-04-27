@@ -656,6 +656,8 @@ where
                     &project_config.git.remote,
                     &project_config.git.base_branch,
                     run_generation,
+                    req.external_id.as_deref(),
+                    req.repo.as_deref(),
                 )
                 .await
             {

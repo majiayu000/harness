@@ -211,25 +211,27 @@ impl WorkspaceManager {
         remote: &str,
         base_branch: &str,
         run_generation: u32,
+        external_id: Option<&str>,
+        repo: Option<&str>,
     ) -> Result<WorkspaceLease, WorkspaceLifecycleError> {
+        let workspace_key = derive_workspace_key(task_id, external_id, repo);
         // Validate inputs to prevent unexpected git behavior.
         if !is_valid_branch_name(base_branch) {
             return Err(WorkspaceLifecycleError::CreateFailed {
-                workspace_path: self.config.root.join(sanitize_task_id(&task_id.0)),
+                workspace_path: self.config.root.join(&workspace_key),
                 workspace_owner: None,
                 message: format!("invalid base_branch: {base_branch:?}"),
             });
         }
         if !is_valid_branch_name(remote) {
             return Err(WorkspaceLifecycleError::CreateFailed {
-                workspace_path: self.config.root.join(sanitize_task_id(&task_id.0)),
+                workspace_path: self.config.root.join(&workspace_key),
                 workspace_owner: None,
                 message: format!("invalid remote: {remote:?}"),
             });
         }
 
-        let sanitized = sanitize_task_id(&task_id.0);
-        let workspace_path = self.config.root.join(&sanitized);
+        let workspace_path = self.config.root.join(&workspace_key);
         let owner_session = self.owner_session.clone();
 
         // Atomic check-and-insert: prevents TOCTOU where two concurrent calls for the
@@ -845,6 +847,32 @@ fn sanitize_task_id(id: &str) -> String {
         .collect()
 }
 
+/// Derive the filesystem key for a workspace.
+///
+/// For tasks with `external_id` matching `issue:N` or `pr:N` and a non-empty `repo`,
+/// returns `<sanitized_repo>/<sanitized_external_id>` (e.g. `myorg_my-repo/issue_42`),
+/// creating a deterministic two-level path that survives task-id changes across retries.
+/// Falls back to the UUID-derived key when either argument is absent or doesn't match.
+fn derive_workspace_key(task_id: &TaskId, external_id: Option<&str>, repo: Option<&str>) -> String {
+    if let (Some(eid), Some(r)) = (external_id, repo) {
+        if !r.is_empty() && is_issue_or_pr_id(eid) {
+            return format!("{}/{}", sanitize_task_id(r), sanitize_task_id(eid));
+        }
+    }
+    sanitize_task_id(&task_id.0)
+}
+
+fn is_issue_or_pr_id(s: &str) -> bool {
+    let digits = if let Some(rest) = s.strip_prefix("issue:") {
+        rest
+    } else if let Some(rest) = s.strip_prefix("pr:") {
+        rest
+    } else {
+        return false;
+    };
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
 /// Returns true when the git worktree at `path` is currently on `branch`.
 /// Used to distinguish crash-recovery (same task's worktree) from a true collision.
 async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {
@@ -1185,6 +1213,42 @@ mod tests {
         assert_eq!(sanitize_task_id("abc.123"), "abc_123");
     }
 
+    fn test_task_id() -> TaskId {
+        harness_core::types::TaskId("550e8400-e29b-41d4-a716-446655440000".to_string())
+    }
+
+    #[test]
+    fn derive_workspace_key_issue() {
+        let key = derive_workspace_key(&test_task_id(), Some("issue:42"), Some("myorg/my-repo"));
+        assert_eq!(key, "myorg_my-repo/issue_42");
+    }
+
+    #[test]
+    fn derive_workspace_key_pr() {
+        let key = derive_workspace_key(&test_task_id(), Some("pr:7"), Some("myorg/my-repo"));
+        assert_eq!(key, "myorg_my-repo/pr_7");
+    }
+
+    #[test]
+    fn derive_workspace_key_prompt_falls_back_to_uuid() {
+        let id = test_task_id();
+        let key = derive_workspace_key(&id, None, None);
+        assert_eq!(key, sanitize_task_id(&id.0));
+    }
+
+    #[test]
+    fn derive_workspace_key_missing_repo_falls_back() {
+        let id = test_task_id();
+        let key = derive_workspace_key(&id, Some("issue:42"), None);
+        assert_eq!(key, sanitize_task_id(&id.0));
+    }
+
+    #[test]
+    fn derive_workspace_key_special_chars_in_repo() {
+        let key = derive_workspace_key(&test_task_id(), Some("issue:99"), Some("my.org/repo name"));
+        assert_eq!(key, "my_org_repo_name/issue_99");
+    }
+
     #[test]
     fn workspace_manager_new_creates_root_dir() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1213,7 +1277,7 @@ mod tests {
         let task_id = harness_core::types::TaskId("test-task-001".to_string());
 
         let ws_path = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create");
         assert!(ws_path.workspace_path.is_dir());
@@ -1238,7 +1302,7 @@ mod tests {
         let task_id = harness_core::types::TaskId("test-task-owner-record".to_string());
 
         let lease = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create");
 
@@ -1289,11 +1353,11 @@ mod tests {
         let task_id = harness_core::types::TaskId("test-task-002".to_string());
 
         let path1 = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create first");
         let path2 = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create second");
         assert_eq!(path1.workspace_path, path2.workspace_path);
@@ -1318,7 +1382,7 @@ mod tests {
         let task_id = harness_core::types::TaskId("test-task-git-index-file".to_string());
 
         let ws_path = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create");
         assert!(ws_path.workspace_path.is_dir());
@@ -1344,7 +1408,7 @@ mod tests {
         let mgr = WorkspaceManager::new(config).expect("new");
         let task_id = harness_core::types::TaskId("test-task-003".to_string());
 
-        mgr.create_workspace(&task_id, source.path(), "origin", &branch, 1)
+        mgr.create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create");
         assert!(
@@ -1371,7 +1435,7 @@ mod tests {
         let task_id = harness_core::types::TaskId("test-task-004".to_string());
 
         let result = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await;
         assert!(result.is_err(), "should fail when hook exits 1");
         assert!(
@@ -1404,7 +1468,7 @@ mod tests {
         std::fs::create_dir_all(&stale_path).expect("create stale dir");
 
         let result = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await;
         assert!(
             result.is_ok(),
@@ -1436,12 +1500,12 @@ mod tests {
         let task_id = harness_core::types::TaskId("foreign-owner-task".to_string());
 
         mgr_a
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create first owner");
 
         let err = mgr_b
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect_err("second owner should be blocked");
         assert!(
@@ -1466,7 +1530,7 @@ mod tests {
         let task_id = harness_core::types::TaskId("startup-reconcile-task".to_string());
 
         let lease = mgr_a
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create workspace");
         assert!(lease.workspace_path.exists());
@@ -1526,7 +1590,15 @@ mod tests {
         let task_id = harness_core::types::TaskId("startup-owning-repo-task".to_string());
 
         let lease = mgr_a
-            .create_workspace(&task_id, source_a.path(), "origin", &branch_a, 1)
+            .create_workspace(
+                &task_id,
+                source_a.path(),
+                "origin",
+                &branch_a,
+                1,
+                None,
+                None,
+            )
             .await
             .expect("create workspace");
         assert!(lease.workspace_path.exists());
@@ -1601,7 +1673,7 @@ mod tests {
         let task_id = harness_core::types::TaskId("missing-registered-task".to_string());
 
         let lease = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create workspace");
         std::fs::remove_dir_all(&lease.workspace_path).expect("remove checkout dir");
@@ -1637,7 +1709,7 @@ mod tests {
         let task_id = harness_core::types::TaskId("startup-missing-registered-task".to_string());
 
         let lease = mgr_a
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create workspace");
         std::fs::remove_dir_all(&lease.workspace_path).expect("remove checkout dir");
@@ -1683,7 +1755,7 @@ mod tests {
         );
 
         let recreated = mgr_b
-            .create_workspace(&task_id, source.path(), "origin", &branch, 2)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 2, None, None)
             .await
             .expect("recreate workspace after startup reconcile");
         assert!(
@@ -1773,7 +1845,7 @@ mod tests {
         let mgr = WorkspaceManager::new(config).expect("new");
         let task_id = harness_core::types::TaskId("test-task-relative-path".to_string());
 
-        mgr.create_workspace(&task_id, &source, "origin", &branch, 1)
+        mgr.create_workspace(&task_id, &source, "origin", &branch, 1, None, None)
             .await
             .expect("create");
         let relative_workspace_path =
@@ -1805,7 +1877,7 @@ mod tests {
             .collect();
 
         for id in &ids {
-            mgr.create_workspace(id, source.path(), "origin", &branch, 1)
+            mgr.create_workspace(id, source.path(), "origin", &branch, 1, None, None)
                 .await
                 .expect("create");
         }
