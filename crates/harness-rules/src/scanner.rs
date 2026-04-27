@@ -1,1 +1,2 @@
-// 扫描能力由 `engine::RuleEngine::scan()` 提供；本模块暂不暴露额外接口。
+// Scanning is provided by `engine::RuleEngine::scan`; this module intentionally
+// exposes no additional API.

@@ -11,8 +11,9 @@ use crate::{
 };
 use async_trait::async_trait;
 use harness_agents::registry::AgentRegistry;
-use harness_core::{config::HarnessConfig, interceptor::TurnInterceptor};
+use harness_core::{agent::CodeAgent, config::HarnessConfig, interceptor::TurnInterceptor};
 use harness_skills::store::SkillStore;
+use harness_workflow::issue_lifecycle::{IssueLifecycleState, IssueWorkflowInstance};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -85,6 +86,12 @@ pub struct DefaultExecutionService {
     allowed_project_roots: Vec<PathBuf>,
 }
 
+enum WorkflowReuseStrategy {
+    ActiveTask(TaskId),
+    PrExternalId(String),
+    None,
+}
+
 impl DefaultExecutionService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -126,22 +133,29 @@ impl DefaultExecutionService {
     async fn resolve_project(
         &self,
         project: Option<PathBuf>,
-    ) -> Result<Option<PathBuf>, EnqueueTaskError> {
-        match (self.project_registry.as_ref(), project) {
-            (Some(registry), Some(project_path)) => {
-                if project_path.is_dir() {
-                    return Ok(Some(project_path));
-                }
-                let id = project_path.to_string_lossy();
-                match registry.resolve_path(&id).await {
-                    Ok(Some(root)) => Ok(Some(root)),
-                    Ok(None) => Err(EnqueueTaskError::BadRequest(format!(
-                        "project '{id}' not found in registry and is not a valid directory"
-                    ))),
-                    Err(e) => Err(EnqueueTaskError::Internal(e.to_string())),
-                }
-            }
-            (_, project) => Ok(project),
+    ) -> Result<(Option<PathBuf>, Option<String>), EnqueueTaskError> {
+        let (Some(registry), Some(project_path)) =
+            (self.project_registry.as_ref(), project.clone())
+        else {
+            return Ok((project, None));
+        };
+
+        if project_path.is_dir() {
+            return Ok((Some(project_path), None));
+        }
+
+        let id = project_path.to_string_lossy();
+        match registry.get(&id).await {
+            Ok(Some(project)) => return Ok((Some(project.root), project.default_agent)),
+            Ok(None) => {}
+            Err(e) => return Err(EnqueueTaskError::Internal(e.to_string())),
+        }
+        match registry.get_by_name(&id).await {
+            Ok(Some(project)) => Ok((Some(project.root), project.default_agent)),
+            Ok(None) => Err(EnqueueTaskError::BadRequest(format!(
+                "project '{id}' not found in registry and is not a valid directory"
+            ))),
+            Err(e) => Err(EnqueueTaskError::Internal(e.to_string())),
         }
     }
 
@@ -168,25 +182,213 @@ impl DefaultExecutionService {
             .map_err(EnqueueTaskError::BadRequest)
     }
 
-    /// Select the agent for this request (explicit name or complexity-routed).
+    fn queue_timeout_message(&self, project_id: &str) -> String {
+        let diag = self.task_queue.diagnostics(project_id);
+        let project_holding = diag.project_running + diag.project_awaiting_global;
+        let project_full = project_holding >= diag.project_limit;
+        let global_full = diag.global_running >= diag.global_limit;
+        let reason = match (global_full, project_full) {
+            (true, true) => "global and project capacity saturated",
+            (true, false) => "global capacity saturated",
+            (false, true) => "project capacity saturated",
+            (false, false) => "permit wait exceeded timeout",
+        };
+        format!(
+            "{reason} (domain=primary, global_running={}, global_queued={}, global_limit={}, project_running={}, project_waiting={}, project_awaiting_global={}, project_limit={})",
+            diag.global_running,
+            diag.global_queued,
+            diag.global_limit,
+            diag.project_running,
+            diag.project_waiting_for_project,
+            diag.project_awaiting_global,
+            diag.project_limit,
+        )
+    }
+
+    fn populate_external_id(req: &mut CreateTaskRequest) {
+        match &req.external_id {
+            None => {
+                if let Some(issue) = req.issue {
+                    req.external_id = Some(format!("issue:{issue}"));
+                } else if let Some(pr) = req.pr {
+                    req.external_id = Some(format!("pr:{pr}"));
+                }
+            }
+            Some(id) => {
+                if id.starts_with("issue:") || id.starts_with("pr:") {
+                    return;
+                }
+                if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
+                    if req.issue.is_some() {
+                        req.external_id = Some(format!("issue:{id}"));
+                    } else if req.pr.is_some() {
+                        req.external_id = Some(format!("pr:{id}"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn workflow_state_allows_reuse(state: IssueLifecycleState) -> bool {
+        !matches!(
+            state,
+            IssueLifecycleState::Failed | IssueLifecycleState::Cancelled
+        )
+    }
+
+    fn workflow_reuse_strategy(workflow: &IssueWorkflowInstance) -> WorkflowReuseStrategy {
+        if !Self::workflow_state_allows_reuse(workflow.state) {
+            return WorkflowReuseStrategy::None;
+        }
+        if let Some(task_id) = workflow.active_task_id.as_ref() {
+            return WorkflowReuseStrategy::ActiveTask(harness_core::types::TaskId(task_id.clone()));
+        }
+        if let Some(pr_number) = workflow.pr_number {
+            return WorkflowReuseStrategy::PrExternalId(format!("pr:{pr_number}"));
+        }
+        WorkflowReuseStrategy::None
+    }
+
+    async fn check_workflow_duplicate(
+        &self,
+        project_id: &str,
+        req: &CreateTaskRequest,
+    ) -> Option<TaskId> {
+        let workflows = self.issue_workflow_store.as_ref()?;
+        let workflow = if let Some(issue_number) = req.issue {
+            workflows
+                .get_by_issue(project_id, req.repo.as_deref(), issue_number)
+                .await
+                .ok()
+                .flatten()
+        } else if let Some(pr_number) = req.pr {
+            workflows
+                .get_by_pr(project_id, req.repo.as_deref(), pr_number)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        }?;
+
+        match Self::workflow_reuse_strategy(&workflow) {
+            WorkflowReuseStrategy::ActiveTask(task_id) => {
+                if self
+                    .tasks
+                    .exists_with_db_fallback(&task_id)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return Some(task_id);
+                }
+            }
+            WorkflowReuseStrategy::PrExternalId(pr_ext_id) => {
+                if let Some(task_id) = self
+                    .tasks
+                    .find_active_duplicate(project_id, &pr_ext_id)
+                    .await
+                {
+                    return Some(task_id);
+                }
+                if let Some((task_id, _)) = self
+                    .tasks
+                    .find_terminal_pr_duplicate(project_id, &pr_ext_id)
+                    .await
+                {
+                    return Some(task_id);
+                }
+            }
+            WorkflowReuseStrategy::None => {}
+        }
+
+        None
+    }
+
+    async fn check_duplicate(&self, project_id: &str, req: &CreateTaskRequest) -> Option<TaskId> {
+        let ext_id = req.external_id.as_deref()?;
+        let existing_id = self.tasks.find_active_duplicate(project_id, ext_id).await?;
+        tracing::info!(
+            existing_task = %existing_id.0,
+            external_id = %ext_id,
+            "dedup: returning existing active task instead of creating duplicate"
+        );
+        Some(existing_id)
+    }
+
+    async fn check_pr_duplicate(
+        &self,
+        project_id: &str,
+        req: &CreateTaskRequest,
+    ) -> Option<TaskId> {
+        let ext_id = req.external_id.as_deref()?;
+        let (existing_id, pr_url) = self
+            .tasks
+            .find_terminal_pr_duplicate(project_id, ext_id)
+            .await?;
+        tracing::info!(
+            existing_task = %existing_id.0,
+            external_id = %ext_id,
+            pr_url = %pr_url,
+            "dedup: terminal task already created PR, returning existing task instead of creating duplicate"
+        );
+        Some(existing_id)
+    }
+
+    async fn dependencies_blocked(&self, req: &CreateTaskRequest) -> bool {
+        if req.depends_on.is_empty() {
+            return false;
+        }
+        for dep_id in &req.depends_on {
+            if !matches!(
+                self.tasks.dep_status(dep_id).await,
+                Some(task_runner::TaskStatus::Done)
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Select the agent for this request (explicit, project default, or complexity-routed).
     fn select_agent(
         &self,
         req: &CreateTaskRequest,
-    ) -> Result<Arc<dyn harness_core::agent::CodeAgent>, EnqueueTaskError> {
+        registry_agent: Option<&str>,
+    ) -> Result<Arc<dyn CodeAgent>, EnqueueTaskError> {
         if let Some(name) = &req.agent {
-            self.agent_registry.get(name).ok_or_else(|| {
+            return self.agent_registry.get(name).ok_or_else(|| {
                 EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
-            })
-        } else {
-            let classification = complexity_router::classify(
-                req.prompt.as_deref().unwrap_or_default(),
-                req.issue,
-                req.pr,
-            );
-            self.agent_registry
-                .dispatch(&classification)
-                .map_err(|e| EnqueueTaskError::Internal(e.to_string()))
+            });
         }
+
+        if let Some(project_root) = &req.project {
+            let project_cfg = harness_core::config::project::load_project_config(project_root)
+                .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+            if let Some(agent_name) = project_cfg.agent.as_ref().and_then(|a| a.default.as_ref()) {
+                if agent_name != "auto" {
+                    return self.agent_registry.get(agent_name).ok_or_else(|| {
+                        EnqueueTaskError::BadRequest(format!("agent '{agent_name}' not registered"))
+                    });
+                }
+            }
+        }
+
+        if let Some(name) = registry_agent {
+            if name != "auto" {
+                return self.agent_registry.get(name).ok_or_else(|| {
+                    EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
+                });
+            }
+        }
+
+        let classification = complexity_router::classify(
+            req.prompt.as_deref().unwrap_or_default(),
+            req.issue,
+            req.pr,
+        );
+        self.agent_registry
+            .dispatch(&classification)
+            .map_err(|e| EnqueueTaskError::Internal(e.to_string()))
     }
 
     async fn track_issue_workflow(
@@ -241,9 +443,19 @@ impl DefaultExecutionService {
 #[async_trait]
 impl ExecutionService for DefaultExecutionService {
     async fn enqueue(&self, mut req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError> {
+        let now = chrono::Utc::now();
+        if self.server_config.maintenance_window.in_quiet_window(now) {
+            let retry_after_secs = self
+                .server_config
+                .maintenance_window
+                .secs_until_window_end(now);
+            return Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs });
+        }
+
         Self::validate_request(&req)?;
 
-        req.project = self.resolve_project(req.project).await?;
+        let (resolved_project, registry_default_agent) = self.resolve_project(req.project).await?;
+        req.project = resolved_project;
 
         let canonical = task_runner::resolve_canonical_project(req.project.clone())
             .await
@@ -253,13 +465,38 @@ impl ExecutionService for DefaultExecutionService {
         let project_id = canonical.to_string_lossy().into_owned();
         req.project = Some(canonical);
 
-        let permit = self
-            .task_queue
-            .acquire(&project_id, req.priority)
-            .await
-            .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+        task_runner::fill_missing_repo_from_project(&mut req).await;
+        Self::populate_external_id(&mut req);
+        if let Some(existing_id) = self.check_workflow_duplicate(&project_id, &req).await {
+            return Ok(existing_id);
+        }
+        if let Some(existing_id) = self.check_duplicate(&project_id, &req).await {
+            return Ok(existing_id);
+        }
+        if let Some(existing_id) = self.check_pr_duplicate(&project_id, &req).await {
+            return Ok(existing_id);
+        }
 
-        let agent = self.select_agent(&req)?;
+        if self.dependencies_blocked(&req).await {
+            let workflow_req = req.clone();
+            let task_id = task_runner::spawn_task_awaiting_deps(self.tasks.clone(), req)
+                .await
+                .map_err(|e| EnqueueTaskError::BadRequest(e.to_string()))?;
+            self.track_issue_workflow(&project_id, &workflow_req, &task_id)
+                .await;
+            return Ok(task_id);
+        }
+        req.depends_on.clear();
+
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.task_queue.acquire(&project_id, req.priority),
+        )
+        .await
+        .map_err(|_| EnqueueTaskError::Internal(self.queue_timeout_message(&project_id)))?
+        .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+
+        let agent = self.select_agent(&req, registry_default_agent.as_deref())?;
         let (reviewer, _) = resolve_reviewer(
             &self.agent_registry,
             &self.server_config.agents.review,
@@ -293,17 +530,19 @@ impl ExecutionService for DefaultExecutionService {
         &self,
         mut req: CreateTaskRequest,
     ) -> Result<TaskId, EnqueueTaskError> {
+        let now = chrono::Utc::now();
+        if self.server_config.maintenance_window.in_quiet_window(now) {
+            let retry_after_secs = self
+                .server_config
+                .maintenance_window
+                .secs_until_window_end(now);
+            return Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs });
+        }
+
         Self::validate_request(&req)?;
 
-        req.project = self.resolve_project(req.project).await?;
-
-        // Resolve agent up-front so validation errors surface immediately.
-        let agent = self.select_agent(&req)?;
-        let (reviewer, _) = resolve_reviewer(
-            &self.agent_registry,
-            &self.server_config.agents.review,
-            agent.name(),
-        );
+        let (resolved_project, registry_default_agent) = self.resolve_project(req.project).await?;
+        req.project = resolved_project;
 
         let canonical = task_runner::resolve_canonical_project(req.project.clone())
             .await
@@ -313,6 +552,35 @@ impl ExecutionService for DefaultExecutionService {
         let project_id = canonical.to_string_lossy().into_owned();
         req.project = Some(canonical);
         task_runner::fill_missing_repo_from_project(&mut req).await;
+
+        let agent = self.select_agent(&req, registry_default_agent.as_deref())?;
+        let (reviewer, _) = resolve_reviewer(
+            &self.agent_registry,
+            &self.server_config.agents.review,
+            agent.name(),
+        );
+
+        Self::populate_external_id(&mut req);
+        if let Some(existing_id) = self.check_workflow_duplicate(&project_id, &req).await {
+            return Ok(existing_id);
+        }
+        if let Some(existing_id) = self.check_duplicate(&project_id, &req).await {
+            return Ok(existing_id);
+        }
+        if let Some(existing_id) = self.check_pr_duplicate(&project_id, &req).await {
+            return Ok(existing_id);
+        }
+
+        if self.dependencies_blocked(&req).await {
+            let workflow_req = req.clone();
+            let task_id = task_runner::spawn_task_awaiting_deps(self.tasks.clone(), req)
+                .await
+                .map_err(|e| EnqueueTaskError::BadRequest(e.to_string()))?;
+            self.track_issue_workflow(&project_id, &workflow_req, &task_id)
+                .await;
+            return Ok(task_id);
+        }
+        req.depends_on.clear();
 
         let server_config = self.server_config.clone();
 
@@ -450,7 +718,8 @@ mod tests {
         let registry = ProjectRegistry::open(&dir.path().join("p.db")).await?;
         let svc = make_minimal_svc(store, Some(registry)).await;
         let result = svc.resolve_project(None).await?;
-        assert!(result.is_none());
+        assert!(result.0.is_none());
+        assert!(result.1.is_none());
         Ok(())
     }
 
@@ -463,7 +732,8 @@ mod tests {
 
         let path = dir.path().to_path_buf();
         let result = svc.resolve_project(Some(path.clone())).await?;
-        assert_eq!(result, Some(path));
+        assert_eq!(result.0, Some(path));
+        assert!(result.1.is_none());
         Ok(())
     }
 

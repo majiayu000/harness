@@ -10,7 +10,7 @@ Runtime hosts should not start from a cold project view on every cycle. We need 
 
 ## In Scope
 
-1. In-memory host project cache manager.
+1. Host project cache manager with runtime-state persistence.
 2. Host-scoped project sync endpoint.
 3. Host-scoped project list endpoint.
 4. Registry/path resolution for project tokens during sync.
@@ -19,10 +19,9 @@ Runtime hosts should not start from a cold project view on every cycle. We need 
 
 ## Out of Scope
 
-1. Persistent cache storage across restart.
-2. Background file watcher or git index prefetch.
-3. Automatic scheduler routing based on watched-project affinity.
-4. Multi-tenant workspace model migration.
+1. Background file watcher or git index prefetch.
+2. Automatic scheduler routing based on watched-project affinity.
+3. Multi-tenant workspace model migration.
 
 ## API (V1)
 
@@ -60,7 +59,7 @@ Runtime hosts should not start from a cold project view on every cycle. We need 
 
 ## Risks
 
-1. In-memory cache is lost on restart.
+1. Runtime-state persistence is best-effort; a persist failure is surfaced by the handler and retried by later mutations.
 2. Sync does not currently warm git metadata; only project identity/root is cached.
 
 ## Verification

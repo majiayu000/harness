@@ -77,62 +77,15 @@ impl GcAgent {
 
     /// Return the list of files changed since the last checkpoint commit.
     ///
-    /// Reads the `head_commit` from the checkpoint, runs
-    /// `git diff --name-only <hash>..HEAD`, and returns the changed paths.
-    /// Returns an empty vec (triggering a full scan) when:
-    /// - no checkpoint is configured,
-    /// - the checkpoint has no `head_commit` recorded, or
-    /// - `git diff` fails.
-    ///
-    /// Also emits a tracing log line describing the scan mode.
+    /// Host-side git inspection is disabled by project policy, so GC uses a
+    /// full scan until changed-file signals are supplied by the orchestrating
+    /// agent or event stream.
     pub async fn changed_files_since_checkpoint(&self) -> Vec<PathBuf> {
-        let Some(cp_path) = &self.checkpoint_path else {
-            tracing::info!("gc: full scan: no checkpoint found");
-            return vec![];
-        };
-        let Some(cp) = GcCheckpoint::load(cp_path) else {
-            tracing::info!("gc: full scan: no checkpoint found");
-            return vec![];
-        };
-        let Some(base_commit) = cp.head_commit else {
-            tracing::info!("gc: full scan: no checkpoint found");
-            return vec![];
-        };
-
-        let range = format!("{base_commit}..HEAD");
-        match tokio::process::Command::new("git")
-            .args(["diff", "--name-only", &range])
-            .current_dir(&self.project_root)
-            .output()
-            .await
-        {
-            Ok(out) if out.status.success() => {
-                let files: Vec<PathBuf> = String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .filter(|l| !l.is_empty())
-                    .map(PathBuf::from)
-                    .collect();
-                tracing::info!(
-                    "gc: incremental scan: {} files changed since last checkpoint",
-                    files.len()
-                );
-                files
-            }
-            Ok(out) => {
-                tracing::warn!(
-                    "gc: git diff failed ({}): {}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-                tracing::info!("gc: full scan: falling back after git diff error");
-                vec![]
-            }
-            Err(e) => {
-                tracing::warn!("gc: git diff error: {e}");
-                tracing::info!("gc: full scan: falling back after git diff error");
-                vec![]
-            }
-        }
+        tracing::info!(
+            project_root = %self.project_root.display(),
+            "gc: full scan: host-side git changed-file detection disabled"
+        );
+        Vec::new()
     }
 
     /// Run a GC cycle using incremental scanning when a checkpoint is configured.
@@ -419,19 +372,12 @@ impl GcAgent {
     }
 }
 
-/// Run `git rev-parse HEAD` in `project_root` and return the commit hash, or `None` on failure.
+/// Return the current revision identifier when it is provided by a future
+/// agent-owned signal. Host-side git inspection is disabled, so this currently
+/// records no commit hash.
 async fn get_current_head(project_root: &Path) -> Option<String> {
-    let out = tokio::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(project_root)
-        .output()
-        .await
-        .ok()?;
-    if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        None
-    }
+    let _ = project_root;
+    None
 }
 
 /// Validate and resolve an artifact target path to an absolute path within `project_root`.
