@@ -546,6 +546,47 @@ pub(crate) async fn detect_repo_slug(project: &Path) -> Option<String> {
     fallback
 }
 
+fn current_branch_from_git_metadata(project: &Path) -> Option<String> {
+    let git_dir = discover_git_dir(project)?;
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?.trim();
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch.to_string())
+    }
+}
+
+fn discover_git_dir(project: &Path) -> Option<PathBuf> {
+    let mut current = if project.is_dir() {
+        Some(project)
+    } else {
+        project.parent()
+    };
+    while let Some(dir) = current {
+        let dotgit = dir.join(".git");
+        if dotgit.is_dir() {
+            return Some(dotgit);
+        }
+        if dotgit.is_file() {
+            return gitdir_from_file(&dotgit);
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn gitdir_from_file(dotgit: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(dotgit).ok()?;
+    let raw_gitdir = contents.trim().strip_prefix("gitdir:")?;
+    let path = PathBuf::from(raw_gitdir.trim());
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        dotgit.parent().map(|parent| parent.join(path))
+    }
+}
+
 fn git_config_candidates(project: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut current = if project.is_dir() {
@@ -602,47 +643,6 @@ fn config_candidates_from_gitdir_file(dotgit: &Path) -> Vec<PathBuf> {
         candidates.push(common_git_dir.join("config"));
     }
     candidates
-}
-
-fn current_branch_from_git_metadata(project: &Path) -> Option<String> {
-    let git_dir = discover_git_dir(project)?;
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let branch = head.trim().strip_prefix("ref: refs/heads/")?.trim();
-    if branch.is_empty() {
-        None
-    } else {
-        Some(branch.to_string())
-    }
-}
-
-fn discover_git_dir(project: &Path) -> Option<PathBuf> {
-    let mut current = if project.is_dir() {
-        Some(project)
-    } else {
-        project.parent()
-    };
-    while let Some(dir) = current {
-        let dotgit = dir.join(".git");
-        if dotgit.is_dir() {
-            return Some(dotgit);
-        }
-        if dotgit.is_file() {
-            return gitdir_from_file(&dotgit);
-        }
-        current = dir.parent();
-    }
-    None
-}
-
-fn gitdir_from_file(dotgit: &Path) -> Option<PathBuf> {
-    let contents = std::fs::read_to_string(dotgit).ok()?;
-    let raw_gitdir = contents.trim().strip_prefix("gitdir:")?;
-    let path = PathBuf::from(raw_gitdir.trim());
-    if path.is_absolute() {
-        Some(path)
-    } else {
-        dotgit.parent().map(|parent| parent.join(path))
-    }
 }
 
 fn parse_remote_urls_from_git_config(config: &str) -> Vec<(String, String)> {

@@ -24,6 +24,7 @@ pub(crate) mod misc_routes;
 pub(crate) mod rate_limit;
 pub(crate) mod sse_routes;
 pub(crate) mod state;
+pub(crate) mod task_mutation_routes;
 pub(crate) mod task_query_routes;
 pub(crate) mod task_routes;
 
