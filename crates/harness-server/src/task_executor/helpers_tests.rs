@@ -541,7 +541,8 @@ async fn inject_skills_retired_skill_not_included() {
     );
     let guard = skills.read().await;
     assert_eq!(
-        guard.list()[0].usage_count, 0,
+        guard.list()[0].usage_count,
+        0,
         "usage must not be recorded for retired skill"
     );
 }
