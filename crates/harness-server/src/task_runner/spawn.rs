@@ -814,6 +814,8 @@ where
                 if let Err(e) = wmgr.remove_workspace(&id).await {
                     tracing::warn!("workspace cleanup failed for {id:?}: {e}");
                 }
+            } else {
+                wmgr.release_workspace(&id);
             }
         }
 

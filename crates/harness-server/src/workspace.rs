@@ -52,6 +52,8 @@ struct WorkspaceOwnerRecord {
     task_id: String,
     run_generation: u32,
     owner_session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +236,22 @@ impl WorkspaceManager {
         let workspace_path = self.config.root.join(&workspace_key);
         let owner_session = self.owner_session.clone();
 
+        if let Some(existing) = self
+            .active
+            .iter()
+            .find(|entry| entry.key() != task_id && entry.workspace_path == workspace_path)
+        {
+            return Err(WorkspaceLifecycleError::LiveForeignOwner {
+                workspace_path: existing.workspace_path.clone(),
+                workspace_owner: Some(existing.owner_session.clone()),
+                message: format!(
+                    "WorktreeCollision: workspace path {:?} already owned by active task {}; manual resolution required",
+                    existing.workspace_path,
+                    existing.key().0
+                ),
+            });
+        }
+
         // Atomic check-and-insert: prevents TOCTOU where two concurrent calls for the
         // same task_id would both attempt git worktree add on the same path.
         // Insert a placeholder immediately so any concurrent caller returns early.
@@ -277,8 +295,7 @@ impl WorkspaceManager {
         if workspace_path.exists() {
             let owner_record = read_owner_record(&workspace_path);
             if owner_record.as_ref().is_some_and(|record| {
-                record.task_id == task_id.0
-                    && record.run_generation == run_generation
+                owner_record_matches_workspace(record, task_id, &workspace_key, run_generation)
                     && record.owner_session != owner_session
             }) {
                 self.active.remove(task_id);
@@ -293,10 +310,23 @@ impl WorkspaceManager {
             }
 
             if owner_record.as_ref().is_some_and(|record| {
-                record.task_id == task_id.0
-                    && record.run_generation == run_generation
+                owner_record_matches_workspace(record, task_id, &workspace_key, run_generation)
                     && record.owner_session == owner_session
             }) {
+                let owner_record = WorkspaceOwnerRecord {
+                    task_id: task_id.0.clone(),
+                    run_generation,
+                    owner_session: owner_session.clone(),
+                    workspace_key: Some(workspace_key.clone()),
+                };
+                if let Err(err) = write_owner_record(&workspace_path, &owner_record) {
+                    self.active.remove(task_id);
+                    return Err(WorkspaceLifecycleError::CreateFailed {
+                        workspace_path: workspace_path.clone(),
+                        workspace_owner: Some(owner_session.clone()),
+                        message: format!("failed to update workspace owner record: {err}"),
+                    });
+                }
                 tracing::info!(
                     task_id = %task_id.0,
                     path = ?workspace_path,
@@ -416,6 +446,7 @@ impl WorkspaceManager {
             task_id: task_id.0.clone(),
             run_generation,
             owner_session: owner_session.clone(),
+            workspace_key: Some(workspace_key),
         };
         if let Err(err) = write_owner_record(&workspace_path, &owner_record) {
             self.active.remove(task_id);
@@ -501,6 +532,15 @@ impl WorkspaceManager {
             );
         }
         Ok(())
+    }
+
+    /// Release the in-memory lease without deleting the workspace on disk.
+    ///
+    /// Used when `auto_cleanup=false` so a later task with the same deterministic
+    /// issue/PR workspace key can reuse the directory while concurrent tasks are
+    /// still protected by the active-path collision check.
+    pub fn release_workspace(&self, task_id: &TaskId) {
+        self.active.remove(task_id);
     }
 
     pub async fn cleanup_workspace_for_retry(
@@ -980,6 +1020,20 @@ fn read_owner_record(workspace_path: &Path) -> Option<WorkspaceOwnerRecord> {
     serde_json::from_slice(&bytes).ok()
 }
 
+fn owner_record_matches_workspace(
+    record: &WorkspaceOwnerRecord,
+    task_id: &TaskId,
+    workspace_key: &str,
+    run_generation: u32,
+) -> bool {
+    let identity_matches = record
+        .workspace_key
+        .as_deref()
+        .map(|key| key == workspace_key)
+        .unwrap_or(record.task_id == task_id.0);
+    identity_matches && record.run_generation == run_generation
+}
+
 fn write_owner_record(
     workspace_path: &Path,
     owner_record: &WorkspaceOwnerRecord,
@@ -1443,6 +1497,64 @@ mod tests {
         );
 
         mgr.remove_workspace(&task_id).await.expect("remove");
+    }
+
+    #[tokio::test]
+    async fn deterministic_issue_workspace_reuses_existing_directory_for_new_task() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            auto_cleanup: false,
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let first_task = harness_core::types::TaskId("task-first".to_string());
+        let second_task = harness_core::types::TaskId("task-second".to_string());
+
+        let first = mgr
+            .create_workspace(
+                &first_task,
+                source.path(),
+                "origin",
+                &branch,
+                1,
+                Some("issue:42"),
+                Some("owner/repo"),
+            )
+            .await
+            .expect("create first workspace");
+        let marker = first.workspace_path.join("handoff.txt");
+        std::fs::write(&marker, "keep this file").expect("write marker");
+        mgr.release_workspace(&first_task);
+
+        let second = mgr
+            .create_workspace(
+                &second_task,
+                source.path(),
+                "origin",
+                &branch,
+                1,
+                Some("issue:42"),
+                Some("owner/repo"),
+            )
+            .await
+            .expect("reuse deterministic workspace");
+
+        assert_eq!(first.workspace_path, second.workspace_path);
+        assert_eq!(second.decision, WorkspaceAcquireDecision::ReusedRecovered);
+        assert!(
+            second.workspace_path.join("handoff.txt").exists(),
+            "reused workspace must preserve prior task output"
+        );
+        let owner = read_owner_record(&second.workspace_path).expect("owner record");
+        assert_eq!(owner.task_id, second_task.0);
+        assert!(owner.workspace_key.is_some());
+
+        mgr.remove_workspace(&second_task).await.expect("remove");
     }
 
     #[tokio::test]
