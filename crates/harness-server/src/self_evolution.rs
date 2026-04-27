@@ -1,7 +1,8 @@
 use crate::handlers::learn;
 use crate::http::AppState;
 use crate::skill_governor;
-use harness_core::types::{Decision, Event, SessionId};
+use chrono::{Duration as ChronoDuration, Utc};
+use harness_core::types::{Decision, DraftStatus, Event, EventFilters, SessionId};
 use harness_protocol::methods::RpcResponse;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +15,9 @@ pub(crate) struct SelfEvolutionReport {
     pub(crate) skills_scored: usize,
     pub(crate) quarantined: usize,
     pub(crate) retired: usize,
+    pub(crate) drafts_pending: usize,
+    pub(crate) drafts_auto_adopted: usize,
+    pub(crate) skills_invoked_in_window: usize,
 }
 
 /// Start periodic self-evolution ticks.
@@ -66,6 +70,50 @@ pub(crate) async fn run_tick(state: &Arc<AppState>) -> anyhow::Result<SelfEvolut
         Err(err) => errors.push(format!("skill_governance failed: {err}")),
     }
 
+    // Telemetry: drafts pending at tick start.
+    match state.engines.gc_agent.drafts() {
+        Ok(drafts) => {
+            report.drafts_pending = drafts
+                .iter()
+                .filter(|d| d.status == DraftStatus::Pending)
+                .count();
+        }
+        Err(err) => errors.push(format!("draft_count failed: {err}")),
+    }
+
+    let since_window = Utc::now() - ChronoDuration::hours(24);
+
+    // Telemetry: gc_adopt events with Complete decision in the 24h window.
+    match state
+        .observability
+        .events
+        .query(&EventFilters {
+            hook: Some("gc_adopt".to_string()),
+            decision: Some(Decision::Complete),
+            since: Some(since_window),
+            ..EventFilters::default()
+        })
+        .await
+    {
+        Ok(adopted_events) => report.drafts_auto_adopted = adopted_events.len(),
+        Err(err) => errors.push(format!("gc_adopt_count failed: {err}")),
+    }
+
+    // Telemetry: skill_used events in the 24h window.
+    match state
+        .observability
+        .events
+        .query(&EventFilters {
+            hook: Some("skill_used".to_string()),
+            since: Some(since_window),
+            ..EventFilters::default()
+        })
+        .await
+    {
+        Ok(skill_events) => report.skills_invoked_in_window = skill_events.len(),
+        Err(err) => errors.push(format!("skill_invoked_count failed: {err}")),
+    }
+
     let decision = if errors.is_empty() {
         Decision::Complete
     } else {
@@ -78,12 +126,15 @@ pub(crate) async fn run_tick(state: &Arc<AppState>) -> anyhow::Result<SelfEvolut
         decision,
     );
     event.reason = Some(format!(
-        "rules={} skills={} scored={} quarantine={} retired={}",
+        "rules={} skills={} scored={} quarantine={} retired={} drafts_pending={} drafts_adopted={} skills_invoked={}",
         report.rules_learned,
         report.skills_learned,
         report.skills_scored,
         report.quarantined,
-        report.retired
+        report.retired,
+        report.drafts_pending,
+        report.drafts_auto_adopted,
+        report.skills_invoked_in_window,
     ));
     event.detail = Some(project_root.display().to_string());
     if !errors.is_empty() {
@@ -118,7 +169,38 @@ fn extract_count(response: &RpcResponse, key: &str) -> anyhow::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::types::EventFilters;
+    use harness_core::types::{
+        Artifact, ArtifactType, Draft, DraftId, DraftStatus, EventFilters, ProjectId,
+        RemediationType, Signal, SignalType,
+    };
+
+    fn make_pending_draft() -> Draft {
+        Draft {
+            id: DraftId::new(),
+            status: DraftStatus::Pending,
+            signal: Signal::new(
+                SignalType::RepeatedWarn,
+                ProjectId::new(),
+                serde_json::json!({}),
+                RemediationType::Guard,
+            ),
+            artifacts: vec![Artifact {
+                artifact_type: ArtifactType::Guard,
+                target_path: std::path::PathBuf::from(".harness/drafts/test.md"),
+                content: "test".into(),
+            }],
+            rationale: "test".into(),
+            validation: "test".into(),
+            generated_at: chrono::Utc::now(),
+            agent_model: "test".into(),
+        }
+    }
+
+    fn make_test_event(hook: &str, decision: Decision) -> Event {
+        let mut e = Event::new(SessionId::new(), hook, "test", decision);
+        e.reason = Some(format!("test {hook}"));
+        e
+    }
 
     #[tokio::test]
     async fn run_tick_logs_summary_event_when_no_adopted_drafts() -> anyhow::Result<()> {
@@ -135,6 +217,9 @@ mod tests {
         assert_eq!(report.rules_learned, 0);
         assert_eq!(report.skills_learned, 0);
         assert_eq!(report.skills_scored, 0);
+        assert_eq!(report.drafts_pending, 0);
+        assert_eq!(report.drafts_auto_adopted, 0);
+        assert_eq!(report.skills_invoked_in_window, 0);
 
         let events = state
             .observability
@@ -150,10 +235,84 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("expected self_evolution_tick event"))?;
         assert_eq!(
             latest.reason.as_deref(),
-            Some("rules=0 skills=0 scored=0 quarantine=0 retired=0")
+            Some(
+                "rules=0 skills=0 scored=0 quarantine=0 retired=0 drafts_pending=0 drafts_adopted=0 skills_invoked=0"
+            )
         );
         let expected_detail = project_root.path().display().to_string();
         assert_eq!(latest.detail.as_deref(), Some(expected_detail.as_str()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_tick_counts_pending_drafts() -> anyhow::Result<()> {
+        let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let data_dir = crate::test_helpers::tempdir_in_home("harness-self-evo-pending-")?;
+        let project_root = crate::test_helpers::tempdir_in_home("harness-self-evo-pending-proj-")?;
+        let state = crate::test_helpers::make_test_state_with_project_root(
+            data_dir.path(),
+            project_root.path(),
+        )
+        .await?;
+
+        let draft = make_pending_draft();
+        state.engines.gc_agent.draft_store().save(&draft)?;
+
+        let report = run_tick(&state).await?;
+        assert_eq!(report.drafts_pending, 1, "expected 1 pending draft");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_tick_counts_adopted_in_window() -> anyhow::Result<()> {
+        let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let data_dir = crate::test_helpers::tempdir_in_home("harness-self-evo-adopted-")?;
+        let project_root = crate::test_helpers::tempdir_in_home("harness-self-evo-adopted-proj-")?;
+        let state = crate::test_helpers::make_test_state_with_project_root(
+            data_dir.path(),
+            project_root.path(),
+        )
+        .await?;
+
+        // Log one gc_adopt Complete event inside the 24h window.
+        let event_in = make_test_event("gc_adopt", Decision::Complete);
+        state.observability.events.log(&event_in).await?;
+
+        // Log one gc_adopt Complete event outside the 24h window — should not be counted.
+        let mut event_out = make_test_event("gc_adopt", Decision::Complete);
+        event_out.ts = chrono::Utc::now() - chrono::Duration::hours(25);
+        state.observability.events.log(&event_out).await?;
+
+        let report = run_tick(&state).await?;
+        assert_eq!(
+            report.drafts_auto_adopted, 1,
+            "only in-window gc_adopt events should be counted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_tick_counts_skills_in_window() -> anyhow::Result<()> {
+        let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let data_dir = crate::test_helpers::tempdir_in_home("harness-self-evo-skills-")?;
+        let project_root = crate::test_helpers::tempdir_in_home("harness-self-evo-skills-proj-")?;
+        let state = crate::test_helpers::make_test_state_with_project_root(
+            data_dir.path(),
+            project_root.path(),
+        )
+        .await?;
+
+        // Log two skill_used events inside the 24h window.
+        let e1 = make_test_event("skill_used", Decision::Complete);
+        let e2 = make_test_event("skill_used", Decision::Complete);
+        state.observability.events.log(&e1).await?;
+        state.observability.events.log(&e2).await?;
+
+        let report = run_tick(&state).await?;
+        assert_eq!(
+            report.skills_invoked_in_window, 2,
+            "both skill_used events should be counted"
+        );
         Ok(())
     }
 }
