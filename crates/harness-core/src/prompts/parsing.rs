@@ -59,8 +59,7 @@ fn scan_bare_pr_url(output: &str) -> Option<String> {
                 .unwrap_or(candidate.len());
             // Trim trailing sentence punctuation that cannot be part of a PR URL.
             // Example: "see https://github.com/o/r/pull/5." — the period ends the sentence.
-            let url = candidate[..url_end]
-                .trim_end_matches(['.', ',', '!', '?', ')', ']']);
+            let url = candidate[..url_end].trim_end_matches(['.', ',', '!', '?', ')', ']']);
             if is_valid_github_pr_url(url) {
                 let normalized = url.split('#').next().unwrap_or(url).trim_end_matches('/');
                 last = Some(normalized.to_string());
