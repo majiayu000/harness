@@ -509,11 +509,13 @@ impl WorkspaceManager {
         source_repo: &Path,
         workspace_path: Option<&Path>,
     ) -> anyhow::Result<()> {
-        self.active.remove(task_id);
-        let fallback_path = self.config.root.join(sanitize_task_id(&task_id.0));
+        // Resolve target before removing from active so deterministic-key workspaces
+        // (whose directory name differs from sanitize_task_id(task_id)) are found.
         let target = workspace_path
             .map(Path::to_path_buf)
-            .unwrap_or(fallback_path);
+            .or_else(|| self.active.get(task_id).map(|e| e.workspace_path.clone()))
+            .unwrap_or_else(|| self.config.root.join(sanitize_task_id(&task_id.0)));
+        self.active.remove(task_id);
         cleanup_workspace_path(source_repo, &target).await
     }
 
@@ -759,6 +761,8 @@ impl WorkspaceManager {
     ///
     /// Errors from individual removals are logged and do not abort the sweep.
     pub async fn cleanup_orphan_worktrees(&self, source_repo: &Path, terminal_task_ids: &[TaskId]) {
+        let terminal_set: std::collections::HashSet<&str> =
+            terminal_task_ids.iter().map(|id| id.0.as_str()).collect();
         let terminal_dirs: std::collections::HashSet<String> = terminal_task_ids
             .iter()
             .map(|id| sanitize_task_id(&id.0))
@@ -790,6 +794,9 @@ impl WorkspaceManager {
             // A broad `starts_with("{td}-")` would also match unrelated workspaces
             // like `task-42-hotfix`, incorrectly deleting them when `task-42` is
             // terminal.  Restricting to the two known suffixes prevents false positives.
+            //
+            // Deterministic workspace keys (e.g. `{hash}__{repo}__{issue}`) don't match
+            // the UUID-derived directory name pattern, so also check the owner record.
             let is_terminal = terminal_dirs.iter().any(|td| {
                 dir_name == *td
                     || dir_name == format!("{td}-seq")
@@ -798,7 +805,9 @@ impl WorkspaceManager {
                         .is_some_and(|rest| {
                             !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
                         })
-            });
+            }) || read_owner_record(&path)
+                .map(|record| terminal_set.contains(record.task_id.as_str()))
+                .unwrap_or(false);
             if !is_terminal {
                 continue;
             }
@@ -847,12 +856,42 @@ fn sanitize_task_id(id: &str) -> String {
         .collect()
 }
 
+/// Sanitize a GitHub repository slug for use as a filesystem path component.
+///
+/// Preserves dots (valid in repo names) so that `my.org/repo` and `my_org/repo`
+/// produce distinct keys (`my.org_repo` vs `my_org_repo`).
+fn sanitize_repo_slug(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Return an 8-character lowercase hex string from a 32-bit FNV-1a hash of `s`.
+///
+/// This is a deterministic, stable hash with no external dependencies, used to
+/// produce a unique project scope component in deterministic workspace keys.
+fn fnv1a_8(s: &str) -> String {
+    let mut hash: u32 = 0x811c9dc5;
+    for b in s.bytes() {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    format!("{hash:08x}")
+}
+
 /// Derive the filesystem key for a workspace.
 ///
 /// For tasks with `external_id` matching `issue:N` or `pr:N` and a non-empty `repo`,
-/// returns `<sanitized_project>__<sanitized_repo>__<sanitized_external_id>`
-/// (e.g. `my-project__myorg_my-repo__issue_42`), scoped to the project root so that
-/// two different projects targeting the same GitHub repo/issue do not collide.
+/// returns `<path_hash>__<sanitized_repo>__<sanitized_external_id>`
+/// (e.g. `a3f2b1c4__myorg_my-repo__issue_42`), scoped by a hash of the project's
+/// absolute path so that two different projects targeting the same GitHub repo/issue
+/// do not collide even when their directory names are identical.
 /// Falls back to the UUID-derived key when `external_id`/`repo` are absent or don't match.
 fn derive_workspace_key(
     task_id: &TaskId,
@@ -863,14 +902,15 @@ fn derive_workspace_key(
     if let (Some(eid), Some(r)) = (external_id, repo) {
         if !r.is_empty() && is_issue_or_pr_id(eid) {
             let project_prefix = source_repo
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .map(|n| format!("{}__", sanitize_task_id(n)))
+                .map(|p| {
+                    let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                    format!("{}__", fnv1a_8(&canonical.to_string_lossy()))
+                })
                 .unwrap_or_default();
             return format!(
                 "{}{}__{}",
                 project_prefix,
-                sanitize_task_id(r),
+                sanitize_repo_slug(r),
                 sanitize_task_id(eid)
             );
         }
@@ -1235,24 +1275,28 @@ mod tests {
 
     #[test]
     fn derive_workspace_key_issue() {
+        let path = std::path::Path::new("/projects/my-project");
+        // canonicalize fails in test env; fnv1a_8 hashes the given path string
+        let prefix = fnv1a_8("/projects/my-project");
         let key = derive_workspace_key(
             &test_task_id(),
             Some("issue:42"),
             Some("myorg/my-repo"),
-            Some(std::path::Path::new("/projects/my-project")),
+            Some(path),
         );
-        assert_eq!(key, "my-project__myorg_my-repo__issue_42");
+        assert_eq!(key, format!("{prefix}__myorg_my-repo__issue_42"));
     }
 
     #[test]
     fn derive_workspace_key_pr() {
+        let prefix = fnv1a_8("/projects/my-project");
         let key = derive_workspace_key(
             &test_task_id(),
             Some("pr:7"),
             Some("myorg/my-repo"),
             Some(std::path::Path::new("/projects/my-project")),
         );
-        assert_eq!(key, "my-project__myorg_my-repo__pr_7");
+        assert_eq!(key, format!("{prefix}__myorg_my-repo__pr_7"));
     }
 
     #[test]
@@ -1271,13 +1315,16 @@ mod tests {
 
     #[test]
     fn derive_workspace_key_special_chars_in_repo() {
+        // sanitize_repo_slug preserves dots: "my.org/repo name" -> "my.org_repo_name"
+        // (distinct from "my_org/repo_name" -> "my_org_repo_name")
+        let prefix = fnv1a_8("/projects/my-project");
         let key = derive_workspace_key(
             &test_task_id(),
             Some("issue:99"),
             Some("my.org/repo name"),
             Some(std::path::Path::new("/projects/my-project")),
         );
-        assert_eq!(key, "my-project__my_org_repo_name__issue_99");
+        assert_eq!(key, format!("{prefix}__my.org_repo_name__issue_99"));
     }
 
     #[test]
@@ -1289,6 +1336,39 @@ mod tests {
             None,
         );
         assert_eq!(key, "myorg_my-repo__issue_42");
+    }
+
+    #[test]
+    fn sanitize_repo_slug_preserves_dots() {
+        assert_eq!(sanitize_repo_slug("my.org/my-repo"), "my.org_my-repo");
+        assert_eq!(sanitize_repo_slug("my_org/my-repo"), "my_org_my-repo");
+        // dots and underscores produce distinct keys
+        assert_ne!(
+            sanitize_repo_slug("my.org/repo"),
+            sanitize_repo_slug("my_org/repo")
+        );
+    }
+
+    #[test]
+    fn derive_workspace_key_different_projects_same_dirname_differ() {
+        // Two projects with the same dir name but different parent paths must
+        // produce different workspace keys (hash of full path, not just file_name).
+        let key_a = derive_workspace_key(
+            &test_task_id(),
+            Some("issue:1"),
+            Some("org/repo"),
+            Some(std::path::Path::new("/home/user/app")),
+        );
+        let key_b = derive_workspace_key(
+            &test_task_id(),
+            Some("issue:1"),
+            Some("org/repo"),
+            Some(std::path::Path::new("/opt/app")),
+        );
+        assert_ne!(
+            key_a, key_b,
+            "projects at different paths must produce different keys"
+        );
     }
 
     #[test]
