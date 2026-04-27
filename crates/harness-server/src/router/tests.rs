@@ -363,11 +363,14 @@ async fn wait_for_terminal_task(
     state: &AppState,
     task_id: &str,
 ) -> anyhow::Result<crate::task_runner::TaskState> {
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{sleep, Duration, Instant};
 
     let tid = harness_core::types::TaskId(task_id.to_string());
-    for _ in 0..120 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_status = None;
+    loop {
         if let Some(task) = state.core.tasks.get(&tid) {
+            last_status = Some(format!("{:?}", task.status));
             if matches!(
                 task.status,
                 crate::task_runner::TaskStatus::Done | crate::task_runner::TaskStatus::Failed
@@ -375,9 +378,12 @@ async fn wait_for_terminal_task(
                 return Ok(task);
             }
         }
+        if Instant::now() >= deadline {
+            break;
+        }
         sleep(Duration::from_millis(25)).await;
     }
-    anyhow::bail!("task did not reach terminal state in time");
+    anyhow::bail!("task did not reach terminal state in time; last_status={last_status:?}");
 }
 
 async fn run_gc_adopt_and_wait_for_failure_turn(max_rounds: u32) -> anyhow::Result<u32> {
