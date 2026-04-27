@@ -288,7 +288,7 @@ async fn track_issue_workflow_enqueue(
 /// Tier 2a: project root is known — load `.harness/config.toml`, resolve its
 ///          `agent.default` field. The sentinel value `"auto"` means "fall through".
 /// Tier 2b: `registry_agent` is `Some` — the project registry record has a
-///          `default_agent` configured via `POST /api/projects`. Also treats `"auto"` as
+///          `default_agent` configured via `POST /projects`. Also treats `"auto"` as
 ///          fall-through so callers can explicitly opt in to complexity dispatch.
 /// Tier 3: fall back to complexity-based dispatch via [`crate::complexity_router`].
 ///
@@ -324,7 +324,7 @@ pub(crate) fn select_agent(
         }
     }
 
-    // Tier 2b: project registry default agent (configured via POST /api/projects).
+    // Tier 2b: project registry default agent (configured via POST /projects).
     // Also treats "auto" as a fall-through sentinel.
     if let Some(name) = registry_agent {
         if name != "auto" {
@@ -350,7 +350,7 @@ pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
     req: task_runner::CreateTaskRequest,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
-    enqueue_task_in_domain(state, req, QueueDomain::Primary).await
+    state.execution_svc.enqueue(req).await
 }
 
 pub(crate) async fn enqueue_task_in_domain(

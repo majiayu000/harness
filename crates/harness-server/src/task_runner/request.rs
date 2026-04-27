@@ -280,26 +280,12 @@ pub async fn fill_missing_repo_from_project(req: &mut CreateTaskRequest) {
     req.repo = crate::task_executor::pr_detection::detect_repo_slug(project).await;
 }
 
-/// Detect the main git worktree root using a blocking subprocess call.
-/// Must be called via `tokio::task::spawn_blocking` in async contexts.
+/// Detect the main workspace root without launching git.
 pub(super) fn detect_main_worktree() -> PathBuf {
-    std::process::Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| {
-            s.lines()
-                .next()
-                .and_then(|line| line.strip_prefix("worktree "))
-                .map(|p| PathBuf::from(p.trim()))
-        })
-        .unwrap_or_else(|| {
-            tracing::warn!(
-                "detect_main_worktree: could not detect git worktree root, falling back to '.'"
-            );
-            PathBuf::from(".")
-        })
+    std::env::current_dir().unwrap_or_else(|e| {
+        tracing::warn!("detect_main_worktree: current_dir failed, falling back to '.': {e}");
+        PathBuf::from(".")
+    })
 }
 
 pub(super) fn default_wait() -> u64 {

@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::sleep;
 
+fn github_cli_command(bin: &str) -> Command {
+    Command::new(std::path::Path::new(bin))
+}
+
 /// One candidate task for reconciliation check.
 struct Candidate {
     id: TaskId,
@@ -136,7 +140,7 @@ fn parse_external_id(eid: Option<&str>) -> (Option<u64>, Option<u64>) {
 async fn fetch_pr_state_by_url(gh_bin: &str, pr_url: &str, project: &Path) -> GitHubState {
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        Command::new(gh_bin)
+        github_cli_command(gh_bin)
             .current_dir(project)
             .args([
                 "pr",
@@ -162,7 +166,7 @@ async fn fetch_pr_state_by_url(gh_bin: &str, pr_url: &str, project: &Path) -> Gi
 async fn fetch_pr_state_by_num(gh_bin: &str, pr_num: u64, project: &Path) -> GitHubState {
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        Command::new(gh_bin)
+        github_cli_command(gh_bin)
             .current_dir(project)
             .args([
                 "pr",
@@ -219,7 +223,7 @@ fn classify_pr_output(
 async fn fetch_issue_state(gh_bin: &str, issue_num: u64, project: &Path) -> GitHubState {
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        Command::new(gh_bin)
+        github_cli_command(gh_bin)
             .current_dir(project)
             .args([
                 "issue",

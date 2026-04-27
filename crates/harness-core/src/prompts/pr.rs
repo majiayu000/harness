@@ -44,9 +44,23 @@ pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str, repo: &str
 /// step uses the correct build/test toolchain instead of hardcoding `cargo`.
 pub fn rebase_conflicting_pr(pr_num: u64, branch: &str, repo: &str, project_root: &Path) -> String {
     let validation_step = rebase_validation_step(pr_num, project_root);
+    let branch_context = if branch.trim().is_empty() {
+        format!(
+            "PR #{pr_num} in `{repo}` has a merge conflict that is small enough for automatic rebase.\n\
+             Harness did not inspect GitHub locally. First determine the PR head branch from GitHub, then use that exact branch name for the commands below."
+        )
+    } else {
+        format!(
+            "PR #{pr_num} on branch `{branch}` in `{repo}` has a merge conflict that is small enough for automatic rebase."
+        )
+    };
+    let branch_arg = if branch.trim().is_empty() {
+        "<pr-head-branch>"
+    } else {
+        branch
+    };
     format!(
-        "PR #{pr_num} on branch `{branch}` in `{repo}` has a merge conflict that is small \
-         enough for automatic rebase.\n\n\
+        "{branch_context}\n\n\
          IMPORTANT: Never run `git checkout` or `git stash` in the main repository working tree.\n\
          All work must be done in an isolated worktree.\n\n\
          Steps:\n\
@@ -55,7 +69,7 @@ pub fn rebase_conflicting_pr(pr_num: u64, branch: &str, repo: &str, project_root
             git fetch origin\n\
             git worktree remove /tmp/harness-rebase-{pr_num} 2>/dev/null || rm -rf /tmp/harness-rebase-{pr_num} 2>/dev/null || true\n\
             git worktree prune\n\
-            git worktree add /tmp/harness-rebase-{pr_num} '{branch}'\n\
+            git worktree add /tmp/harness-rebase-{pr_num} '{branch_arg}'\n\
             ```\n\
          2. Rebase onto origin/main inside the worktree:\n\
             ```\n\
@@ -71,7 +85,7 @@ pub fn rebase_conflicting_pr(pr_num: u64, branch: &str, repo: &str, project_root
          {validation_step}\
          5. Force-push the rebased branch:\n\
             ```\n\
-            git push --force-with-lease origin '{branch}'\n\
+            git push --force-with-lease origin '{branch_arg}'\n\
             ```\n\
          6. Clean up: `git worktree remove /tmp/harness-rebase-{pr_num}`\n\n\
          On the last line of your output, print exactly one of:\n\
