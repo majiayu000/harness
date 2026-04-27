@@ -473,13 +473,14 @@ pub(crate) async fn run_review_loop(
                             .await?;
                             return Ok(());
                         }
-                        Err(_) => {
+                        Err(output) => {
                             tracing::warn!(
                                 task_id = %task_id,
                                 round,
                                 waiting_count,
                                 "silence-as-handoff: tests failed — consuming a round"
                             );
+                            pending_test_failure = Some(output);
                         }
                     }
                 }
@@ -767,7 +768,7 @@ pub(crate) async fn run_review_loop(
         }
         tracing::info!("PR #{pr_num} fixed at round {round}; waiting for bot re-review");
         if round < max_rounds {
-            waiting_count += 1;
+            waiting_count = 1;
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
             sleep(Duration::from_secs(wait_secs)).await;
         }

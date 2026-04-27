@@ -1290,8 +1290,8 @@ async fn run_github_reconciliation(state: &Arc<AppState>, deadline: Option<tokio
                 break;
             }
         }
-        state.core.tasks.wait_for_rate_limit().await;
-        // Re-check: task may have gone terminal between the snapshot and now.
+        // Re-check terminal state before rate-limiting: skip tasks that finished
+        // between the snapshot and now without holding the rate-limit slot.
         if state
             .core
             .tasks
@@ -1301,6 +1301,7 @@ async fn run_github_reconciliation(state: &Arc<AppState>, deadline: Option<tokio
         {
             continue;
         }
+        state.core.tasks.wait_for_rate_limit().await;
         tokio::time::sleep(RECONCILE_API_CALL_DELAY).await;
         let Some((raw_state, new_status)) = fetch_pr_github_state(&task_id, &pr_url).await else {
             continue;
@@ -1312,6 +1313,9 @@ async fn run_github_reconciliation(state: &Arc<AppState>, deadline: Option<tokio
             new_status = ?new_status,
             "reconciliation: transitioning task"
         );
+        // Abort any running worker before marking terminal so the worker cannot
+        // overwrite the reconciled status or fire the callback a second time.
+        state.core.tasks.abort_task(&task_id);
         let new_status_clone = new_status.clone();
         let raw_state_clone = raw_state.clone();
         if let Err(pe) = task_runner::mutate_and_persist(&state.core.tasks, &task_id, move |task| {
@@ -1327,6 +1331,7 @@ async fn run_github_reconciliation(state: &Arc<AppState>, deadline: Option<tokio
         .await
         {
             tracing::error!(task_id = %task_id, "reconciliation: failed to persist status transition: {pe}");
+            continue;
         }
         if let Some(cb) = &state.intake.completion_callback {
             if let Some(final_state) = state.core.tasks.get(&task_id) {

@@ -242,6 +242,27 @@ fn parse_gh_output(
     })
 }
 
+/// Extract the URL for the next page from a GitHub `Link` response header.
+/// Returns `None` when there are no more pages.
+fn extract_next_page_url(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    for segment in link.split(',') {
+        let segment = segment.trim();
+        if segment.contains(r#"rel="next""#) {
+            if let Some(url_part) = segment.split(';').next() {
+                return Some(
+                    url_part
+                        .trim()
+                        .trim_start_matches('<')
+                        .trim_end_matches('>')
+                        .to_string(),
+                );
+            }
+        }
+    }
+    None
+}
+
 #[async_trait]
 impl IntakeSource for GitHubIssuesPoller {
     fn name(&self) -> &str {
@@ -249,45 +270,67 @@ impl IntakeSource for GitHubIssuesPoller {
     }
 
     async fn poll(&self) -> anyhow::Result<Vec<IncomingIssue>> {
-        let url = format!("https://api.github.com/repos/{}/issues", self.repo);
+        let base_url = format!("https://api.github.com/repos/{}/issues", self.repo);
         let client = reqwest::Client::new();
-        let mut request = client
-            .get(url)
+        let token = std::env::var("GITHUB_TOKEN")
+            .or_else(|_| std::env::var("GH_TOKEN"))
+            .ok()
+            .filter(|t| !t.trim().is_empty());
+
+        // Build the first-page URL with query params; subsequent pages use the
+        // URL returned by the Link header which already contains all params.
+        let mut first_request = client
+            .get(&base_url)
             .query(&[("state", "open"), ("per_page", "100")])
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
             .header(reqwest::header::USER_AGENT, "harness-server");
         if !self.label.is_empty() {
-            request = request.query(&[("labels", self.label.as_str())]);
+            first_request = first_request.query(&[("labels", self.label.as_str())]);
         }
-        if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
-            if !token.trim().is_empty() {
-                request = request.bearer_auth(token);
-            }
+        if let Some(ref t) = token {
+            first_request = first_request.bearer_auth(t);
         }
-        let response = request.send().await?;
-        if !response.status().is_success() {
-            anyhow::bail!("GitHub issue list failed with status {}", response.status());
-        }
-        let body = response.bytes().await?;
 
-        let parsed = parse_gh_output(
-            &body,
-            &self.repo,
-            &self.dispatched,
-            self.project_root.as_deref(),
-        )?;
+        let mut all_new_issues: Vec<IncomingIssue> = Vec::new();
+        let mut all_open_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut next_request: Option<reqwest::RequestBuilder> = Some(first_request);
+
+        while let Some(req) = next_request.take() {
+            let response = req.send().await?;
+            if !response.status().is_success() {
+                anyhow::bail!("GitHub issue list failed with status {}", response.status());
+            }
+            let next_url = extract_next_page_url(response.headers());
+            let body = response.bytes().await?;
+            let parsed = parse_gh_output(
+                &body,
+                &self.repo,
+                &self.dispatched,
+                self.project_root.as_deref(),
+            )?;
+            all_new_issues.extend(parsed.new_issues);
+            all_open_ids.extend(parsed.open_issue_ids);
+
+            next_request = next_url.map(|url| {
+                let mut req = client
+                    .get(url)
+                    .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                    .header(reqwest::header::USER_AGENT, "harness-server");
+                if let Some(ref t) = token {
+                    req = req.bearer_auth(t);
+                }
+                req
+            });
+        }
 
         // Evict dispatched entries for issues no longer open (closed/deleted).
-        // This prevents unbounded growth of the dispatched map.
+        // Uses the full paginated set so repos with >100 open issues don't
+        // incorrectly evict still-open issues that appeared on later pages.
         let stale: Vec<String> = self
             .dispatched
             .iter()
             .map(|e| e.key().clone())
-            .filter(|id| {
-                !parsed
-                    .open_issue_ids
-                    .contains(&normalize_issue_external_id(id))
-            })
+            .filter(|id| !all_open_ids.contains(&normalize_issue_external_id(id)))
             .collect();
         if !stale.is_empty() {
             for id in &stale {
@@ -300,7 +343,7 @@ impl IntakeSource for GitHubIssuesPoller {
             self.persist_dispatched();
         }
 
-        Ok(parsed.new_issues)
+        Ok(all_new_issues)
     }
 
     async fn mark_dispatched(&self, external_id: &str, task_id: &TaskId) -> anyhow::Result<()> {
