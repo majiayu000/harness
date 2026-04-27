@@ -118,7 +118,7 @@ impl Default for GitHubIntakeConfig {
     }
 }
 
-/// Feishu (飞书) Bot intake configuration.
+/// Feishu Bot intake configuration.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct FeishuIntakeConfig {
     /// Enable Feishu bot webhook. Default: false.

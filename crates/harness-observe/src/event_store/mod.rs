@@ -113,8 +113,10 @@ impl EventStore {
     /// continue normally. Do not use outside of test code.
     #[doc(hidden)]
     pub fn new_noop_for_tests() -> Self {
-        let pool = PgPool::connect_lazy("postgresql://localhost/harness_noop")
-            .expect("lazy pool URL must be syntactically valid");
+        let pool = match PgPool::connect_lazy("postgresql://localhost/harness_noop") {
+            Ok(pool) => pool,
+            Err(error) => panic!("lazy pool URL must be syntactically valid: {error}"),
+        };
         Self {
             pool,
             data_dir: PathBuf::new(),

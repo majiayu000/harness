@@ -619,8 +619,8 @@ pub(crate) async fn run_implement_phase(
                 } => (pr_url, pr_num, created_issue_num),
             };
 
-        // Fallback: if the agent produced no PR_URL= sentinel, try to recover via
-        // `gh pr list --search "head:<branch>"`. This handles the regression where
+        // Fallback: if the agent produced no PR_URL= sentinel, try to recover from
+        // the current branch via GitHub REST. This handles the regression where
         // ANSI codes or unexpected output channels caused sentinel parsing to miss
         // an already-created PR (issue #982).
         if pr_url.is_none() && task_needs_pr_url(req) {
@@ -631,7 +631,7 @@ pub(crate) async fn run_implement_phase(
                     task_id = %task_id,
                     pr_number = fallback_num,
                     pr_url = %fallback_url,
-                    "PR_URL sentinel missing from output; recovered via gh pr list"
+                    "PR_URL sentinel missing from output; recovered via GitHub REST"
                 );
                 pr_url = Some(fallback_url);
                 pr_num = Some(fallback_num);

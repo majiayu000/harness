@@ -24,6 +24,7 @@ impl DispatchedTaskChecker for crate::task_runner::TaskStore {
 pub struct GitHubIssuesPoller {
     repo: String,
     label: String,
+    client: reqwest::Client,
     project_root: Option<PathBuf>,
     dispatched: DashMap<String, TaskId>,
     persist_path: Option<PathBuf>,
@@ -41,6 +42,7 @@ impl GitHubIssuesPoller {
         Self {
             repo: repo_config.repo.clone(),
             label: repo_config.label.clone(),
+            client: reqwest::Client::new(),
             project_root: repo_config.project_root.as_ref().map(PathBuf::from),
             dispatched,
             persist_path,
@@ -178,15 +180,17 @@ fn dispatched_contains_issue(dispatched: &DashMap<String, TaskId>, issue_id: &st
     dispatched.contains_key(issue_id) || dispatched.contains_key(&format!("issue:{issue_id}"))
 }
 
-/// Raw GitHub issue fields returned by `gh issue list --json`.
+/// Raw GitHub issue fields returned by the GitHub REST API.
 #[derive(Debug, Deserialize)]
 struct GhIssue {
     number: u64,
     title: String,
     body: Option<String>,
+    #[serde(alias = "html_url")]
     url: String,
+    #[serde(default)]
     labels: Vec<GhLabel>,
-    #[serde(rename = "createdAt")]
+    #[serde(alias = "createdAt")]
     created_at: Option<DateTime<Utc>>,
 }
 
@@ -195,7 +199,7 @@ struct GhLabel {
     name: String,
 }
 
-/// Parsed result from `gh issue list` output.
+/// Parsed result from GitHub issue-list output.
 struct ParsedGhOutput {
     /// New issues not yet dispatched.
     new_issues: Vec<IncomingIssue>,
@@ -203,7 +207,7 @@ struct ParsedGhOutput {
     open_issue_ids: std::collections::HashSet<String>,
 }
 
-/// Parse the JSON output of `gh issue list --json number,title,body,url,labels,createdAt`
+/// Parse the JSON output of the GitHub issue list API
 /// into new issues (filtering out dispatched) and the full set of open issue IDs.
 fn parse_gh_output(
     json: &[u8],
@@ -247,34 +251,29 @@ impl IntakeSource for GitHubIssuesPoller {
     }
 
     async fn poll(&self) -> anyhow::Result<Vec<IncomingIssue>> {
-        let mut args = vec![
-            "issue",
-            "list",
-            "--repo",
-            &self.repo,
-            "--state",
-            "open",
-            "--json",
-            "number,title,body,url,labels,createdAt",
-            "--limit",
-            "1000",
-        ];
+        let url = format!("https://api.github.com/repos/{}/issues", self.repo);
+        let mut request = self
+            .client
+            .get(url)
+            .query(&[("state", "open"), ("per_page", "100")])
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::USER_AGENT, "harness-server");
         if !self.label.is_empty() {
-            args.push("--label");
-            args.push(&self.label);
+            request = request.query(&[("labels", self.label.as_str())]);
         }
-        let output = tokio::process::Command::new("gh")
-            .args(&args)
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("gh issue list failed: {stderr}");
+        if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+            if !token.trim().is_empty() {
+                request = request.bearer_auth(token);
+            }
         }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            anyhow::bail!("GitHub issue list failed with status {}", response.status());
+        }
+        let body = response.bytes().await?;
 
         let parsed = parse_gh_output(
-            &output.stdout,
+            &body,
             &self.repo,
             &self.dispatched,
             self.project_root.as_deref(),

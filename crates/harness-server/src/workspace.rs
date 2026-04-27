@@ -32,8 +32,12 @@ const GIT_LOCAL_ENV_VARS: &[&str] = &[
 
 const OWNER_RECORD_FILE: &str = "harness-workspace-owner.json";
 
+fn git_binary() -> String {
+    std::env::var("HARNESS_GIT_BIN").unwrap_or_else(|_| "git".to_string())
+}
+
 fn git_command() -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = tokio::process::Command::new(git_binary());
     for key in GIT_LOCAL_ENV_VARS {
         cmd.env_remove(key);
     }
@@ -184,6 +188,7 @@ impl DiskRateLimiter {
 pub struct WorkspaceManager {
     pub(crate) config: WorkspaceConfig,
     pub(crate) active: DashMap<TaskId, ActiveWorkspace>,
+    pub(crate) active_paths: DashMap<PathBuf, TaskId>,
     pub(crate) owner_session: String,
 }
 
@@ -196,8 +201,25 @@ impl WorkspaceManager {
         Ok(Self {
             config,
             active: DashMap::new(),
+            active_paths: DashMap::new(),
             owner_session: SessionId::new().to_string(),
         })
+    }
+
+    fn release_active_path(&self, task_id: &TaskId, workspace_path: &Path) {
+        let owned_by_task = self
+            .active_paths
+            .get(workspace_path)
+            .is_some_and(|owner| owner.value() == task_id);
+        if owned_by_task {
+            self.active_paths.remove(workspace_path);
+        }
+    }
+
+    fn remove_active_workspace(&self, task_id: &TaskId) -> Option<ActiveWorkspace> {
+        let (_, active) = self.active.remove(task_id)?;
+        self.release_active_path(task_id, &active.workspace_path);
+        Some(active)
     }
 
     /// Create a git worktree for the given task under `config.root/<sanitized_task_id>`.
@@ -236,24 +258,45 @@ impl WorkspaceManager {
         let workspace_path = self.config.root.join(&workspace_key);
         let owner_session = self.owner_session.clone();
 
-        if let Some(existing) = self
-            .active
-            .iter()
-            .find(|entry| entry.key() != task_id && entry.workspace_path == workspace_path)
-        {
-            return Err(WorkspaceLifecycleError::LiveForeignOwner {
-                workspace_path: existing.workspace_path.clone(),
-                workspace_owner: Some(existing.owner_session.clone()),
-                message: format!(
-                    "WorktreeCollision: workspace path {:?} already owned by active task {}; manual resolution required",
-                    existing.workspace_path,
-                    existing.key().0
-                ),
-            });
-        }
+        // Reserve the deterministic path before task insertion. This closes the
+        // race where two different task IDs derive the same issue/PR workspace.
+        let path_reservation_inserted = {
+            use dashmap::mapref::entry::Entry;
+            match self.active_paths.entry(workspace_path.clone()) {
+                Entry::Occupied(occ) => {
+                    let owner_task = occ.get().clone();
+                    if owner_task != task_id.clone() {
+                        let (existing_path, workspace_owner) = self
+                            .active
+                            .get(&owner_task)
+                            .map(|entry| {
+                                (
+                                    entry.workspace_path.clone(),
+                                    Some(entry.owner_session.clone()),
+                                )
+                            })
+                            .unwrap_or_else(|| (workspace_path.clone(), None));
+                        return Err(WorkspaceLifecycleError::LiveForeignOwner {
+                            workspace_path: existing_path.clone(),
+                            workspace_owner,
+                            message: format!(
+                                "WorktreeCollision: workspace path {:?} already reserved by active task {}; manual resolution required",
+                                existing_path,
+                                owner_task.0
+                            ),
+                        });
+                    }
+                    false
+                }
+                Entry::Vacant(vac) => {
+                    vac.insert(task_id.clone());
+                    true
+                }
+            }
+        };
 
-        // Atomic check-and-insert: prevents TOCTOU where two concurrent calls for the
-        // same task_id would both attempt git worktree add on the same path.
+        // Atomic task check-and-insert: prevents TOCTOU where two concurrent calls
+        // for the same task_id would both attempt git worktree add on the same path.
         // Insert a placeholder immediately so any concurrent caller returns early.
         {
             use dashmap::mapref::entry::Entry;
@@ -269,6 +312,9 @@ impl WorkspaceManager {
                             run_generation,
                             decision: WorkspaceAcquireDecision::ReusedTracked,
                         });
+                    }
+                    if path_reservation_inserted {
+                        self.release_active_path(task_id, &workspace_path);
                     }
                     return Err(WorkspaceLifecycleError::LiveForeignOwner {
                         workspace_path: active.workspace_path.clone(),
@@ -298,7 +344,7 @@ impl WorkspaceManager {
                 owner_record_matches_workspace(record, task_id, &workspace_key, run_generation)
                     && record.owner_session != owner_session
             }) {
-                self.active.remove(task_id);
+                self.remove_active_workspace(task_id);
                 return Err(WorkspaceLifecycleError::LiveForeignOwner {
                     workspace_path: workspace_path.clone(),
                     workspace_owner: owner_record.map(|record| record.owner_session),
@@ -320,7 +366,7 @@ impl WorkspaceManager {
                     workspace_key: Some(workspace_key.clone()),
                 };
                 if let Err(err) = write_owner_record(&workspace_path, &owner_record) {
-                    self.active.remove(task_id);
+                    self.remove_active_workspace(task_id);
                     return Err(WorkspaceLifecycleError::CreateFailed {
                         workspace_path: workspace_path.clone(),
                         workspace_owner: Some(owner_session.clone()),
@@ -342,7 +388,7 @@ impl WorkspaceManager {
             }
 
             if let Err(err) = cleanup_workspace_path(source_repo, &workspace_path).await {
-                self.active.remove(task_id);
+                self.remove_active_workspace(task_id);
                 return Err(WorkspaceLifecycleError::ReconcileFailed {
                     workspace_path: workspace_path.clone(),
                     workspace_owner: owner_record.map(|record| record.owner_session),
@@ -356,7 +402,7 @@ impl WorkspaceManager {
         }
 
         // Fetch latest base_branch from remote so the worktree starts from upstream HEAD.
-        let fetch_output = git_command()
+        let fetch_output = match git_command()
             .args([
                 "-C",
                 &source_repo.to_string_lossy(),
@@ -366,11 +412,17 @@ impl WorkspaceManager {
             ])
             .output()
             .await
-            .map_err(|e| WorkspaceLifecycleError::CreateFailed {
-                workspace_path: workspace_path.clone(),
-                workspace_owner: Some(owner_session.clone()),
-                message: format!("git fetch failed for task {}: {e}", task_id.0),
-            })?;
+        {
+            Ok(output) => output,
+            Err(e) => {
+                self.remove_active_workspace(task_id);
+                return Err(WorkspaceLifecycleError::CreateFailed {
+                    workspace_path: workspace_path.clone(),
+                    workspace_owner: Some(owner_session.clone()),
+                    message: format!("git fetch failed for task {}: {e}", task_id.0),
+                });
+            }
+        };
 
         if !fetch_output.status.success() {
             let stderr = String::from_utf8_lossy(&fetch_output.stderr);
@@ -384,7 +436,7 @@ impl WorkspaceManager {
         // Falls back to local base_branch if fetch failed above.
         let remote_ref = format!("{remote}/{base_branch}");
         let branch = format!("harness/{}", task_id.0);
-        let output = git_command()
+        let output = match git_command()
             .args([
                 "-C",
                 &source_repo.to_string_lossy(),
@@ -397,15 +449,21 @@ impl WorkspaceManager {
             ])
             .output()
             .await
-            .map_err(|e| WorkspaceLifecycleError::CreateFailed {
-                workspace_path: workspace_path.clone(),
-                workspace_owner: Some(owner_session.clone()),
-                message: format!("git worktree add failed for task {}: {e}", task_id.0),
-            })?;
+        {
+            Ok(output) => output,
+            Err(e) => {
+                self.remove_active_workspace(task_id);
+                return Err(WorkspaceLifecycleError::CreateFailed {
+                    workspace_path: workspace_path.clone(),
+                    workspace_owner: Some(owner_session.clone()),
+                    message: format!("git worktree add failed for task {}: {e}", task_id.0),
+                });
+            }
+        };
 
         if !output.status.success() {
             // Fallback: try local base_branch (useful for repos without remotes, e.g. tests).
-            let fallback = git_command()
+            let fallback = match git_command()
                 .args([
                     "-C",
                     &source_repo.to_string_lossy(),
@@ -418,17 +476,23 @@ impl WorkspaceManager {
                 ])
                 .output()
                 .await
-                .map_err(|e| WorkspaceLifecycleError::CreateFailed {
-                    workspace_path: workspace_path.clone(),
-                    workspace_owner: Some(owner_session.clone()),
-                    message: format!(
-                        "git worktree add fallback failed for task {}: {e}",
-                        task_id.0
-                    ),
-                })?;
+            {
+                Ok(output) => output,
+                Err(e) => {
+                    self.remove_active_workspace(task_id);
+                    return Err(WorkspaceLifecycleError::CreateFailed {
+                        workspace_path: workspace_path.clone(),
+                        workspace_owner: Some(owner_session.clone()),
+                        message: format!(
+                            "git worktree add fallback failed for task {}: {e}",
+                            task_id.0
+                        ),
+                    });
+                }
+            };
 
             if !fallback.status.success() {
-                self.active.remove(task_id);
+                self.remove_active_workspace(task_id);
                 let stderr = String::from_utf8_lossy(&fallback.stderr);
                 return Err(WorkspaceLifecycleError::CreateFailed {
                     workspace_path: workspace_path.clone(),
@@ -449,7 +513,7 @@ impl WorkspaceManager {
             workspace_key: Some(workspace_key),
         };
         if let Err(err) = write_owner_record(&workspace_path, &owner_record) {
-            self.active.remove(task_id);
+            self.remove_active_workspace(task_id);
             if let Err(cleanup_err) = cleanup_workspace_path(source_repo, &workspace_path).await {
                 tracing::warn!(
                     "failed to cleanup partial worktree after owner-record failure: {cleanup_err}"
@@ -477,7 +541,7 @@ impl WorkspaceManager {
             };
 
             if let Some(err_msg) = hook_error {
-                self.active.remove(task_id);
+                self.remove_active_workspace(task_id);
                 if let Err(cleanup_err) = cleanup_workspace_path(source_repo, &workspace_path).await
                 {
                     tracing::warn!(
@@ -503,8 +567,8 @@ impl WorkspaceManager {
     /// Remove the workspace for the given task. Runs `before_remove_hook` first (non-fatal).
     /// Idempotent: returns Ok if the task has no active workspace.
     pub async fn remove_workspace(&self, task_id: &TaskId) -> anyhow::Result<()> {
-        let entry = match self.active.remove(task_id) {
-            Some((_, entry)) => entry,
+        let entry = match self.remove_active_workspace(task_id) {
+            Some(entry) => entry,
             None => return Ok(()),
         };
 
@@ -540,7 +604,7 @@ impl WorkspaceManager {
     /// issue/PR workspace key can reuse the directory while concurrent tasks are
     /// still protected by the active-path collision check.
     pub fn release_workspace(&self, task_id: &TaskId) {
-        self.active.remove(task_id);
+        self.remove_active_workspace(task_id);
     }
 
     pub async fn cleanup_workspace_for_retry(
@@ -555,7 +619,7 @@ impl WorkspaceManager {
             .map(Path::to_path_buf)
             .or_else(|| self.active.get(task_id).map(|e| e.workspace_path.clone()))
             .unwrap_or_else(|| self.config.root.join(sanitize_task_id(&task_id.0)));
-        self.active.remove(task_id);
+        self.remove_active_workspace(task_id);
         cleanup_workspace_path(source_repo, &target).await
     }
 
@@ -646,10 +710,10 @@ impl WorkspaceManager {
                 let cleanup_repo = resolve_cleanup_source_repo(source_repo, &path, task).await;
                 // Classify as migrated when the owner record carries an issue/PR key
                 // (new-key workspace from slice 1), so startup logs show the right breakdown.
-                let is_new_key = owner_record.as_ref().is_some_and(|r| {
-                    let (issue, pr) = crate::reconciliation::parse_external_id(Some(&r.task_id));
-                    issue.is_some() || pr.is_some()
-                });
+                let is_new_key = owner_record
+                    .as_ref()
+                    .and_then(owner_record_external_id)
+                    .is_some();
                 match cleanup_workspace_path(&cleanup_repo, &path).await {
                     Ok(()) => {
                         if is_new_key {
@@ -702,7 +766,7 @@ impl WorkspaceManager {
     }
 
     /// Walk `config.root` and remove any workspace directory whose owner record identifies
-    /// a closed issue or merged/closed PR, querying GitHub state via `gh_bin`.
+    /// a closed issue or merged/closed PR, querying GitHub state through the REST API.
     ///
     /// UUID-keyed dirs (no parseable external_id in the owner record) are skipped — they
     /// are handled by the spawn.rs GC-on-task-done path. Errors from individual removals
@@ -710,7 +774,7 @@ impl WorkspaceManager {
     pub(crate) async fn reconcile_disk_workspaces(
         &self,
         source_repo: &Path,
-        gh_bin: &str,
+        _gh_bin: &str,
         max_rate: u32,
     ) -> DiskReconciliationSummary {
         let mut summary = DiskReconciliationSummary::default();
@@ -741,27 +805,34 @@ impl WorkspaceManager {
             }
 
             let owner_record = read_owner_record(&path);
-            let task_id_str = match owner_record.as_ref() {
-                Some(r) => r.task_id.clone(),
-                None => {
-                    summary.skipped_uuid += 1;
-                    continue;
-                }
+            let Some(owner_record) = owner_record.as_ref() else {
+                summary.skipped_uuid += 1;
+                continue;
             };
-
-            let (issue_num, pr_num) =
-                crate::reconciliation::parse_external_id(Some(task_id_str.as_str()));
+            let Some(external_id) = owner_record_external_id(owner_record) else {
+                summary.skipped_uuid += 1;
+                continue;
+            };
+            let (issue_num, pr_num) = crate::reconciliation::parse_external_id(Some(&external_id));
             if issue_num.is_none() && pr_num.is_none() {
                 summary.skipped_uuid += 1;
                 continue;
             }
+            let Some(repo_slug) = owner_record
+                .workspace_key
+                .as_deref()
+                .and_then(repo_slug_from_workspace_key)
+            else {
+                summary.skipped_open += 1;
+                continue;
+            };
 
             let gh_state = if let Some(n) = issue_num {
                 rate.acquire().await;
-                crate::reconciliation::fetch_issue_state(gh_bin, n, source_repo).await
+                crate::reconciliation::fetch_issue_state(&repo_slug, n).await
             } else if let Some(n) = pr_num {
                 rate.acquire().await;
-                crate::reconciliation::fetch_pr_state_by_num(gh_bin, n, source_repo).await
+                crate::reconciliation::fetch_pr_state_by_slug(&repo_slug, n).await
             } else {
                 crate::reconciliation::GitHubState::Unknown
             };
@@ -970,6 +1041,43 @@ fn is_issue_or_pr_id(s: &str) -> bool {
         return false;
     };
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
+fn owner_record_external_id(record: &WorkspaceOwnerRecord) -> Option<String> {
+    let (issue, pr) = crate::reconciliation::parse_external_id(Some(&record.task_id));
+    if issue.is_some() || pr.is_some() {
+        return Some(record.task_id.clone());
+    }
+    record
+        .workspace_key
+        .as_deref()
+        .and_then(external_id_from_workspace_key)
+}
+
+fn external_id_from_workspace_key(key: &str) -> Option<String> {
+    let suffix = key.rsplit("__").next()?;
+    if let Some(issue) = suffix.strip_prefix("issue_") {
+        if !issue.is_empty() && issue.chars().all(|c| c.is_ascii_digit()) {
+            return Some(format!("issue:{issue}"));
+        }
+    }
+    if let Some(pr) = suffix.strip_prefix("pr_") {
+        if !pr.is_empty() && pr.chars().all(|c| c.is_ascii_digit()) {
+            return Some(format!("pr:{pr}"));
+        }
+    }
+    None
+}
+
+fn repo_slug_from_workspace_key(key: &str) -> Option<String> {
+    let mut parts = key.rsplit("__");
+    let _external_id = parts.next()?;
+    let repo_part = parts.next()?;
+    let (owner, repo) = repo_part.split_once('_')?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
 }
 
 /// Returns true when the git worktree at `path` is currently on `branch`.
@@ -1196,7 +1304,7 @@ mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     fn git_command_std() -> std::process::Command {
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = std::process::Command::new(git_binary());
         for key in GIT_LOCAL_ENV_VARS {
             cmd.env_remove(key);
         }
@@ -1253,6 +1361,36 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output
+    }
+
+    async fn github_state_server(path: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind GitHub mock");
+        let addr = listener.local_addr().expect("GitHub mock address");
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0_u8; 2048];
+            let Ok(n) = socket.read(&mut buf).await else {
+                return;
+            };
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let (status, response_body) = if request.starts_with(&format!("GET {path} ")) {
+                ("200 OK", body)
+            } else {
+                ("404 Not Found", "{}")
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}")
     }
 
     fn init_git_repo(dir: &Path) {
@@ -1558,6 +1696,57 @@ mod tests {
         assert!(owner.workspace_key.is_some());
 
         mgr.remove_workspace(&second_task).await.expect("remove");
+    }
+
+    #[tokio::test]
+    async fn create_workspace_blocks_inflight_duplicate_deterministic_path() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let first_task = harness_core::types::TaskId("task-first".to_string());
+        let second_task = harness_core::types::TaskId("task-second".to_string());
+        let workspace_key = derive_workspace_key(
+            &first_task,
+            Some("issue:42"),
+            Some("owner/repo"),
+            Some(source.path()),
+        );
+        let reserved_path = mgr.config.root.join(workspace_key);
+
+        mgr.active_paths
+            .insert(reserved_path.clone(), first_task.clone());
+
+        let err = mgr
+            .create_workspace(
+                &second_task,
+                source.path(),
+                "origin",
+                &branch,
+                1,
+                Some("issue:42"),
+                Some("owner/repo"),
+            )
+            .await
+            .expect_err("second task should be blocked by the path reservation");
+
+        assert!(
+            err.to_string().contains("already reserved by active task"),
+            "error should identify the in-flight deterministic path owner: {err}"
+        );
+        assert!(mgr.get_workspace(&second_task).is_none());
+        assert_eq!(
+            mgr.active_paths
+                .get(&reserved_path)
+                .map(|owner| owner.value().clone()),
+            Some(first_task)
+        );
     }
 
     #[tokio::test]
@@ -2279,7 +2468,7 @@ mod tests {
             .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create workspace");
-        mgr.active.remove(&task_id);
+        mgr.release_workspace(&task_id);
 
         let summary = mgr.reconcile_disk_workspaces(source.path(), "gh", 20).await;
 
@@ -2296,6 +2485,7 @@ mod tests {
     /// reconcile_disk_workspaces: removes a closed-issue workspace.
     #[tokio::test]
     async fn reconcile_disk_removes_closed_issue_workspace() {
+        let _env_guard = async_env_lock().lock().await;
         let source = tempfile::tempdir().expect("tempdir");
         init_git_repo(source.path());
 
@@ -2306,7 +2496,7 @@ mod tests {
         };
         let mgr = WorkspaceManager::new(config).expect("mgr");
 
-        let issue_dir = workspaces.path().join("issue_42");
+        let issue_dir = workspaces.path().join("myorg_my-repo__issue_42");
         std::fs::create_dir_all(issue_dir.join(".git")).expect("mkdir");
         std::fs::write(
             issue_dir.join(".git").join(OWNER_RECORD_FILE),
@@ -2314,25 +2504,17 @@ mod tests {
                 task_id: "issue:42".to_string(),
                 run_generation: 1,
                 owner_session: "s".to_string(),
-                workspace_key: None,
+                workspace_key: Some("myorg_my-repo__issue_42".to_string()),
             })
             .expect("serialize"),
         )
         .expect("write record");
 
-        let gh_dir = tempfile::tempdir().expect("tempdir");
-        let gh_script = gh_dir.path().join("gh");
-        std::fs::write(&gh_script, "#!/bin/sh\nprintf 'CLOSED\\n'\n").expect("write gh");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&gh_script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
+        let api_base =
+            github_state_server("/repos/myorg/my-repo/issues/42", r#"{"state":"closed"}"#).await;
+        let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
 
-        let summary = mgr
-            .reconcile_disk_workspaces(source.path(), gh_script.to_str().unwrap(), 20)
-            .await;
+        let summary = mgr.reconcile_disk_workspaces(source.path(), "gh", 20).await;
 
         assert_eq!(summary.removed, 1);
         assert!(!issue_dir.exists(), "closed issue workspace removed");
@@ -2341,6 +2523,7 @@ mod tests {
     /// reconcile_disk_workspaces: preserves an open-issue workspace.
     #[tokio::test]
     async fn reconcile_disk_skips_open_issue_workspace() {
+        let _env_guard = async_env_lock().lock().await;
         let source = tempfile::tempdir().expect("tempdir");
         init_git_repo(source.path());
 
@@ -2351,7 +2534,7 @@ mod tests {
         };
         let mgr = WorkspaceManager::new(config).expect("mgr");
 
-        let issue_dir = workspaces.path().join("issue_7");
+        let issue_dir = workspaces.path().join("myorg_my-repo__issue_7");
         std::fs::create_dir_all(issue_dir.join(".git")).expect("mkdir");
         std::fs::write(
             issue_dir.join(".git").join(OWNER_RECORD_FILE),
@@ -2359,25 +2542,17 @@ mod tests {
                 task_id: "issue:7".to_string(),
                 run_generation: 1,
                 owner_session: "s".to_string(),
-                workspace_key: None,
+                workspace_key: Some("myorg_my-repo__issue_7".to_string()),
             })
             .expect("serialize"),
         )
         .expect("write record");
 
-        let gh_dir = tempfile::tempdir().expect("tempdir");
-        let gh_script = gh_dir.path().join("gh");
-        std::fs::write(&gh_script, "#!/bin/sh\nprintf 'OPEN\\n'\n").expect("write gh");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&gh_script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
+        let api_base =
+            github_state_server("/repos/myorg/my-repo/issues/7", r#"{"state":"open"}"#).await;
+        let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
 
-        let summary = mgr
-            .reconcile_disk_workspaces(source.path(), gh_script.to_str().unwrap(), 20)
-            .await;
+        let summary = mgr.reconcile_disk_workspaces(source.path(), "gh", 20).await;
 
         assert_eq!(summary.removed, 0);
         assert_eq!(summary.skipped_open, 1);
