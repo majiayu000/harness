@@ -3,8 +3,8 @@ import type { FullTask, TaskArtifact, TaskPrompt } from "@/types";
 
 interface Props {
   task: FullTask;
-  prompts: TaskPrompt[];
-  artifacts: TaskArtifact[];
+  prompts: TaskPrompt[] | undefined;
+  artifacts: TaskArtifact[] | undefined;
 }
 
 function reviewerVerdict(state: string): string {
@@ -19,7 +19,7 @@ function reviewerVerdict(state: string): string {
 function elapsedTime(createdAt: string | null, completedAt: string | undefined): string {
   if (!createdAt || !completedAt) return "N/A";
   const ms = new Date(completedAt).getTime() - new Date(createdAt).getTime();
-  if (ms < 0) return "N/A";
+  if (isNaN(ms) || ms < 0) return "N/A";
   const s = Math.floor(ms / 1000);
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
@@ -74,7 +74,9 @@ export function ProofOfWorkCard({ task, prompts, artifacts }: Props) {
 
       <section>
         <div className="text-ink-3 mb-1 uppercase tracking-[0.08em]">Prompts</div>
-        {prompts.length === 0 ? (
+        {prompts === undefined ? (
+          <span className="text-ink-3">Loading prompts…</span>
+        ) : prompts.length === 0 ? (
           <span className="text-ink-3">No prompts recorded</span>
         ) : (
           <div className="flex flex-col gap-1">
@@ -94,7 +96,9 @@ export function ProofOfWorkCard({ task, prompts, artifacts }: Props) {
 
       <section>
         <div className="text-ink-3 mb-1 uppercase tracking-[0.08em]">Artifacts</div>
-        {artifacts.length === 0 ? (
+        {artifacts === undefined ? (
+          <span className="text-ink-3">Loading artifacts…</span>
+        ) : artifacts.length === 0 ? (
           <span className="text-ink-3">No artifacts</span>
         ) : (
           <div className="flex flex-col gap-2">

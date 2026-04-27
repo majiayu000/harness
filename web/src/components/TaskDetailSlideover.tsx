@@ -128,11 +128,11 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
           {!isLoading && !isError && activeTab === "summary" && task && (
             <>
               <SummaryContent task={task} />
-              {isTerminal(task.status) && (
+              {isTaskTerminal && (
                 <ProofOfWorkCard
                   task={task}
-                  prompts={prompts ?? []}
-                  artifacts={artifacts ?? []}
+                  prompts={prompts}
+                  artifacts={artifacts}
                 />
               )}
             </>
