@@ -1,12 +1,16 @@
-use super::helpers::{run_agent_streaming, update_status};
+use super::helpers::{
+    inject_skills_into_prompt, matched_skills_for_prompt, run_agent_streaming, update_status,
+};
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskPhase, TaskStatus, TaskStore,
 };
 use harness_core::agent::{AgentRequest, CodeAgent};
 use harness_core::prompts;
-use harness_core::types::ExecutionPhase;
+use harness_core::types::{Decision, Event, ExecutionPhase, SessionId};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio::time::Duration;
 
 /// Run a plan step for a complex prompt-only task when the planning gate has
@@ -22,6 +26,8 @@ pub(crate) async fn run_plan_for_prompt(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
+    skills: &Arc<RwLock<harness_skills::store::SkillStore>>,
+    events: &Arc<harness_observe::event_store::EventStore>,
 ) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
     let prompt_text = req.prompt.as_deref().unwrap_or_default();
     tracing::info!(task_id = %task_id, "pipeline: starting plan phase for prompt-only task");
@@ -32,6 +38,30 @@ pub(crate) async fn run_plan_for_prompt(
     .await?;
 
     let plan_prompt = prompts::plan_for_prompt_task(prompt_text);
+    let matched_skills = matched_skills_for_prompt(skills, &plan_prompt).await;
+    let skill_additions = inject_skills_into_prompt(skills, &plan_prompt).await;
+    let plan_prompt = if skill_additions.is_empty() {
+        plan_prompt
+    } else {
+        plan_prompt + &skill_additions
+    };
+    for (skill_id, skill_name) in matched_skills {
+        let mut skill_event = Event::new(
+            SessionId::new(),
+            "skill_used",
+            "task_runner",
+            Decision::Pass,
+        );
+        skill_event.reason = Some(skill_name);
+        skill_event.detail = Some(format!(
+            "task_id={} skill_id={}",
+            task_id.as_str(),
+            skill_id.as_str()
+        ));
+        if let Err(err) = events.log(&skill_event).await {
+            tracing::warn!(error = %err, "failed to log skill_used event");
+        }
+    }
 
     let plan_req = AgentRequest {
         prompt: plan_prompt,
@@ -84,6 +114,8 @@ pub(crate) async fn run_triage_plan_pipeline(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
+    skills: &Arc<RwLock<harness_skills::store::SkillStore>>,
+    events: &Arc<harness_observe::event_store::EventStore>,
 ) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
     // --- Phase 1: Triage ---
     tracing::info!(task_id = %task_id, issue, "pipeline: starting triage phase");
@@ -94,6 +126,30 @@ pub(crate) async fn run_triage_plan_pipeline(
     update_status(store, task_id, TaskStatus::Triaging, 0).await?;
 
     let triage_prompt = prompts::triage_prompt(issue).to_prompt_string();
+    let matched_skills = matched_skills_for_prompt(skills, &triage_prompt).await;
+    let skill_additions = inject_skills_into_prompt(skills, &triage_prompt).await;
+    let triage_prompt = if skill_additions.is_empty() {
+        triage_prompt
+    } else {
+        triage_prompt + &skill_additions
+    };
+    for (skill_id, skill_name) in matched_skills {
+        let mut skill_event = Event::new(
+            SessionId::new(),
+            "skill_used",
+            "task_runner",
+            Decision::Pass,
+        );
+        skill_event.reason = Some(skill_name);
+        skill_event.detail = Some(format!(
+            "task_id={} skill_id={}",
+            task_id.as_str(),
+            skill_id.as_str()
+        ));
+        if let Err(err) = events.log(&skill_event).await {
+            tracing::warn!(error = %err, "failed to log skill_used event");
+        }
+    }
     let triage_req = AgentRequest {
         prompt: triage_prompt,
         project_root: project.to_path_buf(),
@@ -162,6 +218,30 @@ pub(crate) async fn run_triage_plan_pipeline(
     update_status(store, task_id, TaskStatus::Planning, 0).await?;
 
     let plan_prompt = prompts::plan_prompt(issue, &triage_resp.output).to_prompt_string();
+    let matched_plan_skills = matched_skills_for_prompt(skills, &plan_prompt).await;
+    let plan_skill_additions = inject_skills_into_prompt(skills, &plan_prompt).await;
+    let plan_prompt = if plan_skill_additions.is_empty() {
+        plan_prompt
+    } else {
+        plan_prompt + &plan_skill_additions
+    };
+    for (skill_id, skill_name) in matched_plan_skills {
+        let mut skill_event = Event::new(
+            SessionId::new(),
+            "skill_used",
+            "task_runner",
+            Decision::Pass,
+        );
+        skill_event.reason = Some(skill_name);
+        skill_event.detail = Some(format!(
+            "task_id={} skill_id={}",
+            task_id.as_str(),
+            skill_id.as_str()
+        ));
+        if let Err(err) = events.log(&skill_event).await {
+            tracing::warn!(error = %err, "failed to log skill_used event");
+        }
+    }
     let plan_req = AgentRequest {
         prompt: plan_prompt,
         project_root: project.to_path_buf(),
@@ -209,6 +289,8 @@ pub(crate) async fn run_replan_for_issue(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
+    skills: &Arc<RwLock<harness_skills::store::SkillStore>>,
+    events: &Arc<harness_observe::event_store::EventStore>,
 ) -> anyhow::Result<String> {
     tracing::info!(task_id = %task_id, issue, "pipeline: starting replan phase");
     mutate_and_persist(store, task_id, |state| {
@@ -217,6 +299,30 @@ pub(crate) async fn run_replan_for_issue(
     .await?;
 
     let prompt = prompts::replan_prompt(issue, prior_plan, plan_issue).to_prompt_string();
+    let matched_skills = matched_skills_for_prompt(skills, &prompt).await;
+    let skill_additions = inject_skills_into_prompt(skills, &prompt).await;
+    let prompt = if skill_additions.is_empty() {
+        prompt
+    } else {
+        prompt + &skill_additions
+    };
+    for (skill_id, skill_name) in matched_skills {
+        let mut skill_event = Event::new(
+            SessionId::new(),
+            "skill_used",
+            "task_runner",
+            Decision::Pass,
+        );
+        skill_event.reason = Some(skill_name);
+        skill_event.detail = Some(format!(
+            "task_id={} skill_id={}",
+            task_id.as_str(),
+            skill_id.as_str()
+        ));
+        if let Err(err) = events.log(&skill_event).await {
+            tracing::warn!(error = %err, "failed to log skill_used event");
+        }
+    }
     let plan_req = AgentRequest {
         prompt,
         project_root: project.to_path_buf(),

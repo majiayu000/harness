@@ -483,6 +483,100 @@ async fn inject_skills_empty_store_returns_empty_string() {
     );
 }
 
+fn make_skill_store_with_two_matching() -> harness_skills::store::SkillStore {
+    let mut store = harness_skills::store::SkillStore::new();
+    store.create(
+        "review".to_string(),
+        "# Review\n<!-- trigger-patterns: code review -->\nReview code carefully.".to_string(),
+    );
+    store.create(
+        "build-fix".to_string(),
+        "# BuildFix\n<!-- trigger-patterns: code review -->\nFix build issues.".to_string(),
+    );
+    store
+}
+
+#[tokio::test]
+async fn inject_skills_multiple_matches_all_usage_counts_incremented() {
+    let skills = RwLock::new(make_skill_store_with_two_matching());
+    inject_skills_into_prompt(&skills, "please do a code review").await;
+    let guard = skills.read().await;
+    for skill in guard.list() {
+        assert_eq!(
+            skill.usage_count, 1,
+            "skill '{}' must have usage_count=1 after matching",
+            skill.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn inject_skills_retired_skill_not_included() {
+    // Drive a skill into Retired state via apply_governance_outcome.
+    // Retired requires: scored_samples >= 30 AND quality_score < 0.30.
+    // Starting from quality_score=0.5, 4 calls with fail=100 yields ~0.293 < 0.30.
+    use harness_skills::store::SkillGovernanceInput;
+    let mut store = harness_skills::store::SkillStore::new();
+    store.create(
+        "retired-review".to_string(),
+        "# RetiredReview\n<!-- trigger-patterns: code review -->\nRetired review content."
+            .to_string(),
+    );
+    let id = store.list()[0].id.clone();
+    for _ in 0..4 {
+        store.apply_governance_outcome(
+            &id,
+            SkillGovernanceInput {
+                success: 0,
+                fail: 100,
+                unknown: 0,
+            },
+        );
+    }
+    let skills = RwLock::new(store);
+    let result = inject_skills_into_prompt(&skills, "please do a code review").await;
+    assert!(
+        !result.contains("Retired review content."),
+        "retired skill content must not appear in prompt"
+    );
+    let guard = skills.read().await;
+    assert_eq!(
+        guard.list()[0].usage_count, 0,
+        "usage must not be recorded for retired skill"
+    );
+}
+
+#[tokio::test]
+async fn inject_skills_quarantine_injection_is_deterministic() {
+    // Drive a skill into Quarantine, then verify same prompt always produces
+    // the same result (canary bucket is deterministic hash, not random).
+    use harness_skills::store::SkillGovernanceInput;
+    let mut store = harness_skills::store::SkillStore::new();
+    store.create(
+        "quarantine-review".to_string(),
+        "# QuarantineReview\n<!-- trigger-patterns: code review -->\nQuarantine content."
+            .to_string(),
+    );
+    let id = store.list()[0].id.clone();
+    // One call with fail=15: quality=0.43 < 0.45, samples=15 >= 10 → Quarantine.
+    store.apply_governance_outcome(
+        &id,
+        SkillGovernanceInput {
+            success: 0,
+            fail: 15,
+            unknown: 0,
+        },
+    );
+    let skills = RwLock::new(store);
+    let prompt = "please do a code review";
+    let result1 = inject_skills_into_prompt(&skills, prompt).await;
+    let result2 = inject_skills_into_prompt(&skills, prompt).await;
+    assert_eq!(
+        result1, result2,
+        "injection result must be deterministic for the same prompt"
+    );
+}
+
 // ── truncate_validation_error ─────────────────────────────────────────────────
 
 #[test]
