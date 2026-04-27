@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useTasks, useDashboard } from "@/lib/queries";
 import { apiFetch } from "@/lib/api";
 import { TaskDetailSlideover } from "@/components/TaskDetailSlideover";
+import { workflowLabel } from "@/lib/format";
 import type { Task, WorkflowSummary } from "@/types";
 
 interface Column {
@@ -75,51 +76,6 @@ function columnOf(taskStatus: string, workflowState?: string | null): string {
     if (c.fallbackTaskStatuses.includes(taskStatus)) return c.key;
   }
   return "other";
-}
-
-function workflowLabel(state: string): string {
-  switch (state) {
-    case "discovered":
-      return "Discovered";
-    case "scheduled":
-      return "Scheduled";
-    case "implementing":
-      return "Implementing";
-    case "pr_open":
-      return "PR Open";
-    case "awaiting_feedback":
-      return "Awaiting Feedback";
-    case "addressing_feedback":
-      return "Addressing Feedback";
-    case "ready_to_merge":
-      return "Ready To Merge";
-    case "blocked":
-      return "Blocked";
-    case "done":
-      return "Done";
-    case "failed":
-      return "Failed";
-    case "cancelled":
-      return "Cancelled";
-    case "idle":
-      return "Idle";
-    case "polling_intake":
-      return "Polling Intake";
-    case "planning_batch":
-      return "Planning Batch";
-    case "dispatching":
-      return "Dispatching";
-    case "monitoring":
-      return "Monitoring";
-    case "sweeping_feedback":
-      return "Sweeping Feedback";
-    case "paused":
-      return "Paused";
-    case "degraded":
-      return "Degraded";
-    default:
-      return state;
-  }
 }
 
 function TaskCard({

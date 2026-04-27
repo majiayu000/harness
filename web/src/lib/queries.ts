@@ -118,6 +118,19 @@ export interface WorktreeCard {
   diskBytes: number | null;
 }
 
+export async function registerProject(req: {
+  id: string;
+  root: string;
+  default_agent?: string;
+  max_concurrent?: number;
+}): Promise<void> {
+  await apiFetch("/projects", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
 export function useWorktrees(): { cards: WorktreeCard[]; isLoading: boolean; error: Error | null } {
   const tasks = useTasks();
   const overview = useOverview();

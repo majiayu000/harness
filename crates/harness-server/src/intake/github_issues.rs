@@ -24,6 +24,7 @@ impl DispatchedTaskChecker for crate::task_runner::TaskStore {
 pub struct GitHubIssuesPoller {
     repo: String,
     label: String,
+    client: reqwest::Client,
     project_root: Option<PathBuf>,
     dispatched: DashMap<String, TaskId>,
     persist_path: Option<PathBuf>,
@@ -41,6 +42,7 @@ impl GitHubIssuesPoller {
         Self {
             repo: repo_config.repo.clone(),
             label: repo_config.label.clone(),
+            client: reqwest::Client::new(),
             project_root: repo_config.project_root.as_ref().map(PathBuf::from),
             dispatched,
             persist_path,
@@ -250,8 +252,8 @@ impl IntakeSource for GitHubIssuesPoller {
 
     async fn poll(&self) -> anyhow::Result<Vec<IncomingIssue>> {
         let url = format!("https://api.github.com/repos/{}/issues", self.repo);
-        let client = reqwest::Client::new();
-        let mut request = client
+        let mut request = self
+            .client
             .get(url)
             .query(&[("state", "open"), ("per_page", "100")])
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -717,5 +719,43 @@ mod tests {
 
         assert_eq!(pruned, 0);
         assert!(poller.dispatched.contains_key("1"));
+    }
+
+    // Surface 3 regression guard: the dispatched JSON file stores only
+    // {issue_id → task_id} pairs.  No workspace path must ever be written.
+    #[test]
+    fn surface3_dispatched_json_has_no_path_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: None,
+        };
+        let poller = GitHubIssuesPoller::new(&repo_cfg, Some(tmp.path()));
+        poller.dispatched.insert(
+            "42".to_string(),
+            harness_core::types::TaskId("task-abc123".to_string()),
+        );
+        poller.dispatched.insert(
+            "99".to_string(),
+            harness_core::types::TaskId("task-xyz456".to_string()),
+        );
+        poller.persist_dispatched();
+
+        let persist_path = tmp.path().join("github_dispatched_owner_repo.json");
+        let json = std::fs::read_to_string(&persist_path)
+            .expect("dispatched file should have been written");
+        assert!(
+            !json.contains("/workspaces/"),
+            "dispatched JSON must not contain workspace paths, got: {json}"
+        );
+        let map: HashMap<String, String> =
+            serde_json::from_str(&json).expect("dispatched JSON must parse");
+        assert_eq!(map.len(), 2, "both entries should be persisted");
+        assert!(
+            map.values()
+                .all(|v| !v.contains('/') || v.starts_with("skip-")),
+            "task IDs must not be filesystem paths"
+        );
     }
 }

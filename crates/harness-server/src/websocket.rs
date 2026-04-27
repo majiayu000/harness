@@ -314,6 +314,7 @@ mod tests {
             vec![],
             None,
             Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             None,
             None,
             None,

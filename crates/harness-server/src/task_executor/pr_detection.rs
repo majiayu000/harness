@@ -393,6 +393,96 @@ fn strip_trailing_repo_qualifier(s: &str) -> Option<&str> {
     Some(&s[..owner_start])
 }
 
+/// Attempt to recover a PR URL when the agent output lacked a `PR_URL=` sentinel.
+///
+/// Detects the current branch from Git metadata and then queries GitHub's REST
+/// API for open PRs whose head branch matches. Returns `(pr_number, pr_url)` for
+/// the first result, or `None` when branch, repo, or GitHub state is unavailable.
+pub(crate) async fn fallback_find_pr_by_branch(project_root: &Path) -> Option<(u64, String)> {
+    let Some(branch) = current_branch_from_git_metadata(project_root) else {
+        tracing::warn!("fallback_find_pr_by_branch: detached HEAD, cannot search by branch");
+        return None;
+    };
+
+    let Some(repo_slug) = detect_repo_slug(project_root).await else {
+        tracing::warn!(
+            branch = %branch,
+            project = %project_root.display(),
+            "fallback_find_pr_by_branch: repository slug unavailable"
+        );
+        return None;
+    };
+
+    let url = format!("https://api.github.com/repos/{repo_slug}/pulls?state=open&per_page=100");
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "harness-server");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+        if !token.trim().is_empty() {
+            request = request.bearer_auth(token);
+        }
+    }
+    let response =
+        match tokio::time::timeout(std::time::Duration::from_secs(10), request.send()).await {
+            Ok(Ok(response)) if response.status().is_success() => response,
+            Ok(Ok(response)) => {
+                tracing::warn!(
+                    branch = %branch,
+                    repo = %repo_slug,
+                    status = %response.status(),
+                    "fallback_find_pr_by_branch: GitHub state check returned non-success status"
+                );
+                return None;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    branch = %branch,
+                    repo = %repo_slug,
+                    error = %e,
+                    "fallback_find_pr_by_branch: GitHub state check failed"
+                );
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    branch = %branch,
+                    repo = %repo_slug,
+                    "fallback_find_pr_by_branch: GitHub state check timed out"
+                );
+                return None;
+            }
+        };
+
+    let items: Vec<GhPrListItem> = match response
+        .json::<Vec<GitHubPullItem>>()
+        .await
+        .map(|items| items.into_iter().map(Into::into).collect())
+    {
+        Ok(items) => items,
+        Err(e) => {
+            tracing::warn!(
+                branch = %branch,
+                repo = %repo_slug,
+                error = %e,
+                "fallback_find_pr_by_branch: JSON parse failed"
+            );
+            return None;
+        }
+    };
+    let first = items
+        .into_iter()
+        .find(|item| item.head_ref_name == branch)?;
+    tracing::info!(
+        branch = %branch,
+        pr_number = first.number,
+        pr_url = %first.url,
+        "fallback_find_pr_by_branch: recovered PR via GitHub REST"
+    );
+    Some((first.number, first.url))
+}
+
 /// Parse `"owner/repo"` from a git remote URL.
 ///
 /// Handles HTTPS (`https://github.com/owner/repo.git`),
@@ -454,6 +544,47 @@ pub(crate) async fn detect_repo_slug(project: &Path) -> Option<String> {
         }
     }
     fallback
+}
+
+fn current_branch_from_git_metadata(project: &Path) -> Option<String> {
+    let git_dir = discover_git_dir(project)?;
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?.trim();
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch.to_string())
+    }
+}
+
+fn discover_git_dir(project: &Path) -> Option<PathBuf> {
+    let mut current = if project.is_dir() {
+        Some(project)
+    } else {
+        project.parent()
+    };
+    while let Some(dir) = current {
+        let dotgit = dir.join(".git");
+        if dotgit.is_dir() {
+            return Some(dotgit);
+        }
+        if dotgit.is_file() {
+            return gitdir_from_file(&dotgit);
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn gitdir_from_file(dotgit: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(dotgit).ok()?;
+    let raw_gitdir = contents.trim().strip_prefix("gitdir:")?;
+    let path = PathBuf::from(raw_gitdir.trim());
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        dotgit.parent().map(|parent| parent.join(path))
+    }
 }
 
 fn git_config_candidates(project: &Path) -> Vec<PathBuf> {
@@ -519,21 +650,61 @@ fn parse_remote_urls_from_git_config(config: &str) -> Vec<(String, String)> {
     let mut remotes = Vec::new();
     for line in config.lines() {
         let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            current_remote = trimmed
-                .strip_prefix("[remote \"")
-                .and_then(|value| value.strip_suffix("\"]"))
-                .map(str::to_string);
+            let section = &trimmed[1..trimmed.len() - 1];
+            current_remote = parse_remote_section_name(section);
             continue;
         }
         let Some(name) = current_remote.as_deref() else {
             continue;
         };
-        if let Some(url) = trimmed.strip_prefix("url =") {
-            remotes.push((name.to_string(), url.trim().to_string()));
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("url") {
+            let url = trim_git_config_value(value);
+            if !url.is_empty() {
+                remotes.push((name.to_string(), url.to_string()));
+            }
         }
     }
     remotes
+}
+
+fn parse_remote_section_name(section: &str) -> Option<String> {
+    let section = section.trim();
+    if let Some(name) = section.strip_prefix("remote.") {
+        let name = name.trim();
+        return (!name.is_empty()).then(|| name.to_string());
+    }
+
+    let rest = section.strip_prefix("remote")?;
+    if rest.chars().next().is_some_and(|ch| !ch.is_whitespace()) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let quoted = rest.strip_prefix('"')?;
+    let end = quoted.find('"')?;
+    let name = quoted[..end].trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn trim_git_config_value(value: &str) -> &str {
+    let value = value.trim();
+    for (idx, ch) in value.char_indices() {
+        if (ch == '#' || ch == ';')
+            && value[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            return value[..idx].trim_end();
+        }
+    }
+    value
 }
 
 #[cfg(test)]
@@ -779,6 +950,31 @@ mod tests {
 
     // --- parse_harness_mention_command (pre-existing, light coverage) ---
 
+    // --- fallback_find_pr_by_branch JSON parsing tests (T6 / T7) ---
+
+    #[test]
+    fn fallback_json_valid_returns_first_item() {
+        // T6: GitHub REST JSON with one match should deserialize correctly.
+        let json = r#"[{"number":42,"html_url":"https://github.com/owner/repo/pull/42","title":"fix","body":null,"head":{"ref":"codex/fix"}}]"#;
+        let items: Vec<GhPrListItem> = serde_json::from_str::<Vec<GitHubPullItem>>(json)
+            .unwrap()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let first = items.into_iter().next().unwrap();
+        assert_eq!(first.number, 42);
+        assert_eq!(first.url, "https://github.com/owner/repo/pull/42");
+        assert_eq!(first.head_ref_name, "codex/fix");
+    }
+
+    #[test]
+    fn fallback_json_empty_array_returns_none() {
+        // T7: empty JSON array — no PR found on this branch.
+        let json = r#"[]"#;
+        let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+        assert!(items.into_iter().next().is_none());
+    }
+
     #[test]
     fn parses_fix_ci_command() {
         assert_eq!(
@@ -850,6 +1046,40 @@ mod tests {
         assert_eq!(
             parse_repo_slug_from_remote_url("https://gitlab.com/owner/repo.git"),
             None
+        );
+    }
+
+    #[test]
+    fn parse_git_config_accepts_dotted_remote_section() {
+        let config = r#"
+            [remote.origin]
+                url = https://github.com/owner/repo.git
+        "#;
+        assert_eq!(
+            parse_remote_urls_from_git_config(config),
+            vec![(
+                "origin".to_string(),
+                "https://github.com/owner/repo.git".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_git_config_accepts_quoted_remote_with_spacing_and_comments() {
+        let config = r#"
+            # ignored
+            [remote "upstream"]
+                fetch = +refs/heads/*:refs/remotes/upstream/*
+                url=git@github.com:owner/repo.git ; mirror used by tests
+            [branch "main"]
+                remote = upstream
+        "#;
+        assert_eq!(
+            parse_remote_urls_from_git_config(config),
+            vec![(
+                "upstream".to_string(),
+                "git@github.com:owner/repo.git".to_string()
+            )]
         );
     }
 }

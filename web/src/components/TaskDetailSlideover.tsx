@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useTaskDetail, useTaskStream } from "@/lib/queries";
 import { apiJson } from "@/lib/api";
-import type { FullTask } from "@/types";
+import { isTerminal } from "@/types/task";
+import { ProofOfWorkCard } from "./ProofOfWorkCard";
+import type { FullTask, TaskArtifact, TaskPrompt } from "@/types";
 
 type Tab = "summary" | "output" | "prompts" | "artifacts";
 
@@ -38,16 +40,18 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
 
   const { data: task, isLoading, isError } = useTaskDetail(taskId);
 
+  const isTaskTerminal = task ? isTerminal(task.status) : false;
+
   const { data: artifacts, isError: isArtifactsError } = useQuery({
     queryKey: ["task-artifacts", taskId],
-    queryFn: ({ signal }) => apiJson<unknown[]>(`/tasks/${taskId}/artifacts`, { signal }),
-    enabled: !!taskId && activeTab === "artifacts",
+    queryFn: ({ signal }) => apiJson<TaskArtifact[]>(`/tasks/${taskId}/artifacts`, { signal }),
+    enabled: !!taskId && (activeTab === "artifacts" || isTaskTerminal),
   });
 
   const { data: prompts, isError: isPromptsError } = useQuery({
     queryKey: ["task-prompts", taskId],
-    queryFn: ({ signal }) => apiJson<unknown[]>(`/tasks/${taskId}/prompts`, { signal }),
-    enabled: !!taskId && activeTab === "prompts",
+    queryFn: ({ signal }) => apiJson<TaskPrompt[]>(`/tasks/${taskId}/prompts`, { signal }),
+    enabled: !!taskId && (activeTab === "prompts" || isTaskTerminal),
   });
 
   useEffect(() => {
@@ -122,7 +126,16 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
             </div>
           )}
           {!isLoading && !isError && activeTab === "summary" && task && (
-            <SummaryContent task={task} />
+            <>
+              <SummaryContent task={task} />
+              {isTaskTerminal && (
+                <ProofOfWorkCard
+                  task={task}
+                  prompts={prompts}
+                  artifacts={artifacts}
+                />
+              )}
+            </>
           )}
           {activeTab === "output" && (
             <>

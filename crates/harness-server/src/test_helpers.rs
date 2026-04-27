@@ -214,6 +214,7 @@ async fn make_state_inner(
         vec![],
         None,
         task_queue.clone(),
+        task_queue.clone(),
         None,
         None,
         None,

@@ -537,7 +537,7 @@ pub(crate) async fn run_task(
             (None, prompts::TriageComplexity::Medium, 0u32)
         } else {
             triage_pipeline::run_triage_plan_pipeline(
-                agent, store, task_id, issue, &cargo_env, &project, req,
+                agent, store, task_id, issue, &cargo_env, &project, req, &skills, &events,
             )
             .await?
         }
@@ -554,8 +554,10 @@ pub(crate) async fn run_task(
             // Planning is in resumable_statuses, so a crash here will be caught by
             // startup recovery: no pr_url/plan checkpoint → mark failed, re-queue manually.
             update_status(store, task_id, TaskStatus::Planning, 0).await?;
-            triage_pipeline::run_plan_for_prompt(agent, store, task_id, &cargo_env, &project, req)
-                .await?
+            triage_pipeline::run_plan_for_prompt(
+                agent, store, task_id, &cargo_env, &project, req, &skills, &events,
+            )
+            .await?
         } else {
             (None, prompts::TriageComplexity::Medium, 0u32)
         }
@@ -691,6 +693,8 @@ pub(crate) async fn run_task(
                         &cargo_env,
                         &project,
                         req,
+                        &skills,
+                        &events,
                     )
                     .await?;
                     turns_used += 1;
@@ -753,6 +757,7 @@ pub(crate) async fn run_task(
                 pr_url.as_deref().unwrap_or(""),
                 project_config.review_type.as_str(),
                 &events,
+                &skills,
                 &cargo_env,
                 effective_max_turns,
                 &mut turns_used,

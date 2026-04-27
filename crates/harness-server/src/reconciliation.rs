@@ -40,7 +40,7 @@ pub struct ReconciliationReport {
 
 /// External GitHub state observed for one candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GitHubState {
+pub(crate) enum GitHubState {
     PrMerged,
     PrClosed,
     IssueClosed,
@@ -137,7 +137,7 @@ fn collect_candidates(store: &TaskStore) -> (Vec<Candidate>, usize) {
     (candidates, skipped_terminal)
 }
 
-fn parse_external_id(eid: Option<&str>) -> (Option<u64>, Option<u64>) {
+pub(crate) fn parse_external_id(eid: Option<&str>) -> (Option<u64>, Option<u64>) {
     match eid {
         Some(s) if s.starts_with("issue:") => (s["issue:".len()..].parse().ok(), None),
         Some(s) if s.starts_with("pr:") => (None, s["pr:".len()..].parse().ok()),
@@ -213,7 +213,7 @@ async fn fetch_pr_state_by_url(pr_url: &str) -> GitHubState {
 }
 
 /// Fetch GitHub PR state by repository slug and number.
-async fn fetch_pr_state_by_slug(repo_slug: &str, pr_num: u64) -> GitHubState {
+pub(crate) async fn fetch_pr_state_by_slug(repo_slug: &str, pr_num: u64) -> GitHubState {
     let Some(state) =
         github_get_json::<GitHubPullState>(&format!("/repos/{repo_slug}/pulls/{pr_num}")).await
     else {
@@ -223,7 +223,7 @@ async fn fetch_pr_state_by_slug(repo_slug: &str, pr_num: u64) -> GitHubState {
 }
 
 /// Fetch issue state by repository slug and number.
-async fn fetch_issue_state(repo_slug: &str, issue_num: u64) -> GitHubState {
+pub(crate) async fn fetch_issue_state(repo_slug: &str, issue_num: u64) -> GitHubState {
     let Some(state) =
         github_get_json::<GitHubIssueState>(&format!("/repos/{repo_slug}/issues/{issue_num}"))
             .await
@@ -393,6 +393,23 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
             false,
         )
         .await;
+
+        // Clean up workspaces for tasks that were just terminated by reconciliation,
+        // so the workspace is gone within the same tick (issue #969).
+        if let Some(ref wmgr) = state.concurrency.workspace_mgr {
+            let transitioned_ids: Vec<crate::task_runner::TaskId> = report
+                .transitions
+                .iter()
+                .filter(|t| t.applied)
+                .map(|t| harness_core::types::TaskId(t.task_id.clone()))
+                .collect();
+            if !transitioned_ids.is_empty() {
+                if let Err(e) = wmgr.cleanup_terminal(&transitioned_ids).await {
+                    tracing::warn!("reconciliation: workspace cleanup failed: {e}");
+                }
+            }
+        }
+
         tracing::info!(
             candidates = report.candidates,
             skipped_terminal = report.skipped_terminal,
@@ -525,5 +542,29 @@ mod tests {
             Some((TaskStatus::Cancelled, "reconciled: PR closed externally"))
         );
         assert_eq!(transition_for_github_state(GitHubState::Open), None);
+    }
+
+    // Reconciliation payload guard: ReconciliationReport and
+    // ReconciliationTransition are serialised over HTTP.  They must never
+    // contain a UUID workspace path.
+    #[test]
+    fn reconciliation_payload_has_no_workspace_paths() {
+        let report = ReconciliationReport {
+            candidates: 3,
+            skipped_terminal: 1,
+            transitions: vec![ReconciliationTransition {
+                task_id: "task-abc123".to_string(),
+                from: "implementing".to_string(),
+                to: "done".to_string(),
+                reason: "PR merged".to_string(),
+                applied: true,
+            }],
+        };
+        let json =
+            serde_json::to_string(&report).expect("ReconciliationReport must serialise to JSON");
+        assert!(
+            !json.contains("/workspaces/"),
+            "ReconciliationReport JSON must not contain a workspace path, got: {json}"
+        );
     }
 }
