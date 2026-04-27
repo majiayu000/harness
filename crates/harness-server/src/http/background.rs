@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::{state::AppState, task_routes};
 use crate::task_runner;
-use harness_workflow::issue_lifecycle::{IssueLifecycleState, IssueWorkflowInstance};
+use harness_workflow::issue_lifecycle::{workflow_id, IssueLifecycleState, IssueWorkflowInstance};
 
 fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
     task.external_id
@@ -403,7 +403,7 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
 
             let mut touched_projects = std::collections::HashSet::new();
             let mut incomplete_projects = std::collections::HashSet::new();
-            for workflow in candidates {
+            for mut workflow in candidates {
                 let Some(pr_number) = workflow.pr_number else {
                     continue;
                 };
@@ -461,7 +461,23 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                                     error = %e,
                                     "sweeper: failed to repair project_id (rekey row)"
                                 );
+                                let _ = issue_workflows
+                                    .release_feedback_claim(
+                                        &workflow.project_id,
+                                        workflow.repo.as_deref(),
+                                        pr_number,
+                                        "sweeper: failed to repair project_id",
+                                    )
+                                    .await;
+                                continue;
                             }
+                            let repaired_project_id = resolved.to_string_lossy().into_owned();
+                            workflow.id = workflow_id(
+                                &repaired_project_id,
+                                workflow.repo.as_deref(),
+                                workflow.issue_number,
+                            );
+                            workflow.project_id = repaired_project_id;
                             warned_unresolvable.remove(&project_key);
                             resolved
                         }
