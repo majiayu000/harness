@@ -898,12 +898,15 @@ fn sanitize_task_id(id: &str) -> String {
 
 /// Sanitize a GitHub repository slug for use as a filesystem path component.
 ///
-/// Preserves dots (valid in repo names) so that `my.org/repo` and `my_org/repo`
-/// produce distinct keys (`my.org_repo` vs `my_org_repo`).
+/// Preserves underscores, dots, and hyphens (all valid in repo names) so that
+/// `my.org/repo` and `my_org/repo` produce distinct keys (`my.org_repo` vs
+/// `my_org_repo`). The `/` org-repo separator maps to `_`. GitHub organisation
+/// names cannot contain underscores (only `[a-zA-Z0-9-]`), so the `owner_repo`
+/// output is unambiguous for valid GitHub slugs.
 fn sanitize_repo_slug(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '.' {
+            if c.is_alphanumeric() || c == '-' || c == '.' || c == '_' {
                 c
             } else {
                 '_'
