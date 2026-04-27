@@ -15,7 +15,7 @@ export interface Task {
   repo: string | null;
   description: string | null;
   created_at: string | null;
-  completed_at?: string;
+  updated_at?: string | null;
   phase: string | null;
   depends_on: string[];
   subtask_ids: string[];

@@ -59,7 +59,7 @@ export function ProofOfWorkCard({ task, prompts, artifacts }: Props) {
         <div className="text-ink-3 mb-1 uppercase tracking-[0.08em]">Rounds / Elapsed</div>
         <div className="flex gap-4 text-ink">
           <span>Rounds: {task.turn}</span>
-          <span>Elapsed: {elapsedTime(task.created_at, task.completed_at)}</span>
+          <span>Elapsed: {elapsedTime(task.created_at, task.updated_at ?? undefined)}</span>
         </div>
       </section>
 

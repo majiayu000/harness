@@ -151,7 +151,7 @@ describe("TaskDetailSlideover", () => {
       status: "done",
       pr_url: "https://github.com/owner/repo/pull/42",
       workflow: { state: "ready_to_merge", pr_number: 42 },
-      completed_at: "2024-01-01T01:00:00Z",
+      updated_at: "2024-01-01T01:00:00Z",
     });
     mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
     mockApiJson.mockImplementation((url: string) => {
@@ -191,8 +191,10 @@ describe("TaskDetailSlideover", () => {
     const card = await screen.findByTestId("proof-of-work-card");
     expect(card).toHaveTextContent("No PR");
     expect(card).toHaveTextContent("No reviewer data");
-    expect(card).toHaveTextContent("No prompts recorded");
-    expect(card).toHaveTextContent("No artifacts");
+    await waitFor(() => {
+      expect(card).toHaveTextContent("No prompts recorded");
+      expect(card).toHaveTextContent("No artifacts");
+    });
   });
 
   it("switches tabs without remounting (Summary → Output → Summary)", () => {
