@@ -1268,13 +1268,16 @@ mod tests {
 
     const RECONCILE_GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+    // ARCH-GH-EXEMPT test double: mirrors the logic of fetch_pr_state_by_url in
+    // reconciliation.rs, but with an injectable gh_bin so tests run without a live
+    // GitHub connection. Keep the parsing (trim_matches('"'), to_uppercase) in sync
+    // with classify_pr_output in reconciliation.rs to avoid logic drift.
     /// Fetch the current GitHub state for a PR identified by `pr_url`.
     ///
-    /// `gh_bin` is injectable so tests can substitute a mock shell script
-    /// without a live GitHub connection.  Returns `Some((raw_state, new_status))`
-    /// only for actionable terminal states (MERGED → Done, CLOSED → Cancelled).
-    /// Any transient failure (I/O error, non-zero exit, timeout, unexpected state)
-    /// returns `None` so the caller skips the task silently.
+    /// Returns `Some((raw_state, new_status))` only for actionable terminal states
+    /// (MERGED → Done, CLOSED → Cancelled). Any transient failure (I/O error,
+    /// non-zero exit, timeout, unexpected state) returns `None` so the caller
+    /// skips the task silently.
     async fn fetch_pr_github_state(
         gh_bin: &str,
         task_id: &task_runner::TaskId,
@@ -1312,6 +1315,7 @@ mod tests {
         }
         let raw = String::from_utf8_lossy(&output.stdout)
             .trim()
+            .trim_matches('"')
             .to_uppercase();
         match raw.as_str() {
             "MERGED" => Some((raw.to_string(), task_runner::TaskStatus::Done)),
