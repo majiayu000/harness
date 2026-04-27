@@ -22,11 +22,20 @@ interface Props {
   projectFilter?: string | null;
 }
 
-function parseNumber(input: string): number | null {
+function parseIssueNumber(input: string): number | null {
   const trimmed = input.trim();
   const direct = parseInt(trimmed, 10);
   if (!isNaN(direct) && String(direct) === trimmed) return direct;
-  const match = trimmed.match(/\/(?:issues|pull)\/(\d+)/);
+  const match = trimmed.match(/\/issues\/(\d+)/);
+  if (match) return parseInt(match[1], 10);
+  return null;
+}
+
+function parsePrNumber(input: string): number | null {
+  const trimmed = input.trim();
+  const direct = parseInt(trimmed, 10);
+  if (!isNaN(direct) && String(direct) === trimmed) return direct;
+  const match = trimmed.match(/\/pull\/(\d+)/);
   if (match) return parseInt(match[1], 10);
   return null;
 }
@@ -95,8 +104,8 @@ function StepConfig({ state, projects, onChange, onNext, onBack }: StepConfigPro
   const agents = projects.find((p) => p.id === state.project)?.agents ?? [];
 
   const isValid =
-    (state.mode === "issue" && parseNumber(state.issueInput) !== null) ||
-    (state.mode === "pr" && parseNumber(state.prInput) !== null) ||
+    (state.mode === "issue" && parseIssueNumber(state.issueInput) !== null) ||
+    (state.mode === "pr" && parsePrNumber(state.prInput) !== null) ||
     (state.mode === "prompt" && state.promptInput.trim().length > 0);
 
   return (
@@ -337,7 +346,7 @@ export function Submit({ projectFilter }: Props) {
 
     let modePayload: Record<string, unknown>;
     if (wizardState.mode === "issue") {
-      const num = parseNumber(wizardState.issueInput);
+      const num = parseIssueNumber(wizardState.issueInput);
       if (num === null) {
         setSubmitError("Invalid issue number");
         setBusy(false);
@@ -345,7 +354,7 @@ export function Submit({ projectFilter }: Props) {
       }
       modePayload = { issue: num };
     } else if (wizardState.mode === "pr") {
-      const num = parseNumber(wizardState.prInput);
+      const num = parsePrNumber(wizardState.prInput);
       if (num === null) {
         setSubmitError("Invalid PR number");
         setBusy(false);
