@@ -743,4 +743,28 @@ mod tests {
         assert_eq!(report.transitions.len(), 0);
         assert_eq!(report.candidates, 3);
     }
+
+    // Reconciliation payload guard: ReconciliationReport and
+    // ReconciliationTransition are serialised over HTTP.  They must never
+    // contain a UUID workspace path.
+    #[test]
+    fn reconciliation_payload_has_no_workspace_paths() {
+        let report = ReconciliationReport {
+            candidates: 3,
+            skipped_terminal: 1,
+            transitions: vec![ReconciliationTransition {
+                task_id: "task-abc123".to_string(),
+                from: "implementing".to_string(),
+                to: "done".to_string(),
+                reason: "PR merged".to_string(),
+                applied: true,
+            }],
+        };
+        let json =
+            serde_json::to_string(&report).expect("ReconciliationReport must serialise to JSON");
+        assert!(
+            !json.contains("/workspaces/"),
+            "ReconciliationReport JSON must not contain a workspace path, got: {json}"
+        );
+    }
 }
