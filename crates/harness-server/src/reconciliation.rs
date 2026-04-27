@@ -39,7 +39,7 @@ pub struct ReconciliationReport {
 
 /// External GitHub state observed for one candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GitHubState {
+pub(crate) enum GitHubState {
     PrMerged,
     PrClosed,
     IssueClosed,
@@ -124,7 +124,7 @@ fn collect_candidates(store: &TaskStore) -> (Vec<Candidate>, usize) {
     (candidates, skipped_terminal)
 }
 
-fn parse_external_id(eid: Option<&str>) -> (Option<u64>, Option<u64>) {
+pub(crate) fn parse_external_id(eid: Option<&str>) -> (Option<u64>, Option<u64>) {
     match eid {
         Some(s) if s.starts_with("issue:") => (s["issue:".len()..].parse().ok(), None),
         Some(s) if s.starts_with("pr:") => (None, s["pr:".len()..].parse().ok()),
@@ -159,7 +159,11 @@ async fn fetch_pr_state_by_url(gh_bin: &str, pr_url: &str, project: &Path) -> Gi
 }
 
 /// Fetch GitHub PR state by number.
-async fn fetch_pr_state_by_num(gh_bin: &str, pr_num: u64, project: &Path) -> GitHubState {
+pub(crate) async fn fetch_pr_state_by_num(
+    gh_bin: &str,
+    pr_num: u64,
+    project: &Path,
+) -> GitHubState {
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         Command::new(gh_bin)
@@ -216,7 +220,7 @@ fn classify_pr_output(
 }
 
 /// Fetch issue state by number.
-async fn fetch_issue_state(gh_bin: &str, issue_num: u64, project: &Path) -> GitHubState {
+pub(crate) async fn fetch_issue_state(gh_bin: &str, issue_num: u64, project: &Path) -> GitHubState {
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         Command::new(gh_bin)
@@ -422,6 +426,23 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
             false,
         )
         .await;
+
+        // Clean up workspaces for tasks that were just terminated by reconciliation,
+        // so the workspace is gone within the same tick (issue #969).
+        if let Some(ref wmgr) = state.concurrency.workspace_mgr {
+            let transitioned_ids: Vec<crate::task_runner::TaskId> = report
+                .transitions
+                .iter()
+                .filter(|t| t.applied)
+                .map(|t| harness_core::types::TaskId(t.task_id.clone()))
+                .collect();
+            if !transitioned_ids.is_empty() {
+                if let Err(e) = wmgr.cleanup_terminal(&transitioned_ids).await {
+                    tracing::warn!("reconciliation: workspace cleanup failed: {e}");
+                }
+            }
+        }
+
         tracing::info!(
             candidates = report.candidates,
             skipped_terminal = report.skipped_terminal,

@@ -9,6 +9,8 @@ pub struct Scheduler {
     pub gc_interval: Duration,
     pub health_interval: Duration,
     pub self_evolution_interval: Duration,
+    /// How often the disk workspace GC scan runs. Default: 1 hour.
+    pub workspace_gc_interval: Duration,
 }
 
 impl Scheduler {
@@ -17,6 +19,7 @@ impl Scheduler {
             gc_interval: grade.recommended_gc_interval(),
             health_interval: Duration::from_secs(24 * 3600),
             self_evolution_interval: Duration::from_secs(24 * 3600),
+            workspace_gc_interval: Duration::from_secs(3600),
         }
     }
 
@@ -39,6 +42,35 @@ impl Scheduler {
                 if let Err(err) = Self::run_health_tick(&health_state).await {
                     tracing::error!("scheduler: periodic health tick failed: {err}");
                 }
+            }
+        });
+
+        // Periodic disk workspace GC: removes on-disk worktrees for closed issues/PRs.
+        let wgc_state = state.clone();
+        let wgc_interval = self.workspace_gc_interval;
+        tokio::spawn(async move {
+            // Brief init delay so the server is fully up before the first scan.
+            sleep(Duration::from_secs(30)).await;
+            loop {
+                if let Some(ref wmgr) = wgc_state.concurrency.workspace_mgr {
+                    let max_rate = wgc_state
+                        .core
+                        .server
+                        .config
+                        .reconciliation
+                        .max_gh_calls_per_minute;
+                    let summary = wmgr
+                        .reconcile_disk_workspaces(&wgc_state.core.project_root, "gh", max_rate)
+                        .await;
+                    tracing::info!(
+                        scanned = summary.scanned,
+                        removed = summary.removed,
+                        skipped_uuid = summary.skipped_uuid,
+                        skipped_open = summary.skipped_open,
+                        "scheduler: workspace disk GC complete"
+                    );
+                }
+                sleep(wgc_interval).await;
             }
         });
 
@@ -115,6 +147,7 @@ mod tests {
         assert_eq!(s.gc_interval, Duration::from_secs(3600));
         assert_eq!(s.health_interval, Duration::from_secs(24 * 3600));
         assert_eq!(s.self_evolution_interval, Duration::from_secs(24 * 3600));
+        assert_eq!(s.workspace_gc_interval, Duration::from_secs(3600));
     }
 
     #[test]
@@ -123,6 +156,7 @@ mod tests {
         assert_eq!(s.gc_interval, Duration::from_secs(7 * 24 * 3600));
         assert_eq!(s.health_interval, Duration::from_secs(24 * 3600));
         assert_eq!(s.self_evolution_interval, Duration::from_secs(24 * 3600));
+        assert_eq!(s.workspace_gc_interval, Duration::from_secs(3600));
     }
 
     #[test]

@@ -129,6 +129,54 @@ impl std::error::Error for WorkspaceLifecycleError {}
 pub(crate) struct StartupReconciliation {
     pub(crate) removed: u32,
     pub(crate) preserved: u32,
+    /// Dirs whose owner record shows a new-key (issue/PR) task that was terminal.
+    pub(crate) migrated: u32,
+}
+
+/// Summary produced by the periodic disk reconciliation scan.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiskReconciliationSummary {
+    pub(crate) scanned: u32,
+    pub(crate) removed: u32,
+    pub(crate) skipped_uuid: u32,
+    pub(crate) skipped_open: u32,
+}
+
+/// Minimal rate-limiter for the disk reconciliation scan's GitHub API calls.
+struct DiskRateLimiter {
+    max_per_minute: u32,
+    calls_this_window: u32,
+    window_start: std::time::Instant,
+}
+
+impl DiskRateLimiter {
+    fn new(max_per_minute: u32) -> Self {
+        Self {
+            max_per_minute,
+            calls_this_window: 0,
+            window_start: std::time::Instant::now(),
+        }
+    }
+
+    async fn acquire(&mut self) {
+        if self.max_per_minute == 0 {
+            return;
+        }
+        if self.window_start.elapsed() >= std::time::Duration::from_secs(60) {
+            self.window_start = std::time::Instant::now();
+            self.calls_this_window = 0;
+        }
+        if self.calls_this_window >= self.max_per_minute {
+            let remaining =
+                std::time::Duration::from_secs(60).saturating_sub(self.window_start.elapsed());
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining).await;
+            }
+            self.window_start = std::time::Instant::now();
+            self.calls_this_window = 0;
+        }
+        self.calls_this_window += 1;
+    }
 }
 
 pub struct WorkspaceManager {
@@ -552,9 +600,19 @@ impl WorkspaceManager {
 
             if should_remove {
                 let cleanup_repo = resolve_cleanup_source_repo(source_repo, &path, task).await;
+                // Classify as migrated when the owner record carries an issue/PR key
+                // (new-key workspace from slice 1), so startup logs show the right breakdown.
+                let is_new_key = owner_record.as_ref().is_some_and(|r| {
+                    let (issue, pr) = crate::reconciliation::parse_external_id(Some(&r.task_id));
+                    issue.is_some() || pr.is_some()
+                });
                 match cleanup_workspace_path(&cleanup_repo, &path).await {
                     Ok(()) => {
-                        summary.removed += 1;
+                        if is_new_key {
+                            summary.migrated += 1;
+                        } else {
+                            summary.removed += 1;
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -597,6 +655,100 @@ impl WorkspaceManager {
         }
 
         Ok(summary)
+    }
+
+    /// Walk `config.root` and remove any workspace directory whose owner record identifies
+    /// a closed issue or merged/closed PR, querying GitHub state via `gh_bin`.
+    ///
+    /// UUID-keyed dirs (no parseable external_id in the owner record) are skipped — they
+    /// are handled by the spawn.rs GC-on-task-done path. Errors from individual removals
+    /// are logged and do not abort the sweep.
+    pub(crate) async fn reconcile_disk_workspaces(
+        &self,
+        source_repo: &Path,
+        gh_bin: &str,
+        max_rate: u32,
+    ) -> DiskReconciliationSummary {
+        let mut summary = DiskReconciliationSummary::default();
+        let read_dir = match std::fs::read_dir(&self.config.root) {
+            Ok(rd) => rd,
+            Err(e) => {
+                tracing::warn!(
+                    "reconcile_disk_workspaces: failed to read {:?}: {e}",
+                    self.config.root
+                );
+                return summary;
+            }
+        };
+
+        let mut rate = DiskRateLimiter::new(max_rate);
+
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            summary.scanned += 1;
+
+            // Active workspaces are owned by a running task — do not touch them.
+            if self.active.iter().any(|e| e.workspace_path == path) {
+                summary.skipped_open += 1;
+                continue;
+            }
+
+            let owner_record = read_owner_record(&path);
+            let task_id_str = match owner_record.as_ref() {
+                Some(r) => r.task_id.clone(),
+                None => {
+                    summary.skipped_uuid += 1;
+                    continue;
+                }
+            };
+
+            let (issue_num, pr_num) =
+                crate::reconciliation::parse_external_id(Some(task_id_str.as_str()));
+            if issue_num.is_none() && pr_num.is_none() {
+                summary.skipped_uuid += 1;
+                continue;
+            }
+
+            let gh_state = if let Some(n) = issue_num {
+                rate.acquire().await;
+                crate::reconciliation::fetch_issue_state(gh_bin, n, source_repo).await
+            } else if let Some(n) = pr_num {
+                rate.acquire().await;
+                crate::reconciliation::fetch_pr_state_by_num(gh_bin, n, source_repo).await
+            } else {
+                crate::reconciliation::GitHubState::Unknown
+            };
+
+            let should_remove = matches!(
+                gh_state,
+                crate::reconciliation::GitHubState::IssueClosed
+                    | crate::reconciliation::GitHubState::PrMerged
+                    | crate::reconciliation::GitHubState::PrClosed
+            );
+
+            if should_remove {
+                match cleanup_workspace_path(source_repo, &path).await {
+                    Ok(()) => summary.removed += 1,
+                    Err(e) => tracing::warn!(
+                        "reconcile_disk_workspaces: cleanup failed for {path:?}: {e}"
+                    ),
+                }
+            } else {
+                summary.skipped_open += 1;
+            }
+        }
+
+        tracing::info!(
+            scanned = summary.scanned,
+            removed = summary.removed,
+            skipped_uuid = summary.skipped_uuid,
+            skipped_open = summary.skipped_open,
+            "reconcile_disk_workspaces: scan complete"
+        );
+        summary
     }
 
     /// Scan `config.root` for worktree directories and remove any that correspond to
@@ -1666,5 +1818,257 @@ mod tests {
                 "workspace for {id:?} should have been cleaned up"
             );
         }
+    }
+
+    // ── GC trigger demotion tests (issue #969) ────────────────────────────
+
+    fn make_task_summary(
+        id: &str,
+        status: crate::task_runner::TaskStatus,
+        external_id: Option<&str>,
+    ) -> crate::task_runner::TaskSummary {
+        crate::task_runner::TaskSummary {
+            id: harness_core::types::TaskId(id.to_string()),
+            status,
+            failure_kind: None,
+            turn: 0,
+            pr_url: None,
+            error: None,
+            source: None,
+            parent_id: None,
+            external_id: external_id.map(|s| s.to_string()),
+            repo: None,
+            description: None,
+            created_at: None,
+            phase: crate::task_runner::TaskPhase::Implement,
+            depends_on: vec![],
+            subtask_ids: vec![],
+            project: None,
+            workspace_path: None,
+            workspace_owner: None,
+            run_generation: 1,
+            task_kind: crate::task_runner::TaskKind::Prompt,
+            workflow: None,
+            scheduler: crate::task_runner::TaskSchedulerState::default(),
+        }
+    }
+
+    /// reconcile_startup counts issue-keyed terminal dirs as `migrated`, not `removed`.
+    /// Uses separate managers so the workspace dirs are not tracked as active by the
+    /// reconciling manager (matching the real server startup scenario).
+    #[tokio::test]
+    async fn reconcile_startup_migration_counts_new_key_terminal_as_migrated() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        // mgr_a creates the UUID workspace (simulates the previous server session).
+        let mgr_a = WorkspaceManager::new(config.clone()).expect("mgr_a");
+        let uuid_id = harness_core::types::TaskId("uuid-task-migration-123".to_string());
+        let uuid_lease = mgr_a
+            .create_workspace(&uuid_id, source.path(), "origin", &branch, 1)
+            .await
+            .expect("create uuid workspace");
+
+        // Simulate a new-key workspace: dir with owner record where task_id = "issue:42".
+        let issue_dir = workspaces.path().join("issue_42");
+        std::fs::create_dir_all(issue_dir.join(".git")).expect("create issue dir");
+        std::fs::write(
+            issue_dir.join(".git").join(OWNER_RECORD_FILE),
+            serde_json::to_vec(&WorkspaceOwnerRecord {
+                task_id: "issue:42".to_string(),
+                run_generation: 1,
+                owner_session: "test-session".to_string(),
+            })
+            .expect("serialize"),
+        )
+        .expect("write owner record");
+
+        // mgr_b is the fresh server-startup manager — has no active workspaces.
+        let mgr_b = WorkspaceManager::new(config).expect("mgr_b");
+        let uuid_task = make_task_summary(
+            "uuid-task-migration-123",
+            crate::task_runner::TaskStatus::Done,
+            None,
+        );
+
+        let summary = mgr_b
+            .reconcile_startup(source.path(), &[uuid_task])
+            .await
+            .expect("reconcile startup");
+
+        assert_eq!(summary.removed, 1, "UUID terminal dir counted as removed");
+        assert_eq!(
+            summary.migrated, 1,
+            "issue-keyed terminal dir counted as migrated"
+        );
+        assert!(
+            !uuid_lease.workspace_path.exists(),
+            "uuid workspace cleaned up"
+        );
+        assert!(!issue_dir.exists(), "issue-keyed workspace cleaned up");
+    }
+
+    /// reconcile_startup orphan UUID dir (no task) → removed, migrated stays 0.
+    #[tokio::test]
+    async fn reconcile_startup_uuid_orphan_removed() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        // mgr_a creates the workspace; mgr_b is the fresh startup manager.
+        let mgr_a = WorkspaceManager::new(config.clone()).expect("mgr_a");
+        let task_id = harness_core::types::TaskId("orphan-uuid-task".to_string());
+
+        let lease = mgr_a
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .await
+            .expect("create workspace");
+
+        let mgr_b = WorkspaceManager::new(config).expect("mgr_b");
+        let summary = mgr_b
+            .reconcile_startup(source.path(), &[])
+            .await
+            .expect("reconcile startup");
+
+        assert_eq!(summary.removed, 1);
+        assert_eq!(summary.migrated, 0);
+        assert!(
+            !lease.workspace_path.exists(),
+            "orphan uuid workspace removed"
+        );
+    }
+
+    /// reconcile_disk_workspaces: UUID-keyed dirs are skipped (not touched).
+    #[tokio::test]
+    async fn reconcile_disk_skips_uuid_keyed_workspace() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("mgr");
+        let task_id = harness_core::types::TaskId("some-uuid-task".to_string());
+
+        let lease = mgr
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .await
+            .expect("create workspace");
+        mgr.active.remove(&task_id);
+
+        let summary = mgr.reconcile_disk_workspaces(source.path(), "gh", 20).await;
+
+        assert_eq!(summary.skipped_uuid, 1);
+        assert_eq!(summary.removed, 0);
+        assert!(
+            lease.workspace_path.exists(),
+            "uuid dir preserved by disk GC"
+        );
+
+        let _ = cleanup_workspace_path(source.path(), &lease.workspace_path).await;
+    }
+
+    /// reconcile_disk_workspaces: removes a closed-issue workspace.
+    #[tokio::test]
+    async fn reconcile_disk_removes_closed_issue_workspace() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("mgr");
+
+        let issue_dir = workspaces.path().join("issue_42");
+        std::fs::create_dir_all(issue_dir.join(".git")).expect("mkdir");
+        std::fs::write(
+            issue_dir.join(".git").join(OWNER_RECORD_FILE),
+            serde_json::to_vec(&WorkspaceOwnerRecord {
+                task_id: "issue:42".to_string(),
+                run_generation: 1,
+                owner_session: "s".to_string(),
+            })
+            .expect("serialize"),
+        )
+        .expect("write record");
+
+        let gh_dir = tempfile::tempdir().expect("tempdir");
+        let gh_script = gh_dir.path().join("gh");
+        std::fs::write(&gh_script, "#!/bin/sh\nprintf 'CLOSED\\n'\n").expect("write gh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh_script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let summary = mgr
+            .reconcile_disk_workspaces(source.path(), gh_script.to_str().unwrap(), 20)
+            .await;
+
+        assert_eq!(summary.removed, 1);
+        assert!(!issue_dir.exists(), "closed issue workspace removed");
+    }
+
+    /// reconcile_disk_workspaces: preserves an open-issue workspace.
+    #[tokio::test]
+    async fn reconcile_disk_skips_open_issue_workspace() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("mgr");
+
+        let issue_dir = workspaces.path().join("issue_7");
+        std::fs::create_dir_all(issue_dir.join(".git")).expect("mkdir");
+        std::fs::write(
+            issue_dir.join(".git").join(OWNER_RECORD_FILE),
+            serde_json::to_vec(&WorkspaceOwnerRecord {
+                task_id: "issue:7".to_string(),
+                run_generation: 1,
+                owner_session: "s".to_string(),
+            })
+            .expect("serialize"),
+        )
+        .expect("write record");
+
+        let gh_dir = tempfile::tempdir().expect("tempdir");
+        let gh_script = gh_dir.path().join("gh");
+        std::fs::write(&gh_script, "#!/bin/sh\nprintf 'OPEN\\n'\n").expect("write gh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh_script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let summary = mgr
+            .reconcile_disk_workspaces(source.path(), gh_script.to_str().unwrap(), 20)
+            .await;
+
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.skipped_open, 1);
+        assert!(issue_dir.exists(), "open issue workspace preserved");
     }
 }
