@@ -2044,4 +2044,26 @@ mod tests {
         );
         Ok(())
     }
+
+    // ── GC trigger demotion tests (issue #969) ────────────────────────────
+
+    #[test]
+    fn is_issue_pr_task_classifies_external_ids() {
+        assert!(
+            is_issue_pr_task(Some("issue:42")),
+            "issue-keyed task must be classified as issue/PR"
+        );
+        assert!(
+            is_issue_pr_task(Some("pr:123")),
+            "pr-keyed task must be classified as issue/PR"
+        );
+        assert!(
+            !is_issue_pr_task(Some("7f3a8b2c-1234-5678-abcd-ef0123456789")),
+            "UUID task must not be classified as issue/PR"
+        );
+        assert!(
+            !is_issue_pr_task(None),
+            "prompt-only task (no external_id) must not be classified as issue/PR"
+        );
+    }
 }
