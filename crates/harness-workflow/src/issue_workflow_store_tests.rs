@@ -1,5 +1,5 @@
 use super::IssueWorkflowStore;
-use crate::issue_lifecycle::{IssueLifecycleState, IssueWorkflowInstance};
+use crate::issue_lifecycle::IssueLifecycleState;
 use chrono::Utc;
 
 async fn open_test_store() -> anyhow::Result<Option<IssueWorkflowStore>> {
@@ -259,6 +259,3 @@ async fn record_merge_approved_transitions_workflow_to_done() -> anyhow::Result<
     assert_eq!(updated.state, IssueLifecycleState::Done);
     Ok(())
 }
-
-#[allow(dead_code)]
-fn _use_workflow_instance(_: &IssueWorkflowInstance) {}
