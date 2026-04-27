@@ -710,10 +710,10 @@ impl WorkspaceManager {
                 let cleanup_repo = resolve_cleanup_source_repo(source_repo, &path, task).await;
                 // Classify as migrated when the owner record carries an issue/PR key
                 // (new-key workspace from slice 1), so startup logs show the right breakdown.
-                let is_new_key = owner_record.as_ref().is_some_and(|r| {
-                    let (issue, pr) = crate::reconciliation::parse_external_id(Some(&r.task_id));
-                    issue.is_some() || pr.is_some()
-                });
+                let is_new_key = owner_record
+                    .as_ref()
+                    .and_then(owner_record_external_id)
+                    .is_some();
                 match cleanup_workspace_path(&cleanup_repo, &path).await {
                     Ok(()) => {
                         if is_new_key {
@@ -766,7 +766,7 @@ impl WorkspaceManager {
     }
 
     /// Walk `config.root` and remove any workspace directory whose owner record identifies
-    /// a closed issue or merged/closed PR, querying GitHub state via `gh_bin`.
+    /// a closed issue or merged/closed PR, querying GitHub state through the REST API.
     ///
     /// UUID-keyed dirs (no parseable external_id in the owner record) are skipped — they
     /// are handled by the spawn.rs GC-on-task-done path. Errors from individual removals
@@ -774,7 +774,7 @@ impl WorkspaceManager {
     pub(crate) async fn reconcile_disk_workspaces(
         &self,
         source_repo: &Path,
-        gh_bin: &str,
+        _gh_bin: &str,
         max_rate: u32,
     ) -> DiskReconciliationSummary {
         let mut summary = DiskReconciliationSummary::default();
@@ -805,27 +805,34 @@ impl WorkspaceManager {
             }
 
             let owner_record = read_owner_record(&path);
-            let task_id_str = match owner_record.as_ref() {
-                Some(r) => r.task_id.clone(),
-                None => {
-                    summary.skipped_uuid += 1;
-                    continue;
-                }
+            let Some(owner_record) = owner_record.as_ref() else {
+                summary.skipped_uuid += 1;
+                continue;
             };
-
-            let (issue_num, pr_num) =
-                crate::reconciliation::parse_external_id(Some(task_id_str.as_str()));
+            let Some(external_id) = owner_record_external_id(owner_record) else {
+                summary.skipped_uuid += 1;
+                continue;
+            };
+            let (issue_num, pr_num) = crate::reconciliation::parse_external_id(Some(&external_id));
             if issue_num.is_none() && pr_num.is_none() {
                 summary.skipped_uuid += 1;
                 continue;
             }
+            let Some(repo_slug) = owner_record
+                .workspace_key
+                .as_deref()
+                .and_then(repo_slug_from_workspace_key)
+            else {
+                summary.skipped_open += 1;
+                continue;
+            };
 
             let gh_state = if let Some(n) = issue_num {
                 rate.acquire().await;
-                crate::reconciliation::fetch_issue_state(gh_bin, n, source_repo).await
+                crate::reconciliation::fetch_issue_state(&repo_slug, n).await
             } else if let Some(n) = pr_num {
                 rate.acquire().await;
-                crate::reconciliation::fetch_pr_state_by_num(gh_bin, n, source_repo).await
+                crate::reconciliation::fetch_pr_state_by_slug(&repo_slug, n).await
             } else {
                 crate::reconciliation::GitHubState::Unknown
             };
@@ -1034,6 +1041,43 @@ fn is_issue_or_pr_id(s: &str) -> bool {
         return false;
     };
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
+fn owner_record_external_id(record: &WorkspaceOwnerRecord) -> Option<String> {
+    let (issue, pr) = crate::reconciliation::parse_external_id(Some(&record.task_id));
+    if issue.is_some() || pr.is_some() {
+        return Some(record.task_id.clone());
+    }
+    record
+        .workspace_key
+        .as_deref()
+        .and_then(external_id_from_workspace_key)
+}
+
+fn external_id_from_workspace_key(key: &str) -> Option<String> {
+    let suffix = key.rsplit("__").next()?;
+    if let Some(issue) = suffix.strip_prefix("issue_") {
+        if !issue.is_empty() && issue.chars().all(|c| c.is_ascii_digit()) {
+            return Some(format!("issue:{issue}"));
+        }
+    }
+    if let Some(pr) = suffix.strip_prefix("pr_") {
+        if !pr.is_empty() && pr.chars().all(|c| c.is_ascii_digit()) {
+            return Some(format!("pr:{pr}"));
+        }
+    }
+    None
+}
+
+fn repo_slug_from_workspace_key(key: &str) -> Option<String> {
+    let mut parts = key.rsplit("__");
+    let _external_id = parts.next()?;
+    let repo_part = parts.next()?;
+    let (owner, repo) = repo_part.split_once('_')?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
 }
 
 /// Returns true when the git worktree at `path` is currently on `branch`.
@@ -1317,6 +1361,36 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output
+    }
+
+    async fn github_state_server(path: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind GitHub mock");
+        let addr = listener.local_addr().expect("GitHub mock address");
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0_u8; 2048];
+            let Ok(n) = socket.read(&mut buf).await else {
+                return;
+            };
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let (status, response_body) = if request.starts_with(&format!("GET {path} ")) {
+                ("200 OK", body)
+            } else {
+                ("404 Not Found", "{}")
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}")
     }
 
     fn init_git_repo(dir: &Path) {
@@ -2411,6 +2485,7 @@ mod tests {
     /// reconcile_disk_workspaces: removes a closed-issue workspace.
     #[tokio::test]
     async fn reconcile_disk_removes_closed_issue_workspace() {
+        let _env_guard = async_env_lock().lock().await;
         let source = tempfile::tempdir().expect("tempdir");
         init_git_repo(source.path());
 
@@ -2421,7 +2496,7 @@ mod tests {
         };
         let mgr = WorkspaceManager::new(config).expect("mgr");
 
-        let issue_dir = workspaces.path().join("issue_42");
+        let issue_dir = workspaces.path().join("myorg_my-repo__issue_42");
         std::fs::create_dir_all(issue_dir.join(".git")).expect("mkdir");
         std::fs::write(
             issue_dir.join(".git").join(OWNER_RECORD_FILE),
@@ -2429,25 +2504,17 @@ mod tests {
                 task_id: "issue:42".to_string(),
                 run_generation: 1,
                 owner_session: "s".to_string(),
-                workspace_key: None,
+                workspace_key: Some("myorg_my-repo__issue_42".to_string()),
             })
             .expect("serialize"),
         )
         .expect("write record");
 
-        let gh_dir = tempfile::tempdir().expect("tempdir");
-        let gh_script = gh_dir.path().join("gh");
-        std::fs::write(&gh_script, "#!/bin/sh\nprintf 'CLOSED\\n'\n").expect("write gh");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&gh_script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
+        let api_base =
+            github_state_server("/repos/myorg/my-repo/issues/42", r#"{"state":"closed"}"#).await;
+        let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
 
-        let summary = mgr
-            .reconcile_disk_workspaces(source.path(), gh_script.to_str().unwrap(), 20)
-            .await;
+        let summary = mgr.reconcile_disk_workspaces(source.path(), "gh", 20).await;
 
         assert_eq!(summary.removed, 1);
         assert!(!issue_dir.exists(), "closed issue workspace removed");
@@ -2456,6 +2523,7 @@ mod tests {
     /// reconcile_disk_workspaces: preserves an open-issue workspace.
     #[tokio::test]
     async fn reconcile_disk_skips_open_issue_workspace() {
+        let _env_guard = async_env_lock().lock().await;
         let source = tempfile::tempdir().expect("tempdir");
         init_git_repo(source.path());
 
@@ -2466,7 +2534,7 @@ mod tests {
         };
         let mgr = WorkspaceManager::new(config).expect("mgr");
 
-        let issue_dir = workspaces.path().join("issue_7");
+        let issue_dir = workspaces.path().join("myorg_my-repo__issue_7");
         std::fs::create_dir_all(issue_dir.join(".git")).expect("mkdir");
         std::fs::write(
             issue_dir.join(".git").join(OWNER_RECORD_FILE),
@@ -2474,25 +2542,17 @@ mod tests {
                 task_id: "issue:7".to_string(),
                 run_generation: 1,
                 owner_session: "s".to_string(),
-                workspace_key: None,
+                workspace_key: Some("myorg_my-repo__issue_7".to_string()),
             })
             .expect("serialize"),
         )
         .expect("write record");
 
-        let gh_dir = tempfile::tempdir().expect("tempdir");
-        let gh_script = gh_dir.path().join("gh");
-        std::fs::write(&gh_script, "#!/bin/sh\nprintf 'OPEN\\n'\n").expect("write gh");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&gh_script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
+        let api_base =
+            github_state_server("/repos/myorg/my-repo/issues/7", r#"{"state":"open"}"#).await;
+        let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
 
-        let summary = mgr
-            .reconcile_disk_workspaces(source.path(), gh_script.to_str().unwrap(), 20)
-            .await;
+        let summary = mgr.reconcile_disk_workspaces(source.path(), "gh", 20).await;
 
         assert_eq!(summary.removed, 0);
         assert_eq!(summary.skipped_open, 1);

@@ -213,7 +213,7 @@ async fn fetch_pr_state_by_url(pr_url: &str) -> GitHubState {
 }
 
 /// Fetch GitHub PR state by repository slug and number.
-async fn fetch_pr_state_by_slug(repo_slug: &str, pr_num: u64) -> GitHubState {
+pub(crate) async fn fetch_pr_state_by_slug(repo_slug: &str, pr_num: u64) -> GitHubState {
     let Some(state) =
         github_get_json::<GitHubPullState>(&format!("/repos/{repo_slug}/pulls/{pr_num}")).await
     else {
@@ -223,7 +223,7 @@ async fn fetch_pr_state_by_slug(repo_slug: &str, pr_num: u64) -> GitHubState {
 }
 
 /// Fetch issue state by repository slug and number.
-async fn fetch_issue_state(repo_slug: &str, issue_num: u64) -> GitHubState {
+pub(crate) async fn fetch_issue_state(repo_slug: &str, issue_num: u64) -> GitHubState {
     let Some(state) =
         github_get_json::<GitHubIssueState>(&format!("/repos/{repo_slug}/issues/{issue_num}"))
             .await
