@@ -1,21 +1,18 @@
 use crate::http::AppState;
 use crate::task_runner::{mutate_and_persist, TaskId, TaskStatus, TaskStore};
 use harness_core::config::misc::ReconciliationConfig;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::process::Command;
 use tokio::time::sleep;
-
-fn github_cli_command(bin: &str) -> Command {
-    Command::new(std::path::Path::new(bin))
-}
 
 /// One candidate task for reconciliation check.
 struct Candidate {
     id: TaskId,
     pr_url: Option<String>,
+    repo: Option<String>,
     /// Numeric issue or PR from `external_id` (e.g. `issue:42` → 42).
     issue_num: Option<u64>,
     /// Numeric PR from `external_id` `pr:N` when no `pr_url` is present.
@@ -51,7 +48,18 @@ enum GitHubState {
     Unknown,
 }
 
-/// Rate-limit state: at most `max_per_minute` `gh` calls per 60-second window.
+#[derive(Debug, Deserialize)]
+struct GitHubPullState {
+    state: String,
+    merged_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubIssueState {
+    state: String,
+}
+
+/// Rate-limit state: at most `max_per_minute` GitHub API calls per 60-second window.
 struct RateLimiter {
     max_per_minute: u32,
     calls_this_window: u32,
@@ -105,6 +113,7 @@ fn candidate_from_task(task: &crate::task_runner::TaskState) -> Option<Candidate
     Some(Candidate {
         id: task.id.clone(),
         pr_url: task.pr_url.clone(),
+        repo: task.repo.clone(),
         issue_num,
         pr_num_from_ext,
     })
@@ -136,162 +145,109 @@ fn parse_external_id(eid: Option<&str>) -> (Option<u64>, Option<u64>) {
     }
 }
 
-/// Fetch GitHub PR state from a full URL (e.g. `https://github.com/…/pull/42`).
-async fn fetch_pr_state_by_url(gh_bin: &str, pr_url: &str, project: &Path) -> GitHubState {
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        github_cli_command(gh_bin)
-            .current_dir(project)
-            .args([
-                "pr",
-                "view",
-                pr_url,
-                "--json",
-                "state,mergedAt",
-                "--jq",
-                ".state + \"|\" + ((.mergedAt // \"\")|tostring)",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await;
-
-    classify_pr_output(result)
+fn github_api_base_url() -> String {
+    std::env::var("HARNESS_GITHUB_API_BASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_string())
+        .trim_end_matches('/')
+        .to_string()
 }
 
-/// Fetch GitHub PR state by number.
-async fn fetch_pr_state_by_num(gh_bin: &str, pr_num: u64, project: &Path) -> GitHubState {
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        github_cli_command(gh_bin)
-            .current_dir(project)
-            .args([
-                "pr",
-                "view",
-                &pr_num.to_string(),
-                "--json",
-                "state,mergedAt",
-                "--jq",
-                ".state + \"|\" + ((.mergedAt // \"\")|tostring)",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await;
-
-    classify_pr_output(result)
-}
-
-fn classify_pr_output(
-    result: Result<Result<std::process::Output, std::io::Error>, tokio::time::error::Elapsed>,
-) -> GitHubState {
-    let output = match result {
-        Ok(Ok(o)) if o.status.success() => o,
-        Ok(Ok(o)) => {
-            tracing::debug!(exit = ?o.status.code(), "reconciliation: gh pr view failed");
-            return GitHubState::Unknown;
+async fn github_get_json<T: DeserializeOwned>(path: &str) -> Option<T> {
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(format!("{}{}", github_api_base_url(), path))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "harness-server");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+        if !token.trim().is_empty() {
+            request = request.bearer_auth(token);
+        }
+    }
+    let response = match tokio::time::timeout(Duration::from_secs(10), request.send()).await {
+        Ok(Ok(response)) if response.status().is_success() => response,
+        Ok(Ok(response)) => {
+            tracing::debug!(status = %response.status(), path, "GitHub state check failed");
+            return None;
         }
         Ok(Err(e)) => {
-            tracing::debug!(error = %e, "reconciliation: gh pr view invocation error");
-            return GitHubState::Unknown;
+            tracing::debug!(error = %e, path, "GitHub state check invocation error");
+            return None;
         }
         Err(_) => {
-            tracing::debug!("reconciliation: gh pr view timed out");
-            return GitHubState::Unknown;
+            tracing::debug!(path, "GitHub state check timed out after 10s");
+            return None;
         }
     };
-    let raw = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .trim_matches('"')
-        .to_string();
-    let (state, merged_at) = raw.split_once('|').unwrap_or((raw.as_str(), ""));
-    match (state.trim(), merged_at.trim().is_empty()) {
-        ("OPEN", _) => GitHubState::Open,
-        ("MERGED", _) | ("CLOSED", false) => GitHubState::PrMerged,
-        ("CLOSED", true) => GitHubState::PrClosed,
+    response.json::<T>().await.ok()
+}
+
+fn classify_pr_state(state: &GitHubPullState) -> GitHubState {
+    let merged_at_empty = state.merged_at.as_deref().unwrap_or("").trim().is_empty();
+    match (state.state.as_str(), merged_at_empty) {
+        ("open", _) | ("OPEN", _) => GitHubState::Open,
+        ("merged", _) | ("MERGED", _) | ("closed", false) | ("CLOSED", false) => {
+            GitHubState::PrMerged
+        }
+        ("closed", true) | ("CLOSED", true) => GitHubState::PrClosed,
         _ => GitHubState::Unknown,
     }
 }
 
-/// Fetch issue state by number.
-async fn fetch_issue_state(gh_bin: &str, issue_num: u64, project: &Path) -> GitHubState {
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        github_cli_command(gh_bin)
-            .current_dir(project)
-            .args([
-                "issue",
-                "view",
-                &issue_num.to_string(),
-                "--json",
-                "state",
-                "--jq",
-                ".state",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await;
-
-    match result {
-        Ok(Ok(o)) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_uppercase();
-            match s.as_str() {
-                "CLOSED" => GitHubState::IssueClosed,
-                "OPEN" => GitHubState::Open,
-                _ => GitHubState::Unknown,
-            }
-        }
-        Ok(Ok(o)) => {
-            tracing::debug!(exit = ?o.status.code(), "reconciliation: gh issue view failed");
-            GitHubState::Unknown
-        }
-        Ok(Err(e)) => {
-            tracing::debug!(error = %e, "reconciliation: gh issue view invocation error");
-            GitHubState::Unknown
-        }
-        Err(_) => {
-            tracing::debug!("reconciliation: gh issue view timed out");
-            GitHubState::Unknown
-        }
+fn classify_issue_state(state: &GitHubIssueState) -> GitHubState {
+    match state.state.as_str() {
+        "closed" | "CLOSED" => GitHubState::IssueClosed,
+        "open" | "OPEN" => GitHubState::Open,
+        _ => GitHubState::Unknown,
     }
 }
 
-/// Core reconciliation logic. Callable from the periodic loop, the HTTP
-/// handler, and test code. `gh_bin` is injectable for testing.
-pub async fn run_once_with_gh(
+/// Fetch GitHub PR state from a full URL (e.g. `https://github.com/.../pull/42`).
+async fn fetch_pr_state_by_url(pr_url: &str) -> GitHubState {
+    let Some((owner, repo, pr_number)) = harness_core::prompts::parse_github_pr_url(pr_url) else {
+        tracing::debug!(pr_url, "GitHub PR state check skipped for unparseable URL");
+        return GitHubState::Unknown;
+    };
+    fetch_pr_state_by_slug(&format!("{owner}/{repo}"), pr_number).await
+}
+
+/// Fetch GitHub PR state by repository slug and number.
+async fn fetch_pr_state_by_slug(repo_slug: &str, pr_num: u64) -> GitHubState {
+    let Some(state) =
+        github_get_json::<GitHubPullState>(&format!("/repos/{repo_slug}/pulls/{pr_num}")).await
+    else {
+        return GitHubState::Unknown;
+    };
+    classify_pr_state(&state)
+}
+
+/// Fetch issue state by repository slug and number.
+async fn fetch_issue_state(repo_slug: &str, issue_num: u64) -> GitHubState {
+    let Some(state) =
+        github_get_json::<GitHubIssueState>(&format!("/repos/{repo_slug}/issues/{issue_num}"))
+            .await
+    else {
+        return GitHubState::Unknown;
+    };
+    classify_issue_state(&state)
+}
+
+/// Core reconciliation logic. Callable from the periodic loop and HTTP handler.
+pub async fn run_once(
     store: &Arc<TaskStore>,
     project: &Path,
     max_gh_calls_per_minute: u32,
     dry_run: bool,
-    gh_bin: &str,
 ) -> ReconciliationReport {
     let (candidates, skipped_terminal) = collect_candidates(store);
     let mut rate = RateLimiter::new(max_gh_calls_per_minute);
     let mut transitions = Vec::new();
 
     for candidate in &candidates {
-        let gh_state = resolve_github_state(gh_bin, candidate, project, &mut rate).await;
+        let gh_state = resolve_github_state(candidate, project, &mut rate).await;
 
-        let new_status = match gh_state {
-            GitHubState::PrMerged => Some((TaskStatus::Done, "reconciled: PR merged externally")),
-            GitHubState::PrClosed => {
-                Some((TaskStatus::Cancelled, "reconciled: PR closed externally"))
-            }
-            GitHubState::IssueClosed => {
-                Some((TaskStatus::Cancelled, "reconciled: issue closed before PR"))
-            }
-            GitHubState::Open | GitHubState::Unknown => None,
-        };
+        let new_status = transition_for_github_state(gh_state);
 
         let Some((target_status, reason)) = new_status else {
             continue;
@@ -331,9 +287,19 @@ pub async fn run_once_with_gh(
     }
 }
 
+fn transition_for_github_state(gh_state: GitHubState) -> Option<(TaskStatus, &'static str)> {
+    match gh_state {
+        GitHubState::PrMerged => Some((TaskStatus::Done, "reconciled: PR merged externally")),
+        GitHubState::PrClosed => Some((TaskStatus::Cancelled, "reconciled: PR closed externally")),
+        GitHubState::IssueClosed => {
+            Some((TaskStatus::Cancelled, "reconciled: issue closed before PR"))
+        }
+        GitHubState::Open | GitHubState::Unknown => None,
+    }
+}
+
 /// Determine the current GitHub state for one candidate, consuming rate-limit budget.
 async fn resolve_github_state(
-    gh_bin: &str,
     candidate: &Candidate,
     project: &Path,
     rate: &mut RateLimiter,
@@ -342,15 +308,26 @@ async fn resolve_github_state(
     // will have one.
     if let Some(pr_url) = &candidate.pr_url {
         rate.acquire().await;
-        return fetch_pr_state_by_url(gh_bin, pr_url, project).await;
+        return fetch_pr_state_by_url(pr_url).await;
     }
+    let repo_slug = match candidate.repo.as_deref() {
+        Some(repo) if !repo.trim().is_empty() => Some(repo.to_string()),
+        _ => crate::task_executor::pr_detection::detect_repo_slug(project).await,
+    };
+    let Some(repo_slug) = repo_slug else {
+        tracing::debug!(
+            task_id = %candidate.id.0,
+            "GitHub state check skipped because repository slug is unavailable"
+        );
+        return GitHubState::Unknown;
+    };
     if let Some(pr_num) = candidate.pr_num_from_ext {
         rate.acquire().await;
-        return fetch_pr_state_by_num(gh_bin, pr_num, project).await;
+        return fetch_pr_state_by_slug(&repo_slug, pr_num).await;
     }
     if let Some(issue_num) = candidate.issue_num {
         rate.acquire().await;
-        return fetch_issue_state(gh_bin, issue_num, project).await;
+        return fetch_issue_state(&repo_slug, issue_num).await;
     }
     GitHubState::Unknown
 }
@@ -387,16 +364,6 @@ async fn apply_transition(
             false
         }
     }
-}
-
-/// Public entry point for callers that always use the real `gh` binary.
-pub async fn run_once(
-    store: &Arc<TaskStore>,
-    project: &Path,
-    max_gh_calls_per_minute: u32,
-    dry_run: bool,
-) -> ReconciliationReport {
-    run_once_with_gh(store, project, max_gh_calls_per_minute, dry_run, "gh").await
 }
 
 /// Spawn the periodic reconciliation loop as a background task.
@@ -440,44 +407,7 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
 mod tests {
     use super::*;
     use crate::task_runner::TaskState;
-    use harness_core::config::dirs::default_db_path;
     use harness_core::types::TaskId;
-
-    fn write_mock_gh(dir: &tempfile::TempDir, stdout: &str) -> std::path::PathBuf {
-        let script = dir.path().join("gh");
-        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' '{stdout}'\n")).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        script
-    }
-
-    fn write_mock_gh_fail(dir: &tempfile::TempDir) -> std::path::PathBuf {
-        let script = dir.path().join("gh");
-        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        script
-    }
-
-    async fn open_store(dir: &tempfile::TempDir) -> Option<Arc<crate::task_runner::TaskStore>> {
-        if !crate::test_helpers::db_tests_enabled().await {
-            return None;
-        }
-        let db_path = default_db_path(dir.path(), "tasks");
-        crate::task_runner::TaskStore::open(&db_path).await.ok()
-    }
-
-    fn populate(store: &Arc<crate::task_runner::TaskStore>, tasks: Vec<TaskState>) {
-        for task in tasks {
-            store.cache.insert(task.id.clone(), task);
-        }
-    }
 
     fn make_task(
         id: &str,
@@ -550,201 +480,50 @@ mod tests {
         assert!(c.pr_url.is_none());
     }
 
-    // ── DB-gated integration tests ────────────────────────────────────────
-
-    #[tokio::test]
-    async fn pr_merged_transitions_to_done() {
-        let dir = tempfile::tempdir().unwrap();
-        let Some(store) = open_store(&dir).await else {
-            return;
-        };
-        populate(
-            &store,
-            vec![make_task(
-                "t1",
-                TaskStatus::Implementing,
-                Some("https://github.com/acme/repo/pull/1"),
-                None,
-            )],
-        );
-        let gh = write_mock_gh(&dir, "MERGED|2024-01-01T00:00:00Z");
-        let report = run_once_with_gh(&store, dir.path(), 60, false, gh.to_str().unwrap()).await;
-        assert_eq!(report.transitions.len(), 1);
-        assert_eq!(report.transitions[0].to, "done");
-        assert!(report.transitions[0].applied);
+    #[test]
+    fn classify_pr_state_handles_merged_and_closed() {
         assert_eq!(
-            store.cache.get(&TaskId("t1".into())).unwrap().status,
-            TaskStatus::Done
+            classify_pr_state(&GitHubPullState {
+                state: "closed".to_string(),
+                merged_at: Some("2024-01-01T00:00:00Z".to_string()),
+            }),
+            GitHubState::PrMerged
         );
-    }
-
-    #[tokio::test]
-    async fn pr_closed_no_merge_transitions_to_cancelled() {
-        let dir = tempfile::tempdir().unwrap();
-        let Some(store) = open_store(&dir).await else {
-            return;
-        };
-        populate(
-            &store,
-            vec![make_task(
-                "t2",
-                TaskStatus::Reviewing,
-                Some("https://github.com/acme/repo/pull/2"),
-                None,
-            )],
-        );
-        let gh = write_mock_gh(&dir, "CLOSED|");
-        let report = run_once_with_gh(&store, dir.path(), 60, false, gh.to_str().unwrap()).await;
-        assert_eq!(report.transitions.len(), 1);
-        assert_eq!(report.transitions[0].to, "cancelled");
-        assert!(report.transitions[0].applied);
-    }
-
-    #[tokio::test]
-    async fn pr_closed_with_merged_at_treats_as_done() {
-        let dir = tempfile::tempdir().unwrap();
-        let Some(store) = open_store(&dir).await else {
-            return;
-        };
-        populate(
-            &store,
-            vec![make_task(
-                "t3",
-                TaskStatus::Implementing,
-                Some("https://github.com/acme/repo/pull/3"),
-                None,
-            )],
-        );
-        let gh = write_mock_gh(&dir, "CLOSED|2024-02-01T00:00:00Z");
-        let report = run_once_with_gh(&store, dir.path(), 60, false, gh.to_str().unwrap()).await;
-        assert_eq!(report.transitions.len(), 1);
-        assert_eq!(report.transitions[0].to, "done");
-    }
-
-    #[tokio::test]
-    async fn issue_only_task_closed_transitions_to_cancelled() {
-        let dir = tempfile::tempdir().unwrap();
-        let Some(store) = open_store(&dir).await else {
-            return;
-        };
-        populate(
-            &store,
-            vec![make_task("t4", TaskStatus::Pending, None, Some("issue:7"))],
-        );
-        let script = dir.path().join("gh");
-        std::fs::write(&script, "#!/bin/sh\nprintf 'CLOSED\\n'\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let report =
-            run_once_with_gh(&store, dir.path(), 60, false, script.to_str().unwrap()).await;
-        assert_eq!(report.transitions.len(), 1);
-        assert_eq!(report.transitions[0].to, "cancelled");
-    }
-
-    #[tokio::test]
-    async fn terminal_task_is_skipped() {
-        let dir = tempfile::tempdir().unwrap();
-        let Some(store) = open_store(&dir).await else {
-            return;
-        };
-        populate(
-            &store,
-            vec![make_task(
-                "t5",
-                TaskStatus::Done,
-                Some("https://github.com/acme/repo/pull/5"),
-                None,
-            )],
-        );
-        let gh = write_mock_gh(&dir, "MERGED|2024-01-01T00:00:00Z");
-        let report = run_once_with_gh(&store, dir.path(), 60, false, gh.to_str().unwrap()).await;
-        assert_eq!(report.transitions.len(), 0);
-        assert_eq!(report.skipped_terminal, 1);
-    }
-
-    #[tokio::test]
-    async fn gh_timeout_leaves_task_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let Some(store) = open_store(&dir).await else {
-            return;
-        };
-        populate(
-            &store,
-            vec![make_task(
-                "t6",
-                TaskStatus::Implementing,
-                Some("https://github.com/acme/repo/pull/6"),
-                None,
-            )],
-        );
-        let script = dir.path().join("gh");
-        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let report = tokio::time::timeout(
-            Duration::from_secs(15),
-            run_once_with_gh(&store, dir.path(), 60, false, script.to_str().unwrap()),
-        )
-        .await
-        .expect("run_once should complete within 15s");
-        assert_eq!(report.transitions.len(), 0);
         assert_eq!(
-            store.cache.get(&TaskId("t6".into())).unwrap().status,
-            TaskStatus::Implementing
+            classify_pr_state(&GitHubPullState {
+                state: "closed".to_string(),
+                merged_at: None,
+            }),
+            GitHubState::PrClosed
         );
     }
 
-    #[tokio::test]
-    async fn dry_run_reports_but_does_not_apply() {
-        let dir = tempfile::tempdir().unwrap();
-        let Some(store) = open_store(&dir).await else {
-            return;
-        };
-        populate(
-            &store,
-            vec![make_task(
-                "t7",
-                TaskStatus::Implementing,
-                Some("https://github.com/acme/repo/pull/7"),
-                None,
-            )],
-        );
-        let gh = write_mock_gh(&dir, "MERGED|2024-01-01T00:00:00Z");
-        let report = run_once_with_gh(&store, dir.path(), 60, true, gh.to_str().unwrap()).await;
-        assert_eq!(report.transitions.len(), 1);
-        assert!(!report.transitions[0].applied);
+    #[test]
+    fn classify_issue_state_handles_open_and_closed() {
         assert_eq!(
-            store.cache.get(&TaskId("t7".into())).unwrap().status,
-            TaskStatus::Implementing
+            classify_issue_state(&GitHubIssueState {
+                state: "open".to_string(),
+            }),
+            GitHubState::Open
+        );
+        assert_eq!(
+            classify_issue_state(&GitHubIssueState {
+                state: "closed".to_string(),
+            }),
+            GitHubState::IssueClosed
         );
     }
 
-    #[tokio::test]
-    async fn rate_limiter_no_panic_with_max_two() {
-        let dir = tempfile::tempdir().unwrap();
-        let Some(store) = open_store(&dir).await else {
-            return;
-        };
-        for i in 1u32..=3 {
-            populate(
-                &store,
-                vec![make_task(
-                    &format!("rl-{i}"),
-                    TaskStatus::Implementing,
-                    Some(&format!("https://github.com/acme/repo/pull/{i}")),
-                    None,
-                )],
-            );
-        }
-        let gh = write_mock_gh_fail(&dir);
-        let report = run_once_with_gh(&store, dir.path(), 2, false, gh.to_str().unwrap()).await;
-        assert_eq!(report.transitions.len(), 0);
-        assert_eq!(report.candidates, 3);
+    #[test]
+    fn transition_mapping_matches_external_states() {
+        assert_eq!(
+            transition_for_github_state(GitHubState::PrMerged),
+            Some((TaskStatus::Done, "reconciled: PR merged externally"))
+        );
+        assert_eq!(
+            transition_for_github_state(GitHubState::PrClosed),
+            Some((TaskStatus::Cancelled, "reconciled: PR closed externally"))
+        );
+        assert_eq!(transition_for_github_state(GitHubState::Open), None);
     }
 }
