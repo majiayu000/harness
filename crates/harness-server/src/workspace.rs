@@ -188,6 +188,7 @@ impl DiskRateLimiter {
 pub struct WorkspaceManager {
     pub(crate) config: WorkspaceConfig,
     pub(crate) active: DashMap<TaskId, ActiveWorkspace>,
+    pub(crate) active_paths: DashMap<PathBuf, TaskId>,
     pub(crate) owner_session: String,
 }
 
@@ -200,8 +201,25 @@ impl WorkspaceManager {
         Ok(Self {
             config,
             active: DashMap::new(),
+            active_paths: DashMap::new(),
             owner_session: SessionId::new().to_string(),
         })
+    }
+
+    fn release_active_path(&self, task_id: &TaskId, workspace_path: &Path) {
+        let owned_by_task = self
+            .active_paths
+            .get(workspace_path)
+            .is_some_and(|owner| owner.value() == task_id);
+        if owned_by_task {
+            self.active_paths.remove(workspace_path);
+        }
+    }
+
+    fn remove_active_workspace(&self, task_id: &TaskId) -> Option<ActiveWorkspace> {
+        let (_, active) = self.active.remove(task_id)?;
+        self.release_active_path(task_id, &active.workspace_path);
+        Some(active)
     }
 
     /// Create a git worktree for the given task under `config.root/<sanitized_task_id>`.
@@ -240,24 +258,45 @@ impl WorkspaceManager {
         let workspace_path = self.config.root.join(&workspace_key);
         let owner_session = self.owner_session.clone();
 
-        if let Some(existing) = self
-            .active
-            .iter()
-            .find(|entry| entry.key() != task_id && entry.workspace_path == workspace_path)
-        {
-            return Err(WorkspaceLifecycleError::LiveForeignOwner {
-                workspace_path: existing.workspace_path.clone(),
-                workspace_owner: Some(existing.owner_session.clone()),
-                message: format!(
-                    "WorktreeCollision: workspace path {:?} already owned by active task {}; manual resolution required",
-                    existing.workspace_path,
-                    existing.key().0
-                ),
-            });
-        }
+        // Reserve the deterministic path before task insertion. This closes the
+        // race where two different task IDs derive the same issue/PR workspace.
+        let path_reservation_inserted = {
+            use dashmap::mapref::entry::Entry;
+            match self.active_paths.entry(workspace_path.clone()) {
+                Entry::Occupied(occ) => {
+                    let owner_task = occ.get().clone();
+                    if owner_task != task_id.clone() {
+                        let (existing_path, workspace_owner) = self
+                            .active
+                            .get(&owner_task)
+                            .map(|entry| {
+                                (
+                                    entry.workspace_path.clone(),
+                                    Some(entry.owner_session.clone()),
+                                )
+                            })
+                            .unwrap_or_else(|| (workspace_path.clone(), None));
+                        return Err(WorkspaceLifecycleError::LiveForeignOwner {
+                            workspace_path: existing_path.clone(),
+                            workspace_owner,
+                            message: format!(
+                                "WorktreeCollision: workspace path {:?} already reserved by active task {}; manual resolution required",
+                                existing_path,
+                                owner_task.0
+                            ),
+                        });
+                    }
+                    false
+                }
+                Entry::Vacant(vac) => {
+                    vac.insert(task_id.clone());
+                    true
+                }
+            }
+        };
 
-        // Atomic check-and-insert: prevents TOCTOU where two concurrent calls for the
-        // same task_id would both attempt git worktree add on the same path.
+        // Atomic task check-and-insert: prevents TOCTOU where two concurrent calls
+        // for the same task_id would both attempt git worktree add on the same path.
         // Insert a placeholder immediately so any concurrent caller returns early.
         {
             use dashmap::mapref::entry::Entry;
@@ -273,6 +312,9 @@ impl WorkspaceManager {
                             run_generation,
                             decision: WorkspaceAcquireDecision::ReusedTracked,
                         });
+                    }
+                    if path_reservation_inserted {
+                        self.release_active_path(task_id, &workspace_path);
                     }
                     return Err(WorkspaceLifecycleError::LiveForeignOwner {
                         workspace_path: active.workspace_path.clone(),
@@ -302,7 +344,7 @@ impl WorkspaceManager {
                 owner_record_matches_workspace(record, task_id, &workspace_key, run_generation)
                     && record.owner_session != owner_session
             }) {
-                self.active.remove(task_id);
+                self.remove_active_workspace(task_id);
                 return Err(WorkspaceLifecycleError::LiveForeignOwner {
                     workspace_path: workspace_path.clone(),
                     workspace_owner: owner_record.map(|record| record.owner_session),
@@ -324,7 +366,7 @@ impl WorkspaceManager {
                     workspace_key: Some(workspace_key.clone()),
                 };
                 if let Err(err) = write_owner_record(&workspace_path, &owner_record) {
-                    self.active.remove(task_id);
+                    self.remove_active_workspace(task_id);
                     return Err(WorkspaceLifecycleError::CreateFailed {
                         workspace_path: workspace_path.clone(),
                         workspace_owner: Some(owner_session.clone()),
@@ -346,7 +388,7 @@ impl WorkspaceManager {
             }
 
             if let Err(err) = cleanup_workspace_path(source_repo, &workspace_path).await {
-                self.active.remove(task_id);
+                self.remove_active_workspace(task_id);
                 return Err(WorkspaceLifecycleError::ReconcileFailed {
                     workspace_path: workspace_path.clone(),
                     workspace_owner: owner_record.map(|record| record.owner_session),
@@ -360,7 +402,7 @@ impl WorkspaceManager {
         }
 
         // Fetch latest base_branch from remote so the worktree starts from upstream HEAD.
-        let fetch_output = git_command()
+        let fetch_output = match git_command()
             .args([
                 "-C",
                 &source_repo.to_string_lossy(),
@@ -370,11 +412,17 @@ impl WorkspaceManager {
             ])
             .output()
             .await
-            .map_err(|e| WorkspaceLifecycleError::CreateFailed {
-                workspace_path: workspace_path.clone(),
-                workspace_owner: Some(owner_session.clone()),
-                message: format!("git fetch failed for task {}: {e}", task_id.0),
-            })?;
+        {
+            Ok(output) => output,
+            Err(e) => {
+                self.remove_active_workspace(task_id);
+                return Err(WorkspaceLifecycleError::CreateFailed {
+                    workspace_path: workspace_path.clone(),
+                    workspace_owner: Some(owner_session.clone()),
+                    message: format!("git fetch failed for task {}: {e}", task_id.0),
+                });
+            }
+        };
 
         if !fetch_output.status.success() {
             let stderr = String::from_utf8_lossy(&fetch_output.stderr);
@@ -388,7 +436,7 @@ impl WorkspaceManager {
         // Falls back to local base_branch if fetch failed above.
         let remote_ref = format!("{remote}/{base_branch}");
         let branch = format!("harness/{}", task_id.0);
-        let output = git_command()
+        let output = match git_command()
             .args([
                 "-C",
                 &source_repo.to_string_lossy(),
@@ -401,15 +449,21 @@ impl WorkspaceManager {
             ])
             .output()
             .await
-            .map_err(|e| WorkspaceLifecycleError::CreateFailed {
-                workspace_path: workspace_path.clone(),
-                workspace_owner: Some(owner_session.clone()),
-                message: format!("git worktree add failed for task {}: {e}", task_id.0),
-            })?;
+        {
+            Ok(output) => output,
+            Err(e) => {
+                self.remove_active_workspace(task_id);
+                return Err(WorkspaceLifecycleError::CreateFailed {
+                    workspace_path: workspace_path.clone(),
+                    workspace_owner: Some(owner_session.clone()),
+                    message: format!("git worktree add failed for task {}: {e}", task_id.0),
+                });
+            }
+        };
 
         if !output.status.success() {
             // Fallback: try local base_branch (useful for repos without remotes, e.g. tests).
-            let fallback = git_command()
+            let fallback = match git_command()
                 .args([
                     "-C",
                     &source_repo.to_string_lossy(),
@@ -422,17 +476,23 @@ impl WorkspaceManager {
                 ])
                 .output()
                 .await
-                .map_err(|e| WorkspaceLifecycleError::CreateFailed {
-                    workspace_path: workspace_path.clone(),
-                    workspace_owner: Some(owner_session.clone()),
-                    message: format!(
-                        "git worktree add fallback failed for task {}: {e}",
-                        task_id.0
-                    ),
-                })?;
+            {
+                Ok(output) => output,
+                Err(e) => {
+                    self.remove_active_workspace(task_id);
+                    return Err(WorkspaceLifecycleError::CreateFailed {
+                        workspace_path: workspace_path.clone(),
+                        workspace_owner: Some(owner_session.clone()),
+                        message: format!(
+                            "git worktree add fallback failed for task {}: {e}",
+                            task_id.0
+                        ),
+                    });
+                }
+            };
 
             if !fallback.status.success() {
-                self.active.remove(task_id);
+                self.remove_active_workspace(task_id);
                 let stderr = String::from_utf8_lossy(&fallback.stderr);
                 return Err(WorkspaceLifecycleError::CreateFailed {
                     workspace_path: workspace_path.clone(),
@@ -453,7 +513,7 @@ impl WorkspaceManager {
             workspace_key: Some(workspace_key),
         };
         if let Err(err) = write_owner_record(&workspace_path, &owner_record) {
-            self.active.remove(task_id);
+            self.remove_active_workspace(task_id);
             if let Err(cleanup_err) = cleanup_workspace_path(source_repo, &workspace_path).await {
                 tracing::warn!(
                     "failed to cleanup partial worktree after owner-record failure: {cleanup_err}"
@@ -481,7 +541,7 @@ impl WorkspaceManager {
             };
 
             if let Some(err_msg) = hook_error {
-                self.active.remove(task_id);
+                self.remove_active_workspace(task_id);
                 if let Err(cleanup_err) = cleanup_workspace_path(source_repo, &workspace_path).await
                 {
                     tracing::warn!(
@@ -507,8 +567,8 @@ impl WorkspaceManager {
     /// Remove the workspace for the given task. Runs `before_remove_hook` first (non-fatal).
     /// Idempotent: returns Ok if the task has no active workspace.
     pub async fn remove_workspace(&self, task_id: &TaskId) -> anyhow::Result<()> {
-        let entry = match self.active.remove(task_id) {
-            Some((_, entry)) => entry,
+        let entry = match self.remove_active_workspace(task_id) {
+            Some(entry) => entry,
             None => return Ok(()),
         };
 
@@ -544,7 +604,7 @@ impl WorkspaceManager {
     /// issue/PR workspace key can reuse the directory while concurrent tasks are
     /// still protected by the active-path collision check.
     pub fn release_workspace(&self, task_id: &TaskId) {
-        self.active.remove(task_id);
+        self.remove_active_workspace(task_id);
     }
 
     pub async fn cleanup_workspace_for_retry(
@@ -559,7 +619,7 @@ impl WorkspaceManager {
             .map(Path::to_path_buf)
             .or_else(|| self.active.get(task_id).map(|e| e.workspace_path.clone()))
             .unwrap_or_else(|| self.config.root.join(sanitize_task_id(&task_id.0)));
-        self.active.remove(task_id);
+        self.remove_active_workspace(task_id);
         cleanup_workspace_path(source_repo, &target).await
     }
 
@@ -1565,6 +1625,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_workspace_blocks_inflight_duplicate_deterministic_path() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let first_task = harness_core::types::TaskId("task-first".to_string());
+        let second_task = harness_core::types::TaskId("task-second".to_string());
+        let workspace_key = derive_workspace_key(
+            &first_task,
+            Some("issue:42"),
+            Some("owner/repo"),
+            Some(source.path()),
+        );
+        let reserved_path = mgr.config.root.join(workspace_key);
+
+        mgr.active_paths
+            .insert(reserved_path.clone(), first_task.clone());
+
+        let err = mgr
+            .create_workspace(
+                &second_task,
+                source.path(),
+                "origin",
+                &branch,
+                1,
+                Some("issue:42"),
+                Some("owner/repo"),
+            )
+            .await
+            .expect_err("second task should be blocked by the path reservation");
+
+        assert!(
+            err.to_string().contains("already reserved by active task"),
+            "error should identify the in-flight deterministic path owner: {err}"
+        );
+        assert!(mgr.get_workspace(&second_task).is_none());
+        assert_eq!(
+            mgr.active_paths
+                .get(&reserved_path)
+                .map(|owner| owner.value().clone()),
+            Some(first_task)
+        );
+    }
+
+    #[tokio::test]
     async fn remove_workspace_idempotent() {
         let workspaces = tempfile::tempdir().expect("tempdir");
         let config = WorkspaceConfig {
@@ -2283,7 +2394,7 @@ mod tests {
             .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create workspace");
-        mgr.active.remove(&task_id);
+        mgr.release_workspace(&task_id);
 
         let summary = mgr.reconcile_disk_workspaces(source.path(), "gh", 20).await;
 
