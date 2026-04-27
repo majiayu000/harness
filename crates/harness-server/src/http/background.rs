@@ -1318,6 +1318,7 @@ async fn fetch_pr_github_state(
     }
     let raw = String::from_utf8_lossy(&output.stdout)
         .trim()
+        .trim_matches('"')
         .to_uppercase();
     match raw.as_str() {
         "MERGED" => Some((raw.to_string(), task_runner::TaskStatus::Done)),
