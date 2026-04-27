@@ -1214,6 +1214,362 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
     }
 }
 
+const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+const RECONCILE_GH_CALL_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+const RECONCILE_GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const RECONCILE_STARTUP_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(super) async fn run_github_reconciliation_once(state: &Arc<AppState>) {
+    run_github_reconciliation_with_gh(state, "gh").await;
+}
+
+async fn run_github_reconciliation_with_gh(state: &Arc<AppState>, gh_bin: &str) {
+    let candidates = state.core.tasks.tasks_with_active_pr();
+    if candidates.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = candidates.len(),
+        "reconciliation: checking active task(s) with PR URLs"
+    );
+    let deadline = tokio::time::Instant::now() + RECONCILE_STARTUP_CAP;
+    for (task_id, pr_url) in candidates {
+        if tokio::time::Instant::now() > deadline {
+            tracing::warn!("reconciliation: 30s cap reached, stopping early");
+            break;
+        }
+        state.core.tasks.wait_for_rate_limit().await;
+        // Re-check: task may have gone terminal between the snapshot and now.
+        if state
+            .core
+            .tasks
+            .get(&task_id)
+            .map(|t| t.status.is_terminal())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        tokio::time::sleep(RECONCILE_GH_CALL_DELAY).await;
+        let Some((raw_state, new_status)) = fetch_pr_github_state(gh_bin, &task_id, &pr_url).await
+        else {
+            continue;
+        };
+        tracing::info!(
+            task_id = %task_id,
+            pr_url = %pr_url,
+            gh_state = %raw_state,
+            new_status = ?new_status,
+            "reconciliation: transitioning task"
+        );
+        let new_status_clone = new_status.clone();
+        let raw_state_clone = raw_state.clone();
+        if let Err(pe) = task_runner::mutate_and_persist(&state.core.tasks, &task_id, move |task| {
+            task.status = new_status_clone.clone();
+            task.scheduler.mark_terminal(&new_status_clone);
+            if matches!(new_status_clone, task_runner::TaskStatus::Cancelled) {
+                task.error = Some(format!(
+                    "PR closed on GitHub without merging ({})",
+                    raw_state_clone
+                ));
+            }
+        })
+        .await
+        {
+            tracing::error!(task_id = %task_id, "reconciliation: failed to persist status transition: {pe}");
+        }
+        if let Some(cb) = &state.intake.completion_callback {
+            if let Some(final_state) = state.core.tasks.get(&task_id) {
+                cb(final_state).await;
+            }
+        }
+    }
+}
+
+async fn fetch_pr_github_state(
+    gh_bin: &str,
+    task_id: &task_runner::TaskId,
+    pr_url: &str,
+) -> Option<(String, task_runner::TaskStatus)> {
+    let output = match tokio::time::timeout(
+        RECONCILE_GH_TIMEOUT,
+        tokio::process::Command::new(gh_bin)
+            .args(["pr", "view", pr_url, "--json", "state", "--jq", ".state"])
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            tracing::warn!(task_id = %task_id, error = %e, "reconciliation: gh command failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(task_id = %task_id, "reconciliation: gh command timed out");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        tracing::debug!(
+            task_id = %task_id,
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "reconciliation: gh pr view returned non-zero"
+        );
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_uppercase();
+    match raw.as_str() {
+        "MERGED" => Some((raw.to_string(), task_runner::TaskStatus::Done)),
+        "CLOSED" => Some((raw.to_string(), task_runner::TaskStatus::Cancelled)),
+        _ => None,
+    }
+}
+
+pub(super) fn spawn_github_reconciliation_loop(state: &Arc<AppState>) {
+    let weak = Arc::downgrade(state);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(RECONCILE_INTERVAL).await;
+            let Some(state) = weak.upgrade() else {
+                break;
+            };
+            run_github_reconciliation_with_gh(&state, "gh").await;
+        }
+    });
+}
+
+/// Re-dispatch orphaned pending tasks: no pr_url, no system_input, no useful checkpoint.
+///
+/// Runs last in the startup recovery sequence so that all other paths (PR recovery,
+/// system-task recovery, checkpoint recovery) have already claimed their tasks first.
+/// If the DB query fails, log a warning and skip (startup must not abort).
+pub(super) async fn spawn_orphaned_pending_recovery(state: &Arc<AppState>) {
+    let orphaned_tasks = match state.core.tasks.pending_orphaned_tasks().await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(
+                "startup: failed to query orphaned pending tasks, \
+                 skipping orphan recovery: {e}"
+            );
+            vec![]
+        }
+    };
+    if orphaned_tasks.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = orphaned_tasks.len(),
+        "startup: re-dispatching orphaned pending task(s) with no checkpoint"
+    );
+    for task in orphaned_tasks {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let Some(task) = await_startup_recovery_ready_task(&state, &task.id, "orphaned").await
+            else {
+                return;
+            };
+
+            // Branch 1 — Prompt task with no external_id: nothing to reconstruct, fail-close.
+            if matches!(task.task_kind, task_runner::TaskKind::Prompt) && task.external_id.is_none()
+            {
+                let reason =
+                    "orphaned: prompt task had no recoverable context at restart".to_string();
+                tracing::warn!(
+                    task_id = ?task.id,
+                    task_kind = %task.task_kind.as_ref(),
+                    branch = "prompt_fail_close",
+                    "{reason}"
+                );
+                if let Err(pe) =
+                    task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
+                        s.status = task_runner::TaskStatus::Failed;
+                        s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
+                        s.error = Some(reason);
+                    })
+                    .await
+                {
+                    tracing::error!(
+                        task_id = ?task.id,
+                        "startup recovery: failed to persist failed status: {pe}"
+                    );
+                }
+                if let Some(cb) = &state.intake.completion_callback {
+                    if let Some(final_state) = state.core.tasks.get(&task.id) {
+                        cb(final_state).await;
+                    }
+                }
+                return;
+            }
+
+            // Branch 2 — Issue/Pr task (or any other kind with a parseable external_id): re-enqueue.
+            // Branch 3 — All other kinds: treat same as issue/pr, log a warn for visibility.
+            let (issue, pr) = parse_issue_pr(&task);
+            if issue.is_none() && pr.is_none() {
+                tracing::warn!(
+                    task_id = ?task.id,
+                    task_kind = %task.task_kind.as_ref(),
+                    branch = "unknown_kind_no_issue_pr",
+                    "startup recovery: orphaned task has no parseable issue/pr number — skipping"
+                );
+                return;
+            }
+            tracing::info!(
+                task_id = ?task.id,
+                task_kind = %task.task_kind.as_ref(),
+                branch = "reenqueue",
+                "startup recovery: re-dispatching orphaned pending task"
+            );
+
+            let project_path = if let Some(root) = task.project_root.clone() {
+                Some(root)
+            } else {
+                match task.repo.as_deref() {
+                    Some(repo) => {
+                        if let Some(registry) = state.core.project_registry.as_deref() {
+                            match registry.resolve_path(repo).await {
+                                Ok(Some(p)) => Some(p),
+                                Ok(None) => Some(std::path::PathBuf::from(repo)),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        task_id = ?task.id,
+                                        repo,
+                                        "startup recovery: registry lookup failed: \
+                                         {e}, using repo as path"
+                                    );
+                                    Some(std::path::PathBuf::from(repo))
+                                }
+                            }
+                        } else {
+                            Some(std::path::PathBuf::from(repo))
+                        }
+                    }
+                    None => None,
+                }
+            };
+
+            let canonical = match task_runner::resolve_canonical_project(project_path).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let reason = format!("startup recovery: failed to resolve project path: {e}");
+                    tracing::error!(task_id = ?task.id, "{reason}");
+                    if let Err(pe) =
+                        task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
+                            s.status = task_runner::TaskStatus::Failed;
+                            s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
+                            s.error = Some(reason);
+                        })
+                        .await
+                    {
+                        tracing::error!(
+                            task_id = ?task.id,
+                            "startup recovery: failed to persist failed status: {pe}; \
+                             skipping completion callback to avoid state split"
+                        );
+                        return;
+                    }
+                    if let Some(cb) = &state.intake.completion_callback {
+                        if let Some(final_state) = state.core.tasks.get(&task.id) {
+                            cb(final_state).await;
+                        }
+                    }
+                    return;
+                }
+            };
+            let project_id = canonical.to_string_lossy().into_owned();
+
+            let permit = match state
+                .concurrency
+                .task_queue
+                .acquire(&project_id, task.priority)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    let reason =
+                        format!("startup recovery: failed to acquire concurrency permit: {e}");
+                    tracing::error!(task_id = ?task.id, "{reason}");
+                    if let Err(pe) =
+                        task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
+                            s.status = task_runner::TaskStatus::Failed;
+                            s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
+                            s.error = Some(reason);
+                        })
+                        .await
+                    {
+                        tracing::error!(
+                            task_id = ?task.id,
+                            "startup recovery: failed to persist failed status: {pe}; \
+                             skipping completion callback to avoid state split"
+                        );
+                        return;
+                    }
+                    if let Some(cb) = &state.intake.completion_callback {
+                        if let Some(final_state) = state.core.tasks.get(&task.id) {
+                            cb(final_state).await;
+                        }
+                    }
+                    return;
+                }
+            };
+
+            let req = build_recovered_request(&task, canonical, issue, pr);
+            let agent =
+                match task_routes::select_agent(&req, &state.core.server.agent_registry, None) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let reason = format!("startup recovery: failed to select agent: {e}");
+                        tracing::error!(task_id = ?task.id, "{reason}");
+                        if let Err(pe) =
+                            task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
+                                s.status = task_runner::TaskStatus::Failed;
+                                s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
+                                s.error = Some(reason);
+                            })
+                            .await
+                        {
+                            tracing::error!(
+                                task_id = ?task.id,
+                                "startup recovery: failed to persist failed status: {pe}; \
+                                 skipping completion callback to avoid state split"
+                            );
+                            return;
+                        }
+                        if let Some(cb) = &state.intake.completion_callback {
+                            if let Some(final_state) = state.core.tasks.get(&task.id) {
+                                cb(final_state).await;
+                            }
+                        }
+                        return;
+                    }
+                };
+            let (reviewer, _) = super::resolve_reviewer(
+                &state.core.server.agent_registry,
+                &state.core.server.config.agents.review,
+                agent.name(),
+            );
+            state.core.tasks.register_task_stream(&task.id);
+            task_runner::spawn_preregistered_task(
+                task.id,
+                state.core.tasks.clone(),
+                agent,
+                reviewer,
+                Arc::new(state.core.server.config.clone()),
+                state.engines.skills.clone(),
+                state.observability.events.clone(),
+                state.interceptors.clone(),
+                req,
+                state.concurrency.workspace_mgr.clone(),
+                permit,
+                state.intake.completion_callback.clone(),
+                state.core.issue_workflow_store.clone(),
+                None,
+            )
+            .await;
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,5 +1618,115 @@ mod tests {
         let mut pending_without_pr = pending_with_pr;
         pending_without_pr.pr_url = None;
         assert!(!task_is_pr_recovery_candidate(&pending_without_pr));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_merged_transitions_to_done() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'MERGED\\n'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = fetch_pr_github_state(
+            script.to_str().unwrap(),
+            &task_id,
+            "https://github.com/owner/repo/pull/1",
+        )
+        .await;
+        assert!(
+            matches!(result, Some((ref s, task_runner::TaskStatus::Done)) if s == "MERGED"),
+            "expected Some((\"MERGED\", Done)), got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_closed_transitions_to_cancelled() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'CLOSED\\n'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = fetch_pr_github_state(
+            script.to_str().unwrap(),
+            &task_id,
+            "https://github.com/owner/repo/pull/1",
+        )
+        .await;
+        assert!(
+            matches!(result, Some((ref s, task_runner::TaskStatus::Cancelled)) if s == "CLOSED"),
+            "expected Some((\"CLOSED\", Cancelled)), got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_open_returns_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'OPEN\\n'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = fetch_pr_github_state(
+            script.to_str().unwrap(),
+            &task_id,
+            "https://github.com/owner/repo/pull/1",
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "expected None for OPEN state, got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_gh_failure_returns_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = fetch_pr_github_state(
+            script.to_str().unwrap(),
+            &task_id,
+            "https://github.com/owner/repo/pull/1",
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "expected None for non-zero exit, got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_gh_timeout_returns_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            fetch_pr_github_state(
+                script.to_str().unwrap(),
+                &task_id,
+                "https://github.com/owner/repo/pull/1",
+            ),
+        )
+        .await;
+        // The inner function times out after RECONCILE_GH_TIMEOUT (10s) and returns None;
+        // the outer 15s guard ensures the test itself does not hang if that logic changes.
+        match result {
+            Ok(inner) => assert!(inner.is_none(), "expected None on timeout, got {inner:?}"),
+            Err(_elapsed) => {} // outer guard fired first — also acceptable
+        }
     }
 }

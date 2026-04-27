@@ -7,10 +7,10 @@ use axum::{
 use std::sync::Arc;
 
 use super::{
-    auth, get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
-    get_task, get_task_artifacts, get_task_prompts, github_webhook, handle_rpc, health_check,
-    ingest_signal, intake_status, list_tasks, password_reset, project_queue_stats, state::AppState,
-    stream_task_sse, task_routes,
+    admin_reconcile, auth, get_issue_workflow_by_issue, get_issue_workflow_by_pr,
+    get_project_workflow_by_project, get_task, get_task_artifacts, get_task_prompts,
+    github_webhook, handle_rpc, health_check, ingest_signal, intake_status, list_tasks,
+    password_reset, project_queue_stats, state::AppState, stream_task_sse, task_routes,
 };
 
 pub(super) fn build_router(state: Arc<AppState>) -> Router {
@@ -112,6 +112,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             )),
         )
         .route("/auth/reset-password", post(password_reset))
+        .route("/admin/reconcile", post(admin_reconcile))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::api_auth_middleware,

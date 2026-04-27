@@ -166,19 +166,24 @@ pub fn is_waiting(output: &str) -> bool {
     last_non_empty_line(output) == Some("WAITING")
 }
 
-/// Check if reviewer output indicates quota exhaustion (e.g., Gemini 24h rate limit).
+/// Check if reviewer output indicates quota exhaustion (Gemini 24h rate limit or Codex usage limits).
 ///
 /// Requires ≥ 2 co-occurring quota-signal terms, or a single high-specificity phrase,
 /// to prevent false positives from reviews that incidentally mention "quota" in code.
 pub fn is_quota_exhausted(output: &str) -> bool {
     let lower = output.to_lowercase();
-    // High-specificity phrase: shortcut without requiring two co-occurring indicators.
+    // High-specificity phrases: shortcut without requiring two co-occurring indicators.
     if lower.contains("start processing again") {
+        return true;
+    }
+    // Codex-specific high-specificity phrase from chatgpt-codex-connector[bot].
+    if lower.contains("codex usage limits have been reached") {
         return true;
     }
     let indicators = [
         "quota",
         "rate limit",
+        "usage limits",
         "24 hour",
         "processing again",
         "will be processed",

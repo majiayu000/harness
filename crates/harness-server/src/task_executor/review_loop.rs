@@ -11,7 +11,96 @@ use harness_core::types::{Event, ExecutionPhase, SessionId};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::time::{sleep, Duration, Instant};
+
+/// Tracks which review bot tier is active in the review loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewTier {
+    /// Gemini (or configured primary bot) is active.
+    Primary,
+    /// Codex fallback is active after primary quota exhaustion.
+    /// A second quota exhaustion from this tier triggers the human gate (tier C).
+    Codex,
+}
+
+/// Codex bot GitHub login, used as reviewer_name in tier B.
+const CODEX_REVIEWER_NAME: &str = "chatgpt-codex-connector[bot]";
+/// PR comment trigger for Codex review, used as review_bot_command in tier B.
+const CODEX_REVIEW_BOT_COMMAND: &str = "@codex";
+
+/// External state of a PR as observed via the GitHub API.
+///
+/// Used to short-circuit the review loop when the PR was already merged or
+/// closed while the server was processing other tasks, avoiding unnecessary
+/// agent turns on stale work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrExternalState {
+    Open,
+    Merged,
+    Closed,
+    /// `gh` call failed or returned an unrecognised value; proceed normally.
+    Unknown,
+}
+
+/// Query GitHub for the current state of a PR via the `gh` CLI.
+///
+/// The `gh_bin` parameter is injectable so that tests can substitute a mock
+/// shell script without requiring a real GitHub token or network access.
+///
+/// All failure paths return [`PrExternalState::Unknown`] so that a transient
+/// `gh` error never blocks the review loop — unknown state is treated as
+/// "proceed with normal review" (graceful degradation).
+async fn fetch_pr_external_state(pr_num: u64, project: &Path, gh_bin: &str) -> PrExternalState {
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        Command::new(gh_bin)
+            .current_dir(project)
+            .args([
+                "pr",
+                "view",
+                &pr_num.to_string(),
+                "--json",
+                "state",
+                "--jq",
+                ".state",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) if out.status.success() => out,
+        Ok(Ok(out)) => {
+            tracing::debug!(
+                pr = pr_num,
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "fetch_pr_external_state: gh returned non-zero"
+            );
+            return PrExternalState::Unknown;
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(pr = pr_num, error = %e, "fetch_pr_external_state: gh failed");
+            return PrExternalState::Unknown;
+        }
+        Err(_) => {
+            tracing::debug!(pr = pr_num, "fetch_pr_external_state: gh timed out");
+            return PrExternalState::Unknown;
+        }
+    };
+    let raw = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .trim_matches('"')
+        .to_uppercase();
+    match raw.as_str() {
+        "OPEN" => PrExternalState::Open,
+        "MERGED" => PrExternalState::Merged,
+        "CLOSED" => PrExternalState::Closed,
+        _ => PrExternalState::Unknown,
+    }
+}
 
 /// Returns `true` when the trailing three entries of `counts` are all `Some`
 /// and the issue count is not decreasing (`c >= a && c >= b`).
@@ -58,8 +147,46 @@ pub(crate) async fn run_review_loop(
     task_start: Instant,
     repo_slug: String,
     jaccard_threshold: f64,
+    gh_bin: &str,
 ) -> anyhow::Result<()> {
     let review_phase_start = Instant::now();
+
+    // Fast-path: if the PR is already merged or closed on GitHub, skip the
+    // review loop entirely to avoid burning agent turns on stale work.
+    match fetch_pr_external_state(pr_num, project, gh_bin).await {
+        PrExternalState::Merged => {
+            tracing::info!(
+                task_id = %task_id,
+                pr_num,
+                "review loop: PR already merged on GitHub — marking done"
+            );
+            mutate_and_persist(store, task_id, |s| {
+                s.status = TaskStatus::Done;
+                s.turn = 1;
+                s.error = Some("PR merged on GitHub before review loop started".to_string());
+            })
+            .await?;
+            return Ok(());
+        }
+        PrExternalState::Closed => {
+            tracing::info!(
+                task_id = %task_id,
+                pr_num,
+                "review loop: PR closed on GitHub without merge — marking cancelled"
+            );
+            mutate_and_persist(store, task_id, |s| {
+                s.status = TaskStatus::Cancelled;
+                s.turn = 1;
+                s.error = Some(
+                    "PR closed on GitHub without merging before review loop started".to_string(),
+                );
+            })
+            .await?;
+            return Ok(());
+        }
+        // Open or Unknown: proceed with normal review loop.
+        PrExternalState::Open | PrExternalState::Unknown => {}
+    }
 
     // `prev_fixed` tracks whether a commit was pushed that hasn't been re-reviewed yet.
     // Starts true if the implementation phase pushed a commit, and is set to true again
@@ -82,7 +209,14 @@ pub(crate) async fn run_review_loop(
     // Tracks the most recent non-waiting review output for Jaccard loop detection.
     let mut prev_review_output: Option<String> = None;
 
-    const QUOTA_EXHAUSTED_THRESHOLD: u32 = 3;
+    // Tiered fallback: tracks which review bot is active.
+    let mut tier = ReviewTier::Primary;
+    // These may be swapped to Codex constants when tier B activates.
+    let mut active_review_bot_command: &str = &review_config.review_bot_command;
+    let mut active_reviewer_name: &str = &review_config.reviewer_name;
+
+    let quota_handoff_threshold = review_config.quota_handoff_threshold;
+    let silence_handoff_rounds = review_config.silence_handoff_rounds;
     let mut quota_exhausted_rounds: u32 = 0;
 
     // Review loop.
@@ -98,8 +232,8 @@ pub(crate) async fn run_review_loop(
             pr_num,
             round,
             prev_fixed,
-            &review_config.review_bot_command,
-            &review_config.reviewer_name,
+            active_review_bot_command,
+            active_reviewer_name,
             &repo_slug,
             impasse,
         );
@@ -278,16 +412,72 @@ pub(crate) async fn run_review_loop(
             }
         }
 
-        // WAITING means review bot hasn't posted yet (e.g., quota exhausted).
-        // Don't consume a round — just sleep and retry without incrementing.
-        // Cap consecutive waits to prevent infinite loops when the bot never responds.
-        const MAX_CONSECUTIVE_WAITS: u32 = 10;
+        // WAITING: review bot hasn't posted yet.
+        // Don't consume a round — just sleep and retry. Cap consecutive waits via
+        // `silence_handoff_rounds`. When that cap is reached, check the five
+        // silence-as-handoff preconditions before deciding whether to park at
+        // ReadyToMerge or consume a round.
         if waiting {
-            if waiting_count >= MAX_CONSECUTIVE_WAITS {
+            if waiting_count >= silence_handoff_rounds {
+                // Five preconditions for silence-as-handoff (tier C via silence path):
+                // 1. No pending test failure from prior LGTM rejection.
+                // 2. No LGTM was ever rejected by the test gate.
+                // 3. At least one real review round completed (round > 1).
+                // 4. Last recorded issue count is <= 2, or bot never posted (issue_counts empty).
+                // 5. Test gate passes.
+                let issues_ok = issue_counts.is_empty()
+                    || issue_counts
+                        .iter()
+                        .rev()
+                        .find_map(|c| *c)
+                        .is_some_and(|n| n <= 2);
+                let preconditions_met = pending_test_failure.is_none()
+                    && !lgtm_test_gate_rejected
+                    && round > 1
+                    && issues_ok;
+
+                if preconditions_met {
+                    match super::run_test_gate(
+                        project,
+                        &project_config.validation.pre_push,
+                        project_config.validation.test_gate_timeout_secs,
+                        cargo_env,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                task_id = %task_id,
+                                round,
+                                waiting_count,
+                                "silence-as-handoff: all preconditions met — marking ReadyToMerge"
+                            );
+                            mutate_and_persist(store, task_id, |s| {
+                                s.status = TaskStatus::ReadyToMerge;
+                                s.turn = round.saturating_add(1);
+                                s.error = Some(format!(
+                                    "ReadyToMerge: review bot silent after {} rounds, tests passed",
+                                    waiting_count
+                                ));
+                            })
+                            .await?;
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                round,
+                                waiting_count,
+                                "silence-as-handoff: tests failed — consuming a round"
+                            );
+                        }
+                    }
+                }
+
                 tracing::warn!(
                     round,
                     waiting_count,
-                    "PR #{pr_num} review bot has not responded after {MAX_CONSECUTIVE_WAITS} waits; \
+                    "PR #{pr_num} review bot has not responded after {silence_handoff_rounds} waits; \
                      consuming a round to prevent infinite loop"
                 );
                 round += 1;
@@ -306,13 +496,16 @@ pub(crate) async fn run_review_loop(
         }
 
         // Quota-exhausted: reviewer posted a quota warning instead of a real review.
-        // Don't consume a round — sleep and retry. After K consecutive quota rounds,
-        // run the test gate as a heuristic graduation check.
+        // Don't consume a round — sleep and retry. After `quota_handoff_threshold`
+        // consecutive quota rounds, escalate through tiers:
+        //   Tier A (primary) -> Tier B (Codex) when codex_fallback_enabled, else Done/Failed.
+        //   Tier B (Codex)   -> Tier C (human gate) -> ReadyToMerge/Failed.
         if quota_exhausted {
             quota_exhausted_rounds += 1;
             tracing::info!(
                 round,
                 quota_exhausted_rounds,
+                tier = ?tier,
                 "PR #{pr_num} reviewer quota exhausted; not consuming a review round"
             );
             mutate_and_persist(store, task_id, |s| {
@@ -326,54 +519,120 @@ pub(crate) async fn run_review_loop(
             })
             .await?;
 
-            if quota_exhausted_rounds >= QUOTA_EXHAUSTED_THRESHOLD && !lgtm_test_gate_rejected {
-                tracing::info!(
-                    task_id = %task_id,
-                    quota_exhausted_rounds,
-                    "quota-heuristic graduation: running test gate after {} quota-exhausted rounds",
-                    quota_exhausted_rounds
-                );
-                match super::run_test_gate(
-                    project,
-                    &project_config.validation.pre_push,
-                    project_config.validation.test_gate_timeout_secs,
-                    cargo_env,
-                )
-                .await
-                {
-                    Ok(()) => {
+            if quota_exhausted_rounds >= quota_handoff_threshold && !lgtm_test_gate_rejected {
+                match tier {
+                    ReviewTier::Primary if review_config.codex_fallback_enabled => {
+                        // Escalate to Tier B: switch active bot to Codex.
+                        tier = ReviewTier::Codex;
+                        quota_exhausted_rounds = 0;
+                        active_review_bot_command = CODEX_REVIEW_BOT_COMMAND;
+                        active_reviewer_name = CODEX_REVIEWER_NAME;
                         tracing::info!(
                             task_id = %task_id,
                             quota_exhausted_rounds,
-                            "quota-heuristic graduation: tests passed — marking done"
+                            "quota exhausted: escalating to Codex tier (B)"
                         );
-                        mutate_and_persist(store, task_id, |s| {
-                            s.status = TaskStatus::Done;
-                            s.turn = round.saturating_add(1);
-                            s.error = Some(format!(
-                                "LGTM via quota-heuristic: external reviewer quota exhausted after {} rounds, tests passed",
-                                quota_exhausted_rounds
-                            ));
-                        })
-                        .await?;
-                        return Ok(());
                     }
-                    Err(_test_output) => {
-                        tracing::warn!(
+                    ReviewTier::Primary => {
+                        // Backward compat: no Codex fallback configured; run test gate.
+                        tracing::info!(
                             task_id = %task_id,
                             quota_exhausted_rounds,
-                            "quota-heuristic graduation: tests failed — marking failed"
+                            "quota-heuristic graduation: running test gate after {} quota-exhausted rounds",
+                            quota_exhausted_rounds
                         );
-                        mutate_and_persist(store, task_id, |s| {
-                            s.status = TaskStatus::Failed;
-                            s.turn = round.saturating_add(1);
-                            s.error = Some(format!(
-                                "Quota-heuristic: tests failed after {} quota-exhausted rounds",
-                                quota_exhausted_rounds
-                            ));
-                        })
-                        .await?;
-                        return Ok(());
+                        match super::run_test_gate(
+                            project,
+                            &project_config.validation.pre_push,
+                            project_config.validation.test_gate_timeout_secs,
+                            cargo_env,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!(
+                                    task_id = %task_id,
+                                    quota_exhausted_rounds,
+                                    "quota-heuristic graduation: tests passed — marking done"
+                                );
+                                mutate_and_persist(store, task_id, |s| {
+                                    s.status = TaskStatus::Done;
+                                    s.turn = round.saturating_add(1);
+                                    s.error = Some(format!(
+                                        "LGTM via quota-heuristic: external reviewer quota exhausted after {} rounds, tests passed",
+                                        quota_exhausted_rounds
+                                    ));
+                                })
+                                .await?;
+                                return Ok(());
+                            }
+                            Err(_test_output) => {
+                                tracing::warn!(
+                                    task_id = %task_id,
+                                    quota_exhausted_rounds,
+                                    "quota-heuristic graduation: tests failed — marking failed"
+                                );
+                                mutate_and_persist(store, task_id, |s| {
+                                    s.status = TaskStatus::Failed;
+                                    s.turn = round.saturating_add(1);
+                                    s.error = Some(format!(
+                                        "Quota-heuristic: tests failed after {} quota-exhausted rounds",
+                                        quota_exhausted_rounds
+                                    ));
+                                })
+                                .await?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    ReviewTier::Codex => {
+                        // Tier C: both primary and Codex exhausted -> human gate.
+                        tracing::info!(
+                            task_id = %task_id,
+                            quota_exhausted_rounds,
+                            "Codex tier also quota-exhausted: escalating to human gate (tier C)"
+                        );
+                        match super::run_test_gate(
+                            project,
+                            &project_config.validation.pre_push,
+                            project_config.validation.test_gate_timeout_secs,
+                            cargo_env,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!(
+                                    task_id = %task_id,
+                                    "tier C: tests passed — marking ReadyToMerge"
+                                );
+                                mutate_and_persist(store, task_id, |s| {
+                                    s.status = TaskStatus::ReadyToMerge;
+                                    s.turn = round.saturating_add(1);
+                                    s.error = Some(format!(
+                                        "ReadyToMerge: both primary and Codex quota exhausted after {} rounds, tests passed",
+                                        quota_exhausted_rounds
+                                    ));
+                                })
+                                .await?;
+                                return Ok(());
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    task_id = %task_id,
+                                    "tier C: tests failed — marking failed"
+                                );
+                                mutate_and_persist(store, task_id, |s| {
+                                    s.status = TaskStatus::Failed;
+                                    s.turn = round.saturating_add(1);
+                                    s.error = Some(format!(
+                                        "ReadyToMerge blocked: tests failed after all review tiers exhausted ({} quota rounds)",
+                                        quota_exhausted_rounds
+                                    ));
+                                })
+                                .await?;
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
@@ -419,6 +678,21 @@ pub(crate) async fn run_review_loop(
         ev.reason = Some(format!("round {round}: {result_label}"));
         if let Err(e) = events.log(&ev).await {
             tracing::warn!("failed to log pr_review event: {e}");
+        }
+
+        // Log pr_review_fallback event when a non-primary tier was active.
+        if tier != ReviewTier::Primary {
+            let mut fallback_ev = Event::new(
+                SessionId::new(),
+                "pr_review_fallback",
+                "task_runner",
+                harness_core::types::Decision::Warn,
+            );
+            fallback_ev.detail = Some(format!("pr={pr_num} tier={tier:?}"));
+            fallback_ev.reason = Some(format!("round {round}: {result_label} via {:?}", tier));
+            if let Err(e) = events.log(&fallback_ev).await {
+                tracing::warn!("failed to log pr_review_fallback event: {e}");
+            }
         }
 
         if lgtm {
@@ -542,4 +816,75 @@ pub(crate) async fn run_review_loop(
         "task_completed"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── TaskStatus::ReadyToMerge serialization ────────────────────────────────
+
+    #[test]
+    fn taskstatus_readytomerge_serializes_correctly() {
+        let s = serde_json::to_string(&TaskStatus::ReadyToMerge).unwrap();
+        assert_eq!(s, r#""ready_to_merge""#);
+        let rt: TaskStatus = serde_json::from_str(&s).unwrap();
+        assert_eq!(rt, TaskStatus::ReadyToMerge);
+    }
+
+    #[test]
+    fn taskstatus_readytomerge_is_terminal() {
+        assert!(TaskStatus::ReadyToMerge.is_terminal());
+        assert!(!TaskStatus::ReadyToMerge.is_inflight());
+        assert!(!TaskStatus::ReadyToMerge.is_success());
+        assert!(!TaskStatus::ReadyToMerge.is_failure());
+    }
+
+    #[test]
+    fn taskstatus_readytomerge_from_str() {
+        let s: TaskStatus = "ready_to_merge".parse().unwrap();
+        assert_eq!(s, TaskStatus::ReadyToMerge);
+    }
+
+    // ── issue_count_not_decreasing ────────────────────────────────────────────
+
+    #[test]
+    fn issue_count_not_decreasing_requires_three_entries() {
+        assert!(!issue_count_not_decreasing(&[]));
+        assert!(!issue_count_not_decreasing(&[Some(5)]));
+        assert!(!issue_count_not_decreasing(&[Some(5), Some(5)]));
+    }
+
+    #[test]
+    fn issue_count_not_decreasing_detects_stagnation() {
+        assert!(issue_count_not_decreasing(&[Some(5), Some(5), Some(5)]));
+        assert!(issue_count_not_decreasing(&[Some(3), Some(4), Some(5)]));
+    }
+
+    #[test]
+    fn issue_count_not_decreasing_false_when_decreasing() {
+        assert!(!issue_count_not_decreasing(&[Some(5), Some(4), Some(3)]));
+        assert!(!issue_count_not_decreasing(&[Some(5), Some(5), Some(4)]));
+    }
+
+    #[test]
+    fn issue_count_not_decreasing_false_when_none_in_tail() {
+        assert!(!issue_count_not_decreasing(&[Some(5), None, Some(5)]));
+        assert!(!issue_count_not_decreasing(&[None, None, None]));
+    }
+
+    // ── ReviewTier ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn review_tier_primary_is_not_codex() {
+        let tier = ReviewTier::Primary;
+        assert_eq!(tier, ReviewTier::Primary);
+        assert_ne!(tier, ReviewTier::Codex);
+    }
+
+    #[test]
+    fn codex_constants_are_nonempty() {
+        assert!(!CODEX_REVIEWER_NAME.is_empty());
+        assert!(!CODEX_REVIEW_BOT_COMMAND.is_empty());
+    }
 }

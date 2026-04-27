@@ -41,9 +41,10 @@ pub use state::{
 
 // Handler re-exports — moved to focused submodules, kept accessible via `crate::http::`.
 pub(crate) use misc_routes::{
-    get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
-    get_task, get_task_artifacts, get_task_prompts, github_webhook, handle_rpc, health_check,
-    ingest_signal, intake_status, list_tasks, password_reset, project_queue_stats,
+    admin_reconcile, get_issue_workflow_by_issue, get_issue_workflow_by_pr,
+    get_project_workflow_by_project, get_task, get_task_artifacts, get_task_prompts,
+    github_webhook, handle_rpc, health_check, ingest_signal, intake_status, list_tasks,
+    password_reset, project_queue_stats,
 };
 pub(crate) use sse_routes::stream_task_sse;
 
@@ -143,11 +144,20 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // These had PRs when the server crashed and need their review loop re-started.
     background::spawn_pr_recovery(&state);
 
+    // Run a one-shot GitHub reconciliation pass to catch PRs that were merged or
+    // closed while the server was offline, then start the periodic loop.
+    background::run_github_reconciliation_once(&state).await;
+    background::spawn_github_reconciliation_loop(&state);
+
     // Re-dispatch recovered review/planner tasks that have restart-safe input bundles.
     background::spawn_system_task_recovery(&state);
 
     // Re-dispatch tasks recovered from plan/triage checkpoints but without a PR.
     background::spawn_checkpoint_recovery(&state).await;
+
+    // Re-dispatch orphaned pending tasks: no pr_url, no checkpoint, no system_input.
+    // Runs last so all other recovery paths have already claimed their tasks first.
+    background::spawn_orphaned_pending_recovery(&state).await;
 
     // Periodically sweep issue workflows with attached PRs and automatically
     // enqueue `pr:N` tasks so PR feedback is handled without manual resubmission.

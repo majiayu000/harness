@@ -944,3 +944,15 @@ pub(crate) async fn password_reset(
     let (status, body) = disabled_password_reset_response();
     (status, Json(body))
 }
+
+/// POST /admin/reconcile — trigger a one-shot GitHub PR reconciliation pass.
+///
+/// Spawns the reconciliation in the background so the request returns immediately.
+/// Useful for operators who want to force a reconciliation without waiting for
+/// the periodic loop to fire.
+pub(crate) async fn admin_reconcile(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    tokio::spawn(async move {
+        super::background::run_github_reconciliation_once(&state).await;
+    });
+    Json(json!({ "status": "triggered" }))
+}

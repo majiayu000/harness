@@ -722,13 +722,37 @@ pub(crate) async fn run_task(
         return Ok(());
     }
 
-    // Conflict resolution gate: intercept CONFLICTING PRs before the review loop.
-    // Only runs on the resume/recovery path — fresh PRs cannot be conflicting yet.
+    // Gate B: ensure the PR branch is rebased onto origin/main before review.
+    // Fresh pr:N tasks use the proactive rebase gate that detects "behind but
+    // conflict-free" and delegates the rebase to the agent.  Resumed issue
+    // tasks keep the legacy conflict detector as a defense-in-depth fallback.
     let mut rebase_pushed = false;
-    let mut conflict_was_detected = false;
-    if was_resumed_pr {
+    if req.pr.is_some() {
+        use conflict_resolver::{run_pr_rebase_gate, PrRebaseGateOutcome};
+        match run_pr_rebase_gate(
+            store,
+            task_id,
+            agent,
+            pr_num,
+            &project,
+            &repo_slug,
+            turn_timeout,
+            &cargo_env,
+            &events,
+        )
+        .await?
+        {
+            PrRebaseGateOutcome::Proceed {
+                rebase_pushed: pushed,
+            } => rebase_pushed = pushed,
+            PrRebaseGateOutcome::TaskFailed => return Ok(()),
+            // Command failure — legacy gate below will make one more attempt.
+            PrRebaseGateOutcome::Unknown => {}
+        }
+    } else if was_resumed_pr {
         use conflict_resolver::{assess_pr_conflict, PrConflictSize};
         let conflict_size = assess_pr_conflict(pr_num, &project).await;
+        let mut conflict_was_detected = false;
         match conflict_size {
             PrConflictSize::Small {
                 file_count,
@@ -765,10 +789,6 @@ pub(crate) async fn run_task(
             }
             PrConflictSize::Clean | PrConflictSize::Unknown(_) => {}
         }
-
-        // Gate B: a detected conflict that was not resolved by a successful rebase
-        // must not silently proceed to review. Mark Failed so the operator can
-        // re-queue after manual resolution rather than getting a false Done.
         if conflict_was_detected && !rebase_pushed {
             mutate_and_persist(store, task_id, |s| {
                 s.status = TaskStatus::Failed;
@@ -880,6 +900,7 @@ pub(crate) async fn run_task(
         task_start,
         repo_slug_for_review,
         jaccard_threshold,
+        "gh",
     )
     .await
 }

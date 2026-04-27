@@ -135,6 +135,43 @@ impl TaskDb {
         Ok(rows)
     }
 
+    /// Return pending tasks that are orphaned: no `pr_url`, no `system_input`, and no useful
+    /// checkpoint (plan/triage/checkpoint-pr_url all NULL). These are tasks skipped by every
+    /// other startup recovery path and would otherwise remain stuck forever.
+    pub async fn pending_orphaned_tasks(&self) -> anyhow::Result<Vec<TaskState>> {
+        let rows = sqlx::query_as::<_, TaskRow>(
+            "SELECT t.id, t.task_kind, t.status, t.failure_kind, t.turn, t.pr_url, t.rounds, \
+                    t.error, t.source, t.external_id, t.parent_id, t.created_at, t.updated_at, \
+                    t.repo, t.depends_on, t.project, t.workspace_path, t.workspace_owner, \
+                    t.run_generation, t.priority, t.phase, t.description, t.request_settings, \
+                    t.scheduler_state \
+             FROM tasks t \
+             LEFT JOIN task_checkpoints c ON c.task_id = t.id \
+             WHERE t.status = 'pending' \
+               AND t.pr_url IS NULL \
+               AND t.system_input IS NULL \
+               AND (c.task_id IS NULL \
+                    OR (c.plan_output IS NULL AND c.triage_output IS NULL AND c.pr_url IS NULL))",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in rows {
+            let task_id = row.id.clone();
+            match row.try_into_task_state() {
+                Ok(s) => tasks.push(s),
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        "skipping malformed orphaned pending task: {e}"
+                    );
+                }
+            }
+        }
+        Ok(tasks)
+    }
+
     pub async fn pending_tasks_with_checkpoint(
         &self,
     ) -> anyhow::Result<Vec<(TaskState, TaskCheckpoint)>> {

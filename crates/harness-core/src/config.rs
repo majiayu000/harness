@@ -6,6 +6,7 @@ pub mod project;
 pub mod resolve;
 pub mod server;
 pub mod workflow;
+pub mod workspace_config;
 
 use self::agents::*;
 use self::intake::*;

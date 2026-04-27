@@ -395,6 +395,87 @@ async fn restart_mixed_recovery_counts() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Branch 1 — `pending_orphaned_tasks()` returns an issue task with no checkpoint and no pr_url.
+#[tokio::test]
+async fn pending_orphaned_tasks_returns_orphaned_issue_task() -> anyhow::Result<()> {
+    let store = setup_store(|db| async move {
+        let mut task = make_task("t-orphan-issue", TaskStatus::Pending);
+        task.task_kind = TaskKind::Issue;
+        task.external_id = Some("issue:42".to_string());
+        db.insert(&task).await?;
+        Ok(())
+    })
+    .await?;
+
+    let orphans = store.pending_orphaned_tasks().await?;
+    assert_eq!(orphans.len(), 1, "orphaned issue task must appear");
+    assert_eq!(orphans[0].id, CoreTaskId("t-orphan-issue".into()));
+    Ok(())
+}
+
+/// Branch 2 — `pending_orphaned_tasks()` excludes tasks already claimed by
+/// `spawn_checkpoint_recovery` (checkpoint with plan_output set).
+#[tokio::test]
+async fn pending_orphaned_tasks_excludes_checkpointed_task() -> anyhow::Result<()> {
+    let store = setup_store(|db| async move {
+        // Has a plan checkpoint — claimed by spawn_checkpoint_recovery, not orphaned.
+        let mut checkpointed = make_task("t-checkpointed", TaskStatus::Pending);
+        checkpointed.task_kind = TaskKind::Issue;
+        checkpointed.external_id = Some("issue:55".to_string());
+        db.insert(&checkpointed).await?;
+        db.write_checkpoint(
+            "t-checkpointed",
+            None,
+            Some("## Plan\nStep 1"),
+            None,
+            "plan_done",
+        )
+        .await?;
+
+        // Truly orphaned — no checkpoint at all.
+        let mut orphan = make_task("t-orphan-only", TaskStatus::Pending);
+        orphan.task_kind = TaskKind::Issue;
+        orphan.external_id = Some("issue:56".to_string());
+        db.insert(&orphan).await?;
+        Ok(())
+    })
+    .await?;
+
+    let orphans = store.pending_orphaned_tasks().await?;
+    assert_eq!(
+        orphans.len(),
+        1,
+        "only the task without checkpoint must appear"
+    );
+    assert_eq!(orphans[0].id, CoreTaskId("t-orphan-only".into()));
+    Ok(())
+}
+
+/// Branch 3 — `pending_orphaned_tasks()` excludes tasks with `pr_url` set (claimed by
+/// `spawn_pr_recovery`).
+#[tokio::test]
+async fn pending_orphaned_tasks_excludes_pr_url_task() -> anyhow::Result<()> {
+    let store = setup_store(|db| async move {
+        // Task with pr_url — claimed by spawn_pr_recovery.
+        let mut with_pr = make_task("t-has-pr", TaskStatus::Pending);
+        with_pr.pr_url = Some("https://github.com/o/r/pull/10".to_string());
+        db.insert(&with_pr).await?;
+
+        // Orphaned: no pr_url, no checkpoint.
+        let mut orphan = make_task("t-no-pr", TaskStatus::Pending);
+        orphan.task_kind = TaskKind::Issue;
+        orphan.external_id = Some("issue:77".to_string());
+        db.insert(&orphan).await?;
+        Ok(())
+    })
+    .await?;
+
+    let orphans = store.pending_orphaned_tasks().await?;
+    assert_eq!(orphans.len(), 1, "task with pr_url must be excluded");
+    assert_eq!(orphans[0].id, CoreTaskId("t-no-pr".into()));
+    Ok(())
+}
+
 #[tokio::test]
 async fn restart_marks_resumed_task_as_recovering_in_scheduler_state() -> anyhow::Result<()> {
     let store = setup_store(|db| async move {

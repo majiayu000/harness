@@ -186,6 +186,19 @@ pub struct AgentReviewConfig {
     /// GitHub login of the review bot (used for freshness checks in review loop).
     #[serde(default = "default_reviewer_name")]
     pub reviewer_name: String,
+    /// When true, escalate to Codex after `quota_handoff_threshold` quota-exhausted rounds.
+    /// If the configured Codex agent is not found in the registry, tier-B is skipped silently.
+    #[serde(default)]
+    pub codex_fallback_enabled: bool,
+    /// Agent name to resolve from the registry for Codex fallback (tier B).
+    #[serde(default = "default_codex_fallback_agent")]
+    pub codex_fallback_agent: String,
+    /// Consecutive quota-exhausted rounds before escalating to Codex (tier B).
+    #[serde(default = "default_quota_handoff_threshold")]
+    pub quota_handoff_threshold: u32,
+    /// Consecutive WAITING rounds before attempting silence-as-handoff (tier C).
+    #[serde(default = "default_silence_handoff_rounds")]
+    pub silence_handoff_rounds: u32,
 }
 
 impl Default for AgentReviewConfig {
@@ -197,6 +210,10 @@ impl Default for AgentReviewConfig {
             review_bot_command: default_review_bot_command(),
             review_bot_auto_trigger: default_review_bot_auto_trigger(),
             reviewer_name: default_reviewer_name(),
+            codex_fallback_enabled: false,
+            codex_fallback_agent: default_codex_fallback_agent(),
+            quota_handoff_threshold: default_quota_handoff_threshold(),
+            silence_handoff_rounds: default_silence_handoff_rounds(),
         }
     }
 }
@@ -215,6 +232,18 @@ fn default_review_bot_auto_trigger() -> bool {
 
 fn default_max_agent_review_rounds() -> u32 {
     3
+}
+
+fn default_codex_fallback_agent() -> String {
+    "codex".to_string()
+}
+
+fn default_quota_handoff_threshold() -> u32 {
+    3
+}
+
+fn default_silence_handoff_rounds() -> u32 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

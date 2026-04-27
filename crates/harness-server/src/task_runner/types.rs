@@ -142,6 +142,8 @@ pub enum TaskStatus {
     AgentReview,
     Waiting,
     Reviewing,
+    /// Review bot silent / quota-exhausted after all tiers; parked for human merge decision.
+    ReadyToMerge,
     Done,
     Failed,
     Cancelled,
@@ -168,7 +170,10 @@ const RESUMABLE_TASK_STATUSES: &[&str] = &[
 
 impl TaskStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Done | Self::Failed | Self::Cancelled | Self::ReadyToMerge
+        )
     }
 
     pub fn is_inflight(&self) -> bool {
@@ -223,6 +228,7 @@ impl AsRef<str> for TaskStatus {
             TaskStatus::AgentReview => "agent_review",
             TaskStatus::Waiting => "waiting",
             TaskStatus::Reviewing => "reviewing",
+            TaskStatus::ReadyToMerge => "ready_to_merge",
             TaskStatus::Done => "done",
             TaskStatus::Failed => "failed",
             TaskStatus::Cancelled => "cancelled",
@@ -245,6 +251,7 @@ impl std::str::FromStr for TaskStatus {
             "agent_review" => Ok(TaskStatus::AgentReview),
             "waiting" => Ok(TaskStatus::Waiting),
             "reviewing" => Ok(TaskStatus::Reviewing),
+            "ready_to_merge" => Ok(TaskStatus::ReadyToMerge),
             "done" => Ok(TaskStatus::Done),
             "failed" => Ok(TaskStatus::Failed),
             "cancelled" => Ok(TaskStatus::Cancelled),

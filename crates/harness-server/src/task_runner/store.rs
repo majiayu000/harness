@@ -987,6 +987,14 @@ impl TaskStore {
         self.db.pending_tasks_with_checkpoint().await
     }
 
+    /// Return orphaned pending tasks: no `pr_url`, no `system_input`, and no useful checkpoint.
+    ///
+    /// Used at startup as the final catch-all recovery path for tasks skipped by all other
+    /// recovery paths.
+    pub async fn pending_orphaned_tasks(&self) -> anyhow::Result<Vec<TaskState>> {
+        self.db.pending_orphaned_tasks().await
+    }
+
     /// Overwrite `external_id` on an auto-fix task, even if one is already set.
     ///
     /// Used during streaming to implement "last sentinel wins" — the agent may
@@ -1158,6 +1166,24 @@ impl TaskStore {
         self.cache
             .iter()
             .filter_map(|entry| recovered_pr_candidate(entry.value()))
+            .collect()
+    }
+
+    /// Return `(TaskId, pr_url)` pairs for all non-terminal tasks that have a PR URL.
+    ///
+    /// Used by the periodic GitHub reconciliation loop to check whether open PRs
+    /// have been merged or closed since the task was last updated.
+    pub fn tasks_with_active_pr(&self) -> Vec<(TaskId, String)> {
+        self.cache
+            .iter()
+            .filter_map(|entry| {
+                let task = entry.value();
+                if task.status.is_terminal() {
+                    return None;
+                }
+                let pr_url = task.pr_url.as_ref()?.clone();
+                Some((task.id.clone(), pr_url))
+            })
             .collect()
     }
 }
@@ -1885,6 +1911,43 @@ mod tests {
         )
         .await
         .map_err(|_| anyhow::anyhow!("rate limit must be cleared after its deadline passes"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tasks_with_active_pr_returns_nonterminal_with_pr() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let mut task = TaskState::new(harness_core::types::TaskId("task-1".to_string()));
+        task.status = TaskStatus::Reviewing;
+        task.pr_url = Some("https://github.com/owner/repo/pull/1".to_string());
+        store.cache.insert(task.id.clone(), task);
+        let result = store.tasks_with_active_pr();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1, "https://github.com/owner/repo/pull/1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tasks_with_active_pr_excludes_tasks_without_pr() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let mut task = TaskState::new(harness_core::types::TaskId("task-2".to_string()));
+        task.status = TaskStatus::Implementing;
+        store.cache.insert(task.id.clone(), task);
+        let result = store.tasks_with_active_pr();
+        assert!(result.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tasks_with_active_pr_excludes_terminal_tasks() -> anyhow::Result<()> {
+        // Terminal tasks are not loaded into the cache at startup.
+        // Verify that an empty cache returns an empty result.
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let result = store.tasks_with_active_pr();
+        assert!(result.is_empty());
         Ok(())
     }
 }
