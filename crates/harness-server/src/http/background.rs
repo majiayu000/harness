@@ -1492,11 +1492,11 @@ mod tests {
             ),
         )
         .await;
-        // The inner function times out after RECONCILE_GH_TIMEOUT (10s) and returns None;
-        // the outer 15s guard ensures the test itself does not hang if that logic changes.
+        // The inner function must time out after RECONCILE_GH_TIMEOUT (10s) and return None;
+        // the outer 15s guard is a safety net — if it fires, the inner timeout logic is broken.
         match result {
             Ok(inner) => assert!(inner.is_none(), "expected None on timeout, got {inner:?}"),
-            Err(_elapsed) => {} // outer guard fired first — also acceptable
+            Err(_) => panic!("outer test timeout fired before inner function timeout logic"),
         }
     }
 }
