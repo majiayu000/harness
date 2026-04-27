@@ -461,6 +461,15 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                                     error = %e,
                                     "sweeper: failed to repair project_id"
                                 );
+                                let _ = issue_workflows
+                                    .release_feedback_claim(
+                                        &workflow.project_id,
+                                        workflow.repo.as_deref(),
+                                        pr_number,
+                                        &format!("sweeper: failed to repair project_id: {e}"),
+                                    )
+                                    .await;
+                                continue;
                             }
                             warned_unresolvable.remove(&project_key);
                             resolved
