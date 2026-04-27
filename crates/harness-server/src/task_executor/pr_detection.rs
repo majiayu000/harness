@@ -356,6 +356,84 @@ fn strip_trailing_repo_qualifier(s: &str) -> Option<&str> {
     Some(&s[..owner_start])
 }
 
+/// Attempt to recover a PR URL when the agent output lacked a `PR_URL=` sentinel.
+///
+/// Detects the current branch of `project_root` via `git rev-parse --abbrev-ref HEAD`,
+/// then queries `gh pr list --search "head:<branch>"` for open PRs on that branch.
+/// Returns `(pr_number, pr_url)` for the first result, or `None` when:
+///   - the branch cannot be detected (detached HEAD, git unavailable)
+///   - `gh pr list` fails (logged at warn)
+///   - the response JSON is empty or unparseable
+pub(crate) async fn fallback_find_pr_by_branch(project_root: &Path) -> Option<(u64, String)> {
+    let branch_out = Command::new("git")
+        .current_dir(project_root)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !branch_out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&branch_out.stdout)
+        .trim()
+        .to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        tracing::warn!("fallback_find_pr_by_branch: detached HEAD, cannot search by branch");
+        return None;
+    }
+
+    let gh_out = Command::new("gh")
+        .current_dir(project_root)
+        .args([
+            "pr",
+            "list",
+            "--search",
+            &format!("head:{branch}"),
+            "--state",
+            "open",
+            "--json",
+            "number,url",
+            "--limit",
+            "5",
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    if !gh_out.status.success() {
+        tracing::warn!(
+            branch = %branch,
+            stderr = %String::from_utf8_lossy(&gh_out.stderr).trim(),
+            "fallback_find_pr_by_branch: gh pr list failed"
+        );
+        return None;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PrItem {
+        number: u64,
+        url: String,
+    }
+    let items: Vec<PrItem> = match serde_json::from_slice(&gh_out.stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(branch = %branch, error = %e, "fallback_find_pr_by_branch: JSON parse failed");
+            return None;
+        }
+    };
+    let first = items.into_iter().next()?;
+    tracing::info!(
+        branch = %branch,
+        pr_number = first.number,
+        pr_url = %first.url,
+        "fallback_find_pr_by_branch: recovered PR via gh pr list"
+    );
+    Some((first.number, first.url))
+}
+
 /// Parse `"owner/repo"` from a git remote URL.
 ///
 /// Handles HTTPS (`https://github.com/owner/repo.git`),
@@ -681,6 +759,38 @@ mod tests {
     }
 
     // --- parse_harness_mention_command (pre-existing, light coverage) ---
+
+    // --- fallback_find_pr_by_branch JSON parsing tests (T6 / T7) ---
+
+    #[test]
+    fn fallback_json_valid_returns_first_item() {
+        // T6: JSON returned by `gh pr list` with one match should deserialise correctly.
+        #[derive(serde::Deserialize)]
+        struct PrItem {
+            number: u64,
+            url: String,
+        }
+        let json = r#"[{"number":42,"url":"https://github.com/owner/repo/pull/42"}]"#;
+        let items: Vec<PrItem> = serde_json::from_str(json).unwrap();
+        let first = items.into_iter().next().unwrap();
+        assert_eq!(first.number, 42);
+        assert_eq!(first.url, "https://github.com/owner/repo/pull/42");
+    }
+
+    #[test]
+    fn fallback_json_empty_array_returns_none() {
+        // T7: empty JSON array — no PR found on this branch.
+        #[derive(serde::Deserialize)]
+        struct PrItem {
+            #[allow(dead_code)]
+            number: u64,
+            #[allow(dead_code)]
+            url: String,
+        }
+        let json = r#"[]"#;
+        let items: Vec<PrItem> = serde_json::from_str(json).unwrap();
+        assert!(items.into_iter().next().is_none());
+    }
 
     #[test]
     fn parses_fix_ci_command() {
