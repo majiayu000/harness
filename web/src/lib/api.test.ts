@@ -50,4 +50,14 @@ describe("apiFetch", () => {
 
     unauthorizedEvents.removeEventListener("unauthorized", handler);
   });
+
+  it("uses JSON error details for non-2xx responses", async () => {
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: "invalid root path: not a git repository" }), {
+        status: 400,
+      }),
+    ) as unknown as typeof fetch;
+
+    await expect(apiFetch("/projects")).rejects.toThrow(/invalid root path/i);
+  });
 });

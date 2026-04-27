@@ -14,10 +14,31 @@ export class ApiError extends Error {
   constructor(
     public readonly status: number,
     message: string,
+    public readonly details?: unknown,
   ) {
     super(message);
     this.name = "ApiError";
   }
+}
+
+async function responseErrorMessage(path: string, resp: Response): Promise<[string, unknown]> {
+  let details: unknown;
+  const fallback = `${path} -> HTTP ${resp.status}`;
+  try {
+    details = await resp.clone().json();
+  } catch {
+    return [fallback, details];
+  }
+
+  if (details && typeof details === "object") {
+    const body = details as Record<string, unknown>;
+    const message = body.error ?? body.message;
+    if (typeof message === "string" && message.trim()) {
+      return [message, details];
+    }
+  }
+
+  return [fallback, details];
 }
 
 function authHeaders(): Record<string, string> {
@@ -40,10 +61,11 @@ export async function apiFetch(
   const resp = await fetch(path, merged);
   if (resp.status === 401) {
     unauthorizedEvents.dispatchEvent(new Event("unauthorized"));
-    throw new ApiError(401, `${path} → 401`);
+    throw new ApiError(401, `${path} -> 401`);
   }
   if (!resp.ok) {
-    throw new ApiError(resp.status, `${path} → HTTP ${resp.status}`);
+    const [message, details] = await responseErrorMessage(path, resp);
+    throw new ApiError(resp.status, message, details);
   }
   return resp;
 }
