@@ -850,13 +850,13 @@ fn sanitize_task_id(id: &str) -> String {
 /// Derive the filesystem key for a workspace.
 ///
 /// For tasks with `external_id` matching `issue:N` or `pr:N` and a non-empty `repo`,
-/// returns `<sanitized_repo>/<sanitized_external_id>` (e.g. `myorg_my-repo/issue_42`),
-/// creating a deterministic two-level path that survives task-id changes across retries.
+/// returns `<sanitized_repo>__<sanitized_external_id>` (e.g. `myorg_my-repo__issue_42`),
+/// creating a deterministic flat path that survives task-id changes across retries.
 /// Falls back to the UUID-derived key when either argument is absent or doesn't match.
 fn derive_workspace_key(task_id: &TaskId, external_id: Option<&str>, repo: Option<&str>) -> String {
     if let (Some(eid), Some(r)) = (external_id, repo) {
         if !r.is_empty() && is_issue_or_pr_id(eid) {
-            return format!("{}/{}", sanitize_task_id(r), sanitize_task_id(eid));
+            return format!("{}__{}", sanitize_task_id(r), sanitize_task_id(eid));
         }
     }
     sanitize_task_id(&task_id.0)
@@ -1220,13 +1220,13 @@ mod tests {
     #[test]
     fn derive_workspace_key_issue() {
         let key = derive_workspace_key(&test_task_id(), Some("issue:42"), Some("myorg/my-repo"));
-        assert_eq!(key, "myorg_my-repo/issue_42");
+        assert_eq!(key, "myorg_my-repo__issue_42");
     }
 
     #[test]
     fn derive_workspace_key_pr() {
         let key = derive_workspace_key(&test_task_id(), Some("pr:7"), Some("myorg/my-repo"));
-        assert_eq!(key, "myorg_my-repo/pr_7");
+        assert_eq!(key, "myorg_my-repo__pr_7");
     }
 
     #[test]
@@ -1246,7 +1246,7 @@ mod tests {
     #[test]
     fn derive_workspace_key_special_chars_in_repo() {
         let key = derive_workspace_key(&test_task_id(), Some("issue:99"), Some("my.org/repo name"));
-        assert_eq!(key, "my_org_repo_name/issue_99");
+        assert_eq!(key, "my_org_repo_name__issue_99");
     }
 
     #[test]
