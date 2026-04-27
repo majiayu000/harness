@@ -13,6 +13,63 @@ pub fn extract_review_issues(output: &str) -> Vec<String> {
         .collect()
 }
 
+/// Strip ANSI CSI escape sequences (e.g. colour codes) from `s`.
+///
+/// Handles `ESC [ <params> <letter>` sequences. Bare ESC characters not
+/// followed by `[` are consumed silently. Uses a state machine so no regex
+/// dependency is required.
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                              // Consume digits and semicolons until an ASCII letter ends the sequence.
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            // else: bare ESC — skip it
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Scan `output` for the last valid bare GitHub PR URL.
+///
+/// Used as a fallback when no `PR_URL=` sentinel is found. Each candidate is
+/// validated with `is_valid_github_pr_url` to maintain the same injection
+/// protections. Returns the last valid URL found (consistent with the sentinel
+/// scan which also takes the last occurrence).
+fn scan_bare_pr_url(output: &str) -> Option<String> {
+    let needle = "https://github.com/";
+    let mut last: Option<String> = None;
+    for line in output.lines() {
+        let mut search_from = 0usize;
+        while let Some(rel) = line[search_from..].find(needle) {
+            let url_start = search_from + rel;
+            let candidate = &line[url_start..];
+            let url_end = candidate
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+                .unwrap_or(candidate.len());
+            // Trim trailing sentence punctuation that cannot be part of a PR URL.
+            // Example: "see https://github.com/o/r/pull/5." — the period ends the sentence.
+            let url = candidate[..url_end].trim_end_matches(['.', ',', '!', '?', ')', ']']);
+            if is_valid_github_pr_url(url) {
+                let normalized = url.split('#').next().unwrap_or(url).trim_end_matches('/');
+                last = Some(normalized.to_string());
+            }
+            search_from = url_start + url_end.max(1);
+        }
+    }
+    last
+}
+
 /// Parse `PR_URL=<url>` from agent output (searches from last line).
 ///
 /// Only returns URLs matching the strict GitHub PR format
@@ -23,8 +80,16 @@ pub fn extract_review_issues(output: &str) -> Vec<String> {
 ///
 /// The fragment (if any) is stripped from the returned URL so it cannot
 /// escape shell quoting in downstream commands.
+///
+/// ANSI colour codes are stripped before scanning so that terminals that
+/// decorate the output do not break the literal `PR_URL=` match. If no
+/// `PR_URL=` sentinel is found, a second pass searches for any bare GitHub
+/// PR URL in the output and returns the last valid match.
 pub fn parse_pr_url(output: &str) -> Option<String> {
-    for line in output.lines().rev() {
+    let stripped = strip_ansi_codes(output);
+
+    // First pass: explicit PR_URL= sentinel (scan from end to get the last one).
+    for line in stripped.lines().rev() {
         let line = line.trim();
         if let Some(url) = line.strip_prefix("PR_URL=") {
             let url = url.trim();
@@ -38,7 +103,9 @@ pub fn parse_pr_url(output: &str) -> Option<String> {
             }
         }
     }
-    None
+
+    // Second pass: bare GitHub PR URL anywhere in the output.
+    scan_bare_pr_url(&stripped)
 }
 
 /// Returns `true` only for well-formed GitHub PR URLs.
@@ -351,6 +418,89 @@ which could mask silent failures.\nISSUES=1\nFIXED";
     #[test]
     fn test_parse_pr_url_not_found() {
         assert_eq!(parse_pr_url("no url here"), None);
+    }
+
+    // --- ANSI stripping tests (issue #982) ---
+
+    #[test]
+    fn test_parse_pr_url_ansi_reset_prefix() {
+        // T1: ANSI reset code on the same line as PR_URL=
+        let output = "Some output\n\x1b[0mPR_URL=https://github.com/owner/repo/pull/42";
+        assert_eq!(
+            parse_pr_url(output),
+            Some("https://github.com/owner/repo/pull/42".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_url_ansi_colors_wrapping_line() {
+        // T2: bold green colour codes wrapping the entire PR_URL= line
+        let output = "Some output\n\x1b[1;32mPR_URL=https://github.com/owner/repo/pull/99\x1b[0m";
+        assert_eq!(
+            parse_pr_url(output),
+            Some("https://github.com/owner/repo/pull/99".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_url_truncated_no_panic() {
+        // T3: truncated URL (no PR number) → None, no panic
+        assert_eq!(
+            parse_pr_url("PR_URL=https://github.com/foo/bar/pull/"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_url_multiple_returns_last() {
+        // T4: agent mentions an old PR then creates a new one — return the last valid URL
+        let output = "see old PR at PR_URL=https://github.com/owner/repo/pull/10\n\
+                      done\n\
+                      PR_URL=https://github.com/owner/repo/pull/42";
+        assert_eq!(
+            parse_pr_url(output),
+            Some("https://github.com/owner/repo/pull/42".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_url_bare_url_fallback() {
+        // T5: no PR_URL= prefix but a plain GitHub PR URL is present
+        let output = "Created PR: https://github.com/owner/repo/pull/77\nDone.";
+        assert_eq!(
+            parse_pr_url(output),
+            Some("https://github.com/owner/repo/pull/77".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_url_bare_url_fallback_returns_last() {
+        // T5 variant: multiple bare URLs → last valid PR URL is returned
+        let output = "Mentioned https://github.com/owner/repo/pull/1 earlier.\n\
+                      Final result https://github.com/owner/repo/pull/55.";
+        assert_eq!(
+            parse_pr_url(output),
+            Some("https://github.com/owner/repo/pull/55".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_url_bare_issue_url_ignored() {
+        // issue URLs must not match the bare URL fallback (not a /pull/ URL)
+        let output = "Created https://github.com/owner/repo/issues/10";
+        assert_eq!(parse_pr_url(output), None);
+    }
+
+    #[test]
+    fn test_parse_pr_url_stderr_combined_output() {
+        // T8: when stderr is appended to output with a separator, sentinel is found
+        let stdout = "Implementing changes...\n";
+        let stderr = "PR_URL=https://github.com/owner/repo/pull/88";
+        let combined = format!("{stdout}\n--- stderr ---\n{stderr}");
+        assert_eq!(
+            parse_pr_url(&combined),
+            Some("https://github.com/owner/repo/pull/88".to_string())
+        );
     }
 
     #[test]

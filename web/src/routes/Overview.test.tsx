@@ -65,6 +65,7 @@ function makeOverview(): OverviewPayload {
     },
     feed: [],
     alerts: [],
+    evolution: null,
     global: {
       uptime_secs: 1,
       running: 1,

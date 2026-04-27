@@ -1289,4 +1289,39 @@ mod tests {
         );
         Ok(())
     }
+
+    // Surface 1 regression guard: after repair_project_id the stored project_id
+    // must never contain a UUID workspace path segment.
+    #[tokio::test]
+    async fn surface1_repaired_project_id_has_no_workspaces_path() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let uuid_path = "/data/workspaces/6b10f4d1-8381-4ceb-be46-9bcd13c08eb1/some-project-s1";
+        store
+            .record_issue_scheduled(uuid_path, Some("owner/repo"), 9101, "task-s1a", &[], false)
+            .await?;
+
+        let workflow = store
+            .get_by_issue(uuid_path, Some("owner/repo"), 9101)
+            .await?
+            .expect("row should exist before repair");
+        let row_id = workflow.id.clone();
+
+        let canonical = "/home/user/projects/some-project-s1";
+        store.repair_project_id(&row_id, canonical).await?;
+
+        let repaired = store
+            .get_by_issue(canonical, Some("owner/repo"), 9101)
+            .await?
+            .expect("repaired row should exist");
+
+        assert!(
+            !repaired.project_id.contains("/workspaces/"),
+            "repaired project_id must not contain a workspace path, got: {}",
+            repaired.project_id
+        );
+        assert_eq!(repaired.project_id, canonical);
+        Ok(())
+    }
 }

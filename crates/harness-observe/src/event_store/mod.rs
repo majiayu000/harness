@@ -107,6 +107,24 @@ impl EventStore {
         self.pool.close().await;
     }
 
+    /// Create a non-functional store for unit tests that need an `&EventStore`
+    /// but do not care about event persistence. All `log` calls will fail and
+    /// callers that handle those errors (e.g. with `tracing::warn!`) will
+    /// continue normally. Do not use outside of test code.
+    #[doc(hidden)]
+    pub fn new_noop_for_tests() -> Self {
+        let pool = match PgPool::connect_lazy("postgresql://localhost/harness_noop") {
+            Ok(pool) => pool,
+            Err(error) => panic!("lazy pool URL must be syntactically valid: {error}"),
+        };
+        Self {
+            pool,
+            data_dir: PathBuf::new(),
+            otel_pipeline: Mutex::new(None),
+            session_renewal_secs: 1800,
+        }
+    }
+
     pub fn session_renewal_secs(&self) -> u64 {
         self.session_renewal_secs
     }

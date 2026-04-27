@@ -262,6 +262,7 @@ pub(crate) async fn build_registry(
                         tracing::info!(
                             removed = summary.removed,
                             preserved = summary.preserved,
+                            migrated = summary.migrated,
                             "workspace startup reconciliation complete"
                         );
                     }

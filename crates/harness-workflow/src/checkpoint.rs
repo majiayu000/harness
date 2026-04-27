@@ -265,4 +265,16 @@ mod tests {
         // exists in CI the test still passes; what matters is no panic.
         let _ = loaded;
     }
+
+    // Surface 2 regression guard: TaskCheckpoint serializes only task metadata
+    // fields (phase, turn, pr_url, branch).  No workspace path must ever appear.
+    #[test]
+    fn surface2_serialized_checkpoint_has_no_workspace_path() {
+        let cp = make_checkpoint("task-s2-audit");
+        let json = serde_json::to_string(&cp).expect("TaskCheckpoint must serialize to JSON");
+        assert!(
+            !json.contains("/workspaces/"),
+            "TaskCheckpoint JSON must not contain a workspace path, got: {json}"
+        );
+    }
 }
