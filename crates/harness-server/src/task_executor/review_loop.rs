@@ -24,7 +24,6 @@ enum ReviewTier {
     Codex,
 }
 
-
 /// External state of a PR as observed via the GitHub API.
 ///
 /// Used to short-circuit the review loop when the PR was already merged or
@@ -829,8 +828,10 @@ mod tests {
     }
 
     #[test]
-    fn taskstatus_readytomerge_is_terminal() {
-        assert!(TaskStatus::ReadyToMerge.is_terminal());
+    fn taskstatus_readytomerge_is_not_terminal() {
+        // ReadyToMerge is not terminal so the reconciliation loop can
+        // transition it to Done/Cancelled when the PR is merged/closed.
+        assert!(!TaskStatus::ReadyToMerge.is_terminal());
         assert!(!TaskStatus::ReadyToMerge.is_inflight());
         assert!(!TaskStatus::ReadyToMerge.is_success());
         assert!(!TaskStatus::ReadyToMerge.is_failure());

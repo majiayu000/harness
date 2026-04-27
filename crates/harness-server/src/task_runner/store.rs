@@ -115,6 +115,10 @@ impl TaskStore {
             "agent_review",
             "waiting",
             "reviewing",
+            // ReadyToMerge is not terminal: the background reconciliation loop
+            // must be able to transition these tasks to Done/Cancelled if the
+            // PR is externally merged or closed on GitHub.
+            "ready_to_merge",
         ];
         for task in db.list_by_status(active_statuses).await? {
             persist_locks.insert(task.id.clone(), Arc::new(Mutex::new(())));

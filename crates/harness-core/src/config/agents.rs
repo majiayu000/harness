@@ -193,10 +193,10 @@ pub struct AgentReviewConfig {
     /// Agent name to resolve from the registry for Codex fallback (tier B).
     #[serde(default = "default_codex_fallback_agent")]
     pub codex_fallback_agent: String,
-    /// GitHub login of the Codex fallback bot (tier B reviewer_name).
+    /// GitHub login of the Codex fallback bot (used for freshness checks in tier B).
     #[serde(default = "default_codex_reviewer_name")]
     pub codex_reviewer_name: String,
-    /// PR comment command to trigger Codex review (tier B review_bot_command).
+    /// PR comment that triggers the Codex fallback bot to run a review.
     #[serde(default = "default_codex_review_bot_command")]
     pub codex_review_bot_command: String,
     /// Consecutive quota-exhausted rounds before escalating to Codex (tier B).

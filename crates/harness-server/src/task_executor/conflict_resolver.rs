@@ -161,14 +161,47 @@ async fn gh_head_ref_name(pr_num: u64, project: &Path) -> Result<String, String>
     Ok(name)
 }
 
+async fn gh_base_ref_name(pr_num: u64, project: &Path) -> Result<String, String> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        Command::new("gh")
+            .current_dir(project)
+            .args([
+                "pr",
+                "view",
+                &pr_num.to_string(),
+                "--json",
+                "baseRefName",
+                "--jq",
+                ".baseRefName",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("gh pr view #{pr_num} --json baseRefName timed out"))?
+    .map_err(|e| format!("gh pr view #{pr_num}: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("gh pr view #{pr_num} failed: {stderr}"));
+    }
+
+    let name = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    Ok(name)
+}
+
 /// Perform a read-only three-way merge via `git merge-tree` and return
 /// `(conflicting_file_count, conflict_region_count)`.
 ///
-/// `git merge-tree <base> origin/main origin/<branch>` outputs the synthetic
-/// merge result — including `<<<<<<<` / `=======` / `>>>>>>>` markers for
-/// unresolved sections — without touching the working tree or index.  Each
-/// `<<<<<<< ` line is one conflict region; each `changed in both` header is
-/// one conflicting file.
+/// Uses `git merge-tree <merge-base> origin/<base> origin/<head>` to produce
+/// the synthetic merge result — including `<<<<<<<` markers — without touching
+/// the working tree or index.
 async fn git_conflict_counts(pr_num: u64, project: &Path) -> Result<(usize, usize), String> {
     let branch = gh_head_ref_name(pr_num, project).await?;
     if !is_safe_ref(&branch) {
@@ -176,8 +209,14 @@ async fn git_conflict_counts(pr_num: u64, project: &Path) -> Result<(usize, usiz
             "PR #{pr_num}: branch name `{branch}` contains unsafe characters"
         ));
     }
+    let base = gh_base_ref_name(pr_num, project).await?;
+    if !is_safe_ref(&base) {
+        return Err(format!(
+            "PR #{pr_num}: base branch `{base}` contains unsafe characters"
+        ));
+    }
 
-    // Fetch to ensure origin/main and origin/<branch> are current.
+    // Fetch to ensure remote refs are current.
     // Best-effort: a stale fetch is not fatal — merge-tree will still run
     // on whatever refs are already present.
     match tokio::time::timeout(
@@ -203,12 +242,16 @@ async fn git_conflict_counts(pr_num: u64, project: &Path) -> Result<(usize, usiz
         _ => {}
     }
 
-    // Compute the merge base between origin/main and origin/<branch>.
+    // Compute the merge base between origin/<base> and origin/<branch>.
     let base_out = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         Command::new("git")
             .current_dir(project)
-            .args(["merge-base", "origin/main", &format!("origin/{branch}")])
+            .args([
+                "merge-base",
+                &format!("origin/{base}"),
+                &format!("origin/{branch}"),
+            ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -233,7 +276,7 @@ async fn git_conflict_counts(pr_num: u64, project: &Path) -> Result<(usize, usiz
             .args([
                 "merge-tree",
                 &base_sha,
-                "origin/main",
+                &format!("origin/{base}"),
                 &format!("origin/{branch}"),
             ])
             .stdin(std::process::Stdio::null())

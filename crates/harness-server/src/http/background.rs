@@ -1220,10 +1220,16 @@ const RECONCILE_GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const RECONCILE_STARTUP_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(super) async fn run_github_reconciliation_once(state: &Arc<AppState>) {
-    run_github_reconciliation_with_gh(state, "gh").await;
+    // Apply 30s cap during startup to avoid blocking server readiness.
+    let deadline = Some(tokio::time::Instant::now() + RECONCILE_STARTUP_CAP);
+    run_github_reconciliation_with_gh(state, "gh", deadline).await;
 }
 
-async fn run_github_reconciliation_with_gh(state: &Arc<AppState>, gh_bin: &str) {
+async fn run_github_reconciliation_with_gh(
+    state: &Arc<AppState>,
+    gh_bin: &str,
+    deadline: Option<tokio::time::Instant>,
+) {
     let candidates = state.core.tasks.tasks_with_active_pr();
     if candidates.is_empty() {
         return;
@@ -1232,11 +1238,12 @@ async fn run_github_reconciliation_with_gh(state: &Arc<AppState>, gh_bin: &str) 
         count = candidates.len(),
         "reconciliation: checking active task(s) with PR URLs"
     );
-    let deadline = tokio::time::Instant::now() + RECONCILE_STARTUP_CAP;
     for (task_id, pr_url) in candidates {
-        if tokio::time::Instant::now() > deadline {
-            tracing::warn!("reconciliation: 30s cap reached, stopping early");
-            break;
+        if let Some(dl) = deadline {
+            if tokio::time::Instant::now() > dl {
+                tracing::warn!("reconciliation: 30s cap reached, stopping early");
+                break;
+            }
         }
         state.core.tasks.wait_for_rate_limit().await;
         // Re-check: task may have gone terminal between the snapshot and now.
@@ -1335,7 +1342,8 @@ pub(super) fn spawn_github_reconciliation_loop(state: &Arc<AppState>) {
             let Some(state) = weak.upgrade() else {
                 break;
             };
-            run_github_reconciliation_with_gh(&state, "gh").await;
+            // Background loop: no deadline cap so all candidates are processed.
+            run_github_reconciliation_with_gh(&state, "gh", None).await;
         }
     });
 }

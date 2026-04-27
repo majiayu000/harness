@@ -170,10 +170,7 @@ const RESUMABLE_TASK_STATUSES: &[&str] = &[
 
 impl TaskStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::Done | Self::Failed | Self::Cancelled | Self::ReadyToMerge
-        )
+        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
 
     pub fn is_inflight(&self) -> bool {
