@@ -50,3 +50,13 @@ export type StreamItem =
   | { type: "Done" }
   | { type: "Error"; message: string }
   | { type: "TokenUsage"; usage: { input_tokens: number; output_tokens: number } };
+
+export type CreateTaskPayload =
+  | { issue: number; project?: string; agent?: string; max_turns?: number; turn_timeout_secs?: number }
+  | { pr: number; project?: string; agent?: string; max_turns?: number; turn_timeout_secs?: number }
+  | { prompt: string; project?: string; agent?: string; max_turns?: number; turn_timeout_secs?: number };
+
+export interface CreateTaskResponse {
+  task_id: string;
+  status: string;
+}
