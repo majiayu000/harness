@@ -134,6 +134,10 @@ pub enum TaskPhase {
 pub enum TaskStatus {
     Pending,
     AwaitingDeps,
+    /// Claude is actively running the triage agent for this task.
+    Triaging,
+    /// Claude is actively running the plan agent for this task.
+    Planning,
     Implementing,
     ReviewGenerating,
     ReviewWaiting,
@@ -158,6 +162,8 @@ pub enum TaskFailureKind {
 
 const TERMINAL_TASK_STATUSES: &[&str] = &["done", "failed", "cancelled"];
 const RESUMABLE_TASK_STATUSES: &[&str] = &[
+    "triaging",
+    "planning",
     "implementing",
     "review_generating",
     "review_waiting",
@@ -176,7 +182,9 @@ impl TaskStatus {
     pub fn is_inflight(&self) -> bool {
         matches!(
             self,
-            Self::Implementing
+            Self::Triaging
+                | Self::Planning
+                | Self::Implementing
                 | Self::ReviewGenerating
                 | Self::ReviewWaiting
                 | Self::PlannerGenerating
@@ -217,6 +225,8 @@ impl AsRef<str> for TaskStatus {
         match self {
             TaskStatus::Pending => "pending",
             TaskStatus::AwaitingDeps => "awaiting_deps",
+            TaskStatus::Triaging => "triaging",
+            TaskStatus::Planning => "planning",
             TaskStatus::Implementing => "implementing",
             TaskStatus::ReviewGenerating => "review_generating",
             TaskStatus::ReviewWaiting => "review_waiting",
@@ -240,6 +250,8 @@ impl std::str::FromStr for TaskStatus {
         match s {
             "pending" => Ok(TaskStatus::Pending),
             "awaiting_deps" => Ok(TaskStatus::AwaitingDeps),
+            "triaging" => Ok(TaskStatus::Triaging),
+            "planning" => Ok(TaskStatus::Planning),
             "implementing" => Ok(TaskStatus::Implementing),
             "review_generating" => Ok(TaskStatus::ReviewGenerating),
             "review_waiting" => Ok(TaskStatus::ReviewWaiting),

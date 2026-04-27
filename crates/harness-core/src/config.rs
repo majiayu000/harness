@@ -54,6 +54,8 @@ pub struct HarnessConfig {
     #[serde(default)]
     pub retry_scheduler: RetrySchedulerConfig,
     #[serde(default)]
+    pub reconciliation: ReconciliationConfig,
+    #[serde(default)]
     pub maintenance_window: MaintenanceWindowConfig,
     /// Projects declared in the config file. Registered on server startup.
     #[serde(default)]

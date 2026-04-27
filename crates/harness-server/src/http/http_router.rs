@@ -113,6 +113,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/auth/reset-password", post(password_reset))
         .route("/admin/reconcile", post(admin_reconcile))
+        .route("/reconcile", post(crate::handlers::reconcile::handle))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::api_auth_middleware,

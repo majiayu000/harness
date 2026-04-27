@@ -243,11 +243,11 @@ impl RuleEngine {
                 {
                     continue;
                 }
-                let severity = if section.contains("严重") || section.contains("critical") {
+                let severity = if section.contains("critical") {
                     Severity::Critical
-                } else if section.contains("严格") || section.contains("high") {
+                } else if section.contains("high") {
                     Severity::High
-                } else if section.contains("中") || section.contains("medium") {
+                } else if section.contains("medium") {
                     Severity::Medium
                 } else {
                     Severity::Low

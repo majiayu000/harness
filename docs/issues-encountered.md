@@ -307,7 +307,7 @@ error[E0433]: failed to resolve: use of undeclared crate or module `tempfile`
 
 ### Root Cause
 
-New `thread_db.rs` tests use `tempfile::tempdir()` for creating temporary SQLite databases, but the crate wasn't declared in `Cargo.toml`.
+New `thread_db.rs` tests use `tempfile::tempdir()` for creating temporary databases, but the crate wasn't declared in `Cargo.toml`.
 
 ### Fix
 

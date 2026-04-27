@@ -391,6 +391,9 @@ pub(crate) async fn run_task(
     interceptors: Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
     req: &CreateTaskRequest,
     project: PathBuf,
+    // Canonical project root used for project_id derivation in issue workflow records.
+    // Distinct from `project` when workspace isolation is active (worktree != canonical root).
+    project_root: PathBuf,
     server_config: &harness_core::config::HarnessConfig,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     // Accumulated turn count from previous transient-retry attempts.
@@ -547,11 +550,10 @@ pub(crate) async fn run_task(
             .map(|s| s.phase == crate::task_runner::TaskPhase::Plan)
             .unwrap_or(false);
         if forced_plan && req.issue.is_none() && req.pr.is_none() {
-            // Set to Implementing BEFORE the plan phase so that a crash during planning
-            // leaves the task in 'implementing' status. The startup recovery code will catch
-            // it and fail-close it (no pr_url → mark failed), rather than leaving it stuck
-            // as a plain 'pending' that is never re-dispatched.
-            update_status(store, task_id, TaskStatus::Implementing, 1).await?;
+            // Set to Planning so operators can see the agent is actively working.
+            // Planning is in resumable_statuses, so a crash here will be caught by
+            // startup recovery: no pr_url/plan checkpoint → mark failed, re-queue manually.
+            update_status(store, task_id, TaskStatus::Planning, 0).await?;
             triage_pipeline::run_plan_for_prompt(agent, store, task_id, &cargo_env, &project, req)
                 .await?
         } else {
@@ -587,7 +589,7 @@ pub(crate) async fn run_task(
     let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
 
     if let (Some(workflows), Some(issue_number)) = (issue_workflow_store.as_ref(), req.issue) {
-        let project_id = project.to_string_lossy().into_owned();
+        let project_id = project_root.to_string_lossy().into_owned();
         if let Err(e) = workflows
             .record_implement_started(&project_id, req.repo.as_deref(), issue_number, &task_id.0)
             .await
@@ -618,6 +620,7 @@ pub(crate) async fn run_task(
             git,
             &repo_slug,
             &project,
+            &project_root,
             current_plan_output.clone(),
             resumed_pr_url.clone(),
             issue_workflow_store.clone(),
@@ -722,8 +725,9 @@ pub(crate) async fn run_task(
         return Ok(());
     }
 
-    // Gate B: conflict and rebase probing is delegated to the agent prompt.
-    // Harness must not run local git/GitHub commands from the server process.
+    // Conflict resolution gate: host-side GitHub/git inspection is disabled by
+    // project policy. On resume paths, ask the agent/reviewer loop to inspect
+    // and resolve any conflicts instead of probing from the server process.
     if was_resumed_pr {
         use conflict_resolver::{assess_pr_conflict, PrConflictSize};
         let PrConflictSize::Unknown(reason) = assess_pr_conflict(pr_num, &project).await;

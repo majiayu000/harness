@@ -24,6 +24,7 @@ pub(crate) mod misc_routes;
 pub(crate) mod rate_limit;
 pub(crate) mod sse_routes;
 pub(crate) mod state;
+pub(crate) mod task_query_routes;
 pub(crate) mod task_routes;
 
 #[cfg(test)]
@@ -42,11 +43,11 @@ pub use state::{
 // Handler re-exports — moved to focused submodules, kept accessible via `crate::http::`.
 pub(crate) use misc_routes::{
     admin_reconcile, get_issue_workflow_by_issue, get_issue_workflow_by_pr,
-    get_project_workflow_by_project, get_task, get_task_artifacts, get_task_prompts,
-    github_webhook, handle_rpc, health_check, ingest_signal, intake_status, list_tasks,
-    password_reset, project_queue_stats,
+    get_project_workflow_by_project, github_webhook, handle_rpc, health_check, ingest_signal,
+    intake_status, password_reset, project_queue_stats,
 };
 pub(crate) use sse_routes::stream_task_sse;
+pub(crate) use task_query_routes::{get_task, get_task_artifacts, get_task_prompts, list_tasks};
 
 /// Resolve the reviewer agent for independent agent review.
 ///
@@ -139,6 +140,24 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
     // Spawn background watcher for AwaitingDeps tasks.
     background::spawn_awaiting_deps_watcher(&state);
+
+    // Run one reconciliation tick against GitHub before any recovery so that
+    // recovery decisions are made on fresh GitHub truth.
+    {
+        let max_calls = state
+            .core
+            .server
+            .config
+            .reconciliation
+            .max_gh_calls_per_minute;
+        crate::reconciliation::run_once(
+            &state.core.tasks,
+            &state.core.project_root,
+            max_calls,
+            false,
+        )
+        .await;
+    }
 
     // Re-dispatch tasks that were recovered to pending after server restart.
     // These had PRs when the server crashed and need their review loop re-started.
