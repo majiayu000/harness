@@ -867,7 +867,12 @@ fn derive_workspace_key(
                 .and_then(|n| n.to_str())
                 .map(|n| format!("{}__", sanitize_task_id(n)))
                 .unwrap_or_default();
-            return format!("{}{}__{}", project_prefix, sanitize_task_id(r), sanitize_task_id(eid));
+            return format!(
+                "{}{}__{}",
+                project_prefix,
+                sanitize_task_id(r),
+                sanitize_task_id(eid)
+            );
         }
     }
     sanitize_task_id(&task_id.0)
